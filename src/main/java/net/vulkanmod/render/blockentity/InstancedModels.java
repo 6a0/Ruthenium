@@ -17,6 +17,8 @@ import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import com.mojang.renderpearl.api.vertex.VertexFormat;
 import net.minecraft.client.model.Model;
+import net.minecraft.client.model.geom.ModelPart;
+import net.minecraft.client.model.object.armorstand.ArmorStandModel;
 import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.client.renderer.MappableRingBuffer;
 import net.minecraft.client.renderer.RenderPipelines;
@@ -25,12 +27,14 @@ import net.minecraft.client.renderer.blockentity.BlockEntityRenderer;
 import net.minecraft.client.renderer.blockentity.EnchantTableRenderer;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
 import net.minecraft.client.renderer.blockentity.state.EnchantTableRenderState;
+import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.texture.UvMapping;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.Identifier;
+import net.vulkanmod.render.entity.ModelCulling;
 import net.vulkanmod.render.entity.ModelGeometryCache;
 import org.joml.Matrix4f;
 import org.jspecify.annotations.Nullable;
@@ -38,18 +42,23 @@ import org.lwjgl.system.MemoryUtil;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 
 /**
- * Draws block entity models whose geometry only differs by their pose as GPU instances: currently the closed
- * books of enchanting tables, which spin and bob every frame (~5k of them facing the chest cube).
+ * Draws models whose geometry only differs by their pose as GPU instances: the closed books of enchanting tables,
+ * which spin and bob every frame (~5k of them facing the chest cube), and armor stands posed alike (the ~190 in
+ * the benchmark all are).
  * <p>
  * The model is captured once in model space ({@link ModelGeometryCache#modelSpaceKey}; all faces, exact repeats
  * left out) into a vertex buffer. Each frame the extraction runs the real renderer into a
  * {@link ModelSubmitCapture} instead of submitting it, and stores the captured pose (camera-relative, rotation
- * only) and light as one instance; the instances are drawn after the world's solid features with
- * {@link #PIPELINE}: vanilla's entity_solid with a vertex shader that applies the instance's pose to the position
- * and normal. The only difference to vanilla is rounding: the normal is quantized before the rotation instead of
+ * only) and light as one instance. Armor stands are taken from their prepared model submits instead: after
+ * {@code setupAnim}, the transforms of all their parts ({@link #snapshot}) key the group, whose mesh is the
+ * model rendered once with the identity pose. The instances are drawn after the world's solid features with
+ * instanced copies of vanilla's entity pipelines, whose vertex shader applies the instance's pose to the position
+ * and normal. The only difference to vanilla is rounding: the normal is quantized before the transform instead of
  * after it.
  * <p>
  * Only used from the render thread, except {@link #clear}.
@@ -62,24 +71,15 @@ public final class InstancedModels {
             .addAttribute("InstanceLight", GpuFormat.RG16_SINT)
             .build();
 
-    public static final RenderPipeline PIPELINE = RenderPipeline.builder()
-            .withBindGroupLayout(BindGroupLayouts.GLOBALS)
-            .withBindGroupLayout(BindGroupLayouts.PROJECTION)
-            .withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS)
-            .withBindGroupLayout(BindGroupLayouts.FOG)
-            .withVertexShader(Identifier.fromNamespaceAndPath("vulkanmod", "core/instanced_entity"))
-            .withFragmentShader(Identifier.withDefaultNamespace("core/entity"))
-            .withBindGroupLayout(BindGroupLayouts.SAMPLER0)
-            .withVertexBinding(0, DefaultVertexFormat.ENTITY)
-            .withVertexBinding(1, INSTANCE_FORMAT)
-            .withPrimitiveTopology(PrimitiveTopology.QUADS)
-            .withDepthStencilState(DepthStencilState.DEFAULT)
-            .withBindGroupLayout(BindGroupLayouts.LIGHTING)
-            .withBindGroupLayout(BindGroupLayouts.SAMPLER2)
-            .withLocation(Identifier.fromNamespaceAndPath("vulkanmod", "pipeline/instanced_entity_solid"))
-            .withBindGroupLayout(BindGroupLayouts.SAMPLER1)
-            .withColorTargetState(ColorTargetState.DEFAULT)
-            .build();
+    /** Instanced copies of vanilla's entity_solid, entity_cutout and entity_cutout_cull */
+    public static final RenderPipeline SOLID = instancedPipeline("entity_solid", false, false, true);
+    public static final RenderPipeline CUTOUT = instancedPipeline("entity_cutout", true, true, false);
+    public static final RenderPipeline CUTOUT_CULL = instancedPipeline("entity_cutout_cull", true, false, true);
+    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT, CUTOUT_CULL);
+
+    /** Models drawn from their prepared submits when their parts are posed like an existing group */
+    private static final Set<Class<?>> POSED_MODELS = Set.of(ArmorStandModel.class);
+    private static final int MAX_GROUPS_PER_MODEL = 32;
 
     /** {@code -Dvulkanmod.instancedModels=false} turns this off (until the config screen is ported) */
     private static final boolean ENABLED = !"false".equals(System.getProperty("vulkanmod.instancedModels"));
@@ -88,6 +88,7 @@ public final class InstancedModels {
     private static final float ROTATION_TOLERANCE = 1.0e-4f;
 
     private static final List<Group> GROUPS = new ArrayList<>();
+    private static float[] snapshotScratch = new float[0];
     private static final ModelSubmitCapture CAPTURE = new ModelSubmitCapture();
     private static final PoseStack POSE_STACK = new PoseStack();
     private static final PoseStack.Pose IDENTITY_POSE = new PoseStack().last();
@@ -99,9 +100,50 @@ public final class InstancedModels {
     private InstancedModels() {
     }
 
+    private static RenderPipeline instancedPipeline(String name, boolean cutout, boolean perFaceLighting, boolean cull) {
+        RenderPipeline.Builder builder = RenderPipeline.builder()
+                .withBindGroupLayout(BindGroupLayouts.GLOBALS)
+                .withBindGroupLayout(BindGroupLayouts.PROJECTION)
+                .withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS)
+                .withBindGroupLayout(BindGroupLayouts.FOG)
+                .withVertexShader(Identifier.fromNamespaceAndPath("vulkanmod", "core/instanced_entity"))
+                .withFragmentShader(Identifier.withDefaultNamespace("core/entity"))
+                .withBindGroupLayout(BindGroupLayouts.SAMPLER0)
+                .withVertexBinding(0, DefaultVertexFormat.ENTITY)
+                .withVertexBinding(1, INSTANCE_FORMAT)
+                .withPrimitiveTopology(PrimitiveTopology.QUADS)
+                .withDepthStencilState(DepthStencilState.DEFAULT)
+                .withBindGroupLayout(BindGroupLayouts.LIGHTING)
+                .withBindGroupLayout(BindGroupLayouts.SAMPLER2)
+                .withLocation(Identifier.fromNamespaceAndPath("vulkanmod", "pipeline/instanced_" + name));
+        if (cutout) {
+            builder.withShaderDefine("ALPHA_CUTOUT", 0.1F);
+        }
+        if (perFaceLighting) {
+            builder.withShaderDefine("PER_FACE_LIGHTING");
+        }
+        return builder.withBindGroupLayout(BindGroupLayouts.SAMPLER1)
+                .withCull(cull)
+                .withColorTargetState(ColorTargetState.DEFAULT)
+                .build();
+    }
+
+    private static @Nullable RenderPipeline instancedPipeline(RenderPipeline vanilla) {
+        if (vanilla == RenderPipelines.ENTITY_SOLID) {
+            return SOLID;
+        } else if (vanilla == RenderPipelines.ENTITY_CUTOUT) {
+            return CUTOUT;
+        } else if (vanilla == RenderPipelines.ENTITY_CUTOUT_CULL) {
+            return CUTOUT_CULL;
+        }
+        return null;
+    }
+
     private static final class Group {
         final Model<?> model;
+        /** A {@link ModelGeometryCache#modelSpaceKey}, or the part transforms ({@link #snapshot}) */
         final Object key;
+        final RenderPipeline pipeline;
         final RenderType renderType;
         final @Nullable UvMapping uvMapping;
         final int overlay;
@@ -116,9 +158,10 @@ public final class InstancedModels {
         @Nullable GpuBufferSlice instanceSlice;
         @Nullable PreparedRenderType prepared;
 
-        Group(Model<?> model, Object key, RenderType renderType, @Nullable UvMapping uvMapping, int overlay, int color) {
+        Group(Model<?> model, Object key, RenderPipeline pipeline, RenderType renderType, @Nullable UvMapping uvMapping, int overlay, int color) {
             this.model = model;
             this.key = key;
+            this.pipeline = pipeline;
             this.renderType = renderType;
             this.uvMapping = uvMapping;
             this.overlay = overlay;
@@ -126,8 +169,9 @@ public final class InstancedModels {
         }
 
         boolean matches(Model<?> model, Object key, RenderType renderType, @Nullable UvMapping uvMapping, int overlay, int color) {
-            return this.model == model && this.key == key && this.renderType == renderType && this.uvMapping == uvMapping
-                    && this.overlay == overlay && this.color == color;
+            return this.model == model && this.renderType == renderType && this.uvMapping == uvMapping
+                    && this.overlay == overlay && this.color == color
+                    && (this.key == key || this.key instanceof float[] a && key instanceof float[] b && Arrays.equals(a, b));
         }
 
         void close() {
@@ -185,28 +229,86 @@ public final class InstancedModels {
         POSE_STACK.popPose();
 
         Object key;
+        RenderPipeline pipeline;
         if (!capture.isSingleModel() || capture.outlineColor != 0 || capture.renderType == null
-                || capture.renderType.pipeline() != RenderPipelines.ENTITY_SOLID
-                || (key = ModelGeometryCache.modelSpaceKey(capture.state)) == null || !isRotation(capture.pose.pose())) {
+                || (pipeline = instancedPipeline(capture.renderType.pipeline())) == null
+                || (key = ModelGeometryCache.modelSpaceKey(capture.state)) == null || !isOrthogonal(capture.pose.pose())) {
             return false;
         }
 
-        Group group = findGroup(capture, key);
+        Group group = findGroup(capture.model, capture.state, key, pipeline, capture.renderType, capture.uvMapping,
+                capture.overlayCoords, capture.tintedColor);
         if (group == null) {
             return false;
         }
+        addInstance(group, capture.pose.pose(), capture.lightCoords);
+        return true;
+    }
 
+    /**
+     * Turns a prepared model submit into an instance when its model is one of {@link #POSED_MODELS} and its parts
+     * end up posed like those of an existing group (or a new one).
+     *
+     * @return false if the model has to be written as usual
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    public static boolean tryAdd(ModelFeatureRenderer.Submit<?> submit) {
+        Model model = submit.model();
+        RenderPipeline pipeline;
+        if (!ENABLED || !POSED_MODELS.contains(model.getClass()) || submit.sheetedDecalPose() != null
+                || (pipeline = instancedPipeline(submit.renderType().pipeline())) == null
+                || !isOrthogonal(submit.pose().pose()) || !isPipelineAvailable()) {
+            return false;
+        }
+
+        model.setupAnim(submit.state());
+        float[] snapshot = snapshot(model);
+        Group group = findGroup(model, submit.state(), snapshot, pipeline, submit.renderType(), submit.uvMapping(),
+                submit.overlayCoords(), submit.tintedColor());
+        if (group == null) {
+            return false;
+        }
+        addInstance(group, submit.pose().pose(), submit.lightCoords());
+        return true;
+    }
+
+    /** The transforms and visibility of every part, which (with the model) decide its model space geometry */
+    private static float[] snapshot(Model<?> model) {
+        List<ModelPart> parts = model.allParts();
+        int size = parts.size() * 11;
+        if (snapshotScratch.length != size) {
+            snapshotScratch = new float[size];
+        }
+        float[] s = snapshotScratch;
+        int o = 0;
+        for (int i = 0; i < parts.size(); i++) {
+            ModelPart part = parts.get(i);
+            s[o] = part.x;
+            s[o + 1] = part.y;
+            s[o + 2] = part.z;
+            s[o + 3] = part.xRot;
+            s[o + 4] = part.yRot;
+            s[o + 5] = part.zRot;
+            s[o + 6] = part.xScale;
+            s[o + 7] = part.yScale;
+            s[o + 8] = part.zScale;
+            s[o + 9] = part.visible ? 1.0f : 0.0f;
+            s[o + 10] = part.skipDraw ? 1.0f : 0.0f;
+            o += 11;
+        }
+        return s;
+    }
+
+    private static void addInstance(Group group, Matrix4f m, int lightCoords) {
         if (group.instances.capacity() < (group.count + 1) * INSTANCE_SIZE) {
             group.instances = MemoryUtil.memRealloc(group.instances, group.instances.capacity() * 2);
         }
-        Matrix4f m = capture.pose.pose();
         long ptr = MemoryUtil.memAddress0(group.instances) + (long) group.count * INSTANCE_SIZE;
         putRow(ptr, m.m00(), m.m10(), m.m20(), m.m30());
         putRow(ptr + 16, m.m01(), m.m11(), m.m21(), m.m31());
         putRow(ptr + 32, m.m02(), m.m12(), m.m22(), m.m32());
-        MemoryUtil.memPutInt(ptr + 48, capture.lightCoords);
+        MemoryUtil.memPutInt(ptr + 48, lightCoords);
         group.count++;
-        return true;
     }
 
     private static void putRow(long ptr, float x, float y, float z, float w) {
@@ -216,8 +318,11 @@ public final class InstancedModels {
         MemoryUtil.memPutFloat(ptr + 12, w);
     }
 
-    /** The shader rotates normals with the pose itself, which is only right for rotations */
-    private static boolean isRotation(Matrix4f m) {
+    /**
+     * The shader transforms normals with the pose itself, which is only right for rotations and reflections
+     * (vanilla's normal matrix is then the same; {@code PoseStack.scale(-1, -1, 1)} flips its signs too)
+     */
+    private static boolean isOrthogonal(Matrix4f m) {
         float c0 = m.m00() * m.m00() + m.m01() * m.m01() + m.m02() * m.m02();
         float c1 = m.m10() * m.m10() + m.m11() * m.m11() + m.m12() * m.m12();
         float c2 = m.m20() * m.m20() + m.m21() * m.m21() + m.m22() * m.m22();
@@ -230,21 +335,42 @@ public final class InstancedModels {
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
-    private static @Nullable Group findGroup(ModelSubmitCapture capture, Object key) {
+    private static @Nullable Group findGroup(Model model, Object state, Object key, RenderPipeline pipeline, RenderType renderType,
+                                             @Nullable UvMapping uvMapping, int overlay, int color) {
+        int modelGroups = 0;
         for (Group group : GROUPS) {
-            if (group.matches(capture.model, key, capture.renderType, capture.uvMapping, capture.overlayCoords, capture.tintedColor)) {
+            if (group.matches(model, key, renderType, uvMapping, overlay, color)) {
                 return group.failed ? null : group;
             }
+            if (group.model == model) {
+                modelGroups++;
+            }
+        }
+        if (modelGroups >= MAX_GROUPS_PER_MODEL) {
+            return null;
         }
 
-        Group group = new Group(capture.model, key, capture.renderType, capture.uvMapping, capture.overlayCoords, capture.tintedColor);
+        Object groupKey = key instanceof float[] snapshot ? snapshot.clone() : key;
+        Group group = new Group(model, groupKey, pipeline, renderType, uvMapping, overlay, color);
         GROUPS.add(group);
 
         try (ByteBufferBuilder bytes = new ByteBufferBuilder(1 << 12)) {
             BufferBuilder builder = new BufferBuilder(bytes, PrimitiveTopology.QUADS, DefaultVertexFormat.ENTITY);
-            // Light comes from the instance
-            boolean written = ModelGeometryCache.writeModelSpace((Model) capture.model, capture.state, key, IDENTITY_POSE, builder, 0,
-                    capture.overlayCoords, capture.tintedColor, capture.uvMapping, false, true);
+            // Light comes from the instance; all faces, the pipeline culls
+            boolean written;
+            if (key instanceof float[]) {
+                ModelCulling.endModel();
+                try {
+                    // The parts are posed already (the snapshot was taken after setupAnim)
+                    model.root().render(new PoseStack(), uvMapping != null ? uvMapping.wrap(builder) : builder, 0, overlay, color);
+                    written = true;
+                } finally {
+                    ModelCulling.beginModel(renderType);
+                }
+            } else {
+                written = ModelGeometryCache.writeModelSpace(model, state, key, IDENTITY_POSE, builder, 0, overlay, color, uvMapping,
+                        false, true);
+            }
             try (MeshData data = written ? builder.build() : null) {
                 if (data == null) {
                     group.failed = true;
@@ -260,7 +386,10 @@ public final class InstancedModels {
     private static boolean isPipelineAvailable() {
         Boolean available = pipelineAvailable;
         if (available == null) {
-            available = RenderSystem.getCompiledPipelineNullable(PIPELINE) != null;
+            available = true;
+            for (RenderPipeline pipeline : PIPELINES) {
+                available &= RenderSystem.getCompiledPipelineNullable(pipeline) != null;
+            }
             pipelineAvailable = available;
         }
         return available;
@@ -311,22 +440,22 @@ public final class InstancedModels {
         if (!drawPending) {
             return;
         }
-        CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(PIPELINE);
-        if (pipeline == null) {
-            return;
-        }
 
         renderPass.pushDebugGroup(() -> "VulkanMod instanced models");
-        renderPass.setPipeline(pipeline);
-        RenderSystem.bindDefaultUniforms(renderPass);
-        renderPass.setUniform("DynamicTransforms", transform);
         RenderSystem.AutoStorageIndexBuffer indices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
-        renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
 
         for (Group group : GROUPS) {
             if (group.instanceSlice == null) {
                 continue;
             }
+            CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(group.pipeline);
+            if (pipeline == null) {
+                continue;
+            }
+            renderPass.setPipeline(pipeline);
+            RenderSystem.bindDefaultUniforms(renderPass);
+            renderPass.setUniform("DynamicTransforms", transform);
+            renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
             for (PreparedRenderType.Texture texture : group.prepared.textures()) {
                 renderPass.setUniform(texture.name(), texture.textureView(), texture.sampler());
             }

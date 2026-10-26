@@ -13,7 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Compiles {@link RetainedChests#PIPELINE} and {@link InstancedModels#PIPELINE} with the other pipelines on resource
+ * Compiles {@link RetainedChests#PIPELINE} and {@link InstancedModels#PIPELINES} with the other pipelines on resource
  * reload; if one fails, that feature stays off
  */
 @Mixin(RenderPipelines.class)
@@ -22,7 +22,7 @@ public class RenderPipelinesM {
     private static void addRetainedPipeline(CallbackInfoReturnable<List<RenderPipeline>> cir) {
         List<RenderPipeline> pipelines = new ArrayList<>(cir.getReturnValue());
         pipelines.add(RetainedChests.PIPELINE);
-        pipelines.add(InstancedModels.PIPELINE);
+        pipelines.addAll(InstancedModels.PIPELINES);
         cir.setReturnValue(pipelines);
     }
 }

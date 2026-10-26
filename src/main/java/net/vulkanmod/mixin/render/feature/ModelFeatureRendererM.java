@@ -6,6 +6,7 @@ import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.model.Model;
 import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
 import net.minecraft.client.renderer.feature.RenderTypeFeatureRenderer;
+import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.entity.ModelCulling;
 import net.vulkanmod.render.entity.ModelGeometryCache;
 import org.spongepowered.asm.mixin.Final;
@@ -19,14 +20,18 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
 
     /**
      * @author VulkanMod
-     * @reason Back face culling ({@link ModelCulling}) and cached rest pose and model space geometry
-     * ({@link ModelGeometryCache});
+     * @reason Instancing ({@link InstancedModels}), back face culling ({@link ModelCulling}) and cached rest pose and
+     * model space geometry ({@link ModelGeometryCache});
      * otherwise the vanilla body
      */
     @Overwrite
     private <S> void prepareModel(ModelFeatureRenderer.Submit<S> submit) {
         ModelCulling.beginModel(submit.renderType());
         try {
+            if (InstancedModels.tryAdd(submit)) {
+                return;
+            }
+
             this.poseStack.last().set(submit.pose());
             VertexConsumer buffer = this.getVertexBuilder(submit.renderType());
             Model<? super S> model = submit.model();
