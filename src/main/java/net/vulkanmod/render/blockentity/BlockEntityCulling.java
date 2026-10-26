@@ -18,12 +18,14 @@ import net.vulkanmod.mixin.render.blockentity.FrustumAccessor;
  * <p>
  * A section is tested with the same margins around its 16³ blocks, so its box contains the box of every block
  * entity in it: when the section box is fully inside (or outside) the frustum, so is every block entity box.
+ * Sections crossing the frustum are split the same way into 4³-block cells.
  */
 public final class BlockEntityCulling {
     public static final int SECTION_UNKNOWN = 0;
     public static final int SECTION_INSIDE = 1;
     public static final int SECTION_OUTSIDE = 2;
     public static final int SECTION_PARTIAL = 3;
+    public static final int CELL_SIZE = 4;
 
     private static final double MARGIN = 1.0;
     private static final double EXTRA_TOP = 2.0;
@@ -34,7 +36,22 @@ public final class BlockEntityCulling {
     }
 
     public static int classifySection(Frustum frustum, BlockPos origin) {
-        int result = cubeInFrustum(frustum, origin.getX(), origin.getY(), origin.getZ(), 16);
+        return classify(frustum, origin.getX(), origin.getY(), origin.getZ(), 16);
+    }
+
+    /** Classifies the {@link #CELL_SIZE}³ cell of a section that contains {@code pos} */
+    public static int classifyCell(Frustum frustum, BlockPos pos) {
+        int mask = -CELL_SIZE;
+        return classify(frustum, pos.getX() & mask, pos.getY() & mask, pos.getZ() & mask, CELL_SIZE);
+    }
+
+    /** Index of the cell of {@code pos} within its section, 0..63 */
+    public static int cellIndex(BlockPos pos) {
+        return (pos.getX() >> 2 & 3) | (pos.getY() >> 2 & 3) << 2 | (pos.getZ() >> 2 & 3) << 4;
+    }
+
+    private static int classify(Frustum frustum, int x, int y, int z, int size) {
+        int result = cubeInFrustum(frustum, x, y, z, size);
         return switch (result) {
             case -2 -> SECTION_INSIDE;
             case -1 -> SECTION_PARTIAL;

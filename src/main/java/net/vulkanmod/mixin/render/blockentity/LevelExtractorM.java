@@ -25,14 +25,18 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * section is extracted and rendered. This additionally frustum culls each block entity, see {@link BlockEntityCulling}.
  * <p>
  * The test happens where vanilla reads the block entity's position, so culled block entities also skip the
- * destruction progress lookup. Each section is classified once, and only block entities of sections that cross the
- * frustum are tested individually.
+ * destruction progress lookup. Each section is classified once; in sections that cross the frustum each 4³ cell is
+ * classified once, and only block entities of cells that cross it are tested individually.
  */
 @Mixin(LevelExtractor.class)
 public class LevelExtractorM {
     @Unique private Frustum cullFrustum;
     @Unique private SectionRenderDispatcher.RenderSection cullSection;
     @Unique private int sectionCull;
+    /** Cell classifications of the current partial section, valid where {@link #cellStamps} equals {@link #sectionStamp} */
+    @Unique private final byte[] cellCull = new byte[64];
+    @Unique private final int[] cellStamps = new int[64];
+    @Unique private int sectionStamp;
     @Unique private boolean culled;
 
     @Inject(method = "extractVisibleBlockEntities", at = @At("HEAD"))
@@ -52,6 +56,7 @@ public class LevelExtractorM {
         // Classified lazily on the first cullable block entity, most sections have none
         this.cullSection = section;
         this.sectionCull = BlockEntityCulling.SECTION_UNKNOWN;
+        this.sectionStamp++;
         return section.getSectionMesh();
     }
 
@@ -68,11 +73,30 @@ public class LevelExtractorM {
             this.culled = switch (this.sectionCull) {
                 case BlockEntityCulling.SECTION_INSIDE -> false;
                 case BlockEntityCulling.SECTION_OUTSIDE -> true;
-                default -> BlockEntityCulling.isOutsideFrustum(this.cullFrustum, blockEntity.getBlockPos());
+                default -> this.testInPartialSection(blockEntity.getBlockPos());
             };
         }
 
         return blockEntity.getBlockPos();
+    }
+
+    @Unique
+    private boolean testInPartialSection(BlockPos pos) {
+        int cell = BlockEntityCulling.cellIndex(pos);
+        int cellCull;
+        if (this.cellStamps[cell] == this.sectionStamp) {
+            cellCull = this.cellCull[cell];
+        } else {
+            cellCull = BlockEntityCulling.classifyCell(this.cullFrustum, pos);
+            this.cellCull[cell] = (byte) cellCull;
+            this.cellStamps[cell] = this.sectionStamp;
+        }
+
+        return switch (cellCull) {
+            case BlockEntityCulling.SECTION_INSIDE -> false;
+            case BlockEntityCulling.SECTION_OUTSIDE -> true;
+            default -> BlockEntityCulling.isOutsideFrustum(this.cullFrustum, pos);
+        };
     }
 
     @Redirect(method = "extractVisibleBlockEntities", at = @At(value = "INVOKE", ordinal = 0,
