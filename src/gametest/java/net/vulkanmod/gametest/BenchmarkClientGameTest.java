@@ -84,6 +84,8 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
      * one (client-side only), taking a screenshot of each state, for checking the retained chest geometry.
      */
     private static final boolean CHEST_EVENTS = Boolean.parseBoolean(prop("chestEvents", "false"));
+    /** Takes an extra screenshot at yaw 270 with a 30 degree field of view, for a closer look at block entities */
+    private static final boolean ZOOM_SHOT = Boolean.parseBoolean(prop("zoomShot", "false"));
 
     private static final int TICKS_PER_SECOND = 20;
     private static final String RUN_ID = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
@@ -121,6 +123,13 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
             if (!yaw.isBlank()) {
                 takeScreenshotAtYaw(context, Float.parseFloat(yaw.trim()));
             }
+        }
+        if (ZOOM_SHOT) {
+            int fov = context.computeOnClient(mc -> mc.options.fov().get());
+            context.runOnClient(mc -> mc.options.fov().set(30));
+            takeScreenshotAtYaw(context, 270.0f);
+            context.takeScreenshot(LABEL + "-zoom270-" + RUN_ID);
+            context.runOnClient(mc -> mc.options.fov().set(fov));
         }
         setYaw(context, STATIC_YAW);
 

@@ -22,6 +22,7 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.Vec3;
 import net.vulkanmod.interfaces.BlockEntityPositions;
 import net.vulkanmod.render.blockentity.BlockEntityCulling;
+import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.blockentity.RetainedChests;
 import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
@@ -45,7 +46,8 @@ import java.util.SortedSet;
  * block entities of cells that cross it are tested individually. Positions and cullability come from the compiled
  * section ({@link BlockEntityPositions}) by list index, so culled block entities are not even loaded from the list:
  * with ~14k block entities per frame the pointer chasing was the main cost. Chests kept by {@link RetainedChests}
- * are skipped. Otherwise this is vanilla's loop.
+ * are skipped, and block entities drawn as {@link InstancedModels} are not submitted. Otherwise this is vanilla's
+ * loop.
  */
 @Mixin(LevelExtractor.class)
 public class LevelExtractorM {
@@ -76,6 +78,7 @@ public class LevelExtractorM {
         List<BlockEntityRenderState> output = levelRenderState.blockEntityRenderStates;
         ObjectArrayList<SectionRenderDispatcher.RenderSection> sections = this.levelRenderer.visibleSections();
         RetainedChests.beginFrame(cameraPos);
+        InstancedModels.beginFrame();
 
         for (int s = 0, sectionCount = sections.size(); s < sectionCount; s++) {
             SectionRenderDispatcher.RenderSection section = sections.get(s);
@@ -144,7 +147,7 @@ public class LevelExtractorM {
                 }
 
                 BlockEntityRenderState state = dispatcher.tryExtractRenderState(blockEntity, deltaPartialTick, breakProgress, false);
-                if (state != null) {
+                if (state != null && !InstancedModels.tryAdd(dispatcher, state, camX, camY, camZ, levelRenderState.cameraRenderState)) {
                     output.add(state);
                 }
             }
@@ -172,6 +175,7 @@ public class LevelExtractorM {
     @Inject(method = {"setLevel", "allChanged"}, at = @At("HEAD"))
     private void clearRetained(CallbackInfo ci) {
         RetainedChests.clear();
+        InstancedModels.clear();
     }
 
     @Unique

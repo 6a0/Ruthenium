@@ -4,6 +4,7 @@ import net.minecraft.client.renderer.LevelRenderer;
 import com.mojang.renderpearl.api.commands.RenderPass;
 import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
+import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.blockentity.RetainedChests;
 import net.vulkanmod.render.entity.ModelCulling;
 import org.spongepowered.asm.mixin.Mixin;
@@ -13,7 +14,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
  * Marks the world's feature preparation and block entity submission for {@link ModelCulling}, and draws
- * {@link RetainedChests} after the world's solid features.
+ * {@link RetainedChests} and {@link InstancedModels} after the world's solid features.
  */
 @Mixin(LevelRenderer.class)
 public class LevelRendererM {
@@ -28,6 +29,7 @@ public class LevelRendererM {
     private void endWorldFeatures(CallbackInfo ci) {
         ModelCulling.setWorldPass(false);
         RetainedChests.prepareDraws();
+        InstancedModels.prepareDraws();
     }
 
     @Inject(method = "executeSolid", at = @At(value = "INVOKE", shift = At.Shift.AFTER,
@@ -35,6 +37,7 @@ public class LevelRendererM {
     private void drawRetainedChests(ChunkSectionsToRender chunkSectionsToRender, FeatureRenderDispatcher.PreparedFrame featureFrame,
                                     RenderPass renderPass, CallbackInfo ci) {
         RetainedChests.draw(renderPass);
+        InstancedModels.draw(renderPass);
     }
 
     @Inject(method = "submitBlockEntities", at = @At("HEAD"))
