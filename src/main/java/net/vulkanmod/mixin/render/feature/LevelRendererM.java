@@ -8,7 +8,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Marks the world's feature preparation for {@link ModelCulling}.
+ * Marks the world's feature preparation and block entity submission for {@link ModelCulling}.
  */
 @Mixin(LevelRenderer.class)
 public class LevelRendererM {
@@ -22,5 +22,15 @@ public class LevelRendererM {
     @Inject(method = "render", at = @At(value = "INVOKE", target = PREPARE_FRAME, shift = At.Shift.AFTER))
     private void endWorldFeatures(CallbackInfo ci) {
         ModelCulling.setWorldPass(false);
+    }
+
+    @Inject(method = "submitBlockEntities", at = @At("HEAD"))
+    private void beginBlockEntities(CallbackInfo ci) {
+        ModelCulling.setBlockEntitySubmit(true);
+    }
+
+    @Inject(method = "submitBlockEntities", at = @At("RETURN"))
+    private void endBlockEntities(CallbackInfo ci) {
+        ModelCulling.setBlockEntitySubmit(false);
     }
 }
