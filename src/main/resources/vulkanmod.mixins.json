@@ -22,7 +22,14 @@
     "render.vertex.BufferBuilderM",
     "render.vertex.MeshDataSortStateM",
     "render.vertex.StagedVertexBufferM",
-    "render.vertex.VertexSortingM"
+    "render.vertex.VertexSortingM",
+    "world.BoundTickingBlockEntityM",
+    "world.ChestBlockEntityM",
+    "world.ChestLidControllerM",
+    "world.EnderChestBlockEntityM",
+    "world.LevelM",
+    "world.RebindableTickingBlockEntityWrapperM",
+    "world.SignBlockEntityM"
   ],
   "injectors": {
     "defaultRequire": 1
