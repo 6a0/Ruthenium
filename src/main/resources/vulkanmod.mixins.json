@@ -16,6 +16,7 @@
     "render.text.AbstractSignRendererM",
     "render.text.BakedSheetGlyphM",
     "render.text.FontSetM",
+    "render.text.SignTextM",
     "render.text.TextFeatureRendererM",
     "render.vertex.BufferBuilderM",
     "render.vertex.MeshDataSortStateM",
