@@ -6,6 +6,8 @@
   "mixins": [],
   "client": [
     "render.entity.model.ModelPartCubeM",
+    "render.particle.ClientPacketListenerM",
+    "render.particle.ParticleEngineM",
     "render.particle.QuadParticleRenderStateM",
     "render.text.BakedSheetGlyphM",
     "render.vertex.BufferBuilderM",
