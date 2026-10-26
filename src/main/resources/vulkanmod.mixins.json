@@ -21,6 +21,7 @@
     "render.text.TextFeatureRendererM",
     "render.vertex.BufferBuilderM",
     "render.vertex.MeshDataSortStateM",
+    "render.vertex.StagedVertexBufferM",
     "render.vertex.VertexSortingM"
   ],
   "injectors": {
