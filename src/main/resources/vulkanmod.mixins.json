@@ -13,6 +13,7 @@
     "render.particle.QuadParticleRenderStateM",
     "render.text.BakedSheetGlyphM",
     "render.vertex.BufferBuilderM",
+    "render.vertex.MeshDataSortStateM",
     "render.vertex.VertexSortingM"
   ],
   "injectors": {
