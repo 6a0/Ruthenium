@@ -41,7 +41,7 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
             if (submit.sheetedDecalPose() == null && (modelSpaceKey = ModelGeometryCache.modelSpaceKey(submit.state())) != null
                     && ModelGeometryCache.writeModelSpace(model, submit.state(), modelSpaceKey, this.poseStack.last(), buffer,
                             submit.lightCoords(), submit.overlayCoords(), submit.tintedColor(), submit.uvMapping(),
-                            ModelCulling.cullBackFaces())) {
+                            ModelCulling.cullBackFaces(), ModelCulling.skipDuplicateQuads())) {
                 return;
             }
 

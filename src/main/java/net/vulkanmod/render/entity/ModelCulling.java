@@ -1,5 +1,6 @@
 package net.vulkanmod.render.entity;
 
+import com.mojang.renderpearl.api.pipeline.ColorTargetState;
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.client.renderer.oit.OitPipelineSet;
@@ -25,6 +26,9 @@ public final class ModelCulling {
 
     private static boolean worldPass;
     private static boolean cullBackFaces;
+    private static boolean skipDuplicateQuads;
+    private static RenderType lastRenderType;
+    private static boolean lastIdempotent;
     private static boolean blockEntitySubmit;
     private static Boolean polygonOffsetTextCulls;
 
@@ -38,10 +42,38 @@ public final class ModelCulling {
 
     public static void beginModel(RenderType renderType) {
         cullBackFaces = worldPass && renderType.pipeline().isCull();
+        if (renderType != lastRenderType) {
+            lastRenderType = renderType;
+            lastIdempotent = isIdempotent(renderType);
+        }
+        skipDuplicateQuads = lastIdempotent;
+    }
+
+    /**
+     * Whether drawing a quad a second time, right after itself, leaves the image unchanged: no blending and no
+     * sorting. The repeated fragments have the same depth and color, so they either fail the depth test or write
+     * what is already there.
+     */
+    private static boolean isIdempotent(RenderType renderType) {
+        if (renderType.sortOnUpload()) {
+            return false;
+        }
+        for (ColorTargetState target : renderType.pipeline().getColorTargetStates()) {
+            if (target != null && target.blendFunction().isPresent()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Whether exact repeats of a quad of the current model may be left out */
+    public static boolean skipDuplicateQuads() {
+        return skipDuplicateQuads;
     }
 
     public static void endModel() {
         cullBackFaces = false;
+        skipDuplicateQuads = false;
     }
 
     public static boolean cullBackFaces() {

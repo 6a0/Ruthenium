@@ -51,7 +51,10 @@ public final class ModelGeometryCache {
     private static final PoseStack CAPTURE_POSE = new PoseStack();
     private static final Capture CAPTURE = new Capture();
     private static boolean[] visible = new boolean[64];
-    private static float[] transformedCorners = new float[64 * 3];
+    private static int[] cornerStamps = new int[64];
+    private static int cornerStamp;
+    private static long[] transformedXY = new long[64];
+    private static long[] transformedZ = new long[64];
     private static final Vector3f SCRATCH = new Vector3f();
 
     private ModelGeometryCache() {
@@ -106,7 +109,7 @@ public final class ModelGeometryCache {
      */
     public static <S> boolean writeModelSpace(Model<? super S> model, S state, Object key, PoseStack.Pose pose,
                                               VertexConsumer buffer, int lightCoords, int overlayCoords, int color,
-                                              UvMapping uvMapping, boolean cullBackFaces) {
+                                              UvMapping uvMapping, boolean cullBackFaces, boolean skipDuplicates) {
         ExtendedVertexBuilder vertexBuilder = ExtendedVertexBuilder.of(buffer, DefaultVertexFormat.ENTITY);
         if (vertexBuilder == null || UNCACHEABLE.contains(model)) {
             return false;
@@ -120,7 +123,7 @@ public final class ModelGeometryCache {
             }
         }
 
-        entry.write(vertexBuilder, pose, lightCoords, cullBackFaces);
+        entry.write(vertexBuilder, pose, lightCoords, cullBackFaces, skipDuplicates);
         return true;
     }
 
@@ -255,9 +258,12 @@ public final class ModelGeometryCache {
         private final UvMapping uvMapping;
 
         private final int quadCount;
-        /** x y z u v per vertex */
-        private final float[] vertices;
-        private final int[] colors;
+        /** x y z per vertex */
+        private final float[] positions;
+        /** u (low half) and v (high half) bits per vertex, as written */
+        private final long[] uvs;
+        /** ABGR color per vertex, in the high half */
+        private final long[] colors;
         private final int[] normals;
         /** Per quad: geometric normal xyz (unnormalized), its dot with the first vertex, and its squared length */
         private final float[] planes;
@@ -270,14 +276,21 @@ public final class ModelGeometryCache {
 
             int vertexCount = capture.vertexCount;
             this.quadCount = vertexCount / 4;
-            this.vertices = Arrays.copyOf(capture.vertices, vertexCount * 5);
-            this.colors = Arrays.copyOf(capture.colors, vertexCount);
+            this.positions = new float[vertexCount * 3];
+            this.uvs = new long[vertexCount];
+            this.colors = new long[vertexCount];
             this.normals = Arrays.copyOf(capture.normals, vertexCount);
             this.planes = new float[this.quadCount * 5];
+            for (int i = 0; i < vertexCount; i++) {
+                System.arraycopy(capture.vertices, i * 5, this.positions, i * 3, 3);
+                this.uvs[i] = pack(Float.floatToRawIntBits(capture.vertices[i * 5 + 3]),
+                        Float.floatToRawIntBits(capture.vertices[i * 5 + 4]));
+                this.colors[i] = pack(0, capture.colors[i]);
+            }
 
-            float[] v = this.vertices;
+            float[] v = this.positions;
             for (int q = 0; q < this.quadCount; q++) {
-                int i0 = q * 20, i1 = i0 + 5, i2 = i0 + 10;
+                int i0 = q * 12, i1 = i0 + 3, i2 = i0 + 6;
                 float ax = v[i1] - v[i0], ay = v[i1 + 1] - v[i0 + 1], az = v[i1 + 2] - v[i0 + 2];
                 float bx = v[i2] - v[i0], by = v[i2 + 1] - v[i0 + 1], bz = v[i2 + 2] - v[i0 + 2];
                 float nx = ay * bz - az * by;
@@ -339,25 +352,22 @@ public final class ModelGeometryCache {
             }
 
             long ptr = vertexBuilder.reserveVertices(visibleQuads * 4);
-            float[] v = this.vertices;
-            int[] colors = this.colors;
+            float[] v = this.positions;
+            long[] uvs = this.uvs;
+            long[] colors = this.colors;
             int[] normals = this.normals;
-            int overlay = this.overlay;
+            long overlayLight = pack(this.overlay, light);
             for (int q = 0; q < quads; q++) {
                 if (!visible[q]) {
                     continue;
                 }
 
                 for (int i = q * 4, end = i + 4; i < end; i++) {
-                    int o = i * 5;
-                    MemoryUtil.memPutFloat(ptr, v[o] + tx);
-                    MemoryUtil.memPutFloat(ptr + 4, v[o + 1] + ty);
-                    MemoryUtil.memPutFloat(ptr + 8, v[o + 2] + tz);
-                    MemoryUtil.memPutInt(ptr + 12, colors[i]);
-                    MemoryUtil.memPutFloat(ptr + 16, v[o + 3]);
-                    MemoryUtil.memPutFloat(ptr + 20, v[o + 4]);
-                    MemoryUtil.memPutInt(ptr + 24, overlay);
-                    MemoryUtil.memPutInt(ptr + 28, light);
+                    int o = i * 3;
+                    MemoryUtil.memPutLong(ptr, pack(Float.floatToRawIntBits(v[o] + tx), Float.floatToRawIntBits(v[o + 1] + ty)));
+                    MemoryUtil.memPutLong(ptr + 8, pack(Float.floatToRawIntBits(v[o + 2] + tz), 0) | colors[i]);
+                    MemoryUtil.memPutLong(ptr + 16, uvs[i]);
+                    MemoryUtil.memPutLong(ptr + 24, overlayLight);
                     MemoryUtil.memPutInt(ptr + 32, normals[i]);
                     ptr += VERTEX_SIZE;
                 }
@@ -377,10 +387,18 @@ public final class ModelGeometryCache {
     }
 
     /**
-     * A model captured with the identity pose. Its distinct corners are transformed per write (as in
-     * {@code ModelPartCubeM}) and each quad's normal is transformed with the submit's normal matrix.
+     * A model captured with the identity pose, written with the submit's pose.
+     * <p>
+     * Back faces are found in model space: when the pose's linear part is a similarity (rotation and uniform
+     * scale, possibly mirrored) the eye is moved into model space once and each quad is tested against its
+     * precomputed plane; otherwise the corners are transformed first and tested as in {@code ModelPartCubeM}. Only
+     * the corners of written quads are transformed. Quads that repeat an earlier quad exactly (the two flip pages of
+     * a closed book) are skipped when the render type allows it ({@link ModelCulling#skipDuplicateQuads}).
      */
     private static final class ModelSpaceEntry {
+        /** Tolerance, relative to the squared scale, of the similarity test */
+        private static final float SIMILARITY_TOLERANCE = 1.0e-4f;
+
         private final Object key;
         private final int overlay;
         private final int color;
@@ -391,14 +409,19 @@ public final class ModelGeometryCache {
         private final float[] corners;
         /** Index into {@link #corners} per vertex */
         private final short[] cornerIndices;
-        /** u v per vertex */
-        private final float[] uvs;
-        private final int[] colors;
+        /** u (low half) and v (high half) bits per vertex, as written */
+        private final long[] uvs;
+        /** ABGR color per vertex, in the high half */
+        private final long[] colors;
         /** Model space normal per quad */
         private final float[] normals;
+        /** Per quad: winding normal xyz (unnormalized), its dot with the first corner, and its squared length */
+        private final float[] planes;
+        private final boolean[] duplicates;
 
         private ModelSpaceEntry(Object key, int overlay, int color, UvMapping uvMapping, int quadCount,
-                                float[] corners, short[] cornerIndices, float[] uvs, int[] colors, float[] normals) {
+                                float[] corners, short[] cornerIndices, long[] uvs, long[] colors, float[] normals,
+                                float[] planes, boolean[] duplicates) {
             this.key = key;
             this.overlay = overlay;
             this.color = color;
@@ -409,6 +432,8 @@ public final class ModelGeometryCache {
             this.uvs = uvs;
             this.colors = colors;
             this.normals = normals;
+            this.planes = planes;
+            this.duplicates = duplicates;
         }
 
         /** Returns null if the quads don't have one normal each */
@@ -433,7 +458,8 @@ public final class ModelGeometryCache {
 
             float[] corners = new float[vertexCount * 3];
             short[] cornerIndices = new short[vertexCount];
-            float[] uvs = new float[vertexCount * 2];
+            long[] uvs = new long[vertexCount];
+            long[] colors = new long[vertexCount];
             int cornerCount = 0;
             for (int i = 0; i < vertexCount; i++) {
                 float x = v[i * 5], y = v[i * 5 + 1], z = v[i * 5 + 2];
@@ -451,43 +477,120 @@ public final class ModelGeometryCache {
                     corners[found * 3 + 2] = z;
                 }
                 cornerIndices[i] = (short) found;
-                uvs[i * 2] = v[i * 5 + 3];
-                uvs[i * 2 + 1] = v[i * 5 + 4];
+                uvs[i] = pack(Float.floatToRawIntBits(v[i * 5 + 3]), Float.floatToRawIntBits(v[i * 5 + 4]));
+                colors[i] = pack(0, capture.colors[i]);
+            }
+
+            float[] planes = new float[quadCount * 5];
+            boolean[] duplicates = new boolean[quadCount];
+            for (int q = 0; q < quadCount; q++) {
+                int i0 = cornerIndices[q * 4] * 3, i1 = cornerIndices[q * 4 + 1] * 3, i2 = cornerIndices[q * 4 + 2] * 3;
+                float ax = corners[i1] - corners[i0], ay = corners[i1 + 1] - corners[i0 + 1], az = corners[i1 + 2] - corners[i0 + 2];
+                float bx = corners[i2] - corners[i0], by = corners[i2 + 1] - corners[i0 + 1], bz = corners[i2 + 2] - corners[i0 + 2];
+                float nx = ay * bz - az * by;
+                float ny = az * bx - ax * bz;
+                float nz = ax * by - ay * bx;
+                planes[q * 5] = nx;
+                planes[q * 5 + 1] = ny;
+                planes[q * 5 + 2] = nz;
+                planes[q * 5 + 3] = nx * corners[i0] + ny * corners[i0 + 1] + nz * corners[i0 + 2];
+                planes[q * 5 + 4] = nx * nx + ny * ny + nz * nz;
+
+                for (int p = 0; p < q && !duplicates[q]; p++) {
+                    duplicates[q] = !duplicates[p] && sameQuad(p, q, cornerIndices, uvs, colors, normals);
+                }
             }
 
             return new ModelSpaceEntry(key, overlay, color, uvMapping, quadCount, Arrays.copyOf(corners, cornerCount * 3),
-                    cornerIndices, uvs, Arrays.copyOf(capture.colors, vertexCount), normals);
+                    cornerIndices, uvs, colors, normals, planes, duplicates);
         }
 
-        void write(ExtendedVertexBuilder vertexBuilder, PoseStack.Pose pose, int light, boolean cullBackFaces) {
-            float[] corners = this.corners;
-            if (transformedCorners.length < corners.length) {
-                transformedCorners = new float[corners.length * 2];
+        private static boolean sameQuad(int p, int q, short[] cornerIndices, long[] uvs, long[] colors, float[] normals) {
+            for (int k = 0; k < 4; k++) {
+                int a = p * 4 + k, b = q * 4 + k;
+                if (cornerIndices[a] != cornerIndices[b] || uvs[a] != uvs[b] || colors[a] != colors[b]) {
+                    return false;
+                }
             }
-            float[] transformed = transformedCorners;
-            Vector3f scratch = SCRATCH;
-            Matrix4f matrix = pose.pose();
-            for (int i = 0; i < corners.length; i += 3) {
-                matrix.transformPosition(corners[i], corners[i + 1], corners[i + 2], scratch);
-                transformed[i] = scratch.x();
-                transformed[i + 1] = scratch.y();
-                transformed[i + 2] = scratch.z();
-            }
+            return normals[p * 3] == normals[q * 3] && normals[p * 3 + 1] == normals[q * 3 + 1]
+                    && normals[p * 3 + 2] == normals[q * 3 + 2];
+        }
+
+        void write(ExtendedVertexBuilder vertexBuilder, PoseStack.Pose pose, int light, boolean cullBackFaces,
+                   boolean skipDuplicates) {
+            Matrix4f m = pose.pose();
+            float m00 = m.m00(), m01 = m.m01(), m02 = m.m02();
+            float m10 = m.m10(), m11 = m.m11(), m12 = m.m12();
+            float m20 = m.m20(), m21 = m.m21(), m22 = m.m22();
+            float m30 = m.m30(), m31 = m.m31(), m32 = m.m32();
 
             int quads = this.quadCount;
             if (visible.length < quads) {
                 visible = new boolean[quads * 2];
             }
+            float[] corners = this.corners;
+            int cornerCount = corners.length / 3;
+            if (cornerStamps.length < cornerCount) {
+                cornerStamps = new int[cornerCount * 2];
+                transformedXY = new long[cornerCount * 2];
+                transformedZ = new long[cornerCount * 2];
+            }
 
             boolean[] visible = ModelGeometryCache.visible;
+            boolean[] duplicates = this.duplicates;
             short[] cornerIndices = this.cornerIndices;
+            int[] stamps = cornerStamps;
+            long[] xy = transformedXY;
+            long[] zs = transformedZ;
+            int stamp = nextCornerStamp();
+
+            float s2 = m00 * m00 + m01 * m01 + m02 * m02;
+            float tolerance = SIMILARITY_TOLERANCE * s2;
+            boolean similarity = s2 > 0.0f
+                    && Math.abs(m10 * m10 + m11 * m11 + m12 * m12 - s2) <= tolerance
+                    && Math.abs(m20 * m20 + m21 * m21 + m22 * m22 - s2) <= tolerance
+                    && Math.abs(m00 * m10 + m01 * m11 + m02 * m12) <= tolerance
+                    && Math.abs(m00 * m20 + m01 * m21 + m02 * m22) <= tolerance
+                    && Math.abs(m10 * m20 + m11 * m21 + m12 * m22) <= tolerance;
+
             int visibleQuads = 0;
-            for (int q = 0; q < quads; q++) {
-                boolean keep = !cullBackFaces || !isBackFace(transformed, cornerIndices[q * 4] * 3,
-                        cornerIndices[q * 4 + 1] * 3, cornerIndices[q * 4 + 2] * 3);
-                visible[q] = keep;
-                if (keep) {
-                    visibleQuads++;
+            if (!cullBackFaces) {
+                for (int q = 0; q < quads; q++) {
+                    boolean keep = !(skipDuplicates && duplicates[q]);
+                    visible[q] = keep;
+                    visibleQuads += keep ? 1 : 0;
+                }
+            } else if (similarity) {
+                // The eye (the origin) in model space: L^-1 (-t), with L^-1 = L^T / s2
+                float ex = -(m00 * m30 + m01 * m31 + m02 * m32) / s2;
+                float ey = -(m10 * m30 + m11 * m31 + m12 * m32) / s2;
+                float ez = -(m20 * m30 + m21 * m31 + m22 * m32) / s2;
+                // The world winding normal is cof(L) n = det(L) L^-T n, so the side flips with det(L)
+                float det = m00 * (m11 * m22 - m12 * m21) - m10 * (m01 * m22 - m02 * m21) + m20 * (m01 * m12 - m02 * m11);
+                float sign = det < 0.0f ? -1.0f : 1.0f;
+                // World distance behind the plane = sqrt(s2) * behind / |n|
+                float marginSq = EYE_MARGIN_SQ / s2;
+
+                float[] planes = this.planes;
+                for (int q = 0; q < quads; q++) {
+                    int p = q * 5;
+                    float behind = sign * (planes[p + 3] - (planes[p] * ex + planes[p + 1] * ey + planes[p + 2] * ez));
+                    boolean keep = !(behind > 0.0f && behind * behind >= marginSq * planes[p + 4])
+                            && !(skipDuplicates && duplicates[q]);
+                    visible[q] = keep;
+                    visibleQuads += keep ? 1 : 0;
+                }
+            } else {
+                // Skewed or non-uniformly scaled: test the transformed corners
+                for (int c = 0; c < cornerCount; c++) {
+                    transformCorner(c, corners, m00, m01, m02, m10, m11, m12, m20, m21, m22, m30, m31, m32, xy, zs);
+                    stamps[c] = stamp;
+                }
+                for (int q = 0; q < quads; q++) {
+                    boolean keep = !isBackFace(xy, zs, cornerIndices[q * 4], cornerIndices[q * 4 + 1], cornerIndices[q * 4 + 2])
+                            && !(skipDuplicates && duplicates[q]);
+                    visible[q] = keep;
+                    visibleQuads += keep ? 1 : 0;
                 }
             }
 
@@ -496,10 +599,11 @@ public final class ModelGeometryCache {
             }
 
             long ptr = vertexBuilder.reserveVertices(visibleQuads * 4);
-            float[] uvs = this.uvs;
-            int[] colors = this.colors;
+            long[] uvs = this.uvs;
+            long[] colors = this.colors;
             float[] normals = this.normals;
-            int overlay = this.overlay;
+            long overlayLight = pack(this.overlay, light);
+            Vector3f scratch = SCRATCH;
             for (int q = 0; q < quads; q++) {
                 if (!visible[q]) {
                     continue;
@@ -511,26 +615,38 @@ public final class ModelGeometryCache {
                         | (Capture.normalByte(normal.z()) & 0xFF) << 16;
 
                 for (int i = q * 4, end = i + 4; i < end; i++) {
-                    int corner = cornerIndices[i] * 3;
-                    MemoryUtil.memPutFloat(ptr, transformed[corner]);
-                    MemoryUtil.memPutFloat(ptr + 4, transformed[corner + 1]);
-                    MemoryUtil.memPutFloat(ptr + 8, transformed[corner + 2]);
-                    MemoryUtil.memPutInt(ptr + 12, colors[i]);
-                    MemoryUtil.memPutFloat(ptr + 16, uvs[i * 2]);
-                    MemoryUtil.memPutFloat(ptr + 20, uvs[i * 2 + 1]);
-                    MemoryUtil.memPutInt(ptr + 24, overlay);
-                    MemoryUtil.memPutInt(ptr + 28, light);
+                    int c = cornerIndices[i];
+                    if (stamps[c] != stamp) {
+                        transformCorner(c, corners, m00, m01, m02, m10, m11, m12, m20, m21, m22, m30, m31, m32, xy, zs);
+                        stamps[c] = stamp;
+                    }
+                    MemoryUtil.memPutLong(ptr, xy[c]);
+                    MemoryUtil.memPutLong(ptr + 8, zs[c] | colors[i]);
+                    MemoryUtil.memPutLong(ptr + 16, uvs[i]);
+                    MemoryUtil.memPutLong(ptr + 24, overlayLight);
                     MemoryUtil.memPutInt(ptr + 32, packedNormal);
                     ptr += VERTEX_SIZE;
                 }
             }
         }
 
-        /** Same test as ModelPartCubeM.isBackFace */
-        private static boolean isBackFace(float[] t, int i0, int i1, int i2) {
-            float x0 = t[i0], y0 = t[i0 + 1], z0 = t[i0 + 2];
-            float ax = t[i1] - x0, ay = t[i1 + 1] - y0, az = t[i1 + 2] - z0;
-            float bx = t[i2] - x0, by = t[i2 + 1] - y0, bz = t[i2 + 2] - z0;
+        /** Stores the transformed corner as written: x and y bits in {@code xy}, z bits in the low half of {@code zs} */
+        private static void transformCorner(int c, float[] corners, float m00, float m01, float m02, float m10, float m11,
+                                            float m12, float m20, float m21, float m22, float m30, float m31, float m32,
+                                            long[] xy, long[] zs) {
+            float x = corners[c * 3], y = corners[c * 3 + 1], z = corners[c * 3 + 2];
+            float tx = m00 * x + m10 * y + m20 * z + m30;
+            float ty = m01 * x + m11 * y + m21 * z + m31;
+            float tz = m02 * x + m12 * y + m22 * z + m32;
+            xy[c] = pack(Float.floatToRawIntBits(tx), Float.floatToRawIntBits(ty));
+            zs[c] = pack(Float.floatToRawIntBits(tz), 0);
+        }
+
+        /** Same test as ModelPartCubeM.isBackFace, on transformed corners */
+        private static boolean isBackFace(long[] xy, long[] zs, int c0, int c1, int c2) {
+            float x0 = lowFloat(xy[c0]), y0 = highFloat(xy[c0]), z0 = lowFloat(zs[c0]);
+            float ax = lowFloat(xy[c1]) - x0, ay = highFloat(xy[c1]) - y0, az = lowFloat(zs[c1]) - z0;
+            float bx = lowFloat(xy[c2]) - x0, by = highFloat(xy[c2]) - y0, bz = lowFloat(zs[c2]) - z0;
             float nx = ay * bz - az * by;
             float ny = az * bx - ax * bz;
             float nz = ax * by - ay * bx;
@@ -538,6 +654,27 @@ public final class ModelGeometryCache {
             float behind = nx * x0 + ny * y0 + nz * z0;
             return behind > 0.0f && behind * behind >= EYE_MARGIN_SQ * (nx * nx + ny * ny + nz * nz);
         }
+
+        private static float lowFloat(long bits) {
+            return Float.intBitsToFloat((int) bits);
+        }
+
+        private static float highFloat(long bits) {
+            return Float.intBitsToFloat((int) (bits >>> 32));
+        }
+    }
+
+    /** Two 32-bit values as one little-endian 64-bit store: {@code low} first */
+    private static long pack(int low, int high) {
+        return (low & 0xFFFFFFFFL) | (long) high << 32;
+    }
+
+    private static int nextCornerStamp() {
+        if (++cornerStamp == 0) {
+            Arrays.fill(cornerStamps, 0);
+            cornerStamp = 1;
+        }
+        return cornerStamp;
     }
 
     /**
