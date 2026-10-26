@@ -66,6 +66,8 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
     private static final String PRESET = prop("preset", "fancy");
     private static final int RENDER_DISTANCE = Integer.parseInt(prop("renderDistance", "16"));
     private static final String[] EXTRA_SHOT_YAWS = prop("extraShotYaws", "270").split(",");
+    /** Yaw of the static and particle phases; only for profiling other view directions */
+    private static final float STATIC_YAW = Float.parseFloat(prop("staticYaw", "0"));
 
     private static final int TICKS_PER_SECOND = 20;
     private static final String RUN_ID = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
@@ -104,7 +106,7 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
                 takeScreenshotAtYaw(context, Float.parseFloat(yaw.trim()));
             }
         }
-        setYaw(context, 0.0f);
+        setYaw(context, STATIC_YAW);
 
         context.takeScreenshot(LABEL + "-static-" + RUN_ID);
         context.runOnClient(_ -> FrameRecorder.startPhase());
