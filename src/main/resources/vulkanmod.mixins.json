@@ -8,6 +8,8 @@
     "render.blockentity.FrustumAccessor",
     "render.blockentity.LevelExtractorM",
     "render.entity.model.ModelPartCubeM",
+    "render.feature.LevelRendererM",
+    "render.feature.ModelFeatureRendererM",
     "render.particle.ClientPacketListenerM",
     "render.particle.ParticleEngineM",
     "render.particle.QuadParticleRenderStateM",

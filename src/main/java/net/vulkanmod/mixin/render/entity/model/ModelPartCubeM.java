@@ -8,6 +8,7 @@ import net.minecraft.client.renderer.SpriteCoordinateExpander;
 import net.minecraft.client.renderer.texture.UvMapping;
 import net.minecraft.util.ARGB;
 import net.vulkanmod.interfaces.ExtendedVertexBuilder;
+import net.vulkanmod.render.entity.ModelCulling;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.lwjgl.system.MemoryUtil;
@@ -23,13 +24,15 @@ import java.util.Arrays;
  * Fast path for cubes written into an entity-format {@link com.mojang.blaze3d.vertex.BufferBuilder}:
  * the cube's distinct corners are transformed once (8 instead of 24 positions), each face is written as one
  * 4-vertex reservation, and color, light, overlay and the packed normal are computed once per face.
- * Output is identical to vanilla's {@code Cube.compile}.
+ * Output is identical to vanilla's {@code Cube.compile}, except that faces the GPU would cull as back faces are
+ * not written when {@link ModelCulling} allows it.
  * <p>
  * Like vanilla model parts this is not thread safe; models are only rendered from the render thread.
  */
 @Mixin(ModelPart.Cube.class)
 public class ModelPartCubeM {
     @Unique private static final int VERTEX_SIZE = 36;
+    @Unique private static final float EYE_MARGIN_SQ = ModelCulling.EYE_MARGIN * ModelCulling.EYE_MARGIN;
 
     @Shadow @Final public ModelPart.Polygon[] polygons;
 
@@ -76,8 +79,13 @@ public class ModelPartCubeM {
         }
 
         int abgr = ARGB.toABGR(color);
+        boolean cullBackFaces = ModelCulling.cullBackFaces();
 
         for (int p = 0; p < this.polygons.length; p++) {
+            if (cullBackFaces && isBackFace(transformed, p)) {
+                continue;
+            }
+
             ModelPart.Polygon polygon = this.polygons[p];
             Vector3f normal = pose.transformNormal(polygon.normal(), scratch);
             int packedNormal = (normalByte(normal.x()) & 0xFF)
@@ -105,6 +113,30 @@ public class ModelPartCubeM {
                 ptr += VERTEX_SIZE;
             }
         }
+    }
+
+    /**
+     * Whether the GPU would cull polygon {@code p} for every eye position within {@link ModelCulling#EYE_MARGIN} of
+     * the origin. Cube faces wind counter-clockwise seen from outside, so the GPU keeps a face when
+     * {@code (v1 - v0) x (v2 - v0)} points towards the eye. This uses the transformed corners, so mirroring poses
+     * flip the result just like they flip the winding on screen. Degenerate faces are kept.
+     */
+    @Unique
+    private boolean isBackFace(float[] transformed, int p) {
+        int i0 = this.cornerIndices[p * 4] * 3;
+        int i1 = this.cornerIndices[p * 4 + 1] * 3;
+        int i2 = this.cornerIndices[p * 4 + 2] * 3;
+
+        float x0 = transformed[i0], y0 = transformed[i0 + 1], z0 = transformed[i0 + 2];
+        float ax = transformed[i1] - x0, ay = transformed[i1 + 1] - y0, az = transformed[i1 + 2] - z0;
+        float bx = transformed[i2] - x0, by = transformed[i2 + 1] - y0, bz = transformed[i2 + 2] - z0;
+        float nx = ay * bz - az * by;
+        float ny = az * bx - ax * bz;
+        float nz = ax * by - ay * bx;
+
+        // Distance of the eye behind the face plane, times |n|
+        float behind = nx * x0 + ny * y0 + nz * z0;
+        return behind > 0.0f && behind * behind >= EYE_MARGIN_SQ * (nx * nx + ny * ny + nz * nz);
     }
 
     /** Vanilla's Cube.compile */
