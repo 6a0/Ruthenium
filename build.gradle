@@ -203,6 +203,7 @@ registerBenchmark("benchVanillaGl", "vanilla-gl", "opengl", false, false)
 registerBenchmark("benchVanillaVulkan", "vanilla-vulkan", "vulkan", false, false)
 registerBenchmark("benchSodium", "sodium", null, false, true)
 registerBenchmark("benchVulkanMod", "vulkanmod", "vulkan", true, false)
+registerBenchmark("benchVulkanModGl", "vulkanmod-gl", "opengl", true, false)
 
 // configure the maven publication
 publishing {
