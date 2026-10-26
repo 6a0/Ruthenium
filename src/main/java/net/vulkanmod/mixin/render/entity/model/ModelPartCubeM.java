@@ -1,0 +1,167 @@
+package net.vulkanmod.mixin.render.entity.model;
+
+import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.blaze3d.vertex.VertexConsumer;
+import net.minecraft.client.model.geom.ModelPart;
+import net.minecraft.client.renderer.SpriteCoordinateExpander;
+import net.minecraft.client.renderer.texture.UvMapping;
+import net.minecraft.util.ARGB;
+import net.vulkanmod.interfaces.ExtendedVertexBuilder;
+import org.joml.Matrix4f;
+import org.joml.Vector3f;
+import org.lwjgl.system.MemoryUtil;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Overwrite;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+
+import java.util.Arrays;
+
+/**
+ * Fast path for cubes written into an entity-format {@link com.mojang.blaze3d.vertex.BufferBuilder}:
+ * the cube's distinct corners are transformed once (8 instead of 24 positions), each face is written as one
+ * 4-vertex reservation, and color, light, overlay and the packed normal are computed once per face.
+ * Output is identical to vanilla's {@code Cube.compile}.
+ * <p>
+ * Like vanilla model parts this is not thread safe; models are only rendered from the render thread.
+ */
+@Mixin(ModelPart.Cube.class)
+public class ModelPartCubeM {
+    @Unique private static final int VERTEX_SIZE = 36;
+
+    @Shadow @Final public ModelPart.Polygon[] polygons;
+
+    /** Distinct vertex positions (in world units) of this cube, xyz interleaved. */
+    @Unique private float[] corners;
+    /** Index into {@link #corners} of each polygon vertex, 4 per polygon. */
+    @Unique private byte[] cornerIndices;
+    @Unique private float[] transformedCorners;
+    @Unique private final Vector3f scratch = new Vector3f();
+
+    /**
+     * @author VulkanMod
+     * @reason Fast path for entity-format buffers; an overwrite rather than an inject so that no CallbackInfo is
+     * allocated per cube
+     */
+    @Overwrite
+    public void compile(PoseStack.Pose pose, VertexConsumer builder, int lightCoords, int overlayCoords, int color) {
+        UvMapping mapping = null;
+        VertexConsumer target = builder;
+        if (builder instanceof SpriteCoordinateExpander expander) {
+            target = expander.delegate();
+            mapping = expander.mapping();
+        }
+
+        ExtendedVertexBuilder vertexBuilder = ExtendedVertexBuilder.of(target, DefaultVertexFormat.ENTITY);
+        if (vertexBuilder == null) {
+            this.compileVanilla(pose, builder, lightCoords, overlayCoords, color);
+            return;
+        }
+
+        if (this.corners == null) {
+            this.initCorners();
+        }
+
+        Matrix4f matrix = pose.pose();
+        float[] corners = this.corners;
+        float[] transformed = this.transformedCorners;
+        Vector3f scratch = this.scratch;
+        for (int i = 0; i < corners.length; i += 3) {
+            matrix.transformPosition(corners[i], corners[i + 1], corners[i + 2], scratch);
+            transformed[i] = scratch.x();
+            transformed[i + 1] = scratch.y();
+            transformed[i + 2] = scratch.z();
+        }
+
+        int abgr = ARGB.toABGR(color);
+
+        for (int p = 0; p < this.polygons.length; p++) {
+            ModelPart.Polygon polygon = this.polygons[p];
+            Vector3f normal = pose.transformNormal(polygon.normal(), scratch);
+            int packedNormal = (normalByte(normal.x()) & 0xFF)
+                    | (normalByte(normal.y()) & 0xFF) << 8
+                    | (normalByte(normal.z()) & 0xFF) << 16;
+
+            ModelPart.Vertex[] vertices = polygon.vertices();
+            long ptr = vertexBuilder.reserveVertices(4);
+
+            for (int v = 0; v < 4; v++) {
+                ModelPart.Vertex vertex = vertices[v];
+                int corner = this.cornerIndices[p * 4 + v] * 3;
+                float u = mapping != null ? mapping.getU(vertex.u()) : vertex.u();
+                float vCoord = mapping != null ? mapping.getV(vertex.v()) : vertex.v();
+
+                MemoryUtil.memPutFloat(ptr, transformed[corner]);
+                MemoryUtil.memPutFloat(ptr + 4, transformed[corner + 1]);
+                MemoryUtil.memPutFloat(ptr + 8, transformed[corner + 2]);
+                MemoryUtil.memPutInt(ptr + 12, abgr);
+                MemoryUtil.memPutFloat(ptr + 16, u);
+                MemoryUtil.memPutFloat(ptr + 20, vCoord);
+                MemoryUtil.memPutInt(ptr + 24, overlayCoords);
+                MemoryUtil.memPutInt(ptr + 28, lightCoords);
+                MemoryUtil.memPutInt(ptr + 32, packedNormal);
+                ptr += VERTEX_SIZE;
+            }
+        }
+    }
+
+    /** Vanilla's Cube.compile */
+    @Unique
+    private void compileVanilla(PoseStack.Pose pose, VertexConsumer builder, int lightCoords, int overlayCoords, int color) {
+        Matrix4f matrix = pose.pose();
+        Vector3f scratchVector = new Vector3f();
+
+        for (ModelPart.Polygon polygon : this.polygons) {
+            Vector3f normal = pose.transformNormal(polygon.normal(), scratchVector);
+            float nx = normal.x();
+            float ny = normal.y();
+            float nz = normal.z();
+
+            for (ModelPart.Vertex vertex : polygon.vertices()) {
+                Vector3f pos = matrix.transformPosition(vertex.worldX(), vertex.worldY(), vertex.worldZ(), scratchVector);
+                builder.addVertex(pos.x(), pos.y(), pos.z(), color, vertex.u(), vertex.v(), overlayCoords, lightCoords, nx, ny, nz);
+            }
+        }
+    }
+
+    @Unique
+    private void initCorners() {
+        float[] unique = new float[this.polygons.length * 4 * 3];
+        byte[] indices = new byte[this.polygons.length * 4];
+        int count = 0;
+
+        for (int p = 0; p < this.polygons.length; p++) {
+            ModelPart.Vertex[] vertices = this.polygons[p].vertices();
+            for (int v = 0; v < 4; v++) {
+                float x = vertices[v].worldX(), y = vertices[v].worldY(), z = vertices[v].worldZ();
+
+                int found = -1;
+                for (int i = 0; i < count; i++) {
+                    if (unique[i * 3] == x && unique[i * 3 + 1] == y && unique[i * 3 + 2] == z) {
+                        found = i;
+                        break;
+                    }
+                }
+                if (found == -1) {
+                    found = count++;
+                    unique[found * 3] = x;
+                    unique[found * 3 + 1] = y;
+                    unique[found * 3 + 2] = z;
+                }
+                indices[p * 4 + v] = (byte) found;
+            }
+        }
+
+        this.transformedCorners = new float[count * 3];
+        this.cornerIndices = indices;
+        this.corners = Arrays.copyOf(unique, count * 3);
+    }
+
+    /** Same conversion as vanilla's BufferBuilder.normalIntValue */
+    @Unique
+    private static byte normalByte(float c) {
+        return (byte) ((int) (Math.clamp(c, -1.0F, 1.0F) * 127.0F) & 0xFF);
+    }
+}
