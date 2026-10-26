@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-26 (second session), at commit `70b8b99` plus the commit that updates this file.
+Last updated: 2026-10-26 (second session), at commit `436c1dd` plus the commit that updates this file.
 
 ---
 
@@ -17,8 +17,8 @@ Last updated: 2026-10-26 (second session), at commit `70b8b99` plus the commit t
 - **Testing:** every change is benchmarked with the automated client gametest (`./gradlew benchVulkanMod`,
   3 runs) and checked for visual parity against vanilla screenshots, then committed with the numbers in the
   commit message. The user asked for this workflow: *commit as you test changes with the benchmark*.
-- **Results so far** (median of 3 runs, vanilla Vulkan backend): static view **25 → 163 fps**, pan **61 → 325 fps**
-  (pan p99 low 18 → 44). Sodium 0.9.3-beta.1 on the same benchmark: 63 / 163.
+- **Results so far** (median of 3 runs, vanilla Vulkan backend): static view **25 → 170 fps**, pan **61 → 337 fps**
+  (pan p99 low 18 → 45). Sodium 0.9.3-beta.1 on the same benchmark: 63 / 163.
 - **The pan p99 is not hitches.** Frames facing the chest cube (yaw 220–320, 11–13k block entities) take
   ~20–24 ms while the rest of the pan runs at ~1 ms (section 7). The remaining work there is per block entity.
 - **Next:** see section 8 (upload copies, enchanting table books, light lookups, config screen, terrain).
@@ -69,6 +69,9 @@ fine; implementations must be our own.
 ## 4. Current state of the branch
 
 ```
+436c1dd Cull block entities from packed section positions
+311a059 Classify 4x4x4 cells in sections that cross the frustum
+5738073 Update continuation notes after the second session
 70b8b99 Keep sign text caches on the sign lines instead of a global map
 2efa2dd Add a static phase yaw option and time windows to jfr_tree
 12b63f8 Reuse rest pose model geometry across submits
@@ -98,7 +101,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/render/text/BakedSheetGlyphM.java` | `@Overwrite render(...)`: direct writes for POSITION_TEX_LIGHTMAP_COLOR (world text) and POSITION_TEX_COLOR (GUI text) |
 | `mixin/render/vertex/VertexSortingM.java` + `render/vertex/DistanceSorting.java` | Replaces `VertexSorting.byDistance` with a packed-long sort (<256) or a stable LSD radix sort with per-thread scratch. Output is **identical** to vanilla (tested against the real 26.3 class) |
 | `mixin/render/particle/ParticleEngineM.java` + `ClientPacketListenerM.java` + `interfaces/ParticleSpawnLimiter.java` | Drops particles whose group is full (exact) and caps queued candidates per group per tick at 8×16384 (peak count within ~1% of vanilla). The packet loop stops once dropping starts |
-| `mixin/render/blockentity/LevelExtractorM.java` + `FrustumAccessor.java` + `render/blockentity/BlockEntityCulling.java` | Per-block-entity frustum culling inside `extractVisibleBlockEntities`. Conservative box: block ±1, +2 extra on top. **Vanilla block entity types only.** Redirects `getBlockPos` (test), the destruction-progress `Long2ObjectMap.get` (skipped when culled or empty) and `tryExtractRenderState`. Each section is classified once (inside/outside/partial with the same margins); only partial sections test per block entity |
+| `mixin/render/blockentity/LevelExtractorM.java` + `FrustumAccessor.java` + `render/blockentity/BlockEntityCulling.java` | Per-block-entity frustum culling inside `extractVisibleBlockEntities`. Conservative box: block ±1, +2 extra on top. **Vanilla block entity types only.** Redirects `getBlockPos` (test), the destruction-progress `Long2ObjectMap.get` (skipped when culled or empty) and `tryExtractRenderState`. Each section is classified once (inside/outside/partial with the same margins), then 4³ cells of partial sections, and only block entities in partial cells are tested individually. Positions and cullability come from `CompiledSectionMeshM` (`interfaces/BlockEntityPositions`, packed once per compiled mesh) by list index, so culled block entities are never dereferenced (vanilla gets `BlockPos.ZERO` for them) |
 | `mixin/render/vertex/MeshDataSortStateM.java` | `@Overwrite` `writeSortedIndexBuffer`/`buildSortedIndexBuffer`: sorted quad indices written with `MemoryUtil` puts instead of an `IntConsumer` per index. Sign text (`text_polygon_offset`) is sorted on upload and needs 32-bit indices with ~500 signs |
 | `render/text/SignTextCache.java` + `mixin/render/text/{SignTextM,AbstractSignRendererM,TextFeatureRendererM,FontSetM}.java` | `SignText.getRenderMessages` wraps each line (only when recomputed) in a `FormattedCharSequence` that carries its width and `Font.PreparedText` (plain/shadowed/outline, keyed by x/y/colours). Obfuscated lines are not cached; `FontSet.resetTextures` bumps a generation. A first version with a global identity map was slower than no cache |
 | `render/entity/ModelCulling.java` + `mixin/render/feature/LevelRendererM.java` | Flags the world's `FeatureRenderDispatcher.prepareFrame` and the current model's render type. When the pipeline culls (`RenderPipeline.isCull()`), `ModelPartCubeM` skips faces the GPU would cull: `(v1-v0)x(v2-v0)` of the transformed corners points away from every eye position within 0.5 blocks of the origin (camera-relative positions; bobbing moves the eye ~0.1). Degenerate faces are kept |
@@ -261,17 +264,19 @@ Sodium runs on its default (OpenGL).
 
 | Phase (avg / p95 low / p99 low) | vanilla GL | vanilla Vulkan | Sodium | VulkanMod v4 | VulkanMod HEAD |
 |---|---|---|---|---|---|
-| initial | 19.3 / 13.9 / 7.8 | 22.9 / 15.1 / 9.1 | 49.1 / 30.1 / 18.1 | 93.3 / 59.0 / 30.0 | **122.3 / 73.4 / 34.2** |
-| pan | 50.1 / 18.1 / 16.0 | 61.2 / 20.8 / 17.8 | 162.9 / 38.2 / 29.3 | 293.2 / 71.3 / 30.9 | **324.8 / 78.4 / 44.0** |
-| static | 21.1 / 17.3 / 15.9 | 25.3 / 21.1 / 20.1 | 63.4 / 52.5 / 41.8 | 121.4 / 93.7 / 77.7 | **163.3 / 115.5 / 103.4** |
-| particles | 20.6 / 18.4 / 15.7 | 24.3 / 20.9 / 18.0 | 60.6 / 51.0 / 42.7 | 115.5 / 86.4 / 72.2 | **153.9 / 106.2 / 88.2** |
+| initial | 19.3 / 13.9 / 7.8 | 22.9 / 15.1 / 9.1 | 49.1 / 30.1 / 18.1 | 93.3 / 59.0 / 30.0 | **130.4 / 79.7 / 36.0** |
+| pan | 50.1 / 18.1 / 16.0 | 61.2 / 20.8 / 17.8 | 162.9 / 38.2 / 29.3 | 293.2 / 71.3 / 30.9 | **336.6 / 83.5 / 45.0** |
+| static | 21.1 / 17.3 / 15.9 | 25.3 / 21.1 / 20.1 | 63.4 / 52.5 / 41.8 | 121.4 / 93.7 / 77.7 | **170.3 / 121.9 / 103.6** |
+| particles | 20.6 / 18.4 / 15.7 | 24.3 / 20.9 / 18.0 | 60.6 / 51.0 / 42.7 | 115.5 / 86.4 / 72.2 | **160.6 / 112.5 / 91.8** |
 | alloc at static view | ~16.5 MB/frame | ~16.7 MB/frame | ~11.3 MB/frame | ~4.6 MB/frame | **~2.6 MB/frame** |
 | block entities / frame (static) | ~14 075 | ~14 075 | ~8 417 | ~3 862 | **~3 861** |
 
 History of the static view: v1 (cube + particle writers + primitive sort) 30.6 → v2 (+glyph writer, radix sort,
 particle cap) 34.3 → v3 (overwrites, pooled sort scratch) 35.1 → v4 (block entity frustum culling) 121.4 →
 section classification ~120 (noise; −6.8% hash lookups in JFR) → direct sorted index writes 126.7 → sign text
-cache 128.3 → CPU back-face skip 139.7 → rest pose geometry cache 161.0 → per-line sign cache 163.3.
+cache 128.3 → CPU back-face skip 139.7 → rest pose geometry cache 161.0 → per-line sign cache 163.3 → 4³ cells
+167.7 → packed section positions 170.3. Rejected (no gain, reverted): an 11-bit, single-histogram radix sort
+(the sort's JFR share was misattributed). Results archives: `results/vulkanmod-v5 … v12` (v12 = HEAD).
 Facing the chest cube (`staticYaw=270`): ~30 (v4) → 47.5 → ~50 fps. Peak particles: vanilla ~16 349,
 VulkanMod ~16 250.
 
@@ -303,8 +308,8 @@ animated enchanting table books, not cacheable), upload 16.7%, text 13%, sign su
      rest pose cache can't take them. Back faces are already skipped (entity_solid culls).
    - **Light lookups** (`LightCoordsUtil.getLightCoords` ~3%) and `ChestRenderer.extractRenderState`
      (double-chest `combine`, ~4%) per block entity per frame.
-   - **Frustum tests** (~4–5%): partial sections (the cube straddles the left plane) still test each block entity.
-     Classifying 4³ cells lazily within partial sections would give the same results with far fewer tests.
+   - **Block entity iteration**: culling no longer touches culled block entities, but vanilla still iterates the
+     ~14k-entry lists per frame; visible ones still pay `tryExtractRenderState` (~8% at static).
    - **Sorted sign text** (~6% facing the cube): `text_polygon_offset` is translucent and sorted on upload.
    - `Level.tickBlockEntities` ~4% (client chest/table ticks, mostly the loop's chunk checks and `isValid`).
    - Occlusion culling of block entities is **not** exact here: chests are 14/16 wide and the chests behind show
