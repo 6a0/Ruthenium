@@ -1,5 +1,7 @@
+import net.fabricmc.loom.task.prod.ClientProductionRunTask
+
 plugins {
-	id 'fabric-loom' version '1.14-SNAPSHOT'
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
 	id 'maven-publish'
 }
 
@@ -10,61 +12,68 @@ base {
 	archivesName = project.archives_base_name
 }
 
+repositories {
+	exclusiveContent {
+		forRepository {
+			maven {
+				name = "Modrinth"
+				url = "https://api.modrinth.com/maven"
+			}
+		}
+		filter {
+			includeGroup "maven.modrinth"
+		}
+	}
+}
+
 loom {
 	accessWidenerPath = file("src/main/resources/vulkanmod.accesswidener")
+
+	runs.configureEach {
+		// Mojang's launcher JVM arguments (see the benchmark tasks below for why these matter)
+		vmArgs("-XX:StackShadowPages=32", "--add-exports", "java.base/jdk.internal.misc=ALL-UNNAMED")
+		if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+			vmArg("-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump")
+		}
+	}
+}
+
+fabricApi {
+	configureTests {
+		createSourceSet = true
+		modId = "vulkanmod-gametest"
+		enableGameTests = false
+		enableClientGameTests = true
+		eula = true
+		username = "6a0"
+	}
 }
 
 dependencies {
 	// To change the versions see the gradle.properties file
 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
-	mappings loom.officialMojangMappings()
-	modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
 
 	// Fabric API.
-	modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
 	ext.includeModule = { name ->
 		var module = fabricApi.module(name, project.fabric_version)
-		modImplementation(module)
+		implementation(module)
 		include(module)
 	}
 
 	includeModule("fabric-api-base")
-	includeModule("fabric-resource-loader-v0")
 	includeModule("fabric-resource-loader-v1")
 	includeModule("fabric-rendering-v1")
 	includeModule("fabric-renderer-api-v1")
 	includeModule("fabric-rendering-fluids-v1")
-	includeModule("fabric-block-view-api-v2")
+	includeModule("fabric-block-getter-api-v2")
 	includeModule("fabric-lifecycle-events-v1")
 	includeModule("fabric-transitive-access-wideners-v1")
-}
 
-project.ext.lwjglVersion = "3.3.3"
-project.ext.jomlVersion = "1.10.4"
-project.ext.winNatives = "natives-windows"
-project.ext.linuxNatives = "natives-linux"
-project.ext.macosNatives = "natives-macos"
-project.ext.macosArmNatives = "natives-macos-arm64"
-
-dependencies {
-	include(implementation("org.lwjgl:lwjgl-vulkan:$lwjglVersion"))
-
-	ext.includeNatives = { name ->
-		include(implementation("$name:$lwjglVersion"))
-		include(runtimeOnly("$name:$lwjglVersion:$winNatives"))
-		include(runtimeOnly("$name:$lwjglVersion:$linuxNatives"))
-		include(runtimeOnly("$name:$lwjglVersion:$macosNatives"))
-		include(runtimeOnly("$name:$lwjglVersion:$macosArmNatives"))
-	}
-
-	includeNatives("org.lwjgl:lwjgl-vma")
-	includeNatives("org.lwjgl:lwjgl-shaderc")
-	includeNatives("org.lwjgl:lwjgl-spvc")
-
-	//MoltenVK
-	include(runtimeOnly("org.lwjgl:lwjgl-vulkan:$lwjglVersion:$macosNatives"))
-	include(runtimeOnly("org.lwjgl:lwjgl-vulkan:$lwjglVersion:$macosArmNatives"))
+	// Literal server IPs otherwise stall ~5s on a reverse DNS lookup when connecting
+	gametestRuntimeOnly "maven.modrinth:fast-ip-ping:${project.fast_ip_ping_version}"
 }
 
 processResources {
@@ -76,7 +85,7 @@ processResources {
 }
 
 tasks.withType(JavaCompile).configureEach {
-	it.options.release = 21
+	it.options.release = 25
 }
 
 java {
@@ -85,8 +94,8 @@ java {
 	// If you remove this line, sources will not be generated.
 	withSourcesJar()
 
-	sourceCompatibility = JavaVersion.VERSION_21
-	targetCompatibility = JavaVersion.VERSION_21
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
 }
 
 jar {
@@ -94,6 +103,102 @@ jar {
 		rename { "${it}_${project.base.archivesName.get()}"}
 	}
 }
+
+// Benchmarks: production-like client runs driven by the client gametest in src/gametest.
+// Usage: ./gradlew benchVulkanMod (or benchVanillaGl / benchVanillaVulkan / benchSodium)
+// Results are written to build/run/bench/results/
+def gametestJar = tasks.register("gametestJar", Jar) {
+	archiveClassifier = "gametest"
+	from sourceSets.gametest.output
+}
+
+configurations {
+	benchBaseMods
+	benchSodiumMods
+}
+
+dependencies {
+	benchBaseMods "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+	benchBaseMods "maven.modrinth:fast-ip-ping:${project.fast_ip_ping_version}"
+	benchSodiumMods "maven.modrinth:sodium:${project.sodium_version}"
+}
+
+def registerBenchmark = { String name, String label, String backend, boolean withVulkanMod, boolean withSodium ->
+	tasks.register(name, ClientProductionRunTask) {
+		group = "benchmark"
+		description = "Runs the client benchmark gametest: ${label}"
+
+		// A benchmark is a measurement, never up to date
+		outputs.upToDateWhen { false }
+
+		mods.setFrom(gametestJar, configurations.benchBaseMods)
+		if (withVulkanMod) {
+			mods.from(tasks.named("jar"))
+		}
+		if (withSodium) {
+			mods.from(configurations.benchSodiumMods)
+		}
+
+		// -PbenchJavaVendor=microsoft runs on a Microsoft OpenJDK 25 (e.g. Mojang's bundled runtime, made visible with
+		// -Porg.gradle.java.installations.paths=<java home>) instead of the build JDK
+		if (project.hasProperty("benchJavaVendor")) {
+			javaLauncher = javaToolchains.launcherFor {
+				languageVersion = JavaLanguageVersion.of(25)
+				vendor = JvmVendorSpec.matching(project.property("benchJavaVendor").toString())
+			}
+		}
+
+		runDir = layout.buildDirectory.dir("run/bench/${label}")
+		// -PbenchProbe=SECONDS: diagnostic startup probe outside client gametest mode (see StartupProbe)
+		if (project.hasProperty("benchProbe")) {
+			jvmArgs.add("-Dvulkanmod.bench.probeSeconds=${project.property("benchProbe")}")
+		} else {
+			jvmArgs.addAll("-Dfabric.client.gametest", "-Dfabric.client.gametest.modid=vulkanmod-gametest")
+		}
+		// Mojang's launcher JVM arguments for 26.3, which the production run task doesn't apply. Without the extra
+		// stack shadow pages, native code (graphics drivers) intermittently overflowed thread stacks during startup,
+		// killing the JVM with 0xC0000005 / 0xC0000409 / 0xC0000374 and no hs_err log.
+		jvmArgs.addAll(
+				"-XX:StackShadowPages=32",
+				"--add-exports", "java.base/jdk.internal.misc=ALL-UNNAMED"
+		)
+		if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+			jvmArgs.add("-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump")
+		}
+
+		jvmArgs.addAll(
+				"-Dvulkanmod.bench.label=${label}",
+				// The benchmark keeps the displays awake via SetThreadExecutionState (FFM downcall)
+				"--enable-native-access=ALL-UNNAMED",
+				"-Xmx4G"
+		)
+		// -PbenchJfr records a Java Flight Recorder profile of the run into the results directory
+		if (project.hasProperty("benchJfr")) {
+			jvmArgs.add("-XX:StartFlightRecording=settings=profile,filename=../results/${label}.jfr,dumponexit=true")
+		}
+		// Forward -Pbench.* project properties as system properties (e.g. -Pbench.renderDistance=16)
+		project.properties.findAll { it.key.startsWith("bench.") }.each { k, v ->
+			jvmArgs.add("-Dvulkanmod.${k}=${v}")
+		}
+		// -PbenchWindow=WIDTHxHEIGHT (default 1920x1080)
+		def (windowWidth, windowHeight) = project.findProperty("benchWindow")?.toString()?.split("x") ?: ["1920", "1080"]
+		programArgs.addAll("--username", "6a0", "--width", windowWidth, "--height", windowHeight)
+		if (backend != null) {
+			programArgs.addAll("--graphicsBackend", backend)
+		}
+
+		doFirst {
+			def eula = runDir.get().file("eula.txt").asFile
+			eula.parentFile.mkdirs()
+			eula.text = "eula=true\n"
+		}
+	}
+}
+
+registerBenchmark("benchVanillaGl", "vanilla-gl", "opengl", false, false)
+registerBenchmark("benchVanillaVulkan", "vanilla-vulkan", "vulkan", false, false)
+registerBenchmark("benchSodium", "sodium", null, false, true)
+registerBenchmark("benchVulkanMod", "vulkanmod", "vulkan", true, false)
 
 // configure the maven publication
 publishing {
