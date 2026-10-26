@@ -20,6 +20,11 @@ import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.multiplayer.resolver.ServerAddress;
 import net.minecraft.client.particle.ParticleGroup;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.entity.ChestBlockEntity;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.vulkanmod.gametest.mixin.ParticleEngineAccessor;
@@ -74,6 +79,11 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
      * profiler slows the frame down, so the static phase's FPS is not comparable with normal runs.
      */
     private static final boolean SECTION_PROFILE = Boolean.parseBoolean(prop("sectionProfile", "false"));
+    /**
+     * Before the static phase, opens the lid of the chest in the crosshair and shows breaking progress on another
+     * one (client-side only), taking a screenshot of each state, for checking the retained chest geometry.
+     */
+    private static final boolean CHEST_EVENTS = Boolean.parseBoolean(prop("chestEvents", "false"));
 
     private static final int TICKS_PER_SECOND = 20;
     private static final String RUN_ID = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
@@ -115,6 +125,9 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         setYaw(context, STATIC_YAW);
 
         context.takeScreenshot(LABEL + "-static-" + RUN_ID);
+        if (CHEST_EVENTS) {
+            chestEvents(context);
+        }
         context.runOnClient(_ -> FrameRecorder.startPhase());
         if (SECTION_PROFILE) {
             context.runOnClient(mc -> mc.debugClientMetricsStart(message -> LOGGER.info(message.getString())));
@@ -217,6 +230,45 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
     private static void takeScreenshotAtYaw(ClientGameTestContext context, float yaw) {
         setYaw(context, yaw);
         context.takeScreenshot(LABEL + "-yaw" + (int) yaw + "-" + RUN_ID);
+    }
+
+    private static void chestEvents(ClientGameTestContext context) {
+        BlockPos[] chests = context.computeOnClient(mc -> {
+            Vec3 eye = mc.player.getEyePosition();
+            Vec3 end = eye.add(mc.player.getViewVector(1.0F).scale(48.0));
+            BlockHitResult hit = mc.level.clip(new ClipContext(eye, end, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, mc.player));
+            BlockPos center = hit.getBlockPos();
+            List<BlockPos> found = new ArrayList<>();
+            for (int dy = 0; dy <= 2 && found.size() < 2; dy++) {
+                for (int dx = -4; dx <= 4 && found.size() < 2; dx += 2) {
+                    for (int dz = 0; dz <= 2 && found.size() < 2; dz++) {
+                        BlockPos pos = center.offset(dx, -dy, dz);
+                        if (mc.level.getBlockEntity(pos) instanceof ChestBlockEntity) {
+                            found.add(pos);
+                        }
+                    }
+                }
+            }
+            return found.toArray(new BlockPos[0]);
+        });
+        if (chests.length < 2) {
+            throw new AssertionError("No two chests found in view for the chest events");
+        }
+        LOGGER.info("Chest events: lid at {}, breaking progress at {}", chests[0], chests[1]);
+
+        context.runOnClient(mc -> {
+            mc.level.blockEvent(chests[0], mc.level.getBlockState(chests[0]).getBlock(), 1, 1);
+            mc.level.destroyBlockProgress(-4242, chests[1], 6);
+        });
+        context.waitTicks(30);
+        context.takeScreenshot(LABEL + "-chestopen-" + RUN_ID);
+
+        context.runOnClient(mc -> {
+            mc.level.blockEvent(chests[0], mc.level.getBlockState(chests[0]).getBlock(), 1, 0);
+            mc.level.destroyBlockProgress(-4242, chests[1], -1);
+        });
+        context.waitTicks(40);
+        context.takeScreenshot(LABEL + "-chestclosed-" + RUN_ID);
     }
 
     private static void setYaw(ClientGameTestContext context, float yaw) {
