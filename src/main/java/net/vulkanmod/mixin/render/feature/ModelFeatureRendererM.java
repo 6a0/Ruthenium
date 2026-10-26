@@ -19,7 +19,8 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
 
     /**
      * @author VulkanMod
-     * @reason Back face culling ({@link ModelCulling}) and cached rest pose geometry ({@link ModelGeometryCache});
+     * @reason Back face culling ({@link ModelCulling}) and cached rest pose and model space geometry
+     * ({@link ModelGeometryCache});
      * otherwise the vanilla body
      */
     @Overwrite
@@ -33,6 +34,14 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
             if (submit.sheetedDecalPose() == null && ModelGeometryCache.isCacheable(submit.state())
                     && ModelGeometryCache.write(model, submit.state(), this.poseStack.last(), buffer, submit.lightCoords(),
                             submit.overlayCoords(), submit.tintedColor(), submit.uvMapping(), ModelCulling.cullBackFaces())) {
+                return;
+            }
+
+            Object modelSpaceKey;
+            if (submit.sheetedDecalPose() == null && (modelSpaceKey = ModelGeometryCache.modelSpaceKey(submit.state())) != null
+                    && ModelGeometryCache.writeModelSpace(model, submit.state(), modelSpaceKey, this.poseStack.last(), buffer,
+                            submit.lightCoords(), submit.overlayCoords(), submit.tintedColor(), submit.uvMapping(),
+                            ModelCulling.cullBackFaces())) {
                 return;
             }
 
