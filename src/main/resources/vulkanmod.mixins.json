@@ -11,7 +11,10 @@
     "render.particle.ClientPacketListenerM",
     "render.particle.ParticleEngineM",
     "render.particle.QuadParticleRenderStateM",
+    "render.text.AbstractSignRendererM",
     "render.text.BakedSheetGlyphM",
+    "render.text.FontSetM",
+    "render.text.TextFeatureRendererM",
     "render.vertex.BufferBuilderM",
     "render.vertex.MeshDataSortStateM",
     "render.vertex.VertexSortingM"
