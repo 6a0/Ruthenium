@@ -5,6 +5,8 @@
   "compatibilityLevel": "JAVA_25",
   "mixins": [],
   "client": [
+    "render.blockentity.FrustumAccessor",
+    "render.blockentity.LevelExtractorM",
     "render.entity.model.ModelPartCubeM",
     "render.particle.ClientPacketListenerM",
     "render.particle.ParticleEngineM",
