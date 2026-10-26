@@ -5,7 +5,6 @@ import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
-import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntityType;
 import net.vulkanmod.mixin.render.blockentity.FrustumAccessor;
 
@@ -16,8 +15,16 @@ import net.vulkanmod.mixin.render.blockentity.FrustumAccessor;
  * every side, and two extra blocks above (standing banners reach ~2.6 blocks up). Only vanilla block entity types
  * are culled; modded ones may render arbitrarily large geometry from a single block, so they are left to vanilla's
  * per-section culling. Block entities that render off screen (beacons etc.) never reach this path.
+ * <p>
+ * A section is tested with the same margins around its 16³ blocks, so its box contains the box of every block
+ * entity in it: when the section box is fully inside (or outside) the frustum, so is every block entity box.
  */
 public final class BlockEntityCulling {
+    public static final int SECTION_UNKNOWN = 0;
+    public static final int SECTION_INSIDE = 1;
+    public static final int SECTION_OUTSIDE = 2;
+    public static final int SECTION_PARTIAL = 3;
+
     private static final double MARGIN = 1.0;
     private static final double EXTRA_TOP = 2.0;
 
@@ -26,19 +33,27 @@ public final class BlockEntityCulling {
     private BlockEntityCulling() {
     }
 
-    public static boolean isOutsideFrustum(Frustum frustum, BlockEntity blockEntity) {
-        if (frustum == null || !isCullable(blockEntity.getType())) {
-            return false;
-        }
+    public static int classifySection(Frustum frustum, BlockPos origin) {
+        int result = cubeInFrustum(frustum, origin.getX(), origin.getY(), origin.getZ(), 16);
+        return switch (result) {
+            case -2 -> SECTION_INSIDE;
+            case -1 -> SECTION_PARTIAL;
+            default -> SECTION_OUTSIDE;
+        };
+    }
 
-        BlockPos pos = blockEntity.getBlockPos();
-        int result = ((FrustumAccessor) frustum).invokeCubeInFrustum(
-                pos.getX() - MARGIN, pos.getY() - MARGIN, pos.getZ() - MARGIN,
-                pos.getX() + 1 + MARGIN, pos.getY() + 1 + MARGIN + EXTRA_TOP, pos.getZ() + 1 + MARGIN);
+    public static boolean isOutsideFrustum(Frustum frustum, BlockPos pos) {
+        int result = cubeInFrustum(frustum, pos.getX(), pos.getY(), pos.getZ(), 1);
         return result != -2 && result != -1;
     }
 
-    private static boolean isCullable(BlockEntityType<?> type) {
+    private static int cubeInFrustum(Frustum frustum, int x, int y, int z, int size) {
+        return ((FrustumAccessor) frustum).invokeCubeInFrustum(
+                x - MARGIN, y - MARGIN, z - MARGIN,
+                x + size + MARGIN, y + size + MARGIN + EXTRA_TOP, z + size + MARGIN);
+    }
+
+    public static boolean isCullable(BlockEntityType<?> type) {
         // Only accessed from the render thread
         if (CULLABLE_TYPES.containsKey(type)) {
             return CULLABLE_TYPES.getBoolean(type);
