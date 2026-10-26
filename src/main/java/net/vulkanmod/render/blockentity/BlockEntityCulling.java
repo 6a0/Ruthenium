@@ -39,15 +39,15 @@ public final class BlockEntityCulling {
         return classify(frustum, origin.getX(), origin.getY(), origin.getZ(), 16);
     }
 
-    /** Classifies the {@link #CELL_SIZE}³ cell of a section that contains {@code pos} */
-    public static int classifyCell(Frustum frustum, BlockPos pos) {
+    /** Classifies the {@link #CELL_SIZE}³ cell of a section that contains the block */
+    public static int classifyCell(Frustum frustum, int x, int y, int z) {
         int mask = -CELL_SIZE;
-        return classify(frustum, pos.getX() & mask, pos.getY() & mask, pos.getZ() & mask, CELL_SIZE);
+        return classify(frustum, x & mask, y & mask, z & mask, CELL_SIZE);
     }
 
-    /** Index of the cell of {@code pos} within its section, 0..63 */
-    public static int cellIndex(BlockPos pos) {
-        return (pos.getX() >> 2 & 3) | (pos.getY() >> 2 & 3) << 2 | (pos.getZ() >> 2 & 3) << 4;
+    /** Index of the cell of the block within its section, 0..63 */
+    public static int cellIndex(int x, int y, int z) {
+        return (x >> 2 & 3) | (y >> 2 & 3) << 2 | (z >> 2 & 3) << 4;
     }
 
     private static int classify(Frustum frustum, int x, int y, int z, int size) {
@@ -59,8 +59,8 @@ public final class BlockEntityCulling {
         };
     }
 
-    public static boolean isOutsideFrustum(Frustum frustum, BlockPos pos) {
-        int result = cubeInFrustum(frustum, pos.getX(), pos.getY(), pos.getZ(), 1);
+    public static boolean isOutsideFrustum(Frustum frustum, int x, int y, int z) {
+        int result = cubeInFrustum(frustum, x, y, z, 1);
         return result != -2 && result != -1;
     }
 

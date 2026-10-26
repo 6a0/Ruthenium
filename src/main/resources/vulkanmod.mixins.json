@@ -5,6 +5,7 @@
   "compatibilityLevel": "JAVA_25",
   "mixins": [],
   "client": [
+    "render.blockentity.CompiledSectionMeshM",
     "render.blockentity.FrustumAccessor",
     "render.blockentity.LevelExtractorM",
     "render.entity.model.ModelPartCubeM",

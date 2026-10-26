@@ -12,6 +12,7 @@ import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.vulkanmod.interfaces.BlockEntityPositions;
 import net.vulkanmod.render.blockentity.BlockEntityCulling;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
@@ -27,6 +28,11 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * The test happens where vanilla reads the block entity's position, so culled block entities also skip the
  * destruction progress lookup. Each section is classified once; in sections that cross the frustum each 4³ cell is
  * classified once, and only block entities of cells that cross it are tested individually.
+ * <p>
+ * Positions and cullability come from the compiled section ({@link BlockEntityPositions}) by list index, so culled
+ * block entities are never dereferenced: with ~14k block entities per frame the pointer chasing was the main cost.
+ * Vanilla only uses the position for the destruction progress lookup, which is skipped for culled block entities,
+ * so they get {@link BlockPos#ZERO}.
  */
 @Mixin(LevelExtractor.class)
 public class LevelExtractorM {
@@ -37,6 +43,9 @@ public class LevelExtractorM {
     @Unique private final byte[] cellCull = new byte[64];
     @Unique private final int[] cellStamps = new int[64];
     @Unique private int sectionStamp;
+    @Unique private long[] sectionPositions;
+    @Unique private boolean[] sectionCullable;
+    @Unique private int blockEntityIndex;
     @Unique private boolean culled;
 
     @Inject(method = "extractVisibleBlockEntities", at = @At("HEAD"))
@@ -47,6 +56,8 @@ public class LevelExtractorM {
     @Inject(method = "extractVisibleBlockEntities", at = @At("RETURN"))
     private void releaseSection(Camera camera, float deltaPartialTick, LevelRenderState levelRenderState, CallbackInfo ci) {
         this.cullSection = null;
+        this.sectionPositions = null;
+        this.sectionCullable = null;
         this.culled = false;
     }
 
@@ -57,37 +68,65 @@ public class LevelExtractorM {
         this.cullSection = section;
         this.sectionCull = BlockEntityCulling.SECTION_UNKNOWN;
         this.sectionStamp++;
-        return section.getSectionMesh();
+        this.blockEntityIndex = 0;
+
+        SectionMesh mesh = section.getSectionMesh();
+        if (mesh instanceof BlockEntityPositions positions && !mesh.getRenderableBlockEntities().isEmpty()) {
+            this.sectionPositions = positions.vulkanmod$getPositions();
+            this.sectionCullable = positions.vulkanmod$getCullable();
+        } else {
+            this.sectionPositions = null;
+            this.sectionCullable = null;
+        }
+        return mesh;
     }
 
     @Redirect(method = "extractVisibleBlockEntities", at = @At(value = "INVOKE", ordinal = 0,
             target = "Lnet/minecraft/world/level/block/entity/BlockEntity;getBlockPos()Lnet/minecraft/core/BlockPos;"))
     private BlockPos testBlockEntity(BlockEntity blockEntity) {
         this.culled = false;
+        int index = this.blockEntityIndex++;
 
-        if (this.cullFrustum != null && BlockEntityCulling.isCullable(blockEntity.getType())) {
-            if (this.sectionCull == BlockEntityCulling.SECTION_UNKNOWN) {
-                this.sectionCull = BlockEntityCulling.classifySection(this.cullFrustum, this.cullSection.getRenderOrigin());
-            }
-
-            this.culled = switch (this.sectionCull) {
-                case BlockEntityCulling.SECTION_INSIDE -> false;
-                case BlockEntityCulling.SECTION_OUTSIDE -> true;
-                default -> this.testInPartialSection(blockEntity.getBlockPos());
-            };
+        if (this.cullFrustum == null) {
+            return blockEntity.getBlockPos();
         }
 
-        return blockEntity.getBlockPos();
+        long[] positions = this.sectionPositions;
+        long packed;
+        if (positions != null && index < positions.length) {
+            if (!this.sectionCullable[index]) {
+                return blockEntity.getBlockPos();
+            }
+            packed = positions[index];
+        } else {
+            // Not a compiled section mesh
+            if (!BlockEntityCulling.isCullable(blockEntity.getType())) {
+                return blockEntity.getBlockPos();
+            }
+            packed = blockEntity.getBlockPos().asLong();
+        }
+
+        if (this.sectionCull == BlockEntityCulling.SECTION_UNKNOWN) {
+            this.sectionCull = BlockEntityCulling.classifySection(this.cullFrustum, this.cullSection.getRenderOrigin());
+        }
+
+        this.culled = switch (this.sectionCull) {
+            case BlockEntityCulling.SECTION_INSIDE -> false;
+            case BlockEntityCulling.SECTION_OUTSIDE -> true;
+            default -> this.testInPartialSection(BlockPos.getX(packed), BlockPos.getY(packed), BlockPos.getZ(packed));
+        };
+
+        return this.culled ? BlockPos.ZERO : blockEntity.getBlockPos();
     }
 
     @Unique
-    private boolean testInPartialSection(BlockPos pos) {
-        int cell = BlockEntityCulling.cellIndex(pos);
+    private boolean testInPartialSection(int x, int y, int z) {
+        int cell = BlockEntityCulling.cellIndex(x, y, z);
         int cellCull;
         if (this.cellStamps[cell] == this.sectionStamp) {
             cellCull = this.cellCull[cell];
         } else {
-            cellCull = BlockEntityCulling.classifyCell(this.cullFrustum, pos);
+            cellCull = BlockEntityCulling.classifyCell(this.cullFrustum, x, y, z);
             this.cellCull[cell] = (byte) cellCull;
             this.cellStamps[cell] = this.sectionStamp;
         }
@@ -95,7 +134,7 @@ public class LevelExtractorM {
         return switch (cellCull) {
             case BlockEntityCulling.SECTION_INSIDE -> false;
             case BlockEntityCulling.SECTION_OUTSIDE -> true;
-            default -> BlockEntityCulling.isOutsideFrustum(this.cullFrustum, pos);
+            default -> BlockEntityCulling.isOutsideFrustum(this.cullFrustum, x, y, z);
         };
     }
 
