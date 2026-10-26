@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "vulkanmod-gametest",
+  "version": "1.0.0",
+  "name": "VulkanMod Benchmark Gametest",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "net.vulkanmod.gametest.StartupProbe"
+    ],
+    "fabric-client-gametest": [
+      "net.vulkanmod.gametest.BenchmarkClientGameTest"
+    ]
+  },
+  "mixins": [
+    "vulkanmod-gametest.mixins.json"
+  ],
+  "depends": {
+    "fabric-client-gametest-api-v1": "*"
+  }
+}
