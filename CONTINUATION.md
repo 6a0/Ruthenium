@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-26 (third session), at commit `447a7c9` plus the commit that updates this file.
+Last updated: 2026-10-26 (third session), at commit `7b4aff1` plus the commit that updates this file.
 
 ---
 
@@ -17,14 +17,14 @@ Last updated: 2026-10-26 (third session), at commit `447a7c9` plus the commit th
 - **Testing:** every change is benchmarked with the automated client gametest (`./gradlew benchVulkanMod`,
   3 runs) and checked for visual parity against vanilla screenshots, then committed with the numbers in the
   commit message. The user asked for this workflow: *commit as you test changes with the benchmark*.
-- **Results so far** (median of 3 runs, vanilla Vulkan backend): static view **25 → 354 fps**, pan **61 → 463 fps**
+- **Results so far** (median of 3 runs, vanilla Vulkan backend): static view **25 → 415 fps**, pan **61 → 516 fps**
   (pan p99 low 18 → 117). Sodium 0.9.3-beta.1 on the same benchmark: 63 / 163. On vanilla's OpenGL backend
-  (`benchVulkanModGl`) the static view runs at 311 fps.
+  (`benchVulkanModGl`) the static view runs at 344 fps.
 - **Closed chests are retained on the GPU** (`RetainedChests`, the user chose this in the third session): their
   geometry lives in per-section vertex buffers and is drawn with a copy of the entity pipeline that adds
   `ModelOffset`. Kill switch: `-Dvulkanmod.retainedChests=false` (`-Pvm.retainedChests=false` on bench tasks).
-- **Closed enchanting table books are GPU instances** (`InstancedModels`): model-space mesh once, a pose + light
-  per book per frame. Kill switch: `-Dvulkanmod.instancedModels=false`.
+- **Closed enchanting table books and armor stands are GPU instances** (`InstancedModels`): model-space mesh once
+  per group, a pose + light per instance per frame. Kill switch: `-Dvulkanmod.instancedModels=false`.
 - **The pan p99 is not hitches.** Frames facing the chest cube (yaw 220–320, 11–13k block entities) take
   ~6 ms (third session start: ~20 ms) while the rest of the pan runs at ~1 ms (section 7). The remaining work
   there is per block entity (signs, enchanting table extraction, ticking).
@@ -79,6 +79,8 @@ fine; implementations must be our own.
 ## 4. Current state of the branch
 
 ```
+7b4aff1 Draw armor stands posed alike as GPU instances
+fe7306b Update continuation notes with the instanced books
 447a7c9 Draw closed enchanting table books as GPU instances
 4aca36a Update continuation notes with the retained chests
 dfb1e97 Add a benchmark task for this mod on vanilla's OpenGL backend
@@ -131,7 +133,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `render/entity/ModelGeometryCache.java` + `mixin/render/feature/ModelFeatureRendererM.java` | `@Overwrite prepareModel`. Models whose state is `Float` 0 (closed chests, …) are captured once per pose rotation + normal matrix, overlay, tint and `UvMapping` (translation removed, through a recording `VertexConsumer` on the vanilla path), then written with the translation added, the submit's light and precomputed face planes for the back-face test. **Model space entries** (`modelSpaceKey`: currently closed `BookModel.State`, openness 0, where the page flips move nothing) are captured with the identity pose and transformed per write: back faces are tested in model space (eye moved into model space when the pose's linear part is a similarity, else the transformed corners are tested), only corners of written quads are transformed, exact duplicate quads are skipped when allowed. Vertices are written as 4 longs + 1 int. Only rounding differs from vanilla; a temporary check against vanilla's model rendering of 214k book submits found no extra quads and only culled or duplicate missing ones. Max 16 entries per model; models whose capture fails are remembered |
 | `mixin/render/vertex/StagedVertexBufferM.java` + `render/vertex/ParallelUploadCopy.java` | Redirects the per-slice `ByteBuffer.put` in `StagedVertexBuffer.uploadDrawsToBuffers` to record the copies; a worker thread and the render thread copy them in 1 MB chunks, starting when the first sorted draw is decoded (sorting overlaps the copy) and joined before the staging buffer is unmapped. Each upload is its own `Job`, so a late worker can't take chunks of the next upload. 1 worker: 3.3 → 1.9 ms for 34 MB; more workers don't help (memory bandwidth) |
 | `render/blockentity/RetainedChests.java` + `ModelSubmitCapture.java` + `mixin/render/blockentity/{ClientLevelM,BlockEntityRenderDispatcherM,RenderPipelinesM}.java` + `assets/vulkanmod/shaders/core/retained_entity.vsh` | Closed chests kept on the GPU. Per render section (keyed by `SectionPos`), all chests at rest (exact vanilla chest/trapped/ender classes, `ChestRenderer` exactly, lid idle incl. the other half of a double chest, no breaking progress, one `Float` 0 model on `ENTITY_CUTOUT_CULL`) are built into one vertex buffer relative to the section origin: the real renderer runs into `ModelSubmitCapture` (a `SubmitNodeCollector` that accepts exactly one model submit) and the model is written through `ModelGeometryCache` with all faces. `LevelExtractorM` skips members; batches are drawn after `featureFrame.executeSolid` in `LevelRendererM` with `PIPELINE` (vanilla `entity_cutout_cull` + a vertex shader adding `DynamicTransforms.ModelOffset`; registered via `RenderPipelines.optionalPipelines`, so a compile failure just turns it off). Transforms are written after `prepareFrame` with fresh vectors (`DynamicGpuDataStorageMapped` dedups against the last record by `equals`), and the sequential index buffer is grown there too (not inside a pass). Rebuilt when the section's mesh changes, when the section or a neighbour hits `LevelExtractor.setSectionDirty(IIIZ)` (block and light changes; a double chest's light can come from the neighbour), on chest `triggerEvent`, `ClientLevel.destroyBlockProgress`, and when a left out (moving) chest comes to rest. Sections partly within the chest view distance (64) use the vanilla path that frame. Budget 2048 chests rebuilt per frame; batches unused for 1200 frames are freed. Cleared on level change, `allChanged` and resource reload |
-| `render/blockentity/InstancedModels.java` + `assets/vulkanmod/shaders/core/instanced_entity.vsh` | GPU instancing of block entity models that only differ by pose; currently `EnchantTableRenderer` with a closed book (`ModelGeometryCache.modelSpaceKey`). The extraction (`LevelExtractorM`) calls `tryAdd` after `tryExtractRenderState`: the real renderer submits into `ModelSubmitCapture`, and a single `ENTITY_SOLID` model with a rotation-only pose becomes an instance (3 pose rows + light, 52 B, `INSTANCE_FORMAT` with step rate 1) instead of a submitted render state. Per group (model, key, render type, UV mapping, overlay, tint): a model-space mesh from `ModelGeometryCache.writeModelSpace` (identity pose, all faces, duplicates skipped) and a `MappableRingBuffer` for the instances (rotated at the next prepare, so its fence covers the frame that used it). Drawn after `RetainedChests` with `PIPELINE` (vanilla `entity_solid` + an instanced vertex shader). Cleared with the retained chests |
+| `render/blockentity/InstancedModels.java` + `assets/vulkanmod/shaders/core/instanced_entity.vsh` | GPU instancing of models that only differ by pose. Two entry points: (1) the extraction (`LevelExtractorM`) calls `tryAdd(dispatcher, state, …)` after `tryExtractRenderState` for `EnchantTableRenderer`: the real renderer submits into `ModelSubmitCapture`, and a single model with a `modelSpaceKey` (closed book) becomes an instance instead of a submitted render state; (2) `ModelFeatureRendererM.prepareModel` calls `tryAdd(submit)` for models in `POSED_MODELS` (`ArmorStandModel`): after `setupAnim`, a snapshot of all parts' transforms/visibility keys the group (exact for pure `ModelPart` trees; max 32 groups per model) and the mesh is `model.root().render` with the identity pose and CPU culling off. An instance is 3 pose rows + light (52 B, `INSTANCE_FORMAT`, step rate 1). Poses must be orthogonal (rotations, or the `scale(-1,-1,1)` mirror of living entities, where vanilla's normal matrix equals the pose). Instanced copies of `entity_solid`, `entity_cutout` (per-face lighting, no cull) and `entity_cutout_cull` (`PIPELINES`). Per group (model, key, render type, UV mapping, overlay, tint): a model-space mesh from `ModelGeometryCache.writeModelSpace` (identity pose, all faces, duplicates skipped) and a `MappableRingBuffer` for the instances (rotated at the next prepare, so its fence covers the frame that used it). Drawn after `RetainedChests` with `PIPELINE` (vanilla `entity_solid` + an instanced vertex shader). Cleared with the retained chests |
 | `mixin/world/{LevelM,BoundTickingBlockEntityM,RebindableTickingBlockEntityWrapperM,ChestBlockEntityM,EnderChestBlockEntityM,ChestLidControllerM,SignBlockEntityM}.java` + `interfaces/IdleTicker.java` | `Level.tickBlockEntities` skips tickers whose tick is a no-op: exact vanilla chest/trapped/ender chest classes with a closed lid that stays closed, and sign/hanging sign classes with no editing player. Also skips the world border, block state and validity checks in front of them. 1.6 → 1.0 ms per tick with ~14k block entities |
 
 Design rules used so far:
@@ -315,10 +317,10 @@ Sodium runs on its default (OpenGL).
 
 | Phase (avg / p95 low / p99 low) | vanilla GL | vanilla Vulkan | Sodium | VulkanMod v4 | VulkanMod HEAD |
 |---|---|---|---|---|---|
-| initial | 19.3 / 13.9 / 7.8 | 22.9 / 15.1 / 9.1 | 49.1 / 30.1 / 18.1 | 93.3 / 59.0 / 30.0 | **228.8 / 128.4 / 43.0** |
-| pan | 50.1 / 18.1 / 16.0 | 61.2 / 20.8 / 17.8 | 162.9 / 38.2 / 29.3 | 293.2 / 71.3 / 30.9 | **462.5 / 156.3 / 117.2** |
-| static | 21.1 / 17.3 / 15.9 | 25.3 / 21.1 / 20.1 | 63.4 / 52.5 / 41.8 | 121.4 / 93.7 / 77.7 | **353.7 / 227.3 / 181.9** |
-| particles | 20.6 / 18.4 / 15.7 | 24.3 / 20.9 / 18.0 | 60.6 / 51.0 / 42.7 | 115.5 / 86.4 / 72.2 | **333.2 / 211.9 / 152.6** |
+| initial | 19.3 / 13.9 / 7.8 | 22.9 / 15.1 / 9.1 | 49.1 / 30.1 / 18.1 | 93.3 / 59.0 / 30.0 | **262.1 / 140.7 / 48.2** |
+| pan | 50.1 / 18.1 / 16.0 | 61.2 / 20.8 / 17.8 | 162.9 / 38.2 / 29.3 | 293.2 / 71.3 / 30.9 | **515.7 / 162.1 / 117.2** |
+| static | 21.1 / 17.3 / 15.9 | 25.3 / 21.1 / 20.1 | 63.4 / 52.5 / 41.8 | 121.4 / 93.7 / 77.7 | **415.2 / 251.7 / 192.2** |
+| particles | 20.6 / 18.4 / 15.7 | 24.3 / 20.9 / 18.0 | 60.6 / 51.0 / 42.7 | 115.5 / 86.4 / 72.2 | **375.7 / 228.0 / 157.7** |
 | alloc at static view | ~16.5 MB/frame | ~16.7 MB/frame | ~11.3 MB/frame | ~4.6 MB/frame | **~1.3 MB/frame** |
 | block entities extracted / frame (static) | ~14 075 | ~14 075 | ~8 417 | ~3 862 | **~507** (+ ~3.1k retained chests, ~250 instanced books) |
 
@@ -328,8 +330,10 @@ section classification ~120 (noise; −6.8% hash lookups in JFR) → direct sort
 cache 128.3 → CPU back-face skip 139.7 → rest pose geometry cache 161.0 → per-line sign cache 163.3 → 4³ cells
 167.7 → packed section positions 170.3 → (third session) closed books in model space 175.3 → parallel upload
 copy 188.2 → sign text back-side skip 194.8 → faster model space writes 199.7 → extraction overwrite 214.1 →
-idle tick skip 217.1 → retained chests 343.4 → instanced books 353.7. Rejected (no gain, reverted): an 11-bit, single-histogram radix sort (the sort's JFR share
-was misattributed). Results archives: `results/vulkanmod-v5 … v20` (v20 = HEAD).
+idle tick skip 217.1 → retained chests 343.4 → instanced books 353.7 → instanced armor stands 415.2.
+Rejected (no gain, reverted): an 11-bit, single-histogram radix sort (the sort's JFR share was misattributed); a
+per-line cache of sign text glyph vertices (verified bit-identical, but static 353.7 → 356.5 is noise: the text
+cost is writing ~3.4 MB of glyph vertices per frame, which the cache still does). Results archives: `results/vulkanmod-v5 … v21` (v21 = HEAD).
 Facing the chest cube (`staticYaw=270`, 1 run each): ~30 (v4) → 47.5 → ~50 → 56.7 (books) → 61.4 (copy) →
 68.5 (sign sides) → 78.5 (book writes) → 103 (retained chests) → 157.5 (instanced books). Initial p99 dropped (47.7 → 41.5): the batches
 are built in the first frames after the teleport (budget 2048 chests per frame). Peak particles: vanilla ~16 349, VulkanMod ~16 250.
@@ -360,9 +364,12 @@ books' write was 640 ns each before the faster model space path (~5.3k per frame
 ## 8. What's next (in priority order)
 
 1. **Per block entity cost** (the pan p99 and the static view, section 7). Ideas, roughly by expected gain:
-   - **Sign text** is now the largest item at the static view (~15% in the section profiler, ~1 µs per sign
-     side). It is translucent and sorted on upload, so it can't be retained as is; a per-line cache of the
-     glyph vertices relative to the pose translation (like the chest rest cache) would keep vanilla's sorting.
+   - **Sign text** is now the largest item at the static view: ~550 µs per frame for 2028 line submits (nanoTime
+     around `TextFeatureRenderer.buildGroup`), ~450 µs of it in `PreparedText.visit`, i.e. writing ~3.4 MB of
+     glyph vertices (memory bound; caching the vertices didn't help, see section 7). It is translucent and sorted
+     with the other translucent submits, so it can't simply be retained; fewer bytes would need a custom text
+     pipeline (e.g. instancing glyph quads) drawn at the same point of the translucent order.
+   - **Armor stand extraction** (~1.3 µs each, `LivingEntityRenderer.extractRenderState`) and their ticking.
    - **Enchanting tables** still pay extraction + a capture submit per frame (~5.3k facing the cube) and ~5.5k
      ticks per tick.
    - **Other retainable/instanceable block entities**: the same batching works for any block entity whose renderer submits one
