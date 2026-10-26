@@ -1,22 +1,51 @@
 package net.vulkanmod.mixin.render.feature;
 
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.blaze3d.vertex.SheetedDecalTextureGenerator;
+import com.mojang.blaze3d.vertex.VertexConsumer;
+import net.minecraft.client.model.Model;
 import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
+import net.minecraft.client.renderer.feature.RenderTypeFeatureRenderer;
 import net.vulkanmod.render.entity.ModelCulling;
+import net.vulkanmod.render.entity.ModelGeometryCache;
+import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.Overwrite;
+import org.spongepowered.asm.mixin.Shadow;
 
 @Mixin(ModelFeatureRenderer.class)
-public class ModelFeatureRendererM {
+public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<ModelFeatureRenderer.Submit<?>> {
+    @Shadow @Final private PoseStack poseStack;
 
-    @Inject(method = "prepareModel", at = @At("HEAD"))
-    private void beginModel(ModelFeatureRenderer.Submit<?> submit, CallbackInfo ci) {
+    /**
+     * @author VulkanMod
+     * @reason Back face culling ({@link ModelCulling}) and cached rest pose geometry ({@link ModelGeometryCache});
+     * otherwise the vanilla body
+     */
+    @Overwrite
+    private <S> void prepareModel(ModelFeatureRenderer.Submit<S> submit) {
         ModelCulling.beginModel(submit.renderType());
-    }
+        try {
+            this.poseStack.last().set(submit.pose());
+            VertexConsumer buffer = this.getVertexBuilder(submit.renderType());
+            Model<? super S> model = submit.model();
 
-    @Inject(method = "prepareModel", at = @At("RETURN"))
-    private void endModel(ModelFeatureRenderer.Submit<?> submit, CallbackInfo ci) {
-        ModelCulling.endModel();
+            if (submit.sheetedDecalPose() == null && ModelGeometryCache.isCacheable(submit.state())
+                    && ModelGeometryCache.write(model, submit.state(), this.poseStack.last(), buffer, submit.lightCoords(),
+                            submit.overlayCoords(), submit.tintedColor(), submit.uvMapping(), ModelCulling.cullBackFaces())) {
+                return;
+            }
+
+            if (submit.sheetedDecalPose() != null) {
+                buffer = new SheetedDecalTextureGenerator(buffer, submit.sheetedDecalPose(), 1.0F);
+            } else if (submit.uvMapping() != null) {
+                buffer = submit.uvMapping().wrap(buffer);
+            }
+
+            model.setupAnim(submit.state());
+            model.renderToBuffer(this.poseStack, buffer, submit.lightCoords(), submit.overlayCoords(), submit.tintedColor());
+        } finally {
+            ModelCulling.endModel();
+        }
     }
 }
