@@ -68,6 +68,12 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
     private static final String[] EXTRA_SHOT_YAWS = prop("extraShotYaws", "270").split(",");
     /** Yaw of the static and particle phases; only for profiling other view directions */
     private static final float STATIC_YAW = Float.parseFloat(prop("staticYaw", "0"));
+    /**
+     * Records vanilla's section profiler (the debug profiling report) during the static phase, into
+     * {@code debug/profiling/} of the run directory. Times are measured per section, unlike JFR samples, but the
+     * profiler slows the frame down, so the static phase's FPS is not comparable with normal runs.
+     */
+    private static final boolean SECTION_PROFILE = Boolean.parseBoolean(prop("sectionProfile", "false"));
 
     private static final int TICKS_PER_SECOND = 20;
     private static final String RUN_ID = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
@@ -110,7 +116,14 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
 
         context.takeScreenshot(LABEL + "-static-" + RUN_ID);
         context.runOnClient(_ -> FrameRecorder.startPhase());
+        if (SECTION_PROFILE) {
+            context.runOnClient(mc -> mc.debugClientMetricsStart(message -> LOGGER.info(message.getString())));
+        }
         waitSeconds(context, STATIC_SECONDS);
+        if (SECTION_PROFILE) {
+            // Toggles the recording off; the report is written asynchronously during the particle phase
+            context.runOnClient(mc -> mc.debugClientMetricsStart(message -> LOGGER.info(message.getString())));
+        }
         results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("static", -1)));
         LOGGER.info(results.getLast().summaryLine());
 
