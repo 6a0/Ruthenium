@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-26 (second session), at commit `436c1dd` plus the commit that updates this file.
+Last updated: 2026-10-26 (third session), at commit `bf555e7` plus the commit that updates this file.
 
 ---
 
@@ -17,11 +17,15 @@ Last updated: 2026-10-26 (second session), at commit `436c1dd` plus the commit t
 - **Testing:** every change is benchmarked with the automated client gametest (`./gradlew benchVulkanMod`,
   3 runs) and checked for visual parity against vanilla screenshots, then committed with the numbers in the
   commit message. The user asked for this workflow: *commit as you test changes with the benchmark*.
-- **Results so far** (median of 3 runs, vanilla Vulkan backend): static view **25 → 170 fps**, pan **61 → 337 fps**
-  (pan p99 low 18 → 45). Sodium 0.9.3-beta.1 on the same benchmark: 63 / 163.
+- **Results so far** (median of 3 runs, vanilla Vulkan backend): static view **25 → 217 fps**, pan **61 → 379 fps**
+  (pan p99 low 18 → 69). Sodium 0.9.3-beta.1 on the same benchmark: 63 / 163.
 - **The pan p99 is not hitches.** Frames facing the chest cube (yaw 220–320, 11–13k block entities) take
-  ~20–24 ms while the rest of the pan runs at ~1 ms (section 7). The remaining work there is per block entity.
-- **Next:** see section 8 (upload copies, enchanting table books, light lookups, config screen, terrain).
+  ~12 ms (third session start: ~20 ms) while the rest of the pan runs at ~1 ms (section 7). The remaining work
+  there is per block entity.
+- **Don't trust JFR's time attribution** (the user warned about it, and it was wrong again in the third session).
+  Use the section profiler (`-Pbench.sectionProfile=true`) and temporary `System.nanoTime` counters to rank work;
+  see section 6.6.
+- **Next:** see section 8.
 
 ---
 
@@ -69,6 +73,14 @@ fine; implementations must be our own.
 ## 4. Current state of the branch
 
 ```
+bf555e7 Skip block entity ticks that would do nothing
+ba2855a Extract visible block entities without loading culled ones
+ca038aa Speed up model space writes and pair vertex stores
+a6d5d24 Skip sign text on sides facing away from the camera
+b96ae59 Copy staged vertex data into the staging buffer on a second thread
+8547630 Add a section profiler option to the benchmark
+3b68123 Cache closed enchanting table books in model space
+200bd24 Update continuation notes with the culling refinements
 436c1dd Cull block entities from packed section positions
 311a059 Classify 4x4x4 cells in sections that cross the frustum
 5738073 Update continuation notes after the second session
@@ -101,17 +113,22 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/render/text/BakedSheetGlyphM.java` | `@Overwrite render(...)`: direct writes for POSITION_TEX_LIGHTMAP_COLOR (world text) and POSITION_TEX_COLOR (GUI text) |
 | `mixin/render/vertex/VertexSortingM.java` + `render/vertex/DistanceSorting.java` | Replaces `VertexSorting.byDistance` with a packed-long sort (<256) or a stable LSD radix sort with per-thread scratch. Output is **identical** to vanilla (tested against the real 26.3 class) |
 | `mixin/render/particle/ParticleEngineM.java` + `ClientPacketListenerM.java` + `interfaces/ParticleSpawnLimiter.java` | Drops particles whose group is full (exact) and caps queued candidates per group per tick at 8×16384 (peak count within ~1% of vanilla). The packet loop stops once dropping starts |
-| `mixin/render/blockentity/LevelExtractorM.java` + `FrustumAccessor.java` + `render/blockentity/BlockEntityCulling.java` | Per-block-entity frustum culling inside `extractVisibleBlockEntities`. Conservative box: block ±1, +2 extra on top. **Vanilla block entity types only.** Redirects `getBlockPos` (test), the destruction-progress `Long2ObjectMap.get` (skipped when culled or empty) and `tryExtractRenderState`. Each section is classified once (inside/outside/partial with the same margins), then 4³ cells of partial sections, and only block entities in partial cells are tested individually. Positions and cullability come from `CompiledSectionMeshM` (`interfaces/BlockEntityPositions`, packed once per compiled mesh) by list index, so culled block entities are never dereferenced (vanilla gets `BlockPos.ZERO` for them) |
+| `mixin/render/blockentity/LevelExtractorM.java` + `FrustumAccessor.java` + `render/blockentity/BlockEntityCulling.java` | `@Overwrite extractVisibleBlockEntities`: vanilla's loop with per-block-entity frustum culling inlined. Conservative box: block ±1, +2 extra on top. **Vanilla block entity types only.** Each section is classified once (inside/outside/partial with the same margins), then 4³ cells of partial sections, and only block entities in partial cells are tested individually. Positions and cullability come from `CompiledSectionMeshM` (`interfaces/BlockEntityPositions`, packed once per compiled mesh) by list index, so culled block entities are not even loaded from the list. The destruction progress map is skipped while empty. Fabric API doesn't inject into this method (checked) |
 | `mixin/render/vertex/MeshDataSortStateM.java` | `@Overwrite` `writeSortedIndexBuffer`/`buildSortedIndexBuffer`: sorted quad indices written with `MemoryUtil` puts instead of an `IntConsumer` per index. Sign text (`text_polygon_offset`) is sorted on upload and needs 32-bit indices with ~500 signs |
-| `render/text/SignTextCache.java` + `mixin/render/text/{SignTextM,AbstractSignRendererM,TextFeatureRendererM,FontSetM}.java` | `SignText.getRenderMessages` wraps each line (only when recomputed) in a `FormattedCharSequence` that carries its width and `Font.PreparedText` (plain/shadowed/outline, keyed by x/y/colours). Obfuscated lines are not cached; `FontSet.resetTextures` bumps a generation. A first version with a global identity map was slower than no cache |
-| `render/entity/ModelCulling.java` + `mixin/render/feature/LevelRendererM.java` | Flags the world's `FeatureRenderDispatcher.prepareFrame` and the current model's render type. When the pipeline culls (`RenderPipeline.isCull()`), `ModelPartCubeM` skips faces the GPU would cull: `(v1-v0)x(v2-v0)` of the transformed corners points away from every eye position within 0.5 blocks of the origin (camera-relative positions; bobbing moves the eye ~0.1). Degenerate faces are kept |
-| `render/entity/ModelGeometryCache.java` + `mixin/render/feature/ModelFeatureRendererM.java` | `@Overwrite prepareModel`. Models whose state is `Float` 0 (closed chests, …) are captured once per pose rotation + normal matrix, overlay, tint and `UvMapping` (translation removed, through a recording `VertexConsumer` on the vanilla path), then written with the translation added, the submit's light and precomputed face planes for the back-face test. Only rounding differs from vanilla. Max 16 entries per model; models whose capture fails are remembered |
+| `render/text/SignTextCache.java` + `mixin/render/text/{SignTextM,AbstractSignRendererM,TextFeatureRendererM,FontSetM}.java` | `SignText.getRenderMessages` wraps each line (only when recomputed) in a `FormattedCharSequence` that carries its width and `Font.PreparedText` (plain/shadowed/outline, keyed by x/y/colours). Obfuscated lines are not cached; `FontSet.resetTextures` bumps a generation. A first version with a global identity map was slower than no cache. `AbstractSignRendererM` also skips the text of a sign side whose plane faces away from the eye by ≥ 0.55 blocks (`ModelCulling.isSignTextHidden`): polygon-offset text pipelines (and their OIT sets) cull back faces, checked at runtime. Glyph quads wind like (0,0),(0,1),(1,1), so the side's facing is `column1 × column0` of the pose |
+| `render/entity/ModelCulling.java` + `mixin/render/feature/LevelRendererM.java` | Flags the world's `FeatureRenderDispatcher.prepareFrame`, `LevelRenderer.submitBlockEntities` (for sign text) and the current model's render type. When the pipeline culls (`RenderPipeline.isCull()`), `ModelPartCubeM` skips faces the GPU would cull: `(v1-v0)x(v2-v0)` of the transformed corners points away from every eye position within 0.5 blocks of the origin (camera-relative positions; bobbing moves the eye ~0.1). Degenerate faces are kept. `skipDuplicateQuads()` is true for render types without blending or upload sorting (drawing a quad twice is then idempotent) |
+| `render/entity/ModelGeometryCache.java` + `mixin/render/feature/ModelFeatureRendererM.java` | `@Overwrite prepareModel`. Models whose state is `Float` 0 (closed chests, …) are captured once per pose rotation + normal matrix, overlay, tint and `UvMapping` (translation removed, through a recording `VertexConsumer` on the vanilla path), then written with the translation added, the submit's light and precomputed face planes for the back-face test. **Model space entries** (`modelSpaceKey`: currently closed `BookModel.State`, openness 0, where the page flips move nothing) are captured with the identity pose and transformed per write: back faces are tested in model space (eye moved into model space when the pose's linear part is a similarity, else the transformed corners are tested), only corners of written quads are transformed, exact duplicate quads are skipped when allowed. Vertices are written as 4 longs + 1 int. Only rounding differs from vanilla; a temporary check against vanilla's model rendering of 214k book submits found no extra quads and only culled or duplicate missing ones. Max 16 entries per model; models whose capture fails are remembered |
+| `mixin/render/vertex/StagedVertexBufferM.java` + `render/vertex/ParallelUploadCopy.java` | Redirects the per-slice `ByteBuffer.put` in `StagedVertexBuffer.uploadDrawsToBuffers` to record the copies; a worker thread and the render thread copy them in 1 MB chunks, starting when the first sorted draw is decoded (sorting overlaps the copy) and joined before the staging buffer is unmapped. Each upload is its own `Job`, so a late worker can't take chunks of the next upload. 1 worker: 3.3 → 1.9 ms for 34 MB; more workers don't help (memory bandwidth) |
+| `mixin/world/{LevelM,BoundTickingBlockEntityM,RebindableTickingBlockEntityWrapperM,ChestBlockEntityM,EnderChestBlockEntityM,ChestLidControllerM,SignBlockEntityM}.java` + `interfaces/IdleTicker.java` | `Level.tickBlockEntities` skips tickers whose tick is a no-op: exact vanilla chest/trapped/ender chest classes with a closed lid that stays closed, and sign/hanging sign classes with no editing player. Also skips the world border, block state and validity checks in front of them. 1.6 → 1.0 ms per tick with ~14k block entities |
 
 Design rules used so far:
 - Hot paths use `@Overwrite` with an inlined vanilla fallback, because a cancellable `@Inject` allocates a
   `CallbackInfo` per call, which showed up in allocation profiles.
 - Fast paths only engage for the exact vertex format they write (`ExtendedVertexBuilder.of(consumer, format)`).
-- Output must match vanilla visually (screenshot diff, section 6.5).
+- Output must match vanilla visually (screenshot diff, section 6.5). Skipping geometry is only done when the GPU
+  provably discards it (back faces of culling pipelines, beyond a margin) or it is an exact, idempotent repeat.
+- Static fields with initializers in a mixin class broke the target's instance field initialisation once
+  (`cellStamps` was null); keep diagnostic statics in a separate plain class.
 
 ### Resources
 - `vulkanmod.mixins.json`: client mixins listed above, `compatibilityLevel` `JAVA_25`.
@@ -203,7 +220,7 @@ python scripts/bench_summary.py build/run/bench/results   # medians per label an
 Options: `-PbenchJfr` (JFR profile to `results/<label>.jfr`), `-PbenchWindow=WxH` (default 1920x1080),
 `-PbenchJavaVendor=microsoft -Porg.gradle.java.installations.paths=<jdk>` (run on another JDK), and
 `-Pbench.<name>=value` → `-Dvulkanmod.bench.<name>` (`renderDistance`, `preset`, `panSeconds`, `initialSeconds`,
-`staticSeconds`, `particleSeconds`, `server`, `particleCommand`, `extraShotYaws`, `staticYaw`).
+`staticSeconds`, `particleSeconds`, `server`, `particleCommand`, `extraShotYaws`, `staticYaw`, `sectionProfile`).
 `-Pbench.staticYaw=270` runs static and particles facing the chest cube, for profiling the slow pan direction.
 `-Pbench.label` does **not** change the label (the task sets it), so move such runs out of `results/` (e.g. to
 `results/heavy270/`) before summarizing. `python scripts/frames_by_yaw.py <csv> [bin°]` buckets the pan by yaw
@@ -212,7 +229,8 @@ and lists frames much slower than their neighbours.
 **Workflow per change:** archive the previous `vulkanmod-*` results and frame CSVs
 (`mkdir -p results/vulkanmod-vN/frames && mv vulkanmod-2026* vulkanmod-vN/ && mv frames/vulkanmod-* vulkanmod-vN/frames/`),
 run 3×, summarize, diff the static and yaw 270 screenshots, then commit with the numbers. Archives so far go up to
-`vulkanmod-v9`; the reference screenshots for parity are the v4 ones from `20261026-201821`.
+`vulkanmod-v18`; the reference screenshots for parity are the v4 ones from `20261026-201821`. Runs with
+`staticYaw=270`, `sectionProfile` or temporary instrumentation go to `results/heavy270/` or `results/sectprof/`.
 
 ### 6.4 Gotchas
 - **Don't compile or run anything CPU-heavy while a benchmark matrix is running.** Each bench task also rebuilds
@@ -250,10 +268,23 @@ profile was archived under `results/old-nostatic/`. The profile setting samples 
 phase (≥ 400 samples) before trusting a percentage.
 
 **JFR attributes time inside inlined code to the nearest debug scope, which is often wrong.** Seen so far:
-16% "in" `ByteBufferBuilder.ensureCapacity` that was really `Cube.compile`'s vertex writes, and `Font.width`
-samples under a cache *hit* path that instrumented counters proved never ran. Check surprising leaf frames with a
-counter or an experiment before acting on them. Inclusive totals of non-inlined callers (e.g. `prepareModel`,
-`upload`) are reliable.
+16% "in" `ByteBufferBuilder.ensureCapacity` that was really `Cube.compile`'s vertex writes, `Font.width`
+samples under a cache *hit* path that instrumented counters proved never ran, 5.8% in
+`RenderTypeFeatureRenderer$Group.getVertexBuilder` whose slow path runs ~5 times per frame, and 20% for the book
+model space write that nanoTime put at ~12%. `jdk.ExecutionSample` also never sees native time. Inclusive totals
+of non-inlined callers are better, but rank work with measurements:
+
+- **Section profiler:** `-Pbench.sectionProfile=true` records vanilla's debug profiler (`debugClientMetricsStart`)
+  over the static phase into `build/run/bench/vulkanmod/debug/profiling/*.zip`; `client/profiling.txt` has
+  nanoTime-based shares per section (`prepare` → `Entity Model`/`Text`, `uploadSharedVertexBuffer`,
+  `submitFeatures`, `extract` → `blockEntities`, `tick`). The profiler slows frames, and per block entity pushes
+  inflate `tick` → `blockEntities` heavily, so read it for proportions only.
+- **Temporary nanoTime counters** around a call (in a separate plain class, see the design rules), printing
+  averages every N calls, for exact costs. Examples from this session: book write 640 ns (130 transform / 185
+  culling / 370 writing), chest cached write 123 ns, `tryExtractRenderState` 137 ns per chest, upload 3.3 ms for
+  34 MB, `tickBlockEntities` 1.6 ms per tick. Remove them before benchmarking for a commit.
+- **Cross-checks against vanilla** for geometry changes: render the same submit through the vanilla path into a
+  recording `VertexConsumer` and compare quad sets (used for the model space cache).
 
 ---
 
@@ -264,57 +295,66 @@ Sodium runs on its default (OpenGL).
 
 | Phase (avg / p95 low / p99 low) | vanilla GL | vanilla Vulkan | Sodium | VulkanMod v4 | VulkanMod HEAD |
 |---|---|---|---|---|---|
-| initial | 19.3 / 13.9 / 7.8 | 22.9 / 15.1 / 9.1 | 49.1 / 30.1 / 18.1 | 93.3 / 59.0 / 30.0 | **130.4 / 79.7 / 36.0** |
-| pan | 50.1 / 18.1 / 16.0 | 61.2 / 20.8 / 17.8 | 162.9 / 38.2 / 29.3 | 293.2 / 71.3 / 30.9 | **336.6 / 83.5 / 45.0** |
-| static | 21.1 / 17.3 / 15.9 | 25.3 / 21.1 / 20.1 | 63.4 / 52.5 / 41.8 | 121.4 / 93.7 / 77.7 | **170.3 / 121.9 / 103.6** |
-| particles | 20.6 / 18.4 / 15.7 | 24.3 / 20.9 / 18.0 | 60.6 / 51.0 / 42.7 | 115.5 / 86.4 / 72.2 | **160.6 / 112.5 / 91.8** |
-| alloc at static view | ~16.5 MB/frame | ~16.7 MB/frame | ~11.3 MB/frame | ~4.6 MB/frame | **~2.6 MB/frame** |
-| block entities / frame (static) | ~14 075 | ~14 075 | ~8 417 | ~3 862 | **~3 861** |
+| initial | 19.3 / 13.9 / 7.8 | 22.9 / 15.1 / 9.1 | 49.1 / 30.1 / 18.1 | 93.3 / 59.0 / 30.0 | **165.3 / 93.5 / 47.7** |
+| pan | 50.1 / 18.1 / 16.0 | 61.2 / 20.8 / 17.8 | 162.9 / 38.2 / 29.3 | 293.2 / 71.3 / 30.9 | **378.6 / 93.3 / 69.1** |
+| static | 21.1 / 17.3 / 15.9 | 25.3 / 21.1 / 20.1 | 63.4 / 52.5 / 41.8 | 121.4 / 93.7 / 77.7 | **217.1 / 150.7 / 129.0** |
+| particles | 20.6 / 18.4 / 15.7 | 24.3 / 20.9 / 18.0 | 60.6 / 51.0 / 42.7 | 115.5 / 86.4 / 72.2 | **207.2 / 146.1 / 109.8** |
+| alloc at static view | ~16.5 MB/frame | ~16.7 MB/frame | ~11.3 MB/frame | ~4.6 MB/frame | **~2.3 MB/frame** |
+| block entities / frame (static) | ~14 075 | ~14 075 | ~8 417 | ~3 862 | **~3 860** |
 
 History of the static view: v1 (cube + particle writers + primitive sort) 30.6 → v2 (+glyph writer, radix sort,
 particle cap) 34.3 → v3 (overwrites, pooled sort scratch) 35.1 → v4 (block entity frustum culling) 121.4 →
 section classification ~120 (noise; −6.8% hash lookups in JFR) → direct sorted index writes 126.7 → sign text
 cache 128.3 → CPU back-face skip 139.7 → rest pose geometry cache 161.0 → per-line sign cache 163.3 → 4³ cells
-167.7 → packed section positions 170.3. Rejected (no gain, reverted): an 11-bit, single-histogram radix sort
-(the sort's JFR share was misattributed). Results archives: `results/vulkanmod-v5 … v12` (v12 = HEAD).
-Facing the chest cube (`staticYaw=270`): ~30 (v4) → 47.5 → ~50 fps. Peak particles: vanilla ~16 349,
-VulkanMod ~16 250.
+167.7 → packed section positions 170.3 → (third session) closed books in model space 175.3 → parallel upload
+copy 188.2 → sign text back-side skip 194.8 → faster model space writes 199.7 → extraction overwrite 214.1 →
+idle tick skip 217.1. Rejected (no gain, reverted): an 11-bit, single-histogram radix sort (the sort's JFR share
+was misattributed). Results archives: `results/vulkanmod-v5 … v18` (v18 = HEAD).
+Facing the chest cube (`staticYaw=270`, 1 run each): ~30 (v4) → 47.5 → ~50 → 56.7 (books) → 61.4 (copy) →
+68.5 (sign sides) → 78.5 (book writes). Peak particles: vanilla ~16 349, VulkanMod ~16 250.
 
 ### The pan's p99
 `frames_by_yaw.py` on the pan series: yaw 100–200 has no block entities in view and runs at ~1 ms; yaw 220–320
-faces the chest cube (7–13k block entities extracted) at a median of ~24 ms (v4: ~33 ms). GC-correlated spikes
-exist but stay under ~15 ms. So the p99 low is the cube's frame time, and only per block entity work moves it.
-The scene (from the debug counts): ~3.1k `ChestRenderState` (chests and ender chests), ~250–1800
-`EnchantTableRenderState`, ~500–620 standing signs and 188 armor stands in view, depending on direction.
+faces the chest cube (7–13k block entities extracted) at ~12 ms now (v4: ~33 ms, third session start ~20 ms).
+GC-correlated spikes exist but stay under ~15 ms. So the p99 low is the cube's frame time, and only per block
+entity work moves it. Counted with instrumentation: at the static view ~3.1k chests, ~250 enchanting tables, ~507
+signs, 188 armor stands; facing the cube (yaw 270) ~5.3k chests and ~5.3k enchanting tables (closed books)
+per frame, and ~80k sign glyph quads before the back-side skip (~49k after). Signs in 26.3 submit only text;
+the sign board is not a block entity model. The client ticks ~8.3k chests, ~5.5k enchanting tables and ~2.3k
+signs every tick regardless of view.
 
-### Where the render thread goes now (inclusive, before the geometry cache unless noted)
-Static view (v8 JFR, ~7.2 ms/frame): models 31.8% (`Cube.compile` 24.5%; chests were most of it and are now
-cached), `extractVisibleBlockEntities` 15.2% (frustum tests ~5–7%, `tryExtractRenderState` 5.5%,
-`ChestRenderer.extractRenderState` 4%, `LightCoordsUtil.getLightCoords` 3%), upload 9.5% (mostly the vertex
-memcpy into the mapped staging buffer; sorting ~3%), text 9.2%, armor stand extraction 5%, sign submit 4.8%,
-`Level.tickBlockEntities` 4.2% (client chest/table ticks, mostly loop overhead), terrain draw prep 4%.
-Facing the chest cube (heavy270-c JFR, after the geometry cache, ~20 ms/frame): models 31.6% (mostly ~1.8k
-animated enchanting table books, not cacheable), upload 16.7%, text 13%, sign submit 5.9%, sort 6%.
+### Where the render thread goes now (measured, third session)
+Static view (~4.6 ms/frame at 217 fps), from the section profiler and nanoTime counters before the last few
+changes: block entity extraction ~1.0 ms (`tryExtractRenderState` 0.51 ms for 3.9k visible, chests 137 ns each;
+the loop over ~10k culled ones ~0.45 ms before the overwrite), model prepare ~1.2 ms (chests 3.1k × 212 ns
+≈ 0.65 ms, armor stands 188 × 1.7 µs ≈ 0.33 ms, books 250 × 760 ns before the faster writes), text prepare
+~0.5 ms, `submitFeatures` ~0.55 ms, upload ~0.4 ms, entity extraction ~0.25 ms, block entity ticks 1.0 ms per tick
+(every ~10th frame).
+Facing the chest cube (~12 ms/frame): the world upload is 34 MB per frame before the sign-side skip (books
+16.4 MB, sign text 8.9 MB sorted + 1.9 MB indices, chests 6.9 MB), copied at ~17 GB/s with 2 threads; the
+books' write was 640 ns each before the faster model space path (~5.3k per frame).
 
 ---
 
 ## 8. What's next (in priority order)
 
-1. **Per block entity cost facing the chest cube** (the pan p99, section 7). Ideas, roughly by expected gain:
-   - **Upload copies** (`StagedVertexBuffer.uploadDrawsToBuffers`, 10–17%): vertices are built in a
-     `ByteBufferBuilder`, memcpy'd into a mapped staging `GpuBuffer`, then GPU-copied into the vertex buffer.
-     Writing straight into mapped memory would remove one copy, but sizes are only known after building.
-   - **Enchanting table books** (~1.8k in the cube direction): animated every frame (`BookModel` state), so the
-     rest pose cache can't take them. Back faces are already skipped (entity_solid culls).
-   - **Light lookups** (`LightCoordsUtil.getLightCoords` ~3%) and `ChestRenderer.extractRenderState`
-     (double-chest `combine`, ~4%) per block entity per frame.
-   - **Block entity iteration**: culling no longer touches culled block entities, but vanilla still iterates the
-     ~14k-entry lists per frame; visible ones still pay `tryExtractRenderState` (~8% at static).
-   - **Sorted sign text** (~6% facing the cube): `text_polygon_offset` is translucent and sorted on upload.
-   - `Level.tickBlockEntities` ~4% (client chest/table ticks, mostly the loop's chunk checks and `isValid`).
+1. **Per block entity cost** (the pan p99 and the static view, section 7). Ideas, roughly by expected gain:
+   - **Chest pipeline per frame** (~3.1k at static, ~5.3k facing the cube): extract 137 ns, submit (pose copy,
+     `Submit` record, `Float` boxing, facing `mulPose`, sprite lookups), prepare 212 ns (123 ns of it the cached
+     write). A retained path for rest-state chests (vertex data kept per section, re-written only on change,
+     light from the extraction) would remove most of it but needs light-change invalidation; the cheaper route
+     is trimming each step.
+   - **`tryExtractRenderState` per visible block entity**: renderer lookup (`ImmutableMap`), `isValid` (set
+     lookup), `shouldRender`, render state allocation, `LightCoordsUtil.getLightCoords`, chest `combine`.
+   - **Writing vertices straight into mapped memory** would remove the remaining upload copy (1.9 ms for 34 MB
+     facing the cube), but sorting reads vertices back (slow from write-combined memory), sizes are only known
+     after building, and the staging memory must survive until the GPU copy.
+   - **Armor stands** (188 × 1.7 µs prepare + extraction): their state is a mutable render state; a model space
+     entry keyed by the pose fields would work.
+   - **Enchanting table ticks** (~5.5k per tick, most of the remaining 1.0 ms): they animate every tick.
    - Occlusion culling of block entities is **not** exact here: chests are 14/16 wide and the chests behind show
      through the 2/16 gaps, so culling them changes pixels.
-2. **Allocation** (~2.6 MB/frame at static): `Float` boxing of chest openness per submit, submit records,
+2. **Allocation** (~2.3 MB/frame at static): `Float` boxing of chest openness per submit, submit records,
    `PoseStack.Pose`, glyph instances of non-sign text, `CompactVectorArray` per sort.
 3. **Config and settings screen port** (`dev:src/main/java/net/vulkanmod/config/**`). Needed so the particle cap
    and block-entity culling become toggles. Port notes from the audit:
@@ -374,13 +414,16 @@ animated enchanting table books, not cacheable), upload 16.7%, text 13%, sign su
 - **Thread-safety assumptions:** `ModelPartCubeM`, `BakedSheetGlyphM` and `QuadParticleRenderStateM` keep
   per-instance scratch, which matches vanilla (models and text are built on the render thread).
   `DistanceSorting` uses a `ThreadLocal` because sorting can run on worker threads. `SignTextCache`,
-  `ModelCulling` and `ModelGeometryCache` are static, render-thread-only state.
+  `ModelCulling`, `ModelGeometryCache` and `ParallelUploadCopy` are static, render-thread-only state
+  (`ParallelUploadCopy`'s worker only copies chunks of the current job).
 - **Assumptions of the model caches/culling:** world features are camera-relative (eye at the origin) and
   drawn with a perspective projection; `Float`-state models are pure functions of that state in `setupAnim`;
   atlas sprites are replaced (not mutated) on resource reload, so identity keys stay valid.
 - **Decompiled sources** from the first session are still at
   `%TEMP%/claude/D--dev-VulkanMod/28854e05-c88c-445a-b4b2-c27fb65a3ca3/scratchpad/src-26.3` (client and
-  `com/mojang` only; disassemble other classes from the merged jar with `javap -c -p`).
+  `com/mojang` only), and the third session decompiled `net/minecraft/{world,core,util}` to
+  `%TEMP%/claude/D--dev-VulkanMod/269eb9c8-84bf-4573-8d0b-c12a3702d95e/scratchpad/src-world` (Vineflower is at
+  `.../28854e05-.../scratchpad/tools/vineflower.jar`; ~20 s per package set).
 - **26.4 snapshots** already change renderpearl further (Vulkan is the default there). Expect API churn when moving
   past 26.3.
 - **Memory files** for future sessions: `~/.claude/projects/D--dev-VulkanMod/memory/` (`port-26-3-strategy.md`,
