@@ -65,6 +65,7 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
     private static final double PARTICLE_SECONDS = Double.parseDouble(prop("particleSeconds", "10"));
     private static final String PRESET = prop("preset", "fancy");
     private static final int RENDER_DISTANCE = Integer.parseInt(prop("renderDistance", "16"));
+    private static final String[] EXTRA_SHOT_YAWS = prop("extraShotYaws", "270").split(",");
 
     private static final int TICKS_PER_SECOND = 20;
     private static final String RUN_ID = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
@@ -78,6 +79,7 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         teleport(context);
 
         List<PhaseResult> results = new ArrayList<>();
+        Map<String, String> frameSeries = new HashMap<>();
 
         // Initial phase: measure while FPS settles after the teleport
         context.runOnClient(_ -> FrameRecorder.startPhase());
@@ -92,10 +94,18 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         });
         context.waitFor(_ -> !FrameRecorder.isPanning(), (int) (PAN_SECONDS * TICKS_PER_SECOND * 10));
         results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("pan", -1)));
+        frameSeries.put("pan", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
         LOGGER.info(results.getLast().summaryLine());
 
         // Static view at the particle spot, as the reference for the particle phase.
         // The screenshot (taken before measuring) is for comparing rendering output between configurations.
+        for (String yaw : EXTRA_SHOT_YAWS) {
+            if (!yaw.isBlank()) {
+                takeScreenshotAtYaw(context, Float.parseFloat(yaw.trim()));
+            }
+        }
+        setYaw(context, 0.0f);
+
         context.takeScreenshot(LABEL + "-static-" + RUN_ID);
         context.runOnClient(_ -> FrameRecorder.startPhase());
         waitSeconds(context, STATIC_SECONDS);
@@ -121,7 +131,7 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         LOGGER.info(results.getLast().summaryLine());
 
         JsonObject environment = context.computeOnClient(this::describeEnvironment);
-        writeResults(results, environment);
+        writeResults(results, environment, frameSeries);
 
         context.runOnClient(mc -> mc.disconnect(new TitleScreen(), false));
         context.waitForScreen(TitleScreen.class);
@@ -185,6 +195,24 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         }
     }
 
+    /**
+     * Screenshots of other view directions, taken between the pan and the static phase, for checking rendering
+     * parity where the static view doesn't look.
+     */
+    private static void takeScreenshotAtYaw(ClientGameTestContext context, float yaw) {
+        setYaw(context, yaw);
+        context.takeScreenshot(LABEL + "-yaw" + (int) yaw + "-" + RUN_ID);
+    }
+
+    private static void setYaw(ClientGameTestContext context, float yaw) {
+        context.runOnClient(mc -> {
+            mc.player.setYRot(yaw);
+            mc.player.yRotO = yaw;
+        });
+        // Let section visibility and compilation catch up with the new direction
+        context.waitTicks(20);
+    }
+
     private static void waitSeconds(ClientGameTestContext context, double seconds) {
         long end = System.nanoTime() + (long) (seconds * 1.0e9);
         while (System.nanoTime() < end) {
@@ -229,7 +257,7 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         return env;
     }
 
-    private static void writeResults(List<PhaseResult> results, JsonObject environment) {
+    private static void writeResults(List<PhaseResult> results, JsonObject environment, Map<String, String> frameSeries) {
         Gson gson = new GsonBuilder().setPrettyPrinting().create();
         JsonObject root = new JsonObject();
         root.add("environment", environment);
@@ -248,6 +276,11 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
             Files.createDirectories(outDir);
             Files.writeString(outDir.resolve(LABEL + "-" + timestamp + ".json"), gson.toJson(root));
             Files.writeString(outDir.resolve(LABEL + "-" + timestamp + ".txt"), summary);
+            Path framesDir = outDir.resolve("frames");
+            Files.createDirectories(framesDir);
+            for (Map.Entry<String, String> series : frameSeries.entrySet()) {
+                Files.writeString(framesDir.resolve(LABEL + "-" + timestamp + "-" + series.getKey() + ".csv"), series.getValue());
+            }
         } catch (IOException e) {
             throw new RuntimeException("Failed to write benchmark results", e);
         }
