@@ -12,7 +12,8 @@ table books skip extraction and their light is cached; **sign text is retained o
 fps). See section 7, "Eighth session". Ninth session: armor stands are extracted into reused render states
 (static 964 -> 1032 fps interleaved; section 7, "Ninth session"). Tenth session: an entity benchmark scene (section
 6.9; the server scene has only armor stands), measurements that ruled out cheaper entity culling and generic render
-state reuse, and **cached block model quads of entities** (item frames etc.; entity scene static 121.8 -> 127.5 fps).
+state reuse, **cached block model quads of entities** (item frames etc.; entity scene static 121.8 -> 127.5 fps), a
+hashed draw lookup (126.8 -> 130.9) and baked quads written a quad at a time (132.3 -> 135.6).
 
 ---
 
@@ -41,9 +42,11 @@ state reuse, and **cached block model quads of entities** (item frames etc.; ent
   screen or `-Dvulkanmod.instancedModels=false`. Since the ninth session armor stands are extracted into render
   states reused across frames (`ReusedRenderStates`, switch `-Dvulkanmod.reuseEntityStates`).
 - **Entity scene** (tenth session, `-Pbench.scene=entities`, section 6.9): ~1.3k entities of 30 types. Vanilla Vulkan
-  86 fps at its static view, VulkanMod 127.5. The block model quads that entities render (item frames, block
+  86 fps at its static view, VulkanMod ~135. The block model quads that entities render (item frames, block
   displays, minecart and enderman blocks) are cached across frames (`BlockModelMeshCache`, switch
-  "Cache Entity Block Models"). Section 8 lists this scene's remaining hot spots.
+  "Cache Entity Block Models"), feature renderer groups find their draw with a hash lookup
+  (`RenderTypeFeatureRendererGroupM`, "Fast Draw Lookup"), and `BufferBuilder` writes baked quads (items) a quad at
+  a time (`BufferBuilderM.putBakedQuad`, "Fast Item Vertices"). Section 8 lists this scene's remaining hot spots.
 - **The settings screen is ported** (fourth session): the video settings button opens VulkanMod's screen with Video,
   Graphics (vanilla options through their `OptionInstance`s) and Optimizations (the mod's switches, `Config`,
   `config/vulkanmod_settings.json`). `-Dvulkanmod.<field>=true|false` overrides any switch for a launch.
@@ -184,6 +187,8 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `render/blockentity/InstancedModels.java` + `assets/vulkanmod/shaders/core/instanced_entity.vsh` | GPU instancing of models that only differ by pose. Two entry points: (1) the extraction (`LevelExtractorM`) calls `tryAdd(dispatcher, state, …)` after `tryExtractRenderState` for `EnchantTableRenderer`: the real renderer submits into `ModelSubmitCapture`, and a single model with a `modelSpaceKey` (closed book) becomes an instance instead of a submitted render state; (2) `ModelFeatureRendererM.prepareModel` calls `tryAdd(submit)` for models in `POSED_MODELS` (`ArmorStandModel`): after `setupAnim`, a snapshot of all parts' transforms/visibility keys the group (exact for pure `ModelPart` trees; max 32 groups per model) and the mesh is `model.root().render` with the identity pose and CPU culling off. An instance is 3 pose rows + light (52 B, `INSTANCE_FORMAT`, step rate 1). Poses must be orthogonal (rotations, or the `scale(-1,-1,1)` mirror of living entities, where vanilla's normal matrix equals the pose). Instanced copies of `entity_solid`, `entity_cutout` (per-face lighting, no cull) and `entity_cutout_cull` (`PIPELINES`). Per group (model, key, render type, UV mapping, overlay, tint): a model-space mesh from `ModelGeometryCache.writeModelSpace` (identity pose, all faces, duplicates skipped) and a `MappableRingBuffer` for the instances (rotated at the next prepare, so its fence covers the frame that used it). Drawn after `RetainedBlockEntities` with `PIPELINE` (vanilla `entity_solid` + an instanced vertex shader). Cleared with the retained chests. **Closed book fast path** (eighth session, `tryAddClosedBook`, called by `LevelExtractorM` before `tryExtractRenderState`): once one closed book went through the capture path (which records its group and renderer), vanilla `EnchantingTableBlockEntity`s with `open == oOpen == 0` and no breaking progress skip the render state and capture: the pose is built with the same JOML calls in the same order as the extraction + `EnchantTableRenderer.submit` (`translate` x3, `rotateY(-yRot)`, `rotateZ(80°)`; bit-identical, checked on 16.7M books), plus `shouldRender`'s distance test. The light and the `isValid` block state check are cached on the block entity (`EnchantingTableBlockEntityM`, `interfaces/CachedBlockEntityLight`) under a generation stamp that every `setSectionDirty` (and `clear`) bumps (`invalidateLight`); 69M cache hits matched fresh lookups |
 | `render/entity/ReusedRenderStates.java` + `mixin/render/entity/{LevelExtractorEntityM,EntityRendererAccessor}.java` | `@Overwrite LevelExtractor.extractEntity`: vanilla `ArmorStand`s with `ArmorStandRenderer` are extracted into render states kept from the previous frame (a pool reset at the head of `extractVisibleEntities`) instead of `createRenderState(entity, partialTicks)`: `extractRenderState` + `finalizeRenderState` (invoker) into the reused state. Vanilla's call took ~1.05 us per armor stand, the reused one ~0.27 us: allocating the state and extracting into it in the same compiled method made the extraction ~5x slower (each step alone, or extracting into an existing state, was 0.07-0.25 us; not JIT tiers, deopts, stack banging or a mixin, all checked). States are submitted and cleared in the frame they are extracted in (`LevelRenderer.submitFeatures`). The extraction overwrites every field except `nameTagAttachment`, `distanceToCameraSq`/`nameTag`/`scoreText` (only with a camera) and `ArmedEntityRenderState`'s arm poses (hidden by the armor stand's own `Rotations` fields, only set by humanoid mobs), which are reset to a new state's values. A temporary reflective deep compare of 2.4M reused states against fresh vanilla ones (139 fields each, incl. the item states) found no difference. Exceptions fall back to vanilla's path (which reports them). Cleared on `setLevel`/`allChanged`. Switch: "Reuse Entity Render States", `-Dvulkanmod.reuseEntityStates` |
 | `render/entity/BlockModelMeshCache.java` + `mixin/render/entity/BlockStateModelWrapperM.java` | The Fabric Renderer API overwrites `BlockStateModelWrapper.update` to emit the model's quads into a new `MutableMesh` on every call, i.e. per item frame, block display, minecart block and enderman's block per frame (decoding and encoding every baked quad; ~2 us per item frame). A `@WrapOperation` on its `emitQuads` call (priority 1100, after Fabric's overwrite; `require = 0`, so without the overwrite nothing changes) looks the output up by the model's geometry key (`FabricBlockStateModel.createGeometryKey` with a random of its own seeded like `update`'s, `@Local(argsOnly)` seed; by FRAPI's contract the key determines `emitQuads`' output for a cull test that culls nothing, which `update` passes), wrapped in `OpaqueKey` when Fabric's default `emitQuads` forces leaves to the solid layer (`ModelBlockRenderer.forceOpaque` with the cutout leaves option). A miss emits into a private `MutableMesh` and stores `immutableCopy()`; hit or miss, the mesh is replayed with `outputTo(emitter)`. Models without a key (custom models) keep Fabric's path. Render thread only, max 4096 entries, cleared on resource reload and when toggled. Switch `blockModelMeshCache`. A temporary check compared 1.5M hits against a fresh emission word for word: identical. **Mixin pitfall seen here:** `BlockAndTintGetter` is `net.minecraft.client.renderer.block.BlockAndTintGetter` in 26.3; with the wrong package in the target the `require = 0` injector silently did nothing |
+| `mixin/render/feature/RenderTypeFeatureRendererGroupM.java` | `RenderTypeFeatureRenderer$Group.getOrAddDraw` runs on every render type switch within a group (~290 times per frame in the entity scene) and searched all of the group's draws with `List.indexOf` and the deep `PreparedRenderType` record `equals` (~0.95 us per call, groups of up to ~200 draws). A `@WrapOperation` on the `indexOf` looks the type up in a per-group `HashMap` from prepared type to its first index, filled by a `@WrapOperation` on the `List.add` calls (only the one on `drawRenderTypes` counts), so it returns what `indexOf` would (~0.1 us). The switch `hashedDrawLookup` is read once per group, so the map always covers the whole list. **Found here:** vanilla's lookup never matches, because `ScissorState` has no `equals` and `prepare()` copies it into a new instance every call, so every render type switch appends a new draw (0 hits in the entity scene). Making scissor states compare by value would let draws merge as Mojang presumably intended (fewer draw calls), but changes the draw order within a group; not done |
+| `mixin/render/vertex/BufferBuilderM.java` (`putBakedQuad`) | Overrides `VertexConsumer.putBakedQuad` (dropped, held and framed items via `ItemFeatureRenderer`) for the block and entity formats: one `reserveVertices(4)`, the same `transformPosition`/`transformNormal` calls as vanilla into a scratch vector (allocated lazily: the mixin's field initializer didn't run for the builders in use, which crashed with a null vector), and the same color, UV, overlay and light per vertex. Other formats, big-endian hosts and switch `directBakedQuads` off call the default method. A temporary check (vanilla's write, then the fast writer into scratch memory, compared byte for byte except the normal's padding byte) passed for 59.5M quads. Items with a Fabric mesh go through Indigo's `ExtendedItemFeatureRenderer` instead and are not affected |
 | `mixin/world/{LevelM,BoundTickingBlockEntityM,RebindableTickingBlockEntityWrapperM,ChestBlockEntityM,EnderChestBlockEntityM,ChestLidControllerM,SignBlockEntityM,ShulkerBoxBlockEntityM}.java` + `interfaces/IdleTicker.java` | `Level.tickBlockEntities` skips tickers whose tick is a no-op: exact vanilla chest/trapped/ender chest classes with a closed lid that stays closed, closed shulker boxes (progress and old progress 0; client and server), and sign/hanging sign classes with no editing player. Also skips the world border, block state and validity checks in front of them. 1.6 → 1.0 ms per tick with ~14k block entities |
 
 Design rules used so far:
@@ -532,6 +537,15 @@ particles: vanilla ~16 349, VulkanMod ~16 250.
 - **Cached entity block model quads** (`2b25f26`; see `BlockModelMeshCache` in section 4): entity scene, interleaved
   with `-Pvm.blockModelMeshCache=false`, median of 3: static 121.8 -> 127.5 (render thread 8.00 -> 7.74 ms), pan
   687.4 -> 720.1 (p99 119.2 -> 125.4). `results/entities-dev/meshcache/{off,on}`.
+- **Hashed draw lookup** (`93c6359`; `RenderTypeFeatureRendererGroupM` in section 4): a probe on vanilla's `indexOf`
+  (`results/probe-drawlookup`) showed ~36k calls/s at the static view, average list size 69 (max 199), ~950 ns per
+  call and never a match; the map takes ~100 ns. Interleaved with `-Pvm.hashedDrawLookup=false`, median of 3: static
+  126.8 -> 130.9 (render thread 7.58 -> 7.36 ms), pan 696.2 -> 699.2. `results/entities-dev/drawlookup/{off,on}`.
+- **Baked quads a quad at a time** (`28e2b5e`; `BufferBuilderM.putBakedQuad` in section 4): interleaved with
+  `-Pvm.directBakedQuads=false`, median of 3: static 132.3 -> 135.6 (render thread 7.44 -> 7.14 ms; allocation
+  1054 -> 771 MB/s, so vanilla's two vectors per vertex were not scalar replaced), pan 722.6 -> 726.1 (p99
+  128.5 -> 135.0). `results/entities-dev/bakedquads/{off,on}`. Screenshots on vs off differ by 1.3-1.7% at threshold
+  12, same-setting pairs by 1.0-1.5%.
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
@@ -646,16 +660,13 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 
 ## 8. What's next (in priority order)
 
-1. **Entity scene hot spots** (section 6.9, static ~7.7 ms/frame; tenth session profile in section 7). By expected
-   gain:
-   - **`RenderTypeFeatureRenderer$Group.getOrAddDraw`** (~5%): every switch of render type in a group calls
-     `renderType.prepare()` and a linear `drawRenderTypes.indexOf(prepared)`, whose `PreparedRenderType` record
-     `equals` is deep (names are equal for all `item_entity_translucent_cull`/`entity_cutout` types, so it compares
-     pipelines, slices and the texture lists). `prepare()` must still be called (it writes the dynamic transform, and
-     the slice is part of the equality); replace only the `indexOf` with a hash map from prepared type to the first
-     index, which returns the same draw.
-   - **Baked quad writes** (`VertexConsumer.putBakedQuad` ~10%: dropped items, held items, item frame contents,
-     item displays): a direct whole-quad write for the formats in use, like `ModelPartCubeM`.
+1. **Entity scene hot spots** (section 6.9, static ~7.1 ms/frame; tenth session profile in section 7). Done in the
+   tenth session: block model mesh cache, hashed draw lookup, baked quads a quad at a time. By expected gain:
+   - **Draw consolidation**: every render type switch in a feature renderer group still appends a new draw (vanilla's
+     lookup never matches, see `RenderTypeFeatureRendererGroupM` in section 4), ~290 draws per frame in the entity
+     scene, each with its own `prepare()` (texture list, transform write). Merging draws of equal types would mean
+     comparing scissor states by value and changes the draw order within groups that may be reordered; measure the
+     draw count and GPU time first, and check translucent groups.
    - **Posed mob models** (`Cube.compile` ~20%): the geometry of every mob is transformed per frame. Already on the
      fast path; animated mobs can't use the armor stand instancing, which keys on the exact pose.
    - Block displays (2.3 us) and minecarts (1 us) still extract slowly after the mesh cache; profile them.
