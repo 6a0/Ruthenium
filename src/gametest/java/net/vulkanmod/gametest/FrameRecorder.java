@@ -30,6 +30,9 @@ public final class FrameRecorder {
     private static final int[] frameEntities = new int[MAX_FRAMES];
     private static final int[] frameBlockEntities = new int[MAX_FRAMES];
     private static final int[] frameGcCount = new int[MAX_FRAMES];
+    /** Client ticks run between this frame's start and the previous one's (in the same loop iteration) */
+    private static final byte[] frameTicks = new byte[MAX_FRAMES];
+    private static int pendingTicks;
     private static float pendingYaw;
     private static int pendingEntities;
     private static int pendingBlockEntities;
@@ -67,12 +70,14 @@ public final class FrameRecorder {
                 frameEntities[frameCount] = pendingEntities;
                 frameBlockEntities[frameCount] = pendingBlockEntities;
                 frameGcCount[frameCount] = (int) (gcCount() - phaseStartGcCount);
+                frameTicks[frameCount] = (byte) Math.min(pendingTicks, 127);
                 frameCount++;
             }
             lastFrameStart = now;
             pendingEntities = 0;
             pendingBlockEntities = 0;
         }
+        pendingTicks = 0;
 
         if (panning) {
             updatePan(minecraft, now);
@@ -85,6 +90,10 @@ public final class FrameRecorder {
         if (recording && minecraft.player != null) {
             pendingYaw = minecraft.player.getYRot();
         }
+    }
+
+    public static void onTick() {
+        pendingTicks++;
     }
 
     public static void onLevelExtracted(LevelRenderState levelState) {
@@ -109,10 +118,23 @@ public final class FrameRecorder {
         phaseStartGcCount = gcCount();
         phaseStartGcMillis = gcMillis();
         phaseStartCpuNanos = THREAD_BEAN.getCurrentThreadCpuTime();
+        if (LightProfiler.enabled()) {
+            LightProfiler.INSTANCE.startRecording();
+        }
+        if (GpuFrameProbe.ENABLED) {
+            GpuFrameProbe.reset();
+        }
     }
 
     public static PhaseResult stopPhase(String name, int peakParticles) {
         recording = false;
+        org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("{}: {}", name, tickSplit());
+        if (GpuFrameProbe.ENABLED) {
+            org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("{}: {}", name, GpuFrameProbe.report());
+        }
+        if (LightProfiler.enabled()) {
+            org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("\n{}", LightProfiler.INSTANCE.stopRecording(name));
+        }
 
         long elapsed = System.nanoTime() - phaseStartNanos;
         long totalAlloc = THREAD_BEAN.getTotalThreadAllocatedBytes() - phaseStartTotalAlloc;
@@ -134,16 +156,49 @@ public final class FrameRecorder {
      */
     public static String framesCsv() {
         StringBuilder sb = new StringBuilder(frameCount * 32);
-        sb.append("frame,ms,yaw,entities,blockEntities,gcs\n");
+        sb.append("frame,ms,yaw,entities,blockEntities,gcs,ticks\n");
         for (int i = 0; i < frameCount; i++) {
             sb.append(i).append(',')
                     .append(String.format(Locale.ROOT, "%.4f", frameNanos[i] / 1.0e6)).append(',')
                     .append(String.format(Locale.ROOT, "%.2f", frameYaw[i])).append(',')
                     .append(frameEntities[i]).append(',')
                     .append(frameBlockEntities[i]).append(',')
-                    .append(frameGcCount[i]).append('\n');
+                    .append(frameGcCount[i]).append(',')
+                    .append(frameTicks[i]).append('\n');
         }
         return sb.toString();
+    }
+
+    /**
+     * Frame times split by whether a client tick ran in the frame's interval: at ~1000 fps only ~2% of the frames
+     * tick, so the tick's cost decides the p99.
+     */
+    private static String tickSplit() {
+        long[] ticked = new long[frameCount];
+        long[] plain = new long[frameCount];
+        int t = 0, p = 0;
+        for (int i = 0; i < frameCount; i++) {
+            if (frameTicks[i] > 0) {
+                ticked[t++] = frameNanos[i];
+            } else {
+                plain[p++] = frameNanos[i];
+            }
+        }
+        return "frames with a tick: %d, %s; without: %d, %s".formatted(t, stats(Arrays.copyOf(ticked, t)), p,
+                stats(Arrays.copyOf(plain, p)));
+    }
+
+    private static String stats(long[] nanos) {
+        if (nanos.length == 0) {
+            return "-";
+        }
+        Arrays.sort(nanos);
+        long sum = 0;
+        for (long n : nanos) {
+            sum += n;
+        }
+        return String.format(Locale.ROOT, "avg %.3f ms, median %.3f, p99 %.3f", sum / 1.0e6 / nanos.length,
+                nanos[nanos.length / 2] / 1.0e6, nanos[Math.min(nanos.length - 1, (int) (nanos.length * 0.99))] / 1.0e6);
     }
 
     public static void setFrameWatcher(@Nullable Consumer<Minecraft> watcher) {

@@ -6,11 +6,16 @@
   "client": [
     "DrawIndirectMixin",
     "LevelExtractorMixin",
+    "LevelRendererProfileMixin",
+    "LevelTickProfileMixin",
     "MinecraftMixin",
+    "MinecraftProfilerMixin",
     "ParticleEngineAccessor",
     "SectionRenderDispatcherAccessor",
     "TerrainDrawListGroupAccessor",
-    "TerrainDrawListMixin"
+    "TerrainDrawListMixin",
+    "TerrainDrawListProfileMixin",
+    "VulkanCommandEncoderProfileMixin"
   ],
   "injectors": {
     "defaultRequire": 1
