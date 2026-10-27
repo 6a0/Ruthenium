@@ -184,6 +184,10 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 		project.properties.findAll { it.key.startsWith("vm.") }.each { k, v ->
 			jvmArgs.add("-Dvulkanmod.${k.substring(3)}=${v}")
 		}
+		// Forward -Pjvm.* project properties as plain system properties (e.g. -Pjvm.MC_DEBUG_ENABLED=true)
+		project.properties.findAll { it.key.startsWith("jvm.") }.each { k, v ->
+			jvmArgs.add("-D${k.substring(4)}=${v}")
+		}
 		// -PbenchWindow=WIDTHxHEIGHT (default 1920x1080)
 		def (windowWidth, windowHeight) = project.findProperty("benchWindow")?.toString()?.split("x") ?: ["1920", "1080"]
 		programArgs.addAll("--username", "6a0", "--width", windowWidth, "--height", windowHeight)

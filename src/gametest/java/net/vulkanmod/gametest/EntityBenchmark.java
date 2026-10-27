@@ -28,6 +28,11 @@ import java.util.TreeMap;
  * so that runs compare. Phases: "static" ({@code bench.staticSeconds}) facing the field and "pan" (a 360 degree pan
  * over {@code bench.panSeconds}). Screenshot: the static view. Clouds are off so that screenshots of different runs
  * compare.
+ * <p>
+ * {@code bench.closeShots=N} adds close-ups of the mob rows after the benchmark, with ticks frozen so that frames of
+ * one run differ only where rendering isn't deterministic: N screenshots per position ({@code close<k>-<n>}). With
+ * {@code bench.closeToggle=<Config field>} the boolean switch is flipped before every other screenshot (and restored
+ * after), so that shots 0, 2, ... and 1, 3, ... compare the two settings on the same frozen frame.
  */
 final class EntityBenchmark {
     private static final Logger LOGGER = LoggerFactory.getLogger("VulkanMod Entity Benchmark");
@@ -36,6 +41,19 @@ final class EntityBenchmark {
     private static final int RENDER_DISTANCE = Integer.parseInt(BenchmarkClientGameTest.prop("entityRenderDistance", "12"));
     private static final float PITCH = 30.0F;
     private static final boolean AI = Boolean.parseBoolean(BenchmarkClientGameTest.prop("entityAi", "false"));
+    private static final int CLOSE_SHOTS = Integer.parseInt(BenchmarkClientGameTest.prop("closeShots", "0"));
+    private static final String CLOSE_TOGGLE = BenchmarkClientGameTest.prop("closeToggle", "");
+
+    /** Close-up camera positions (x, height above the floor, z, pitch), each looking along +z at a few mob rows */
+    private static final float[][] CLOSE_UPS = {
+            {0.5F, 1.8F, 4.5F, 15.0F},   // farm animals
+            {0.5F, 2.2F, 11.0F, 20.0F},  // villagers, zombie villagers
+            {0.5F, 2.2F, 15.5F, 20.0F},  // zombies, skeletons, creepers
+            {0.5F, 2.6F, 20.5F, 20.0F},  // spiders, endermen
+            {0.5F, 2.6F, 24.0F, 20.0F},  // illagers, iron golems
+            {0.5F, 2.6F, 28.0F, 20.0F},  // horses, wolves and cats
+            {0.5F, 2.0F, 32.0F, 15.0F},  // vehicles, displays, item frames
+    };
 
     /** The flat world's surface; the field spans x -32..31, z 0..37 */
     private static final int FLOOR = -60;
@@ -98,6 +116,10 @@ final class EntityBenchmark {
             frameSeries.put("pan", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
             LOGGER.info(results.getLast().summaryLine());
 
+            if (CLOSE_SHOTS > 0) {
+                closeUps(context, server, label, runId);
+            }
+
             var environment = context.computeOnClient(BenchmarkClientGameTest::describeEnvironment);
             environment.addProperty("label", label + "-entities");
             environment.addProperty("entityAi", AI);
@@ -106,6 +128,47 @@ final class EntityBenchmark {
             environment.add("entities", entities);
             BenchmarkClientGameTest.writeResults(label + "-entities", results, environment, frameSeries);
         }
+    }
+
+    private static void closeUps(ClientGameTestContext context, TestServerContext server, String label, String runId) {
+        server.runCommand("tick freeze");
+        context.waitTicks(5);
+        for (int k = 0; k < CLOSE_UPS.length; k++) {
+            float[] view = CLOSE_UPS[k];
+            server.runCommand("tp @a %s %s %s 0 %s".formatted(view[0], FLOOR + view[1], view[2], view[3]));
+            context.waitTicks(10);
+            context.runOnClient(mc -> {
+                mc.player.setYRot(0.0F);
+                mc.player.yRotO = 0.0F;
+                mc.player.setXRot(view[3]);
+                mc.player.xRotO = view[3];
+            });
+            context.waitTicks(5);
+            for (int n = 0; n < CLOSE_SHOTS; n++) {
+                boolean toggled = !CLOSE_TOGGLE.isEmpty() && n % 2 == 1;
+                if (toggled) {
+                    toggleConfig(context);
+                }
+                context.takeScreenshot("%s-entities-close%d-%d-%s".formatted(label, k, n, runId));
+                if (toggled) {
+                    toggleConfig(context);
+                }
+            }
+        }
+        server.runCommand("tick unfreeze");
+    }
+
+    /** Flips the boolean {@code Config} field named by {@code bench.closeToggle}, by reflection (vanilla runs have no mod) */
+    private static void toggleConfig(ClientGameTestContext context) {
+        context.runOnClient(_ -> {
+            try {
+                Object config = Class.forName("net.vulkanmod.Initializer").getField("CONFIG").get(null);
+                var field = config.getClass().getField(CLOSE_TOGGLE);
+                field.setBoolean(config, !field.getBoolean(config));
+            } catch (ReflectiveOperationException e) {
+                throw new AssertionError("Can't toggle " + CLOSE_TOGGLE, e);
+            }
+        });
     }
 
     private static void build(TestServerContext server) {
