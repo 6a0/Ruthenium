@@ -87,7 +87,10 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
     private static final boolean CHEST_EVENTS = Boolean.parseBoolean(prop("chestEvents", "false"));
     /** Instead of the benchmark, drives the settings screen from the title screen (see {@link SettingsScreenCheck}) */
     private static final boolean SETTINGS_SCREEN = Boolean.parseBoolean(prop("settingsScreen", "false"));
-    /** "server" (the multiplayer benchmark) or "terrain" (a singleplayer world, see {@link TerrainBenchmark}) */
+    /**
+     * "server" (the multiplayer benchmark), or a singleplayer world: "terrain" ({@link TerrainBenchmark}),
+     * "blockentities" ({@link BlockEntityBenchmark}) or "entities" ({@link EntityBenchmark})
+     */
     private static final String SCENE = prop("scene", "server");
     /** Takes an extra screenshot at yaw 270 with a 30 degree field of view, for a closer look at block entities */
     private static final boolean ZOOM_SHOT = Boolean.parseBoolean(prop("zoomShot", "false"));
@@ -109,6 +112,10 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         }
         if (SCENE.equals("blockentities")) {
             BlockEntityBenchmark.run(context, LABEL, RUN_ID);
+            return;
+        }
+        if (SCENE.equals("entities")) {
+            EntityBenchmark.run(context, LABEL, RUN_ID);
             return;
         }
 
