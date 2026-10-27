@@ -10,7 +10,9 @@ to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a bl
 (section 6.8). Eighth session (2026-10-27): the settings switches were A/B tested and cost nothing; closed enchanting
 table books skip extraction and their light is cached; **sign text is retained on the GPU** (static view 436 -> 908
 fps). See section 7, "Eighth session". Ninth session: armor stands are extracted into reused render states
-(static 964 -> 1032 fps interleaved; section 7, "Ninth session").
+(static 964 -> 1032 fps interleaved; section 7, "Ninth session"). Tenth session: an entity benchmark scene (section
+6.9; the server scene has only armor stands), measurements that ruled out cheaper entity culling and generic render
+state reuse, and **cached block model quads of entities** (item frames etc.; entity scene static 121.8 -> 127.5 fps).
 
 ---
 
@@ -38,6 +40,10 @@ fps). See section 7, "Eighth session". Ninth session: armor stands are extracted
   entirely (pose computed from the block entity, light cached until a section is marked dirty). Switch: settings
   screen or `-Dvulkanmod.instancedModels=false`. Since the ninth session armor stands are extracted into render
   states reused across frames (`ReusedRenderStates`, switch `-Dvulkanmod.reuseEntityStates`).
+- **Entity scene** (tenth session, `-Pbench.scene=entities`, section 6.9): ~1.3k entities of 30 types. Vanilla Vulkan
+  86 fps at its static view, VulkanMod 127.5. The block model quads that entities render (item frames, block
+  displays, minecart and enderman blocks) are cached across frames (`BlockModelMeshCache`, switch
+  "Cache Entity Block Models"). Section 8 lists this scene's remaining hot spots.
 - **The settings screen is ported** (fourth session): the video settings button opens VulkanMod's screen with Video,
   Graphics (vanilla options through their `OptionInstance`s) and Optimizations (the mod's switches, `Config`,
   `config/vulkanmod_settings.json`). `-Dvulkanmod.<field>=true|false` overrides any switch for a launch.
@@ -177,6 +183,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `render/blockentity/RetainedBlockEntities.java` + `ModelSubmitCapture.java` + `mixin/render/blockentity/{ClientLevelM,BlockEntityRenderDispatcherM,BlockEntityDataPacketM,RenderPipelinesM}.java` + `mixin/world/{ShulkerBoxBlockEntityM,DecoratedPotBlockEntityM}.java` + `assets/vulkanmod/shaders/core/retained_entity.vsh` | Block entities at rest kept on the GPU. Candidates (exact vanilla classes and renderers): chests (lid idle incl. the other half of a double chest), shulker boxes (`CLOSED`, progress 0 at partial tick 0 and 1), decorated pots (no wobble, or game time - start > duration) and skulls (`getAnimation` constant, dragon/piglin heads not `POWERED`; heads with an owner profile never, their skin loads asynchronously). Others of these types are "moving": left out and re-checked every frame. Per render section (keyed by `SectionPos`), the real renderer runs into `ModelSubmitCapture` (a `SubmitNodeCollector` that records model submits; pots submit their 7 parts as `Model.Simple`; anything else, e.g. crumbling, rejects the block entity); a block entity is kept only if every model has no outline and a render type that maps to a retained pipeline (`entity_solid`/`_z_offset_forward`, `entity_cutout_cull`, `entity_cutout`/`_z_offset`) with `DEFAULT_TEXTURING`. Models are written with all faces, through `ModelGeometryCache` for `Float` 0 states, else with vanilla's `setupAnim` + `renderToBuffer`, relative to the section origin, into one vertex buffer per render type. `LevelExtractorM` skips members; batches are drawn after `featureFrame.executeSolid` in `LevelRendererM` with `PIPELINES` (vanilla entity pipelines + a vertex shader adding `DynamicTransforms.ModelOffset`; registered via `RenderPipelines.optionalPipelines`, so a compile failure just turns it off), the render type's textures (`prepare()` once per type per frame) and its layering transform applied to the model view (the skulls' z offset; `RenderType.state` and `RenderSetup`'s transforms are widened in the access widener). Transforms are written after `prepareFrame` with fresh vectors (`DynamicGpuDataStorageMapped` dedups against the last record by `equals`), and the sequential index buffer is grown there too (not inside a pass). Rebuilt when the section's mesh changes, when the section or a neighbour hits `LevelExtractor.setSectionDirty(IIIZ)` (block and light changes; a double chest's light can come from the neighbour), on chest, shulker box and pot `triggerEvent`, block entity data packets (pot sherds, skull profiles; they can arrive after the block), `ClientLevel.destroyBlockProgress`, and when a moving block entity comes to rest. Sections partly within the view distance (64) use the vanilla path that frame. Budget 2048 block entities rebuilt per frame; batches unused for 1200 frames are freed. Cleared on level change, `allChanged` and resource reload. **Signs** (eighth session; `SignBlockEntity`/`HangingSignBlockEntity` with `StandingSignRenderer`/`HangingSignRenderer`, no glowing or obfuscated text on either side): `ModelSubmitCapture` records text submits; a text is retained only if vanilla would put it in the **solid** phase (`SubmitNodeCollection.canRenderAsSolid`: colour alpha 255, no background) with `POLYGON_OFFSET` and no outline, which is why the draw order can change. Its glyphs are prepared through `SignTextCache.prepareText` (as `TextFeatureRendererM` does) and written with `TextRenderable.render` into a part per render type (`renderType.format()`, POSITION_TEX_LIGHTMAP_COLOR), drawn with `TEXT`/`TEXT_GRAYSCALE`: copies of vanilla's `TEXT_POLYGON_OFFSET`/`TEXT_GRAYSCALE_POLYGON_OFFSET` (same state, built from a `Snippet` like `CompressedTerrain`) with `retained_text.vsh`. Extra rebuild triggers: `SignBlockEntity.setText` on the client (`SignBlockEntityM`; the edit screen calls it while typing), `FontSet.resetTextures` (`FontSetM`, clears everything) and a change of `Minecraft.isTextFilteringEnabled` (checked in `beginFrame`, clears) |
 | `render/blockentity/InstancedModels.java` + `assets/vulkanmod/shaders/core/instanced_entity.vsh` | GPU instancing of models that only differ by pose. Two entry points: (1) the extraction (`LevelExtractorM`) calls `tryAdd(dispatcher, state, …)` after `tryExtractRenderState` for `EnchantTableRenderer`: the real renderer submits into `ModelSubmitCapture`, and a single model with a `modelSpaceKey` (closed book) becomes an instance instead of a submitted render state; (2) `ModelFeatureRendererM.prepareModel` calls `tryAdd(submit)` for models in `POSED_MODELS` (`ArmorStandModel`): after `setupAnim`, a snapshot of all parts' transforms/visibility keys the group (exact for pure `ModelPart` trees; max 32 groups per model) and the mesh is `model.root().render` with the identity pose and CPU culling off. An instance is 3 pose rows + light (52 B, `INSTANCE_FORMAT`, step rate 1). Poses must be orthogonal (rotations, or the `scale(-1,-1,1)` mirror of living entities, where vanilla's normal matrix equals the pose). Instanced copies of `entity_solid`, `entity_cutout` (per-face lighting, no cull) and `entity_cutout_cull` (`PIPELINES`). Per group (model, key, render type, UV mapping, overlay, tint): a model-space mesh from `ModelGeometryCache.writeModelSpace` (identity pose, all faces, duplicates skipped) and a `MappableRingBuffer` for the instances (rotated at the next prepare, so its fence covers the frame that used it). Drawn after `RetainedBlockEntities` with `PIPELINE` (vanilla `entity_solid` + an instanced vertex shader). Cleared with the retained chests. **Closed book fast path** (eighth session, `tryAddClosedBook`, called by `LevelExtractorM` before `tryExtractRenderState`): once one closed book went through the capture path (which records its group and renderer), vanilla `EnchantingTableBlockEntity`s with `open == oOpen == 0` and no breaking progress skip the render state and capture: the pose is built with the same JOML calls in the same order as the extraction + `EnchantTableRenderer.submit` (`translate` x3, `rotateY(-yRot)`, `rotateZ(80°)`; bit-identical, checked on 16.7M books), plus `shouldRender`'s distance test. The light and the `isValid` block state check are cached on the block entity (`EnchantingTableBlockEntityM`, `interfaces/CachedBlockEntityLight`) under a generation stamp that every `setSectionDirty` (and `clear`) bumps (`invalidateLight`); 69M cache hits matched fresh lookups |
 | `render/entity/ReusedRenderStates.java` + `mixin/render/entity/{LevelExtractorEntityM,EntityRendererAccessor}.java` | `@Overwrite LevelExtractor.extractEntity`: vanilla `ArmorStand`s with `ArmorStandRenderer` are extracted into render states kept from the previous frame (a pool reset at the head of `extractVisibleEntities`) instead of `createRenderState(entity, partialTicks)`: `extractRenderState` + `finalizeRenderState` (invoker) into the reused state. Vanilla's call took ~1.05 us per armor stand, the reused one ~0.27 us: allocating the state and extracting into it in the same compiled method made the extraction ~5x slower (each step alone, or extracting into an existing state, was 0.07-0.25 us; not JIT tiers, deopts, stack banging or a mixin, all checked). States are submitted and cleared in the frame they are extracted in (`LevelRenderer.submitFeatures`). The extraction overwrites every field except `nameTagAttachment`, `distanceToCameraSq`/`nameTag`/`scoreText` (only with a camera) and `ArmedEntityRenderState`'s arm poses (hidden by the armor stand's own `Rotations` fields, only set by humanoid mobs), which are reset to a new state's values. A temporary reflective deep compare of 2.4M reused states against fresh vanilla ones (139 fields each, incl. the item states) found no difference. Exceptions fall back to vanilla's path (which reports them). Cleared on `setLevel`/`allChanged`. Switch: "Reuse Entity Render States", `-Dvulkanmod.reuseEntityStates` |
+| `render/entity/BlockModelMeshCache.java` + `mixin/render/entity/BlockStateModelWrapperM.java` | The Fabric Renderer API overwrites `BlockStateModelWrapper.update` to emit the model's quads into a new `MutableMesh` on every call, i.e. per item frame, block display, minecart block and enderman's block per frame (decoding and encoding every baked quad; ~2 us per item frame). A `@WrapOperation` on its `emitQuads` call (priority 1100, after Fabric's overwrite; `require = 0`, so without the overwrite nothing changes) looks the output up by the model's geometry key (`FabricBlockStateModel.createGeometryKey` with a random of its own seeded like `update`'s, `@Local(argsOnly)` seed; by FRAPI's contract the key determines `emitQuads`' output for a cull test that culls nothing, which `update` passes), wrapped in `OpaqueKey` when Fabric's default `emitQuads` forces leaves to the solid layer (`ModelBlockRenderer.forceOpaque` with the cutout leaves option). A miss emits into a private `MutableMesh` and stores `immutableCopy()`; hit or miss, the mesh is replayed with `outputTo(emitter)`. Models without a key (custom models) keep Fabric's path. Render thread only, max 4096 entries, cleared on resource reload and when toggled. Switch `blockModelMeshCache`. A temporary check compared 1.5M hits against a fresh emission word for word: identical. **Mixin pitfall seen here:** `BlockAndTintGetter` is `net.minecraft.client.renderer.block.BlockAndTintGetter` in 26.3; with the wrong package in the target the `require = 0` injector silently did nothing |
 | `mixin/world/{LevelM,BoundTickingBlockEntityM,RebindableTickingBlockEntityWrapperM,ChestBlockEntityM,EnderChestBlockEntityM,ChestLidControllerM,SignBlockEntityM,ShulkerBoxBlockEntityM}.java` + `interfaces/IdleTicker.java` | `Level.tickBlockEntities` skips tickers whose tick is a no-op: exact vanilla chest/trapped/ender chest classes with a closed lid that stays closed, closed shulker boxes (progress and old progress 0; client and server), and sign/hanging sign classes with no editing player. Also skips the world border, block state and validity checks in front of them. 1.6 → 1.0 ms per tick with ~14k block entities |
 
 Design rules used so far:
@@ -407,6 +414,21 @@ events it also changes one sign's text on the client (`besign`). It hides part o
 with runs without it. Crop the signs with `scripts/Crop.java` (`java scripts/Crop.java out.png x y w h
 scale in1.png in2.png`, around x 740 y 600) to compare glyphs.
 
+### 6.9 Entity benchmark (tenth session)
+`-Pbench.scene=entities` on any bench task (`EntityBenchmark`): a fresh flat world, render distance 12
+(`entityRenderDistance`; entity view scale 1.5), clouds off, time 6000, difficulty normal, a spectator at
+(0.5, -46, -8.5), yaw 0, pitch 30. Rows of entities summoned with NBT (so `finalizeSpawn` and its random equipment
+are skipped), near to far: 256 dropped items (no gravity, no pickup, no despawn, 1 block apart so they don't merge),
+64 experience orbs (different values), cows/pigs/sheep (colours, some sheared)/chickens (every fourth a baby), villagers
+and zombie villagers (all professions and types), zombies (every third in iron armor with a sword), skeletons with
+bows, creepers (every eighth charged), spiders, endermen (half carrying grass), pillagers/vindicators/evokers/witches,
+iron golems, horses (variants, half saddled), wolves and cats, minecarts/chest minecarts/boats/chest boats, text/item/
+block displays, and a stone brick wall with 256 item and glow item frames and 64 paintings. Undead wear unbreakable
+helmets so they don't burn; some mobs have visible name tags. 1332 entities, ~1190 extracted at the static view.
+Mobs have `NoAI` unless `-Pbench.entityAi=true`. Phases: static and pan; results labelled `<label>-entities`.
+Screenshots of two runs differ by ~1% even with the same settings (dropped items spin and bob, chickens flap): compare
+on/off pairs against a same-setting pair. Results in `results/entities-dev/`.
+
 ---
 
 ## 7. Results so far
@@ -489,6 +511,27 @@ particles: vanilla ~16 349, VulkanMod ~16 250.
   initial 651.8 → 757.5, particles 811.0 → 869.0; render thread at static 0.90 → 0.78 ms/frame; allocation 334 →
   180 MB/s. Screenshots: on vs off 0.021% (static) / 0.030% (yaw 270) at rows ≥ 400, the full-frame threshold-40
   map shows only clouds; v4 vs on 0.016% / 0.033%. `results/vulkanmod-v29`, `results/ab-reuse/off`.
+
+### Tenth session (2026-10-27)
+- **Entity culling measured** (`results/probe-cull`): `isEntityVisible` over the server scene's 297 entities costs
+  ~16.5 us per frame (~56 ns each; the "~50 us" in the ninth session's notes was wrong), timed as separate loops over
+  the same entities: `shouldRender` ~29 ns, the section check ~45 ns (mostly `Util.getMillis()` per call). The whole
+  loop is ~68 us, of which ~50 us are the 189 extractions. A cheaper cull could save ~5-10 us (~1%), below the
+  benchmark's noise; not done.
+- **Generic render state reuse measured and rejected** (`results/entities-dev/xprobe`): in the entity scene, per
+  renderer class, vanilla's `createRenderState(entity, partialTicks)` vs extracting into a kept state
+  (`extractRenderState` + `finalizeRenderState`), alternating which runs first: 1647 vs 1627 ms in total, within ~5%
+  for every type (zombie 667/659 ns, item frame 1964/1990, cow 463/458). The armor stand's ~4x effect (ninth session)
+  doesn't happen for other types, so reuse would save ~20 us per frame there at the risk of stale fields.
+- **Entity scene profile** (JFR, `results/entities-dev/vulkanmod-e0.jfr`, static, ~8 ms/frame): model prepare
+  (`Cube.compile` of posed mobs) ~27%, items (`ItemFeatureRenderer`, `putBakedQuad` ~10%) ~17%, extraction ~15%
+  (item frames ~6% before the cache), upload ~9%, `RenderTypeFeatureRenderer$Group.getOrAddDraw` ~5% (see section 8),
+  Indigo's `ExtendedBlockModelFeatureRenderer` ~5%. Per entity extraction costs (ns): item frame 1964, block display
+  2272, enderman 1167, minecart 1009, item display 718, zombie 667, skeleton 678, pillager 801, cow 463, villager 434,
+  item 334, painting 218, experience orb 175.
+- **Cached entity block model quads** (`2b25f26`; see `BlockModelMeshCache` in section 4): entity scene, interleaved
+  with `-Pvm.blockModelMeshCache=false`, median of 3: static 121.8 -> 127.5 (render thread 8.00 -> 7.74 ms), pan
+  687.4 -> 720.1 (p99 119.2 -> 125.4). `results/entities-dev/meshcache/{off,on}`.
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
@@ -603,16 +646,23 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 
 ## 8. What's next (in priority order)
 
-1. **Per entity and block entity cost** (the static view is now ~0.9 ms of render thread per frame; section 7,
-   "Eighth session"). Done in the eighth session: sign text retained, closed books without extraction, cached
-   table light. Ideas, roughly by expected gain:
-   - **Entity extraction after the reused armor stand states** (ninth session): ~91 us per frame at the static
-     view, of which ~50 us `isEntityVisible` over all ~297 entities (`shouldRender`: AABB allocation + frustum
-     test, then `isSectionCompiledAndVisible`) and ~50 us the 188 reused extractions (~0.27 us each; the vanilla
-     parts measured in isolation: base `EntityRenderer` state ~60 ns, humanoid state ~70 ns, poses ~35 ns, light
-     ~30 ns). Other entity types could reuse states too (`ReusedRenderStates` is armor stands only); check each
-     state class for fields the extraction writes conditionally, and players' `AvatarRenderState` (cape, parrots)
-     with care.
+1. **Entity scene hot spots** (section 6.9, static ~7.7 ms/frame; tenth session profile in section 7). By expected
+   gain:
+   - **`RenderTypeFeatureRenderer$Group.getOrAddDraw`** (~5%): every switch of render type in a group calls
+     `renderType.prepare()` and a linear `drawRenderTypes.indexOf(prepared)`, whose `PreparedRenderType` record
+     `equals` is deep (names are equal for all `item_entity_translucent_cull`/`entity_cutout` types, so it compares
+     pipelines, slices and the texture lists). `prepare()` must still be called (it writes the dynamic transform, and
+     the slice is part of the equality); replace only the `indexOf` with a hash map from prepared type to the first
+     index, which returns the same draw.
+   - **Baked quad writes** (`VertexConsumer.putBakedQuad` ~10%: dropped items, held items, item frame contents,
+     item displays): a direct whole-quad write for the formats in use, like `ModelPartCubeM`.
+   - **Posed mob models** (`Cube.compile` ~20%): the geometry of every mob is transformed per frame. Already on the
+     fast path; animated mobs can't use the armor stand instancing, which keys on the exact pose.
+   - Block displays (2.3 us) and minecarts (1 us) still extract slowly after the mesh cache; profile them.
+2. **Per entity and block entity cost in the server scene** (static ~0.8 ms of render thread per frame). Done in the
+   eighth and ninth sessions: sign text retained, closed books without extraction, cached table light, reused armor
+   stand states. Ruled out in the tenth session: cheaper entity culling (~16 us/frame in total) and render state reuse
+   for other entity types (~1%); see section 7, "Tenth session". Ideas, roughly by expected gain:
    - **`TerrainDrawList.collect`** (~16% in JFR at the static view): per visible section and layer work of the
      draw list; it is now one of the largest render thread items.
    - **Block entity culling loop** in sections partly beyond the view distance (their retained batch isn't used
@@ -630,20 +680,21 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
      re-measure before considering it.
    - Occlusion culling of block entities is **not** exact here: chests are 14/16 wide and the chests behind show
      through the 2/16 gaps, so culling them changes pixels.
-2. **Allocation** (~0.35 MB/frame at static since the eighth session; was ~2.3): `Float` boxing of chest openness per submit, submit records,
+3. **Allocation** (~0.35 MB/frame at static since the eighth session; was ~2.3): `Float` boxing of chest openness per submit, submit records,
    `PoseStack.Pose`, glyph instances of non-sign text, `CompactVectorArray` per sort.
-3. **Settings screen follow-ups** (the port itself is done, section 4).
+4. **Settings screen follow-ups** (the port itself is done, section 4).
    - Give every new optimisation that changes output or could misbehave a `Config` switch and an entry on the
      Optimizations page (with a tooltip and impact), instead of a system property.
    - At GUI scale 4 on 1080p the list is too narrow for the side tooltip, so tooltips go below the list and long
      ones cover the Apply/Done buttons (inherited layout).
    - Only `en_us` has the new keys; terrain options (old advanced culling, indirect draw, ...) come back with the
      terrain renderer.
-4. **Other CPU hot spots.**
-   - Entity extraction (~91 us/frame at static after the ninth session; see item 1).
+5. **Other CPU hot spots.**
+   - Entity extraction (~91 us/frame at static after the ninth session: ~16 us culling, the rest extraction; see
+     section 7, "Tenth session").
    - Entity culling: Sodium and vanilla render the same ~188 entities.
    - Armor stands use `entity_cutout` (no culling), so the CPU back-face skip doesn't apply to them.
-5. **Terrain**, after the sixth session (section 7, "Terrain"). The view is GPU bound on per-vertex work (see
+6. **Terrain**, after the sixth session (section 7, "Terrain"). The view is GPU bound on per-vertex work (see
    "Where the terrain's GPU time goes"); 16 bit indices, translucent compression and draw counts were measured and
    don't matter. Ideas:
    - Fewer vertices: anything exact must skip whole invisible faces/sections (occlusion), which renderpearl can't
@@ -677,11 +728,11 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
    - Disable OIT via `GameRenderer.useImprovedTransparency()` → false until an OIT path exists.
    - Mesher changes: per-quad layer from `BakedQuad.materialInfo()`, `CardinalLighting.byFace(shadeOverride ?: face)`,
      `BlockTintSource` lists, `LightCoordsUtil` emission, `VertexFormat.builder(stepRate).addAttribute(name, GpuFormat)`.
-6. **Fabric Renderer API 17.** Needed once the mod has its own mesher again. Re-port `EncodingFormat`/`QuadViewImpl`
+7. **Fabric Renderer API 17.** Needed once the mod has its own mesher again. Re-port `EncodingFormat`/`QuadViewImpl`
    /`MutableQuadViewImpl` from Indigo 26.3, implement the 3-method `Renderer` plus an `AltModelBlockRenderer`,
    and register feature renderers via `FeatureRendererRegistry`. Do **not** re-add the old `SubmitNode*` /
    `ItemStackRenderState*` mixins; Fabric now does that itself.
-7. **Smaller ports.** Clouds (mixin vanilla `CloudRenderer` `prepare`/`render`; there is no separate clouds pass
+8. **Smaller ports.** Clouds (mixin vanilla `CloudRenderer` `prepare`/`render`; there is no separate clouds pass
    any more), the debug overlay and profiler HUD (`Gui` → `Hud`, `extractRenderState`), and
    `DebugEntryMemory` (`bytesToMebibytes`).
 
