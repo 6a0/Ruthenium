@@ -25,6 +25,8 @@ public class Config {
     public boolean particleSpawnLimit = true;
     /** Skips block entity ticks that would do nothing */
     public boolean skipIdleTicks = true;
+    /** Armor stands extracted into render states reused across frames */
+    public boolean reuseEntityStates = true;
     /** Skips the terrain faces of a section that all face away from the camera */
     public boolean terrainFaceCulling = true;
     /** Solid and cutout terrain vertices in 20 instead of 28 bytes */

@@ -249,6 +249,11 @@ public abstract class Options {
                                 value -> config.skipIdleTicks = value,
                                 () -> config.skipIdleTicks)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.skipIdleTicks.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.reuseEntityStates"),
+                                value -> config.reuseEntityStates = value,
+                                () -> config.reuseEntityStates)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.reuseEntityStates.tooltip"))
                                 .setImpact(PerformanceImpact.LOW)
                 })
         };
