@@ -25,6 +25,8 @@ public class Config {
     public boolean particleSpawnLimit = true;
     /** Skips block entity ticks that would do nothing */
     public boolean skipIdleTicks = true;
+    /** Idle block entity tickers leave the client's ticker list until something wakes them (with skipIdleTicks) */
+    public boolean parkIdleTickers = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */

@@ -297,6 +297,8 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         });
         context.waitTicks(30);
         context.takeScreenshot(LABEL + "-chestopen-" + RUN_ID);
+        // The lid only moves while its ticker runs, so this also checks that a parked ticker was woken
+        assertLid(context, chests[0], 1.0F);
 
         context.runOnClient(mc -> {
             mc.level.blockEvent(chests[0], mc.level.getBlockState(chests[0]).getBlock(), 1, 0);
@@ -304,6 +306,16 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         });
         context.waitTicks(40);
         context.takeScreenshot(LABEL + "-chestclosed-" + RUN_ID);
+        assertLid(context, chests[0], 0.0F);
+    }
+
+    private static void assertLid(ClientGameTestContext context, BlockPos pos, float expected) {
+        float openness = context.computeOnClient(mc -> mc.level.getBlockEntity(pos) instanceof ChestBlockEntity chest
+                ? chest.getOpenNess(1.0F) : Float.NaN);
+        LOGGER.info("Chest lid at {}: openness {}", pos, openness);
+        if (openness != expected) {
+            throw new AssertionError("Chest lid at " + pos + " has openness " + openness + ", expected " + expected);
+        }
     }
 
     private static void setYaw(ClientGameTestContext context, float yaw) {

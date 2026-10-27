@@ -6,6 +6,7 @@ import net.minecraft.world.level.block.entity.SignBlockEntity;
 import net.minecraft.world.level.block.entity.SignText;
 import net.minecraft.world.level.block.entity.SignTextSlot;
 import net.vulkanmod.interfaces.IdleTicker;
+import net.vulkanmod.interfaces.ParkedTickerHolder;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -30,6 +31,12 @@ public abstract class SignBlockEntityM implements IdleTicker {
         if (level != null && level.isClientSide()) {
             RetainedBlockEntities.markDirty(self.getBlockPos());
         }
+    }
+
+    /** An editing player makes the ticker non-idle */
+    @Inject(method = "setAllowedPlayerEditor", at = @At("RETURN"))
+    private void wakeTicker(UUID player, CallbackInfo ci) {
+        ((ParkedTickerHolder) this).vulkanmod$wakeTicker();
     }
 
     @Override

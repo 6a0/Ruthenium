@@ -6,6 +6,7 @@ import net.minecraft.world.level.block.entity.TrappedChestBlockEntity;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.vulkanmod.interfaces.IdleTicker;
+import net.vulkanmod.interfaces.ParkedTickerHolder;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -26,10 +27,14 @@ public class ChestBlockEntityM implements IdleTicker {
                 && ((IdleTicker) this.chestLidController).vulkanmod$isTickIdle();
     }
 
-    /** Lid events start or stop the lid; the chest leaves or rejoins its section's retained geometry */
+    /**
+     * Lid events start or stop the lid: the ticker is woken, and the chest leaves or rejoins its section's retained
+     * geometry
+     */
     @Inject(method = "triggerEvent", at = @At("RETURN"))
     private void markRetainedDirty(int b0, int b1, CallbackInfoReturnable<Boolean> cir) {
         BlockEntity self = (BlockEntity) (Object) this;
+        ((ParkedTickerHolder) self).vulkanmod$wakeTicker();
         Level level = self.getLevel();
         if (level != null && level.isClientSide()) {
             RetainedBlockEntities.markDirty(self.getBlockPos());

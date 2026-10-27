@@ -10,6 +10,7 @@ import net.vulkanmod.Initializer;
 import net.vulkanmod.config.Config;
 import net.vulkanmod.config.gui.OptionBlock;
 import net.vulkanmod.interfaces.SectionDispatcherReset;
+import net.vulkanmod.interfaces.TickerParkingLevel;
 import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.entity.InstancedParts;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
@@ -248,9 +249,20 @@ public abstract class Options {
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.particleSpawnLimit.tooltip"))
                                 .setImpact(PerformanceImpact.MEDIUM),
                         new SwitchOption(Component.translatable("vulkanmod.options.skipIdleTicks"),
-                                value -> config.skipIdleTicks = value,
+                                value -> {
+                                    config.skipIdleTicks = value;
+                                    unparkTickers();
+                                },
                                 () -> config.skipIdleTicks)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.skipIdleTicks.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.parkIdleTickers"),
+                                value -> {
+                                    config.parkIdleTickers = value;
+                                    unparkTickers();
+                                },
+                                () -> config.parkIdleTickers)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.parkIdleTickers.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("vulkanmod.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
@@ -290,6 +302,13 @@ public abstract class Options {
                                 .setImpact(PerformanceImpact.LOW)
                 })
         };
+    }
+
+    /** Puts parked block entity tickers back into the ticker list; they are parked again if parking is still on */
+    private static void unparkTickers() {
+        if (Minecraft.getInstance().level instanceof TickerParkingLevel level) {
+            level.vulkanmod$unparkAll();
+        }
     }
 
     /** The upper bound of an int range option, which depends on the memory available at startup */
