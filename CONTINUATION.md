@@ -4,7 +4,8 @@ This is a hand-off document for a new session. It covers what was decided, what 
 what the numbers are, and what to do next. Read it all before changing code.
 
 Last updated: 2026-10-27 (sixth session), with the GPU probe findings and the faster section compiles (biome blend,
-light, block state and tint caches).
+light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
+was built, measured and rejected (section 7, "Rejected: CPU occlusion culling").
 
 ---
 
@@ -455,6 +456,39 @@ here, ~5% fewer drawn): static 659.2 -> 657.4 and pan 844.2 -> 849.6, no measura
 tolerance and a 0.05 block margin, because rotated vertices aren't exactly diagonal; the patch was in the fifth
 session's scratchpad (`diagonal-groups.patch`).
 
+**Rejected: CPU occlusion culling** (seventh session, user's request, dropped after measuring). Design, exact by
+construction: at compile time each section kept its vertex bounds and its solid layer quads that are whole block faces,
+greedy-merged per plane into rectangles (the occluders are geometry the GPU really draws, opaque, never a solid volume
+whose hiding faces may sit in an undrawn neighbour). Each frame, inside `TerrainDrawList.collect` (vanilla's visible
+list order, roughly front to back), a section was tested against a coverage buffer and, if drawn, its front-facing
+rectangles (eye 0.01 in front of the plane) were rasterized. The buffer worked on the GPU's own samples: the frame's
+final projection (captured at `RenderSystem.setProjectionMatrix` in `GameRenderer.renderLevel`, bobbing and nausea
+included), 8x8 sample tiles holding a full-coverage depth (1/w, farthest over the tile's sample corners) plus a 64 bit
+partial mask with its depth, so faces meeting on a tile (section borders, ledges) fill it together; edges shrunk by
+1/16 px against vertex snapping, faces clipped to w >= 0.1, sections with a vertex nearer than that always drawn, and
+a section hidden only if behind by a relative 1e-4. Screenshots stayed identical to the reference (differences only
+in clouds, water animation and an edge that also flickers between earlier runs).
+Measured (terrain scene, static view, one session, `bench.occlusionSweep` of the face size cap):
+
+| faces rasterized / frame | sections hidden of 2426 | fps | render thread CPU |
+|---|---|---|---|
+| culling off | - | 674 / 679 | 0.83 / 0.72 ms |
+| all, 168k | 281 | 41 | 24.3 ms |
+| >= 64 px on screen, 15k | 103 | 124 | 8.0 ms |
+| >= 1024 px, 1.1k | 99 | 400 | 2.5 ms |
+| >= 16384 px, 54 | 99 | 681 | 1.1 ms |
+
+The 99 sections hidden with almost no occluders are only off screen (vanilla's cull frustum is wider than the
+screen); occlusion proper hides ~180 sections, ~10% of the drawn quads (solid 586k -> 527k, cutout 963k -> 868k),
+worth ~0.12 ms of GPU time, and only with the whole visible surface as occluders: savanna hills are made of 1 block
+terraces, so no small set of large faces hides anything. At ~145 ns per rasterized face it can't pay. The server
+scene has nothing to gain either (the "building" is the chest/enchanting table cube: block entities and non-full
+blocks, no solid walls). It could only pay where few large drawn faces hide a lot (walls of cities, cliffs); solid
+*volume* occluders would be far cheaper but are not exact (they differ from vanilla wherever vanilla itself shows a
+hole through an unbuilt or graph-culled section). The patch (with the non-MDI path, a settings switch and the sweep)
+is in the seventh session's scratchpad (`terrain-occlusion.patch`); results and logs in
+`results/terrain-dev/occlusion/`.
+
 ### The pan's p99
 `frames_by_yaw.py` on the pan series: yaw 100–200 has no block entities in view and runs at ~1 ms; yaw 220–320
 faces the chest cube (7–13k block entities extracted) at ~12 ms now (v4: ~33 ms, third session start ~20 ms).
@@ -522,7 +556,8 @@ books' write was 640 ns each before the faster model space path (~5.3k per frame
    "Where the terrain's GPU time goes"); 16 bit indices, translucent compression and draw counts were measured and
    don't matter. Ideas:
    - Fewer vertices: anything exact must skip whole invisible faces/sections (occlusion), which renderpearl can't
-     do on the GPU; a conservative CPU occlusion test (software depth of large occluders) is the remaining option.
+     do on the GPU. An exact CPU occlusion test was built and rejected in the seventh session (section 7): in this
+     scene occlusion hides only ~10% of the quads, and only with ~168k occluder faces per frame.
    - Section compiles (now ~400 us per section single-threaded): Indigo's `AoCalculator` (~22% before the caches,
      Fabric internals, so mixins there are fragile), fluids (~8%), Indigo's quad transform/emit overhead.
    - The vanilla occlusion graph bug after `allChanged` (section 6.7), which also leaves holes for players who
