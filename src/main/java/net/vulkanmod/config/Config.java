@@ -32,7 +32,7 @@ public class Config {
     /** Finds the draw of a render type with a hash lookup instead of a linear search */
     public boolean hashedDrawLookup = true;
     /** Geometry of equal render types joins one draw in groups that may be reordered */
-    public boolean mergeDraws = false;
+    public boolean mergeDraws = true;
     /** Baked quads (items, block models) are written into vertex buffers a whole quad at a time */
     public boolean directBakedQuads = true;
     /** Skips the terrain faces of a section that all face away from the camera */
