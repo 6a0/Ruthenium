@@ -126,6 +126,9 @@ public final class FrameRecorder {
             GpuPassProbe.reset();
         }
         TickProbe.reset();
+        if (EntityCostProbe.ENABLED) {
+            EntityCostProbe.reset();
+        }
     }
 
     public static PhaseResult stopPhase(String name, int peakParticles) {
@@ -137,6 +140,9 @@ public final class FrameRecorder {
         }
         if (LightProfiler.enabled()) {
             org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("\n{}", LightProfiler.INSTANCE.stopRecording(name));
+        }
+        if (EntityCostProbe.ENABLED) {
+            org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("\n{}", EntityCostProbe.report(name, frameCount, TickProbe.ticks));
         }
 
         long elapsed = System.nanoTime() - phaseStartNanos;

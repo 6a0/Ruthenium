@@ -13,7 +13,8 @@
     ]
   },
   "mixins": [
-    "vulkanmod-gametest.mixins.json"
+    "vulkanmod-gametest.mixins.json",
+    "vulkanmod-gametest-probe.mixins.json"
   ],
   "depends": {
     "fabric-client-gametest-api-v1": "*"

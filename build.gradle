@@ -174,7 +174,9 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 		)
 		// -PbenchJfr records a Java Flight Recorder profile of the run into the results directory
 		if (project.hasProperty("benchJfr")) {
-			jvmArgs.add("-XX:StartFlightRecording=settings=profile,filename=../results/${label}.jfr,dumponexit=true")
+			// -PbenchJfrPeriod=1ms samples more often than the profile setting's 10-20 ms (short phases, small costs)
+			def period = project.findProperty("benchJfrPeriod")?.with { ",jdk.ExecutionSample#period=${it}" } ?: ""
+			jvmArgs.add("-XX:StartFlightRecording=settings=profile${period},filename=../results/${label}.jfr,dumponexit=true")
 		}
 		// Forward -Pbench.* project properties as system properties (e.g. -Pbench.renderDistance=16)
 		project.properties.findAll { it.key.startsWith("bench.") }.each { k, v ->

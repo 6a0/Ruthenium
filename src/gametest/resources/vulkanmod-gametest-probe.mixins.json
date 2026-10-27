@@ -1,0 +1,18 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "net.vulkanmod.gametest.probemixin",
+  "plugin": "net.vulkanmod.gametest.ProbeMixinPlugin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "ClientLevelCostProbeMixin",
+    "FeatureGroupCostProbeMixin",
+    "ItemFeatureCostProbeMixin",
+    "LevelExtractorCostProbeMixin",
+    "LevelRendererCostProbeMixin",
+    "ModelFeatureCostProbeMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
