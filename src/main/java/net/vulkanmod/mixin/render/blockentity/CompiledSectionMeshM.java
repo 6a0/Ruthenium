@@ -1,13 +1,13 @@
 package net.vulkanmod.mixin.render.blockentity;
 
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.chunk.CompiledSectionMesh;
 import net.minecraft.client.renderer.chunk.SectionCompiler;
-import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
 import net.minecraft.client.renderer.chunk.TranslucencyPointOfView;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.vulkanmod.interfaces.BlockEntityPositions;
-import net.vulkanmod.interfaces.CachedSectionSlices;
+import net.vulkanmod.interfaces.PackedSectionDraws;
 import net.vulkanmod.interfaces.FaceGroupsHolder;
 import net.vulkanmod.render.blockentity.BlockEntityCulling;
 import net.vulkanmod.render.chunk.SectionFaceGroups;
@@ -25,17 +25,18 @@ import java.util.List;
 /**
  * The renderable block entity list of a compiled section never changes, so its positions are packed once (on the
  * render thread, when culling first needs them). The mesh also keeps the face groups of its compile results and
- * its cached place in the terrain buffers.
+ * its draws in the terrain buffers, packed by {@code TerrainDrawList}.
  */
 @Mixin(CompiledSectionMesh.class)
-public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHolder, CachedSectionSlices {
+public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHolder, PackedSectionDraws {
     @Shadow @Final private List<BlockEntity> renderableBlockEntities;
 
     @Unique private long[] positions;
     @Unique private boolean[] cullable;
     // Allocated in code: initializers of these fields were not merged into the constructor before the injection ran
     @Unique private SectionFaceGroups @Nullable [] faceGroups;
-    @Unique private SectionRenderDispatcher.RenderSectionBufferSlice @Nullable [] slices;
+    @Unique private int @Nullable [] packedDraws;
+    @Unique private GpuBuffer @Nullable [] packedBuffers;
 
     @Inject(method = "<init>", at = @At("RETURN"))
     private void copyFaceGroups(TranslucencyPointOfView pointOfView, SectionCompiler.Results results, long compileTaskStartTimeNs,
@@ -62,16 +63,19 @@ public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHol
     }
 
     @Override
-    public SectionRenderDispatcher.@Nullable RenderSectionBufferSlice vulkanmod$getSlice(ChunkSectionLayer layer) {
-        return this.slices != null ? this.slices[layer.ordinal()] : null;
+    public int @Nullable [] vulkanmod$getPackedDraws() {
+        return this.packedDraws;
     }
 
     @Override
-    public void vulkanmod$setSlice(ChunkSectionLayer layer, SectionRenderDispatcher.RenderSectionBufferSlice slice) {
-        if (this.slices == null) {
-            this.slices = new SectionRenderDispatcher.RenderSectionBufferSlice[ChunkSectionLayer.values().length];
-        }
-        this.slices[layer.ordinal()] = slice;
+    public GpuBuffer @Nullable [] vulkanmod$getPackedBuffers() {
+        return this.packedBuffers;
+    }
+
+    @Override
+    public void vulkanmod$setPackedDraws(int[] draws, GpuBuffer[] buffers) {
+        this.packedBuffers = buffers;
+        this.packedDraws = draws;
     }
 
     @Override

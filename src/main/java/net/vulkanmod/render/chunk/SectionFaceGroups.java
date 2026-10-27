@@ -221,6 +221,76 @@ public final class SectionFaceGroups {
         return count;
     }
 
+    /**
+     * Ints {@link #packInto} writes: the group starts (and the quad count at the end), the facing groups' plane bits
+     * with the margin applied, and the mask of groups that are always drawn (unassigned or empty)
+     */
+    static final int PACKED_INTS = GROUPS + 1 + GROUPS - 1 + 1;
+    private static final int PACKED_PLANES = GROUPS + 1 - 1;
+    private static final int PACKED_ALWAYS = GROUPS + 1 + GROUPS - 1;
+    /** Per mask of drawn groups: the first and end group of each run of drawn groups */
+    private static final int[][] RUNS_BY_MASK = new int[1 << GROUPS][];
+
+    static {
+        for (int mask = 0; mask < RUNS_BY_MASK.length; mask++) {
+            int[] runs = new int[MAX_RUNS * 2];
+            int count = 0;
+            int runStart = -1;
+            for (int g = 0; g <= GROUPS; g++) {
+                if (g < GROUPS && (mask & 1 << g) != 0) {
+                    if (runStart < 0) {
+                        runStart = g;
+                    }
+                } else if (runStart >= 0) {
+                    runs[count++] = runStart;
+                    runs[count++] = g;
+                    runStart = -1;
+                }
+            }
+            RUNS_BY_MASK[mask] = java.util.Arrays.copyOf(runs, count);
+        }
+    }
+
+    /** Writes the groups into {@code data} at {@code offset}, for {@link #addVisibleCommands(int[], int, TerrainDrawList.Group, int, int, int, float, float, float)} */
+    void packInto(int[] data, int offset) {
+        System.arraycopy(this.starts, 0, data, offset, GROUPS + 1);
+        int always = 1 << UNASSIGNED;
+        for (int g = 1; g < GROUPS; g++) {
+            // The same float operation as faces()
+            float plane = (g & 1) == 1 ? this.planes[g] - MARGIN : this.planes[g] + MARGIN;
+            data[offset + PACKED_PLANES + g] = Float.floatToRawIntBits(plane);
+            if (this.starts[g] == this.starts[g + 1]) {
+                always |= 1 << g;
+            }
+        }
+        data[offset + PACKED_ALWAYS] = always;
+    }
+
+    /**
+     * {@link #addVisibleCommands(TerrainDrawList.Group, int, int, int, float, float, float)} from packed groups, so
+     * the draw list reads one array per section instead of the groups' objects, and finds the runs to draw from a
+     * mask of the drawn groups instead of a loop with a branch per group
+     */
+    static void addVisibleCommands(int[] data, int offset, TerrainDrawList.Group group, int firstIndex, int baseVertex,
+                                   int baseInstance, float eyeX, float eyeY, float eyeZ) {
+        int p = offset + PACKED_PLANES;
+        int mask = data[offset + PACKED_ALWAYS]
+                | (eyeX > Float.intBitsToFloat(data[p + EAST]) ? 1 << EAST : 0)
+                | (eyeX < Float.intBitsToFloat(data[p + WEST]) ? 1 << WEST : 0)
+                | (eyeY > Float.intBitsToFloat(data[p + UP]) ? 1 << UP : 0)
+                | (eyeY < Float.intBitsToFloat(data[p + DOWN]) ? 1 << DOWN : 0)
+                | (eyeZ > Float.intBitsToFloat(data[p + SOUTH]) ? 1 << SOUTH : 0)
+                | (eyeZ < Float.intBitsToFloat(data[p + NORTH]) ? 1 << NORTH : 0);
+        int[] runs = RUNS_BY_MASK[mask];
+        for (int r = 0; r < runs.length; r += 2) {
+            int start = data[offset + runs[r]];
+            int end = data[offset + runs[r + 1]];
+            if (end > start) {
+                group.add((end - start) * 6, firstIndex, baseVertex + start * 4, baseInstance);
+            }
+        }
+    }
+
     /** Like {@link #addVisibleDraws}, for {@link TerrainDrawList}'s commands */
     void addVisibleCommands(TerrainDrawList.Group group, int firstIndex, int baseVertex, int baseInstance,
                             float eyeX, float eyeY, float eyeZ) {

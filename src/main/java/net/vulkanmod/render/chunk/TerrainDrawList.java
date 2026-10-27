@@ -16,8 +16,8 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.util.Util;
 import net.minecraft.world.phys.Vec3;
 import net.vulkanmod.Initializer;
-import net.vulkanmod.interfaces.CachedSectionSlices;
 import net.vulkanmod.interfaces.FaceGroupsHolder;
+import net.vulkanmod.interfaces.PackedSectionDraws;
 import org.joml.Matrix4fc;
 import org.jspecify.annotations.Nullable;
 import org.lwjgl.system.MemoryUtil;
@@ -31,11 +31,11 @@ import java.util.List;
 
 /**
  * Builds the terrain's multi-draw-indirect commands like vanilla's {@code LevelRenderer.prepareChunkRendersIndirect},
- * without its per-frame costs: a solid or cutout layer's buffer slice is cached in the compiled mesh instead of
- * being looked up in the uber buffers' hash maps, commands are collected in reused int arrays instead of a record
- * per draw, and they are written to mapped memory in one copy per group. Draw groups, their order (translucent
- * groups and draws back to front) and the commands are the same as vanilla's, plus the face groups of
- * {@link SectionFaceGroups}.
+ * without its per-frame costs: a compiled mesh's solid and cutout draws are packed once into an int array on the
+ * mesh ({@link #pack}) instead of being looked up in the uber buffers' hash maps every frame, commands are collected
+ * in reused int arrays instead of a record per draw, and they are written to mapped memory in one copy per group.
+ * Draw groups, their order (translucent groups and draws back to front) and the commands are the same as vanilla's,
+ * plus the face groups of {@link SectionFaceGroups}.
  * <p>
  * Render thread only.
  */
@@ -43,6 +43,13 @@ public final class TerrainDrawList {
     private static final ChunkSectionLayer[] LAYERS = ChunkSectionLayer.values();
     private static final int COMMAND_INTS = 5;
     private static final int COMMAND_BYTES = COMMAND_INTS * Integer.BYTES;
+
+    /** Layers packed per mesh: solid and cutout (translucent index buffers move when they are resorted) */
+    private static final int PACKED_LAYERS = 2;
+    /** Per packed layer: drawn (0 or 1), index count, base vertex, face groups (0 or 1), then the groups */
+    private static final int PACKED_STRIDE = 4 + SectionFaceGroups.PACKED_INTS;
+    /** Meshes with a custom index buffer in a packed layer use the lookups every frame */
+    private static final int[] UNPACKABLE = new int[0];
 
     private static final int[] VERTEX_SIZES = new int[LAYERS.length];
     @SuppressWarnings("unchecked")
@@ -142,23 +149,55 @@ public final class TerrainDrawList {
             SectionMesh mesh = section.getSectionMesh();
             BlockPos origin = section.getRenderOrigin();
             int sectionInfo = -1;
+            float eyeX = (float) (eye.x - origin.getX()), eyeY = (float) (eye.y - origin.getY()), eyeZ = (float) (eye.z - origin.getZ());
+
+            int[] packed = null;
+            GpuBuffer[] packedBuffers = null;
+            if (mesh instanceof PackedSectionDraws holder) {
+                packed = holder.vulkanmod$getPackedDraws();
+                if (packed == null) {
+                    packed = pack(dispatcher, mesh, holder);
+                }
+                if (packed == UNPACKABLE) {
+                    packed = null;
+                } else if (packed != null) {
+                    packedBuffers = holder.vulkanmod$getPackedBuffers();
+                }
+            }
 
             for (ChunkSectionLayer layer : LAYERS) {
+                if (packed != null && layer.ordinal() < PACKED_LAYERS) {
+                    int o = layer.ordinal() * PACKED_STRIDE;
+                    if (packed[o] == 0) {
+                        continue;
+                    }
+                    if (sectionInfo == -1) {
+                        sectionInfo = addSectionInfo(section, origin, now, fadeDuration);
+                    }
+                    int indexCount = packed[o + 1];
+                    largestIndexCount = Math.max(largestIndexCount, indexCount);
+                    Group group = group(GROUPS[layer.ordinal()], packedBuffers[layer.ordinal()], null, null);
+                    if (faceCulling && packed[o + 3] != 0) {
+                        SectionFaceGroups.addVisibleCommands(packed, o + 4, group, 0, packed[o + 2], sectionInfo, eyeX, eyeY, eyeZ);
+                    } else {
+                        group.add(indexCount, 0, packed[o + 2], sectionInfo);
+                    }
+                    continue;
+                }
+
                 SectionMesh.SectionDraw draw = mesh.getSectionDraw(layer);
                 if (draw == null) {
                     continue;
                 }
 
                 boolean customIndices = draw.hasCustomIndexBuffer();
-                SectionRenderDispatcher.RenderSectionBufferSlice slice = slice(dispatcher, mesh, layer, customIndices);
+                SectionRenderDispatcher.RenderSectionBufferSlice slice = dispatcher.getRenderSectionSlice(mesh, layer);
                 if (slice == null || customIndices && slice.indexBuffer() == null) {
                     continue;
                 }
 
                 if (sectionInfo == -1) {
-                    sectionInfo = SECTION_INFOS.size();
-                    SECTION_INFOS.add(new DynamicGpuData.ChunkSectionInfo(origin.getX(), origin.getY(), origin.getZ(),
-                            section.getVisibility(now, fadeDuration)));
+                    sectionInfo = addSectionInfo(section, origin, now, fadeDuration);
                 }
 
                 GpuBuffer vertexBuffer = slice.vertexBuffer();
@@ -174,28 +213,16 @@ public final class TerrainDrawList {
                 }
                 int baseVertex = (int) (slice.vertexBufferOffset() / VERTEX_SIZES[layer.ordinal()]);
 
-                List<Group> layerGroups = GROUPS[layer.ordinal()];
                 Group group = null;
                 if (layer.translucent() && respectTranslucentOrder) {
                     // Consecutive draws in the same buffers share a group, so the order between sections is kept
                     if (lastTranslucent != null && lastTranslucent.matches(vertexBuffer, indexBuffer, indexType)) {
                         group = lastTranslucent;
+                    } else {
+                        group = newGroup(GROUPS[layer.ordinal()], vertexBuffer, indexBuffer, indexType);
                     }
                 } else {
-                    for (int g = 0, n = layerGroups.size(); g < n; g++) {
-                        Group candidate = layerGroups.get(g);
-                        if (candidate.matches(vertexBuffer, indexBuffer, indexType)) {
-                            group = candidate;
-                            break;
-                        }
-                    }
-                }
-                if (group == null) {
-                    group = POOL.isEmpty() ? new Group() : POOL.removeLast();
-                    group.vertexBuffer = vertexBuffer;
-                    group.indexBuffer = indexBuffer;
-                    group.indexType = indexType;
-                    layerGroups.add(group);
+                    group = group(GROUPS[layer.ordinal()], vertexBuffer, indexBuffer, indexType);
                 }
                 if (layer.translucent()) {
                     lastTranslucent = group;
@@ -204,8 +231,7 @@ public final class TerrainDrawList {
                 SectionFaceGroups faces = faceCulling && !customIndices && mesh instanceof FaceGroupsHolder holder
                         ? holder.vulkanmod$getFaceGroups(layer) : null;
                 if (faces != null && draw.indexCount() == faces.quadCount() * 6) {
-                    faces.addVisibleCommands(group, firstIndex, baseVertex, sectionInfo,
-                            (float) (eye.x - origin.getX()), (float) (eye.y - origin.getY()), (float) (eye.z - origin.getZ()));
+                    faces.addVisibleCommands(group, firstIndex, baseVertex, sectionInfo, eyeX, eyeY, eyeZ);
                 } else {
                     group.add(draw.indexCount(), firstIndex, baseVertex, sectionInfo);
                 }
@@ -214,24 +240,70 @@ public final class TerrainDrawList {
         return largestIndexCount;
     }
 
-    /**
-     * The layer's place in the uber buffers. A solid or cutout layer's vertex allocation stays where it is until its
-     * mesh is released (only translucent index buffers are re-uploaded under the same mesh, when resorted), and a mesh
-     * is only drawn once all its buffers are uploaded, so the slice is cached in the mesh on first use.
-     */
-    private static SectionRenderDispatcher.@Nullable RenderSectionBufferSlice slice(SectionRenderDispatcher dispatcher, SectionMesh mesh,
-                                                                                     ChunkSectionLayer layer, boolean customIndices) {
-        if (customIndices || layer.translucent() || !(mesh instanceof CachedSectionSlices cache)) {
-            return dispatcher.getRenderSectionSlice(mesh, layer);
-        }
-        SectionRenderDispatcher.RenderSectionBufferSlice slice = cache.vulkanmod$getSlice(layer);
-        if (slice == null) {
-            slice = dispatcher.getRenderSectionSlice(mesh, layer);
-            if (slice != null) {
-                cache.vulkanmod$setSlice(layer, slice);
+    private static int addSectionInfo(SectionRenderDispatcher.RenderSection section, BlockPos origin, long now, long fadeDuration) {
+        int index = SECTION_INFOS.size();
+        SECTION_INFOS.add(new DynamicGpuData.ChunkSectionInfo(origin.getX(), origin.getY(), origin.getZ(),
+                section.getVisibility(now, fadeDuration)));
+        return index;
+    }
+
+    /** The layer's group drawing from these buffers */
+    private static Group group(List<Group> layerGroups, GpuBuffer vertexBuffer, @Nullable GpuBuffer indexBuffer, @Nullable IndexType indexType) {
+        for (int g = 0, n = layerGroups.size(); g < n; g++) {
+            Group candidate = layerGroups.get(g);
+            if (candidate.matches(vertexBuffer, indexBuffer, indexType)) {
+                return candidate;
             }
         }
-        return slice;
+        return newGroup(layerGroups, vertexBuffer, indexBuffer, indexType);
+    }
+
+    private static Group newGroup(List<Group> layerGroups, GpuBuffer vertexBuffer, @Nullable GpuBuffer indexBuffer, @Nullable IndexType indexType) {
+        Group group = POOL.isEmpty() ? new Group() : POOL.removeLast();
+        group.vertexBuffer = vertexBuffer;
+        group.indexBuffer = indexBuffer;
+        group.indexType = indexType;
+        layerGroups.add(group);
+        return group;
+    }
+
+    /**
+     * Packs the mesh's solid and cutout draws: their place in the uber buffers stays where it is until the mesh is
+     * released (only translucent index buffers are re-uploaded under the same mesh, when resorted), and a mesh is only
+     * drawn once all its buffers are uploaded.
+     *
+     * @return the packed draws, {@link #UNPACKABLE}, or null if a buffer isn't uploaded yet
+     */
+    private static int @Nullable [] pack(SectionRenderDispatcher dispatcher, SectionMesh mesh, PackedSectionDraws holder) {
+        int[] packed = new int[PACKED_LAYERS * PACKED_STRIDE];
+        GpuBuffer[] buffers = new GpuBuffer[PACKED_LAYERS];
+        for (int l = 0; l < PACKED_LAYERS; l++) {
+            ChunkSectionLayer layer = LAYERS[l];
+            SectionMesh.SectionDraw draw = mesh.getSectionDraw(layer);
+            if (draw == null) {
+                continue;
+            }
+            if (draw.hasCustomIndexBuffer()) {
+                holder.vulkanmod$setPackedDraws(UNPACKABLE, buffers);
+                return UNPACKABLE;
+            }
+            SectionRenderDispatcher.RenderSectionBufferSlice slice = dispatcher.getRenderSectionSlice(mesh, layer);
+            if (slice == null) {
+                return null;
+            }
+            int o = l * PACKED_STRIDE;
+            packed[o] = 1;
+            packed[o + 1] = draw.indexCount();
+            packed[o + 2] = (int) (slice.vertexBufferOffset() / VERTEX_SIZES[l]);
+            buffers[l] = slice.vertexBuffer();
+            SectionFaceGroups faces = mesh instanceof FaceGroupsHolder groupsHolder ? groupsHolder.vulkanmod$getFaceGroups(layer) : null;
+            if (faces != null && draw.indexCount() == faces.quadCount() * 6) {
+                packed[o + 3] = 1;
+                faces.packInto(packed, o + 4);
+            }
+        }
+        holder.vulkanmod$setPackedDraws(packed, buffers);
+        return packed;
     }
 
     private static EnumMap<ChunkSectionLayer, List<ChunkSectionsToRender.GpuMultiDrawIndexedIndirect>> writeCommands(boolean respectTranslucentOrder) {

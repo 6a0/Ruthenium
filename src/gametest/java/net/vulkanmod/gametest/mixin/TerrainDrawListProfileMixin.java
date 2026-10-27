@@ -25,6 +25,7 @@ public class TerrainDrawListProfileMixin {
                                       boolean order, Operation<Integer> original) {
         ProfilerFiller profiler = Profiler.get();
         profiler.push("collect");
+        profiler.incrementCounter("visibleSections", sections.size());
         int result = original.call(dispatcher, sections, eye, fade, order);
         profiler.pop();
         return result;
