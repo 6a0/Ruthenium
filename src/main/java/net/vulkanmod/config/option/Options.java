@@ -199,6 +199,16 @@ public abstract class Options {
                                 value -> config.biomeBlendCache = value,
                                 () -> config.biomeBlendCache)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.biomeBlendCache.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM),
+                        new SwitchOption(Component.translatable("vulkanmod.options.sectionLightCache"),
+                                value -> config.sectionLightCache = value,
+                                () -> config.sectionLightCache)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.sectionLightCache.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM),
+                        new SwitchOption(Component.translatable("vulkanmod.options.sectionStateCache"),
+                                value -> config.sectionStateCache = value,
+                                () -> config.sectionStateCache)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.sectionStateCache.tooltip"))
                                 .setImpact(PerformanceImpact.MEDIUM)
                 }),
                 new OptionBlock("", new Option<?>[]{

@@ -31,6 +31,10 @@ public class Config {
     public boolean compressedTerrain = true;
     /** Biome tint blending computes each column's sample once per section instead of once per block */
     public boolean biomeBlendCache = true;
+    /** Smooth lighting keeps the light of the section being compiled in arrays */
+    public boolean sectionLightCache = true;
+    /** Section compiles read the block states around each block from an array */
+    public boolean sectionStateCache = true;
 
     private static Path CONFIG_PATH;
 

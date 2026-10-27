@@ -88,6 +88,12 @@ final class TerrainBenchmark {
             if (BiomeTintCheck.ENABLED) {
                 BiomeTintCheck.run(context);
             }
+            if (MeshCompareCheck.ENABLED) {
+                MeshCompareCheck.run(context);
+            }
+            if (CompileBenchmark.ENABLED) {
+                CompileBenchmark.run(context);
+            }
 
             // Compile what the other directions see before measuring
             pan(context, 0.0f, 8.0);

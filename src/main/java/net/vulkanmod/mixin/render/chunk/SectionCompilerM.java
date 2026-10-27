@@ -9,7 +9,12 @@ import com.mojang.blaze3d.vertex.MeshData;
 import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import com.mojang.renderpearl.api.vertex.VertexFormat;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+import com.mojang.blaze3d.vertex.VertexSorting;
+import net.minecraft.client.renderer.SectionBufferBuilderPack;
+import net.minecraft.client.renderer.chunk.RenderSectionRegion;
 import net.minecraft.client.renderer.chunk.SectionCompiler;
+import net.minecraft.core.SectionPos;
+import net.vulkanmod.interfaces.SectionLightWindow;
 import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.FaceGroupsHolder;
 import net.vulkanmod.render.chunk.CompressedTerrain;
@@ -17,11 +22,20 @@ import net.vulkanmod.render.chunk.CompressedTerrainBuilder;
 import net.vulkanmod.render.chunk.SectionFaceGroups;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.Map;
 
 @Mixin(SectionCompiler.class)
 public class SectionCompilerM {
+
+    /** The smooth lighting keeps this section's light while it compiles ({@code BlockModelLighterCacheM}) */
+    @Inject(method = "compile", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/block/BlockModelLighter;enableCaching()V", shift = At.Shift.AFTER))
+    private void beginLightWindow(SectionPos sectionPos, RenderSectionRegion region, VertexSorting vertexSorting,
+                                  SectionBufferBuilderPack builders, CallbackInfoReturnable<SectionCompiler.Results> cir) {
+        ((SectionLightWindow) BlockModelLighterAccessor.vulkanmod$getCache().get()).vulkanmod$beginSection(sectionPos.origin());
+    }
 
     /** Groups the quads of each opaque layer's mesh by facing as it is added to the results */
     @WrapOperation(method = "compile", at = @At(value = "INVOKE", target = "Ljava/util/Map;put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"))
