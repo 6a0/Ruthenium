@@ -15,6 +15,7 @@
     "TerrainDrawListGroupAccessor",
     "TerrainDrawListMixin",
     "TerrainDrawListProfileMixin",
+    "TickProbeMixin",
     "VulkanCommandEncoderProfileMixin"
   ],
   "injectors": {

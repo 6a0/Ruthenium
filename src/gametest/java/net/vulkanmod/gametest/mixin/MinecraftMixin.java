@@ -3,6 +3,7 @@ package net.vulkanmod.gametest.mixin;
 import net.minecraft.client.Minecraft;
 import net.vulkanmod.gametest.FrameRecorder;
 import net.vulkanmod.gametest.GpuFrameProbe;
+import net.vulkanmod.gametest.TickProbe;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -22,6 +23,12 @@ public class MinecraftMixin {
     @Inject(method = "tick", at = @At("HEAD"))
     private void onTick(CallbackInfo ci) {
         FrameRecorder.onTick();
+        TickProbe.start = System.nanoTime();
+    }
+
+    @Inject(method = "tick", at = @At("RETURN"))
+    private void afterTick(CallbackInfo ci) {
+        TickProbe.endTick(System.nanoTime() - TickProbe.start);
     }
 
     @Inject(method = "renderFrame", at = @At(value = "INVOKE", target = "Lcom/mojang/renderpearl/api/commands/CommandEncoder;submit()V"))

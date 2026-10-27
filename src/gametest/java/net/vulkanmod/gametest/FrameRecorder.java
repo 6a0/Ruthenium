@@ -124,11 +124,13 @@ public final class FrameRecorder {
         if (GpuFrameProbe.ENABLED) {
             GpuFrameProbe.reset();
         }
+        TickProbe.reset();
     }
 
     public static PhaseResult stopPhase(String name, int peakParticles) {
         recording = false;
         org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("{}: {}", name, tickSplit());
+        org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("{}: {}", name, TickProbe.report());
         if (GpuFrameProbe.ENABLED) {
             org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("{}: {}", name, GpuFrameProbe.report());
         }
