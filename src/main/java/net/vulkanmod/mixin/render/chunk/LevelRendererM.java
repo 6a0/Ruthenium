@@ -3,19 +3,29 @@ package net.vulkanmod.mixin.render.chunk;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.llamalad7.mixinextras.sugar.Local;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
+import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import net.minecraft.client.renderer.DynamicGpuData;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.chunk.SectionMesh;
 import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
+import net.minecraft.client.renderer.state.OptionsRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
+import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.client.renderer.texture.TextureManager;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.phys.Vec3;
 import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.FaceGroupsHolder;
 import net.vulkanmod.render.chunk.SectionFaceGroups;
+import net.vulkanmod.render.chunk.TerrainDrawList;
+import org.joml.Matrix4fc;
+import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Overwrite;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 
@@ -24,10 +34,27 @@ import java.util.List;
 @Mixin(LevelRenderer.class)
 public class LevelRendererM {
     @Shadow @Final private LevelRenderState levelRenderState;
+    @Shadow @Final private OptionsRenderState optionsRenderState;
+    @Shadow @Final private TextureManager textureManager;
+    @Shadow @Final private ObjectArrayList<SectionRenderDispatcher.RenderSection> visibleSections;
+    @Shadow private @Nullable SectionRenderDispatcher sectionRenderDispatcher;
+
+    /**
+     * @author VulkanMod
+     * @reason Builds the same multi-draw-indirect commands without the per-frame hash lookups and records
+     * ({@link TerrainDrawList}), and with the face groups
+     */
+    @Overwrite
+    public ChunkSectionsToRender prepareChunkRendersIndirect(final Matrix4fc modelViewMatrix, final boolean respectTranslucentOrder) {
+        GpuTextureView blockAtlas = this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
+        return TerrainDrawList.prepare(this.sectionRenderDispatcher, this.visibleSections, this.levelRenderState.cameraRenderState.pos,
+                this.optionsRenderState.chunkSectionFadeInTime, modelViewMatrix, blockAtlas.getWidth(0), blockAtlas.getHeight(0),
+                respectTranslucentOrder);
+    }
 
     /**
      * Replaces the draw of a section layer whose quads are grouped by facing with draws of the groups that can face
-     * the camera (the multi-draw-indirect and the separate draw paths are both built from these draws).
+     * the camera, on the path without multi-draw-indirect.
      */
     @SuppressWarnings({"rawtypes", "unchecked"})
     @WrapOperation(method = "extractSectionDrawGroups", at = @At(value = "INVOKE", target = "Ljava/util/List;add(Ljava/lang/Object;)Z"))

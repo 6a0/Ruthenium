@@ -10,15 +10,19 @@ import org.spongepowered.asm.mixin.Unique;
 
 @Mixin(SectionCompiler.Results.class)
 public class SectionCompilerResultsM implements FaceGroupsHolder {
-    @Unique private final SectionFaceGroups[] faceGroups = new SectionFaceGroups[ChunkSectionLayer.values().length];
+    // Allocated in code rather than by an initializer (see CompiledSectionMeshM)
+    @Unique private SectionFaceGroups @Nullable [] faceGroups;
 
     @Override
     public @Nullable SectionFaceGroups vulkanmod$getFaceGroups(ChunkSectionLayer layer) {
-        return this.faceGroups[layer.ordinal()];
+        return this.faceGroups != null ? this.faceGroups[layer.ordinal()] : null;
     }
 
     @Override
     public void vulkanmod$setFaceGroups(ChunkSectionLayer layer, @Nullable SectionFaceGroups groups) {
+        if (this.faceGroups == null) {
+            this.faceGroups = new SectionFaceGroups[ChunkSectionLayer.values().length];
+        }
         this.faceGroups[layer.ordinal()] = groups;
     }
 }

@@ -3,9 +3,11 @@ package net.vulkanmod.mixin.render.blockentity;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.chunk.CompiledSectionMesh;
 import net.minecraft.client.renderer.chunk.SectionCompiler;
+import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
 import net.minecraft.client.renderer.chunk.TranslucencyPointOfView;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.vulkanmod.interfaces.BlockEntityPositions;
+import net.vulkanmod.interfaces.CachedSectionSlices;
 import net.vulkanmod.interfaces.FaceGroupsHolder;
 import net.vulkanmod.render.blockentity.BlockEntityCulling;
 import net.vulkanmod.render.chunk.SectionFaceGroups;
@@ -22,32 +24,54 @@ import java.util.List;
 
 /**
  * The renderable block entity list of a compiled section never changes, so its positions are packed once (on the
- * render thread, when culling first needs them). The mesh also keeps the face groups of its compile results.
+ * render thread, when culling first needs them). The mesh also keeps the face groups of its compile results and
+ * its cached place in the terrain buffers.
  */
 @Mixin(CompiledSectionMesh.class)
-public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHolder {
+public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHolder, CachedSectionSlices {
     @Shadow @Final private List<BlockEntity> renderableBlockEntities;
 
     @Unique private long[] positions;
     @Unique private boolean[] cullable;
-    @Unique private final SectionFaceGroups[] faceGroups = new SectionFaceGroups[ChunkSectionLayer.values().length];
+    // Allocated in code: initializers of these fields were not merged into the constructor before the injection ran
+    @Unique private SectionFaceGroups @Nullable [] faceGroups;
+    @Unique private SectionRenderDispatcher.RenderSectionBufferSlice @Nullable [] slices;
 
     @Inject(method = "<init>", at = @At("RETURN"))
     private void copyFaceGroups(TranslucencyPointOfView pointOfView, SectionCompiler.Results results, long compileTaskStartTimeNs,
                                 CallbackInfo ci) {
         for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
-            this.faceGroups[layer.ordinal()] = ((FaceGroupsHolder) (Object) results).vulkanmod$getFaceGroups(layer);
+            SectionFaceGroups groups = ((FaceGroupsHolder) (Object) results).vulkanmod$getFaceGroups(layer);
+            if (groups != null) {
+                this.vulkanmod$setFaceGroups(layer, groups);
+            }
         }
     }
 
     @Override
     public @Nullable SectionFaceGroups vulkanmod$getFaceGroups(ChunkSectionLayer layer) {
-        return this.faceGroups[layer.ordinal()];
+        return this.faceGroups != null ? this.faceGroups[layer.ordinal()] : null;
     }
 
     @Override
     public void vulkanmod$setFaceGroups(ChunkSectionLayer layer, @Nullable SectionFaceGroups groups) {
+        if (this.faceGroups == null) {
+            this.faceGroups = new SectionFaceGroups[ChunkSectionLayer.values().length];
+        }
         this.faceGroups[layer.ordinal()] = groups;
+    }
+
+    @Override
+    public SectionRenderDispatcher.@Nullable RenderSectionBufferSlice vulkanmod$getSlice(ChunkSectionLayer layer) {
+        return this.slices != null ? this.slices[layer.ordinal()] : null;
+    }
+
+    @Override
+    public void vulkanmod$setSlice(ChunkSectionLayer layer, SectionRenderDispatcher.RenderSectionBufferSlice slice) {
+        if (this.slices == null) {
+            this.slices = new SectionRenderDispatcher.RenderSectionBufferSlice[ChunkSectionLayer.values().length];
+        }
+        this.slices[layer.ordinal()] = slice;
     }
 
     @Override

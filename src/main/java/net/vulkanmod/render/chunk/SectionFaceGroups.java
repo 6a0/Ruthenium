@@ -147,8 +147,7 @@ public final class SectionFaceGroups {
                                 float eyeX, float eyeY, float eyeZ) {
         int runStart = -1;
         for (int g = 0; g <= GROUPS; g++) {
-            boolean include = g < GROUPS && (this.starts[g] == this.starts[g + 1] || this.faces(g, eyeX, eyeY, eyeZ));
-            if (include) {
+            if (g < GROUPS && this.isDrawn(g, eyeX, eyeY, eyeZ)) {
                 if (runStart < 0) {
                     runStart = this.starts[g];
                 }
@@ -161,6 +160,30 @@ public final class SectionFaceGroups {
                 runStart = -1;
             }
         }
+    }
+
+    /** Like {@link #addVisibleDraws}, for {@link TerrainDrawList}'s commands */
+    void addVisibleCommands(TerrainDrawList.Group group, int firstIndex, int baseVertex, int baseInstance,
+                            float eyeX, float eyeY, float eyeZ) {
+        int runStart = -1;
+        for (int g = 0; g <= GROUPS; g++) {
+            if (g < GROUPS && this.isDrawn(g, eyeX, eyeY, eyeZ)) {
+                if (runStart < 0) {
+                    runStart = this.starts[g];
+                }
+            } else if (runStart >= 0) {
+                int runEnd = this.starts[g];
+                if (runEnd > runStart) {
+                    group.add((runEnd - runStart) * 6, firstIndex, baseVertex + runStart * 4, baseInstance);
+                }
+                runStart = -1;
+            }
+        }
+    }
+
+    /** Empty groups count as drawn, so they don't split runs */
+    private boolean isDrawn(int group, float eyeX, float eyeY, float eyeZ) {
+        return this.starts[group] == this.starts[group + 1] || this.faces(group, eyeX, eyeY, eyeZ);
     }
 
     private boolean faces(int group, float eyeX, float eyeY, float eyeZ) {
