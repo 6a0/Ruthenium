@@ -269,6 +269,11 @@ public abstract class Options {
                                 () -> config.hashedDrawLookup)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.hashedDrawLookup.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.mergeDraws"),
+                                value -> config.mergeDraws = value,
+                                () -> config.mergeDraws)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.mergeDraws.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("vulkanmod.options.directBakedQuads"),
                                 value -> config.directBakedQuads = value,
                                 () -> config.directBakedQuads)

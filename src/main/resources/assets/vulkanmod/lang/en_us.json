@@ -53,6 +53,8 @@
   "vulkanmod.options.blockModelMeshCache.tooltip": "Item frames, block displays, minecarts and endermen reuse the quads of their block models instead of building them again every frame.",
   "vulkanmod.options.hashedDrawLookup": "Fast Draw Lookup",
   "vulkanmod.options.hashedDrawLookup.tooltip": "Finds the draw an entity's or item's geometry goes into with a hash lookup instead of searching all of the frame's draws.",
+  "vulkanmod.options.mergeDraws": "Merge Entity Draws",
+  "vulkanmod.options.mergeDraws.tooltip": "Puts entity and item geometry with the same texture and settings into one draw call, as vanilla intends but never does. Turn off if a mod's entity overlays flicker or disappear.",
   "vulkanmod.options.directBakedQuads": "Fast Item Vertices",
   "vulkanmod.options.directBakedQuads.tooltip": "Dropped, held and framed items write the four vertices of each quad at once instead of one vertex at a time.",
 
