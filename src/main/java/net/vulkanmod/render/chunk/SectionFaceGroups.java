@@ -3,6 +3,7 @@ package net.vulkanmod.render.chunk;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.MeshData;
 import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
+import com.mojang.renderpearl.api.vertex.VertexFormat;
 import net.minecraft.client.renderer.DynamicGpuData;
 import org.jspecify.annotations.Nullable;
 import org.lwjgl.system.MemoryUtil;
@@ -11,8 +12,8 @@ import java.nio.ByteBuffer;
 import java.util.List;
 
 /**
- * Quads of a section layer grouped by the axis-aligned plane they face, so a frame can skip the groups that face
- * away from the camera.
+ * Quads of a section layer (or of a retained block entity batch) grouped by the axis-aligned plane they face, so a
+ * frame can skip the groups that face away from the camera.
  * <p>
  * At compile time the layer's quads are reordered (stably) into the groups below, by the winding normal of each
  * quad that lies in an axis-aligned plane. Terrain pipelines cull back faces, and with a perspective projection a
@@ -30,9 +31,15 @@ public final class SectionFaceGroups {
     public static final int SOUTH = 5;
     public static final int NORTH = 6;
     private static final int GROUPS = 7;
+    /** Runs of {@link #visibleRuns} at most: drawn and skipped groups alternate */
+    public static final int MAX_RUNS = (GROUPS + 1) / 2;
 
-    /** Draws a group when the eye is within this distance behind its frontmost plane, against rounding */
-    private static final float MARGIN = 1.0e-3f;
+    /**
+     * Draws a group when the eye is within this distance behind its frontmost plane. The tests use the camera
+     * position, but view bobbing is multiplied into the projection and moves the eye up to ~0.11 blocks from it
+     * ({@code GameRenderer.bobView}: a translation of {@code bob * 0.5} and {@code bob}, bob <= 0.1).
+     */
+    private static final float MARGIN = 0.25f;
 
     /** First quad of each group, and the quad count at the end */
     private final int[] starts = new int[GROUPS + 1];
@@ -46,19 +53,22 @@ public final class SectionFaceGroups {
     }
 
     /**
-     * Reorders the quads of a layer mesh (vanilla's block vertex format or {@link CompressedTerrain#FORMAT},
-     * sequential quads) by facing.
+     * Reorders the quads of a mesh (sequential quads in vanilla's block, entity or world text vertex format, or
+     * {@link CompressedTerrain#FORMAT}) by facing.
      *
      * @return the groups, or null if the mesh isn't one this handles or has nothing to skip
      */
     public static @Nullable SectionFaceGroups sort(MeshData mesh) {
         MeshData.DrawState state = mesh.drawState();
-        boolean compressed = state.format() == CompressedTerrain.FORMAT;
-        if (mesh.indexBuffer() != null || state.format() != DefaultVertexFormat.BLOCK && !compressed
-                || state.primitiveTopology() != PrimitiveTopology.QUADS) {
+        VertexFormat format = state.format();
+        boolean compressed = format == CompressedTerrain.FORMAT;
+        // These formats start with a float position
+        boolean floatPosition = format == DefaultVertexFormat.BLOCK || format == DefaultVertexFormat.ENTITY
+                || format == DefaultVertexFormat.POSITION_TEX_LIGHTMAP_COLOR;
+        if (mesh.indexBuffer() != null || !floatPosition && !compressed || state.primitiveTopology() != PrimitiveTopology.QUADS) {
             return null;
         }
-        int stride = state.format().getVertexSize();
+        int stride = format.getVertexSize();
         int quadBytes = 4 * stride;
 
         ByteBuffer vertices = mesh.vertexBuffer();
@@ -181,6 +191,34 @@ public final class SectionFaceGroups {
                 runStart = -1;
             }
         }
+    }
+
+    /**
+     * The runs of quads to draw for an eye position, merging adjacent groups.
+     *
+     * @param eyeX eye position relative to the mesh's origin
+     * @param runs receives the first quad and quad count of each run ({@link #MAX_RUNS} pairs at most)
+     * @return the number of runs
+     */
+    public int visibleRuns(float eyeX, float eyeY, float eyeZ, int[] runs) {
+        int count = 0;
+        int runStart = -1;
+        for (int g = 0; g <= GROUPS; g++) {
+            if (g < GROUPS && this.isDrawn(g, eyeX, eyeY, eyeZ)) {
+                if (runStart < 0) {
+                    runStart = this.starts[g];
+                }
+            } else if (runStart >= 0) {
+                int runEnd = this.starts[g];
+                if (runEnd > runStart) {
+                    runs[count * 2] = runStart;
+                    runs[count * 2 + 1] = runEnd - runStart;
+                    count++;
+                }
+                runStart = -1;
+            }
+        }
+        return count;
     }
 
     /** Like {@link #addVisibleDraws}, for {@link TerrainDrawList}'s commands */

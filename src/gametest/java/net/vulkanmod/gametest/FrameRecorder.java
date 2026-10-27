@@ -123,6 +123,7 @@ public final class FrameRecorder {
         }
         if (GpuFrameProbe.ENABLED) {
             GpuFrameProbe.reset();
+            GpuPassProbe.reset();
         }
         TickProbe.reset();
     }
@@ -132,7 +133,7 @@ public final class FrameRecorder {
         org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("{}: {}", name, tickSplit());
         org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("{}: {}", name, TickProbe.report());
         if (GpuFrameProbe.ENABLED) {
-            org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("{}: {}", name, GpuFrameProbe.report());
+            org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("{}: {}; {}", name, GpuFrameProbe.report(), GpuPassProbe.report());
         }
         if (LightProfiler.enabled()) {
             org.slf4j.LoggerFactory.getLogger("VulkanMod Benchmark").info("\n{}", LightProfiler.INSTANCE.stopRecording(name));

@@ -68,6 +68,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.ChestType;
 import net.minecraft.world.phys.Vec3;
 import net.vulkanmod.Initializer;
+import net.vulkanmod.render.chunk.SectionFaceGroups;
 import net.vulkanmod.interfaces.IdleTicker;
 import net.vulkanmod.render.entity.ModelGeometryCache;
 import net.vulkanmod.render.text.SignTextCache;
@@ -100,6 +101,9 @@ import java.util.function.Consumer;
  * batches are drawn right after the world's solid features with copies of vanilla's entity and text pipelines
  * ({@link #PIPELINES}) whose vertex shader adds {@code ModelOffset} (section origin minus camera) to the position;
  * the render type's textures and its layering transform (the z offset of skulls) are applied as vanilla does.
+ * Buffers of pipelines that cull back faces are sorted by facing ({@link SectionFaceGroups}), and a frame skips the
+ * groups that face away from the eye (switch {@code modelBackFaceCulling}); the GPU would cull them after running
+ * their vertex shader, which is most of the batches' GPU cost.
  * <p>
  * A batch is rebuilt when the section's compiled mesh changes (block entity list), when the section or a neighbour
  * is marked dirty (block and light changes, which is where the light comes from), on block events of chests,
@@ -125,6 +129,7 @@ public final class RetainedBlockEntities {
     private static final Vector4f WHITE = new Vector4f(1.0F, 1.0F, 1.0F, 1.0F);
     private static final Matrix4f IDENTITY = new Matrix4f();
     private static final Draw[] NO_DRAWS = new Draw[0];
+    private static final int[] RUNS = new int[SectionFaceGroups.MAX_RUNS * 2];
 
     private static final int NOT_CANDIDATE = 0;
     private static final int CANDIDATE = 1;
@@ -239,7 +244,9 @@ public final class RetainedBlockEntities {
         return null;
     }
 
-    private record Draw(RenderPipeline pipeline, RenderType renderType, GpuBuffer buffer, int indexCount) {
+    /** @param faces the quads grouped by facing, for pipelines that cull back faces */
+    private record Draw(RenderPipeline pipeline, RenderType renderType, GpuBuffer buffer, int indexCount,
+                        @Nullable SectionFaceGroups faces) {
     }
 
     private static final class Part {
@@ -657,9 +664,11 @@ public final class RetainedBlockEntities {
                     if (draws.length == 0) {
                         draws = new Draw[partCount];
                     }
+                    // Reorders the vertices before the upload
+                    SectionFaceGroups faces = part.pipeline.isCull() ? SectionFaceGroups.sort(data) : null;
                     GpuBuffer buffer = RenderSystem.getDevice().createBuffer(() -> "VulkanMod retained block entities",
                             GpuBuffer.USAGE_VERTEX, data.vertexBuffer());
-                    draws[drawn++] = new Draw(part.pipeline, part.renderType, buffer, data.drawState().vertexCount() / 4 * 6);
+                    draws[drawn++] = new Draw(part.pipeline, part.renderType, buffer, data.drawState().vertexCount() / 4 * 6, faces);
                 }
             }
             part.builder = null;
@@ -736,8 +745,10 @@ public final class RetainedBlockEntities {
         RenderSystem.AutoStorageIndexBuffer indices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
         RenderPipeline boundPipeline = null;
         RenderType boundType = null;
+        boolean faceCulling = Initializer.CONFIG.modelBackFaceCulling;
         int i = 0;
         for (Batch batch : VISIBLE) {
+            float eyeX = (float) (camX - batch.originX), eyeY = (float) (camY - batch.originY), eyeZ = (float) (camZ - batch.originZ);
             for (Draw draw : batch.draws) {
                 GpuBufferSlice transform = transforms[i++];
                 if (draw.pipeline != boundPipeline) {
@@ -759,7 +770,15 @@ public final class RetainedBlockEntities {
                 }
                 renderPass.setUniform("DynamicTransforms", transform);
                 renderPass.setVertexBuffer(0, draw.buffer.slice());
-                renderPass.drawIndexed(draw.indexCount, 1, 0, 0, 0);
+                if (faceCulling && draw.faces != null) {
+                    // Groups of quads that all face away from the eye would be culled by the pipeline
+                    int runs = draw.faces.visibleRuns(eyeX, eyeY, eyeZ, RUNS);
+                    for (int r = 0; r < runs; r++) {
+                        renderPass.drawIndexed(RUNS[r * 2 + 1] * 6, 1, 0, RUNS[r * 2] * 4, 0);
+                    }
+                } else {
+                    renderPass.drawIndexed(draw.indexCount, 1, 0, 0, 0);
+                }
             }
         }
         renderPass.popDebugGroup();
