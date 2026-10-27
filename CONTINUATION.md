@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-26 (third session), at commit `7b4aff1` plus the commit that updates this file.
+Last updated: 2026-10-26 (fourth session), with the settings screen port.
 
 ---
 
@@ -22,9 +22,13 @@ Last updated: 2026-10-26 (third session), at commit `7b4aff1` plus the commit th
   (`benchVulkanModGl`) the static view runs at 344 fps.
 - **Closed chests are retained on the GPU** (`RetainedChests`, the user chose this in the third session): their
   geometry lives in per-section vertex buffers and is drawn with a copy of the entity pipeline that adds
-  `ModelOffset`. Kill switch: `-Dvulkanmod.retainedChests=false` (`-Pvm.retainedChests=false` on bench tasks).
+  `ModelOffset`. Switch: Optimizations page of the settings screen, or `-Dvulkanmod.retainedChests=false`
+  (`-Pvm.retainedChests=false` on bench tasks).
 - **Closed enchanting table books and armor stands are GPU instances** (`InstancedModels`): model-space mesh once
-  per group, a pose + light per instance per frame. Kill switch: `-Dvulkanmod.instancedModels=false`.
+  per group, a pose + light per instance per frame. Switch: settings screen or `-Dvulkanmod.instancedModels=false`.
+- **The settings screen is ported** (fourth session): the video settings button opens VulkanMod's screen with Video,
+  Graphics (vanilla options through their `OptionInstance`s) and Optimizations (the mod's switches, `Config`,
+  `config/vulkanmod_settings.json`). `-Dvulkanmod.<field>=true|false` overrides any switch for a launch.
 - **The pan p99 is not hitches.** Frames facing the chest cube (yaw 220–320, 11–13k block entities) take
   ~6 ms (third session start: ~20 ms) while the rest of the pan runs at ~1 ms (section 7). The remaining work
   there is per block entity (signs, enchanting table extraction, ticking).
@@ -118,7 +122,9 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 
 | File | What it does |
 |---|---|
-| `Initializer.java` | Minimal client entrypoint (version and logging only). The old config, Platform and FRAPI registration are not ported yet |
+| `Initializer.java` | Client entrypoint: version, logging, loads `Config`. Platform and FRAPI registration are not ported yet |
+| `config/Config.java` | The mod's switches (`blockEntityCulling`, `retainedChests`, `instancedModels`, `modelBackFaceCulling`, `particleSpawnLimit`, `skipIdleTicks`, all on by default), Gson to `config/vulkanmod_settings.json` (unknown fields of the old 1.21.11 file are ignored). `-Dvulkanmod.<field>=true|false` overrides a field at load (and is written back if the user applies settings in that session). The features read `Initializer.CONFIG.<field>` at use, so toggles apply immediately; retained chests and instanced models also `clear()` when toggled |
+| `config/**` (settings screen) + `mixin/screen/{OptionsScreenM,OptionInstanceAccessor,TooltipAccessor}.java` | Port of the old screen (`VOptionScreen`, `VOptionList`, widgets, search, Apply/Undo, the `vulkanmod:mod_settings_registry` entrypoint API for other mods). `OptionsScreenM` swaps the supplier of the video button (`@ModifyArg` on `openScreenButton` when the message is `VIDEO`); Shift+P in the screen opens vanilla's. Pages: **Video** (window mode = vanilla `fullscreen` + `exclusiveFullscreen`, exclusive fullscreen mode of `window.findBestMonitor()`, framerate, vsync, inactivity limit, GUI scale, brightness, graphics API, attack/autosave indicators), **Graphics** (preset first, distances, chunk updates, filtering/anisotropy, particles, clouds, leaves, improved transparency, chunk fade, AO, biome blend, shadows, entity distance, mipmaps, weather radius, menu blur, vignette), **Optimizations** (the `Config` switches). `VanillaOptions` wraps a vanilla `OptionInstance`: `set` runs vanilla's listener (preset, `allChanged`, sampler reset, ...), and caption, value label (with the leading `options.generic_value` caption stripped) and tooltip come from the instance through accessors. After Apply every option re-reads its value (the preset changes the others); texture reloads (mipmaps/filtering/anisotropy) happen when the screen closes, like vanilla's video screen. Drawing goes through `GuiRenderer` → `GuiGraphicsExtractor`; the cycling arrows are `PolygonRenderState` triangles (a quad of `RenderPipelines.GUI` with the last vertex repeated; `guiRenderState`/`scissorStack` opened by the access widener). Text input uses `charTyped`; shortcut letters compare `KeyEvent.shortcutKey()` (SDL keycodes, lowercase ASCII for letters). Dropped from the old screen: device/frame queue/builder threads/wayland/texture animation options, advanced chunk culling, indirect draw, unique opaque layer, backface culling (terrain options come back with the terrain renderer), the update checker button |
 | `interfaces/ExtendedVertexBuilder.java` | `canWriteDirect(VertexFormat)` and `reserveVertices(int)`, for writing whole quads into a `BufferBuilder` |
 | `mixin/render/vertex/BufferBuilderM.java` | Implements the above (handles the `ensureBuilding`/`endLastVertex`/vertex count/`vertexPointer` bookkeeping; LE only; non-LINES topology) |
 | `mixin/render/entity/model/ModelPartCubeM.java` | `@Overwrite Cube.compile`: transforms the distinct corners once, writes ENTITY-format faces directly, unwraps `SpriteCoordinateExpander`; vanilla fallback for other formats |
@@ -154,10 +160,10 @@ Design rules used so far:
   rework them when porting terrain.
 
 ### Not ported yet (all still on `dev`)
-`config/**` (settings GUI and options), `render/chunk/**` (terrain renderer: section graph, AreaBuffer,
+`render/chunk/**` (terrain renderer: section graph, AreaBuffer,
 DrawBuffers, QuadFacing culling, light pipelines, FRAPI impl, fluid renderer), `render/vertex/**`
 (`CustomVertexFormat`, `TerrainBuilder`, `QuadSorter`), `render/sky/CloudRenderer`, `render/profiling` (overlay),
-`mixin/debug/**`, `mixin/screen/**`, `UpdateChecker`, `Platform`. The device, GL compat, window, wayland and
+`mixin/debug/**`, `UpdateChecker`, `Platform`. The device, GL compat, window, wayland and
 shader-converter code is **obsolete under strategy B** and should not be ported.
 
 ---
@@ -237,8 +243,12 @@ Options: `-PbenchJfr` (JFR profile to `results/<label>.jfr`), `-PbenchWindow=WxH
 `-PbenchJavaVendor=microsoft -Porg.gradle.java.installations.paths=<jdk>` (run on another JDK), and
 `-Pbench.<name>=value` → `-Dvulkanmod.bench.<name>` (`renderDistance`, `preset`, `panSeconds`, `initialSeconds`,
 `staticSeconds`, `particleSeconds`, `server`, `particleCommand`, `extraShotYaws`, `staticYaw`, `sectionProfile`,
-`chestEvents`, `zoomShot`), and `-Pvm.<name>=value` → `-Dvulkanmod.<name>` for mod switches (`retainedChests=false`,
-`instancedModels=false`). `zoomShot` adds a 30° FOV screenshot at yaw 270 (`zoom270`), where the enchanting table
+`chestEvents`, `zoomShot`, `settingsScreen`), and `-Pvm.<name>=value` → `-Dvulkanmod.<name>`, which overrides that
+`Config` switch (`retainedChests=false`, `instancedModels=false`, `blockEntityCulling=false`, ...).
+`-Pbench.settingsScreen=true` skips the benchmark: from the title screen it opens the settings screen through the
+options screen's video button, screenshots each page (`settings-*`), toggles and applies a switch (checking
+`Config` and the written file), hovers an option for its tooltip, searches with Ctrl+L and opens vanilla's screen
+with Shift+P (`SettingsScreenCheck`). No server needed, ~20 s. `zoomShot` adds a 30° FOV screenshot at yaw 270 (`zoom270`), where the enchanting table
 books are large enough to compare.
 `chestEvents` opens the lid of a chest in the crosshair and adds breaking progress to another one (client-side)
 before the static phase, with `chestopen`/`chestclosed` screenshots; compare runs with `-Pvm.retainedChests=false`
@@ -331,9 +341,14 @@ cache 128.3 → CPU back-face skip 139.7 → rest pose geometry cache 161.0 → 
 167.7 → packed section positions 170.3 → (third session) closed books in model space 175.3 → parallel upload
 copy 188.2 → sign text back-side skip 194.8 → faster model space writes 199.7 → extraction overwrite 214.1 →
 idle tick skip 217.1 → retained chests 343.4 → instanced books 353.7 → instanced armor stands 415.2.
+Settings screen port (fourth session, config field reads instead of constants on the hot paths): 404.3 static
+(386.0 / 404.3 / 415.6 vs HEAD's 406.9 / 415.2 / 423.9), screenshots within noise (0.017% static, 0.058% yaw 270).
+Later runs that session were slowed ~30% by other load on the machine (HEAD too: 364.7) and were moved to
+`results/noisy-20261027/`. **To do when the machine is idle:** an interleaved A/B (HEAD, port, HEAD, ... 3 each) to
+rule out a 2–3% cost of the switches.
 Rejected (no gain, reverted): an 11-bit, single-histogram radix sort (the sort's JFR share was misattributed); a
 per-line cache of sign text glyph vertices (verified bit-identical, but static 353.7 → 356.5 is noise: the text
-cost is writing ~3.4 MB of glyph vertices per frame, which the cache still does). Results archives: `results/vulkanmod-v5 … v21` (v21 = HEAD).
+cost is writing ~3.4 MB of glyph vertices per frame, which the cache still does). Results archives: `results/vulkanmod-v5 … v22` (v22 = HEAD, the settings screen port).
 Facing the chest cube (`staticYaw=270`, 1 run each): ~30 (v4) → 47.5 → ~50 → 56.7 (books) → 61.4 (copy) →
 68.5 (sign sides) → 78.5 (book writes) → 103 (retained chests) → 157.5 (instanced books). Initial p99 dropped (47.7 → 41.5): the batches
 are built in the first frames after the teleport (budget 2048 chests per frame). Peak particles: vanilla ~16 349, VulkanMod ~16 250.
@@ -390,18 +405,13 @@ books' write was 640 ns each before the faster model space path (~5.3k per frame
      through the 2/16 gaps, so culling them changes pixels.
 2. **Allocation** (~2.3 MB/frame at static): `Float` boxing of chest openness per submit, submit records,
    `PoseStack.Pose`, glyph instances of non-sign text, `CompactVectorArray` per sort.
-3. **Config and settings screen port** (`dev:src/main/java/net/vulkanmod/config/**`). Needed so the particle cap
-   and block-entity culling become toggles. Port notes from the audit:
-   - `GuiGraphics` → `GuiGraphicsExtractor` (`drawString`→`text`, `drawCenteredString`→`centeredText`,
-     `submitGuiElement`→`addGuiElement`); `Screen.render` → `extractRenderState(GuiGraphicsExtractor,int,int,float)`.
-   - `Minecraft.setScreen` → `minecraft.gui.setScreen`; `levelRenderer.allChanged()` → `minecraft.levelExtractor.allChanged()`.
-   - Key codes are SDL scancodes (`InputConstants.KEY_*`), there is no GLFW (`glfwGetKeyName` would crash), and
-     text input uses `CharacterEvent`.
-   - Hook the video settings button with `@ModifyArg` on `OptionsScreen.init` → `openScreenButton` (ordinal of
-     the video button). The old lambda target `method_19828` no longer exists.
-   - Vanilla added a **Graphics API option** (`Options.preferredGraphicsBackend()`) and `exclusiveFullscreen()`;
-     surface both in the mod's page. Device-specific options from the old config (present modes, device
-     selection, frame queue) are obsolete under strategy B.
+3. **Settings screen follow-ups** (the port itself is done, section 4).
+   - Give every new optimisation that changes output or could misbehave a `Config` switch and an entry on the
+     Optimizations page (with a tooltip and impact), instead of a system property.
+   - At GUI scale 4 on 1080p the list is too narrow for the side tooltip, so tooltips go below the list and long
+     ones cover the Apply/Done buttons (inherited layout).
+   - Only `en_us` has the new keys; terrain options (old advanced culling, indirect draw, ...) come back with the
+     terrain renderer.
 4. **Other CPU hot spots.**
    - Armor stand extraction (~5% at static, spread thin across `LivingEntityRenderer.extractRenderState`).
    - Entity culling: Sodium and vanilla render the same ~188 entities.
