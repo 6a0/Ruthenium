@@ -4,9 +4,12 @@
   "package": "net.vulkanmod.gametest.mixin",
   "compatibilityLevel": "JAVA_25",
   "client": [
+    "DrawIndirectMixin",
     "LevelExtractorMixin",
     "MinecraftMixin",
-    "ParticleEngineAccessor"
+    "ParticleEngineAccessor",
+    "TerrainDrawListGroupAccessor",
+    "TerrainDrawListMixin"
   ],
   "injectors": {
     "defaultRequire": 1

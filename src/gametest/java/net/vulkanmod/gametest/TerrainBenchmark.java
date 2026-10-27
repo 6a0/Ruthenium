@@ -100,14 +100,26 @@ final class TerrainBenchmark {
             }
             context.takeScreenshot(label + "-terrain-static-" + runId);
             int renderedSections = context.computeOnClient(mc -> mc.levelExtractor.countRenderedSections());
-            context.runOnClient(_ -> FrameRecorder.startPhase());
+            context.runOnClient(_ -> {
+                FrameRecorder.startPhase();
+                GpuProbe.reset();
+            });
             BenchmarkClientGameTest.waitSeconds(context, BenchmarkClientGameTest.STATIC_SECONDS);
             results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("static", -1)));
+            if (GpuProbe.ENABLED) {
+                context.runOnClient(_ -> GpuProbe.report("static"));
+            }
             LOGGER.info(results.getLast().summaryLine());
 
-            context.runOnClient(_ -> FrameRecorder.startPhase());
+            context.runOnClient(_ -> {
+                FrameRecorder.startPhase();
+                GpuProbe.reset();
+            });
             pan(context, BenchmarkClientGameTest.STATIC_YAW, BenchmarkClientGameTest.PAN_SECONDS);
             results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("pan", -1)));
+            if (GpuProbe.ENABLED) {
+                context.runOnClient(_ -> GpuProbe.report("pan"));
+            }
             frameSeries.put("pan", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
             LOGGER.info(results.getLast().summaryLine());
 
@@ -255,6 +267,7 @@ final class TerrainBenchmark {
         // Followed every frame: the compiled count and when it last changed
         int[] last = {-1};
         long[] lastChange = {0};
+        long workerCpuStart = workerCpuNanos();
         long start = context.computeOnClient(mc -> {
             mc.levelExtractor.allChanged();
             long now = System.nanoTime();
@@ -275,8 +288,26 @@ final class TerrainBenchmark {
             context.runOnClient(_ -> FrameRecorder.setFrameWatcher(null));
         }
         double seconds = context.computeOnClient(_ -> lastChange[0] - start) / 1.0e9;
+        double workerCpu = (workerCpuNanos() - workerCpuStart) / 1.0e9;
+        LOGGER.info("Rebuild worker CPU: {} s in {} s ({} threads busy on average)", "%.3f".formatted(workerCpu),
+                "%.3f".formatted(seconds), "%.1f".formatted(workerCpu / seconds));
         completeOcclusionGraph(context);
         return new double[]{seconds, compiled};
+    }
+
+    /** CPU time of vanilla's background workers (section compiles run there) */
+    private static long workerCpuNanos() {
+        java.lang.management.ThreadMXBean threads = java.lang.management.ManagementFactory.getThreadMXBean();
+        long total = 0;
+        for (java.lang.management.ThreadInfo info : threads.getThreadInfo(threads.getAllThreadIds())) {
+            if (info != null && info.getThreadName().startsWith("Worker-Main")) {
+                long cpu = threads.getThreadCpuTime(info.getThreadId());
+                if (cpu > 0) {
+                    total += cpu;
+                }
+            }
+        }
+        return total;
     }
 
     /** Waits until every visible section is compiled again after the terrain was reset, with a complete graph */
