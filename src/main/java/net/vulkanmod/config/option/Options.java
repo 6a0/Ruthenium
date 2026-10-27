@@ -264,6 +264,11 @@ public abstract class Options {
                                 () -> config.parkIdleTickers)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.parkIdleTickers.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.cacheTickerStates"),
+                                value -> config.cacheTickerStates = value,
+                                () -> config.cacheTickerStates)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.cacheTickerStates.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("vulkanmod.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)
