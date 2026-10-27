@@ -39,6 +39,7 @@ import net.minecraft.util.Mth;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.EnchantingTableBlockEntity;
 import net.vulkanmod.Initializer;
+import net.vulkanmod.interfaces.CachedBlockEntityLight;
 import net.vulkanmod.render.entity.ModelCulling;
 import net.vulkanmod.render.entity.ModelGeometryCache;
 import org.joml.Matrix4f;
@@ -103,6 +104,12 @@ public final class InstancedModels {
     /** The enchanting table renderer of this frame, looked up on the first table */
     private static @Nullable BlockEntityRenderer<?, ?> frameTableRenderer;
     private static final Matrix4f BOOK_POSE = new Matrix4f();
+    /**
+     * Bumped whenever a section is marked dirty (block and light changes), which invalidates the light cached in
+     * enchanting tables ({@link CachedBlockEntityLight}); 0 means not cached
+     */
+    private static volatile int lightGeneration = 1;
+    private static int frameLightStamp;
     private static volatile boolean clearPending;
     private static @Nullable Boolean pipelineAvailable;
     private static @Nullable GpuBufferSlice transform;
@@ -201,6 +208,13 @@ public final class InstancedModels {
     /** Drops every group at the start of the next frame (level change, resource reload) */
     public static void clear() {
         clearPending = true;
+        invalidateLight();
+    }
+
+    /** A section was marked dirty: block entity light may have changed */
+    public static void invalidateLight() {
+        int next = lightGeneration + 1;
+        lightGeneration = next == 0 ? 1 : next;
     }
 
     public static void beginFrame() {
@@ -213,6 +227,7 @@ public final class InstancedModels {
             closedBookRenderer = null;
         }
         frameTableRenderer = null;
+        frameLightStamp = lightGeneration;
         for (Group group : GROUPS) {
             group.count = 0;
         }
@@ -240,8 +255,20 @@ public final class InstancedModels {
         }
         Level level = table.getLevel();
         BlockPos pos = table.getBlockPos();
-        if (renderer != closedBookRenderer || level == null || !table.getType().isValid(table.getBlockState())) {
+        if (renderer != closedBookRenderer || level == null) {
             return false;
+        }
+        // The block state check and the light only change with the blocks and light around the table
+        CachedBlockEntityLight cache = (CachedBlockEntityLight) table;
+        int light;
+        if (cache.vulkanmod$getLightStamp() == frameLightStamp) {
+            light = cache.vulkanmod$getLight();
+        } else {
+            if (!table.getType().isValid(table.getBlockState())) {
+                return false;
+            }
+            light = LightCoordsUtil.getLightCoords(level, pos);
+            cache.vulkanmod$setLight(frameLightStamp, light);
         }
         // BlockEntityRenderer.shouldRender
         double dx = pos.getX() + 0.5 - camX;
@@ -269,7 +296,7 @@ public final class InstancedModels {
         m.translate(0.0F, 0.1F + Mth.sin(time * 0.1F) * 0.01F, 0.0F);
         m.rotateY(-yRot);
         m.rotateZ(80.0F * (float) (Math.PI / 180.0));
-        addInstance(closedBookGroup, m, LightCoordsUtil.getLightCoords(level, pos));
+        addInstance(closedBookGroup, m, light);
         return true;
     }
 

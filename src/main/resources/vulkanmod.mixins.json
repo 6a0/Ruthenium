@@ -44,6 +44,7 @@
     "world.ChestBlockEntityM",
     "world.ChestLidControllerM",
     "world.DecoratedPotBlockEntityM",
+    "world.EnchantingTableBlockEntityM",
     "world.EnderChestBlockEntityM",
     "world.LevelM",
     "world.RebindableTickingBlockEntityWrapperM",

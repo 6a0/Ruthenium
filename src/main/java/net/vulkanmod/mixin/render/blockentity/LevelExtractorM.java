@@ -177,6 +177,7 @@ public class LevelExtractorM {
     @Inject(method = "setSectionDirty(IIIZ)V", at = @At("HEAD"))
     private void markRetainedDirty(int sectionX, int sectionY, int sectionZ, boolean playerChanged, CallbackInfo ci) {
         RetainedBlockEntities.markDirty(sectionX, sectionY, sectionZ);
+        InstancedModels.invalidateLight();
     }
 
     @Inject(method = {"setLevel", "allChanged"}, at = @At("HEAD"))
