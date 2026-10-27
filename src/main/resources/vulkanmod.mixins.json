@@ -47,6 +47,7 @@
     "screen.OptionsScreenM",
     "screen.TooltipAccessor",
     "world.BlockEntityM",
+    "world.ArmorStandM",
     "world.BoundTickingBlockEntityM",
     "world.ChestBlockEntityM",
     "world.ChestLidControllerM",
