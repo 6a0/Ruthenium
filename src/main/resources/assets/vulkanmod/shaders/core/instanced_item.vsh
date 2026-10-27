@@ -15,7 +15,8 @@ layout(location = 3) in ivec2 UV1;
 layout(location = 4) in ivec2 UV2;
 layout(location = 5) in vec3 Normal;
 // VulkanMod: per instance, the rows of the item's affine pose (camera-relative) and of its normal matrix, its light
-// and overlay; the mesh's color is the quad's tint, its UV2.x the quad's light emission, its overlay is not used
+// and overlay; the mesh's color is the quad's tint, its UV2.x the quad's light emission (with MESH_LIGHT: its UV2 the
+// vertex's own light, of a Fabric Renderer API mesh), its overlay is not used
 layout(location = 6) in vec4 InstanceRow0;
 layout(location = 7) in vec4 InstanceRow1;
 layout(location = 8) in vec4 InstanceRow2;
@@ -49,12 +50,17 @@ void main() {
     cylindricalVertexDistance = fog_cylindrical_distance(pos);
     vertexColor = minecraft_mix_light(Light0_Direction, Light1_Direction, normal, Color);
 
+#ifdef MESH_LIGHT
+    // ExtraLightCoordsUtil.smoothMax of the vertex's light and the instance's, as Indigo's minLightmap
+    ivec2 light = max(UV2 & 255, InstanceLightOverlay.xy & 255);
+#else
     // LightCoordsUtil.lightCoordsWithEmission: block and sky light raised to the quad's emission (whole levels)
     ivec2 light = InstanceLightOverlay.xy;
     int emission = UV2.x;
     if (emission != 0) {
         light = ivec2(max((light.x >> 4) & 15, emission) << 4, max((light.y >> 4) & 15, emission) << 4);
     }
+#endif
     lightMapColor = sample_lightmap(Sampler2, light);
     overlayColor = texelFetch(Sampler1, InstanceLightOverlay.zw, 0);
 

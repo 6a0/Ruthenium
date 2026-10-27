@@ -40,6 +40,7 @@ public class Config {
     /** The parts of posed world models (mobs, ...) are drawn as GPU instances instead of writing their vertices */
     public boolean instancedParts = true;
     public boolean instancedItems = true;
+    public boolean instancedBlockModels = true;
     /** Baked quads (items, block models) are written into vertex buffers a whole quad at a time */
     public boolean directBakedQuads = true;
     /** Skips the terrain faces of a section that all face away from the camera */

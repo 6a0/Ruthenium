@@ -62,6 +62,8 @@
   "vulkanmod.options.instancedParts": "Instanced Mob Parts",
   "vulkanmod.options.instancedParts.tooltip": "Keeps the shape of every mob body part on the GPU and only sends each part's position per frame, instead of all of its corners. Turn off if a mod's mobs look wrong.",
   "vulkanmod.options.instancedItems": "Instanced Items",
+  "vulkanmod.options.instancedBlockModels": "Instanced Entity Blocks",
+  "vulkanmod.options.instancedBlockModels.tooltip": "Keeps the shape of blocks shown by entities (item frames, block displays, blocks in minecarts) on the GPU and only sends each one's position per frame. Turn off if such blocks look wrong.",
   "vulkanmod.options.instancedItems.tooltip": "Keeps the shape of every item model on the GPU and only sends each item's position per frame, for dropped items, items in frames, held items and item displays. Turn off if a mod's items look wrong.",
   "vulkanmod.options.directBakedQuads": "Fast Item Vertices",
   "vulkanmod.options.directBakedQuads.tooltip": "Dropped, held and framed items write the four vertices of each quad at once instead of one vertex at a time.",

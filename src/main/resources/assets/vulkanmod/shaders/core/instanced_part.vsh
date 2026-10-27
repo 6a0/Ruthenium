@@ -17,7 +17,8 @@ layout(location = 3) in ivec2 UV1;
 layout(location = 4) in ivec2 UV2;
 layout(location = 5) in vec3 Normal;
 // VulkanMod: per instance, the rows of the part's affine pose (camera-relative) and of its normal matrix, its light,
-// overlay and color; the mesh's own color, overlay and light are not used
+// overlay and color; the mesh's own color, overlay and light are not used (with MESH_LIGHT, for Fabric Renderer API
+// meshes: the mesh's color instead of the instance's, and each vertex's light raised to the instance's)
 layout(location = 6) in vec4 InstanceRow0;
 layout(location = 7) in vec4 InstanceRow1;
 layout(location = 8) in vec4 InstanceRow2;
@@ -68,7 +69,11 @@ void main() {
     pos.y = InstanceRow1.x * Position.x + (InstanceRow1.y * Position.y + (InstanceRow1.z * Position.z + InstanceRow1.w));
     pos.z = InstanceRow2.x * Position.x + (InstanceRow2.y * Position.y + (InstanceRow2.z * Position.z + InstanceRow2.w));
     vec3 normal = normalize(vec3(dot(InstanceNormal0, Normal), dot(InstanceNormal1, Normal), dot(InstanceNormal2, Normal)));
+#ifdef MESH_LIGHT
+    vec4 color = Color;
+#else
     vec4 color = InstanceColor;
+#endif
     gl_Position = ProjMat * ModelViewMat * vec4(pos, 1.0);
 
     sphericalVertexDistance = fog_spherical_distance(pos);
@@ -85,7 +90,12 @@ void main() {
 #endif
 
 #if !defined(EMISSIVE) && !defined(OIT_ALPHA_ONLY)
+#ifdef MESH_LIGHT
+    // ExtraLightCoordsUtil.smoothMax of the vertex's light and the instance's, as Indigo's minLightmap
+    lightMapColor = sample_lightmap(Sampler2, max(UV2 & 255, InstanceLightOverlay.xy & 255));
+#else
     lightMapColor = sample_lightmap(Sampler2, InstanceLightOverlay.xy);
+#endif
 #endif
 
 #if !defined(NO_OVERLAY) && !defined(OIT_ALPHA_ONLY)

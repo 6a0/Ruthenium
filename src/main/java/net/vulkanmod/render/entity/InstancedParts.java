@@ -17,11 +17,13 @@ import com.mojang.renderpearl.api.pipeline.DepthStencilState;
 import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import com.mojang.renderpearl.api.vertex.VertexFormat;
+import net.fabricmc.fabric.api.client.renderer.v1.mesh.Mesh;
 import net.minecraft.client.model.geom.ModelPart;
 import net.minecraft.client.model.geom.builders.UVPair;
 import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.client.renderer.MappableRingBuffer;
 import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.texture.OverlayTexture;
@@ -29,10 +31,12 @@ import net.minecraft.client.renderer.texture.UvMapping;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.ARGB;
+import net.minecraft.util.LightCoordsUtil;
 import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.InstancedPartHolder;
 import org.joml.Matrix3f;
 import org.joml.Matrix4f;
+import org.joml.Vector3f;
 import org.joml.Vector3fc;
 import org.jspecify.annotations.Nullable;
 import org.lwjgl.system.MemoryUtil;
@@ -40,9 +44,11 @@ import org.lwjgl.system.MemoryUtil;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 /**
  * Draws the parts of the world's posed models (mobs and other entities) as GPU instances instead of writing their
@@ -81,20 +87,26 @@ public final class InstancedParts {
     private static final int INSTANCE_SIZE = INSTANCE_FORMAT.getVertexSize();
 
     /** Instanced copies of vanilla's entity_solid, entity_cutout and entity_cutout_cull */
-    public static final RenderPipeline SOLID = instancedPipeline("entity_solid", false, false, true);
-    public static final RenderPipeline CUTOUT = instancedPipeline("entity_cutout", true, true, false);
-    public static final RenderPipeline CUTOUT_CULL = instancedPipeline("entity_cutout_cull", true, false, true);
-    /** Instanced copy of vanilla's item_cutout */
-    public static final RenderPipeline ITEM_CUTOUT = instancedItemPipeline();
-    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT, CUTOUT_CULL, ITEM_CUTOUT);
+    public static final RenderPipeline SOLID = instancedPipeline("entity_solid", false, false, true, false);
+    public static final RenderPipeline CUTOUT = instancedPipeline("entity_cutout", true, true, false, false);
+    public static final RenderPipeline CUTOUT_CULL = instancedPipeline("entity_cutout_cull", true, false, true, false);
+    /** Instanced copy of vanilla's entity_solid for Fabric Renderer API meshes (item frames' z offset type) */
+    public static final RenderPipeline SOLID_MESH = instancedPipeline("entity_solid_mesh", false, false, true, true);
+    /** Instanced copies of vanilla's item_cutout, for baked quads and for Fabric Renderer API meshes */
+    public static final RenderPipeline ITEM_CUTOUT = instancedItemPipeline("instanced_item_cutout", false);
+    public static final RenderPipeline ITEM_CUTOUT_MESH = instancedItemPipeline("instanced_item_cutout_mesh", true);
+    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT, CUTOUT_CULL, SOLID_MESH, ITEM_CUTOUT, ITEM_CUTOUT_MESH);
 
     /** Meshes kept at most; models created over and over (by mods) fall back to vanilla beyond this */
     private static final int MAX_BATCHES = 4096;
     private static final PoseStack.Pose IDENTITY_POSE = new PoseStack().last();
+    private static final ChunkSectionLayer[] NO_LAYERS = new ChunkSectionLayer[0];
 
     private static final List<PartBatch> BATCHES = new ArrayList<>();
     /** Item meshes by quad list (vanilla's lists belong to baked models), chained by tint colors */
     private static final Map<List<BakedQuad>, PartBatch> ITEM_BATCHES = new IdentityHashMap<>();
+    /** Block model meshes by the cached mesh ({@link BlockModelMeshCache}), chained by tint colors */
+    private static final Map<Mesh, PartBatch> MESH_BATCHES = new IdentityHashMap<>();
     private static int generation = 1;
     private static boolean clearPending;
     private static @Nullable Boolean pipelineAvailable;
@@ -121,7 +133,7 @@ public final class InstancedParts {
     private InstancedParts() {
     }
 
-    private static RenderPipeline instancedPipeline(String name, boolean cutout, boolean perFaceLighting, boolean cull) {
+    private static RenderPipeline instancedPipeline(String name, boolean cutout, boolean perFaceLighting, boolean cull, boolean meshLight) {
         RenderPipeline.Builder builder = RenderPipeline.builder()
                 .withBindGroupLayout(BindGroupLayouts.GLOBALS)
                 .withBindGroupLayout(BindGroupLayouts.PROJECTION)
@@ -143,14 +155,17 @@ public final class InstancedParts {
         if (perFaceLighting) {
             builder.withShaderDefine("PER_FACE_LIGHTING");
         }
+        if (meshLight) {
+            builder.withShaderDefine("MESH_LIGHT");
+        }
         return builder.withBindGroupLayout(BindGroupLayouts.SAMPLER1)
                 .withCull(cull)
                 .withColorTargetState(ColorTargetState.DEFAULT)
                 .build();
     }
 
-    private static RenderPipeline instancedItemPipeline() {
-        return RenderPipeline.builder()
+    private static RenderPipeline instancedItemPipeline(String name, boolean meshLight) {
+        RenderPipeline.Builder builder = RenderPipeline.builder()
                 .withBindGroupLayout(BindGroupLayouts.GLOBALS)
                 .withBindGroupLayout(BindGroupLayouts.PROJECTION)
                 .withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS)
@@ -163,10 +178,12 @@ public final class InstancedParts {
                 .withVertexBinding(1, INSTANCE_FORMAT)
                 .withPrimitiveTopology(PrimitiveTopology.QUADS)
                 .withDepthStencilState(DepthStencilState.DEFAULT)
-                .withLocation(Identifier.fromNamespaceAndPath("vulkanmod", "pipeline/instanced_item_cutout"))
-                .withShaderDefine("ALPHA_CUTOUT", 0.1F)
-                .withColorTargetState(ColorTargetState.DEFAULT)
-                .build();
+                .withLocation(Identifier.fromNamespaceAndPath("vulkanmod", "pipeline/" + name))
+                .withShaderDefine("ALPHA_CUTOUT", 0.1F);
+        if (meshLight) {
+            builder.withShaderDefine("MESH_LIGHT");
+        }
+        return builder.withColorTargetState(ColorTargetState.DEFAULT).build();
     }
 
     private static @Nullable RenderPipeline instancedPipeline(RenderPipeline vanilla) {
@@ -185,9 +202,12 @@ public final class InstancedParts {
      * in the current group
      */
     public static final class PartBatch {
-        final RenderType renderType;
+        /** Null only for a block model mesh whose layers have no render type (never drawn) */
+        final @Nullable RenderType renderType;
         final @Nullable UvMapping uvMapping;
         final int @Nullable [] tints;
+        /** The chunk layers of a block model mesh's quads, each drawn with {@link #renderType} */
+        ChunkSectionLayer[] layers = NO_LAYERS;
         final RenderPipeline pipeline;
         final int generation;
         final @Nullable PartBatch next;
@@ -196,7 +216,7 @@ public final class InstancedParts {
         ByteBuffer pending = MemoryUtil.memAlloc(16 * INSTANCE_SIZE);
         int count;
 
-        PartBatch(RenderType renderType, @Nullable UvMapping uvMapping, int @Nullable [] tints, RenderPipeline pipeline, int generation,
+        PartBatch(@Nullable RenderType renderType, @Nullable UvMapping uvMapping, int @Nullable [] tints, RenderPipeline pipeline, int generation,
                   @Nullable PartBatch next) {
             this.renderType = renderType;
             this.uvMapping = uvMapping;
@@ -235,6 +255,7 @@ public final class InstancedParts {
             BATCHES.forEach(PartBatch::close);
             BATCHES.clear();
             ITEM_BATCHES.clear();
+            MESH_BATCHES.clear();
             generation++;
         }
         frameBytes = 0;
@@ -250,7 +271,8 @@ public final class InstancedParts {
      * @return the index of its first draw
      */
     public static int beginGroup(boolean strictlyOrdered) {
-        groupActive = !strictlyOrdered && ModelCulling.isWorldPass() && (Initializer.CONFIG.instancedParts || Initializer.CONFIG.instancedItems)
+        groupActive = !strictlyOrdered && ModelCulling.isWorldPass()
+                && (Initializer.CONFIG.instancedParts || Initializer.CONFIG.instancedItems || Initializer.CONFIG.instancedBlockModels)
                 && isPipelineAvailable();
         return cmdCount;
     }
@@ -347,6 +369,34 @@ public final class InstancedParts {
         PartBatch batch = findItemBatch(quads, tintLayers);
         if (batch == null) {
             return false;
+        }
+        addInstance(batch, pose, lightCoords, overlayCoords, -1);
+        return true;
+    }
+
+    /**
+     * Adds a block model mesh of an entity (item frames, block displays, minecart blocks: Indigo's
+     * {@code ExtendedBlockModelFeatureRenderer}), posed by {@code pose}, as an instance: a model-space mesh of its quads
+     * per tint colors, in vanilla's {@code item_cutout} or {@code entity_solid} pipeline, with the colors, normals and
+     * light that renderer writes (each vertex's light raised to the submit's, emissive quads at full brightness).
+     *
+     * @param renderTypes the render type of each chunk layer; every layer of the mesh must give the same such type
+     * @return false if the mesh must be written as usual
+     */
+    public static boolean addBlockMesh(Mesh mesh, Function<ChunkSectionLayer, @Nullable RenderType> renderTypes, int tintColor, int[] tintLayers,
+                                       PoseStack.Pose pose, int lightCoords, int overlayCoords) {
+        if (!groupActive || !Initializer.CONFIG.instancedBlockModels) {
+            return false;
+        }
+        PartBatch batch = findMeshBatch(mesh, renderTypes, tintColor, tintLayers);
+        if (batch == null) {
+            return false;
+        }
+        ChunkSectionLayer[] layers = batch.layers;
+        for (int i = 1; i < layers.length; i++) {
+            if (renderTypes.apply(layers[i]) != batch.renderType) {
+                return false;
+            }
         }
         addInstance(batch, pose, lightCoords, overlayCoords, -1);
         return true;
@@ -475,6 +525,91 @@ public final class InstancedParts {
                     return null;
                 }
                 batch.mesh = RenderSystem.getDevice().createBuffer(() -> "VulkanMod instanced item", GpuBuffer.USAGE_VERTEX, data.vertexBuffer());
+                batch.indexCount = data.drawState().vertexCount() / 4 * 6;
+            }
+        }
+        return batch;
+    }
+
+    private static @Nullable RenderPipeline instancedMeshPipeline(RenderPipeline vanilla) {
+        if (vanilla == RenderPipelines.ITEM_CUTOUT) {
+            return ITEM_CUTOUT_MESH;
+        } else if (vanilla == RenderPipelines.ENTITY_SOLID || vanilla == RenderPipelines.ENTITY_SOLID_Z_OFFSET_FORWARD) {
+            return SOLID_MESH;
+        }
+        return null;
+    }
+
+    private static @Nullable PartBatch findMeshBatch(Mesh mesh, Function<ChunkSectionLayer, @Nullable RenderType> renderTypes, int tintColor,
+                                                     int[] tintLayers) {
+        // Batches are per render type of the mesh's first layer (an outline or other submit of the same mesh may
+        // come first) and tint colors
+        PartBatch head = MESH_BATCHES.get(mesh);
+        ChunkSectionLayer[] layers;
+        if (head != null) {
+            layers = head.layers;
+        } else {
+            if (mesh.size() == 0) {
+                return null;
+            }
+            EnumSet<ChunkSectionLayer> layerSet = EnumSet.noneOf(ChunkSectionLayer.class);
+            mesh.forEach(quad -> layerSet.add(quad.chunkLayer()));
+            layers = layerSet.toArray(NO_LAYERS);
+        }
+        RenderType renderType = renderTypes.apply(layers[0]);
+        for (PartBatch batch = head; batch != null; batch = batch.next) {
+            int[] tints = batch.tints;
+            if (batch.renderType == renderType && tints[0] == tintColor && Arrays.equals(tints, 1, tints.length, tintLayers, 0, tintLayers.length)) {
+                return batch.mesh != null ? batch : null;
+            }
+        }
+        if (BATCHES.size() >= MAX_BATCHES) {
+            return null;
+        }
+
+        // Only meshes whose layers all map to one item_cutout or entity_solid type (item frames submit with a z
+        // offset): others keep Indigo's path, the batch without a mesh says so
+        RenderPipeline pipeline = renderType == null ? null : instancedMeshPipeline(renderType.pipeline());
+        boolean instanced = pipeline != null;
+        for (ChunkSectionLayer layer : layers) {
+            instanced &= renderTypes.apply(layer) == renderType;
+        }
+
+        int[] tints = new int[tintLayers.length + 1];
+        tints[0] = tintColor;
+        System.arraycopy(tintLayers, 0, tints, 1, tintLayers.length);
+        PartBatch batch = new PartBatch(renderType, null, tints, instanced ? pipeline : ITEM_CUTOUT_MESH, generation, head);
+        batch.layers = layers;
+        MESH_BATCHES.put(mesh, batch);
+        BATCHES.add(batch);
+        if (!instanced) {
+            return null;
+        }
+
+        try (ByteBufferBuilder bytes = new ByteBufferBuilder(mesh.size() * 4 * DefaultVertexFormat.ENTITY.getVertexSize())) {
+            BufferBuilder builder = new BufferBuilder(bytes, PrimitiveTopology.QUADS, DefaultVertexFormat.ENTITY);
+            Vector3f normal = new Vector3f();
+            mesh.forEach(quad -> {
+                // ExtendedBlockModelFeatureRenderer.bufferQuad
+                int tintIndex = quad.tintIndex();
+                int tint = tintIndex != -1 && tintIndex < tintLayers.length ? ARGB.multiply(tintColor, tintLayers[tintIndex]) : tintColor;
+                for (int vertex = 0; vertex < 4; vertex++) {
+                    if (quad.hasNormal(vertex)) {
+                        quad.copyNormal(vertex, normal);
+                    } else {
+                        normal.set(quad.faceNormal());
+                    }
+                    // The light is the vertex's own, raised in the shader to the instance's
+                    int light = quad.emissive() ? LightCoordsUtil.FULL_BRIGHT : quad.lightmap(vertex);
+                    builder.addVertex(quad.x(vertex), quad.y(vertex), quad.z(vertex), ARGB.multiply(quad.color(vertex), tint), quad.u(vertex),
+                            quad.v(vertex), OverlayTexture.NO_OVERLAY, light, normal.x(), normal.y(), normal.z());
+                }
+            });
+            try (MeshData data = builder.build()) {
+                if (data == null) {
+                    return null;
+                }
+                batch.mesh = RenderSystem.getDevice().createBuffer(() -> "VulkanMod instanced block model", GpuBuffer.USAGE_VERTEX, data.vertexBuffer());
                 batch.indexCount = data.drawState().vertexCount() / 4 * 6;
             }
         }

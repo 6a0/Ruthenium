@@ -25,6 +25,7 @@
     "render.entity.BlockModelRenderStateM",
     "render.entity.BlockStateModelWrapperM",
     "render.entity.EntityRendererAccessor",
+    "render.entity.ExtendedBlockModelFeatureRendererM",
     "render.entity.LevelExtractorEntityM",
     "render.entity.model.ModelPartCubeM",
     "render.entity.model.ModelPartM",
