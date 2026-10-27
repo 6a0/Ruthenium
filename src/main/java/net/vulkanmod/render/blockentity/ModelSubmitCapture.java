@@ -24,30 +24,39 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 import org.joml.Quaternionf;
 import org.jspecify.annotations.Nullable;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Records what a block entity renderer submits, for {@link RetainedChests}. Only a single model submit is
- * accepted; anything else marks the capture as unsupported.
+ * Records what a block entity renderer submits, for {@link RetainedBlockEntities} and {@link InstancedModels}. Only
+ * model submits (and model parts, which vanilla submits as models) are accepted; anything else marks the capture as
+ * unsupported.
  */
 final class ModelSubmitCapture implements SubmitNodeCollector {
-    @Nullable Model<?> model;
-    @Nullable Object state;
-    final PoseStack.Pose pose = new PoseStack().last();
-    @Nullable RenderType renderType;
-    int lightCoords;
-    int overlayCoords;
-    int tintedColor;
-    @Nullable UvMapping uvMapping;
-    int outlineColor;
+    static final class ModelRecord {
+        @Nullable Model<?> model;
+        @Nullable Object state;
+        final PoseStack.Pose pose = new PoseStack().last();
+        @Nullable RenderType renderType;
+        int lightCoords;
+        int overlayCoords;
+        int tintedColor;
+        @Nullable UvMapping uvMapping;
+        int outlineColor;
+    }
+
+    private final List<ModelRecord> records = new ArrayList<>();
     int modelCount;
     boolean unsupported;
 
     void reset() {
-        this.model = null;
-        this.state = null;
-        this.renderType = null;
-        this.uvMapping = null;
+        for (int i = 0; i < this.modelCount; i++) {
+            ModelRecord record = this.records.get(i);
+            record.model = null;
+            record.state = null;
+            record.renderType = null;
+            record.uvMapping = null;
+        }
         this.modelCount = 0;
         this.unsupported = false;
     }
@@ -55,6 +64,16 @@ final class ModelSubmitCapture implements SubmitNodeCollector {
     /** Exactly one model was submitted and nothing else */
     boolean isSingleModel() {
         return !this.unsupported && this.modelCount == 1;
+    }
+
+    /** At least one model was submitted and nothing else */
+    boolean isModelsOnly() {
+        return !this.unsupported && this.modelCount > 0;
+    }
+
+    /** The i-th submitted model, valid until the next {@link #reset} */
+    ModelRecord model(int i) {
+        return this.records.get(i);
     }
 
     @Override
@@ -69,16 +88,19 @@ final class ModelSubmitCapture implements SubmitNodeCollector {
     @Override
     public <S> void submitModel(Model<? super S> model, S state, PoseStack poseStack, RenderType renderType, int lightCoords,
                                 int overlayCoords, int tintedColor, @Nullable UvMapping uvMapping, int outlineColor) {
-        this.modelCount++;
-        this.model = model;
-        this.state = state;
-        this.pose.set(poseStack.last());
-        this.renderType = renderType;
-        this.lightCoords = lightCoords;
-        this.overlayCoords = overlayCoords;
-        this.tintedColor = tintedColor;
-        this.uvMapping = uvMapping;
-        this.outlineColor = outlineColor;
+        if (this.modelCount == this.records.size()) {
+            this.records.add(new ModelRecord());
+        }
+        ModelRecord record = this.records.get(this.modelCount++);
+        record.model = model;
+        record.state = state;
+        record.pose.set(poseStack.last());
+        record.renderType = renderType;
+        record.lightCoords = lightCoords;
+        record.overlayCoords = overlayCoords;
+        record.tintedColor = tintedColor;
+        record.uvMapping = uvMapping;
+        record.outlineColor = outlineColor;
     }
 
     @Override

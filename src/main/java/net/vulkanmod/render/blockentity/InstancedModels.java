@@ -222,14 +222,17 @@ public final class InstancedModels {
         BlockPos pos = state.blockPos;
         POSE_STACK.pushPose();
         POSE_STACK.translate(pos.getX() - camX, pos.getY() - camY, pos.getZ() - camZ);
-        ModelSubmitCapture capture = CAPTURE;
-        capture.reset();
-        renderer.submit(state, POSE_STACK, capture, camera);
+        CAPTURE.reset();
+        renderer.submit(state, POSE_STACK, CAPTURE, camera);
         POSE_STACK.popPose();
+        if (!CAPTURE.isSingleModel()) {
+            return false;
+        }
 
+        ModelSubmitCapture.ModelRecord capture = CAPTURE.model(0);
         Object key;
         RenderPipeline pipeline;
-        if (!capture.isSingleModel() || capture.outlineColor != 0 || capture.renderType == null
+        if (capture.outlineColor != 0 || capture.renderType == null
                 || (pipeline = instancedPipeline(capture.renderType.pipeline())) == null
                 || (key = ModelGeometryCache.modelSpaceKey(capture.state)) == null || !isOrthogonal(capture.pose.pose())) {
             return false;

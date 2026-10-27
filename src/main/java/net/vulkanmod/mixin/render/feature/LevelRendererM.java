@@ -5,7 +5,7 @@ import com.mojang.renderpearl.api.commands.RenderPass;
 import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
 import net.vulkanmod.render.blockentity.InstancedModels;
-import net.vulkanmod.render.blockentity.RetainedChests;
+import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import net.vulkanmod.render.entity.ModelCulling;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -14,7 +14,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
  * Marks the world's feature preparation and block entity submission for {@link ModelCulling}, and draws
- * {@link RetainedChests} and {@link InstancedModels} after the world's solid features.
+ * {@link RetainedBlockEntities} and {@link InstancedModels} after the world's solid features.
  */
 @Mixin(LevelRenderer.class)
 public class LevelRendererM {
@@ -28,15 +28,15 @@ public class LevelRendererM {
     @Inject(method = "render", at = @At(value = "INVOKE", target = PREPARE_FRAME, shift = At.Shift.AFTER))
     private void endWorldFeatures(CallbackInfo ci) {
         ModelCulling.setWorldPass(false);
-        RetainedChests.prepareDraws();
+        RetainedBlockEntities.prepareDraws();
         InstancedModels.prepareDraws();
     }
 
     @Inject(method = "executeSolid", at = @At(value = "INVOKE", shift = At.Shift.AFTER,
             target = "Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher$PreparedFrame;executeSolid(Lcom/mojang/renderpearl/api/commands/RenderPass;)V"))
-    private void drawRetainedChests(ChunkSectionsToRender chunkSectionsToRender, FeatureRenderDispatcher.PreparedFrame featureFrame,
-                                    RenderPass renderPass, CallbackInfo ci) {
-        RetainedChests.draw(renderPass);
+    private void drawRetainedBlockEntities(ChunkSectionsToRender chunkSectionsToRender, FeatureRenderDispatcher.PreparedFrame featureFrame,
+                                           RenderPass renderPass, CallbackInfo ci) {
+        RetainedBlockEntities.draw(renderPass);
         InstancedModels.draw(renderPass);
     }
 

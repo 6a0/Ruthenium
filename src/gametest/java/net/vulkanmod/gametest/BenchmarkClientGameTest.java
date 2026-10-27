@@ -107,6 +107,10 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
             TerrainBenchmark.run(context, LABEL, RUN_ID);
             return;
         }
+        if (SCENE.equals("blockentities")) {
+            BlockEntityBenchmark.run(context, LABEL, RUN_ID);
+            return;
+        }
 
         connect(context);
         teleport(context);

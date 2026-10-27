@@ -6,7 +6,7 @@ import net.minecraft.world.level.block.entity.TrappedChestBlockEntity;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.vulkanmod.interfaces.IdleTicker;
-import net.vulkanmod.render.blockentity.RetainedChests;
+import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -32,7 +32,7 @@ public class ChestBlockEntityM implements IdleTicker {
         BlockEntity self = (BlockEntity) (Object) this;
         Level level = self.getLevel();
         if (level != null && level.isClientSide()) {
-            RetainedChests.markDirty(self.getBlockPos());
+            RetainedBlockEntities.markDirty(self.getBlockPos());
         }
     }
 }

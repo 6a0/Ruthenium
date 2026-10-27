@@ -5,6 +5,7 @@
   "compatibilityLevel": "JAVA_25",
   "mixins": [],
   "client": [
+    "render.blockentity.BlockEntityDataPacketM",
     "render.blockentity.BlockEntityRenderDispatcherM",
     "render.blockentity.ClientLevelM",
     "render.blockentity.CompiledSectionMeshM",
@@ -42,9 +43,11 @@
     "world.BoundTickingBlockEntityM",
     "world.ChestBlockEntityM",
     "world.ChestLidControllerM",
+    "world.DecoratedPotBlockEntityM",
     "world.EnderChestBlockEntityM",
     "world.LevelM",
     "world.RebindableTickingBlockEntityWrapperM",
+    "world.ShulkerBoxBlockEntityM",
     "world.SignBlockEntityM"
   ],
   "injectors": {

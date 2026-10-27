@@ -11,7 +11,7 @@ import net.vulkanmod.config.Config;
 import net.vulkanmod.config.gui.OptionBlock;
 import net.vulkanmod.interfaces.SectionDispatcherReset;
 import net.vulkanmod.render.blockentity.InstancedModels;
-import net.vulkanmod.render.blockentity.RetainedChests;
+import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -220,7 +220,7 @@ public abstract class Options {
                         new SwitchOption(Component.translatable("vulkanmod.options.retainedChests"),
                                 value -> {
                                     config.retainedChests = value;
-                                    RetainedChests.clear();
+                                    RetainedBlockEntities.clear();
                                 },
                                 () -> config.retainedChests)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.retainedChests.tooltip"))

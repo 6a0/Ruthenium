@@ -3,7 +3,7 @@ package net.vulkanmod.mixin.render.blockentity;
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.vulkanmod.render.blockentity.InstancedModels;
-import net.vulkanmod.render.blockentity.RetainedChests;
+import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import net.vulkanmod.render.chunk.CompressedTerrain;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -14,7 +14,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Compiles {@link RetainedChests#PIPELINE}, {@link InstancedModels#PIPELINES} and {@link CompressedTerrain#PIPELINES}
+ * Compiles {@link RetainedBlockEntities#PIPELINES}, {@link InstancedModels#PIPELINES} and {@link CompressedTerrain#PIPELINES}
  * with the other pipelines on resource reload; if one fails, that feature stays off
  */
 @Mixin(RenderPipelines.class)
@@ -22,7 +22,7 @@ public class RenderPipelinesM {
     @Inject(method = "optionalPipelines", at = @At("RETURN"), cancellable = true)
     private static void addRetainedPipeline(CallbackInfoReturnable<List<RenderPipeline>> cir) {
         List<RenderPipeline> pipelines = new ArrayList<>(cir.getReturnValue());
-        pipelines.add(RetainedChests.PIPELINE);
+        pipelines.addAll(RetainedBlockEntities.PIPELINES);
         pipelines.addAll(InstancedModels.PIPELINES);
         pipelines.addAll(CompressedTerrain.PIPELINES);
         cir.setReturnValue(pipelines);

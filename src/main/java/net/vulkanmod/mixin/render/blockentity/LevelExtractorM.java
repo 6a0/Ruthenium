@@ -24,7 +24,7 @@ import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.BlockEntityPositions;
 import net.vulkanmod.render.blockentity.BlockEntityCulling;
 import net.vulkanmod.render.blockentity.InstancedModels;
-import net.vulkanmod.render.blockentity.RetainedChests;
+import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -46,9 +46,9 @@ import java.util.SortedSet;
  * Each section is classified once; in sections that cross the frustum each 4³ cell is classified once, and only
  * block entities of cells that cross it are tested individually. Positions and cullability come from the compiled
  * section ({@link BlockEntityPositions}) by list index, so culled block entities are not even loaded from the list:
- * with ~14k block entities per frame the pointer chasing was the main cost. Chests kept by {@link RetainedChests}
- * are skipped, and block entities drawn as {@link InstancedModels} are not submitted. Otherwise this is vanilla's
- * loop.
+ * with ~14k block entities per frame the pointer chasing was the main cost. Block entities kept by
+ * {@link RetainedBlockEntities} are skipped, and block entities drawn as {@link InstancedModels} are not submitted.
+ * Otherwise this is vanilla's loop.
  */
 @Mixin(LevelExtractor.class)
 public class LevelExtractorM {
@@ -79,7 +79,7 @@ public class LevelExtractorM {
         BlockEntityRenderDispatcher dispatcher = this.levelRenderer.blockEntityRenderDispatcher();
         List<BlockEntityRenderState> output = levelRenderState.blockEntityRenderStates;
         ObjectArrayList<SectionRenderDispatcher.RenderSection> sections = this.levelRenderer.visibleSections();
-        RetainedChests.beginFrame(cameraPos);
+        RetainedBlockEntities.beginFrame(cameraPos);
         InstancedModels.beginFrame();
 
         for (int s = 0, sectionCount = sections.size(); s < sectionCount; s++) {
@@ -90,8 +90,8 @@ public class LevelExtractorM {
                 continue;
             }
 
-            // Chests whose geometry is kept on the GPU
-            boolean[] retained = RetainedChests.section(section.getRenderOrigin(), mesh, blockEntities, this.level, dispatcher,
+            // Block entities whose geometry is kept on the GPU
+            boolean[] retained = RetainedBlockEntities.section(section.getRenderOrigin(), mesh, blockEntities, this.level, dispatcher,
                     deltaPartialTick, cameraPos, levelRenderState.cameraRenderState);
 
             long[] positions = null;
@@ -171,12 +171,12 @@ public class LevelExtractorM {
 
     @Inject(method = "setSectionDirty(IIIZ)V", at = @At("HEAD"))
     private void markRetainedDirty(int sectionX, int sectionY, int sectionZ, boolean playerChanged, CallbackInfo ci) {
-        RetainedChests.markDirty(sectionX, sectionY, sectionZ);
+        RetainedBlockEntities.markDirty(sectionX, sectionY, sectionZ);
     }
 
     @Inject(method = {"setLevel", "allChanged"}, at = @At("HEAD"))
     private void clearRetained(CallbackInfo ci) {
-        RetainedChests.clear();
+        RetainedBlockEntities.clear();
         InstancedModels.clear();
     }
 
