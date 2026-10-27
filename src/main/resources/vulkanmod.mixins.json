@@ -13,6 +13,7 @@
     "render.blockentity.RenderPipelinesM",
     "render.chunk.ChunkSectionLayerM",
     "render.chunk.ChunkSectionsToRenderM",
+    "render.chunk.ClientLevelTintM",
     "render.chunk.LevelRendererM",
     "render.chunk.SectionCompilerM",
     "render.chunk.SectionCompilerResultsM",

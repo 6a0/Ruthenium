@@ -85,6 +85,10 @@ final class TerrainBenchmark {
             double joinSeconds = (System.nanoTime() - joinStart) / 1.0e9;
             LOGGER.info("Terrain loaded in {} s", "%.2f".formatted(loadSeconds));
 
+            if (BiomeTintCheck.ENABLED) {
+                BiomeTintCheck.run(context);
+            }
+
             // Compile what the other directions see before measuring
             pan(context, 0.0f, 8.0);
             waitForCompiles(context);

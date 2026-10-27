@@ -194,7 +194,12 @@ public abstract class Options {
                                 },
                                 () -> config.compressedTerrain)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.compressedTerrain.tooltip"))
-                                .setImpact(PerformanceImpact.HIGH)
+                                .setImpact(PerformanceImpact.HIGH),
+                        new SwitchOption(Component.translatable("vulkanmod.options.biomeBlendCache"),
+                                value -> config.biomeBlendCache = value,
+                                () -> config.biomeBlendCache)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.biomeBlendCache.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM)
                 }),
                 new OptionBlock("", new Option<?>[]{
                         new SwitchOption(Component.translatable("vulkanmod.options.blockEntityCulling"),

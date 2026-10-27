@@ -29,6 +29,8 @@ public class Config {
     public boolean terrainFaceCulling = true;
     /** Solid and cutout terrain vertices in 20 instead of 28 bytes */
     public boolean compressedTerrain = true;
+    /** Biome tint blending computes each column's sample once per section instead of once per block */
+    public boolean biomeBlendCache = true;
 
     private static Path CONFIG_PATH;
 
