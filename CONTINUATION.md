@@ -9,7 +9,8 @@ was built, measured and rejected (section 7, "Rejected: CPU occlusion culling");
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
 (section 6.8). Eighth session (2026-10-27): the settings switches were A/B tested and cost nothing; closed enchanting
 table books skip extraction and their light is cached; **sign text is retained on the GPU** (static view 436 -> 908
-fps). See section 7, "Eighth session".
+fps). See section 7, "Eighth session". Ninth session: armor stands are extracted into reused render states
+(static 964 -> 1032 fps interleaved; section 7, "Ninth session").
 
 ---
 
@@ -23,8 +24,8 @@ fps). See section 7, "Eighth session".
 - **Testing:** every change is benchmarked with the automated client gametest (`./gradlew benchVulkanMod`,
   3 runs) and checked for visual parity against vanilla screenshots, then committed with the numbers in the
   commit message. The user asked for this workflow: *commit as you test changes with the benchmark*.
-- **Results so far** (median of 3 runs, vanilla Vulkan backend): static view **25 → 918 fps**, pan **61 → 899 fps**
-  (pan p99 low 18 → 279). Sodium 0.9.3-beta.1 on the same benchmark: 63 / 163. On vanilla's OpenGL backend
+- **Results so far** (median of 3 runs, vanilla Vulkan backend): static view **25 → 1032 fps**, pan **61 → 998 fps**
+  (pan p99 low 18 → 294). Sodium 0.9.3-beta.1 on the same benchmark: 63 / 163. On vanilla's OpenGL backend
   (`benchVulkanModGl`) the static view ran at 344 fps (before the eighth session; not re-measured).
 - **Block entities at rest are retained on the GPU** (`RetainedBlockEntities`; chests since the third session, at
   the user's choice, shulker boxes, decorated pots and skulls since the seventh, sign text since the eighth): their
@@ -35,7 +36,8 @@ fps). See section 7, "Eighth session".
 - **Closed enchanting table books and armor stands are GPU instances** (`InstancedModels`): model-space mesh once
   per group, a pose + light per instance per frame. Since the eighth session closed books skip the extraction
   entirely (pose computed from the block entity, light cached until a section is marked dirty). Switch: settings
-  screen or `-Dvulkanmod.instancedModels=false`.
+  screen or `-Dvulkanmod.instancedModels=false`. Since the ninth session armor stands are extracted into render
+  states reused across frames (`ReusedRenderStates`, switch `-Dvulkanmod.reuseEntityStates`).
 - **The settings screen is ported** (fourth session): the video settings button opens VulkanMod's screen with Video,
   Graphics (vanilla options through their `OptionInstance`s) and Optimizations (the mod's switches, `Config`,
   `config/vulkanmod_settings.json`). `-Dvulkanmod.<field>=true|false` overrides any switch for a launch.
@@ -174,6 +176,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/render/vertex/StagedVertexBufferM.java` + `render/vertex/ParallelUploadCopy.java` | Redirects the per-slice `ByteBuffer.put` in `StagedVertexBuffer.uploadDrawsToBuffers` to record the copies; a worker thread and the render thread copy them in 1 MB chunks, starting when the first sorted draw is decoded (sorting overlaps the copy) and joined before the staging buffer is unmapped. Each upload is its own `Job`, so a late worker can't take chunks of the next upload. 1 worker: 3.3 → 1.9 ms for 34 MB; more workers don't help (memory bandwidth) |
 | `render/blockentity/RetainedBlockEntities.java` + `ModelSubmitCapture.java` + `mixin/render/blockentity/{ClientLevelM,BlockEntityRenderDispatcherM,BlockEntityDataPacketM,RenderPipelinesM}.java` + `mixin/world/{ShulkerBoxBlockEntityM,DecoratedPotBlockEntityM}.java` + `assets/vulkanmod/shaders/core/retained_entity.vsh` | Block entities at rest kept on the GPU. Candidates (exact vanilla classes and renderers): chests (lid idle incl. the other half of a double chest), shulker boxes (`CLOSED`, progress 0 at partial tick 0 and 1), decorated pots (no wobble, or game time - start > duration) and skulls (`getAnimation` constant, dragon/piglin heads not `POWERED`; heads with an owner profile never, their skin loads asynchronously). Others of these types are "moving": left out and re-checked every frame. Per render section (keyed by `SectionPos`), the real renderer runs into `ModelSubmitCapture` (a `SubmitNodeCollector` that records model submits; pots submit their 7 parts as `Model.Simple`; anything else, e.g. crumbling, rejects the block entity); a block entity is kept only if every model has no outline and a render type that maps to a retained pipeline (`entity_solid`/`_z_offset_forward`, `entity_cutout_cull`, `entity_cutout`/`_z_offset`) with `DEFAULT_TEXTURING`. Models are written with all faces, through `ModelGeometryCache` for `Float` 0 states, else with vanilla's `setupAnim` + `renderToBuffer`, relative to the section origin, into one vertex buffer per render type. `LevelExtractorM` skips members; batches are drawn after `featureFrame.executeSolid` in `LevelRendererM` with `PIPELINES` (vanilla entity pipelines + a vertex shader adding `DynamicTransforms.ModelOffset`; registered via `RenderPipelines.optionalPipelines`, so a compile failure just turns it off), the render type's textures (`prepare()` once per type per frame) and its layering transform applied to the model view (the skulls' z offset; `RenderType.state` and `RenderSetup`'s transforms are widened in the access widener). Transforms are written after `prepareFrame` with fresh vectors (`DynamicGpuDataStorageMapped` dedups against the last record by `equals`), and the sequential index buffer is grown there too (not inside a pass). Rebuilt when the section's mesh changes, when the section or a neighbour hits `LevelExtractor.setSectionDirty(IIIZ)` (block and light changes; a double chest's light can come from the neighbour), on chest, shulker box and pot `triggerEvent`, block entity data packets (pot sherds, skull profiles; they can arrive after the block), `ClientLevel.destroyBlockProgress`, and when a moving block entity comes to rest. Sections partly within the view distance (64) use the vanilla path that frame. Budget 2048 block entities rebuilt per frame; batches unused for 1200 frames are freed. Cleared on level change, `allChanged` and resource reload. **Signs** (eighth session; `SignBlockEntity`/`HangingSignBlockEntity` with `StandingSignRenderer`/`HangingSignRenderer`, no glowing or obfuscated text on either side): `ModelSubmitCapture` records text submits; a text is retained only if vanilla would put it in the **solid** phase (`SubmitNodeCollection.canRenderAsSolid`: colour alpha 255, no background) with `POLYGON_OFFSET` and no outline, which is why the draw order can change. Its glyphs are prepared through `SignTextCache.prepareText` (as `TextFeatureRendererM` does) and written with `TextRenderable.render` into a part per render type (`renderType.format()`, POSITION_TEX_LIGHTMAP_COLOR), drawn with `TEXT`/`TEXT_GRAYSCALE`: copies of vanilla's `TEXT_POLYGON_OFFSET`/`TEXT_GRAYSCALE_POLYGON_OFFSET` (same state, built from a `Snippet` like `CompressedTerrain`) with `retained_text.vsh`. Extra rebuild triggers: `SignBlockEntity.setText` on the client (`SignBlockEntityM`; the edit screen calls it while typing), `FontSet.resetTextures` (`FontSetM`, clears everything) and a change of `Minecraft.isTextFilteringEnabled` (checked in `beginFrame`, clears) |
 | `render/blockentity/InstancedModels.java` + `assets/vulkanmod/shaders/core/instanced_entity.vsh` | GPU instancing of models that only differ by pose. Two entry points: (1) the extraction (`LevelExtractorM`) calls `tryAdd(dispatcher, state, …)` after `tryExtractRenderState` for `EnchantTableRenderer`: the real renderer submits into `ModelSubmitCapture`, and a single model with a `modelSpaceKey` (closed book) becomes an instance instead of a submitted render state; (2) `ModelFeatureRendererM.prepareModel` calls `tryAdd(submit)` for models in `POSED_MODELS` (`ArmorStandModel`): after `setupAnim`, a snapshot of all parts' transforms/visibility keys the group (exact for pure `ModelPart` trees; max 32 groups per model) and the mesh is `model.root().render` with the identity pose and CPU culling off. An instance is 3 pose rows + light (52 B, `INSTANCE_FORMAT`, step rate 1). Poses must be orthogonal (rotations, or the `scale(-1,-1,1)` mirror of living entities, where vanilla's normal matrix equals the pose). Instanced copies of `entity_solid`, `entity_cutout` (per-face lighting, no cull) and `entity_cutout_cull` (`PIPELINES`). Per group (model, key, render type, UV mapping, overlay, tint): a model-space mesh from `ModelGeometryCache.writeModelSpace` (identity pose, all faces, duplicates skipped) and a `MappableRingBuffer` for the instances (rotated at the next prepare, so its fence covers the frame that used it). Drawn after `RetainedBlockEntities` with `PIPELINE` (vanilla `entity_solid` + an instanced vertex shader). Cleared with the retained chests. **Closed book fast path** (eighth session, `tryAddClosedBook`, called by `LevelExtractorM` before `tryExtractRenderState`): once one closed book went through the capture path (which records its group and renderer), vanilla `EnchantingTableBlockEntity`s with `open == oOpen == 0` and no breaking progress skip the render state and capture: the pose is built with the same JOML calls in the same order as the extraction + `EnchantTableRenderer.submit` (`translate` x3, `rotateY(-yRot)`, `rotateZ(80°)`; bit-identical, checked on 16.7M books), plus `shouldRender`'s distance test. The light and the `isValid` block state check are cached on the block entity (`EnchantingTableBlockEntityM`, `interfaces/CachedBlockEntityLight`) under a generation stamp that every `setSectionDirty` (and `clear`) bumps (`invalidateLight`); 69M cache hits matched fresh lookups |
+| `render/entity/ReusedRenderStates.java` + `mixin/render/entity/{LevelExtractorEntityM,EntityRendererAccessor}.java` | `@Overwrite LevelExtractor.extractEntity`: vanilla `ArmorStand`s with `ArmorStandRenderer` are extracted into render states kept from the previous frame (a pool reset at the head of `extractVisibleEntities`) instead of `createRenderState(entity, partialTicks)`: `extractRenderState` + `finalizeRenderState` (invoker) into the reused state. Vanilla's call took ~1.05 us per armor stand, the reused one ~0.27 us: allocating the state and extracting into it in the same compiled method made the extraction ~5x slower (each step alone, or extracting into an existing state, was 0.07-0.25 us; not JIT tiers, deopts, stack banging or a mixin, all checked). States are submitted and cleared in the frame they are extracted in (`LevelRenderer.submitFeatures`). The extraction overwrites every field except `nameTagAttachment`, `distanceToCameraSq`/`nameTag`/`scoreText` (only with a camera) and `ArmedEntityRenderState`'s arm poses (hidden by the armor stand's own `Rotations` fields, only set by humanoid mobs), which are reset to a new state's values. A temporary reflective deep compare of 2.4M reused states against fresh vanilla ones (139 fields each, incl. the item states) found no difference. Exceptions fall back to vanilla's path (which reports them). Cleared on `setLevel`/`allChanged`. Switch: "Reuse Entity Render States", `-Dvulkanmod.reuseEntityStates` |
 | `mixin/world/{LevelM,BoundTickingBlockEntityM,RebindableTickingBlockEntityWrapperM,ChestBlockEntityM,EnderChestBlockEntityM,ChestLidControllerM,SignBlockEntityM,ShulkerBoxBlockEntityM}.java` + `interfaces/IdleTicker.java` | `Level.tickBlockEntities` skips tickers whose tick is a no-op: exact vanilla chest/trapped/ender chest classes with a closed lid that stays closed, closed shulker boxes (progress and old progress 0; client and server), and sign/hanging sign classes with no editing player. Also skips the world border, block state and validity checks in front of them. 1.6 → 1.0 ms per tick with ~14k block entities |
 
 Design rules used so far:
@@ -413,11 +416,11 @@ Sodium runs on its default (OpenGL).
 
 | Phase (avg / p95 low / p99 low) | vanilla GL | vanilla Vulkan | Sodium | VulkanMod v4 | VulkanMod HEAD |
 |---|---|---|---|---|---|
-| initial | 19.3 / 13.9 / 7.8 | 22.9 / 15.1 / 9.1 | 49.1 / 30.1 / 18.1 | 93.3 / 59.0 / 30.0 | **616.0 / 279.2 / 122.9** |
-| pan | 50.1 / 18.1 / 16.0 | 61.2 / 20.8 / 17.8 | 162.9 / 38.2 / 29.3 | 293.2 / 71.3 / 30.9 | **898.6 / 546.5 / 279.3** |
-| static | 21.1 / 17.3 / 15.9 | 25.3 / 21.1 / 20.1 | 63.4 / 52.5 / 41.8 | 121.4 / 93.7 / 77.7 | **917.8 / 659.9 / 317.1** |
-| particles | 20.6 / 18.4 / 15.7 | 24.3 / 20.9 / 18.0 | 60.6 / 51.0 / 42.7 | 115.5 / 86.4 / 72.2 | **775.9 / 385.4 / 277.0** |
-| alloc at static view | ~16.5 MB/frame | ~16.7 MB/frame | ~11.3 MB/frame | ~4.6 MB/frame | **~0.35 MB/frame** (318 MB/s) |
+| initial | 19.3 / 13.9 / 7.8 | 22.9 / 15.1 / 9.1 | 49.1 / 30.1 / 18.1 | 93.3 / 59.0 / 30.0 | **757.5 / 337.2 / 128.1** |
+| pan | 50.1 / 18.1 / 16.0 | 61.2 / 20.8 / 17.8 | 162.9 / 38.2 / 29.3 | 293.2 / 71.3 / 30.9 | **998.0 / 652.4 / 294.3** |
+| static | 21.1 / 17.3 / 15.9 | 25.3 / 21.1 / 20.1 | 63.4 / 52.5 / 41.8 | 121.4 / 93.7 / 77.7 | **1032.3 / 758.2 / 343.6** |
+| particles | 20.6 / 18.4 / 15.7 | 24.3 / 20.9 / 18.0 | 60.6 / 51.0 / 42.7 | 115.5 / 86.4 / 72.2 | **869.0 / 427.9 / 307.6** |
+| alloc at static view | ~16.5 MB/frame | ~16.7 MB/frame | ~11.3 MB/frame | ~4.6 MB/frame | **~0.17 MB/frame** (180 MB/s) |
 | block entities extracted / frame (static) | ~14 075 | ~14 075 | ~8 417 | ~3 862 | **0** (~3.1k retained chests, ~507 retained signs, ~250 instanced books) |
 
 History of the static view: v1 (cube + particle writers + primitive sort) 30.6 → v2 (+glyph writer, radix sort,
@@ -427,7 +430,8 @@ cache 128.3 → CPU back-face skip 139.7 → rest pose geometry cache 161.0 → 
 167.7 → packed section positions 170.3 → (third session) closed books in model space 175.3 → parallel upload
 copy 188.2 → sign text back-side skip 194.8 → faster model space writes 199.7 → extraction overwrite 214.1 →
 idle tick skip 217.1 → retained chests 343.4 → instanced books 353.7 → instanced armor stands 415.2 → (eighth
-session, see below) closed books without extraction 435.6 → retained sign text 907.9 → cached table light 917.8.
+session, see below) closed books without extraction 435.6 → retained sign text 907.9 → cached table light 917.8 → (ninth session) reused armor stand states 1032.3 (964.0
+without, interleaved).
 Settings screen port (fourth session, config field reads instead of constants on the hot paths): 404.3 static
 (386.0 / 404.3 / 415.6 vs HEAD's 406.9 / 415.2 / 423.9), screenshots within noise (0.017% static, 0.058% yaw 270).
 Later runs that session were slowed ~30% by other load on the machine (HEAD too: 364.7) and were moved to
@@ -435,7 +439,7 @@ Later runs that session were slowed ~30% by other load on the machine (HEAD too:
 Rejected (no gain, reverted): an 11-bit, single-histogram radix sort (the sort's JFR share was misattributed); a
 per-line cache of sign text glyph vertices (verified bit-identical, but static 353.7 → 356.5 is noise: the text
 cost is writing ~3.4 MB of glyph vertices per frame, which the cache still does). Results archives: `results/vulkanmod-v5 … v28` (v22 = the settings screen port, v23 face groups, v24 draw list,
-v25 compressed terrain vertices, v26 closed books without extraction, v27 retained sign text, v28 cached table light).
+v25 compressed terrain vertices, v26 closed books without extraction, v27 retained sign text, v28 cached table light, v29 reused armor stand states).
 Facing the chest cube (`staticYaw=270`, 1 run each): ~30 (v4) → 47.5 → ~50 → 56.7 (books) → 61.4 (copy) →
 68.5 (sign sides) → 78.5 (book writes) → 103 (retained chests) → 157.5 (instanced books) → (eighth session, median
 of 3 interleaved where marked) 159.3 → 188.4 (closed books without extraction, interleaved) → 671.4 (retained sign
@@ -471,6 +475,20 @@ particles: vanilla ~16 349, VulkanMod ~16 250.
   (block entities 4.9%, of which ~5.5k enchanting tables; armor stands 1.9%), and vanilla's frame graph
   setup/execution and present. Facing the cube, block entity extraction (the ~5.3k closed books) was ~39% before
   the light cache.
+
+### Ninth session (2026-10-27)
+- **Reused armor stand render states**: see `ReusedRenderStates` in section 4. nanoTime counters around the real
+  extraction (`results/probe-armorstand`): 1050 → 267 ns per armor stand, entity extraction 288 → 91 us per frame.
+  How it was found: vanilla's parts timed in isolation summed to ~0.35 us; extracting into an existing state took
+  ~0.2 us, allocating ~0.08 us, but any method that allocated the state and extracted into it (vanilla's
+  `createRenderState(entity, partialTicks)` or a copy of it in our code) took ~1 us, while the same statements
+  inlined into a loop body took ~0.2 us. Ruled out: mixins on `EntityRenderer` (`-Dmixin.debug.export`, none),
+  JIT tiers (`PrintCompilation`: all C2), deoptimization storms (JFR `jdk.Deoptimization`), stack banging
+  (`StackShadowPages=20` same). The cause wasn't identified further. Benchmark, interleaved with
+  `-Pvm.reuseEntityStates=false`, median of 3 each: static 964.0 → 1032.3 (p99 319.8 → 343.6), pan 945.9 → 998.0,
+  initial 651.8 → 757.5, particles 811.0 → 869.0; render thread at static 0.90 → 0.78 ms/frame; allocation 334 →
+  180 MB/s. Screenshots: on vs off 0.021% (static) / 0.030% (yaw 270) at rows ≥ 400, the full-frame threshold-40
+  map shows only clouds; v4 vs on 0.016% / 0.033%. `results/vulkanmod-v29`, `results/ab-reuse/off`.
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
@@ -588,13 +606,13 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 1. **Per entity and block entity cost** (the static view is now ~0.9 ms of render thread per frame; section 7,
    "Eighth session"). Done in the eighth session: sign text retained, closed books without extraction, cached
    table light. Ideas, roughly by expected gain:
-   - **Armor stand extraction** (~18% of the static view's profile, 188 armor stands): `ArmorStandRenderer
-     .extractRenderState` (`LivingEntityRenderer`/`EntityRenderer` base state, `HumanoidMobRenderer
-     .extractHumanoidRenderState`: hand items through the item model resolver, crossbow charge time with an
-     enchantment iteration, armor and head items, name tag attributes). Measure the parts with nanoTime first;
-     JFR attributes most of it to the method itself (inlined callees). An exact fast path has to reproduce a lot
-     of vanilla state (and Fabric's render state data), so prefer skipping individual expensive pieces whose
-     inputs provably didn't change.
+   - **Entity extraction after the reused armor stand states** (ninth session): ~91 us per frame at the static
+     view, of which ~50 us `isEntityVisible` over all ~297 entities (`shouldRender`: AABB allocation + frustum
+     test, then `isSectionCompiledAndVisible`) and ~50 us the 188 reused extractions (~0.27 us each; the vanilla
+     parts measured in isolation: base `EntityRenderer` state ~60 ns, humanoid state ~70 ns, poses ~35 ns, light
+     ~30 ns). Other entity types could reuse states too (`ReusedRenderStates` is armor stands only); check each
+     state class for fields the extraction writes conditionally, and players' `AvatarRenderState` (cape, parrots)
+     with care.
    - **`TerrainDrawList.collect`** (~16% in JFR at the static view): per visible section and layer work of the
      draw list; it is now one of the largest render thread items.
    - **Block entity culling loop** in sections partly beyond the view distance (their retained batch isn't used
@@ -622,7 +640,7 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
    - Only `en_us` has the new keys; terrain options (old advanced culling, indirect draw, ...) come back with the
      terrain renderer.
 4. **Other CPU hot spots.**
-   - Armor stand extraction (~5% at static, spread thin across `LivingEntityRenderer.extractRenderState`).
+   - Entity extraction (~91 us/frame at static after the ninth session; see item 1).
    - Entity culling: Sodium and vanilla render the same ~188 entities.
    - Armor stands use `entity_cutout` (no culling), so the CPU back-face skip doesn't apply to them.
 5. **Terrain**, after the sixth session (section 7, "Terrain"). The view is GPU bound on per-vertex work (see
