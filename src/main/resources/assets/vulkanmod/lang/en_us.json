@@ -37,6 +37,8 @@
 
   "vulkanmod.options.terrainFaceCulling": "Terrain Face Culling",
   "vulkanmod.options.terrainFaceCulling.tooltip": "Skips the block faces of a chunk section that all point away from the camera, which the GPU would discard anyway. Changing it reloads the chunks.",
+  "vulkanmod.options.compressedTerrain": "Compressed Terrain Vertices",
+  "vulkanmod.options.compressedTerrain.tooltip": "Stores solid and cutout block vertices in 20 instead of 28 bytes, so the GPU reads less memory per frame. Changing it reloads the chunks.",
   "vulkanmod.options.skipIdleTicks": "Skip Idle Block Entity Ticks",
   "vulkanmod.options.skipIdleTicks.tooltip": "Skips ticking closed chests and signs nobody is editing, whose ticks do nothing.",
 

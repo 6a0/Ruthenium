@@ -25,6 +25,7 @@ public abstract class BufferBuilderM implements ExtendedVertexBuilder {
 
     @Shadow protected abstract void ensureBuilding();
     @Shadow protected abstract void endLastVertex();
+    @Shadow protected abstract long beginElement(int semanticID);
 
     @Override
     public boolean canWriteDirect(VertexFormat format) {
@@ -44,5 +45,15 @@ public abstract class BufferBuilderM implements ExtendedVertexBuilder {
         this.vertices += count;
         this.vertexPointer = pointer + (long) this.vertexSize * (count - 1);
         return pointer;
+    }
+
+    @Override
+    public long vulkanmod$vertexPointer() {
+        return this.vertexPointer;
+    }
+
+    @Override
+    public long vulkanmod$beginElement(int semanticId) {
+        return this.beginElement(semanticId);
     }
 }

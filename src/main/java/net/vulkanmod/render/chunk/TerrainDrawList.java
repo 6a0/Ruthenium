@@ -55,7 +55,6 @@ public final class TerrainDrawList {
 
     static {
         for (ChunkSectionLayer layer : LAYERS) {
-            VERTEX_SIZES[layer.ordinal()] = layer.pipeline(false).getVertexFormatBinding(0).getVertexSize();
             GROUPS[layer.ordinal()] = new ArrayList<>();
         }
     }
@@ -102,6 +101,10 @@ public final class TerrainDrawList {
             groups.clear();
         }
         SECTION_INFOS.clear();
+        // The layers' vertex format can change when the section dispatcher is recreated (CompressedTerrain)
+        for (ChunkSectionLayer layer : LAYERS) {
+            VERTEX_SIZES[layer.ordinal()] = layer.pipeline(false).getVertexFormatBinding(0).getVertexSize();
+        }
 
         int largestIndexCount = 0;
         if (dispatcher != null) {

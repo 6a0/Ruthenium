@@ -33,7 +33,6 @@ public final class SectionFaceGroups {
 
     /** Draws a group when the eye is within this distance behind its frontmost plane, against rounding */
     private static final float MARGIN = 1.0e-3f;
-    private static final int QUAD_BYTES = 4 * 28;
 
     /** First quad of each group, and the quad count at the end */
     private final int[] starts = new int[GROUPS + 1];
@@ -47,20 +46,24 @@ public final class SectionFaceGroups {
     }
 
     /**
-     * Reorders the quads of a layer mesh (block vertex format, sequential quads) by facing.
+     * Reorders the quads of a layer mesh (vanilla's block vertex format or {@link CompressedTerrain#FORMAT},
+     * sequential quads) by facing.
      *
      * @return the groups, or null if the mesh isn't one this handles or has nothing to skip
      */
     public static @Nullable SectionFaceGroups sort(MeshData mesh) {
         MeshData.DrawState state = mesh.drawState();
-        if (mesh.indexBuffer() != null || state.format() != DefaultVertexFormat.BLOCK
+        boolean compressed = state.format() == CompressedTerrain.FORMAT;
+        if (mesh.indexBuffer() != null || state.format() != DefaultVertexFormat.BLOCK && !compressed
                 || state.primitiveTopology() != PrimitiveTopology.QUADS) {
             return null;
         }
+        int stride = state.format().getVertexSize();
+        int quadBytes = 4 * stride;
 
         ByteBuffer vertices = mesh.vertexBuffer();
         int quadCount = state.vertexCount() / 4;
-        if (quadCount == 0 || vertices.remaining() < quadCount * QUAD_BYTES) {
+        if (quadCount == 0 || vertices.remaining() < quadCount * quadBytes) {
             return null;
         }
 
@@ -73,12 +76,13 @@ public final class SectionFaceGroups {
             planes[g] = (g & 1) == 1 ? Float.POSITIVE_INFINITY : Float.NEGATIVE_INFINITY;
         }
 
+        float[] position = new float[12];
         for (int q = 0; q < quadCount; q++) {
-            long p = base + (long) q * QUAD_BYTES;
-            float x0 = MemoryUtil.memGetFloat(p), y0 = MemoryUtil.memGetFloat(p + 4), z0 = MemoryUtil.memGetFloat(p + 8);
-            float x1 = MemoryUtil.memGetFloat(p + 28), y1 = MemoryUtil.memGetFloat(p + 32), z1 = MemoryUtil.memGetFloat(p + 36);
-            float x2 = MemoryUtil.memGetFloat(p + 56), y2 = MemoryUtil.memGetFloat(p + 60), z2 = MemoryUtil.memGetFloat(p + 64);
-            float x3 = MemoryUtil.memGetFloat(p + 84), y3 = MemoryUtil.memGetFloat(p + 88), z3 = MemoryUtil.memGetFloat(p + 92);
+            readPositions(base + (long) q * quadBytes, stride, compressed, position);
+            float x0 = position[0], y0 = position[1], z0 = position[2];
+            float x1 = position[3], y1 = position[4], z1 = position[5];
+            float x2 = position[6], y2 = position[7], z2 = position[8];
+            float x3 = position[9], y3 = position[10], z3 = position[11];
 
             // Normal of the quad's winding from its diagonals (also right for a quad with a collapsed edge)
             float ax = x2 - x0, ay = y2 - y0, az = z2 - z0;
@@ -118,19 +122,36 @@ public final class SectionFaceGroups {
             }
         }
 
-        long scratch = MemoryUtil.nmemAlloc((long) quadCount * QUAD_BYTES);
+        long scratch = MemoryUtil.nmemAlloc((long) quadCount * quadBytes);
         try {
             int[] next = new int[GROUPS];
             System.arraycopy(starts, 0, next, 0, GROUPS);
             for (int q = 0; q < quadCount; q++) {
                 int dst = next[groupOf[q]]++;
-                MemoryUtil.memCopy(base + (long) q * QUAD_BYTES, scratch + (long) dst * QUAD_BYTES, QUAD_BYTES);
+                MemoryUtil.memCopy(base + (long) q * quadBytes, scratch + (long) dst * quadBytes, quadBytes);
             }
-            MemoryUtil.memCopy(scratch, base, (long) quadCount * QUAD_BYTES);
+            MemoryUtil.memCopy(scratch, base, (long) quadCount * quadBytes);
         } finally {
             MemoryUtil.nmemFree(scratch);
         }
         return groups;
+    }
+
+    /** The positions of a quad's 4 vertices, as the vertex shader sees them */
+    private static void readPositions(long quad, int stride, boolean compressed, float[] out) {
+        for (int i = 0; i < 4; i++) {
+            long vertex = quad + (long) i * stride;
+            if (compressed) {
+                long packed = MemoryUtil.memGetLong(vertex + CompressedTerrain.POSITION_OFFSET);
+                out[i * 3] = CompressedTerrain.unpackCoordinate(packed, 0);
+                out[i * 3 + 1] = CompressedTerrain.unpackCoordinate(packed, 1);
+                out[i * 3 + 2] = CompressedTerrain.unpackCoordinate(packed, 2);
+            } else {
+                out[i * 3] = MemoryUtil.memGetFloat(vertex);
+                out[i * 3 + 1] = MemoryUtil.memGetFloat(vertex + 4);
+                out[i * 3 + 2] = MemoryUtil.memGetFloat(vertex + 8);
+            }
+        }
     }
 
     public int quadCount() {

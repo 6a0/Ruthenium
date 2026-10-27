@@ -11,6 +11,8 @@
     "render.blockentity.FrustumAccessor",
     "render.blockentity.LevelExtractorM",
     "render.blockentity.RenderPipelinesM",
+    "render.chunk.ChunkSectionLayerM",
+    "render.chunk.ChunkSectionsToRenderM",
     "render.chunk.LevelRendererM",
     "render.chunk.SectionCompilerM",
     "render.chunk.SectionCompilerResultsM",

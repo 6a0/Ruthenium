@@ -9,6 +9,7 @@ import net.minecraft.server.level.ParticleStatus;
 import net.vulkanmod.Initializer;
 import net.vulkanmod.config.Config;
 import net.vulkanmod.config.gui.OptionBlock;
+import net.vulkanmod.interfaces.SectionDispatcherReset;
 import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.blockentity.RetainedChests;
 
@@ -180,6 +181,19 @@ public abstract class Options {
                                 },
                                 () -> config.terrainFaceCulling)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.terrainFaceCulling.tooltip"))
+                                .setImpact(PerformanceImpact.HIGH),
+                        new SwitchOption(Component.translatable("vulkanmod.options.compressedTerrain"),
+                                value -> {
+                                    config.compressedTerrain = value;
+                                    // The vertex format is chosen when the section dispatcher is created
+                                    Minecraft minecraft = Minecraft.getInstance();
+                                    if (minecraft.level != null) {
+                                        ((SectionDispatcherReset) minecraft.levelRenderer).vulkanmod$recreateSectionDispatcher();
+                                        minecraft.levelExtractor.allChanged();
+                                    }
+                                },
+                                () -> config.compressedTerrain)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.compressedTerrain.tooltip"))
                                 .setImpact(PerformanceImpact.HIGH)
                 }),
                 new OptionBlock("", new Option<?>[]{

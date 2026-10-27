@@ -3,11 +3,17 @@ package net.vulkanmod.mixin.render.chunk;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.llamalad7.mixinextras.sugar.Local;
+import com.mojang.blaze3d.vertex.BufferBuilder;
+import com.mojang.blaze3d.vertex.ByteBufferBuilder;
 import com.mojang.blaze3d.vertex.MeshData;
+import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
+import com.mojang.renderpearl.api.vertex.VertexFormat;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.chunk.SectionCompiler;
 import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.FaceGroupsHolder;
+import net.vulkanmod.render.chunk.CompressedTerrain;
+import net.vulkanmod.render.chunk.CompressedTerrainBuilder;
 import net.vulkanmod.render.chunk.SectionFaceGroups;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -26,5 +32,12 @@ public class SectionCompilerM {
             ((FaceGroupsHolder) (Object) results).vulkanmod$setFaceGroups(sectionLayer, SectionFaceGroups.sort(meshData));
         }
         return original.call(layers, layer, mesh);
+    }
+
+    /** Sections in the compressed format get its builder */
+    @WrapOperation(method = "getOrBeginLayer", at = @At(value = "NEW", target = "(Lcom/mojang/blaze3d/vertex/ByteBufferBuilder;Lcom/mojang/renderpearl/api/pipeline/PrimitiveTopology;Lcom/mojang/renderpearl/api/vertex/VertexFormat;)Lcom/mojang/blaze3d/vertex/BufferBuilder;"))
+    private BufferBuilder compressedBuilder(ByteBufferBuilder buffer, PrimitiveTopology topology, VertexFormat format,
+                                            Operation<BufferBuilder> original) {
+        return format == CompressedTerrain.FORMAT ? new CompressedTerrainBuilder(buffer, topology) : original.call(buffer, topology, format);
     }
 }

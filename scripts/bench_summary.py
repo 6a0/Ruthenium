@@ -21,7 +21,7 @@ METRICS = [
 ]
 PHASES = ["initial", "pan", "static", "particles", "rebuild"]
 # Per-run values the terrain benchmark records in its environment
-ENV_METRICS = [("rebuildSeconds", "rebuild s", "{:.3f}"), ("loadSeconds", "load s", "{:.2f}"), ("joinSeconds", "join s", "{:.2f}"),
+ENV_METRICS = [("rebuildSectionsPerSecond", "rebuild /s", "{:.0f}"), ("rebuildSeconds", "rebuild s", "{:.3f}"), ("loadSeconds", "load s", "{:.2f}"), ("joinSeconds", "join s", "{:.2f}"),
                ("renderedSections", "sections", "{:.0f}")]
 
 

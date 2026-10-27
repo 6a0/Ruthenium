@@ -30,4 +30,15 @@ public interface ExtendedVertexBuilder {
      * @return the address of the first vertex
      */
     long reserveVertices(int count);
+
+    /** @return the address of the vertex being built */
+    long vulkanmod$vertexPointer();
+
+    /**
+     * Marks an element of the vertex being built as written, like the setters of {@code BufferBuilder} do.
+     *
+     * @param semanticId BufferBuilder's element id (0 position, 1 color, 2 UV0, 3 UV1, 4 UV2, ...)
+     * @return its address, or -1 if the format has no such element or it was already written
+     */
+    long vulkanmod$beginElement(int semanticId);
 }
