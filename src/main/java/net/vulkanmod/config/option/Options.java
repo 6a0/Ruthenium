@@ -300,6 +300,14 @@ public abstract class Options {
                                 () -> config.instancedParts)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.instancedParts.tooltip"))
                                 .setImpact(PerformanceImpact.HIGH),
+                        new SwitchOption(Component.translatable("vulkanmod.options.instancedItems"),
+                                value -> {
+                                    config.instancedItems = value;
+                                    InstancedParts.clear();
+                                },
+                                () -> config.instancedItems)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.instancedItems.tooltip"))
+                                .setImpact(PerformanceImpact.HIGH),
                         new SwitchOption(Component.translatable("vulkanmod.options.directBakedQuads"),
                                 value -> config.directBakedQuads = value,
                                 () -> config.directBakedQuads)

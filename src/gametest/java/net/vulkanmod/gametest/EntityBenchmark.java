@@ -53,6 +53,7 @@ final class EntityBenchmark {
             {0.5F, 2.6F, 24.0F, 20.0F},  // illagers, iron golems
             {0.5F, 2.6F, 28.0F, 20.0F},  // horses, wolves and cats
             {0.5F, 2.0F, 32.0F, 15.0F},  // vehicles, displays, item frames
+            {0.5F, 1.6F, -2.0F, 25.0F},  // dropped items, experience orbs
     };
 
     /** The flat world's surface; the field spans x -32..31, z 0..37 */
