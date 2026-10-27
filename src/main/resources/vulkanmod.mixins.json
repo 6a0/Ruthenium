@@ -26,6 +26,7 @@
     "render.entity.EntityRendererAccessor",
     "render.entity.LevelExtractorEntityM",
     "render.entity.model.ModelPartCubeM",
+    "render.feature.RenderTypeFeatureRendererGroupM",
     "render.feature.LevelRendererM",
     "render.feature.ModelFeatureRendererM",
     "render.particle.ClientPacketListenerM",

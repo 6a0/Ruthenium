@@ -263,7 +263,12 @@ public abstract class Options {
                                 },
                                 () -> config.blockModelMeshCache)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.blockModelMeshCache.tooltip"))
-                                .setImpact(PerformanceImpact.MEDIUM)
+                                .setImpact(PerformanceImpact.MEDIUM),
+                        new SwitchOption(Component.translatable("vulkanmod.options.hashedDrawLookup"),
+                                value -> config.hashedDrawLookup = value,
+                                () -> config.hashedDrawLookup)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.hashedDrawLookup.tooltip"))
+                                .setImpact(PerformanceImpact.LOW)
                 })
         };
     }
