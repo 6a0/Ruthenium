@@ -7,6 +7,7 @@ import net.minecraft.client.model.Model;
 import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
 import net.minecraft.client.renderer.feature.RenderTypeFeatureRenderer;
 import net.vulkanmod.render.blockentity.InstancedModels;
+import net.vulkanmod.render.entity.InstancedParts;
 import net.vulkanmod.render.entity.ModelCulling;
 import net.vulkanmod.render.entity.ModelGeometryCache;
 import org.spongepowered.asm.mixin.Final;
@@ -20,8 +21,8 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
 
     /**
      * @author VulkanMod
-     * @reason Instancing ({@link InstancedModels}), back face culling ({@link ModelCulling}) and cached rest pose and
-     * model space geometry ({@link ModelGeometryCache});
+     * @reason Instancing ({@link InstancedModels}), back face culling ({@link ModelCulling}), cached rest pose and
+     * model space geometry ({@link ModelGeometryCache}) and instanced parts of posed models ({@link InstancedParts});
      * otherwise the vanilla body
      */
     @Overwrite
@@ -56,8 +57,15 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
                 buffer = submit.uvMapping().wrap(buffer);
             }
 
-            model.setupAnim(submit.state());
-            model.renderToBuffer(this.poseStack, buffer, submit.lightCoords(), submit.overlayCoords(), submit.tintedColor());
+            boolean instancedParts = submit.sheetedDecalPose() == null && InstancedParts.beginModel(submit.renderType(), submit.uvMapping());
+            try {
+                model.setupAnim(submit.state());
+                model.renderToBuffer(this.poseStack, buffer, submit.lightCoords(), submit.overlayCoords(), submit.tintedColor());
+            } finally {
+                if (instancedParts) {
+                    InstancedParts.endModel();
+                }
+            }
         } finally {
             ModelCulling.endModel();
         }

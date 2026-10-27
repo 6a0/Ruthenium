@@ -55,6 +55,8 @@
   "vulkanmod.options.hashedDrawLookup.tooltip": "Finds the draw an entity's or item's geometry goes into with a hash lookup instead of searching all of the frame's draws.",
   "vulkanmod.options.mergeDraws": "Merge Entity Draws",
   "vulkanmod.options.mergeDraws.tooltip": "Puts entity and item geometry with the same texture and settings into one draw call, as vanilla intends but never does. Turn off if a mod's entity overlays flicker or disappear.",
+  "vulkanmod.options.instancedParts": "Instanced Mob Parts",
+  "vulkanmod.options.instancedParts.tooltip": "Keeps the shape of every mob body part on the GPU and only sends each part's position per frame, instead of all of its corners. Turn off if a mod's mobs look wrong.",
   "vulkanmod.options.directBakedQuads": "Fast Item Vertices",
   "vulkanmod.options.directBakedQuads.tooltip": "Dropped, held and framed items write the four vertices of each quad at once instead of one vertex at a time.",
 

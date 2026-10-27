@@ -3,6 +3,7 @@ package net.vulkanmod.mixin.render.blockentity;
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.vulkanmod.render.blockentity.InstancedModels;
+import net.vulkanmod.render.entity.InstancedParts;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import net.vulkanmod.render.chunk.CompressedTerrain;
 import org.spongepowered.asm.mixin.Mixin;
@@ -24,6 +25,7 @@ public class RenderPipelinesM {
         List<RenderPipeline> pipelines = new ArrayList<>(cir.getReturnValue());
         pipelines.addAll(RetainedBlockEntities.PIPELINES);
         pipelines.addAll(InstancedModels.PIPELINES);
+        pipelines.addAll(InstancedParts.PIPELINES);
         pipelines.addAll(CompressedTerrain.PIPELINES);
         cir.setReturnValue(pipelines);
     }

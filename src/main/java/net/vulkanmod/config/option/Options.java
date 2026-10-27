@@ -11,6 +11,7 @@ import net.vulkanmod.config.Config;
 import net.vulkanmod.config.gui.OptionBlock;
 import net.vulkanmod.interfaces.SectionDispatcherReset;
 import net.vulkanmod.render.blockentity.InstancedModels;
+import net.vulkanmod.render.entity.InstancedParts;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import net.vulkanmod.render.entity.BlockModelMeshCache;
 
@@ -274,6 +275,14 @@ public abstract class Options {
                                 () -> config.mergeDraws)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.mergeDraws.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.instancedParts"),
+                                value -> {
+                                    config.instancedParts = value;
+                                    InstancedParts.clear();
+                                },
+                                () -> config.instancedParts)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.instancedParts.tooltip"))
+                                .setImpact(PerformanceImpact.HIGH),
                         new SwitchOption(Component.translatable("vulkanmod.options.directBakedQuads"),
                                 value -> config.directBakedQuads = value,
                                 () -> config.directBakedQuads)

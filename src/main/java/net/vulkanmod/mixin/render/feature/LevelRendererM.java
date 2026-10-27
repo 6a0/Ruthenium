@@ -6,6 +6,7 @@ import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
 import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
+import net.vulkanmod.render.entity.InstancedParts;
 import net.vulkanmod.render.entity.ModelCulling;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -23,6 +24,7 @@ public class LevelRendererM {
     @Inject(method = "render", at = @At(value = "INVOKE", target = PREPARE_FRAME))
     private void beginWorldFeatures(CallbackInfo ci) {
         ModelCulling.setWorldPass(true);
+        InstancedParts.beginFrame();
     }
 
     @Inject(method = "render", at = @At(value = "INVOKE", target = PREPARE_FRAME, shift = At.Shift.AFTER))
@@ -30,6 +32,7 @@ public class LevelRendererM {
         ModelCulling.setWorldPass(false);
         RetainedBlockEntities.prepareDraws();
         InstancedModels.prepareDraws();
+        InstancedParts.upload();
     }
 
     @Inject(method = "executeSolid", at = @At(value = "INVOKE", shift = At.Shift.AFTER,

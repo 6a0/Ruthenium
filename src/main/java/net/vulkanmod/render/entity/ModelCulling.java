@@ -41,6 +41,11 @@ public final class ModelCulling {
         cullBackFaces = false;
     }
 
+    /** Whether the world's features are being prepared */
+    public static boolean isWorldPass() {
+        return worldPass;
+    }
+
     public static void beginModel(RenderType renderType) {
         cullBackFaces = worldPass && renderType.pipeline().isCull() && Initializer.CONFIG.modelBackFaceCulling;
         if (renderType != lastRenderType) {
