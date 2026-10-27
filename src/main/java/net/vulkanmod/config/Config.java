@@ -31,6 +31,8 @@ public class Config {
     public boolean blockModelMeshCache = true;
     /** Finds the draw of a render type with a hash lookup instead of a linear search */
     public boolean hashedDrawLookup = true;
+    /** Baked quads (items, block models) are written into vertex buffers a whole quad at a time */
+    public boolean directBakedQuads = true;
     /** Skips the terrain faces of a section that all face away from the camera */
     public boolean terrainFaceCulling = true;
     /** Solid and cutout terrain vertices in 20 instead of 28 bytes */
