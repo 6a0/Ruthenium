@@ -57,6 +57,7 @@
     "world.DecoratedPotBlockEntityM",
     "world.EnchantingTableBlockEntityM",
     "world.EnderChestBlockEntityM",
+    "world.EntityM",
     "world.LevelM",
     "world.RebindableTickingBlockEntityWrapperM",
     "world.ShulkerBoxBlockEntityM",
