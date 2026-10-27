@@ -3,7 +3,8 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-27 (fifth session), with the terrain work (terrain benchmark, face groups, draw list, compressed vertices).
+Last updated: 2026-10-27 (sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+light, block state and tint caches).
 
 ---
 
@@ -35,6 +36,11 @@ Last updated: 2026-10-27 (fifth session), with the terrain work (terrain benchma
   Terrain static view 477 -> 670 fps, pan 658 -> 873 (vanilla Vulkan 474 / 651). Each has a switch on the
   Optimizations page. The old VulkanMod terrain renderer was **not** ported: vanilla's section compiler, uber
   buffers, occlusion graph and multi-draw-indirect are kept.
+- **Section compiles (sixth session).** Exact caches in vanilla's section compile (meshes byte-identical, checked by
+  `-Pbench.meshCheck=true`): biome tint blending (`BiomeTintBlend`), AO light/shade (`BlockModelLighterCacheM`) and
+  block states (`RenderSectionRegionM`). Single-thread compile 681 -> ~400 us per section, terrain rebuild
+  3987 -> 6588 sections/s (vanilla 3864). The GPU probe (`-Pbench.gpuProfile=true`) showed that the terrain's GPU
+  time is per-vertex work, and ruled out 16 bit indices, translucent compression and draw splitting (section 7).
 - **The pan p99 is not hitches.** Frames facing the chest cube (yaw 220–320, 11–13k block entities) take
   ~6 ms (third session start: ~20 ms) while the rest of the pan runs at ~1 ms (section 7). The remaining work
   there is per block entity (signs, enchanting table extraction, ticking).
@@ -141,6 +147,9 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `render/chunk/SectionFaceGroups.java` + `mixin/render/chunk/{SectionCompilerM,SectionCompilerResultsM}.java` + `CompiledSectionMeshM` (`interfaces/FaceGroupsHolder`) | Solid and cutout layer meshes (sequential quads) are reordered at compile time (stably, after `BufferBuilder.build`, through a wrap of the results' `Map.put`) into 7 groups: one per axis-aligned facing (by the quad's winding normal from its diagonals; all 4 vertices must share the plane coordinate) plus the rest. Each group keeps its lowest `normal . vertex`. When the draw list is built, a layer's draw is replaced by draws of the groups the eye can be in front of (margin 1e-3), merging adjacent ones. Exact: terrain pipelines cull back faces, and a quad is back facing iff the eye is behind its plane. Switch `terrainFaceCulling` (toggling calls `allChanged`). The non-MDI path (`extractSectionDrawGroups`) gets the same through a `List.add` wrap. **Mixin pitfall seen here:** array field initializers in a mixin were not merged before a constructor `@Inject` ran once a second such field existed; the NPE happened in a compile worker, where vanilla's `runTask` catches it and requeues the task silently (symptom: a compile queue that never drains). The arrays are now allocated in code |
 | `render/chunk/TerrainDrawList.java` + `mixin/render/chunk/LevelRendererM.java` (`@Overwrite prepareChunkRendersIndirect`) + `interfaces/CachedSectionSlices` | Builds vanilla's multi-draw-indirect commands: the same draw groups (per vertex/index buffer heap; translucent ones consecutive-only and back to front) and commands, without the 2 hash lookups per section and layer in `UberGpuBuffer.getAllocation` and without a record per command. A solid/cutout layer's `RenderSectionBufferSlice` is cached in its compiled mesh (its vertex allocation never moves until the mesh is released; translucent index buffers are re-uploaded under the same mesh when resorted, so those are still looked up). Commands go into reused int arrays and one bulk copy per group into a VulkanMod `MappableRingBuffer` of indirect parameters, rotated each frame. Vertex sizes per layer are read per frame (they change with `CompressedTerrain`) |
 | `render/chunk/CompressedTerrain.java` + `CompressedTerrainBuilder.java` + `mixin/render/chunk/{ChunkSectionLayerM,ChunkSectionsToRenderM}.java` + `assets/vulkanmod/shaders/core/terrain_compressed.vsh` + `interfaces/SectionDispatcherReset` | Solid/cutout vertices in 20 bytes: `Position` RG32_UINT = 3x21 bit fixed point (1/65536 block, offset -8, range [-8, 24)), `Color` RGBA8, `UV0` RG16_UINT (/65536), `UV2` as vanilla. `ChunkSectionLayer.pipeline()`/`vertexFormat()` return copies of vanilla's terrain pipelines (built through a `RenderPipeline.Snippet` of the vanilla pipeline's properties, with the vertex shader and binding 0 replaced; also for the wireframe override). The section compiler gets `CompressedTerrainBuilder` (a `BufferBuilder` subclass handling the 11-arg `addVertex`, chained `addVertex(x,y,z)` and `setUv`) through a `NEW` wrap in `getOrBeginLayer`. The format is chosen when vanilla creates the section dispatcher (`invalidateCompiledGeometry` with a null dispatcher), because the uber buffers are sized per vertex. The switch `compressedTerrain` calls `LevelRenderer.vulkanmod$recreateSectionDispatcher` (like `resetLevelRenderData`, but keeping the occlusion graph's loaded chunks and empty sections, which only fill as chunks load) and then `allChanged`. Translucent layers keep vanilla's format (their quad sorting reads float positions). Little-endian hosts only |
+| `render/chunk/BiomeTintBlend.java` + `mixin/render/chunk/{ClientLevelTintM,BiomeManagerAccessor}.java` | `ClientLevel.calculateBlockTint` (and, through `RenderSectionRegionM`, every tint a section compile asks for) from per-thread grids: the biomes of the section plus the blend radius around it (shared by all resolvers), each resolver's sample colours and its blended tints per block. Vanilla's per-block `BlockTintCache` (256 chunk columns, so it thrashed at render distance 32; a read lock and a linear search of the column's heights per lookup) is bypassed for compiles. The biomes are `BiomeManager.getBiome`'s fuzzy zoom with each quart corner's offsets (8 LCG steps) and noise biome cached; the distances use the same double arithmetic, and the sums vanilla's integer arithmetic, so results are identical (`-Pbench.tintCheck=true`: 14.2M blends, 0 mismatches). Grids are dropped through a generation counter on chunk load/unload and `clearTintCaches`. Only for vanilla's `BiomeManager` class and blend radius 1..16; otherwise vanilla's path. Switch `biomeBlendCache` |
+| `mixin/render/chunk/{BlockModelLighterCacheM,BlockModelLighterAccessor}.java` + `interfaces/SectionLightWindow` + `SectionCompilerM.beginLightWindow` | While a section compiles (from vanilla's `enableCaching` in `SectionCompiler.compile`), the AO light (packed brightness) and shade brightness of the section and its 1 block border (18^3) are kept in per-thread arrays instead of vanilla's 100 entry FIFO maps (`@Overwrite` of `Cache.getLightCoords`/`getShadeBrightness`; positions outside the window and other callers use vanilla's maps). Indigo's `AoCalculator` goes through this cache. Switch `sectionLightCache` |
+| `mixin/render/chunk/RenderSectionRegionM.java` | `@Overwrite getBlockState`/`getFluidState`: the region's center section and border (18^3) are read once from the `SectionCopy`s into a per-thread array (stamped per region, checked by region and thread), switch `sectionStateCache`. `@Overwrite getBlockTint`: straight to `BiomeTintBlend` when `biomeBlendCache` is on. Fabric's block getter API only adds methods to this class |
 | `interfaces/ExtendedVertexBuilder.java` | `canWriteDirect(VertexFormat)` and `reserveVertices(int)`, for writing whole quads into a `BufferBuilder` |
 | `mixin/render/vertex/BufferBuilderM.java` | Implements the above (handles the `ensureBuilding`/`endLastVertex`/vertex count/`vertexPointer` bookkeeping; LE only; non-LINES topology) |
 | `mixin/render/entity/model/ModelPartCubeM.java` | `@Overwrite Cube.compile`: transforms the distinct corners once, writes ENTITY-format faces directly, unwraps `SpriteCoordinateExpander`; vanilla fallback for other formats |
@@ -354,6 +363,19 @@ screenshots both.
 - The static terrain view is GPU bound: render thread 0.87 ms CPU per 1.49 ms frame. At 960x540 it is only ~25%
   faster, and at render distance 4 a frame takes 0.39 ms, so most of the GPU time is per-vertex terrain work.
 - Phases now report the render thread's CPU time per frame (`cpu ms/f` in `bench_summary.py`).
+- Sixth session diagnostics (all off by default, on any terrain run):
+  - `-Pbench.gpuProfile=true` (`GpuProbe`): GPU timestamps around each terrain layer's draws
+    (`ChunkSectionsToRender.DrawIndirect.render`), quads and draws per layer, and how much of the visible geometry
+    is in fully underground sections. Logged as `GPU static: ...` / `GPU pan: ...`.
+  - `-Pbench.meshCheck=true` (`MeshCompareCheck`): compiles 486 sections around the player with the mesher switches
+    on and off (tint caches cleared before each) and fails on any differing vertex byte.
+  - `-Pbench.tintCheck=true` (`BiomeTintCheck`): `BiomeTintBlend` vs vanilla's blending for 288 sections, 4
+    resolvers, radius 1/2/7 (~2.5 minutes; changing the radius reloads the chunks, so that run's fps are invalid).
+  - `-Pbench.compileBench=true` (`CompileBenchmark`): compile time per section on the render thread, median of 7
+    rounds of the same 486 sections, with each mesher switch off in turn (interleaved), and the same sections
+    compiled by 1..19 threads at once. Far less noisy than the rebuild phase, which depends on vanilla's
+    scheduling and on the occlusion graph bug.
+  - The rebuild phase logs the background workers' CPU time (`Rebuild worker CPU: ...`).
 - The benchmark turns off vanilla's AFK frame rate limit (30 fps after 60 s without input), which capped every
   phase of the first terrain runs.
 
@@ -401,7 +423,30 @@ are built in the first frames after the teleport (budget 2048 chests per frame).
 | render thread CPU, static | 0.91 ms | 0.90 ms | 1.21 ms | 0.86 ms | 0.87 ms |
 | rebuild (sections/s) | 3864 | - | - | - | 3760 (switch off: 3855) |
 
-Archives: `results/vulkanmod-terrain-v0..v3` (+ `v3-compressed-off`); the vanilla terrain runs are in `results/`.
+Archives: `results/vulkanmod-terrain-v0..v3` (+ `v3-compressed-off`), `v4-tint` and `v5-mesher` (interleaved
+A/B runs, `on/` and `off/`); the vanilla terrain runs are in `results/`; dev and probe runs in `terrain-dev/`.
+
+**Where the terrain's GPU time goes** (sixth session, `gpuProfile`, static view, 1.48 ms frames): solid 0.46 ms
+(586k quads, ~5.3k draws), cutout 0.77 ms (963k quads), translucent 0.07 ms (97k quads); the rest of the frame
+~0.18 ms. Both opaque layers cost ~0.8 ns per quad. With the vertex shader emitting degenerate triangles (nothing
+rasterised) solid+cutout still take 1.00 ms, with a position-only shader 0.63 ms: ~50% index/position fetch and
+primitive processing, ~30% the other attributes and shader outputs, ~20% rasterisation and fragments.
+Measured and rejected: 16 bit indices for the terrain draws (vanilla's shared sequential buffer is 32 bit here;
+0.459 vs 0.461 ms), splitting every draw in two (twice the draws, no change: per-draw cost is not the limit),
+`ProjMat * (ModelViewMat * pos)` (no change). Translucent compression could save at most ~1% (0.07 ms in total).
+Fully underground sections hold 11% of the solid quads and 0.3% of the cutout ones, so finer cave culling would
+gain at most ~4%. The cutout layer is mostly leaves (Fancy's cutout leaves draw the faces between leaf blocks,
+which show through the holes, so they can't be dropped) and grass. renderpearl 26.3 has no compute shaders or
+occlusion queries, so GPU-side culling isn't available.
+
+**Section compiles** (sixth session). JFR of the worker threads: 42% of compile time was biome blending (25 fuzzy
+zoomed biome lookups per tinted block, vanilla's per-block cache thrashing), 22% Indigo's AO, ~13% light/shade
+lookups, ~8% fluids. `compileBench` (render thread, us per section): all off 681 -> all on 391-413; with only
+the biome blend cache off 581-597, light cache off 431-453, state cache off 459-476; face group sorting ~8.
+Parallel, all on: 1 thread 410, 19 threads 1039 us per section per thread (hyperthreads, E-cores, all-core
+clocks), 18.3k sections/s in total. In the game the visible (surface) sections cost ~2.1 ms worker CPU each and
+13-15 of the 19 workers are busy during a rebuild. A/B, interleaved, median of 3: biome blend alone 3911 -> 5119
+sections/s; all three switches 3987 -> 6588; static/pan fps unchanged.
 Interleaved A/B for the compressed vertices (off -> on): static 657.2 -> 670.3, pan 844.9 -> 873.1; the server
 benchmark was neutral within noise for it (`v25`, `v25-compressed-off`). The draw list took the server scene's static
 view from 405 to 432 (v24). Quads drawn at the static view: ~0.59M solid + 0.96M cutout with face groups (2.2M
@@ -473,11 +518,13 @@ books' write was 640 ns each before the faster model space path (~5.3k per frame
    - Armor stand extraction (~5% at static, spread thin across `LivingEntityRenderer.extractRenderState`).
    - Entity culling: Sodium and vanilla render the same ~188 entities.
    - Armor stands use `entity_cutout` (no culling), so the CPU back-face skip doesn't apply to them.
-5. **Terrain**, after the fifth session (section 7, "Terrain"). The view is GPU bound on vertex work. Ideas:
-   - Translucent layers in the compressed format (needs `MeshData.decodeQuadCentroids` and the sorting to read it).
-   - 16-bit indices: the shared sequential index buffer becomes 32-bit once a section draw exceeds 65536 vertices.
-   - Section compile throughput (rebuild ~3.8k sections/s, the same as vanilla): the mesher (`ModelBlockRenderer`,
-     AO).
+5. **Terrain**, after the sixth session (section 7, "Terrain"). The view is GPU bound on per-vertex work (see
+   "Where the terrain's GPU time goes"); 16 bit indices, translucent compression and draw counts were measured and
+   don't matter. Ideas:
+   - Fewer vertices: anything exact must skip whole invisible faces/sections (occlusion), which renderpearl can't
+     do on the GPU; a conservative CPU occlusion test (software depth of large occluders) is the remaining option.
+   - Section compiles (now ~400 us per section single-threaded): Indigo's `AoCalculator` (~22% before the caches,
+     Fabric internals, so mixins there are fragile), fluids (~8%), Indigo's quad transform/emit overhead.
    - The vanilla occlusion graph bug after `allChanged` (section 6.7), which also leaves holes for players who
      change a video setting while standing still.
    - Singleplayer chunk loading runs at the integrated server's speed (~60 chunks/s), not the client's.
