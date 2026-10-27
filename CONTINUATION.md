@@ -14,6 +14,8 @@ fps). See section 7, "Eighth session". Ninth session: armor stands are extracted
 6.9; the server scene has only armor stands), measurements that ruled out cheaper entity culling and generic render
 state reuse, **cached block model quads of entities** (item frames etc.; entity scene static 121.8 -> 127.5 fps), a
 hashed draw lookup (126.8 -> 130.9) and baked quads written a quad at a time (132.3 -> 135.6).
+Eleventh session: the per switch cost of feature renderer groups was measured (~115 us/frame in the entity scene)
+and a draw reuse cache rejected (no gain; section 7, "Eleventh session").
 
 ---
 
@@ -566,6 +568,29 @@ particles: vanilla ~16 349, VulkanMod ~16 250.
   relies on submit order within these phases can turn it off; the gain may be larger where draw calls cost more,
   e.g. integrated GPUs, not measured).
 
+### Eleventh session (2026-10-27)
+- **Per switch cost in feature renderer groups measured; draw reuse rejected** (`results/entities-dev/probe-switch`,
+  `results/entities-dev/drawtargets/{off,on}`). A temporary `System.nanoTime` probe on `RenderTypeFeatureRenderer$Group`
+  at the entity scene's static view (render thread ~7.2 ms/frame) found:
+  - ~197 render type switches per frame, not ~290. By type: item_cutout ~100 (dropped items alternate between the block
+    and item atlas types), entity_cutout ~44, eyes ~23, entity_translucent ~12.
+  - `getOrAddDraw` takes ~75 us per frame in total, ~42 us of it in `prepare()`.
+  - The ~197 new `BufferBuilder`s (finishing the previous one into `MeshData`) take ~39 us.
+  - `Group.getVertexBuilder` runs ~13.7k times per frame (once per item quad); its fast path is a few field compares.
+
+  The whole per switch cost is therefore ~115 us/frame (~1.6%). Of the switches, 44 are in strictly ordered groups
+  (they always append), ~54 are a type's first use in its group (a draw needs a prepared type anyway) and ~99 hit an
+  existing draw. All 97 appended draws per frame are of those first two kinds, so slice-keyed merging loses no
+  merges here.
+
+  A per group cache from render type to its draw, checked against the model view matrix, projection type and scissor
+  (only for constant texture transforms and vanilla's layering transforms), skipped `prepare()` and the lookup on
+  those ~99 hits. The probe showed it saving ~10 us/frame. Three interleaved ABBA pairs, off vs on: static
+  139.1/138.7/139.5 vs 138.7/137.7/138.5 fps (render thread 7.08/7.05/6.89 vs 7.00/7.11/7.17 ms), pan
+  746.8/763.6/747.2 vs 730.0/731.8/735.2. No gain, so it was not committed. The remaining ~40 us of builder switches
+  could only go if merged draws had their own staging memory (a rewrite of `StagedVertexBuffer`'s single
+  `ByteBufferBuilder`), or by sorting item submits by render type, whose sort would cost about what it saves.
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -681,9 +706,9 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 
 1. **Entity scene hot spots** (section 6.9, static ~7.1 ms/frame; tenth session profile in section 7). Done in the
    tenth session: block model mesh cache, hashed draw lookup, baked quads a quad at a time. By expected gain:
-   - **Per switch cost in feature renderer groups**: every render type switch calls `prepare()` (texture list,
-     transform write) and `StagedVertexBuffer.getVertexBuilder` builds a new `BufferBuilder` and `MeshData`
-     (~290 switches per frame in the entity scene). Draw merging (`mergeDraws`, tenth session) didn't remove these.
+   - ~~Per switch cost in feature renderer groups~~: measured in the eleventh session at ~115 us/frame in total
+     (~197 switches). Reusing draws without `prepare()` saved ~10 us and didn't show in interleaved pairs; see
+     section 7, "Eleventh session". Not worth more unless a scene has far more switches.
    - **Posed mob models** (`Cube.compile` ~20%): the geometry of every mob is transformed per frame. Already on the
      fast path; animated mobs can't use the armor stand instancing, which keys on the exact pose.
    - Block displays (2.3 us) and minecarts (1 us) still extract slowly after the mesh cache; profile them.
