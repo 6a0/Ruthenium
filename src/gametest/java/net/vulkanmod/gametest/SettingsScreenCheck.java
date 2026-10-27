@@ -57,8 +57,8 @@ final class SettingsScreenCheck {
         context.takeScreenshot(label + "-settings-hover");
         context.getInput().setCursorPos(0, 0);
 
-        // Optimizations page: switch off the first option (block entity culling) and apply
-        boolean before = context.computeOnClient(_ -> Initializer.CONFIG.blockEntityCulling);
+        // Optimizations page: switch off the first option (terrain face culling) and apply
+        boolean before = context.computeOnClient(_ -> Initializer.CONFIG.terrainFaceCulling);
         context.runOnClient(mc -> {
             Screen screen = mc.gui.screen();
             click(screen, firstControlX(screen) + 10, 32 + 10);
@@ -67,11 +67,11 @@ final class SettingsScreenCheck {
         context.takeScreenshot(label + "-settings-changed");
         context.runOnClient(mc -> clickApply(mc, mc.gui.screen()));
         context.waitTicks(3);
-        boolean after = context.computeOnClient(_ -> Initializer.CONFIG.blockEntityCulling);
+        boolean after = context.computeOnClient(_ -> Initializer.CONFIG.terrainFaceCulling);
         String written = readConfig();
-        LOGGER.info("blockEntityCulling {} -> {}, config file: {}", before, after, written.replaceAll("\\s+", " "));
+        LOGGER.info("terrainFaceCulling {} -> {}, config file: {}", before, after, written.replaceAll("\\s+", " "));
         check(after != before, "applying the switch changed the config");
-        check(written.contains("\"blockEntityCulling\": " + after), "the config file has the new value");
+        check(written.contains("\"terrainFaceCulling\": " + after), "the config file has the new value");
 
         // Restore it
         context.runOnClient(mc -> {
@@ -80,7 +80,7 @@ final class SettingsScreenCheck {
             clickApply(mc, screen);
         });
         context.waitTicks(3);
-        check(context.computeOnClient(_ -> Initializer.CONFIG.blockEntityCulling) == before, "the switch was restored");
+        check(context.computeOnClient(_ -> Initializer.CONFIG.terrainFaceCulling) == before, "the switch was restored");
 
         // Search: Ctrl+L focuses the field, typed characters filter the options
         context.runOnClient(mc -> {
