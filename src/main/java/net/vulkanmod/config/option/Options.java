@@ -300,6 +300,14 @@ public abstract class Options {
                                 () -> config.instancedParts)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.instancedParts.tooltip"))
                                 .setImpact(PerformanceImpact.HIGH),
+                        new SwitchOption(Component.translatable("vulkanmod.options.instancedArmor"),
+                                value -> {
+                                    config.instancedArmor = value;
+                                    InstancedParts.clear();
+                                },
+                                () -> config.instancedArmor)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.instancedArmor.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM),
                         new SwitchOption(Component.translatable("vulkanmod.options.instancedItems"),
                                 value -> {
                                     config.instancedItems = value;

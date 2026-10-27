@@ -1,7 +1,7 @@
 package net.vulkanmod.gametest;
 
 import java.util.ArrayList;
-import java.util.IdentityHashMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -19,7 +19,7 @@ public final class EntityCostProbe {
     public static final Table SUBMIT = new Table("submit (per entity type)", false);
     public static final Table TICK = new Table("tick (per entity type)", true);
     public static final Table FEATURE_GROUPS = new Table("prepare groups (per feature renderer)", false);
-    public static final Table MODELS = new Table("prepare models (per model class)", false);
+    public static final Table MODELS = new Table("prepare models (per model class and pipeline)", false);
     public static final Table SETUP_ANIM = new Table("setupAnim of posed models (per model class)", false);
     public static final Table MODEL_RENDER = new Table("part tree of posed models (per model class)", false);
     public static final Table ITEMS = new Table("prepare items (per display context, extra = quads)", false);
@@ -31,7 +31,7 @@ public final class EntityCostProbe {
     public static final class Table {
         final String name;
         final boolean perTick;
-        final Map<Object, long[]> entries = new IdentityHashMap<>();
+        final Map<Object, long[]> entries = new HashMap<>();
 
         Table(String name, boolean perTick) {
             this.name = name;
@@ -77,6 +77,9 @@ public final class EntityCostProbe {
     }
 
     private static String name(Object key) {
+        if (key instanceof List<?> list) {
+            return list.stream().map(EntityCostProbe::name).reduce((a, b) -> a + " " + b).orElse("");
+        }
         return key instanceof Class<?> c ? c.getName().substring(c.getName().lastIndexOf('.') + 1) : String.valueOf(key);
     }
 }

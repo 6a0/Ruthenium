@@ -62,10 +62,13 @@ import java.util.function.Function;
  * instanced copies of vanilla's entity pipelines, so they keep their place among the submit orders (layers like
  * villager clothing sit on the same faces as the body, one order later) and phases.
  * <p>
- * Only render types of vanilla's {@code entity_solid}, {@code entity_cutout} and {@code entity_cutout_cull}
- * pipelines are taken (drawn with the type's prepared transform and textures); they never blend and always go to
- * the solid phase, whose groups vanilla may reorder. The only differences to vanilla are rounding: the GPU transforms
- * the positions, and normals are transformed in full precision and quantized nowhere.
+ * Only render types of vanilla's {@code entity_solid}, {@code entity_cutout}, {@code entity_cutout_cull} and
+ * {@code armor_cutout_no_cull} pipelines are taken (drawn with the type's prepared transform and textures); they never
+ * blend and always go to the solid phase, whose groups vanilla may reorder. The only differences to vanilla are
+ * rounding: the GPU transforms the positions (in JOML's operation order, so they are bit-identical), and normals are
+ * transformed in full precision and quantized nowhere. Armor trims are instanced like armor (with their UV mapping),
+ * except those with a decal pattern (none in vanilla, datapacks can add them): their pipeline tests depth for equality
+ * with the armor, which the equipment layer submits one order earlier, and which is bit-identical here.
  * <p>
  * Items work the same way ({@link #addItem}): the quads of an item submit without foil, all of vanilla's
  * {@code item_cutout} type (solid phase), are written once into an item-space mesh per quad list and tint colors,
@@ -87,15 +90,21 @@ public final class InstancedParts {
     private static final int INSTANCE_SIZE = INSTANCE_FORMAT.getVertexSize();
 
     /** Instanced copies of vanilla's entity_solid, entity_cutout and entity_cutout_cull */
-    public static final RenderPipeline SOLID = instancedPipeline("entity_solid", false, false, true, false);
-    public static final RenderPipeline CUTOUT = instancedPipeline("entity_cutout", true, true, false, false);
-    public static final RenderPipeline CUTOUT_CULL = instancedPipeline("entity_cutout_cull", true, false, true, false);
+    // Features of the instanced copies of vanilla's entity pipelines
+    private static final int ALPHA_CUTOUT = 1, PER_FACE_LIGHTING = 2, CULL = 4, MESH_LIGHT = 8, NO_OVERLAY = 16;
+
+    public static final RenderPipeline SOLID = instancedPipeline("entity_solid", CULL);
+    public static final RenderPipeline CUTOUT = instancedPipeline("entity_cutout", ALPHA_CUTOUT | PER_FACE_LIGHTING);
+    public static final RenderPipeline CUTOUT_CULL = instancedPipeline("entity_cutout_cull", ALPHA_CUTOUT | CULL);
+    /** Instanced copy of vanilla's armor_cutout_no_cull (equipment layers: armor, saddles, horse armor) */
+    public static final RenderPipeline ARMOR_CUTOUT_NO_CULL = instancedPipeline("armor_cutout_no_cull", ALPHA_CUTOUT | PER_FACE_LIGHTING | NO_OVERLAY);
     /** Instanced copy of vanilla's entity_solid for Fabric Renderer API meshes (item frames' z offset type) */
-    public static final RenderPipeline SOLID_MESH = instancedPipeline("entity_solid_mesh", false, false, true, true);
+    public static final RenderPipeline SOLID_MESH = instancedPipeline("entity_solid_mesh", CULL | MESH_LIGHT);
     /** Instanced copies of vanilla's item_cutout, for baked quads and for Fabric Renderer API meshes */
     public static final RenderPipeline ITEM_CUTOUT = instancedItemPipeline("instanced_item_cutout", false);
     public static final RenderPipeline ITEM_CUTOUT_MESH = instancedItemPipeline("instanced_item_cutout_mesh", true);
-    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT, CUTOUT_CULL, SOLID_MESH, ITEM_CUTOUT, ITEM_CUTOUT_MESH);
+    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT, CUTOUT_CULL, ARMOR_CUTOUT_NO_CULL, SOLID_MESH, ITEM_CUTOUT,
+            ITEM_CUTOUT_MESH);
 
     /** Meshes kept at most; models created over and over (by mods) fall back to vanilla beyond this */
     private static final int MAX_BATCHES = 4096;
@@ -133,7 +142,7 @@ public final class InstancedParts {
     private InstancedParts() {
     }
 
-    private static RenderPipeline instancedPipeline(String name, boolean cutout, boolean perFaceLighting, boolean cull, boolean meshLight) {
+    private static RenderPipeline instancedPipeline(String name, int features) {
         RenderPipeline.Builder builder = RenderPipeline.builder()
                 .withBindGroupLayout(BindGroupLayouts.GLOBALS)
                 .withBindGroupLayout(BindGroupLayouts.PROJECTION)
@@ -149,17 +158,21 @@ public final class InstancedParts {
                 .withBindGroupLayout(BindGroupLayouts.LIGHTING)
                 .withBindGroupLayout(BindGroupLayouts.SAMPLER2)
                 .withLocation(Identifier.fromNamespaceAndPath("vulkanmod", "pipeline/instanced_part_" + name));
-        if (cutout) {
+        if ((features & ALPHA_CUTOUT) != 0) {
             builder.withShaderDefine("ALPHA_CUTOUT", 0.1F);
         }
-        if (perFaceLighting) {
+        if ((features & PER_FACE_LIGHTING) != 0) {
             builder.withShaderDefine("PER_FACE_LIGHTING");
         }
-        if (meshLight) {
+        if ((features & MESH_LIGHT) != 0) {
             builder.withShaderDefine("MESH_LIGHT");
         }
-        return builder.withBindGroupLayout(BindGroupLayouts.SAMPLER1)
-                .withCull(cull)
+        if ((features & NO_OVERLAY) != 0) {
+            builder.withShaderDefine("NO_OVERLAY");
+        } else {
+            builder.withBindGroupLayout(BindGroupLayouts.SAMPLER1);
+        }
+        return builder.withCull((features & CULL) != 0)
                 .withColorTargetState(ColorTargetState.DEFAULT)
                 .build();
     }
@@ -193,6 +206,8 @@ public final class InstancedParts {
             return CUTOUT;
         } else if (vanilla == RenderPipelines.ENTITY_CUTOUT_CULL) {
             return CUTOUT_CULL;
+        } else if (vanilla == RenderPipelines.ARMOR_CUTOUT_NO_CULL) {
+            return ARMOR_CUTOUT_NO_CULL;
         }
         return null;
     }
@@ -318,7 +333,7 @@ public final class InstancedParts {
             return false;
         }
         RenderPipeline pipeline = instancedPipeline(renderType.pipeline());
-        if (pipeline == null) {
+        if (pipeline == null || pipeline == ARMOR_CUTOUT_NO_CULL && !Initializer.CONFIG.instancedArmor) {
             return false;
         }
         modelActive = true;

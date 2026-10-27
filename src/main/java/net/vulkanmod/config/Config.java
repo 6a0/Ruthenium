@@ -39,6 +39,7 @@ public class Config {
     public boolean mergeDraws = true;
     /** The parts of posed world models (mobs, ...) are drawn as GPU instances instead of writing their vertices */
     public boolean instancedParts = true;
+    public boolean instancedArmor = true;
     public boolean instancedItems = true;
     public boolean instancedBlockModels = true;
     /** Baked quads (items, block models) are written into vertex buffers a whole quad at a time */

@@ -227,12 +227,17 @@ final class EntityBenchmark {
             }
         }
 
-        // Zombies (every third in full armor with a sword) and skeletons with bows
+        // Zombies (every third in full armor with a sword: trimmed chestplates, two patterns and materials, every other
+        // armored one with enchanted leggings) and skeletons with bows
         int i = 0;
         for (double x = MIN_X + 0.5; x < MAX_X; x += 1.5, i++) {
+            String trim = i % 6 == 0 ? "{material:\"minecraft:gold\",pattern:\"minecraft:bolt\"}"
+                    : "{material:\"minecraft:diamond\",pattern:\"minecraft:sentry\"}";
+            String legs = i % 6 == 0 ? "{id:\"minecraft:iron_leggings\",count:1,components:{\"minecraft:enchantments\":{\"minecraft:protection\":1}}}"
+                    : "{id:\"minecraft:iron_leggings\",count:1}";
             String zombieEquipment = i % 3 == 0
-                    ? "equipment:{head:%s,chest:{id:\"minecraft:iron_chestplate\",count:1},legs:{id:\"minecraft:iron_leggings\",count:1},feet:{id:\"minecraft:iron_boots\",count:1},mainhand:{id:\"minecraft:iron_sword\",count:1}}"
-                            .formatted(unbreakable("iron_helmet"))
+                    ? "equipment:{head:%s,chest:{id:\"minecraft:iron_chestplate\",count:1,components:{\"minecraft:trim\":%s}},legs:%s,feet:{id:\"minecraft:iron_boots\",count:1},mainhand:{id:\"minecraft:iron_sword\",count:1}}"
+                            .formatted(unbreakable("iron_helmet"), trim, legs)
                     : equipment(helmet(i), null);
             summon(server, "zombie", x, FLOOR, 17.5, mob + "," + facing + "," + zombieEquipment);
             summon(server, "skeleton", x, FLOOR, 19.0, mob + "," + facing + "," + equipment(helmet(i + 2), "bow"));
