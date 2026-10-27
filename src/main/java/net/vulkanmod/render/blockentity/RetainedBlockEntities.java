@@ -15,10 +15,15 @@ import com.mojang.renderpearl.api.pipeline.CompiledRenderPipeline;
 import com.mojang.renderpearl.api.pipeline.DepthStencilState;
 import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
+import com.mojang.renderpearl.api.vertex.VertexFormat;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
 import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.objects.ObjectIterator;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.Font;
+import net.minecraft.client.gui.font.TextRenderable;
 import net.minecraft.client.model.Model;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.BindGroupLayouts;
@@ -28,8 +33,10 @@ import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderer;
 import net.minecraft.client.renderer.blockentity.ChestRenderer;
 import net.minecraft.client.renderer.blockentity.DecoratedPotRenderer;
+import net.minecraft.client.renderer.blockentity.HangingSignRenderer;
 import net.minecraft.client.renderer.blockentity.ShulkerBoxRenderer;
 import net.minecraft.client.renderer.blockentity.SkullBlockRenderer;
+import net.minecraft.client.renderer.blockentity.StandingSignRenderer;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
 import net.minecraft.client.renderer.chunk.SectionMesh;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
@@ -38,7 +45,11 @@ import net.minecraft.client.renderer.rendertype.TextureTransform;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.FormattedText;
+import net.minecraft.network.chat.Style;
 import net.minecraft.resources.Identifier;
+import net.minecraft.util.ARGB;
 import net.minecraft.world.level.block.AbstractSkullBlock;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.ChestBlock;
@@ -46,7 +57,11 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.block.entity.DecoratedPotBlockEntity;
 import net.minecraft.world.level.block.entity.EnderChestBlockEntity;
+import net.minecraft.world.level.block.entity.HangingSignBlockEntity;
 import net.minecraft.world.level.block.entity.ShulkerBoxBlockEntity;
+import net.minecraft.world.level.block.entity.SignBlockEntity;
+import net.minecraft.world.level.block.entity.SignText;
+import net.minecraft.world.level.block.entity.SignTextSlot;
 import net.minecraft.world.level.block.entity.SkullBlockEntity;
 import net.minecraft.world.level.block.entity.TrappedChestBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
@@ -55,6 +70,7 @@ import net.minecraft.world.phys.Vec3;
 import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.IdleTicker;
 import net.vulkanmod.render.entity.ModelGeometryCache;
+import net.vulkanmod.render.text.SignTextCache;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
@@ -65,6 +81,7 @@ import java.util.Arrays;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Consumer;
 
 /**
@@ -72,20 +89,23 @@ import java.util.function.Consumer;
  * building it every frame.
  * <p>
  * Handled are the vanilla classes and renderers of chests (lid closed and staying closed), shulker boxes (closed),
- * decorated pots (not wobbling) and skulls (not animating, no player skin). Per render section, their vertices are
- * built once, relative to the section origin, by running the real renderer into a {@link ModelSubmitCapture}: every
- * submitted model (pots submit their parts as models) is written with all faces, through {@link ModelGeometryCache}
- * for rest pose models and with vanilla's model rendering otherwise, into one vertex buffer per render type. A block
+ * decorated pots (not wobbling), skulls (not animating, no player skin) and signs (no glowing or obfuscated text).
+ * Per render section, their vertices are built once, relative to the section origin, by running the real renderer
+ * into a {@link ModelSubmitCapture}: every submitted model (pots submit their parts as models) is written with all
+ * faces, through {@link ModelGeometryCache} for rest pose models and with vanilla's model rendering otherwise, and
+ * every submitted text the way {@code TextFeatureRenderer} writes it, into one vertex buffer per render type. A block
  * entity is only kept if all its submits are models in a cutout or solid entity pipeline with the default texture
- * transform and no outline. The extraction then skips those block entities, and the batches are drawn right after
- * the world's solid features with copies of vanilla's entity pipelines ({@link #PIPELINES}) whose vertex shader
- * adds {@code ModelOffset} (section origin minus camera) to the position; the render type's textures and its
- * layering transform (the z offset of skulls) are applied as vanilla does.
+ * transform and no outline, or opaque polygon offset text without background or outline: text vanilla itself draws
+ * with the solid features, where the order doesn't matter. The extraction then skips those block entities, and the
+ * batches are drawn right after the world's solid features with copies of vanilla's entity and text pipelines
+ * ({@link #PIPELINES}) whose vertex shader adds {@code ModelOffset} (section origin minus camera) to the position;
+ * the render type's textures and its layering transform (the z offset of skulls) are applied as vanilla does.
  * <p>
  * A batch is rebuilt when the section's compiled mesh changes (block entity list), when the section or a neighbour
  * is marked dirty (block and light changes, which is where the light comes from), on block events of chests,
- * shulker boxes and pots (lids, wobbles), on block entity data updates, when breaking progress changes, and when a
- * left out block entity comes to rest. Batches of sections only partly within the view distance aren't drawn; their
+ * shulker boxes and pots (lids, wobbles), on block entity data updates and sign text changes, when breaking progress
+ * changes, and when a left out block entity comes to rest. Everything is dropped when fonts reload or the text
+ * filtering setting changes. Batches of sections only partly within the view distance aren't drawn; their
  * block entities take the vanilla path that frame.
  * <p>
  * Only used from the render thread, except {@link #markDirty} and {@link #clear}.
@@ -94,7 +114,10 @@ public final class RetainedBlockEntities {
     public static final RenderPipeline SOLID = retainedPipeline("entity_solid", false, false, true);
     public static final RenderPipeline CUTOUT_CULL = retainedPipeline("entity_cutout_cull", true, false, true);
     public static final RenderPipeline CUTOUT = retainedPipeline("entity_cutout", true, true, false);
-    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT_CULL, CUTOUT);
+    public static final RenderPipeline TEXT = retainedTextPipeline(RenderPipelines.TEXT_POLYGON_OFFSET, "text_polygon_offset");
+    public static final RenderPipeline TEXT_GRAYSCALE = retainedTextPipeline(RenderPipelines.TEXT_GRAYSCALE_POLYGON_OFFSET,
+            "text_grayscale_polygon_offset");
+    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT_CULL, CUTOUT, TEXT, TEXT_GRAYSCALE);
 
     /** Block entities rebuilt per frame at most; sections over budget take the vanilla path until they are built */
     private static final int REBUILD_BUDGET = 2048;
@@ -125,6 +148,18 @@ public final class RetainedBlockEntities {
     private static final List<Part> PARTS = new ArrayList<>();
     private static int partCount;
     private static @Nullable Boolean pipelineAvailable;
+    /** Glyphs of the block entity being built and the index of the text each belongs to */
+    private static final List<TextRenderable> GLYPHS = new ArrayList<>();
+    private static final IntArrayList GLYPH_TEXTS = new IntArrayList();
+    private static int glyphText;
+    private static final Font.GlyphVisitor GLYPH_COLLECTOR = new Font.GlyphVisitor() {
+        @Override
+        public void acceptRenderable(TextRenderable renderable) {
+            GLYPHS.add(renderable);
+            GLYPH_TEXTS.add(glyphText);
+        }
+    };
+    private static boolean textFiltering;
     private static int frame;
     private static int rebuiltThisFrame;
     private static double camX, camY, camZ;
@@ -159,6 +194,28 @@ public final class RetainedBlockEntities {
                 .build();
     }
 
+    /** Vanilla's world text pipeline with only the vertex shader replaced */
+    private static RenderPipeline retainedTextPipeline(RenderPipeline vanilla, String name) {
+        List<ColorTargetState> colorTargets = vanilla.getColorTargetStates();
+        List<VertexFormat> vertexFormats = vanilla.getVertexFormatBindings();
+        RenderPipeline.Snippet snippet = new RenderPipeline.Snippet(
+                vanilla.getShaders(),
+                Optional.of(vanilla.getShaderDefines()),
+                Optional.of(List.copyOf(vanilla.getBindGroupLayouts())),
+                colorTargets.toArray(new ColorTargetState[0]),
+                colorTargets.size(),
+                Optional.ofNullable(vanilla.getDepthStencilState()),
+                Optional.of(vanilla.getPolygonMode()),
+                Optional.of(vanilla.isCull()),
+                vertexFormats.toArray(new VertexFormat[0]),
+                Optional.of(vanilla.getPrimitiveTopology()),
+                vanilla.pushConstantSize());
+        return RenderPipeline.builder(snippet)
+                .withLocation(Identifier.fromNamespaceAndPath("vulkanmod", "pipeline/retained_" + name))
+                .withVertexShader(Identifier.fromNamespaceAndPath("vulkanmod", "core/retained_text"))
+                .build();
+    }
+
     /**
      * The retained copy of the render type's pipeline, or null if it can't be retained. The z offset pipelines only
      * differ from the plain ones by name; their offset is the render type's layering transform.
@@ -168,7 +225,11 @@ public final class RetainedBlockEntities {
             return null;
         }
         RenderPipeline vanilla = renderType.pipeline();
-        if (vanilla == RenderPipelines.ENTITY_CUTOUT_CULL) {
+        if (vanilla == RenderPipelines.TEXT_POLYGON_OFFSET) {
+            return TEXT;
+        } else if (vanilla == RenderPipelines.TEXT_GRAYSCALE_POLYGON_OFFSET) {
+            return TEXT_GRAYSCALE;
+        } else if (vanilla == RenderPipelines.ENTITY_CUTOUT_CULL) {
             return CUTOUT_CULL;
         } else if (vanilla == RenderPipelines.ENTITY_CUTOUT || vanilla == RenderPipelines.ENTITY_CUTOUT_Z_OFFSET) {
             return CUTOUT;
@@ -239,6 +300,13 @@ public final class RetainedBlockEntities {
         camX = cameraPos.x();
         camY = cameraPos.y();
         camZ = cameraPos.z();
+
+        // Sign lines are resolved with this setting when they are submitted
+        boolean filtering = Minecraft.getInstance().isTextFilteringEnabled();
+        if (filtering != textFiltering) {
+            textFiltering = filtering;
+            clearPending = true;
+        }
 
         if (clearPending) {
             clearPending = false;
@@ -391,14 +459,37 @@ public final class RetainedBlockEntities {
                 return MOVING;
             }
             return CANDIDATE;
+        } else if (type == SignBlockEntity.class || type == HangingSignBlockEntity.class) {
+            // Glowing text draws an outline depending on the camera distance; obfuscated text changes every frame
+            SignBlockEntity sign = (SignBlockEntity) blockEntity;
+            SignText front = sign.getText(SignTextSlot.FRONT);
+            SignText back = sign.getText(SignTextSlot.BACK);
+            if (front.hasGlowingText() || back.hasGlowingText() || hasObfuscated(front) || hasObfuscated(back)) {
+                return NOT_CANDIDATE;
+            }
+            return blockEntity.isRemoved() ? MOVING : CANDIDATE;
         }
         return NOT_CANDIDATE;
+    }
+
+    private static boolean hasObfuscated(SignText text) {
+        return hasObfuscated(text.getMessages(false)) || hasObfuscated(text.getMessages(true));
+    }
+
+    private static boolean hasObfuscated(List<Component> messages) {
+        for (Component message : messages) {
+            if (message.visit((style, _) -> style.isObfuscated() ? FormattedText.STOP_ITERATION : Optional.empty(), Style.EMPTY)
+                    .isPresent()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isRetainedRenderer(BlockEntityRenderer<?, ?> renderer) {
         Class<?> type = renderer.getClass();
         return type == ChestRenderer.class || type == ShulkerBoxRenderer.class || type == DecoratedPotRenderer.class
-                || type == SkullBlockRenderer.class;
+                || type == SkullBlockRenderer.class || type == StandingSignRenderer.class || type == HangingSignRenderer.class;
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -456,12 +547,18 @@ public final class RetainedBlockEntities {
                 renderer.submit(state, POSE_STACK, CAPTURE, cameraState);
                 POSE_STACK.popPose();
 
-                if (!CAPTURE.isModelsOnly() || !isRetainable(CAPTURE)) {
+                if (!CAPTURE.isModelsAndText() || !isRetainable(CAPTURE)) {
                     continue;
                 }
                 for (int m = 0; m < CAPTURE.modelCount; m++) {
                     ModelSubmitCapture.ModelRecord model = CAPTURE.model(m);
                     write(model, part(model.renderType).builder);
+                }
+                // TextFeatureRenderer's glyph renderer
+                for (int g = 0; g < GLYPHS.size(); g++) {
+                    TextRenderable glyph = GLYPHS.get(g);
+                    ModelSubmitCapture.TextRecord text = CAPTURE.text(GLYPH_TEXTS.getInt(g));
+                    glyph.render(text.pose, part(glyph.renderType(text.displayMode)).builder, text.lightCoords, false);
                 }
 
                 viewDistance = distance;
@@ -470,6 +567,8 @@ public final class RetainedBlockEntities {
             }
         } finally {
             batch.draws = finishParts();
+            GLYPHS.clear();
+            GLYPH_TEXTS.clear();
         }
 
         rebuiltThisFrame += count;
@@ -483,10 +582,31 @@ public final class RetainedBlockEntities {
         batch.memberCount = count;
     }
 
+    /** Checks the captured submits and prepares the glyphs of the captured text into {@link #GLYPHS} */
     private static boolean isRetainable(ModelSubmitCapture capture) {
         for (int m = 0; m < capture.modelCount; m++) {
             ModelSubmitCapture.ModelRecord model = capture.model(m);
             if (model.outlineColor != 0 || model.renderType == null || retainedPipeline(model.renderType) == null) {
+                return false;
+            }
+        }
+
+        GLYPHS.clear();
+        GLYPH_TEXTS.clear();
+        Font font = Minecraft.getInstance().font;
+        for (int t = 0; t < capture.textCount; t++) {
+            ModelSubmitCapture.TextRecord text = capture.text(t);
+            // SubmitNodeCollection.canRenderAsSolid, and no outline (TextFeatureRenderer would draw it separately)
+            if (text.displayMode != Font.DisplayMode.POLYGON_OFFSET || ARGB.alpha(text.color) != 255
+                    || ARGB.alpha(text.backgroundColor) != 0 || text.outlineColor != 0) {
+                return false;
+            }
+            glyphText = t;
+            SignTextCache.prepareText(font, text.string, text.x, text.y, text.color, text.dropShadow, false, text.backgroundColor)
+                    .visit(GLYPH_COLLECTOR);
+        }
+        for (int g = 0; g < GLYPHS.size(); g++) {
+            if (retainedPipeline(GLYPHS.get(g).renderType(Font.DisplayMode.POLYGON_OFFSET)) == null) {
                 return false;
             }
         }
@@ -522,7 +642,7 @@ public final class RetainedBlockEntities {
         Part part = PARTS.get(partCount++);
         part.renderType = renderType;
         part.pipeline = retainedPipeline(renderType);
-        part.builder = new BufferBuilder(part.bytes, PrimitiveTopology.QUADS, DefaultVertexFormat.ENTITY);
+        part.builder = new BufferBuilder(part.bytes, PrimitiveTopology.QUADS, renderType.format());
         return part;
     }
 

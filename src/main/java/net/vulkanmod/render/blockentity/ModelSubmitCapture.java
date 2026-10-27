@@ -21,6 +21,7 @@ import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.world.item.ItemDisplayContext;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
+import org.joml.Matrix4f;
 import org.joml.Quaternionf;
 import org.jspecify.annotations.Nullable;
 
@@ -29,8 +30,8 @@ import java.util.List;
 
 /**
  * Records what a block entity renderer submits, for {@link RetainedBlockEntities} and {@link InstancedModels}. Only
- * model submits (and model parts, which vanilla submits as models) are accepted; anything else marks the capture as
- * unsupported.
+ * model submits (and model parts, which vanilla submits as models) and text are accepted; anything else marks the
+ * capture as unsupported.
  */
 final class ModelSubmitCapture implements SubmitNodeCollector {
     static final class ModelRecord {
@@ -45,8 +46,22 @@ final class ModelSubmitCapture implements SubmitNodeCollector {
         int outlineColor;
     }
 
+    static final class TextRecord {
+        final Matrix4f pose = new Matrix4f();
+        float x, y;
+        @Nullable FormattedCharSequence string;
+        boolean dropShadow;
+        Font.@Nullable DisplayMode displayMode;
+        int lightCoords;
+        int color;
+        int backgroundColor;
+        int outlineColor;
+    }
+
     private final List<ModelRecord> records = new ArrayList<>();
+    private final List<TextRecord> texts = new ArrayList<>();
     int modelCount;
+    int textCount;
     boolean unsupported;
 
     void reset() {
@@ -57,23 +72,32 @@ final class ModelSubmitCapture implements SubmitNodeCollector {
             record.renderType = null;
             record.uvMapping = null;
         }
+        for (int i = 0; i < this.textCount; i++) {
+            this.texts.get(i).string = null;
+        }
         this.modelCount = 0;
+        this.textCount = 0;
         this.unsupported = false;
     }
 
     /** Exactly one model was submitted and nothing else */
     boolean isSingleModel() {
-        return !this.unsupported && this.modelCount == 1;
+        return !this.unsupported && this.modelCount == 1 && this.textCount == 0;
     }
 
-    /** At least one model was submitted and nothing else */
-    boolean isModelsOnly() {
-        return !this.unsupported && this.modelCount > 0;
+    /** At least one model or text was submitted and nothing else */
+    boolean isModelsAndText() {
+        return !this.unsupported && this.modelCount + this.textCount > 0;
     }
 
     /** The i-th submitted model, valid until the next {@link #reset} */
     ModelRecord model(int i) {
         return this.records.get(i);
+    }
+
+    /** The i-th submitted text, valid until the next {@link #reset} */
+    TextRecord text(int i) {
+        return this.texts.get(i);
     }
 
     @Override
@@ -123,7 +147,20 @@ final class ModelSubmitCapture implements SubmitNodeCollector {
     @Override
     public void submitText(PoseStack poseStack, float x, float y, FormattedCharSequence string, boolean dropShadow,
                            Font.DisplayMode displayMode, int lightCoords, int color, int backgroundColor, int outlineColor) {
-        this.unsupported = true;
+        if (this.textCount == this.texts.size()) {
+            this.texts.add(new TextRecord());
+        }
+        TextRecord record = this.texts.get(this.textCount++);
+        record.pose.set(poseStack.last().pose());
+        record.x = x;
+        record.y = y;
+        record.string = string;
+        record.dropShadow = dropShadow;
+        record.displayMode = displayMode;
+        record.lightCoords = lightCoords;
+        record.color = color;
+        record.backgroundColor = backgroundColor;
+        record.outlineColor = outlineColor;
     }
 
     @Override

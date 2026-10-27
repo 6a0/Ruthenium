@@ -5,10 +5,15 @@ import net.fabricmc.fabric.api.client.gametest.v1.context.TestServerContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
 import net.minecraft.client.CloudStatus;
 import net.minecraft.client.Minecraft;
+import net.minecraft.ChatFormatting;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.SignBlockEntity;
+import net.minecraft.world.level.block.entity.SignText;
+import net.minecraft.world.level.block.entity.SignTextSlot;
 import net.minecraft.world.level.chunk.LevelChunk;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,6 +35,10 @@ import java.util.TreeMap;
  * Screenshots: the static view, and with {@code bench.blockEntityEvents=true} a shulker box opened, a pot wobbled and
  * breaking progress on a skull ({@code beevents}), then all of it undone ({@code bereset}). Clouds are off so that
  * screenshots of different runs compare.
+ * <p>
+ * {@code bench.blockEntitySigns=true} adds a row of signs close to the camera (standing, wall and hanging; plain,
+ * coloured, bold and underlined lines, back sides, one glowing), large enough to compare their glyphs; with the
+ * events, one sign's text is then changed on the client as the sign edit screen does ({@code besign}).
  */
 final class BlockEntityBenchmark {
     private static final Logger LOGGER = LoggerFactory.getLogger("VulkanMod Block Entity Benchmark");
@@ -38,6 +47,7 @@ final class BlockEntityBenchmark {
     private static final int RENDER_DISTANCE = Integer.parseInt(BenchmarkClientGameTest.prop("blockEntityRenderDistance", "8"));
     private static final float PITCH = 30.0F;
     private static final boolean EVENTS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("blockEntityEvents", "false"));
+    private static final boolean SIGNS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("blockEntitySigns", "false"));
 
     /** The flat world's surface; the field spans x -32..31, z 2..31 */
     private static final int FLOOR = -60;
@@ -52,6 +62,10 @@ final class BlockEntityBenchmark {
     private static final BlockPos SHULKER_EVENT = new BlockPos(-2, FLOOR + 7, 8);
     private static final BlockPos POT_EVENT = new BlockPos(9, FLOOR, 8);
     private static final BlockPos SKULL_EVENT = new BlockPos(2, FLOOR + 7, 8);
+    /** The sign row: standing signs on a stone row, wall signs on its north face and hanging signs below it */
+    private static final int SIGN_Z = -4;
+    private static final int SIGN_ROW_Y = FLOOR + 7;
+    private static final BlockPos SIGN_EVENT = new BlockPos(0, SIGN_ROW_Y + 1, SIGN_Z);
 
     private BlockEntityBenchmark() {
     }
@@ -70,6 +84,9 @@ final class BlockEntityBenchmark {
             server.runCommand("time set 6000");
             server.runCommand("gamemode spectator @a");
             build(server);
+            if (SIGNS) {
+                buildSigns(server);
+            }
             server.runCommand("tp @a 0.5 %d -12.5 0 %s".formatted(FLOOR + 14, PITCH));
             context.waitTicks(TICKS_PER_SECOND);
             TerrainBenchmark.waitForVisibleCompiled(context);
@@ -186,6 +203,47 @@ final class BlockEntityBenchmark {
         });
         context.waitTicks(30);
         context.takeScreenshot(label + "-bereset-" + runId);
+
+        if (SIGNS) {
+            context.runOnClient(mc -> {
+                if (mc.level.getBlockEntity(SIGN_EVENT) instanceof SignBlockEntity sign) {
+                    SignText text = sign.getText(SignTextSlot.FRONT).asMutable()
+                            .setLine(0, Component.literal("Edited"))
+                            .setLine(3, Component.literal("on client").withStyle(ChatFormatting.AQUA))
+                            .asImmutable();
+                    sign.setText(text, SignTextSlot.FRONT);
+                } else {
+                    throw new AssertionError("No sign at " + SIGN_EVENT);
+                }
+            });
+            context.waitTicks(10);
+            context.takeScreenshot(label + "-besign-" + runId);
+        }
+    }
+
+    private static void buildSigns(TestServerContext server) {
+        int y = SIGN_ROW_Y;
+        server.runCommand("fill -8 %d %d 8 %d %d minecraft:stone".formatted(y, SIGN_Z, y, SIGN_Z));
+        String[] woods = {"oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "bamboo", "crimson",
+                "warped", "pale_oak"};
+        String[] colors = {"black", "red", "white", "blue", "green", "yellow", "purple", "orange", "cyan", "brown", "lime", "gray"};
+        for (int x = -8; x <= 8; x++) {
+            int i = x + 8;
+            String wood = woods[i % woods.length];
+            String color = colors[i % colors.length];
+            String front = "{messages:[\"Sign %d\",{text:\"Bold %s\",bold:true},{text:\"under\",underlined:true,color:\"gold\"},\"%s\"],color:\"%s\"%s}"
+                    .formatted(i, wood, "Wwg@#jy_" + i, color, x == 4 ? ",has_glowing_text:true" : "");
+            String back = "{messages:[\"Back %d\",\"\",\"\",\"\"]}".formatted(i);
+            // Standing signs facing the camera (north), wall signs on the row's north face, hanging signs below it
+            server.runCommand("setblock %d %d %d minecraft:%s_sign[rotation=8]{front_text:%s,back_text:%s}"
+                    .formatted(x, y + 1, SIGN_Z, wood, front, back));
+            server.runCommand("setblock %d %d %d minecraft:%s_wall_sign[facing=north]{front_text:%s}"
+                    .formatted(x, y, SIGN_Z - 1, wood, front));
+            if (i % 2 == 0) {
+                server.runCommand("setblock %d %d %d minecraft:%s_hanging_sign[rotation=8]{front_text:%s}"
+                        .formatted(x, y - 1, SIGN_Z, wood, front));
+            }
+        }
     }
 
     private static void setView(ClientGameTestContext context, float yaw) {
