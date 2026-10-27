@@ -23,20 +23,21 @@ public record PhaseResult(
         long gcMillis,
         int peakParticles,
         double avgEntitiesRendered,
-        double avgBlockEntitiesRendered
+        double avgBlockEntitiesRendered,
+        double renderThreadCpuMsPerFrame
 ) {
     private static final double MB = 1024.0 * 1024.0;
 
     static PhaseResult compute(String name, long[] frameNanos, long elapsedNanos, long totalAllocBytes,
                                long renderThreadAllocBytes, long gcCount, long gcMillis, int peakParticles,
-                               double avgEntities, double avgBlockEntities) {
+                               double avgEntities, double avgBlockEntities, long renderThreadCpuNanos) {
         double seconds = elapsedNanos / 1.0e9;
         int n = frameNanos.length;
 
         if (n == 0) {
             return new PhaseResult(name, 0, seconds, 0, 0, 0, 0, 0, 0, 0,
                     totalAllocBytes / MB / seconds, renderThreadAllocBytes / MB / seconds, gcCount, gcMillis, peakParticles,
-                    avgEntities, avgBlockEntities);
+                    avgEntities, avgBlockEntities, 0);
         }
 
         long[] sorted = frameNanos.clone();
@@ -64,7 +65,8 @@ public record PhaseResult(
                 gcMillis,
                 peakParticles,
                 avgEntities,
-                avgBlockEntities
+                avgBlockEntities,
+                renderThreadCpuNanos / 1.0e6 / n
         );
     }
 
@@ -90,10 +92,10 @@ public record PhaseResult(
         return String.format(
                 "%-10s frames=%6d  avg=%7.1f fps  p95 low=%7.1f  p99 low=%7.1f  (worst 5%%=%6.1f, worst 1%%=%6.1f)  " +
                 "median=%6.2f ms  max=%7.2f ms  alloc=%7.1f MB/s (render thread %7.1f MB/s)  GCs=%d (%d ms)  " +
-                "entities=%.0f block entities=%.0f%s",
+                "entities=%.0f block entities=%.0f  render thread CPU=%.2f ms/frame%s",
                 name, frames, avgFps, p95LowFps, p99LowFps, worst5PctAvgFps, worst1PctAvgFps,
                 medianFrameMs, maxFrameMs, allocMBps, renderThreadAllocMBps, gcCount, gcMillis,
-                avgEntitiesRendered, avgBlockEntitiesRendered,
+                avgEntitiesRendered, avgBlockEntitiesRendered, renderThreadCpuMsPerFrame,
                 peakParticles >= 0 ? "  peak particles=" + peakParticles : "");
     }
 }

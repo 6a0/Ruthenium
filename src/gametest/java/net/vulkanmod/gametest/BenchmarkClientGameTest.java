@@ -10,6 +10,7 @@ import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.GraphicsPreset;
+import net.minecraft.client.InactivityFpsLimit;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
 import net.minecraft.client.gui.screens.ConnectScreen;
@@ -65,14 +66,14 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
             "particle minecraft:happy_villager -97.5 68 199 2 2 2 1 500000");
 
     private static final double INITIAL_SECONDS = Double.parseDouble(prop("initialSeconds", "5"));
-    private static final double PAN_SECONDS = Double.parseDouble(prop("panSeconds", "10"));
-    private static final double STATIC_SECONDS = Double.parseDouble(prop("staticSeconds", "5"));
+    static final double PAN_SECONDS = Double.parseDouble(prop("panSeconds", "10"));
+    static final double STATIC_SECONDS = Double.parseDouble(prop("staticSeconds", "5"));
     private static final double PARTICLE_SECONDS = Double.parseDouble(prop("particleSeconds", "10"));
     private static final String PRESET = prop("preset", "fancy");
     private static final int RENDER_DISTANCE = Integer.parseInt(prop("renderDistance", "16"));
     private static final String[] EXTRA_SHOT_YAWS = prop("extraShotYaws", "270").split(",");
     /** Yaw of the static and particle phases; only for profiling other view directions */
-    private static final float STATIC_YAW = Float.parseFloat(prop("staticYaw", "0"));
+    static final float STATIC_YAW = Float.parseFloat(prop("staticYaw", "0"));
     /**
      * Records vanilla's section profiler (the debug profiling report) during the static phase, into
      * {@code debug/profiling/} of the run directory. Times are measured per section, unlike JFR samples, but the
@@ -86,6 +87,8 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
     private static final boolean CHEST_EVENTS = Boolean.parseBoolean(prop("chestEvents", "false"));
     /** Instead of the benchmark, drives the settings screen from the title screen (see {@link SettingsScreenCheck}) */
     private static final boolean SETTINGS_SCREEN = Boolean.parseBoolean(prop("settingsScreen", "false"));
+    /** "server" (the multiplayer benchmark) or "terrain" (a singleplayer world, see {@link TerrainBenchmark}) */
+    private static final String SCENE = prop("scene", "server");
     /** Takes an extra screenshot at yaw 270 with a 30 degree field of view, for a closer look at block entities */
     private static final boolean ZOOM_SHOT = Boolean.parseBoolean(prop("zoomShot", "false"));
 
@@ -99,7 +102,11 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
             SettingsScreenCheck.run(context, LABEL);
             return;
         }
-        context.runOnClient(this::applyOptions);
+        context.runOnClient(BenchmarkClientGameTest::applyOptions);
+        if (SCENE.equals("terrain")) {
+            TerrainBenchmark.run(context, LABEL, RUN_ID);
+            return;
+        }
 
         connect(context);
         teleport(context);
@@ -173,20 +180,22 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("particles", finalPeak)));
         LOGGER.info(results.getLast().summaryLine());
 
-        JsonObject environment = context.computeOnClient(this::describeEnvironment);
-        writeResults(results, environment, frameSeries);
+        JsonObject environment = context.computeOnClient(BenchmarkClientGameTest::describeEnvironment);
+        writeResults(LABEL, results, environment, frameSeries);
 
         context.runOnClient(mc -> mc.disconnect(new TitleScreen(), false));
         context.waitForScreen(TitleScreen.class);
     }
 
-    private void applyOptions(Minecraft mc) {
+    private static void applyOptions(Minecraft mc) {
         Options options = mc.options;
         options.applyGraphicsPreset(GraphicsPreset.valueOf(PRESET.toUpperCase(Locale.ROOT)));
         options.graphicsPreset().set(GraphicsPreset.valueOf(PRESET.toUpperCase(Locale.ROOT)));
         options.renderDistance().set(RENDER_DISTANCE);
         options.framerateLimit().set(Options.UNLIMITED_FRAMERATE_CUTOFF);
         options.enableVsync().set(false);
+        // The AFK limit caps the frame rate at 30 fps after 60 s without input (e.g. while a world generates)
+        options.inactivityFpsLimit().set(InactivityFpsLimit.MINIMIZED);
         options.pauseOnLostFocus = false;
     }
 
@@ -295,7 +304,7 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         context.waitTicks(20);
     }
 
-    private static void waitSeconds(ClientGameTestContext context, double seconds) {
+    static void waitSeconds(ClientGameTestContext context, double seconds) {
         long end = System.nanoTime() + (long) (seconds * 1.0e9);
         while (System.nanoTime() < end) {
             context.waitTick();
@@ -310,7 +319,7 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         return total;
     }
 
-    private JsonObject describeEnvironment(Minecraft mc) {
+    static JsonObject describeEnvironment(Minecraft mc) {
         DeviceInfo device = RenderSystem.getDevice().getDeviceInfo();
         JsonObject env = new JsonObject();
         env.addProperty("label", LABEL);
@@ -339,14 +348,14 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         return env;
     }
 
-    private static void writeResults(List<PhaseResult> results, JsonObject environment, Map<String, String> frameSeries) {
+    static void writeResults(String label, List<PhaseResult> results, JsonObject environment, Map<String, String> frameSeries) {
         Gson gson = new GsonBuilder().setPrettyPrinting().create();
         JsonObject root = new JsonObject();
         root.add("environment", environment);
         root.add("phases", gson.toJsonTree(results));
 
         StringBuilder summary = new StringBuilder();
-        summary.append("== Benchmark: ").append(LABEL).append(" ==\n").append(gson.toJson(environment)).append('\n');
+        summary.append("== Benchmark: ").append(label).append(" ==\n").append(gson.toJson(environment)).append('\n');
         for (PhaseResult result : results) {
             summary.append(result.summaryLine()).append('\n');
         }
@@ -356,19 +365,19 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
         Path outDir = Path.of(prop("outDir", "../results"));
         try {
             Files.createDirectories(outDir);
-            Files.writeString(outDir.resolve(LABEL + "-" + timestamp + ".json"), gson.toJson(root));
-            Files.writeString(outDir.resolve(LABEL + "-" + timestamp + ".txt"), summary);
+            Files.writeString(outDir.resolve(label + "-" + timestamp + ".json"), gson.toJson(root));
+            Files.writeString(outDir.resolve(label + "-" + timestamp + ".txt"), summary);
             Path framesDir = outDir.resolve("frames");
             Files.createDirectories(framesDir);
             for (Map.Entry<String, String> series : frameSeries.entrySet()) {
-                Files.writeString(framesDir.resolve(LABEL + "-" + timestamp + "-" + series.getKey() + ".csv"), series.getValue());
+                Files.writeString(framesDir.resolve(label + "-" + timestamp + "-" + series.getKey() + ".csv"), series.getValue());
             }
         } catch (IOException e) {
             throw new RuntimeException("Failed to write benchmark results", e);
         }
     }
 
-    private static String prop(String name, String def) {
+    static String prop(String name, String def) {
         return System.getProperty("vulkanmod.bench." + name, def);
     }
 }

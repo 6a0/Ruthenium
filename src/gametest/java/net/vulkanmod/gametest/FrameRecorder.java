@@ -3,12 +3,14 @@ package net.vulkanmod.gametest;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
+import org.jspecify.annotations.Nullable;
 
 import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.Consumer;
 
 /**
  * Records frame-to-frame times and allocation counters on the client thread, and drives the camera pan.
@@ -42,11 +44,15 @@ public final class FrameRecorder {
     private static long phaseStartRenderThreadAlloc;
     private static long phaseStartGcCount;
     private static long phaseStartGcMillis;
+    private static long phaseStartCpuNanos;
+    /** Runs at every frame start, e.g. to follow section compilation per frame */
+    private static @Nullable Consumer<Minecraft> frameWatcher;
 
     private static boolean panning;
     private static long panStartNanos;
     private static long panDurationNanos;
     private static float panStartYaw;
+    private static float panPitch;
 
     private FrameRecorder() {
     }
@@ -70,6 +76,10 @@ public final class FrameRecorder {
 
         if (panning) {
             updatePan(minecraft, now);
+        }
+
+        if (frameWatcher != null) {
+            frameWatcher.accept(minecraft);
         }
 
         if (recording && minecraft.player != null) {
@@ -98,6 +108,7 @@ public final class FrameRecorder {
         phaseStartRenderThreadAlloc = THREAD_BEAN.getCurrentThreadAllocatedBytes();
         phaseStartGcCount = gcCount();
         phaseStartGcMillis = gcMillis();
+        phaseStartCpuNanos = THREAD_BEAN.getCurrentThreadCpuTime();
     }
 
     public static PhaseResult stopPhase(String name, int peakParticles) {
@@ -108,11 +119,13 @@ public final class FrameRecorder {
         long renderThreadAlloc = THREAD_BEAN.getCurrentThreadAllocatedBytes() - phaseStartRenderThreadAlloc;
         long gcCount = gcCount() - phaseStartGcCount;
         long gcMillis = gcMillis() - phaseStartGcMillis;
+        // Includes time spent waiting inside the graphics driver if it spins instead of blocking
+        long cpuNanos = THREAD_BEAN.getCurrentThreadCpuTime() - phaseStartCpuNanos;
 
         double avgEntities = frameCount > 0 ? (double) entitySum / frameCount : 0;
         double avgBlockEntities = frameCount > 0 ? (double) blockEntitySum / frameCount : 0;
         return PhaseResult.compute(name, Arrays.copyOf(frameNanos, frameCount), elapsed,
-                totalAlloc, renderThreadAlloc, gcCount, gcMillis, peakParticles, avgEntities, avgBlockEntities);
+                totalAlloc, renderThreadAlloc, gcCount, gcMillis, peakParticles, avgEntities, avgBlockEntities, cpuNanos);
     }
 
     /**
@@ -133,8 +146,17 @@ public final class FrameRecorder {
         return sb.toString();
     }
 
+    public static void setFrameWatcher(@Nullable Consumer<Minecraft> watcher) {
+        frameWatcher = watcher;
+    }
+
     public static void startPan(Minecraft minecraft, float startYaw, double seconds) {
+        startPan(minecraft, startYaw, 0.0f, seconds);
+    }
+
+    public static void startPan(Minecraft minecraft, float startYaw, float pitch, double seconds) {
         panStartYaw = startYaw;
+        panPitch = pitch;
         panDurationNanos = (long) (seconds * 1.0e9);
         panStartNanos = System.nanoTime();
         panning = true;
@@ -161,8 +183,8 @@ public final class FrameRecorder {
         float yaw = panStartYaw + (float) (360.0 * progress);
         player.setYRot(yaw);
         player.yRotO = yaw;
-        player.setXRot(0.0f);
-        player.xRotO = 0.0f;
+        player.setXRot(panPitch);
+        player.xRotO = panPitch;
     }
 
     private static long gcCount() {
