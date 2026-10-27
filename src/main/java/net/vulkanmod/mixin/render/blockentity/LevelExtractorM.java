@@ -19,6 +19,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.BlockDestructionProgress;
 import net.minecraft.util.Util;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.EnchantingTableBlockEntity;
 import net.minecraft.world.phys.Vec3;
 import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.BlockEntityPositions;
@@ -146,6 +147,10 @@ public class LevelExtractorM {
                     poseStack.popPose();
                 } else {
                     breakProgress = null;
+                    if (blockEntity instanceof EnchantingTableBlockEntity table
+                            && InstancedModels.tryAddClosedBook(dispatcher, table, deltaPartialTick, camX, camY, camZ)) {
+                        continue;
+                    }
                 }
 
                 BlockEntityRenderState state = dispatcher.tryExtractRenderState(blockEntity, deltaPartialTick, breakProgress, false);

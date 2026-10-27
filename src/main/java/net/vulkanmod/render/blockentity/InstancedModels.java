@@ -34,6 +34,10 @@ import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.texture.UvMapping;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.Identifier;
+import net.minecraft.util.LightCoordsUtil;
+import net.minecraft.util.Mth;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.EnchantingTableBlockEntity;
 import net.vulkanmod.Initializer;
 import net.vulkanmod.render.entity.ModelCulling;
 import net.vulkanmod.render.entity.ModelGeometryCache;
@@ -55,7 +59,9 @@ import java.util.Set;
  * The model is captured once in model space ({@link ModelGeometryCache#modelSpaceKey}; all faces, exact repeats
  * left out) into a vertex buffer. Each frame the extraction runs the real renderer into a
  * {@link ModelSubmitCapture} instead of submitting it, and stores the captured pose (camera-relative, rotation
- * only) and light as one instance. Armor stands are taken from their prepared model submits instead: after
+ * only) and light as one instance. Once a closed book has been captured, the others skip the extraction and the
+ * capture: their pose and light are computed from the block entity like the renderer does ({@link #tryAddClosedBook}).
+ * Armor stands are taken from their prepared model submits instead: after
  * {@code setupAnim}, the transforms of all their parts ({@link #snapshot}) key the group, whose mesh is the
  * model rendered once with the identity pose. The instances are drawn after the world's solid features with
  * instanced copies of vanilla's entity pipelines, whose vertex shader applies the instance's pose to the position
@@ -91,6 +97,12 @@ public final class InstancedModels {
     private static final ModelSubmitCapture CAPTURE = new ModelSubmitCapture();
     private static final PoseStack POSE_STACK = new PoseStack();
     private static final PoseStack.Pose IDENTITY_POSE = new PoseStack().last();
+    /** The group of closed books and the renderer that submitted it, for {@link #tryAddClosedBook} */
+    private static @Nullable Group closedBookGroup;
+    private static @Nullable EnchantTableRenderer closedBookRenderer;
+    /** The enchanting table renderer of this frame, looked up on the first table */
+    private static @Nullable BlockEntityRenderer<?, ?> frameTableRenderer;
+    private static final Matrix4f BOOK_POSE = new Matrix4f();
     private static volatile boolean clearPending;
     private static @Nullable Boolean pipelineAvailable;
     private static @Nullable GpuBufferSlice transform;
@@ -197,10 +209,68 @@ public final class InstancedModels {
             pipelineAvailable = null;
             GROUPS.forEach(Group::close);
             GROUPS.clear();
+            closedBookGroup = null;
+            closedBookRenderer = null;
         }
+        frameTableRenderer = null;
         for (Group group : GROUPS) {
             group.count = 0;
         }
+    }
+
+    /**
+     * Adds the closed book of an enchanting table as an instance straight from the block entity, without a render
+     * state and a captured submit: the pose and light are what {@link EnchantTableRenderer} extracts and submits
+     * (the same float operations in the same order), and the group is the one the first closed book captured
+     * through {@link #tryAdd(BlockEntityRenderDispatcher, BlockEntityRenderState, double, double, double, CameraRenderState)}.
+     * Only for vanilla's block entity and renderer classes, a book that is shut ({@code open} and {@code oOpen} 0,
+     * so the interpolated openness is 0) and no breaking progress.
+     *
+     * @return false if the block entity must be extracted as usual
+     */
+    public static boolean tryAddClosedBook(BlockEntityRenderDispatcher dispatcher, EnchantingTableBlockEntity table, float partialTicks,
+                                           double camX, double camY, double camZ) {
+        if (table.open != 0.0f || table.oOpen != 0.0f || table.getClass() != EnchantingTableBlockEntity.class
+                || closedBookGroup == null || !Initializer.CONFIG.instancedModels) {
+            return false;
+        }
+        BlockEntityRenderer<?, ?> renderer = frameTableRenderer;
+        if (renderer == null) {
+            renderer = frameTableRenderer = dispatcher.getRenderer(table);
+        }
+        Level level = table.getLevel();
+        BlockPos pos = table.getBlockPos();
+        if (renderer != closedBookRenderer || level == null || !table.getType().isValid(table.getBlockState())) {
+            return false;
+        }
+        // BlockEntityRenderer.shouldRender
+        double dx = pos.getX() + 0.5 - camX;
+        double dy = pos.getY() + 0.5 - camY;
+        double dz = pos.getZ() + 0.5 - camZ;
+        if (!(dx * dx + dy * dy + dz * dz < 64.0 * 64.0)) {
+            return false;
+        }
+
+        // EnchantTableRenderer.extractRenderState
+        float time = table.time + partialTicks;
+        float or = table.rot - table.oRot;
+        while (or >= (float) Math.PI) {
+            or -= (float) (Math.PI * 2);
+        }
+        while (or < (float) -Math.PI) {
+            or += (float) (Math.PI * 2);
+        }
+        float yRot = table.oRot + or * partialTicks;
+
+        // The extraction's translation, then EnchantTableRenderer.submit
+        Matrix4f m = BOOK_POSE.identity();
+        m.translate((float) (pos.getX() - camX), (float) (pos.getY() - camY), (float) (pos.getZ() - camZ));
+        m.translate(0.5F, 0.75F, 0.5F);
+        m.translate(0.0F, 0.1F + Mth.sin(time * 0.1F) * 0.01F, 0.0F);
+        m.rotateY(-yRot);
+        m.rotateZ(80.0F * (float) (Math.PI / 180.0));
+        addInstance(closedBookGroup, m, LightCoordsUtil.getLightCoords(level, pos));
+        return true;
     }
 
     /**
@@ -244,6 +314,9 @@ public final class InstancedModels {
             return false;
         }
         addInstance(group, capture.pose.pose(), capture.lightCoords);
+        // Everything but the pose and light is a constant of the renderer
+        closedBookGroup = group;
+        closedBookRenderer = (EnchantTableRenderer) renderer;
         return true;
     }
 
