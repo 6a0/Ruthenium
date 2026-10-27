@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-26 (fourth session), with the settings screen port.
+Last updated: 2026-10-27 (fifth session), with the terrain work (terrain benchmark, face groups, draw list, compressed vertices).
 
 ---
 
@@ -29,6 +29,12 @@ Last updated: 2026-10-26 (fourth session), with the settings screen port.
 - **The settings screen is ported** (fourth session): the video settings button opens VulkanMod's screen with Video,
   Graphics (vanilla options through their `OptionInstance`s) and Optimizations (the mod's switches, `Config`,
   `config/vulkanmod_settings.json`). `-Dvulkanmod.<field>=true|false` overrides any switch for a launch.
+- **Terrain (fifth session).** A singleplayer terrain benchmark (`-Pbench.scene=terrain`, section 6.7) and three
+  terrain optimisations on vanilla's section renderer: per-direction face groups (`SectionFaceGroups`), the indirect
+  draw list without per-draw lookups (`TerrainDrawList`) and 20 byte solid/cutout vertices (`CompressedTerrain`).
+  Terrain static view 477 -> 670 fps, pan 658 -> 873 (vanilla Vulkan 474 / 651). Each has a switch on the
+  Optimizations page. The old VulkanMod terrain renderer was **not** ported: vanilla's section compiler, uber
+  buffers, occlusion graph and multi-draw-indirect are kept.
 - **The pan p99 is not hitches.** Frames facing the chest cube (yaw 220–320, 11–13k block entities) take
   ~6 ms (third session start: ~20 ms) while the rest of the pan runs at ~1 ms (section 7). The remaining work
   there is per block entity (signs, enchanting table extraction, ticking).
@@ -83,6 +89,13 @@ fine; implementations must be our own.
 ## 4. Current state of the branch
 
 ```
+130bf16 Store solid and cutout terrain vertices in 20 bytes
+b63badc Build the terrain's indirect draw commands without per-draw lookups
+7a8f19d Skip terrain faces that face away from the camera
+8e829fb Add a singleplayer terrain benchmark
+e574d75 Update continuation notes with the settings screen port
+afbf27e Port the settings screen to 26.3
+3a018a8 Update continuation notes with the instanced armor stands
 7b4aff1 Draw armor stands posed alike as GPU instances
 fe7306b Update continuation notes with the instanced books
 447a7c9 Draw closed enchanting table books as GPU instances
@@ -125,6 +138,9 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `Initializer.java` | Client entrypoint: version, logging, loads `Config`. Platform and FRAPI registration are not ported yet |
 | `config/Config.java` | The mod's switches (`blockEntityCulling`, `retainedChests`, `instancedModels`, `modelBackFaceCulling`, `particleSpawnLimit`, `skipIdleTicks`, all on by default), Gson to `config/vulkanmod_settings.json` (unknown fields of the old 1.21.11 file are ignored). `-Dvulkanmod.<field>=true|false` overrides a field at load (and is written back if the user applies settings in that session). The features read `Initializer.CONFIG.<field>` at use, so toggles apply immediately; retained chests and instanced models also `clear()` when toggled |
 | `config/**` (settings screen) + `mixin/screen/{OptionsScreenM,OptionInstanceAccessor,TooltipAccessor}.java` | Port of the old screen (`VOptionScreen`, `VOptionList`, widgets, search, Apply/Undo, the `vulkanmod:mod_settings_registry` entrypoint API for other mods). `OptionsScreenM` swaps the supplier of the video button (`@ModifyArg` on `openScreenButton` when the message is `VIDEO`); Shift+P in the screen opens vanilla's. Pages: **Video** (window mode = vanilla `fullscreen` + `exclusiveFullscreen`, exclusive fullscreen mode of `window.findBestMonitor()`, framerate, vsync, inactivity limit, GUI scale, brightness, graphics API, attack/autosave indicators), **Graphics** (preset first, distances, chunk updates, filtering/anisotropy, particles, clouds, leaves, improved transparency, chunk fade, AO, biome blend, shadows, entity distance, mipmaps, weather radius, menu blur, vignette), **Optimizations** (the `Config` switches). `VanillaOptions` wraps a vanilla `OptionInstance`: `set` runs vanilla's listener (preset, `allChanged`, sampler reset, ...), and caption, value label (with the leading `options.generic_value` caption stripped) and tooltip come from the instance through accessors. After Apply every option re-reads its value (the preset changes the others); texture reloads (mipmaps/filtering/anisotropy) happen when the screen closes, like vanilla's video screen. Drawing goes through `GuiRenderer` → `GuiGraphicsExtractor`; the cycling arrows are `PolygonRenderState` triangles (a quad of `RenderPipelines.GUI` with the last vertex repeated; `guiRenderState`/`scissorStack` opened by the access widener). Text input uses `charTyped`; shortcut letters compare `KeyEvent.shortcutKey()` (SDL keycodes, lowercase ASCII for letters). Dropped from the old screen: device/frame queue/builder threads/wayland/texture animation options, advanced chunk culling, indirect draw, unique opaque layer, backface culling (terrain options come back with the terrain renderer), the update checker button |
+| `render/chunk/SectionFaceGroups.java` + `mixin/render/chunk/{SectionCompilerM,SectionCompilerResultsM}.java` + `CompiledSectionMeshM` (`interfaces/FaceGroupsHolder`) | Solid and cutout layer meshes (sequential quads) are reordered at compile time (stably, after `BufferBuilder.build`, through a wrap of the results' `Map.put`) into 7 groups: one per axis-aligned facing (by the quad's winding normal from its diagonals; all 4 vertices must share the plane coordinate) plus the rest. Each group keeps its lowest `normal . vertex`. When the draw list is built, a layer's draw is replaced by draws of the groups the eye can be in front of (margin 1e-3), merging adjacent ones. Exact: terrain pipelines cull back faces, and a quad is back facing iff the eye is behind its plane. Switch `terrainFaceCulling` (toggling calls `allChanged`). The non-MDI path (`extractSectionDrawGroups`) gets the same through a `List.add` wrap. **Mixin pitfall seen here:** array field initializers in a mixin were not merged before a constructor `@Inject` ran once a second such field existed; the NPE happened in a compile worker, where vanilla's `runTask` catches it and requeues the task silently (symptom: a compile queue that never drains). The arrays are now allocated in code |
+| `render/chunk/TerrainDrawList.java` + `mixin/render/chunk/LevelRendererM.java` (`@Overwrite prepareChunkRendersIndirect`) + `interfaces/CachedSectionSlices` | Builds vanilla's multi-draw-indirect commands: the same draw groups (per vertex/index buffer heap; translucent ones consecutive-only and back to front) and commands, without the 2 hash lookups per section and layer in `UberGpuBuffer.getAllocation` and without a record per command. A solid/cutout layer's `RenderSectionBufferSlice` is cached in its compiled mesh (its vertex allocation never moves until the mesh is released; translucent index buffers are re-uploaded under the same mesh when resorted, so those are still looked up). Commands go into reused int arrays and one bulk copy per group into a VulkanMod `MappableRingBuffer` of indirect parameters, rotated each frame. Vertex sizes per layer are read per frame (they change with `CompressedTerrain`) |
+| `render/chunk/CompressedTerrain.java` + `CompressedTerrainBuilder.java` + `mixin/render/chunk/{ChunkSectionLayerM,ChunkSectionsToRenderM}.java` + `assets/vulkanmod/shaders/core/terrain_compressed.vsh` + `interfaces/SectionDispatcherReset` | Solid/cutout vertices in 20 bytes: `Position` RG32_UINT = 3x21 bit fixed point (1/65536 block, offset -8, range [-8, 24)), `Color` RGBA8, `UV0` RG16_UINT (/65536), `UV2` as vanilla. `ChunkSectionLayer.pipeline()`/`vertexFormat()` return copies of vanilla's terrain pipelines (built through a `RenderPipeline.Snippet` of the vanilla pipeline's properties, with the vertex shader and binding 0 replaced; also for the wireframe override). The section compiler gets `CompressedTerrainBuilder` (a `BufferBuilder` subclass handling the 11-arg `addVertex`, chained `addVertex(x,y,z)` and `setUv`) through a `NEW` wrap in `getOrBeginLayer`. The format is chosen when vanilla creates the section dispatcher (`invalidateCompiledGeometry` with a null dispatcher), because the uber buffers are sized per vertex. The switch `compressedTerrain` calls `LevelRenderer.vulkanmod$recreateSectionDispatcher` (like `resetLevelRenderData`, but keeping the occlusion graph's loaded chunks and empty sections, which only fill as chunks load) and then `allChanged`. Translucent layers keep vanilla's format (their quad sorting reads float positions). Little-endian hosts only |
 | `interfaces/ExtendedVertexBuilder.java` | `canWriteDirect(VertexFormat)` and `reserveVertices(int)`, for writing whole quads into a `BufferBuilder` |
 | `mixin/render/vertex/BufferBuilderM.java` | Implements the above (handles the `ensureBuilding`/`endLastVertex`/vertex count/`vertexPointer` bookkeeping; LE only; non-LINES topology) |
 | `mixin/render/entity/model/ModelPartCubeM.java` | `@Overwrite Cube.compile`: transforms the distinct corners once, writes ENTITY-format faces directly, unwraps `SpriteCoordinateExpander`; vanilla fallback for other formats |
@@ -160,8 +176,8 @@ Design rules used so far:
   rework them when porting terrain.
 
 ### Not ported yet (all still on `dev`)
-`render/chunk/**` (terrain renderer: section graph, AreaBuffer,
-DrawBuffers, QuadFacing culling, light pipelines, FRAPI impl, fluid renderer), `render/vertex/**`
+`render/chunk/**` (the old terrain renderer: section graph, AreaBuffer, DrawBuffers, light pipelines, FRAPI impl,
+fluid renderer; its face culling and compressed vertices now exist on top of vanilla's renderer, see above), `render/vertex/**`
 (`CustomVertexFormat`, `TerrainBuilder`, `QuadSorter`), `render/sky/CloudRenderer`, `render/profiling` (overlay),
 `mixin/debug/**`, `UpdateChecker`, `Platform`. The device, GL compat, window, wayland and
 shader-converter code is **obsolete under strategy B** and should not be ported.
@@ -265,6 +281,8 @@ run 3×, summarize, diff the static and yaw 270 screenshots, then commit with th
 `staticYaw=270`, `sectionProfile` or temporary instrumentation go to `results/heavy270/` or `results/sectprof/`.
 
 ### 6.4 Gotchas
+- **A rejected or interrupted Bash command can leave its Gradle build running** (the daemon keeps going). Check
+  `jps -l` for a `KnotClient` before starting runs; a running one holds the terrain world's `session.lock`.
 - **Don't compile or run anything CPU-heavy while a benchmark matrix is running.** Each bench task also rebuilds
   the jars, so editing `src/main` mid-matrix can mix builds or break later runs. Do read-only work in the
   meantime.
@@ -318,6 +336,27 @@ of non-inlined callers are better, but rank work with measurements:
 - **Cross-checks against vanilla** for geometry changes: render the same submit through the vanilla path into a
   recording `VertexConsumer` and compare quad sets (used for the model space cache).
 
+### 6.7 Terrain benchmark (fifth session)
+`-Pbench.scene=terrain` on any bench task (`TerrainBenchmark`): a singleplayer world from seed `8279265` (savanna
+hills, forest, a river and the ocean in view), render distance 32 (`terrainRenderDistance`), a spectator 16 blocks
+above the highest block at the spawn (`terrainHeight`, `terrainSpot=x,z`), pitch 15 (`terrainPitch`), Fancy,
+1920x1080. The world is generated once into `build/run/bench/worlds/terrain-<seed>` and copied into the run's saves
+for every run. Results are labelled `<label>-terrain`. Phases: static (5 s), pan (10 s, after an untimed pan that
+compiles every direction), rebuild (3x F3+A-style `allChanged`, reported as `rebuildSectionsPerSecond`).
+Screenshots: static, yaw 90/180/270, and after the rebuilds. Joining is logged but not measured: in singleplayer the
+chunks arrive as fast as the integrated server loads them (~60/s, ~70 s for the 3.7k chunks).
+`-Pbench.terrainSwitchCheck=true` switches `compressedTerrain` off and on through the option in-world and
+screenshots both.
+- **Vanilla bug:** after `allChanged` with a still camera, the section occlusion graph often misses sections until
+  its next full update (here ~1770 instead of ~2080 visible, every other F3+A, a hillside missing). Turning the
+  camera doesn't help; moving 8 blocks would. This made the rebuild time bimodal (0.44/0.64 s). The benchmark
+  invalidates the graph (untimed) after each rebuild and reports throughput. Not fixed in the mod.
+- The static terrain view is GPU bound: render thread 0.87 ms CPU per 1.49 ms frame. At 960x540 it is only ~25%
+  faster, and at render distance 4 a frame takes 0.39 ms, so most of the GPU time is per-vertex terrain work.
+- Phases now report the render thread's CPU time per frame (`cpu ms/f` in `bench_summary.py`).
+- The benchmark turns off vanilla's AFK frame rate limit (30 fps after 60 s without input), which capped every
+  phase of the first terrain runs.
+
 ---
 
 ## 7. Results so far
@@ -348,10 +387,28 @@ Later runs that session were slowed ~30% by other load on the machine (HEAD too:
 rule out a 2–3% cost of the switches.
 Rejected (no gain, reverted): an 11-bit, single-histogram radix sort (the sort's JFR share was misattributed); a
 per-line cache of sign text glyph vertices (verified bit-identical, but static 353.7 → 356.5 is noise: the text
-cost is writing ~3.4 MB of glyph vertices per frame, which the cache still does). Results archives: `results/vulkanmod-v5 … v22` (v22 = HEAD, the settings screen port).
+cost is writing ~3.4 MB of glyph vertices per frame, which the cache still does). Results archives: `results/vulkanmod-v5 … v25` (v22 = the settings screen port, v23 face groups, v24 draw list,
+v25 compressed terrain vertices).
 Facing the chest cube (`staticYaw=270`, 1 run each): ~30 (v4) → 47.5 → ~50 → 56.7 (books) → 61.4 (copy) →
 68.5 (sign sides) → 78.5 (book writes) → 103 (retained chests) → 157.5 (instanced books). Initial p99 dropped (47.7 → 41.5): the batches
 are built in the first frames after the teleport (budget 2048 chests per frame). Peak particles: vanilla ~16 349, VulkanMod ~16 250.
+
+### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
+| Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
+|---|---|---|---|---|---|
+| static | 473.7 | 476.6 | 644.0 | 659.2 | **670.3** |
+| pan | 651.4 | 657.7 | 829.4 | 844.2 | **873.1** |
+| render thread CPU, static | 0.91 ms | 0.90 ms | 1.21 ms | 0.86 ms | 0.87 ms |
+| rebuild (sections/s) | 3864 | - | - | - | 3760 (switch off: 3855) |
+
+Archives: `results/vulkanmod-terrain-v0..v3` (+ `v3-compressed-off`); the vanilla terrain runs are in `results/`.
+Interleaved A/B for the compressed vertices (off -> on): static 657.2 -> 670.3, pan 844.9 -> 873.1; the server
+benchmark was neutral within noise for it (`v25`, `v25-compressed-off`). The draw list took the server scene's static
+view from 405 to 432 (v24). Quads drawn at the static view: ~0.59M solid + 0.96M cutout with face groups (2.2M
+without). Rejected: **diagonal face groups** (the vertical 45 degree planes of cross plants, 12% of the compiled quads
+here, ~5% fewer drawn): static 659.2 -> 657.4 and pan 844.2 -> 849.6, no measurable gain. It needs a 1e-5 normal
+tolerance and a 0.05 block margin, because rotated vertices aren't exactly diagonal; the patch was in the fifth
+session's scratchpad (`diagonal-groups.patch`).
 
 ### The pan's p99
 `frames_by_yaw.py` on the pan series: yaw 100–200 has no block entities in view and runs at ~1 ms; yaw 220–320
@@ -416,7 +473,17 @@ books' write was 640 ns each before the faster model space path (~5.3k per frame
    - Armor stand extraction (~5% at static, spread thin across `LivingEntityRenderer.extractRenderState`).
    - Entity culling: Sodium and vanilla render the same ~188 entities.
    - Armor stands use `entity_cutout` (no culling), so the CPU back-face skip doesn't apply to them.
-5. **Terrain renderer** (old `render/chunk/**`), the large piece. Only do it if it beats vanilla 26.3, which
+5. **Terrain**, after the fifth session (section 7, "Terrain"). The view is GPU bound on vertex work. Ideas:
+   - Translucent layers in the compressed format (needs `MeshData.decodeQuadCentroids` and the sorting to read it).
+   - 16-bit indices: the shared sequential index buffer becomes 32-bit once a section draw exceeds 65536 vertices.
+   - Section compile throughput (rebuild ~3.8k sections/s, the same as vanilla): the mesher (`ModelBlockRenderer`,
+     AO).
+   - The vanilla occlusion graph bug after `allChanged` (section 6.7), which also leaves holes for players who
+     change a video setting while standing still.
+   - Singleplayer chunk loading runs at the integrated server's speed (~60 chunks/s), not the client's.
+
+   The notes below on a full terrain renderer predate the fifth session.
+   **Terrain renderer** (old `render/chunk/**`), the large piece. Only do it if it beats vanilla 26.3, which
    already has uber buffers + MDI. VulkanMod's remaining differentiators are the **compressed vertex format**
    (`CustomVertexFormat`: int16 positions, uint16 UVs, packed colour, about half of vanilla's 28 B/vertex) and
    **per-direction face culling** (`QuadFacing`: draw only faces pointing toward the camera via separate
