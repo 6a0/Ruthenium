@@ -22,6 +22,7 @@
     "render.chunk.RenderSectionRegionM",
     "render.chunk.SectionCompilerM",
     "render.chunk.SectionCompilerResultsM",
+    "render.entity.BlockModelRenderStateM",
     "render.entity.BlockStateModelWrapperM",
     "render.entity.EntityRendererAccessor",
     "render.entity.LevelExtractorEntityM",

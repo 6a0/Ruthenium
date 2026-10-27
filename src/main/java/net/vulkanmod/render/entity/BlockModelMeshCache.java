@@ -19,7 +19,8 @@ import java.util.Map;
  * The quads of block models that entities render (item frames, block displays, minecart blocks, endermen's blocks),
  * kept across frames. With the Fabric Renderer API, {@code BlockStateModelWrapper.update} emits the model's quads into
  * a new mesh every time it is called, i.e. for every such entity and frame, decoding and encoding each baked quad.
- * Here a model's output is emitted once into a mesh of its own and copied into the render state's mesh after that.
+ * Here a model's output is emitted once into a mesh of its own, which the render state then submits itself
+ * ({@code BlockModelRenderStateM}) instead of copying it into its own mesh and that into a new one per submit.
  * <p>
  * The cache is keyed by the model's geometry key ({@code FabricBlockStateModel.createGeometryKey}), which by its
  * contract determines what {@code emitQuads} outputs for the same level, position, state and random and a cull test
