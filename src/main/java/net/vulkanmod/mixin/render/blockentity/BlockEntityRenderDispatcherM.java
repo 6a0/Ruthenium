@@ -4,6 +4,7 @@ import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
 import net.minecraft.server.packs.resources.ResourceManager;
 import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
+import net.vulkanmod.render.entity.BlockModelMeshCache;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -16,5 +17,6 @@ public class BlockEntityRenderDispatcherM {
     private void clearRetained(ResourceManager resourceManager, CallbackInfo ci) {
         RetainedBlockEntities.clear();
         InstancedModels.clear();
+        BlockModelMeshCache.clear();
     }
 }

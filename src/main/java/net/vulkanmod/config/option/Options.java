@@ -12,6 +12,7 @@ import net.vulkanmod.config.gui.OptionBlock;
 import net.vulkanmod.interfaces.SectionDispatcherReset;
 import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
+import net.vulkanmod.render.entity.BlockModelMeshCache;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -254,7 +255,15 @@ public abstract class Options {
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.reuseEntityStates.tooltip"))
-                                .setImpact(PerformanceImpact.LOW)
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.blockModelMeshCache"),
+                                value -> {
+                                    config.blockModelMeshCache = value;
+                                    BlockModelMeshCache.clear();
+                                },
+                                () -> config.blockModelMeshCache)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.blockModelMeshCache.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM)
                 })
         };
     }

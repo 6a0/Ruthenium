@@ -49,6 +49,8 @@
   "vulkanmod.options.skipIdleTicks.tooltip": "Skips ticking closed chests and signs nobody is editing, whose ticks do nothing.",
   "vulkanmod.options.reuseEntityStates": "Reuse Entity Render States",
   "vulkanmod.options.reuseEntityStates.tooltip": "Armor stands reuse their render state from the previous frame instead of creating a new one every frame.",
+  "vulkanmod.options.blockModelMeshCache": "Cache Entity Block Models",
+  "vulkanmod.options.blockModelMeshCache.tooltip": "Item frames, block displays, minecarts and endermen reuse the quads of their block models instead of building them again every frame.",
 
   "vulkanmod.options.searchFieldPlaceholder": "Search Graphics Settings"
 }

@@ -27,6 +27,8 @@ public class Config {
     public boolean skipIdleTicks = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
+    /** Block models of entities (item frames, block displays, ...) keep their quads across frames */
+    public boolean blockModelMeshCache = true;
     /** Skips the terrain faces of a section that all face away from the camera */
     public boolean terrainFaceCulling = true;
     /** Solid and cutout terrain vertices in 20 instead of 28 bytes */
