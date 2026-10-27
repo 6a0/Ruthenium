@@ -42,6 +42,7 @@ import net.minecraft.world.level.block.entity.TrappedChestBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.ChestType;
 import net.minecraft.world.phys.Vec3;
+import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.IdleTicker;
 import net.vulkanmod.render.entity.ModelGeometryCache;
 import org.joml.Matrix4f;
@@ -92,9 +93,6 @@ public final class RetainedChests {
             .withBindGroupLayout(BindGroupLayouts.SAMPLER1)
             .withColorTargetState(ColorTargetState.DEFAULT)
             .build();
-
-    /** {@code -Dvulkanmod.retainedChests=false} turns this off (until the config screen is ported) */
-    private static final boolean ENABLED = !"false".equals(System.getProperty("vulkanmod.retainedChests"));
 
     /** Chests rebuilt per frame at most; sections over budget take the vanilla path until they are built */
     private static final int REBUILD_BUDGET = 2048;
@@ -236,7 +234,7 @@ public final class RetainedChests {
     public static boolean @Nullable [] section(BlockPos origin, SectionMesh mesh, List<BlockEntity> blockEntities, ClientLevel level,
                                                 BlockEntityRenderDispatcher dispatcher, float partialTick, Vec3 cameraPos,
                                                 CameraRenderState cameraState) {
-        if (!ENABLED || !isPipelineAvailable()) {
+        if (!Initializer.CONFIG.retainedChests || !isPipelineAvailable()) {
             return null;
         }
 

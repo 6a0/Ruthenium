@@ -20,6 +20,7 @@ import net.minecraft.server.level.BlockDestructionProgress;
 import net.minecraft.util.Util;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.phys.Vec3;
+import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.BlockEntityPositions;
 import net.vulkanmod.render.blockentity.BlockEntityCulling;
 import net.vulkanmod.render.blockentity.InstancedModels;
@@ -72,7 +73,8 @@ public class LevelExtractorM {
         double camZ = cameraPos.z();
         PoseStack poseStack = null;
         long chunkFadeDuration = Util.toMillis(this.minecraft.options.chunkSectionFadeInTime().get());
-        Frustum frustum = camera.getCullFrustum();
+        // Null when per block entity culling is off
+        Frustum frustum = Initializer.CONFIG.blockEntityCulling ? camera.getCullFrustum() : null;
         Long2ObjectMap<SortedSet<BlockDestructionProgress>> destructionProgress = this.level.destructionProgress();
         BlockEntityRenderDispatcher dispatcher = this.levelRenderer.blockEntityRenderDispatcher();
         List<BlockEntityRenderState> output = levelRenderState.blockEntityRenderStates;

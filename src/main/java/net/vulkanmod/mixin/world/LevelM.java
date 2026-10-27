@@ -2,6 +2,7 @@ package net.vulkanmod.mixin.world;
 
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
+import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.IdleTicker;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -18,7 +19,7 @@ public class LevelM {
     @Redirect(method = "tickBlockEntities", at = @At(value = "INVOKE",
             target = "Lnet/minecraft/world/level/block/entity/TickingBlockEntity;tick()V"))
     private void skipIdleTicks(TickingBlockEntity ticker) {
-        if (!(ticker instanceof IdleTicker idle && idle.vulkanmod$isTickIdle())) {
+        if (!(Initializer.CONFIG.skipIdleTicks && ticker instanceof IdleTicker idle && idle.vulkanmod$isTickIdle())) {
             ticker.tick();
         }
     }

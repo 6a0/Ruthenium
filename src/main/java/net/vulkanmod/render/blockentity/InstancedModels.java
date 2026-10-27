@@ -34,6 +34,7 @@ import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.texture.UvMapping;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.Identifier;
+import net.vulkanmod.Initializer;
 import net.vulkanmod.render.entity.ModelCulling;
 import net.vulkanmod.render.entity.ModelGeometryCache;
 import org.joml.Matrix4f;
@@ -81,8 +82,6 @@ public final class InstancedModels {
     private static final Set<Class<?>> POSED_MODELS = Set.of(ArmorStandModel.class);
     private static final int MAX_GROUPS_PER_MODEL = 32;
 
-    /** {@code -Dvulkanmod.instancedModels=false} turns this off (until the config screen is ported) */
-    private static final boolean ENABLED = !"false".equals(System.getProperty("vulkanmod.instancedModels"));
     private static final int INSTANCE_SIZE = INSTANCE_FORMAT.getVertexSize();
     /** Tolerance of the rotation test on the pose's linear part */
     private static final float ROTATION_TOLERANCE = 1.0e-4f;
@@ -212,7 +211,7 @@ public final class InstancedModels {
     @SuppressWarnings({"rawtypes", "unchecked"})
     public static boolean tryAdd(BlockEntityRenderDispatcher dispatcher, BlockEntityRenderState state, double camX, double camY,
                                  double camZ, CameraRenderState camera) {
-        if (!ENABLED || !(state instanceof EnchantTableRenderState) || state.breakProgress != null) {
+        if (!Initializer.CONFIG.instancedModels || !(state instanceof EnchantTableRenderState) || state.breakProgress != null) {
             return false;
         }
         BlockEntityRenderer renderer = dispatcher.getRenderer(state);
@@ -255,7 +254,7 @@ public final class InstancedModels {
     public static boolean tryAdd(ModelFeatureRenderer.Submit<?> submit) {
         Model model = submit.model();
         RenderPipeline pipeline;
-        if (!ENABLED || !POSED_MODELS.contains(model.getClass()) || submit.sheetedDecalPose() != null
+        if (!Initializer.CONFIG.instancedModels || !POSED_MODELS.contains(model.getClass()) || submit.sheetedDecalPose() != null
                 || (pipeline = instancedPipeline(submit.renderType().pipeline())) == null
                 || !isOrthogonal(submit.pose().pose()) || !isPipelineAvailable()) {
             return false;

@@ -84,6 +84,8 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
      * one (client-side only), taking a screenshot of each state, for checking the retained chest geometry.
      */
     private static final boolean CHEST_EVENTS = Boolean.parseBoolean(prop("chestEvents", "false"));
+    /** Instead of the benchmark, drives the settings screen from the title screen (see {@link SettingsScreenCheck}) */
+    private static final boolean SETTINGS_SCREEN = Boolean.parseBoolean(prop("settingsScreen", "false"));
     /** Takes an extra screenshot at yaw 270 with a 30 degree field of view, for a closer look at block entities */
     private static final boolean ZOOM_SHOT = Boolean.parseBoolean(prop("zoomShot", "false"));
 
@@ -93,6 +95,10 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
     @Override
     public void runTest(ClientGameTestContext context) {
         context.runOnClient(_ -> DisplayKeepAwake.enable());
+        if (SETTINGS_SCREEN) {
+            SettingsScreenCheck.run(context, LABEL);
+            return;
+        }
         context.runOnClient(this::applyOptions);
 
         connect(context);

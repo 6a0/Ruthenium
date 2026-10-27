@@ -5,6 +5,7 @@ import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.client.renderer.oit.OitPipelineSet;
 import net.minecraft.client.renderer.rendertype.RenderType;
+import net.vulkanmod.Initializer;
 import org.joml.Matrix4f;
 
 /**
@@ -41,7 +42,7 @@ public final class ModelCulling {
     }
 
     public static void beginModel(RenderType renderType) {
-        cullBackFaces = worldPass && renderType.pipeline().isCull();
+        cullBackFaces = worldPass && renderType.pipeline().isCull() && Initializer.CONFIG.modelBackFaceCulling;
         if (renderType != lastRenderType) {
             lastRenderType = renderType;
             lastIdempotent = isIdempotent(renderType);
@@ -94,7 +95,7 @@ public final class ModelCulling {
      * towards the eye.
      */
     public static boolean isSignTextHidden(Matrix4f pose) {
-        if (!blockEntitySubmit || !polygonOffsetTextCulls()) {
+        if (!blockEntitySubmit || !Initializer.CONFIG.modelBackFaceCulling || !polygonOffsetTextCulls()) {
             return false;
         }
 

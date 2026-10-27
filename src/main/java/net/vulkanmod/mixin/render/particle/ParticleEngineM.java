@@ -5,6 +5,7 @@ import net.minecraft.client.particle.Particle;
 import net.minecraft.client.particle.ParticleEngine;
 import net.minecraft.client.particle.ParticleGroup;
 import net.minecraft.client.particle.ParticleRenderType;
+import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.ParticleSpawnLimiter;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -36,6 +37,11 @@ public class ParticleEngineM implements ParticleSpawnLimiter {
 
     @Inject(method = "add", at = @At("HEAD"), cancellable = true)
     private void limitQueuedParticles(Particle particle, CallbackInfo ci) {
+        if (!Initializer.CONFIG.particleSpawnLimit) {
+            this.lastAddRejected = false;
+            return;
+        }
+
         ParticleRenderType group = particle.getGroup();
         ParticleGroup<?> existing = this.particles.get(group);
         int pending = this.pendingCounts.getInt(group);

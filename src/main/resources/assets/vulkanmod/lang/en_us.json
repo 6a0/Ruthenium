@@ -1,62 +1,42 @@
 {
-  "vulkanmod.options.unknown": "Unknown",
-
   "vulkanmod.options.pages.video": "Video",
   "vulkanmod.options.pages.graphics": "Graphics",
   "vulkanmod.options.pages.optimizations": "Optimizations",
-  "vulkanmod.options.pages.other": "Other",
 
   "vulkanmod.options.performanceImpact": "Performance impact: %s",
   "vulkanmod.options.performanceImpact.low": "Low",
   "vulkanmod.options.performanceImpact.medium": "Medium",
   "vulkanmod.options.performanceImpact.high": "High",
 
+  "vulkanmod.options.percent": "%s%%",
+  "vulkanmod.options.pixels": "%spx",
+
   "vulkanmod.options.buttons.apply": "Apply",
   "vulkanmod.options.buttons.undo": "Undo",
   "vulkanmod.options.buttons.kofi": "Support me",
-  "vulkanmod.options.buttons.update_available": "Update available!",
-
-  "vulkanmod.options.advCulling": "Advanced Chunk Culling",
-  "vulkanmod.options.advCulling.aggressive": "Aggressive",
-  "vulkanmod.options.advCulling.conservative": "Conservative",
-  "vulkanmod.options.advCulling.normal": "Normal",
-  "vulkanmod.options.advCulling.tooltip": "Use a culling algorithm that might improve performance by reducing the number of non visible chunk sections rendered.",
-
-  "vulkanmod.options.ao.subBlock": "Sub Block",
-  "vulkanmod.options.ao.subBlock.tooltip": "Enables smooth lighting for non full block (experimental).",
-
-  "vulkanmod.options.deviceSelector": "Device selector",
-  "vulkanmod.options.deviceSelector.auto": "Auto",
-  "vulkanmod.options.deviceSelector.tooltip": "Current device",
-
-  "vulkanmod.options.entityCulling": "Entity Culling",
-  "vulkanmod.options.entityCulling.tooltip": "Enables culling for entities on not visible sections.",
-
-  "vulkanmod.options.frameQueue": "Render queue size",
-  "vulkanmod.options.frameQueue.tooltip": "Higher values might help stabilize frametime but will increase input lag.",
-
-  "vulkanmod.options.backfaceCulling": "Backface Culling",
-  "vulkanmod.options.backfaceCulling.tooltip": "Culls not visible block faces on the CPU improving GPU performance. To prevent increased CPU overhead enable Indirect Draw.",
-
-  "vulkanmod.options.indirectDraw": "Indirect Draw",
-  "vulkanmod.options.indirectDraw.tooltip": "Reduces CPU overhead but might increase GPU overhead.",
-
-  "vulkanmod.options.refreshRate": "Fullscreen Refresh Rate",
-
-  "vulkanmod.options.uniqueOpaqueLayer": "Unique opaque layer",
-  "vulkanmod.options.uniqueOpaqueLayer.tooltip": "Use a unique render layer for opaque terrain to improve performance.",
-
-  "vulkanmod.options.wayland": "Use Wayland",
-  "vulkanmod.options.wayland.tooltip": "Use Linux Wayland compositor if available (Experimental). Requires restart.",
 
   "vulkanmod.options.windowMode": "Window Mode",
   "vulkanmod.options.windowMode.windowed": "Windowed",
-  "vulkanmod.options.windowMode.windowedFullscreen": "Windowed Fullscreen",
+  "vulkanmod.options.windowMode.borderlessFullscreen": "Borderless Fullscreen",
+  "vulkanmod.options.windowMode.exclusiveFullscreen": "Exclusive Fullscreen",
 
-  "vulkanmod.options.builderThreads": "Chunk Builder Threads",
-  "vulkanmod.options.builderThreads.auto": "Auto",
+  "vulkanmod.options.blockEntityCulling": "Block Entity Culling",
+  "vulkanmod.options.blockEntityCulling.tooltip": "Skips each block entity outside the view, instead of drawing every block entity of a partly visible chunk section.",
 
-  "vulkanmod.options.textureAnimations": "Texture Animations",
+  "vulkanmod.options.retainedChests": "Retained Chests",
+  "vulkanmod.options.retainedChests.tooltip": "Keeps the geometry of closed chests on the GPU across frames instead of rebuilding it every frame.",
+
+  "vulkanmod.options.instancedModels": "Instanced Models",
+  "vulkanmod.options.instancedModels.tooltip": "Draws closed enchanting table books and armor stands posed alike as GPU instances.",
+
+  "vulkanmod.options.modelBackFaceCulling": "Model Backface Culling",
+  "vulkanmod.options.modelBackFaceCulling.tooltip": "Leaves out entity and block entity faces, and sign text, that face away from the camera on the CPU. The GPU would discard them anyway.",
+
+  "vulkanmod.options.particleSpawnLimit": "Particle Spawn Limit",
+  "vulkanmod.options.particleSpawnLimit.tooltip": "Drops new particles when there are already as many as the game can show, instead of queueing them to be discarded later.",
+
+  "vulkanmod.options.skipIdleTicks": "Skip Idle Block Entity Ticks",
+  "vulkanmod.options.skipIdleTicks.tooltip": "Skips ticking closed chests and signs nobody is editing, whose ticks do nothing.",
 
   "vulkanmod.options.searchFieldPlaceholder": "Search Graphics Settings"
 }
