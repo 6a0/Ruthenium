@@ -35,6 +35,8 @@
   "vulkanmod.options.particleSpawnLimit": "Particle Spawn Limit",
   "vulkanmod.options.particleSpawnLimit.tooltip": "Drops new particles when there are already as many as the game can show, instead of queueing them to be discarded later.",
 
+  "vulkanmod.options.terrainFaceCulling": "Terrain Face Culling",
+  "vulkanmod.options.terrainFaceCulling.tooltip": "Skips the block faces of a chunk section that all point away from the camera, which the GPU would discard anyway. Changing it reloads the chunks.",
   "vulkanmod.options.skipIdleTicks": "Skip Idle Block Entity Ticks",
   "vulkanmod.options.skipIdleTicks.tooltip": "Skips ticking closed chests and signs nobody is editing, whose ticks do nothing.",
 

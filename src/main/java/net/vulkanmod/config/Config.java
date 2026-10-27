@@ -25,6 +25,8 @@ public class Config {
     public boolean particleSpawnLimit = true;
     /** Skips block entity ticks that would do nothing */
     public boolean skipIdleTicks = true;
+    /** Skips the terrain faces of a section that all face away from the camera */
+    public boolean terrainFaceCulling = true;
 
     private static Path CONFIG_PATH;
 

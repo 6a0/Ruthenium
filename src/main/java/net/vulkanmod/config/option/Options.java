@@ -172,6 +172,17 @@ public abstract class Options {
     public static OptionBlock[] getOptimizationOpts() {
         return new OptionBlock[]{
                 new OptionBlock("", new Option<?>[]{
+                        new SwitchOption(Component.translatable("vulkanmod.options.terrainFaceCulling"),
+                                value -> {
+                                    config.terrainFaceCulling = value;
+                                    // Sections are grouped by facing when they compile
+                                    Minecraft.getInstance().levelExtractor.allChanged();
+                                },
+                                () -> config.terrainFaceCulling)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.terrainFaceCulling.tooltip"))
+                                .setImpact(PerformanceImpact.HIGH)
+                }),
+                new OptionBlock("", new Option<?>[]{
                         new SwitchOption(Component.translatable("vulkanmod.options.blockEntityCulling"),
                                 value -> config.blockEntityCulling = value,
                                 () -> config.blockEntityCulling)
