@@ -278,6 +278,11 @@ public abstract class Options {
                                 () -> config.cacheTickerStates)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.cacheTickerStates.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.fastEntityCulling"),
+                                value -> config.fastEntityCulling = value,
+                                () -> config.fastEntityCulling)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.fastEntityCulling.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("vulkanmod.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)

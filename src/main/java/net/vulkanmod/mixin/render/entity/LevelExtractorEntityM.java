@@ -1,6 +1,14 @@
 package net.vulkanmod.mixin.render.entity;
 
+import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import net.minecraft.client.Camera;
+import net.minecraft.client.entity.ClientMannequin;
+import net.minecraft.client.player.AbstractClientPlayer;
+import net.vulkanmod.Initializer;
+import net.vulkanmod.interfaces.EntityRendererMap;
+import net.vulkanmod.render.entity.EntityRendererCache;
+import java.util.Map;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.culling.Frustum;
@@ -20,7 +28,8 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Armor stands are extracted into reused render states ({@link ReusedRenderStates}).
+ * Armor stands are extracted into reused render states ({@link ReusedRenderStates}); entity frustum culling through
+ * {@link EntityRendererCache}.
  */
 @Mixin(LevelExtractor.class)
 public class LevelExtractorEntityM {
@@ -49,6 +58,31 @@ public class LevelExtractorEntityM {
             }
         }
         return dispatcher.extractEntity(entity, partialTickTime);
+    }
+
+    /**
+     * Frustum culling of entities with plain renderers without allocating boxes or looking the renderer up
+     * ({@link EntityRendererCache#isVisible}); the rest, and undecided cases, take vanilla's path.
+     */
+    @WrapOperation(method = "isEntityVisible", at = @At(value = "INVOKE",
+            target = "Lnet/minecraft/client/renderer/entity/EntityRenderDispatcher;shouldRender(Lnet/minecraft/world/entity/Entity;Lnet/minecraft/client/renderer/culling/Frustum;DDDF)Z"))
+    private boolean vulkanmod$fastCulling(EntityRenderDispatcher dispatcher, Entity entity, Frustum frustum, double camX, double camY, double camZ,
+                                          float partialTicks, Operation<Boolean> original) {
+        if (Initializer.CONFIG.fastEntityCulling && !(entity instanceof AbstractClientPlayer) && !(entity instanceof ClientMannequin)) {
+            Map<?, ?> renderers = ((EntityRendererMap) dispatcher).vulkanmod$renderers();
+            EntityRendererCache.Entry entry = EntityRendererCache.entry(entity.getType(), renderers);
+            if (entry == null) {
+                dispatcher.getRenderer(entity);
+                entry = EntityRendererCache.entry(entity.getType(), renderers);
+            }
+            if (entry != null && entry.cullKind() != EntityRendererCache.CULL_VANILLA) {
+                int visible = EntityRendererCache.isVisible(entry.cullKind(), entity, frustum, camX, camY, camZ, partialTicks);
+                if (visible != EntityRendererCache.UNDECIDED) {
+                    return visible == EntityRendererCache.VISIBLE;
+                }
+            }
+        }
+        return original.call(dispatcher, entity, frustum, camX, camY, camZ, partialTicks);
     }
 
     @Inject(method = {"setLevel", "allChanged"}, at = @At("HEAD"))

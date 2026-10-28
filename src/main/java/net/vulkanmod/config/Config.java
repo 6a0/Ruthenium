@@ -31,6 +31,8 @@ public class Config {
     public boolean parkIdleTickers = true;
     /** A ticking block entity checks its block state once per state instead of every tick (client) */
     public boolean cacheTickerStates = true;
+    /** Entity frustum culling without allocations or renderer lookups for renderers that keep vanilla's culling */
+    public boolean fastEntityCulling = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */
