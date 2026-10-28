@@ -105,6 +105,13 @@ public final class InstancedModels {
     private static @Nullable BlockEntityRenderer<?, ?> frameTableRenderer;
     private static final Matrix4f BOOK_POSE = new Matrix4f();
     /**
+     * The sine and cosine {@code Matrix4f.rotateZ} computes for the book's constant 80 degree tilt (with JOML's own
+     * functions, so the same values); on a matrix that isn't a pure translation it then calls {@code rotateTowardsXY}
+     */
+    private static final float BOOK_TILT = 80.0F * (float) (Math.PI / 180.0);
+    private static final float BOOK_TILT_SIN = org.joml.Math.sin(BOOK_TILT);
+    private static final float BOOK_TILT_COS = org.joml.Math.cosFromSin(BOOK_TILT_SIN, BOOK_TILT);
+    /**
      * Bumped whenever a section is marked dirty (block and light changes), which invalidates the light cached in
      * enchanting tables ({@link CachedBlockEntityLight}); 0 means not cached
      */
@@ -295,7 +302,12 @@ public final class InstancedModels {
         m.translate(0.5F, 0.75F, 0.5F);
         m.translate(0.0F, 0.1F + Mth.sin(time * 0.1F) * 0.01F, 0.0F);
         m.rotateY(-yRot);
-        m.rotateZ(80.0F * (float) (Math.PI / 180.0));
+        if ((m.properties() & (Matrix4f.PROPERTY_IDENTITY | Matrix4f.PROPERTY_TRANSLATION)) == 0) {
+            // What rotateZ(BOOK_TILT) does on such a matrix, without computing the sine and cosine again
+            m.rotateTowardsXY(BOOK_TILT_SIN, BOOK_TILT_COS);
+        } else {
+            m.rotateZ(BOOK_TILT);
+        }
         addInstance(closedBookGroup, m, light);
         return true;
     }
