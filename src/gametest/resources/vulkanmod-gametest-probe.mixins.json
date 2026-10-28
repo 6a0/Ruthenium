@@ -13,6 +13,7 @@
     "ItemModelResolverPartsProbeMixin",
     "LayerPartsProbeMixin",
     "LevelExtractorCostProbeMixin",
+    "LevelExtractorPartsProbeMixin",
     "LevelRendererCostProbeMixin",
     "LivingEntityRendererPartsProbeMixin",
     "ModelFeatureCostProbeMixin",

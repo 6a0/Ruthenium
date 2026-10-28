@@ -20,7 +20,9 @@ public class ProbeMixinPlugin implements IMixinConfigPlugin {
 
     @Override
     public boolean shouldApplyMixin(String targetClassName, String mixinClassName) {
-        return Boolean.getBoolean("vulkanmod.bench.entityCost");
+        // The parts table's wrappers box their arguments and slow the scene; only with bench.entityCostParts=true too
+        return Boolean.getBoolean("vulkanmod.bench.entityCost")
+                && (!mixinClassName.endsWith("PartsProbeMixin") || Boolean.getBoolean("vulkanmod.bench.entityCostParts"));
     }
 
     @Override
