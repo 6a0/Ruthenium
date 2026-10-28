@@ -60,6 +60,7 @@
     "screen.OptionsScreenM",
     "screen.TooltipAccessor",
     "world.BlockEntityM",
+    "world.AbstractBoatM",
     "world.ArmorStandM",
     "world.BoundTickingBlockEntityM",
     "world.ChestBlockEntityM",

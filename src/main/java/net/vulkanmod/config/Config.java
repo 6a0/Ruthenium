@@ -39,6 +39,8 @@ public class Config {
     public boolean fastEntityCollisions = true;
     /** The block animation tick steps its random seed without atomics and skips biome lookups where no biome has ambient particles */
     public boolean fastAnimateTick = true;
+    /** Client boat ticks: full cube ground friction tests from boxes, push searches for the local player only */
+    public boolean fastBoatTicks = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */
