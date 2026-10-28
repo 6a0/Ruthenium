@@ -2,7 +2,8 @@
 # Interleaved A/B of two commits, checked out in turn in the main tree (ABBA), for one bench task.
 # Usage (from the repo root): sh scripts/run-ab-commits.sh <pairs> <dir> <commitA> <commitB> <gradle args...>
 # Copy this script out of the tree first if commit A predates it (checking A out removes it mid-run).
-pairs=$1; dir=$2; ca=$3; cb=$4; shift 4
+# Commits are resolved to hashes first (a symbolic HEAD would follow the checkouts)
+pairs=$1; dir=$2; ca=$(git rev-parse --short "$3") || exit 1; cb=$(git rev-parse --short "$4") || exit 1; shift 4
 gargs="$*"
 R=build/run/bench/results
 mkdir -p build/bench-logs "$R/$dir/a/frames" "$R/$dir/b/frames"
