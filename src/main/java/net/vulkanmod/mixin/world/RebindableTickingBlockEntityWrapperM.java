@@ -1,12 +1,17 @@
 package net.vulkanmod.mixin.world;
 
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.EnchantingTableBlock;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.EnchantingTableBlockEntity;
 import net.minecraft.world.level.block.entity.TickingBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
 import net.vulkanmod.interfaces.BlockEntityTicker;
 import net.vulkanmod.interfaces.IdleTicker;
 import net.vulkanmod.interfaces.ParkableTicker;
 import net.vulkanmod.interfaces.ParkedTickerHolder;
+import net.vulkanmod.world.EnchantingTableBatch;
+import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -24,6 +29,9 @@ public class RebindableTickingBlockEntityWrapperM implements IdleTicker, Parkabl
 
     @Unique private boolean parked;
     @Unique private boolean listed;
+    /** The enchanting table batch holding this parked ticker, and its slot there */
+    @Unique private @Nullable EnchantingTableBatch batch;
+    @Unique private int batchSlot;
 
     @Override
     public boolean vulkanmod$isTickIdle() {
@@ -41,6 +49,39 @@ public class RebindableTickingBlockEntityWrapperM implements IdleTicker, Parkabl
     }
 
     @Override
+    public boolean vulkanmod$tryBatch(EnchantingTableBatch batch) {
+        if (this.ticker instanceof BlockEntityTicker bound
+                && bound.vulkanmod$getBlockEntity() instanceof EnchantingTableBlockEntity table
+                && table.getClass() == EnchantingTableBlockEntity.class) {
+            // The block's class decides the ticker (EnchantingTableBlock.getTicker: bookAnimationTick on the client)
+            BlockState state = bound.vulkanmod$getValidState();
+            if (state != null && state.getBlock().getClass() == EnchantingTableBlock.class) {
+                this.parked = true;
+                this.batch = batch;
+                this.batchSlot = batch.add(this, table);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Override
+    public void vulkanmod$setBatchSlot(int slot) {
+        this.batchSlot = slot;
+    }
+
+    @Override
+    public void vulkanmod$leaveBatch() {
+        this.parked = false;
+        this.batch = null;
+    }
+
+    @Override
+    public @Nullable BlockState vulkanmod$tickedState() {
+        return this.ticker instanceof BlockEntityTicker bound ? bound.vulkanmod$getValidState() : null;
+    }
+
+    @Override
     public boolean vulkanmod$isParked() {
         return this.parked;
     }
@@ -51,6 +92,10 @@ public class RebindableTickingBlockEntityWrapperM implements IdleTicker, Parkabl
             return;
         }
         this.parked = false;
+        if (this.batch != null) {
+            this.batch.remove(this.batchSlot);
+            this.batch = null;
+        }
         // A null ticker (removed block entity, unloaded chunk) needs no list entry
         if (this.ticker instanceof BlockEntityTicker bound) {
             BlockEntity blockEntity = bound.vulkanmod$getBlockEntity();

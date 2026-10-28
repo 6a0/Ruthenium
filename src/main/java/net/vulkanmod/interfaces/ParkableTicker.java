@@ -1,5 +1,9 @@
 package net.vulkanmod.interfaces;
 
+import net.minecraft.world.level.block.state.BlockState;
+import net.vulkanmod.world.EnchantingTableBatch;
+import org.jspecify.annotations.Nullable;
+
 /**
  * Implemented by the level's block entity ticker wrappers. An idle ticker ({@link IdleTicker}) can be parked: it
  * leaves the level's ticker list until its block entity wakes it ({@link ParkedTickerHolder}) or the wrapper is
@@ -18,4 +22,21 @@ public interface ParkableTicker {
     boolean vulkanmod$isListed();
 
     void vulkanmod$setListed(boolean listed);
+
+    /**
+     * Parks this ticker into the enchanting table batch if it ticks a vanilla enchanting table with vanilla's ticker
+     * and a validated block state ({@link EnchantingTableBatch})
+     *
+     * @return false if this ticker can't be batched
+     */
+    boolean vulkanmod$tryBatch(EnchantingTableBatch batch);
+
+    /** The ticker's slot in its batch moved */
+    void vulkanmod$setBatchSlot(int slot);
+
+    /** Leaves the batch without returning to the ticker list (the block entity was removed) */
+    void vulkanmod$leaveBatch();
+
+    /** The validated block state of the bound ticker, or null */
+    @Nullable BlockState vulkanmod$tickedState();
 }

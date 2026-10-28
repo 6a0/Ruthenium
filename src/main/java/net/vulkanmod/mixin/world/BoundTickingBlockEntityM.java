@@ -42,6 +42,11 @@ public class BoundTickingBlockEntityM implements IdleTicker, BlockEntityTicker {
         return this.blockEntity;
     }
 
+    @Override
+    public @Nullable BlockState vulkanmod$getValidState() {
+        return this.validState;
+    }
+
     /** Redirects rather than wrappers: this runs for every ticking block entity every tick */
     @Redirect(method = "tick", at = @At(value = "INVOKE",
             target = "Lnet/minecraft/world/level/chunk/LevelChunk;getBlockState(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;"))

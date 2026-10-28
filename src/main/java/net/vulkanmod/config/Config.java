@@ -31,6 +31,8 @@ public class Config {
     public boolean parkIdleTickers = true;
     /** A ticking block entity checks its block state once per state instead of every tick (client) */
     public boolean cacheTickerStates = true;
+    /** The client's enchanting tables are ticked in one loop with the player search done once per tick (with parking and cacheTickerStates) */
+    public boolean batchTableTicks = true;
     /** Entity frustum culling without allocations or renderer lookups for renderers that keep vanilla's culling */
     public boolean fastEntityCulling = true;
     /** Entities keep the block and sky light at their light probe position until it moves or light data changes */

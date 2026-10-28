@@ -8,6 +8,7 @@ import net.vulkanmod.Initializer;
 import net.vulkanmod.interfaces.IdleTicker;
 import net.vulkanmod.interfaces.ParkableTicker;
 import net.vulkanmod.interfaces.TickerParkingLevel;
+import net.vulkanmod.world.EnchantingTableBatch;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -43,6 +44,8 @@ public abstract class LevelM implements TickerParkingLevel {
     /** Parked tickers, for {@link #vulkanmod$unparkAll}; may hold tickers woken since (each ticker at most once) */
     @Unique private List<ParkableTicker> parkedTickers;
     @Unique private int parkedCompactSize;
+    /** The client's enchanting table tickers, ticked in one loop after the list ({@link EnchantingTableBatch}) */
+    @Unique private EnchantingTableBatch tableBatch;
 
     @Redirect(method = "tickBlockEntities", at = @At(value = "INVOKE",
             target = "Lnet/minecraft/world/level/block/entity/TickingBlockEntity;tick()V"))
@@ -69,6 +72,16 @@ public abstract class LevelM implements TickerParkingLevel {
             this.pendingBlockEntityTickers.clear();
         }
 
+        EnchantingTableBatch batch = this.tableBatch;
+        boolean batchTables = Initializer.CONFIG.batchTableTicks && Initializer.CONFIG.cacheTickerStates;
+        if (batchTables) {
+            if (batch == null) {
+                batch = this.tableBatch = new EnchantingTableBatch();
+            }
+        } else if (batch != null && batch.size() > 0) {
+            batch.unparkAll();
+        }
+
         List<TickingBlockEntity> tickers = this.blockEntityTickers;
         boolean tick = this.tickRateManager().runsNormally();
         int size = tickers.size();
@@ -81,13 +94,22 @@ public abstract class LevelM implements TickerParkingLevel {
                     continue;
                 }
                 if (tick && this.shouldTickBlocksAt(ticker.getPos())) {
-                    if (ticker instanceof ParkableTicker parkable && parkable.vulkanmod$tryPark()) {
-                        this.addParked(parkable);
-                        continue;
+                    if (ticker instanceof ParkableTicker parkable) {
+                        if (parkable.vulkanmod$tryPark()) {
+                            this.addParked(parkable);
+                            continue;
+                        }
+                        if (batchTables && parkable.vulkanmod$tryBatch(batch)) {
+                            // Ticks with the batch below, this tick too
+                            continue;
+                        }
                     }
                     ticker.tick();
                 }
                 tickers.set(kept++, ticker);
+            }
+            if (batchTables) {
+                batch.tick((Level) (Object) this, tick);
             }
         } finally {
             // Only after a tick threw: keep the tickers not visited yet
@@ -127,6 +149,9 @@ public abstract class LevelM implements TickerParkingLevel {
 
     @Override
     public void vulkanmod$unparkAll() {
+        if (this.tableBatch != null) {
+            this.tableBatch.unparkAll();
+        }
         List<ParkableTicker> parked = this.parkedTickers;
         if (parked == null) {
             return;

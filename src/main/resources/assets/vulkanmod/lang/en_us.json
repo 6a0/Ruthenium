@@ -53,6 +53,8 @@
   "vulkanmod.options.parkIdleTickers.tooltip": "Idle chests, shulker boxes and signs leave the list of block entities the game goes through every tick until they open or get edited, instead of being checked and skipped every tick. Needs Skip Idle Block Entity Ticks.",
   "vulkanmod.options.cacheTickerStates": "Fast Block Entity Ticks",
   "vulkanmod.options.cacheTickerStates.tooltip": "Block entities that animate every tick (enchanting tables, ...) look up and check their block once after it changes instead of before every tick.",
+  "vulkanmod.options.batchTableTicks": "Fast Enchanting Table Ticks",
+  "vulkanmod.options.batchTableTicks.tooltip": "Enchanting tables animate their books in one loop that looks for nearby players once per tick, instead of each table going through the list of ticking block entities and searching the players. Needs Park Idle Block Entities and Fast Block Entity Ticks.",
   "vulkanmod.options.fastEntityCulling": "Fast Entity Culling",
   "vulkanmod.options.fastEntityCulling.tooltip": "Tests entities against the view without allocating boxes or looking up their renderer, with the same result. Mods that change entity culling by hooking Minecraft's culling methods may want it off.",
   "vulkanmod.options.entityLightCache": "Keep Entity Light",
