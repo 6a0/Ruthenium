@@ -39,6 +39,10 @@ import java.util.TreeMap;
  * {@code bench.blockEntitySigns=true} adds a row of signs close to the camera (standing, wall and hanging; plain,
  * coloured, bold and underlined lines, back sides, one glowing), large enough to compare their glyphs; with the
  * events, one sign's text is then changed on the client as the sign edit screen does ({@code besign}).
+ * <p>
+ * {@code bench.blockEntityKinds=extras} fills the field with other block entities instead (~5.5k): 3072 lecterns with
+ * books (four facings), 768 bells on stone (four facings, two layers) and 1536 copper golem statues (four poses, four
+ * oxidation levels, four facings); the chest row stays. Its events ring a bell and put breaking progress on a lectern.
  */
 final class BlockEntityBenchmark {
     private static final Logger LOGGER = LoggerFactory.getLogger("VulkanMod Block Entity Benchmark");
@@ -48,6 +52,7 @@ final class BlockEntityBenchmark {
     private static final float PITCH = 30.0F;
     private static final boolean EVENTS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("blockEntityEvents", "false"));
     private static final boolean SIGNS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("blockEntitySigns", "false"));
+    private static final boolean EXTRAS = "extras".equals(BenchmarkClientGameTest.prop("blockEntityKinds", "default"));
 
     /** The flat world's surface; the field spans x -32..31, z 2..31 */
     private static final int FLOOR = -60;
@@ -59,6 +64,8 @@ final class BlockEntityBenchmark {
             {"friend", "heart", "heartbreak", "howl"},
     };
 
+    private static final BlockPos BELL_EVENT = new BlockPos(4, FLOOR + 3, 8);
+    private static final BlockPos LECTERN_EVENT = new BlockPos(-6, FLOOR + 3, 8);
     private static final BlockPos SHULKER_EVENT = new BlockPos(-2, FLOOR + 7, 8);
     private static final BlockPos POT_EVENT = new BlockPos(9, FLOOR, 8);
     private static final BlockPos SKULL_EVENT = new BlockPos(2, FLOOR + 7, 8);
@@ -83,7 +90,11 @@ final class BlockEntityBenchmark {
             TestServerContext server = world.getServer();
             server.runCommand("time set 6000");
             server.runCommand("gamemode spectator @a");
-            build(server);
+            if (EXTRAS) {
+                buildExtras(server);
+            } else {
+                build(server);
+            }
             if (SIGNS) {
                 buildSigns(server);
             }
@@ -95,13 +106,17 @@ final class BlockEntityBenchmark {
             Map<String, Integer> counts = context.computeOnClient(BlockEntityBenchmark::countBlockEntities);
             LOGGER.info("Block entities: {}", counts);
             int total = counts.values().stream().mapToInt(Integer::intValue).sum();
-            if (total < 12_000) {
+            if (total < (EXTRAS ? 5_000 : 12_000)) {
                 throw new AssertionError("Only " + total + " block entities were placed: " + counts);
             }
 
             context.takeScreenshot(label + "-blockentities-static-" + runId);
             if (EVENTS) {
-                events(context, label, runId);
+                if (EXTRAS) {
+                    extraEvents(context, label, runId);
+                } else {
+                    events(context, label, runId);
+                }
             }
 
             context.runOnClient(_ -> FrameRecorder.startPhase());
@@ -166,6 +181,53 @@ final class BlockEntityBenchmark {
                 server.runCommand("fill %d %d 8 %d %d 31 %s".formatted(x, y0 + 4 + layer, x + 3, y0 + 4 + layer, block));
             }
         }
+    }
+
+    private static void buildExtras(TestServerContext server) {
+        int y0 = FLOOR;
+        server.runCommand("fill -32 %d 2 31 %d 3 minecraft:chest[facing=north]".formatted(y0, y0));
+        String[] facings = {"north", "east", "south", "west"};
+
+        // Lecterns with books: 32 wide x 24 deep x 4 high, one facing per layer
+        for (int layer = 0; layer < 4; layer++) {
+            server.runCommand("fill -32 %d 8 -1 %d 31 minecraft:lectern[facing=%s,has_book=true]"
+                    .formatted(y0 + layer, y0 + layer, facings[layer]));
+        }
+
+        // Bells standing on stone: 16 wide x 24 deep, two layers, one facing per 4 columns
+        for (int layer = 0; layer < 2; layer++) {
+            int y = y0 + 2 * layer;
+            server.runCommand("fill 0 %d 8 15 %d 31 minecraft:stone".formatted(y, y));
+            for (int f = 0; f < 4; f++) {
+                server.runCommand("fill %d %d 8 %d %d 31 minecraft:bell[attachment=floor,facing=%s]"
+                        .formatted(4 * f, y + 1, 4 * f + 3, y + 1, facings[f]));
+            }
+        }
+
+        // Copper golem statues: 16 wide x 24 deep x 4 high, a pose per 4 columns, an oxidation level per layer
+        String[] oxidation = {"", "exposed_", "weathered_", "oxidized_"};
+        String[] poses = {"standing", "sitting", "running", "star"};
+        for (int layer = 0; layer < 4; layer++) {
+            for (int p = 0; p < 4; p++) {
+                server.runCommand("fill %d %d 8 %d %d 31 minecraft:%scopper_golem_statue[copper_golem_pose=%s,facing=%s]"
+                        .formatted(16 + 4 * p, y0 + layer, 16 + 4 * p + 3, y0 + layer, oxidation[layer], poses[p], facings[(p + layer) % 4]));
+            }
+        }
+    }
+
+    /** A bell rung and breaking progress on a lectern, client side; screenshots while the bell swings and at rest */
+    private static void extraEvents(ClientGameTestContext context, String label, String runId) {
+        context.runOnClient(mc -> {
+            mc.level.blockEvent(BELL_EVENT, mc.level.getBlockState(BELL_EVENT).getBlock(), 1, net.minecraft.core.Direction.NORTH.get3DDataValue());
+            mc.level.destroyBlockProgress(-4244, LECTERN_EVENT, 6);
+        });
+        context.waitTicks(5);
+        context.takeScreenshot(label + "-beevents-" + runId);
+
+        context.runOnClient(mc -> mc.level.destroyBlockProgress(-4244, LECTERN_EVENT, -1));
+        // The bell swings for 50 ticks
+        context.waitTicks(60);
+        context.takeScreenshot(label + "-bereset-" + runId);
     }
 
     private static Map<String, Integer> countBlockEntities(Minecraft mc) {
