@@ -31,6 +31,8 @@ public final class ModelCulling {
     private static boolean cullBackFaces;
     private static boolean skipDuplicateQuads;
     private static TransparentFaces.@Nullable TextureAlpha textureAlpha;
+    /** The render type whose texture alpha {@link #textureAlpha()} looks up on first use, or null once looked up */
+    private static @Nullable RenderType alphaRenderType;
     private static RenderType lastRenderType;
     private static boolean lastIdempotent;
     private static boolean blockEntitySubmit;
@@ -56,9 +58,9 @@ public final class ModelCulling {
             lastIdempotent = isIdempotent(renderType);
         }
         skipDuplicateQuads = lastIdempotent;
-        // Improved transparency draws blending types with OIT pipelines, which aren't tested
-        textureAlpha = worldPass && Initializer.CONFIG.transparentFaceCulling && !Minecraft.getInstance().gameRenderer.useImprovedTransparency()
-                ? TransparentFaces.of(renderType) : null;
+        // Looked up when a cube is written: most submits are instanced and write none
+        textureAlpha = null;
+        alphaRenderType = worldPass && Initializer.CONFIG.transparentFaceCulling ? renderType : null;
     }
 
     /**
@@ -87,6 +89,7 @@ public final class ModelCulling {
         cullBackFaces = false;
         skipDuplicateQuads = false;
         textureAlpha = null;
+        alphaRenderType = null;
     }
 
     /**
@@ -94,6 +97,12 @@ public final class ModelCulling {
      * ({@link TransparentFaces}), or null
      */
     public static TransparentFaces.@Nullable TextureAlpha textureAlpha() {
+        RenderType renderType = alphaRenderType;
+        if (renderType != null) {
+            alphaRenderType = null;
+            // Improved transparency draws blending types with OIT pipelines, which aren't tested
+            textureAlpha = !Minecraft.getInstance().gameRenderer.useImprovedTransparency() ? TransparentFaces.of(renderType) : null;
+        }
         return textureAlpha;
     }
 

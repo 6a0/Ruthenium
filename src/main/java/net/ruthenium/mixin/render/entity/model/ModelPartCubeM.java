@@ -44,10 +44,15 @@ public class ModelPartCubeM {
     @Unique private byte[] cornerIndices;
     @Unique private float[] transformedCorners;
     @Unique private final Vector3f scratch = new Vector3f();
-    /** Texture alphas ({@link TransparentFaces}) and the polygons that draw nothing in them, bit per polygon */
-    @Unique private Object[] transparentKeys;
+    /**
+     * Hash table of texture alphas ({@link TransparentFaces}) and the polygons that draw nothing in them, bit per
+     * polygon. It grows with the number of textures the cube is drawn with: a villager's cubes see ~28 per frame
+     * (types, professions and levels).
+     */
+    @Unique private TransparentFaces.TextureAlpha[] transparentKeys;
     @Unique private int[] transparentMasks;
-    @Unique private int transparentNext;
+    @Unique private int transparentCount;
+    @Unique private int transparentGeneration;
 
     /**
      * @author Ruthenium
@@ -155,25 +160,58 @@ public class ModelPartCubeM {
         return behind > 0.0f && behind * behind >= EYE_MARGIN_SQ * (nx * nx + ny * ny + nz * nz);
     }
 
-    /** The transparent polygons of this cube in a texture, kept for the last few textures */
+    /** The transparent polygons of this cube in a texture, kept per texture */
     @Unique
     private int transparentPolygons(TransparentFaces.TextureAlpha textureAlpha) {
-        Object[] keys = this.transparentKeys;
-        if (keys == null) {
-            keys = this.transparentKeys = new Object[4];
-            this.transparentMasks = new int[4];
+        TransparentFaces.TextureAlpha[] keys = this.transparentKeys;
+        if (keys == null || this.transparentGeneration != TransparentFaces.generation()) {
+            keys = this.resetTransparent(4);
         }
-        for (int i = 0; i < keys.length; i++) {
-            if (keys[i] == textureAlpha) {
-                return this.transparentMasks[i];
+        int bits = Integer.numberOfTrailingZeros(keys.length);
+        int slot = textureAlpha.id * 0x9E3779B9 >>> 32 - bits;
+        for (TransparentFaces.TextureAlpha key; (key = keys[slot]) != null; slot = slot + 1 & keys.length - 1) {
+            if (key == textureAlpha) {
+                return this.transparentMasks[slot];
             }
         }
+
         int mask = textureAlpha.transparentPolygons(this.polygons);
-        int slot = this.transparentNext;
-        this.transparentNext = (slot + 1) & 3;
+        // At most half full; a table of 128 that fills up (texture alphas replaced by reloads) starts over
+        if ((this.transparentCount + 1) * 2 > keys.length) {
+            TransparentFaces.TextureAlpha[] oldKeys = keys;
+            int[] oldMasks = this.transparentMasks;
+            keys = this.resetTransparent(keys.length < 128 ? keys.length * 2 : 4);
+            if (keys.length > oldKeys.length) {
+                for (int i = 0; i < oldKeys.length; i++) {
+                    if (oldKeys[i] != null) {
+                        this.putTransparent(oldKeys[i], oldMasks[i]);
+                    }
+                }
+            }
+        }
+        this.putTransparent(textureAlpha, mask);
+        return mask;
+    }
+
+    @Unique
+    private TransparentFaces.TextureAlpha[] resetTransparent(int capacity) {
+        this.transparentKeys = new TransparentFaces.TextureAlpha[capacity];
+        this.transparentMasks = new int[capacity];
+        this.transparentCount = 0;
+        this.transparentGeneration = TransparentFaces.generation();
+        return this.transparentKeys;
+    }
+
+    @Unique
+    private void putTransparent(TransparentFaces.TextureAlpha textureAlpha, int mask) {
+        TransparentFaces.TextureAlpha[] keys = this.transparentKeys;
+        int slot = textureAlpha.id * 0x9E3779B9 >>> 32 - Integer.numberOfTrailingZeros(keys.length);
+        while (keys[slot] != null) {
+            slot = slot + 1 & keys.length - 1;
+        }
         keys[slot] = textureAlpha;
         this.transparentMasks[slot] = mask;
-        return mask;
+        this.transparentCount++;
     }
 
     /** Vanilla's Cube.compile */

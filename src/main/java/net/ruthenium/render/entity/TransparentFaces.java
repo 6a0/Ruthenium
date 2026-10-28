@@ -45,12 +45,17 @@ public final class TransparentFaces {
     private static final Map<RenderType, Object> BY_RENDER_TYPE = new IdentityHashMap<>();
     private static @Nullable RenderType lastRenderType;
     private static @Nullable TextureAlpha lastAlpha;
+    /** Bumped by {@link #clear}, so that caches keyed by {@link TextureAlpha} drop the old ones */
+    private static int generation;
+    private static int nextId;
 
     private TransparentFaces() {
     }
 
     /** A texture's alpha and the 8 bit alpha below which a texel draws nothing in a pipeline */
     public static final class TextureAlpha {
+        /** Distinct per texture alpha, for hashing */
+        public final int id = nextId++;
         final byte[] alpha;
         final int width;
         final int height;
@@ -124,6 +129,12 @@ public final class TransparentFaces {
         BY_RENDER_TYPE.clear();
         lastRenderType = null;
         lastAlpha = null;
+        generation++;
+    }
+
+    /** Changes whenever the texture alphas handed out so far are dropped */
+    public static int generation() {
+        return generation;
     }
 
     /** The texture alpha of a render type whose transparent faces may be left out, or null */
