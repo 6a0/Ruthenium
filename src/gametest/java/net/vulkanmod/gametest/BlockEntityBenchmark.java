@@ -36,6 +36,8 @@ import java.util.TreeMap;
  * breaking progress on a skull ({@code beevents}), then all of it undone ({@code bereset}). Clouds are off so that
  * screenshots of different runs compare.
  * <p>
+ * The events end with glowstone placed above the field and removed ({@code belight}, {@code belightreset}).
+ * <p>
  * {@code bench.blockEntitySigns=true} adds a row of signs close to the camera (standing, wall and hanging; plain,
  * coloured, bold and underlined lines, back sides, one glowing), large enough to compare their glyphs; with the
  * events, one sign's text is then changed on the client as the sign edit screen does ({@code besign}).
@@ -117,6 +119,7 @@ final class BlockEntityBenchmark {
                 } else {
                     events(context, label, runId);
                 }
+                lightEvents(context, server, label, runId);
             }
 
             context.runOnClient(_ -> FrameRecorder.startPhase());
@@ -213,6 +216,20 @@ final class BlockEntityBenchmark {
                         .formatted(16 + 4 * p, y0 + layer, 16 + 4 * p + 3, y0 + layer, oxidation[layer], poses[p], facings[(p + layer) % 4]));
             }
         }
+    }
+
+    /**
+     * Glowstone placed above the field (a light change around retained block entities, in sections whose block
+     * entities don't change), screenshot ({@code belight}), then removed again ({@code belightreset})
+     */
+    private static void lightEvents(ClientGameTestContext context, TestServerContext server, String label, String runId) {
+        BlockPos pos = EXTRAS ? new BlockPos(-4, FLOOR + 5, 10) : new BlockPos(2, FLOOR + 9, 10);
+        server.runCommand("setblock %d %d %d minecraft:glowstone".formatted(pos.getX(), pos.getY(), pos.getZ()));
+        context.waitTicks(20);
+        context.takeScreenshot(label + "-belight-" + runId);
+        server.runCommand("setblock %d %d %d minecraft:air".formatted(pos.getX(), pos.getY(), pos.getZ()));
+        context.waitTicks(20);
+        context.takeScreenshot(label + "-belightreset-" + runId);
     }
 
     /** A bell rung and breaking progress on a lectern, client side; screenshots while the bell swings and at rest */
