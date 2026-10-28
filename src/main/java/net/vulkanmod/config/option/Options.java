@@ -297,6 +297,11 @@ public abstract class Options {
                                 () -> config.fastEntityCollisions)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.fastEntityCollisions.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.fastAnimateTick"),
+                                value -> config.fastAnimateTick = value,
+                                () -> config.fastAnimateTick)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.fastAnimateTick.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("vulkanmod.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)
