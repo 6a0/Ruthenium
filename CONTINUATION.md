@@ -1160,6 +1160,15 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
   blocks with context dependent collision shapes overriding `getCollisionShape` (a mod changing shapes by mixin into
   `BlockBehaviour` would be missed); `fastBoatTicks` pushes only `minecraft.player` on the client, as vanilla's own
   `ClientLevel.getPushableEntities` assumes for living entities.
+- Sixteenth session, verified independently (`results/verify/`): all four switches exact (~3.3M compared answers incl.
+  nether biome patches, shulkers and a happy ghast, a survival player on boats, floor swaps through slab/ice/honey/soul
+  sand/stairs, and the multiplayer server scene; 0 mismatches). Entity scene tick, 5 pairs off -> on:
+  `fastEntityCollisions` 1.422 -> 1.281 ms, `fastAnimateTick` 1.330 -> 1.251, `fastBoatTicks` 1.324 -> 1.281 (16 boats),
+  `fastSupportingBlocks` 1.433 -> 1.401 (4 of 5; pan 1.358 -> 1.286). **Keep or drop `fastSupportingBlocks`:** exact
+  and measurable but the smallest gain for its size (~280 lines, an `Entity` field, chunk mixins); a mod writing
+  `LevelChunkSection`s directly on the client would leave it stale. Kept for now. The server scene's tick gain is
+  ~0.05 ms (not 0.1; spread +-0.1) and its armor stand tick slowdown was noise (no consistent sign over 3 matrices).
+  `fastAnimateTick` loses vanilla's detection of `level.random` being used from two threads.
 - Fifteenth session, verified independently (`results/verify-s15/`: 0 mismatches over 23-39M answers per run on
   Vulkan, GL and the multiplayer server scene, incl. chunk unload/reload and light packets; each switch +3% in its
   phase, also with instanced parts off). Mod compatibility only: `entityLightCache` would serve stale light to a
@@ -1227,7 +1236,8 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
    - **Client tick** (~1.4 ms, sets the p99): block entities ~0.5 ms (~5.6k enchanting tables at ~90 ns: wrapper,
      bound ticker and block entity loads, the world border check, profiler push/pop), entities ~0.34 (~300 armor
      stands at ~1.1 us), animateTick ~0.27 (vanilla's 1334 random block lookups; ~0.1 ms less since the sixteenth
-     session's `fastAnimateTick`: tick 1.23 -> 1.13 ms in that session's comparison), textures ~0.16 (animated texture
+     session's switches: the verification measured only ~0.05 ms per tick start -> end, 5 pairs, and 0.06-0.09 ms
+     switches off -> on, against a +-0.1 ms spread; the session's own 1.23 -> 1.13 ms did not reproduce), textures ~0.16 (animated texture
      uploads), the rest ~0.1.
    - **GPU:** retained block entities still 0.155 ms (vertex work; the entity vertex format is 36 B and its shader
      does lighting per vertex); instanced models 0.065.
