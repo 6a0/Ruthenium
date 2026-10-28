@@ -5,12 +5,19 @@
   "plugin": "net.vulkanmod.gametest.ProbeMixinPlugin",
   "compatibilityLevel": "JAVA_25",
   "client": [
+    "AttributeSupplierPartsProbeMixin",
     "ClientLevelCostProbeMixin",
+    "EntityRendererPartsProbeMixin",
     "FeatureGroupCostProbeMixin",
     "ItemFeatureCostProbeMixin",
+    "ItemModelResolverPartsProbeMixin",
+    "LayerPartsProbeMixin",
     "LevelExtractorCostProbeMixin",
     "LevelRendererCostProbeMixin",
-    "ModelFeatureCostProbeMixin"
+    "LivingEntityRendererPartsProbeMixin",
+    "ModelFeatureCostProbeMixin",
+    "RenderTypesPartsProbeMixin",
+    "VillagerProfessionLayerPartsProbeMixin"
   ],
   "injectors": {
     "defaultRequire": 1

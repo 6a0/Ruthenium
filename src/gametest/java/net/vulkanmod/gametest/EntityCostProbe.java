@@ -23,7 +23,8 @@ public final class EntityCostProbe {
     public static final Table SETUP_ANIM = new Table("setupAnim of posed models (per model class)", false);
     public static final Table MODEL_RENDER = new Table("part tree of posed models (per model class)", false);
     public static final Table ITEMS = new Table("prepare items (per display context, extra = quads)", false);
-    private static final List<Table> TABLES = List.of(EXTRACT, SUBMIT, FEATURE_GROUPS, MODELS, SETUP_ANIM, MODEL_RENDER, ITEMS, TICK);
+    public static final Table PARTS = new Table("parts of extraction and submission (per method, nested in the above)", false);
+    private static final List<Table> TABLES = List.of(EXTRACT, SUBMIT, PARTS, FEATURE_GROUPS, MODELS, SETUP_ANIM, MODEL_RENDER, ITEMS, TICK);
 
     private EntityCostProbe() {
     }
