@@ -22,7 +22,7 @@ public class ModSettingsRegistry {
 
     ModSettingsRegistry() {
         ModSettingsEntry rutheniumSettings = new ModSettingsEntry(Component.literal("Ruthenium").withColor(VGuiConstants.PRIMARY_RGB),
-                                                                  () -> Identifier.fromNamespaceAndPath("ruthenium", "vlogo_transparent.png"),
+                                                                  () -> Identifier.fromNamespaceAndPath("ruthenium", "rlogo.png"),
                                                                   Options::getOptionPages,
                                                                   () -> Initializer.CONFIG.write());
         this.addModEntry(rutheniumSettings);

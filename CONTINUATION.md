@@ -73,8 +73,8 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   loading times, fix bugs, and increase frame rate, latency and consistency **in all scenarios**. This widens the
   earlier "port VulkanMod's optimisations" strategy (section 1): memory, load time and bug fixes are in scope too, not
   only rendering speed.
-- **TODO: the icon is to be changed.** `assets/ruthenium/vlogo.png` (mod list icon, `fabric.mod.json`) and
-  `vlogo_transparent.png` (settings screen, `ModSettingsRegistry`) are still VulkanMod's logo.
+- **Icon:** `assets/ruthenium/rlogo.png` (960×960 RGBA, transparent background) is both the mod list icon
+  (`fabric.mod.json`) and the settings screen icon (`ModSettingsRegistry`); VulkanMod's `vlogo*.png` were removed.
 - **Still to decide:** the issue templates in `.github/` and the
   Ko-fi button on the settings screen (`VOptionScreen.KOFI_URI`) still point to upstream VulkanMod; `fabric.mod.json`
   still lists `Collateral` as the author.
