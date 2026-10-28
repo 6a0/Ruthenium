@@ -33,6 +33,12 @@ public final class SectionFaceGroups {
     private static final int GROUPS = 7;
     /** Runs of {@link #visibleRuns} at most: drawn and skipped groups alternate */
     public static final int MAX_RUNS = (GROUPS + 1) / 2;
+    /** Runs of {@link #visiblePlaneRuns} at most: one per group */
+    public static final int MAX_PLANE_RUNS = GROUPS;
+    /** Largest tilt (other normal components relative to the main one) of a quad counted as axis-aligned by plane */
+    private static final float TILT = 1.0e-5f;
+    /** Largest spread of a near axis-aligned quad's plane coordinates */
+    private static final float SPREAD = 1.0e-4f;
 
     /**
      * Draws a group when the eye is within this distance behind its frontmost plane. The tests use the camera
@@ -49,7 +55,205 @@ public final class SectionFaceGroups {
      */
     private final float[] planes = new float[GROUPS];
 
+    /**
+     * Per plane sorted groups ({@link #sortByPlanes}): the first index into {@link #planeTests} of each group (and the
+     * end), each plane's test value (margin applied) and the end of its quads; null otherwise
+     */
+    private int @Nullable [] groupPlanes;
+    private float @Nullable [] planeTests;
+    private int @Nullable [] planeEnds;
+
     private SectionFaceGroups() {
+    }
+
+    /**
+     * Like {@link #sort}, but also orders each facing group's quads by plane, nearest to the side the group faces
+     * first, so a frame can draw only the quads whose plane the eye is in front of ({@link #visiblePlaneRuns}) instead
+     * of the whole group when any of them can face the eye. Quads whose normal is within a tilt of 1e-5 of an axis and
+     * whose vertices are within 1e-4 blocks of a plane count as in that plane (rotated models: a rotation by a multiple
+     * of 90 degrees leaves coordinates like 6e-17 instead of 0); their plane is their outermost vertex coordinate
+     * towards the back, so the test stays conservative (the margin covers the tilt over thousands of blocks). The
+     * order only changes between quads of different planes or facings: equal plane quads keep their order.
+     *
+     * @return the groups, or null if the mesh isn't one this handles or has no quad in an axis-aligned plane
+     */
+    public static @Nullable SectionFaceGroups sortByPlanes(MeshData mesh) {
+        MeshData.DrawState state = mesh.drawState();
+        VertexFormat format = state.format();
+        boolean floatPosition = format == DefaultVertexFormat.BLOCK || format == DefaultVertexFormat.ENTITY
+                || format == DefaultVertexFormat.POSITION_TEX_LIGHTMAP_COLOR;
+        if (mesh.indexBuffer() != null || !floatPosition || state.primitiveTopology() != PrimitiveTopology.QUADS) {
+            return null;
+        }
+        int stride = format.getVertexSize();
+        int quadBytes = 4 * stride;
+        ByteBuffer vertices = mesh.vertexBuffer();
+        int quadCount = state.vertexCount() / 4;
+        if (quadCount == 0 || quadCount >= 1 << 20 || vertices.remaining() < quadCount * quadBytes) {
+            return null;
+        }
+
+        long base = MemoryUtil.memAddress(vertices);
+        long[] keys = new long[quadCount];
+        float[] quadPlanes = new float[quadCount];
+        int[] counts = new int[GROUPS];
+        float[] position = new float[12];
+        for (int q = 0; q < quadCount; q++) {
+            readPositions(base + (long) q * quadBytes, stride, false, position);
+            float ax = position[6] - position[0], ay = position[7] - position[1], az = position[8] - position[2];
+            float bx = position[9] - position[3], by = position[10] - position[4], bz = position[11] - position[5];
+            float nx = ay * bz - az * by;
+            float ny = az * bx - ax * bz;
+            float nz = ax * by - ay * bx;
+            float anx = Math.abs(nx), any = Math.abs(ny), anz = Math.abs(nz);
+
+            int group = UNASSIGNED;
+            int axis = -1;
+            if (anx > 0.0f && any <= anx * TILT && anz <= anx * TILT) {
+                axis = 0;
+                group = nx > 0.0f ? EAST : WEST;
+            } else if (any > 0.0f && anx <= any * TILT && anz <= any * TILT) {
+                axis = 1;
+                group = ny > 0.0f ? UP : DOWN;
+            } else if (anz > 0.0f && anx <= anz * TILT && any <= anz * TILT) {
+                axis = 2;
+                group = nz > 0.0f ? SOUTH : NORTH;
+            }
+            float plane = 0.0f;
+            if (axis >= 0) {
+                float lo = Math.min(Math.min(position[axis], position[3 + axis]), Math.min(position[6 + axis], position[9 + axis]));
+                float hi = Math.max(Math.max(position[axis], position[3 + axis]), Math.max(position[6 + axis], position[9 + axis]));
+                if (hi - lo <= SPREAD) {
+                    // Groups facing the positive direction are drawn from their lowest plane on, the others up to their highest
+                    plane = (group & 1) == 1 ? lo : hi;
+                } else {
+                    group = UNASSIGNED;
+                }
+            }
+            quadPlanes[q] = plane;
+            counts[group]++;
+            // Nearest to the faced side first: ascending planes for positive facings, descending for negative ones
+            int order = group == UNASSIGNED ? 0 : sortable(plane);
+            if (group != UNASSIGNED && (group & 1) == 0) {
+                order = ~order;
+            }
+            keys[q] = (long) group << 52 | ((order ^ Integer.MIN_VALUE) & 0xFFFFFFFFL) << 20 | q;
+        }
+        if (counts[UNASSIGNED] == quadCount) {
+            return null;
+        }
+        java.util.Arrays.sort(keys);
+
+        SectionFaceGroups groups = new SectionFaceGroups();
+        int[] starts = groups.starts;
+        for (int g = 0; g < GROUPS; g++) {
+            starts[g + 1] = starts[g] + counts[g];
+        }
+        int[] groupPlanes = new int[GROUPS + 1];
+        float[] tests = new float[quadCount];
+        int[] ends = new int[quadCount];
+        int planeCount = 0;
+        float[] planes = groups.planes;
+        for (int g = 1; g < GROUPS; g++) {
+            planes[g] = (g & 1) == 1 ? Float.POSITIVE_INFINITY : Float.NEGATIVE_INFINITY;
+        }
+        int g = 0;
+        for (int i = 0; i < quadCount; i++) {
+            int q = (int) (keys[i] & 0xFFFFF);
+            int group = (int) (keys[i] >>> 52);
+            while (g < group) {
+                groupPlanes[++g] = planeCount;
+            }
+            if (group == UNASSIGNED) {
+                continue;
+            }
+            float plane = quadPlanes[q];
+            planes[group] = (group & 1) == 1 ? Math.min(planes[group], plane) : Math.max(planes[group], plane);
+            float test = (group & 1) == 1 ? plane - MARGIN : plane + MARGIN;
+            if (planeCount > groupPlanes[group] && Float.floatToRawIntBits(tests[planeCount - 1]) == Float.floatToRawIntBits(test)) {
+                ends[planeCount - 1] = i + 1;
+            } else {
+                tests[planeCount] = test;
+                ends[planeCount] = i + 1;
+                planeCount++;
+            }
+        }
+        while (g < GROUPS) {
+            groupPlanes[++g] = planeCount;
+        }
+        groups.groupPlanes = groupPlanes;
+        groups.planeTests = java.util.Arrays.copyOf(tests, planeCount);
+        groups.planeEnds = java.util.Arrays.copyOf(ends, planeCount);
+
+        long scratch = MemoryUtil.nmemAlloc((long) quadCount * quadBytes);
+        try {
+            for (int i = 0; i < quadCount; i++) {
+                int q = (int) (keys[i] & 0xFFFFF);
+                MemoryUtil.memCopy(base + (long) q * quadBytes, scratch + (long) i * quadBytes, quadBytes);
+            }
+            MemoryUtil.memCopy(scratch, base, (long) quadCount * quadBytes);
+        } finally {
+            MemoryUtil.nmemFree(scratch);
+        }
+        return groups;
+    }
+
+    /** An int whose signed order is the float's order */
+    private static int sortable(float f) {
+        int bits = Float.floatToIntBits(f == 0.0f ? 0.0f : f);
+        return bits ^ (bits >> 31 & 0x7FFFFFFF);
+    }
+
+    /**
+     * The runs of quads to draw for an eye position, of groups sorted by {@link #sortByPlanes}: of each facing group
+     * the quads whose plane the eye can be in front of, merging adjacent runs.
+     *
+     * @param eyeX eye position relative to the mesh's origin
+     * @param runs receives the first quad and quad count of each run ({@link #MAX_PLANE_RUNS} pairs at most)
+     * @return the number of runs
+     */
+    public int visiblePlaneRuns(float eyeX, float eyeY, float eyeZ, int[] runs) {
+        int[] groupPlanes = this.groupPlanes;
+        float[] tests = this.planeTests;
+        int[] ends = this.planeEnds;
+        int count = 0;
+        int runStart = 0;
+        int runEnd = this.starts[1];
+        for (int g = 1; g < GROUPS; g++) {
+            int start = this.starts[g];
+            int end = start;
+            int first = groupPlanes[g], last = groupPlanes[g + 1];
+            float eye = g <= WEST ? eyeX : g <= DOWN ? eyeY : eyeZ;
+            if ((g & 1) == 1) {
+                for (int p = first; p < last && eye > tests[p]; p++) {
+                    end = ends[p];
+                }
+            } else {
+                for (int p = first; p < last && eye < tests[p]; p++) {
+                    end = ends[p];
+                }
+            }
+            if (end == start) {
+                continue;
+            }
+            if (start == runEnd) {
+                runEnd = end;
+            } else {
+                if (runEnd > runStart) {
+                    runs[count * 2] = runStart;
+                    runs[count * 2 + 1] = runEnd - runStart;
+                    count++;
+                }
+                runStart = start;
+                runEnd = end;
+            }
+        }
+        if (runEnd > runStart) {
+            runs[count * 2] = runStart;
+            runs[count * 2 + 1] = runEnd - runStart;
+            count++;
+        }
+        return count;
     }
 
     /**

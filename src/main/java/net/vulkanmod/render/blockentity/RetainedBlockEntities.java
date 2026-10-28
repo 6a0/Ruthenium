@@ -101,9 +101,9 @@ import java.util.function.Consumer;
  * batches are drawn right after the world's solid features with copies of vanilla's entity and text pipelines
  * ({@link #PIPELINES}) whose vertex shader adds {@code ModelOffset} (section origin minus camera) to the position;
  * the render type's textures and its layering transform (the z offset of skulls) are applied as vanilla does.
- * Buffers of pipelines that cull back faces are sorted by facing ({@link SectionFaceGroups}), and a frame skips the
- * groups that face away from the eye (switch {@code modelBackFaceCulling}); the GPU would cull them after running
- * their vertex shader, which is most of the batches' GPU cost.
+ * Buffers of pipelines that cull back faces are sorted by facing and plane ({@link SectionFaceGroups#sortByPlanes}),
+ * and a frame draws only the quads whose plane the eye can be in front of (switch {@code modelBackFaceCulling}); the
+ * GPU would cull the others after running their vertex shader, which is most of the batches' GPU cost.
  * <p>
  * A batch is rebuilt when the section's compiled mesh changes (block entity list), when the section or a neighbour
  * is marked dirty (block and light changes, which is where the light comes from), on block events of chests,
@@ -129,7 +129,7 @@ public final class RetainedBlockEntities {
     private static final Vector4f WHITE = new Vector4f(1.0F, 1.0F, 1.0F, 1.0F);
     private static final Matrix4f IDENTITY = new Matrix4f();
     private static final Draw[] NO_DRAWS = new Draw[0];
-    private static final int[] RUNS = new int[SectionFaceGroups.MAX_RUNS * 2];
+    private static final int[] RUNS = new int[SectionFaceGroups.MAX_PLANE_RUNS * 2];
 
     private static final int NOT_CANDIDATE = 0;
     private static final int CANDIDATE = 1;
@@ -665,7 +665,7 @@ public final class RetainedBlockEntities {
                         draws = new Draw[partCount];
                     }
                     // Reorders the vertices before the upload
-                    SectionFaceGroups faces = part.pipeline.isCull() ? SectionFaceGroups.sort(data) : null;
+                    SectionFaceGroups faces = part.pipeline.isCull() ? SectionFaceGroups.sortByPlanes(data) : null;
                     GpuBuffer buffer = RenderSystem.getDevice().createBuffer(() -> "VulkanMod retained block entities",
                             GpuBuffer.USAGE_VERTEX, data.vertexBuffer());
                     draws[drawn++] = new Draw(part.pipeline, part.renderType, buffer, data.drawState().vertexCount() / 4 * 6, faces);
@@ -771,8 +771,8 @@ public final class RetainedBlockEntities {
                 renderPass.setUniform("DynamicTransforms", transform);
                 renderPass.setVertexBuffer(0, draw.buffer.slice());
                 if (faceCulling && draw.faces != null) {
-                    // Groups of quads that all face away from the eye would be culled by the pipeline
-                    int runs = draw.faces.visibleRuns(eyeX, eyeY, eyeZ, RUNS);
+                    // Quads that face away from the eye would be culled by the pipeline
+                    int runs = draw.faces.visiblePlaneRuns(eyeX, eyeY, eyeZ, RUNS);
                     for (int r = 0; r < runs; r++) {
                         renderPass.drawIndexed(RUNS[r * 2 + 1] * 6, 1, 0, RUNS[r * 2] * 4, 0);
                     }
