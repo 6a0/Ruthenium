@@ -41,6 +41,8 @@ final class EntityBenchmark {
     private static final int RENDER_DISTANCE = Integer.parseInt(BenchmarkClientGameTest.prop("entityRenderDistance", "12"));
     private static final float PITCH = 30.0F;
     private static final boolean AI = Boolean.parseBoolean(BenchmarkClientGameTest.prop("entityAi", "false"));
+    /** {@code bench.entityGravity=true}: dropped items and experience orbs fall and rest on the floor (as in real play) */
+    private static final boolean GRAVITY = Boolean.parseBoolean(BenchmarkClientGameTest.prop("entityGravity", "false"));
     private static final int CLOSE_SHOTS = Integer.parseInt(BenchmarkClientGameTest.prop("closeShots", "0"));
     private static final String CLOSE_TOGGLE = BenchmarkClientGameTest.prop("closeToggle", "");
     /** {@code bench.staticView=k}: the static phase runs at close-up position k instead of the overview (pan unchanged) */
@@ -100,7 +102,8 @@ final class EntityBenchmark {
             Map<String, Integer> counts = context.computeOnClient(EntityBenchmark::countEntities);
             LOGGER.info("Entities: {}", counts);
             int total = counts.values().stream().mapToInt(Integer::intValue).sum();
-            if (total < 1_300) {
+            // With AI, mobs fight while the chunks arrive (zombies and villagers, golems, wolves and skeletons)
+            if (total < (AI ? 1_200 : 1_300)) {
                 throw new AssertionError("Only " + total + " entities were summoned: " + counts);
             }
 
@@ -217,13 +220,13 @@ final class EntityBenchmark {
             for (int x = MIN_X; x < MAX_X; x++) {
                 String item = ITEMS[Math.floorMod(x + row * 5, ITEMS.length)];
                 summon(server, "item", x + 0.5, FLOOR + 0.5, row + 0.5,
-                        "Item:{id:\"minecraft:%s\",count:1},NoGravity:1b,PickupDelay:32767,Age:-32768".formatted(item));
+                        "Item:{id:\"minecraft:%s\",count:1}%s,PickupDelay:32767,Age:-32768".formatted(item, GRAVITY ? "" : ",NoGravity:1b"));
             }
         }
 
         // Experience orbs with different values (orbs of the same value merge)
         for (int x = MIN_X; x < MAX_X; x++) {
-            summon(server, "experience_orb", x + 0.5, FLOOR + 0.5, 5.5, "Value:%d,NoGravity:1b,Age:-32768".formatted(x - MIN_X + 1));
+            summon(server, "experience_orb", x + 0.5, FLOOR + 0.5, 5.5, "Value:%d%s,Age:-32768".formatted(x - MIN_X + 1, GRAVITY ? "" : ",NoGravity:1b"));
         }
 
         // Farm animals, every fourth a baby

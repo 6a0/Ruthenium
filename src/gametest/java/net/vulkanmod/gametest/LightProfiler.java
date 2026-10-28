@@ -21,6 +21,10 @@ import java.util.function.Supplier;
  * <p>
  * The game installs it per loop iteration (one frame plus its ticks) through {@code MinecraftProfilerMixin}; only
  * the render thread uses it.
+ * <p>
+ * Each phase also gets a split by frame kind: per section, ms per frame over the loop iterations that ran a client
+ * tick and over those that didn't (the tick runs every ~12th frame at ~250 fps and sets the p95/p99 low), so work a
+ * tick causes outside its own section shows up as a difference between the two columns.
  */
 public final class LightProfiler implements ProfilerFiller {
     public static final int MAX_DEPTH = Integer.parseInt(System.getProperty("vulkanmod.bench.lightProfile", "0"));
@@ -34,6 +38,11 @@ public final class LightProfiler implements ProfilerFiller {
         final HashMap<String, long[]> counters = new HashMap<>();
         long nanos;
         long calls;
+        /** This loop iteration's time, committed at its end to the tick or no-tick totals */
+        long pending;
+        long tickNanos;
+        long otherNanos;
+        boolean touched;
         /** Pushes below the timed depth, attributed to their nearest timed ancestor */
         long deepPushes;
 
@@ -57,6 +66,10 @@ public final class LightProfiler implements ProfilerFiller {
             this.counters.clear();
             this.calls = 0;
             this.deepPushes = 0;
+            this.pending = 0;
+            this.tickNanos = 0;
+            this.otherNanos = 0;
+            this.touched = false;
             for (Node child : this.order) {
                 child.reset();
             }
@@ -70,6 +83,10 @@ public final class LightProfiler implements ProfilerFiller {
     private int depth;
     private boolean inTick;
     private long frames;
+    private long tickFrames;
+    /** Whether this loop iteration ran a client tick (vanilla counts "clientTick" in each) */
+    private boolean ticked;
+    private final List<Node> touched = new ArrayList<>();
     private boolean recording;
 
     private LightProfiler() {
@@ -82,6 +99,8 @@ public final class LightProfiler implements ProfilerFiller {
     public void startRecording() {
         this.root.reset();
         this.frames = 0;
+        this.tickFrames = 0;
+        this.touched.clear();
         this.recording = true;
     }
 
@@ -95,7 +114,24 @@ public final class LightProfiler implements ProfilerFiller {
         for (Node child : this.root.order) {
             append(sb, child, 0);
         }
+        long otherFrames = this.frames - this.tickFrames;
+        sb.append(String.format(Locale.ROOT, "%nSplit by frame kind: %d frames with a client tick, %d without (ms per frame of each kind)%n",
+                this.tickFrames, otherFrames));
+        sb.append(String.format(Locale.ROOT, "%-58s %9s %9s %9s%n", "section", "tick f", "other f", "diff"));
+        appendSplit(sb, this.root, 0, otherFrames);
         return sb.toString();
+    }
+
+    private void appendSplit(StringBuilder sb, Node node, int indent, long otherFrames) {
+        double t = node.tickNanos / 1.0e6 / Math.max(1, this.tickFrames);
+        double o = node.otherNanos / 1.0e6 / Math.max(1, otherFrames);
+        if (node.calls == 0 || Math.max(t, o) < 0.001) {
+            return;
+        }
+        sb.append(String.format(Locale.ROOT, "%-58s %9.4f %9.4f %9.4f%n", "  ".repeat(indent) + node.name, t, o, t - o));
+        for (Node child : node.order) {
+            appendSplit(sb, child, indent + 1, otherFrames);
+        }
     }
 
     private void append(StringBuilder sb, Node node, int indent) {
@@ -133,10 +169,28 @@ public final class LightProfiler implements ProfilerFiller {
     public void endTick() {
         // Unbalanced sections (shouldn't happen) are dropped
         if (this.recording && this.inTick) {
-            this.root.nanos += System.nanoTime() - this.starts[0];
+            long nanos = System.nanoTime() - this.starts[0];
+            this.root.nanos += nanos;
             this.root.calls++;
             this.frames++;
+            if (this.ticked) {
+                this.tickFrames++;
+                this.root.tickNanos += nanos;
+            } else {
+                this.root.otherNanos += nanos;
+            }
+            for (Node node : this.touched) {
+                if (this.ticked) {
+                    node.tickNanos += node.pending;
+                } else {
+                    node.otherNanos += node.pending;
+                }
+                node.pending = 0;
+                node.touched = false;
+            }
         }
+        this.touched.clear();
+        this.ticked = false;
         this.inTick = false;
         this.depth = 0;
     }
@@ -177,8 +231,14 @@ public final class LightProfiler implements ProfilerFiller {
         long now = System.nanoTime();
         Node node = this.stack[d];
         if (this.recording) {
-            node.nanos += now - this.starts[d];
+            long nanos = now - this.starts[d];
+            node.nanos += nanos;
             node.calls++;
+            node.pending += nanos;
+            if (!node.touched) {
+                node.touched = true;
+                this.touched.add(node);
+            }
         }
     }
 
@@ -200,6 +260,9 @@ public final class LightProfiler implements ProfilerFiller {
 
     @Override
     public void incrementCounter(String name, int amount) {
+        if (name.equals("clientTick")) {
+            this.ticked = true;
+        }
         int d = Math.min(this.depth, MAX_DEPTH);
         if (this.recording && this.inTick && d < this.stack.length) {
             this.stack[d].counters.computeIfAbsent(name, _ -> new long[1])[0] += amount;
