@@ -57,6 +57,8 @@
   "vulkanmod.options.fastEntityCulling.tooltip": "Tests entities against the view without allocating boxes or looking up their renderer, with the same result. Mods that change entity culling by hooking Minecraft's culling methods may want it off.",
   "vulkanmod.options.entityLightCache": "Keep Entity Light",
   "vulkanmod.options.entityLightCache.tooltip": "Entities keep the light level at their position from one frame to the next until they move to another block or the world's light changes, instead of looking it up every frame.",
+  "vulkanmod.options.fastEntityCollisions": "Fast Entity Collisions",
+  "vulkanmod.options.fastEntityCollisions.tooltip": "Moving entities look for entities to collide with (boats, shulkers) only in the parts of the world that contain such entities, instead of checking every entity around them. Same collisions.",
   "vulkanmod.options.reuseEntityStates": "Reuse Entity Render States",
   "vulkanmod.options.reuseEntityStates.tooltip": "Armor stands reuse their render state from the previous frame instead of creating a new one every frame.",
   "vulkanmod.options.blockModelMeshCache": "Cache Entity Block Models",

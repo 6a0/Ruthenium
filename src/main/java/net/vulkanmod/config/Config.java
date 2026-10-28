@@ -35,6 +35,8 @@ public class Config {
     public boolean fastEntityCulling = true;
     /** Entities keep the block and sky light at their light probe position until it moves or light data changes */
     public boolean entityLightCache = true;
+    /** Entity collision queries skip entity sections without entities that can be collided with (boats, shulkers) */
+    public boolean fastEntityCollisions = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */
