@@ -63,6 +63,7 @@
     "world.AbstractBoatM",
     "world.ArmorStandM",
     "world.BlockChangeTrackingM",
+    "world.BellBlockEntityM",
     "world.BoundTickingBlockEntityM",
     "world.ChestBlockEntityM",
     "world.ChestLidControllerM",

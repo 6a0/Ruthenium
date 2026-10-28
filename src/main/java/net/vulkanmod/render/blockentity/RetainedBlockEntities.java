@@ -29,11 +29,14 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.client.renderer.DynamicGpuData;
 import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.client.renderer.blockentity.BellRenderer;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderer;
 import net.minecraft.client.renderer.blockentity.ChestRenderer;
+import net.minecraft.client.renderer.blockentity.CopperGolemStatueBlockRenderer;
 import net.minecraft.client.renderer.blockentity.DecoratedPotRenderer;
 import net.minecraft.client.renderer.blockentity.HangingSignRenderer;
+import net.minecraft.client.renderer.blockentity.LecternRenderer;
 import net.minecraft.client.renderer.blockentity.ShulkerBoxRenderer;
 import net.minecraft.client.renderer.blockentity.SkullBlockRenderer;
 import net.minecraft.client.renderer.blockentity.StandingSignRenderer;
@@ -53,11 +56,14 @@ import net.minecraft.util.ARGB;
 import net.minecraft.world.level.block.AbstractSkullBlock;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.ChestBlock;
+import net.minecraft.world.level.block.entity.BellBlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
+import net.minecraft.world.level.block.entity.CopperGolemStatueBlockEntity;
 import net.minecraft.world.level.block.entity.DecoratedPotBlockEntity;
 import net.minecraft.world.level.block.entity.EnderChestBlockEntity;
 import net.minecraft.world.level.block.entity.HangingSignBlockEntity;
+import net.minecraft.world.level.block.entity.LecternBlockEntity;
 import net.minecraft.world.level.block.entity.ShulkerBoxBlockEntity;
 import net.minecraft.world.level.block.entity.SignBlockEntity;
 import net.minecraft.world.level.block.entity.SignText;
@@ -90,7 +96,8 @@ import java.util.function.Consumer;
  * building it every frame.
  * <p>
  * Handled are the vanilla classes and renderers of chests (lid closed and staying closed), shulker boxes (closed),
- * decorated pots (not wobbling), skulls (not animating, no player skin) and signs (no glowing or obfuscated text).
+ * decorated pots (not wobbling), skulls (not animating, no player skin), signs (no glowing or obfuscated text),
+ * lecterns, bells (not swinging) and copper golem statues.
  * Per render section, their vertices are built once, relative to the section origin, by running the real renderer
  * into a {@link ModelSubmitCapture}: every submitted model (pots submit their parts as models) is written with all
  * faces, through {@link ModelGeometryCache} for rest pose models and with vanilla's model rendering otherwise, and
@@ -107,7 +114,7 @@ import java.util.function.Consumer;
  * <p>
  * A batch is rebuilt when the section's compiled mesh changes (block entity list), when the section or a neighbour
  * is marked dirty (block and light changes, which is where the light comes from), on block events of chests,
- * shulker boxes and pots (lids, wobbles), on block entity data updates and sign text changes, when breaking progress
+ * shulker boxes, pots and bells (lids, wobbles, swings), on block entity data updates and sign text changes, when breaking progress
  * changes, and when a left out block entity comes to rest. Everything is dropped when fonts reload or the text
  * filtering setting changes. Batches of sections only partly within the view distance aren't drawn; their
  * block entities take the vanilla path that frame.
@@ -466,6 +473,12 @@ public final class RetainedBlockEntities {
                 return MOVING;
             }
             return CANDIDATE;
+        } else if (type == LecternBlockEntity.class || type == CopperGolemStatueBlockEntity.class) {
+            // Posed by their block state alone (book on the lectern, statue pose, facing, oxidation)
+            return blockEntity.isRemoved() ? MOVING : CANDIDATE;
+        } else if (type == BellBlockEntity.class) {
+            // A rung bell swings for 50 ticks
+            return blockEntity.isRemoved() || ((BellBlockEntity) blockEntity).shaking ? MOVING : CANDIDATE;
         } else if (type == SignBlockEntity.class || type == HangingSignBlockEntity.class) {
             // Glowing text draws an outline depending on the camera distance; obfuscated text changes every frame
             SignBlockEntity sign = (SignBlockEntity) blockEntity;
@@ -496,7 +509,8 @@ public final class RetainedBlockEntities {
     private static boolean isRetainedRenderer(BlockEntityRenderer<?, ?> renderer) {
         Class<?> type = renderer.getClass();
         return type == ChestRenderer.class || type == ShulkerBoxRenderer.class || type == DecoratedPotRenderer.class
-                || type == SkullBlockRenderer.class || type == StandingSignRenderer.class || type == HangingSignRenderer.class;
+                || type == SkullBlockRenderer.class || type == StandingSignRenderer.class || type == HangingSignRenderer.class
+                || type == LecternRenderer.class || type == BellRenderer.class || type == CopperGolemStatueBlockRenderer.class;
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
