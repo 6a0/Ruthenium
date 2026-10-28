@@ -17,7 +17,7 @@ import java.util.Set;
  * JFR execution samples of one thread, read with the JDK's consumer API (seconds instead of the minutes jfr_tree.py
  * needs for a 1 ms profile's JSON).
  * <p>
- * Usage: java scripts/JfrTree.java <file.jfr> <thread> [--from HH:MM:SS] [--to HH:MM:SS] [--under Class.method] [--depth N]
+ * Usage: java scripts/JfrTree.java <file.jfr> <thread> [--from HH:MM:SS] [--to HH:MM:SS] [--under Class.method] [--depth N] [--min PERCENT]
  * <p>
  * Prints the inclusive share of each method over the thread's samples in the window. With --under, only samples
  * whose stack contains that method count, and it also prints the callees directly below its outermost occurrence
@@ -36,6 +36,7 @@ public class JfrTree {
                 case "--to" -> to = LocalTime.parse(args[i + 1]);
                 case "--under" -> under = args[i + 1];
                 case "--depth" -> depth = Integer.parseInt(args[i + 1]);
+                case "--min" -> minShare = Double.parseDouble(args[i + 1]) / 100.0;
                 default -> throw new IllegalArgumentException(args[i]);
             }
         }
@@ -120,6 +121,9 @@ public class JfrTree {
                 .forEach(e -> System.out.printf("%6.2f%%  %s%n", 100.0 * e.getValue() / total, e.getKey()));
     }
 
+    /** Smallest share of the window a tree node needs to be printed (--min PERCENT, default 0.2) */
+    static double minShare = 0.002;
+
     static final class Node {
         final String name;
         int count, self;
@@ -131,7 +135,7 @@ public class JfrTree {
 
         void print(String indent, int total) {
             System.out.printf("%s%6.2f%% (self %5.2f%%) %s%n", indent, 100.0 * count / total, 100.0 * self / total, name);
-            children.values().stream().sorted((a, b) -> b.count - a.count).filter(c -> c.count * 500 >= total)
+            children.values().stream().sorted((a, b) -> b.count - a.count).filter(c -> c.count >= minShare * total)
                     .forEach(c -> c.print(indent + "  ", total));
         }
     }

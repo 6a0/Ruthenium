@@ -18,6 +18,7 @@ run() {
   r=$(grep -oE "NTSTATUS 0x[0-9A-F]+|AssertionError: .{0,120}|BUILD [A-Z]+" "$L" | sort -u | tr '\n' ' ')
   for f in "$R"/vulkanmod*-2026*.json "$R"/vulkanmod*-2026*.txt; do [ -e "$f" ] && mv "$f" "$R/$dir/$side/"; done
   for f in "$R"/frames/vulkanmod*-2026*; do [ -e "$f" ] && mv "$f" "$R/$dir/$side/frames/"; done
+  cp "$L" "$R/$dir/$side/"
   echo "$side ($commit): $r $(grep -hE '^(static|pan|initial|particles) ' "$L" | sed -E 's/^([a-z]+) .*avg= *([0-9.]+).*p99 low= *([0-9.]+).*/\1 \2 (p99 \3)/' | tr '\n' ' ')"
 }
 i=1
