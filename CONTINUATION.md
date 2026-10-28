@@ -1260,7 +1260,10 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 
 ## 8. What's next (in priority order)
 
-### Pending user decisions
+### Decisions and verification notes
+On 2026-10-28 the user reviewed the items below and **kept all of them** (transparent face culling, supporting
+blocks, plane culling and the mod compatibility trade-offs). Nothing is pending. The notes stay as reference; the
+`TransparentFaces` cache miss with instanced parts off is still worth fixing as an ordinary optimisation.
 - **`TransparentFaces` (7e76c79) is ~8% slower with instanced parts off** (independent verification after the
   fourteenth session, `results/verify-s14/`): entity scene, `-Pvm.instancedParts=false`, 3 pairs, every pair slower
   with the culling on: static 194.9 -> 179.7 fps (render thread 4.99 -> 5.37 ms), pan 987 -> 906. With defaults it
@@ -1268,7 +1271,7 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
   caches its face mask for only 4 textures (`ModelPartCubeM.transparentPolygons`), so models whose cubes see many
   textures per frame (villager clothing, ~28) rescan the faces' UV rectangles on every miss. This also hits the
   non-instanced fallbacks with defaults (translucent models with >4 textures, `MAX_BATCHES` overflow). Fix options: a
-  larger or per-texture cache, or giving up on a cube after repeated misses. Kept, as the gain with defaults is real.
+  larger or per-texture cache, or giving up on a cube after repeated misses. Kept (user, 2026-10-28).
 - The server scene's static render thread CPU read 0.71 -> 0.74 ms in all 4 verification pairs (4150777 vs a9aafe1),
   fps unchanged (GPU bound); probably the per-submit `TransparentFaces.of` / `ModelPoseReplay.begin` checks across
   the 296 armor stands (not profiled).
@@ -1285,9 +1288,9 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
   nether biome patches, shulkers and a happy ghast, a survival player on boats, floor swaps through slab/ice/honey/soul
   sand/stairs, and the multiplayer server scene; 0 mismatches). Entity scene tick, 5 pairs off -> on:
   `fastEntityCollisions` 1.422 -> 1.281 ms, `fastAnimateTick` 1.330 -> 1.251, `fastBoatTicks` 1.324 -> 1.281 (16 boats),
-  `fastSupportingBlocks` 1.433 -> 1.401 (4 of 5; pan 1.358 -> 1.286). **Keep or drop `fastSupportingBlocks`:** exact
-  and measurable but the smallest gain for its size (~280 lines, an `Entity` field, chunk mixins); a mod writing
-  `LevelChunkSection`s directly on the client would leave it stale. Kept for now. The server scene's tick gain is
+  `fastSupportingBlocks` 1.433 -> 1.401 (4 of 5; pan 1.358 -> 1.286). `fastSupportingBlocks` is exact and measurable
+  but the smallest gain for its size (~280 lines, an `Entity` field, chunk mixins); a mod writing
+  `LevelChunkSection`s directly on the client would leave it stale. Kept (user, 2026-10-28). The server scene's tick gain is
   ~0.05 ms (not 0.1; spread +-0.1) and its armor stand tick slowdown was noise (no consistent sign over 3 matrices).
   `fastAnimateTick` loses vanilla's detection of `level.random` being used from two threads.
 - Fifteenth session, verified independently (`results/verify-s15/`: 0 mismatches over 23-39M answers per run on
@@ -1302,7 +1305,7 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
   block state, the light at it (and at a double chest's other half) or an event that marks it dirty (block events, data
   packets, sign text, breaking progress), so a mod that changes a retained vanilla block entity's fields on the client
   without one of these leaves its geometry stale until the next rebuild.
-- Seventeenth session, a trade-off kept: drawing retained quads by plane (`9c15ac0`) gains ~3% in the server scene (GPU
+- Seventeenth session, a trade-off kept (user, 2026-10-28): drawing retained quads by plane (`9c15ac0`) gains ~3% in the server scene (GPU
   0.873 -> 0.837 ms) but costs the block entity scene's static view ~0.6% (GPU 0.542 -> 0.546 ms; section 7). Revisit if
   a scene that matters more looks like the block entity field from outside (no section containing the eye).
 - Seventeenth session, verified independently (`results/v17-*`, `v17-vis/`): no correctness or visual issue in any
