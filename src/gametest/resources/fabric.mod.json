@@ -1,20 +1,20 @@
 {
   "schemaVersion": 1,
-  "id": "vulkanmod-gametest",
+  "id": "rubidium-gametest",
   "version": "1.0.0",
-  "name": "VulkanMod Benchmark Gametest",
+  "name": "Rubidium Benchmark Gametest",
   "environment": "client",
   "entrypoints": {
     "client": [
-      "net.vulkanmod.gametest.StartupProbe"
+      "net.rubidium.gametest.StartupProbe"
     ],
     "fabric-client-gametest": [
-      "net.vulkanmod.gametest.BenchmarkClientGameTest"
+      "net.rubidium.gametest.BenchmarkClientGameTest"
     ]
   },
   "mixins": [
-    "vulkanmod-gametest.mixins.json",
-    "vulkanmod-gametest-probe.mixins.json"
+    "rubidium-gametest.mixins.json",
+    "rubidium-gametest-probe.mixins.json"
   ],
   "depends": {
     "fabric-client-gametest-api-v1": "*"

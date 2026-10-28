@@ -1,0 +1,27 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "net.rubidium.gametest.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "DrawIndirectMixin",
+    "GpuPassProbeMixin",
+    "InstancedDrawProbeMixin",
+    "LevelExtractorMixin",
+    "LevelRendererProfileMixin",
+    "LevelTickProfileMixin",
+    "MinecraftMixin",
+    "MinecraftProfilerMixin",
+    "ParticleEngineAccessor",
+    "RetainedDrawProbeMixin",
+    "SectionRenderDispatcherAccessor",
+    "TerrainDrawListGroupAccessor",
+    "TerrainDrawListMixin",
+    "TerrainDrawListProfileMixin",
+    "TickProbeMixin",
+    "VulkanCommandEncoderProfileMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

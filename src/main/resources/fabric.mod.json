@@ -1,30 +1,30 @@
 {
   "schemaVersion": 1,
-  "id": "vulkanmod",
+  "id": "rubidium",
   "version": "${version}",
 
-  "name": "VulkanMod",
-  "description": "Bring Vulkan to Minecraft!",
+  "name": "Rubidium",
+  "description": "An all-in-one tweak designed to run as efficiently as possible: lower RAM usage, faster loading, bug fixes, and higher, more consistent frame rates with lower latency in every scenario.",
   "authors": [
     "Collateral"
   ],
   "contact": {
     "homepage": "",
-    "sources": "https://github.com/xCollateral/VulkanMod"
+    "sources": "https://github.com/6a0/VulkanMod"
   },
 
-  "icon": "assets/vulkanmod/vlogo.png",
+  "icon": "assets/rubidium/vlogo.png",
 
   "environment": "client",
   "entrypoints": {
     "client": [
-      "net.vulkanmod.Initializer"
+      "net.rubidium.Initializer"
     ]
   },
   "mixins": [
-    "vulkanmod.mixins.json"
+    "rubidium.mixins.json"
   ],
-  "accessWidener" : "vulkanmod.accesswidener",
+  "accessWidener" : "rubidium.accesswidener",
 
   "depends": {
     "fabricloader": ">=0.19.3",
