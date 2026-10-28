@@ -10,8 +10,12 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 import net.vulkanmod.interfaces.SectionChangeStamp;
+
+import java.util.Arrays;
+import java.util.Optional;
 
 /**
  * Support for keeping an entity's {@code findSupportingBlock} answer while nothing it depends on changed.
@@ -47,6 +51,47 @@ public final class SupportingBlocks {
     };
 
     private SupportingBlocks() {
+    }
+
+    /** An entity's kept answer and what it depended on */
+    public static final class Kept {
+        private Level level;
+        private double minX, minY, minZ, maxX, maxY, maxZ;
+        private double x, y, z;
+        public Optional<BlockPos> result;
+        private final LevelChunkSection[] sections = new LevelChunkSection[MAX_SECTIONS];
+        private final int[] stamps = new int[MAX_SECTIONS];
+        private int sectionCount;
+
+        public boolean matches(Level level, AABB box, Vec3 position) {
+            return this.result != null && this.level == level
+                    && this.minX == box.minX && this.minY == box.minY && this.minZ == box.minZ
+                    && this.maxX == box.maxX && this.maxY == box.maxY && this.maxZ == box.maxZ
+                    && this.x == position.x && this.y == position.y && this.z == position.z
+                    && unchanged(level, box, this.sections, this.stamps, this.sectionCount);
+        }
+
+        public void store(Level level, AABB box, Vec3 position, Optional<BlockPos> result) {
+            int count = capture(level, box, this.sections, this.stamps);
+            if (count < 0) {
+                this.result = null;
+                this.level = null;
+                Arrays.fill(this.sections, null);
+                return;
+            }
+            this.level = level;
+            this.minX = box.minX;
+            this.minY = box.minY;
+            this.minZ = box.minZ;
+            this.maxX = box.maxX;
+            this.maxY = box.maxY;
+            this.maxZ = box.maxZ;
+            this.x = position.x;
+            this.y = position.y;
+            this.z = position.z;
+            this.result = result;
+            this.sectionCount = count;
+        }
     }
 
     /**
