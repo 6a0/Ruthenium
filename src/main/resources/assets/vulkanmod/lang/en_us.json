@@ -31,6 +31,8 @@
 
   "vulkanmod.options.modelBackFaceCulling": "Model Backface Culling",
   "vulkanmod.options.modelBackFaceCulling.tooltip": "Leaves out entity and block entity faces, and sign text, that face away from the camera on the CPU. The GPU would discard them anyway.",
+  "vulkanmod.options.transparentFaceCulling": "Transparent Face Culling",
+  "vulkanmod.options.transparentFaceCulling.tooltip": "Leaves out the faces of entity models whose texture is fully transparent there (spider and enderman eyes, horse markings, ...). They draw nothing. Reads those textures from the resource packs once.",
 
   "vulkanmod.options.particleSpawnLimit": "Particle Spawn Limit",
   "vulkanmod.options.particleSpawnLimit.tooltip": "Drops new particles when there are already as many as the game can show, instead of queueing them to be discarded later.",

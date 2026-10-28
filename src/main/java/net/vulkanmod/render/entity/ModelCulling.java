@@ -5,7 +5,9 @@ import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.client.renderer.oit.OitPipelineSet;
 import net.minecraft.client.renderer.rendertype.RenderType;
+import net.minecraft.client.Minecraft;
 import net.vulkanmod.Initializer;
+import org.jspecify.annotations.Nullable;
 import org.joml.Matrix4f;
 
 /**
@@ -28,6 +30,7 @@ public final class ModelCulling {
     private static boolean worldPass;
     private static boolean cullBackFaces;
     private static boolean skipDuplicateQuads;
+    private static TransparentFaces.@Nullable TextureAlpha textureAlpha;
     private static RenderType lastRenderType;
     private static boolean lastIdempotent;
     private static boolean blockEntitySubmit;
@@ -53,6 +56,9 @@ public final class ModelCulling {
             lastIdempotent = isIdempotent(renderType);
         }
         skipDuplicateQuads = lastIdempotent;
+        // Improved transparency draws blending types with OIT pipelines, which aren't tested
+        textureAlpha = worldPass && Initializer.CONFIG.transparentFaceCulling && !Minecraft.getInstance().gameRenderer.useImprovedTransparency()
+                ? TransparentFaces.of(renderType) : null;
     }
 
     /**
@@ -80,6 +86,15 @@ public final class ModelCulling {
     public static void endModel() {
         cullBackFaces = false;
         skipDuplicateQuads = false;
+        textureAlpha = null;
+    }
+
+    /**
+     * The texture alpha of the current model's render type when faces that draw nothing may be left out
+     * ({@link TransparentFaces}), or null
+     */
+    public static TransparentFaces.@Nullable TextureAlpha textureAlpha() {
+        return textureAlpha;
     }
 
     public static boolean cullBackFaces() {

@@ -7,6 +7,7 @@ import net.vulkanmod.render.entity.InstancedParts;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import net.vulkanmod.render.entity.BlockModelMeshCache;
 import net.vulkanmod.render.entity.ItemBoundingBoxes;
+import net.vulkanmod.render.entity.TransparentFaces;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -22,5 +23,6 @@ public class BlockEntityRenderDispatcherM {
         InstancedParts.clear();
         BlockModelMeshCache.clear();
         ItemBoundingBoxes.clear();
+        TransparentFaces.clear();
     }
 }

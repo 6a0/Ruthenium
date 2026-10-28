@@ -21,6 +21,8 @@ public class Config {
     public boolean instancedModels = true;
     /** CPU skip of model faces and sign text the GPU would cull as back faces */
     public boolean modelBackFaceCulling = true;
+    /** CPU skip of model faces whose texels all draw nothing (alpha cutout, or alpha 0 with translucent blending) */
+    public boolean transparentFaceCulling = true;
     /** Particles dropped at spawn when their group can't take them */
     public boolean particleSpawnLimit = true;
     /** Skips block entity ticks that would do nothing */

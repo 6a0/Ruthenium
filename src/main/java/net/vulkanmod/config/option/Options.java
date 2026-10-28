@@ -13,6 +13,7 @@ import net.vulkanmod.interfaces.SectionDispatcherReset;
 import net.vulkanmod.interfaces.TickerParkingLevel;
 import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.entity.InstancedParts;
+import net.vulkanmod.render.entity.TransparentFaces;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import net.vulkanmod.render.entity.BlockModelMeshCache;
 
@@ -240,7 +241,15 @@ public abstract class Options {
                                 value -> config.modelBackFaceCulling = value,
                                 () -> config.modelBackFaceCulling)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.modelBackFaceCulling.tooltip"))
-                                .setImpact(PerformanceImpact.MEDIUM)
+                                .setImpact(PerformanceImpact.MEDIUM),
+                        new SwitchOption(Component.translatable("vulkanmod.options.transparentFaceCulling"),
+                                value -> {
+                                    config.transparentFaceCulling = value;
+                                    TransparentFaces.clear();
+                                },
+                                () -> config.transparentFaceCulling)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.transparentFaceCulling.tooltip"))
+                                .setImpact(PerformanceImpact.LOW)
                 }),
                 new OptionBlock("", new Option<?>[]{
                         new SwitchOption(Component.translatable("vulkanmod.options.particleSpawnLimit"),

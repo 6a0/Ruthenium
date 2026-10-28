@@ -9,6 +9,7 @@ import net.minecraft.client.renderer.texture.UvMapping;
 import net.minecraft.util.ARGB;
 import net.vulkanmod.interfaces.ExtendedVertexBuilder;
 import net.vulkanmod.render.entity.ModelCulling;
+import net.vulkanmod.render.entity.TransparentFaces;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.lwjgl.system.MemoryUtil;
@@ -25,7 +26,8 @@ import java.util.Arrays;
  * the cube's distinct corners are transformed once (8 instead of 24 positions), each face is written as one
  * 4-vertex reservation, and color, light, overlay and the packed normal are computed once per face.
  * Output is identical to vanilla's {@code Cube.compile}, except that faces the GPU would cull as back faces are
- * not written when {@link ModelCulling} allows it.
+ * not written when {@link ModelCulling} allows it, and neither are faces that draw nothing in the render type's
+ * texture ({@link TransparentFaces}).
  * <p>
  * Like vanilla model parts this is not thread safe; models are only rendered from the render thread.
  */
@@ -42,6 +44,10 @@ public class ModelPartCubeM {
     @Unique private byte[] cornerIndices;
     @Unique private float[] transformedCorners;
     @Unique private final Vector3f scratch = new Vector3f();
+    /** Texture alphas ({@link TransparentFaces}) and the polygons that draw nothing in them, bit per polygon */
+    @Unique private Object[] transparentKeys;
+    @Unique private int[] transparentMasks;
+    @Unique private int transparentNext;
 
     /**
      * @author VulkanMod
@@ -63,6 +69,16 @@ public class ModelPartCubeM {
             return;
         }
 
+        // Faces that draw nothing in this render type's texture (TransparentFaces); atlas sprites aren't tested
+        int skipped = 0;
+        TransparentFaces.TextureAlpha textureAlpha = ModelCulling.textureAlpha();
+        if (textureAlpha != null && mapping == null) {
+            skipped = this.transparentPolygons(textureAlpha);
+            if (skipped == (1 << this.polygons.length) - 1) {
+                return;
+            }
+        }
+
         if (this.corners == null) {
             this.initCorners();
         }
@@ -82,7 +98,7 @@ public class ModelPartCubeM {
         boolean cullBackFaces = ModelCulling.cullBackFaces();
 
         for (int p = 0; p < this.polygons.length; p++) {
-            if (cullBackFaces && isBackFace(transformed, p)) {
+            if ((skipped & 1 << p) != 0 || cullBackFaces && isBackFace(transformed, p)) {
                 continue;
             }
 
@@ -137,6 +153,27 @@ public class ModelPartCubeM {
         // Distance of the eye behind the face plane, times |n|
         float behind = nx * x0 + ny * y0 + nz * z0;
         return behind > 0.0f && behind * behind >= EYE_MARGIN_SQ * (nx * nx + ny * ny + nz * nz);
+    }
+
+    /** The transparent polygons of this cube in a texture, kept for the last few textures */
+    @Unique
+    private int transparentPolygons(TransparentFaces.TextureAlpha textureAlpha) {
+        Object[] keys = this.transparentKeys;
+        if (keys == null) {
+            keys = this.transparentKeys = new Object[4];
+            this.transparentMasks = new int[4];
+        }
+        for (int i = 0; i < keys.length; i++) {
+            if (keys[i] == textureAlpha) {
+                return this.transparentMasks[i];
+            }
+        }
+        int mask = textureAlpha.transparentPolygons(this.polygons);
+        int slot = this.transparentNext;
+        this.transparentNext = (slot + 1) & 3;
+        keys[slot] = textureAlpha;
+        this.transparentMasks[slot] = mask;
+        return mask;
     }
 
     /** Vanilla's Cube.compile */
