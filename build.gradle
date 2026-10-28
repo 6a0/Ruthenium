@@ -27,7 +27,7 @@ repositories {
 }
 
 loom {
-	accessWidenerPath = file("src/main/resources/thallium.accesswidener")
+	accessWidenerPath = file("src/main/resources/ruthenium.accesswidener")
 
 	runs.configureEach {
 		// Mojang's launcher JVM arguments (see the benchmark tasks below for why these matter)
@@ -41,7 +41,7 @@ loom {
 fabricApi {
 	configureTests {
 		createSourceSet = true
-		modId = "thallium-gametest"
+		modId = "ruthenium-gametest"
 		enableGameTests = false
 		enableClientGameTests = true
 		eula = true
@@ -105,7 +105,7 @@ jar {
 }
 
 // Benchmarks: production-like client runs driven by the client gametest in src/gametest.
-// Usage: ./gradlew benchThallium (or benchVanillaGl / benchVanillaVulkan / benchSodium)
+// Usage: ./gradlew benchRuthenium (or benchVanillaGl / benchVanillaVulkan / benchSodium)
 // Results are written to build/run/bench/results/
 def gametestJar = tasks.register("gametestJar", Jar) {
 	archiveClassifier = "gametest"
@@ -123,7 +123,7 @@ dependencies {
 	benchSodiumMods "maven.modrinth:sodium:${project.sodium_version}"
 }
 
-def registerBenchmark = { String name, String label, String backend, boolean withThallium, boolean withSodium ->
+def registerBenchmark = { String name, String label, String backend, boolean withRuthenium, boolean withSodium ->
 	tasks.register(name, ClientProductionRunTask) {
 		group = "benchmark"
 		description = "Runs the client benchmark gametest: ${label}"
@@ -132,7 +132,7 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 		outputs.upToDateWhen { false }
 
 		mods.setFrom(gametestJar, configurations.benchBaseMods)
-		if (withThallium) {
+		if (withRuthenium) {
 			mods.from(tasks.named("jar"))
 		}
 		if (withSodium) {
@@ -151,9 +151,9 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 		runDir = layout.buildDirectory.dir("run/bench/${label}")
 		// -PbenchProbe=SECONDS: diagnostic startup probe outside client gametest mode (see StartupProbe)
 		if (project.hasProperty("benchProbe")) {
-			jvmArgs.add("-Dthallium.bench.probeSeconds=${project.property("benchProbe")}")
+			jvmArgs.add("-Druthenium.bench.probeSeconds=${project.property("benchProbe")}")
 		} else {
-			jvmArgs.addAll("-Dfabric.client.gametest", "-Dfabric.client.gametest.modid=thallium-gametest")
+			jvmArgs.addAll("-Dfabric.client.gametest", "-Dfabric.client.gametest.modid=ruthenium-gametest")
 		}
 		// Mojang's launcher JVM arguments for 26.3, which the production run task doesn't apply. Without the extra
 		// stack shadow pages, native code (graphics drivers) intermittently overflowed thread stacks during startup,
@@ -167,7 +167,7 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 		}
 
 		jvmArgs.addAll(
-				"-Dthallium.bench.label=${label}",
+				"-Druthenium.bench.label=${label}",
 				// The benchmark keeps the displays awake via SetThreadExecutionState (FFM downcall)
 				"--enable-native-access=ALL-UNNAMED",
 				"-Xmx4G"
@@ -180,11 +180,11 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 		}
 		// Forward -Pbench.* project properties as system properties (e.g. -Pbench.renderDistance=16)
 		project.properties.findAll { it.key.startsWith("bench.") }.each { k, v ->
-			jvmArgs.add("-Dthallium.${k}=${v}")
+			jvmArgs.add("-Druthenium.${k}=${v}")
 		}
 		// Forward -Pvm.* project properties as mod system properties (e.g. -Pvm.retainedChests=false)
 		project.properties.findAll { it.key.startsWith("vm.") }.each { k, v ->
-			jvmArgs.add("-Dthallium.${k.substring(3)}=${v}")
+			jvmArgs.add("-Druthenium.${k.substring(3)}=${v}")
 		}
 		// Forward -Pjvm.* project properties as plain system properties (e.g. -Pjvm.MC_DEBUG_ENABLED=true)
 		project.properties.findAll { it.key.startsWith("jvm.") }.each { k, v ->
@@ -208,8 +208,8 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 registerBenchmark("benchVanillaGl", "vanilla-gl", "opengl", false, false)
 registerBenchmark("benchVanillaVulkan", "vanilla-vulkan", "vulkan", false, false)
 registerBenchmark("benchSodium", "sodium", null, false, true)
-registerBenchmark("benchThallium", "thallium", "vulkan", true, false)
-registerBenchmark("benchThalliumGl", "thallium-gl", "opengl", true, false)
+registerBenchmark("benchRuthenium", "ruthenium", "vulkan", true, false)
+registerBenchmark("benchRutheniumGl", "ruthenium-gl", "opengl", true, false)
 
 // configure the maven publication
 publishing {

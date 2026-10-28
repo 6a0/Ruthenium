@@ -16,8 +16,8 @@ run() {
   # shellcheck disable=SC2086
   ./gradlew --console=plain $gargs > "$L" 2>&1
   r=$(grep -oE "NTSTATUS 0x[0-9A-F]+|AssertionError: .{0,120}|BUILD [A-Z]+" "$L" | sort -u | tr '\n' ' ')
-  for f in "$R"/thallium*-2026*.json "$R"/thallium*-2026*.txt; do [ -e "$f" ] && mv "$f" "$R/$dir/$side/"; done
-  for f in "$R"/frames/thallium*-2026*; do [ -e "$f" ] && mv "$f" "$R/$dir/$side/frames/"; done
+  for f in "$R"/ruthenium*-2026*.json "$R"/ruthenium*-2026*.txt; do [ -e "$f" ] && mv "$f" "$R/$dir/$side/"; done
+  for f in "$R"/frames/ruthenium*-2026*; do [ -e "$f" ] && mv "$f" "$R/$dir/$side/frames/"; done
   cp "$L" "$R/$dir/$side/"
   echo "$side ($commit): $r $(grep -hE '^(static|pan|initial|particles) ' "$L" | sed -E 's/^([a-z]+) .*avg= *([0-9.]+).*p99 low= *([0-9.]+).*/\1 \2 (p99 \3)/' | tr '\n' ' ')"
 }

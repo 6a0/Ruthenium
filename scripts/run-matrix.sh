@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runs each benchmark task N times, logging to build/bench-logs/ and printing one result line per run.
-# Usage: scripts/run-matrix.sh <runs> <task>...   e.g. scripts/run-matrix.sh 3 benchThallium benchVanillaVulkan
+# Usage: scripts/run-matrix.sh <runs> <task>...   e.g. scripts/run-matrix.sh 3 benchRuthenium benchVanillaVulkan
 runs=$1; shift
 mkdir -p build/bench-logs
 for t in "$@"; do

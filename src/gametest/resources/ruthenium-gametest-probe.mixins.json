@@ -1,0 +1,35 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "net.ruthenium.gametest.probemixin",
+  "plugin": "net.ruthenium.gametest.ProbeMixinPlugin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "AttributeMapTickPartsProbeMixin",
+    "AttributeSupplierPartsProbeMixin",
+    "BoatTickPartsProbeMixin",
+    "ClientLevelCostProbeMixin",
+    "EntityRendererPartsProbeMixin",
+    "EntityTickPartsProbeMixin",
+    "FeatureGroupCostProbeMixin",
+    "InterpolationTickPartsProbeMixin",
+    "ItemFeatureCostProbeMixin",
+    "ItemModelResolverPartsProbeMixin",
+    "LayerPartsProbeMixin",
+    "LevelExtractorCostProbeMixin",
+    "LevelExtractorPartsProbeMixin",
+    "LevelRendererCostProbeMixin",
+    "LevelTickPartsProbeMixin",
+    "LivingEntityRendererPartsProbeMixin",
+    "LivingEntityTickPartsProbeMixin",
+    "LocalPlayerTickPartsProbeMixin",
+    "ModelFeatureCostProbeMixin",
+    "OrbTickPartsProbeMixin",
+    "RenderTypesPartsProbeMixin",
+    "TextureAtlasTickPartsProbeMixin",
+    "VillagerProfessionLayerPartsProbeMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
