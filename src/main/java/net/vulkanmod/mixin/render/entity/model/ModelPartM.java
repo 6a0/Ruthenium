@@ -7,6 +7,7 @@ import net.minecraft.client.model.geom.ModelPart;
 import net.vulkanmod.interfaces.InstancedPartHolder;
 import net.vulkanmod.interfaces.ReplayablePart;
 import net.vulkanmod.render.entity.InstancedParts;
+import net.vulkanmod.render.entity.LazyVertexBuilder;
 import net.vulkanmod.render.entity.ModelPoseReplay;
 import org.joml.Quaternionf;
 import org.jspecify.annotations.Nullable;
@@ -91,6 +92,9 @@ public class ModelPartM implements InstancedPartHolder, ReplayablePart {
         }
         if (InstancedParts.addPart((ModelPart) (Object) this, this.cubes, pose, lightCoords, overlayCoords, color)) {
             return;
+        }
+        if (builder instanceof LazyVertexBuilder lazy) {
+            builder = lazy.resolve();
         }
         for (ModelPart.Cube cube : this.cubes) {
             cube.compile(pose, builder, lightCoords, overlayCoords, color);

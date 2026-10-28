@@ -8,6 +8,7 @@ import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
 import net.minecraft.client.renderer.feature.RenderTypeFeatureRenderer;
 import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.entity.InstancedParts;
+import net.vulkanmod.render.entity.LazyVertexBuilder;
 import net.vulkanmod.render.entity.ModelCulling;
 import net.vulkanmod.render.entity.ModelGeometryCache;
 import net.vulkanmod.render.entity.ModelPoseReplay;
@@ -15,10 +16,14 @@ import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Overwrite;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+import org.jspecify.annotations.Nullable;
 
 @Mixin(ModelFeatureRenderer.class)
 public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<ModelFeatureRenderer.Submit<?>> {
     @Shadow @Final private PoseStack poseStack;
+    /** The vertex builder of submits whose parts become instances, reused for each */
+    @Unique private @Nullable LazyVertexBuilder lazyBuilder;
 
     /**
      * @author VulkanMod
@@ -36,30 +41,50 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
             }
 
             this.poseStack.last().set(submit.pose());
-            VertexConsumer buffer = this.getVertexBuilder(submit.renderType());
             Model<? super S> model = submit.model();
+            boolean decal = submit.sheetedDecalPose() != null;
+            VertexConsumer buffer = null;
 
-            if (submit.sheetedDecalPose() == null && ModelGeometryCache.isCacheable(submit.state())
-                    && ModelGeometryCache.write(model, submit.state(), this.poseStack.last(), buffer, submit.lightCoords(),
-                            submit.overlayCoords(), submit.tintedColor(), submit.uvMapping(), ModelCulling.cullBackFaces())) {
-                return;
+            if (!decal && ModelGeometryCache.isCacheable(submit.state())) {
+                buffer = this.getVertexBuilder(submit.renderType());
+                if (ModelGeometryCache.write(model, submit.state(), this.poseStack.last(), buffer, submit.lightCoords(),
+                        submit.overlayCoords(), submit.tintedColor(), submit.uvMapping(), ModelCulling.cullBackFaces())) {
+                    return;
+                }
             }
 
             Object modelSpaceKey;
-            if (submit.sheetedDecalPose() == null && (modelSpaceKey = ModelGeometryCache.modelSpaceKey(submit.state())) != null
-                    && ModelGeometryCache.writeModelSpace(model, submit.state(), modelSpaceKey, this.poseStack.last(), buffer,
-                            submit.lightCoords(), submit.overlayCoords(), submit.tintedColor(), submit.uvMapping(),
-                            ModelCulling.cullBackFaces(), ModelCulling.skipDuplicateQuads())) {
-                return;
+            if (!decal && (modelSpaceKey = ModelGeometryCache.modelSpaceKey(submit.state())) != null) {
+                if (buffer == null) {
+                    buffer = this.getVertexBuilder(submit.renderType());
+                }
+                if (ModelGeometryCache.writeModelSpace(model, submit.state(), modelSpaceKey, this.poseStack.last(), buffer,
+                        submit.lightCoords(), submit.overlayCoords(), submit.tintedColor(), submit.uvMapping(),
+                        ModelCulling.cullBackFaces(), ModelCulling.skipDuplicateQuads())) {
+                    return;
+                }
             }
 
-            if (submit.sheetedDecalPose() != null) {
-                buffer = new SheetedDecalTextureGenerator(buffer, submit.sheetedDecalPose(), 1.0F);
-            } else if (submit.uvMapping() != null) {
-                buffer = submit.uvMapping().wrap(buffer);
+            boolean instancedParts = !decal && InstancedParts.beginModel(submit.renderType(), submit.uvMapping());
+            if (instancedParts && buffer == null) {
+                // The parts become instances: the group's vertex builder (a render type switch) is only fetched if
+                // one of them has to be written after all
+                LazyVertexBuilder lazy = this.lazyBuilder;
+                if (lazy == null) {
+                    lazy = this.lazyBuilder = new LazyVertexBuilder(this::getVertexBuilder);
+                }
+                buffer = lazy.reset(submit.renderType(), submit.uvMapping());
+            } else {
+                if (buffer == null) {
+                    buffer = this.getVertexBuilder(submit.renderType());
+                }
+                if (decal) {
+                    buffer = new SheetedDecalTextureGenerator(buffer, submit.sheetedDecalPose(), 1.0F);
+                } else if (submit.uvMapping() != null) {
+                    buffer = submit.uvMapping().wrap(buffer);
+                }
             }
 
-            boolean instancedParts = submit.sheetedDecalPose() == null && InstancedParts.beginModel(submit.renderType(), submit.uvMapping());
             try {
                 // A layer of a model posed earlier in this frame for the same state takes the recorded part poses
                 ModelPoseReplay.Record replay = ModelPoseReplay.begin(model, submit.state(), this.poseStack.last());
