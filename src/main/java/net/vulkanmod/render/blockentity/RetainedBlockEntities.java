@@ -133,7 +133,15 @@ public final class RetainedBlockEntities {
 
     /** Block entities rebuilt per frame at most; sections over budget take the vanilla path until they are built */
     private static final int REBUILD_BUDGET = 2048;
+    /**
+     * Batches unused for this many frames and seconds are freed, or for this many frames alone when their section is
+     * beyond {@link #EVICT_DISTANCE} blocks past their view distance. A frame count alone freed the batches behind the
+     * camera after ~1 s at high frame rates, so turning around rebuilt them (a section of ~2k chests takes ~7-10 ms).
+     */
     private static final int EVICT_AFTER_FRAMES = 1200;
+    private static final long EVICT_AFTER_NANOS = 30_000_000_000L;
+    private static final double EVICT_DISTANCE = 64.0;
+    private static long frameNanos;
     private static final Vector4f WHITE = new Vector4f(1.0F, 1.0F, 1.0F, 1.0F);
     private static final Matrix4f IDENTITY = new Matrix4f();
     private static final Draw[] NO_DRAWS = new Draw[0];
@@ -292,6 +300,7 @@ public final class RetainedBlockEntities {
         Draw[] draws = NO_DRAWS;
         double viewDistance;
         int lastFrame;
+        long lastNanos;
 
         Batch(BlockPos origin) {
             this.originX = origin.getX();
@@ -338,6 +347,7 @@ public final class RetainedBlockEntities {
     /** Called before the visible block entities are extracted */
     public static void beginFrame(Vec3 cameraPos) {
         frame++;
+        frameNanos = System.nanoTime();
         rebuiltThisFrame = 0;
         VISIBLE.clear();
         camX = cameraPos.x();
@@ -450,11 +460,18 @@ public final class RetainedBlockEntities {
         return pos.relative(ChestBlock.getConnectedDirection(state));
     }
 
+    private static boolean isFar(Batch batch) {
+        double dx = batch.originX + 8.0 - camX, dy = batch.originY + 8.0 - camY, dz = batch.originZ + 8.0 - camZ;
+        double limit = Math.max(batch.viewDistance, 0.0) + EVICT_DISTANCE;
+        return dx * dx + dy * dy + dz * dz > limit * limit;
+    }
+
     private static void evict() {
         ObjectIterator<Long2ObjectMap.Entry<Batch>> iterator = BATCHES.long2ObjectEntrySet().fastIterator();
         while (iterator.hasNext()) {
             Batch batch = iterator.next().getValue();
-            if (frame - batch.lastFrame > EVICT_AFTER_FRAMES) {
+            if (frame - batch.lastFrame > EVICT_AFTER_FRAMES
+                    && (frameNanos - batch.lastNanos > EVICT_AFTER_NANOS || isFar(batch))) {
                 batch.close();
                 iterator.remove();
             }
@@ -482,6 +499,7 @@ public final class RetainedBlockEntities {
             BATCHES.put(key, batch);
         }
         batch.lastFrame = frame;
+        batch.lastNanos = frameNanos;
 
         if (!batch.dirty && batch.mesh == mesh) {
             for (BlockEntity moving : batch.moving) {
