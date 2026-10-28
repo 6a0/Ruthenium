@@ -1,0 +1,136 @@
+diff --git a/src/gametest/java/net/ruthenium/gametest/EntityBenchmark.java b/src/gametest/java/net/ruthenium/gametest/EntityBenchmark.java
+index fa764c1..ccf16a7 100644
+--- a/src/gametest/java/net/ruthenium/gametest/EntityBenchmark.java
++++ b/src/gametest/java/net/ruthenium/gametest/EntityBenchmark.java
+@@ -151,7 +151,7 @@ final class EntityBenchmark {
+      * frames). Not measured.
+      */
+     private static void lightEvents(ClientGameTestContext context, TestServerContext server) {
+-        for (int round = 0; round < 8; round++) {
++        for (int round = 0; round < 9; round++) {
+             String block = round % 2 == 0 ? "glowstone" : "air";
+             for (int x = MIN_X + 2; x < MAX_X; x += 5) {
+                 for (int z = 8; z <= 32; z += 3) {
+@@ -161,6 +161,28 @@ final class EntityBenchmark {
+             context.waitTicks(30);
+         }
+         LOGGER.info("Light events done");
++        net.ruthenium.render.entity.VerifyCounters.logLight();
++        // Client chunk unload and reload: render distance 2 and back
++        context.runOnClient(mc -> mc.options.renderDistance().set(2));
++        context.waitTicks(100);
++        net.ruthenium.render.entity.VerifyCounters.logLight();
++        context.runOnClient(mc -> mc.options.renderDistance().set(RENDER_DISTANCE));
++        context.waitTicks(200);
++        net.ruthenium.render.entity.VerifyCounters.logLight();
++        net.ruthenium.render.entity.VerifyCounters.logCull();
++        // Air (kept), then glowstone again just before the close-ups
++        for (int x = MIN_X + 2; x < MAX_X; x += 5) {
++            for (int z = 8; z <= 32; z += 3) {
++                server.runCommand("setblock %d %d %d minecraft:air".formatted(x, FLOOR + 3, z));
++            }
++        }
++        context.waitTicks(30);
++        for (int x = MIN_X + 2; x < MAX_X; x += 5) {
++            for (int z = 8; z <= 32; z += 3) {
++                server.runCommand("setblock %d %d %d minecraft:glowstone".formatted(x, FLOOR + 3, z));
++            }
++        }
++        context.waitTicks(30);
+     }
+ 
+     private static void closeUps(ClientGameTestContext context, TestServerContext server, String label, String runId) {
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/EntityRendererLightM.java b/src/main/java/net/ruthenium/mixin/render/entity/EntityRendererLightM.java
+index 75ac5e4..df8f485 100644
+--- a/src/main/java/net/ruthenium/mixin/render/entity/EntityRendererLightM.java
++++ b/src/main/java/net/ruthenium/mixin/render/entity/EntityRendererLightM.java
+@@ -33,6 +33,9 @@ public class EntityRendererLightM {
+         if (light < 0) {
+             light = original.call(level, layer, pos);
+             cache.ruthenium$setLight(layer, light);
++            net.ruthenium.render.entity.VerifyCounters.lightMisses++;
++        } else {
++            net.ruthenium.render.entity.VerifyCounters.light(entity, layer, pos.asLong(), light, original.call(level, layer, pos));
+         }
+         return light;
+     }
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/LevelExtractorEntityM.java b/src/main/java/net/ruthenium/mixin/render/entity/LevelExtractorEntityM.java
+index 85a42db..fb63489 100644
+--- a/src/main/java/net/ruthenium/mixin/render/entity/LevelExtractorEntityM.java
++++ b/src/main/java/net/ruthenium/mixin/render/entity/LevelExtractorEntityM.java
+@@ -77,6 +77,11 @@ public class LevelExtractorEntityM {
+             }
+             if (entry != null && entry.cullKind() != EntityRendererCache.CULL_VANILLA) {
+                 int visible = EntityRendererCache.isVisible(entry.cullKind(), entity, frustum, camX, camY, camZ, partialTicks);
++                if (renderers.get(entity.getType()) != entry.renderer()) {
++                    net.ruthenium.render.entity.VerifyCounters.cullMismatches += 1_000_000_000L;
++                    net.ruthenium.Initializer.LOGGER.warn("VERIFY renderer mismatch {}", entity.getType());
++                }
++                net.ruthenium.render.entity.VerifyCounters.cull(entity, visible, original.call(dispatcher, entity, frustum, camX, camY, camZ, partialTicks));
+                 if (visible != EntityRendererCache.UNDECIDED) {
+                     return visible == EntityRendererCache.VISIBLE;
+                 }
+diff --git a/src/main/java/net/ruthenium/render/entity/VerifyCounters.java b/src/main/java/net/ruthenium/render/entity/VerifyCounters.java
+new file mode 100644
+index 0000000..e459e3b
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/entity/VerifyCounters.java
+@@ -0,0 +1,58 @@
++package net.ruthenium.render.entity;
++
++import net.minecraft.world.entity.Entity;
++import net.ruthenium.Initializer;
++
++/** Throwaway verification counters (verify/s15-diag branch only) */
++public final class VerifyCounters {
++    public static long lightHits, lightMisses, lightMismatches;
++    public static long cullDecided, cullUndecided, cullMismatches;
++    private static long nextLightLog = 1_000_000, nextCullLog = 1_000_000;
++    private static int lightReports, cullReports;
++
++    private VerifyCounters() {
++    }
++
++    public static void light(Entity entity, Object layer, long pos, int kept, int fresh) {
++        lightHits++;
++        if (kept != fresh) {
++            lightMismatches++;
++            if (lightReports++ < 30) {
++                Initializer.LOGGER.warn("VERIFY light mismatch {} {} at {} kept {} fresh {} gen {}", entity.getType(), layer,
++                        net.minecraft.core.BlockPos.of(pos), kept, fresh, EntityLight.generation());
++            }
++        }
++        if (lightHits >= nextLightLog) {
++            nextLightLog += 1_000_000;
++            logLight();
++        }
++    }
++
++    public static void logLight() {
++        Initializer.LOGGER.info("VERIFY light: hits {} misses {} mismatches {} gen {}", lightHits, lightMisses, lightMismatches,
++                EntityLight.generation());
++    }
++
++    public static void cull(Entity entity, int fast, boolean vanilla) {
++        if (fast < 0) {
++            cullUndecided++;
++            return;
++        }
++        cullDecided++;
++        if ((fast == 1) != vanilla) {
++            cullMismatches++;
++            if (cullReports++ < 30) {
++                Initializer.LOGGER.warn("VERIFY cull mismatch {} fast {} vanilla {} box {}", entity.getType(), fast, vanilla,
++                        entity.getBoundingBox());
++            }
++        }
++        if (cullDecided >= nextCullLog) {
++            nextCullLog += 1_000_000;
++            logCull();
++        }
++    }
++
++    public static void logCull() {
++        Initializer.LOGGER.info("VERIFY cull: decided {} undecided {} mismatches {}", cullDecided, cullUndecided, cullMismatches);
++    }
++}

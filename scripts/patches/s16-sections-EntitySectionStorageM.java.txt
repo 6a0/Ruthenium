@@ -1,0 +1,92 @@
+package net.ruthenium.mixin.world;
+
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.LongIterator;
+import it.unimi.dsi.fastutil.longs.LongSortedSet;
+import net.minecraft.core.SectionPos;
+import net.minecraft.util.AbortableIterationConsumer;
+import net.minecraft.world.level.entity.EntityAccess;
+import net.minecraft.world.level.entity.EntitySection;
+import net.minecraft.world.level.entity.EntitySectionStorage;
+import net.minecraft.world.phys.AABB;
+import net.ruthenium.Initializer;
+import org.spongepowered.asm.mixin.Final;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Overwrite;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+
+/**
+ * Every entity query by box ({@code getEntities}, collisions, pushes, item merges, ...) walks, for each section
+ * column x in the box, the sorted set of all entity sections with that x (every y and z in the loaded area) to find
+ * the few in the box. With a small box the sections are looked up directly instead (an idea from Lithium's entity
+ * retrieval, implemented here independently), in the order the sorted set gives them: x ascending, then z and y as
+ * unsigned 22 and 20 bit values (as {@link SectionPos#asLong} packs them), i.e. non-negative coordinates ascending
+ * before negative ones ascending. Same sections, same order.
+ */
+@Mixin(EntitySectionStorage.class)
+public class EntitySectionStorageM<T extends EntityAccess> {
+    /** Most sections a box may span to be looked up directly (vanilla's walk visits each existing section of its x) */
+    @Unique
+    private static final int DIRECT_SECTIONS = 64;
+
+    @Shadow @Final private Long2ObjectMap<EntitySection<T>> sections;
+    @Shadow @Final private LongSortedSet sectionIds;
+
+    /**
+     * @author Ruthenium
+     * @reason look the sections of small boxes up directly, keeping vanilla's order
+     */
+    @Overwrite
+    public void forEachAccessibleNonEmptySection(final AABB bb, final AbortableIterationConsumer<EntitySection<T>> output) {
+        int xMin = SectionPos.posToSectionCoord(bb.minX - 2.0);
+        int yMin = SectionPos.posToSectionCoord(bb.minY - 4.0);
+        int zMin = SectionPos.posToSectionCoord(bb.minZ - 2.0);
+        int xMax = SectionPos.posToSectionCoord(bb.maxX + 2.0);
+        int yMax = SectionPos.posToSectionCoord(bb.maxY + 0.0);
+        int zMax = SectionPos.posToSectionCoord(bb.maxZ + 2.0);
+
+        if (Initializer.CONFIG.fastEntitySections && xMin <= xMax && yMin <= yMax && zMin <= zMax
+                && (long) (xMax - xMin + 1) * (yMax - yMin + 1) * (zMax - zMin + 1) <= DIRECT_SECTIONS) {
+            // Unsigned order: [max(min, 0), max] first, then [min, min(max, -1)]
+            int zSplit = Math.max(zMin, 0), ySplit = Math.max(yMin, 0);
+            for (int x = xMin; x <= xMax; x++) {
+                for (int zi = 0, z = zSplit; zi < 2; zi++, z = zMin) {
+                    int zEnd = zi == 0 ? zMax : Math.min(zMax, -1);
+                    for (; z <= zEnd; z++) {
+                        for (int yi = 0, y = ySplit; yi < 2; yi++, y = yMin) {
+                            int yEnd = yi == 0 ? yMax : Math.min(yMax, -1);
+                            for (; y <= yEnd; y++) {
+                                EntitySection<T> entitySection = this.sections.get(SectionPos.asLong(x, y, z));
+                                if (entitySection != null && !entitySection.isEmpty() && entitySection.getStatus().isAccessible()
+                                        && output.accept(entitySection).shouldAbort()) {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        for (int x = xMin; x <= xMax; x++) {
+            long lowestAbsoluteSectionKey = SectionPos.asLong(x, 0, 0);
+            long highestAbsoluteSectionKey = SectionPos.asLong(x, -1, -1);
+            LongIterator it = this.sectionIds.subSet(lowestAbsoluteSectionKey, highestAbsoluteSectionKey + 1L).iterator();
+
+            while (it.hasNext()) {
+                long sectionKey = it.nextLong();
+                int y = SectionPos.y(sectionKey);
+                int z = SectionPos.z(sectionKey);
+                if (y >= yMin && y <= yMax && z >= zMin && z <= zMax) {
+                    EntitySection<T> entitySection = this.sections.get(sectionKey);
+                    if (entitySection != null && !entitySection.isEmpty() && entitySection.getStatus().isAccessible()
+                            && output.accept(entitySection).shouldAbort()) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}

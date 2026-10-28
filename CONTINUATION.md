@@ -997,12 +997,12 @@ Changes, each A/B tested in five interleaved pairs with `-Pbench.staticSeconds=1
   1.25% under it; a probe counted **0** `createInstance` calls on the render thread, so that attribution was impossible
   (inlined code again). Keeping the instances on the entity: probe `extractNameTags` 285 -> 300 ns (noise). Not
   committed.
-- **Rejected: name tags without the attribute reads** (`s15-nametags`, patch `nametags.patch` there): `shouldShowName`
+- **Rejected: name tags without the attribute reads** (`s15-nametags`, patch `scripts/patches/s15-nametags.patch`): `shouldShowName`
   before the name tag distance and the below name distance only when the scoreboard shows a below name objective (or the
   entity class overrides `belowNameDisplay`); 5M name tags compared with vanilla's, 0 mismatches. JFR had 2.75% of the
   static frame under `extractNameTags`, 1.47% of it as self time in `Object2ObjectOpenHashMap.get`. A/B: static 328.0 vs
   328.2, pan 1180.3 vs 1167.9. So the attribute reads were not the cost JFR showed.
-- **Rejected: villager clothing identifiers kept per layer** (`s15-villager`, patch `villager-ids.patch` there):
+- **Rejected: villager clothing identifiers kept per layer** (`s15-villager`, patch `scripts/patches/s15-villager-ids.patch`):
   `VillagerProfessionLayer.getIdentifier` results kept per kind and registry key. Probe: layer submits 958 -> 425 ns
   (-46 us per frame); JFR 3.1% -> 1.4%. A/B with the static phase at the villager close-up (`bench.staticView=1`, static
   ~430 fps): 428.7 vs 431.6 (3 of 5 pairs), pan 1171.8 vs 1210.2 (4 of 5, but villagers are a small part of the pan).
@@ -1056,13 +1056,13 @@ read with `scripts/tick_ab.py` (median; `results/entities-dev/<dir>`):
   0.327 ms per tick in the session comparison (four pairs, inferred to be the larger objects), so it moved into an
   object created on first use (`272da2e`; probe: items 1047 ns, orbs 2430 ns).
 - Tools (`eba9a88`, `2b24b07`, `67b10c3`, `7f4e28c`): section 6.6.
-- **Rejected: direct entity section lookups** (Lithium's `entity.fast_retrieval` idea, own code; `s16-sections`, patch
-  `EntitySectionStorageM.java.txt` there): small boxes looked their sections up by key in vanilla's iteration order (x
+- **Rejected: direct entity section lookups** (Lithium's `entity.fast_retrieval` idea, own code; `s16-sections`, source
+  `scripts/patches/s16-sections-EntitySectionStorageM.java.txt`): small boxes looked their sections up by key in vanilla's iteration order (x
   ascending, then z and y as unsigned 22/20 bit values) instead of walking the sorted set of all sections with that x;
   500k+ calls compared with vanilla's walk, 0 differences (181k with several sections, 55k crossing coordinate 0). Tick
   1.407 vs 1.405 ms, pan 1.291 vs 1.293: nothing to gain in this scene (few entity sections per x column); it would
   matter with entities spread over a large area.
-- **Rejected: inside-block checks skipped at rest over air** (`s16-inside`, patch `EntityInsideBlocksM.java.txt`, related
+- **Rejected: inside-block checks skipped at rest over air** (`s16-inside`, source `scripts/patches/s16-inside-EntityInsideBlocksM.java.txt`, related
   to Lithium's `entity.collisions.block_effects`): `applyEffectsFromBlocks` of entities that didn't move visits the blocks
   of their box and does nothing at air; when all of them were air the visit was skipped (exact for zero travel: vanilla
   visits `BlockPos.betweenClosed` of the box deflated by 1e-5 at the target). Check: 300k skips, 0 with a non-air block;
@@ -1130,16 +1130,16 @@ Changes, each A/B tested in five interleaved pairs unless noted (median; `result
   the chest cube's batches during the pan (~1.2 s at ~1000 fps), so turning back rebuilt them (frames of 7-21 ms). Pan
   frames over 7 ms that are neither GC nor tick frames, per run: 2/2/3/2/1 -> 0/0/1/0/1; fps unchanged (pan 1050.5 vs
   1058.4).
-- **Rejected: pipeline set once per run of equal sprites in texture animation** (`s17-sprites`, patch there). Vanilla's
+- **Rejected: pipeline set once per run of equal sprites in texture animation** (`s17-sprites`, patch `scripts/patches/s17-sprites.patch`). Vanilla's
   `SpriteContents.AnimationState.drawToAtlas` sets its pipeline before every sprite, which binds it again and makes the
   frontend set every uniform again. The parts probe put the blocks atlas at 105/104 -> 129/146 us per tick without/with the
   repeats (2 runs each), but the tick A/B (5 pairs) read static 0.953 vs 0.945 ms, pan 1.179 vs 1.143, not consistent across
   pairs: within noise, binned.
-- **Rejected: front-to-back order within facing groups** (`s17-f2b-*`, five pairs each, patch there): planes sorted
+- **Rejected: front-to-back order within facing groups** (`s17-f2b-*`, five pairs each, patch `scripts/patches/s17-f2b.patch`): planes sorted
   farthest out first so the drawn suffix runs nearest to the eye first, with a binary search for the visible part; 0 of
   400k draws differed from a per-quad brute force, but no measurable change (server static 1096.5 vs 1095.3, GPU 0.835
   both; block entity scene 1731.6 vs 1735.1).
-- **Rejected: block entity extraction through per cell index masks** (`s17-cells`, patch there): sections crossing the
+- **Rejected: block entity extraction through per cell index masks** (`s17-cells`, patch `scripts/patches/s17-cells.patch`): sections crossing the
   frustum visited only the list indices of cells not outside it (bit sets per mesh, list order kept; 260k sections compared
   with the old loop, 0 differences). Extraction probe: static 92 us per frame for 22 sections, 14k listed, 9.3k retained,
   4.7k visited (253 books, ~4.4k culled); the pan facing the cube 0.2-0.3 ms, mostly books. A/B: static 1102.7 vs 1105.4,
@@ -1161,7 +1161,7 @@ Session start (`77b631c`) vs end (`aa618c3`), checked out in turn in the same tr
   plane sorting (`9c15ac0`): 1727 -> 1714 fps, GPU frame 0.542 -> 0.546 ms, retained 0.295 -> 0.299 ms, although fewer
   quads are drawn. Not the draw count (merging runs across gaps of hidden quads, `s17-dev/gap`: no better, worse with
   large gaps) and not front-to-back order within a group (`s17-f2b-*`, five pairs each: BE 1731.6 vs 1735.1, server
-  1096.5 vs 1095.3, GPU equal; binned, patch there); grouping planes into 4 block slabs kept in build order (`s17-dev/slab-*`)
+  1096.5 vs 1095.3, GPU equal; binned, `scripts/patches/s17-f2b.patch`); grouping planes into 4 block slabs kept in build order (`s17-dev/slab-*`)
   was within single-run noise in this scene and lost part of the server scene's gain (retained 0.138-0.141 exact planes,
   0.142-0.148 slabs, 0.155-0.157 with 16 block slabs, i.e. the old per group culling). Inferred cause: plane order spreads
   each block entity's quads through the buffer (less locality for the GPU). Kept: the server scene gains 15 us of GPU per
@@ -1207,8 +1207,8 @@ benchmark was neutral within noise for it (`v25`, `v25-compressed-off`). The dra
 view from 405 to 432 (v24). Quads drawn at the static view: ~0.59M solid + 0.96M cutout with face groups (2.2M
 without). Rejected: **diagonal face groups** (the vertical 45 degree planes of cross plants, 12% of the compiled quads
 here, ~5% fewer drawn): static 659.2 -> 657.4 and pan 844.2 -> 849.6, no measurable gain. It needs a 1e-5 normal
-tolerance and a 0.05 block margin, because rotated vertices aren't exactly diagonal; the patch was in the fifth
-session's scratchpad (`diagonal-groups.patch`).
+tolerance and a 0.05 block margin, because rotated vertices aren't exactly diagonal; the patch is
+`scripts/patches/s05-diagonal-groups.patch` (made against `b63badc`).
 
 **Rejected: CPU occlusion culling** (seventh session, user's request, dropped after measuring). Design, exact by
 construction: at compile time each section kept its vertex bounds and its solid layer quads that are whole block faces,
@@ -1240,7 +1240,7 @@ scene has nothing to gain either (the "building" is the chest/enchanting table c
 blocks, no solid walls). It could only pay where few large drawn faces hide a lot (walls of cities, cliffs); solid
 *volume* occluders would be far cheaper but are not exact (they differ from vanilla wherever vanilla itself shows a
 hole through an unbuilt or graph-culled section). The patch (with the non-MDI path, a settings switch and the sweep)
-is in the seventh session's scratchpad (`terrain-occlusion.patch`); results and logs in
+is `scripts/patches/s07-terrain-occlusion.patch` (made against `dd183cb`); results and logs in
 `results/terrain-dev/occlusion/`.
 
 ### The pan's p99
@@ -1365,8 +1365,8 @@ blocks, plane culling and the mod compatibility trade-offs). Nothing is pending.
      entity. What is left is a long tail of vanilla per-entity work, each item at or below the ~2% an A/B resolves (JFR
      shares of the static render thread at the end of the session; JFR misattributed twice this session, see 6.6):
      name tags ~2.7% (but skipping their attribute reads gained nothing), villager clothing identifiers ~3% (keeping them
-     cut the layer to 1.4% in JFR and -46 us in the probe, but the A/B was within noise; patch in
-     `results/entities-dev/s15-villager`), item frames' frame block model resolve ~1.2% (geometry key per frame), item
+     cut the layer to 1.4% in JFR and -46 us in the probe, but the A/B was within noise; patch
+     `scripts/patches/s15-villager-ids.patch`), item frames' frame block model resolve ~1.2% (geometry key per frame), item
      model resolves (~160 ns each, `ModelManager.getItemModel` hash lookups), armor layers ~2% (spread over render type
      memo lookups, `EquipmentClientInfo.getLayers` and submit records), the pose stack's matrix math in submission ~3%
      (`Matrix4f.rotateY`, `pushPose`), `LivingEntityRenderer.submit`'s `model.setupAnim` before layers ~1% (only layers

@@ -1,0 +1,12 @@
+diff --git a/src/main/resources/ruthenium.mixins.json b/src/main/resources/ruthenium.mixins.json
+index 556152e..e3295f4 100644
+--- a/src/main/resources/ruthenium.mixins.json
++++ b/src/main/resources/ruthenium.mixins.json
+@@ -47,6 +47,7 @@
+     "render.particle.ClientPacketListenerM",
+     "render.particle.ParticleEngineM",
+     "render.particle.QuadParticleRenderStateM",
++    "render.texture.SpriteAnimationStateM",
+     "render.text.AbstractSignRendererM",
+     "render.text.BakedSheetGlyphM",
+     "render.text.FontSetM",

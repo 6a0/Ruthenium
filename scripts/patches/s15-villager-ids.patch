@@ -1,0 +1,103 @@
+diff --git a/src/main/resources/ruthenium.mixins.json b/src/main/resources/ruthenium.mixins.json
+index 1fa1e65..1a381ea 100644
+--- a/src/main/resources/ruthenium.mixins.json
++++ b/src/main/resources/ruthenium.mixins.json
+@@ -32,6 +32,7 @@
+     "render.entity.LayerLightSectionStorageM",
+     "render.entity.ExtendedBlockModelFeatureRendererM",
+     "render.entity.LevelExtractorEntityM",
++    "render.entity.VillagerProfessionLayerM",
+     "render.entity.model.ModelPartCubeM",
+     "render.entity.model.ModelPartM",
+     "render.entity.model.ModelM",
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/VillagerProfessionLayerM.java b/src/main/java/net/ruthenium/mixin/render/entity/VillagerProfessionLayerM.java
+new file mode 100644
+index 0000000..f7e58cb
+--- /dev/null
++++ b/src/main/java/net/ruthenium/mixin/render/entity/VillagerProfessionLayerM.java
+@@ -0,0 +1,85 @@
++package net.ruthenium.mixin.render.entity;
++
++import com.mojang.blaze3d.systems.RenderSystem;
++import it.unimi.dsi.fastutil.objects.Reference2ObjectOpenHashMap;
++import net.minecraft.client.renderer.entity.layers.VillagerProfessionLayer;
++import net.minecraft.client.renderer.texture.MissingTextureAtlasSprite;
++import net.minecraft.core.Holder;
++import net.minecraft.resources.Identifier;
++import net.minecraft.resources.ResourceKey;
++import org.spongepowered.asm.mixin.Final;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Overwrite;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.Unique;
++
++/**
++ * Villager and zombie villager clothing layers build up to three texture identifiers per submit
++ * ({@code "textures/entity/<path>/<type>/<key>.png"}: string concatenation and path validation, and a new identifier
++ * whose strings then hash afresh in the render type lookup). They are a function of the layer's path, the kind of
++ * texture and the registry key, so each layer keeps them per kind and key (render thread only; keys are interned
++ * {@link ResourceKey}s and the layer's own level identifiers).
++ */
++@Mixin(VillagerProfessionLayer.class)
++public class VillagerProfessionLayerM {
++    @Shadow @Final private String path;
++
++    @Unique private Reference2ObjectOpenHashMap<Object, Identifier>[] ruthenium$identifiers;
++
++    /**
++     * @author Ruthenium
++     * @reason Identifiers kept per kind and key
++     */
++    @Overwrite
++    private Identifier getIdentifier(final String type, final Identifier key) {
++        return this.ruthenium$identifier(type, key, key);
++    }
++
++    /**
++     * @author Ruthenium
++     * @reason Identifiers kept per kind and key
++     */
++    @Overwrite
++    private Identifier getIdentifier(final String type, final Holder<?> holder) {
++        ResourceKey<?> key = holder.unwrapKey().orElse(null);
++        return key != null ? this.ruthenium$identifier(type, key, key.identifier()) : MissingTextureAtlasSprite.getLocation();
++    }
++
++    @Unique
++    @SuppressWarnings("unchecked")
++    private Identifier ruthenium$identifier(String type, Object cacheKey, Identifier key) {
++        int kind = switch (type) {
++            case "baby" -> 0;
++            case "type" -> 1;
++            case "profession" -> 2;
++            case "profession_level" -> 3;
++            default -> -1;
++        };
++        if (kind < 0 || net.ruthenium.render.entity.ProbeSwitches.NO_VILLAGER_IDS || !RenderSystem.isOnRenderThread()) {
++            return this.ruthenium$build(type, key);
++        }
++
++        Reference2ObjectOpenHashMap<Object, Identifier>[] identifiers = this.ruthenium$identifiers;
++        if (identifiers == null) {
++            identifiers = new Reference2ObjectOpenHashMap[4];
++            this.ruthenium$identifiers = identifiers;
++        }
++        Reference2ObjectOpenHashMap<Object, Identifier> byKey = identifiers[kind];
++        if (byKey == null) {
++            byKey = new Reference2ObjectOpenHashMap<>();
++            identifiers[kind] = byKey;
++        }
++
++        Identifier identifier = byKey.get(cacheKey);
++        if (identifier == null) {
++            identifier = this.ruthenium$build(type, key);
++            byKey.put(cacheKey, identifier);
++        }
++        return identifier;
++    }
++
++    @Unique
++    private Identifier ruthenium$build(String type, Identifier key) {
++        return key.withPath(keyPath -> "textures/entity/" + this.path + "/" + type + "/" + keyPath + ".png");
++    }
++}

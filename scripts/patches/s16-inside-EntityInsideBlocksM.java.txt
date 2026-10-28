@@ -1,0 +1,75 @@
+package net.ruthenium.mixin.world;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.InsideBlockEffectApplier;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import net.ruthenium.Initializer;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Redirect;
+
+import java.util.List;
+
+/**
+ * {@code applyEffectsFromBlocks} runs every tick for dropped items, experience orbs, boats and the player on the
+ * client, and checks the blocks the entity's box passes through for effects (fire, powder snow, portals, ...). For
+ * movements by zero (resting or floating entities) vanilla visits exactly the blocks of the box at the target
+ * ({@code BlockPos.betweenClosed} of the box deflated by 1e-5) and does nothing at air blocks; when all of them are
+ * air, the visit is skipped. Client only (the server's debug subscribers report air blocks as well).
+ */
+@Mixin(Entity.class)
+public abstract class EntityInsideBlocksM {
+    @Shadow public abstract Level level();
+    @Shadow protected abstract AABB makeBoundingBox(Vec3 position);
+    @Shadow protected abstract void checkInsideBlocks(List<Entity.Movement> movements, InsideBlockEffectApplier.StepBasedCollector effectCollector);
+
+    @Redirect(method = "applyEffectsFromBlocks(Ljava/util/List;)V", at = @At(value = "INVOKE",
+            target = "Lnet/minecraft/world/entity/Entity;checkInsideBlocks(Ljava/util/List;Lnet/minecraft/world/entity/InsideBlockEffectApplier$StepBasedCollector;)V"))
+    private void skipAirOnlyChecks(Entity entity, List<Entity.Movement> movements, InsideBlockEffectApplier.StepBasedCollector collector) {
+        if (!(Initializer.CONFIG.fastBlockEffects && this.level().isClientSide() && this.onlyAirAtRest(movements))) {
+            this.checkInsideBlocks(movements, collector);
+        }
+    }
+
+    /** Whether every movement is by zero (vanilla's own test) and all blocks of the box at its target are air */
+    @Unique
+    private boolean onlyAirAtRest(List<Entity.Movement> movements) {
+        Level level = this.level();
+        BlockPos.MutableBlockPos pos = null;
+        for (int i = 0, n = movements.size(); i < n; i++) {
+            Entity.Movement movement = movements.get(i);
+            Vec3 from = movement.from(), to = movement.to();
+            double dx = to.x - from.x, dy = to.y - from.y, dz = to.z - from.z;
+            // forEachBlockIntersectedBetween's test for no travel; tiny travel split by axis visits boxes elsewhere
+            double lengthSqr = dx * dx + dy * dy + dz * dz;
+            if (!(lengthSqr < Mth.square(1.0E-5F)) || lengthSqr > 0.0 && movement.axisDependentOriginalMovement().isPresent()) {
+                return false;
+            }
+            AABB box = this.makeBoundingBox(to).deflate(1.0E-5F);
+            int x0 = Mth.floor(box.minX), y0 = Mth.floor(box.minY), z0 = Mth.floor(box.minZ);
+            int x1 = Mth.floor(box.maxX), y1 = Mth.floor(box.maxY), z1 = Mth.floor(box.maxZ);
+            if ((long) (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1) > 64) {
+                return false;
+            }
+            if (pos == null) {
+                pos = new BlockPos.MutableBlockPos();
+            }
+            for (int x = x0; x <= x1; x++) {
+                for (int y = y0; y <= y1; y++) {
+                    for (int z = z0; z <= z1; z++) {
+                        if (!level.getBlockState(pos.set(x, y, z)).isAir()) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+}

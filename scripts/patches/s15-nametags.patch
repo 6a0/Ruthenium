@@ -1,0 +1,110 @@
+diff --git a/src/main/resources/ruthenium.mixins.json b/src/main/resources/ruthenium.mixins.json
+index 1fa1e65..940bc78 100644
+--- a/src/main/resources/ruthenium.mixins.json
++++ b/src/main/resources/ruthenium.mixins.json
+@@ -32,6 +32,7 @@
+     "render.entity.LayerLightSectionStorageM",
+     "render.entity.ExtendedBlockModelFeatureRendererM",
+     "render.entity.LevelExtractorEntityM",
++    "render.entity.LivingEntityRendererM",
+     "render.entity.model.ModelPartCubeM",
+     "render.entity.model.ModelPartM",
+     "render.entity.model.ModelM",
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/LivingEntityRendererM.java b/src/main/java/net/ruthenium/mixin/render/entity/LivingEntityRendererM.java
+new file mode 100644
+index 0000000..74f3453
+--- /dev/null
++++ b/src/main/java/net/ruthenium/mixin/render/entity/LivingEntityRendererM.java
+@@ -0,0 +1,92 @@
++package net.ruthenium.mixin.render.entity;
++
++import net.minecraft.client.renderer.entity.EntityRenderer;
++import net.minecraft.client.renderer.entity.EntityRendererProvider;
++import net.minecraft.client.renderer.entity.LivingEntityRenderer;
++import net.minecraft.client.renderer.entity.state.LivingEntityRenderState;
++import net.minecraft.network.chat.Component;
++import net.minecraft.util.Mth;
++import net.minecraft.world.entity.Entity;
++import net.minecraft.world.entity.EntityAttachment;
++import net.minecraft.world.entity.LivingEntity;
++import net.minecraft.world.entity.ai.attributes.Attributes;
++import net.minecraft.world.scores.DisplaySlot;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Overwrite;
++import org.spongepowered.asm.mixin.Unique;
++
++/**
++ * Name tags of living entities without the two attribute reads per entity and frame when they can't matter.
++ * <p>
++ * Vanilla reads the name tag and below name distances from the entity's attributes first, then shows the name if the
++ * entity is within the name tag distance and {@code shouldShowName} says so, and the below name score if it is within
++ * the below name distance. Both conditions are queries, so the name tag distance is read only when
++ * {@code shouldShowName} is true (it is false for most mobs: no custom name), and the below name distance only when
++ * the scoreboard shows an objective below names or the entity's class overrides {@code belowNameDisplay}: otherwise
++ * {@code Entity.belowNameDisplay} returns null at any distance. The results are vanilla's.
++ */
++@Mixin(LivingEntityRenderer.class)
++public abstract class LivingEntityRendererM<T extends LivingEntity, S extends LivingEntityRenderState> extends EntityRenderer<T, S> {
++    @Unique
++    private static final ClassValue<Boolean> ruthenium$OVERRIDES_BELOW_NAME = new ClassValue<>() {
++        @Override
++        protected Boolean computeValue(Class<?> type) {
++            try {
++                return type.getMethod("belowNameDisplay").getDeclaringClass() != Entity.class;
++            } catch (NoSuchMethodException e) {
++                return true;
++            }
++        }
++    };
++
++    protected LivingEntityRendererM(EntityRendererProvider.Context context) {
++        super(context);
++    }
++
++    /**
++     * @author Ruthenium
++     * @reason Attribute reads only where they decide the result
++     */
++    @Overwrite
++    protected void extractNameTags(final T entity, final S state, final float partialTicks) {
++        if (net.ruthenium.render.entity.ProbeSwitches.VANILLA_NAME_TAGS) {
++            double nameTagDistance = entity.getAttribute(Attributes.NAME_TAG_DISTANCE).getValue();
++            double belowNameDistance = entity.getAttribute(Attributes.BELOW_NAME_DISTANCE).getValue();
++            this.extractNameTags(entity, state, partialTicks, nameTagDistance, belowNameDistance);
++            return;
++        }
++        if (this.entityRenderDispatcher.camera == null) {
++            return;
++        }
++
++        double distanceSq = this.entityRenderDispatcher.distanceToSqr(entity);
++        state.distanceToCameraSq = distanceSq;
++        if (this.shouldShowName(entity, distanceSq)
++                && distanceSq < Mth.square(entity.getAttribute(Attributes.NAME_TAG_DISTANCE).getValue())) {
++            state.nameTag = this.getNameTag(entity);
++            state.nameTagAttachment = entity.getAttachments().getNullable(EntityAttachment.NAME_TAG, 0, entity.getYRot(partialTicks));
++        } else {
++            state.nameTag = null;
++        }
++
++        if (entity.level().getScoreboard().getDisplayObjective(DisplaySlot.BELOW_NAME) == null
++                && !ruthenium$OVERRIDES_BELOW_NAME.get(entity.getClass())) {
++            state.scoreText = null;
++        } else if (distanceSq < Mth.square(entity.getAttribute(Attributes.BELOW_NAME_DISTANCE).getValue())) {
++            Component scoreText = entity.belowNameDisplay();
++            state.scoreText = scoreText;
++        } else {
++            state.scoreText = null;
++        }
++
++        if (net.ruthenium.render.entity.ProbeSwitches.NAME_TAG_CHECK) {
++            Component name = state.nameTag, score = state.scoreText;
++            var attachment = state.nameTagAttachment;
++            double nameTagDistance = entity.getAttribute(Attributes.NAME_TAG_DISTANCE).getValue();
++            double belowNameDistance = entity.getAttribute(Attributes.BELOW_NAME_DISTANCE).getValue();
++            this.extractNameTags(entity, state, partialTicks, nameTagDistance, belowNameDistance);
++            net.ruthenium.render.entity.ProbeSwitches.recordNameTag(java.util.Objects.equals(name, state.nameTag)
++                    && java.util.Objects.equals(score, state.scoreText) && java.util.Objects.equals(attachment, state.nameTagAttachment), name != null);
++        }
++    }
++}

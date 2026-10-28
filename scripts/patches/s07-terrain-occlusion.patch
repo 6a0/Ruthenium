@@ -1,0 +1,1282 @@
+diff --git a/src/gametest/java/net/ruthenium/gametest/TerrainBenchmark.java b/src/gametest/java/net/ruthenium/gametest/TerrainBenchmark.java
+index a48cd7c..850ba2b 100644
+--- a/src/gametest/java/net/ruthenium/gametest/TerrainBenchmark.java
++++ b/src/gametest/java/net/ruthenium/gametest/TerrainBenchmark.java
+@@ -54,6 +54,7 @@ final class TerrainBenchmark {
+     private static final String[] TERRAIN_SHOT_YAWS = BenchmarkClientGameTest.prop("terrainShotYaws", "90,180,270").split(",");
+     /** Switches Ruthenium's compressed terrain vertices off and on again through the settings, with screenshots */
+     private static final boolean SWITCH_CHECK = Boolean.parseBoolean(BenchmarkClientGameTest.prop("terrainSwitchCheck", "false"));
++    private static final String OCCLUSION_SWEEP = BenchmarkClientGameTest.prop("occlusionSweep", "");
+     private static final int REBUILDS = Integer.parseInt(BenchmarkClientGameTest.prop("terrainRebuilds", "3"));
+     private static final double LOAD_TIMEOUT_SECONDS = 120;
+ 
+@@ -109,27 +110,34 @@ final class TerrainBenchmark {
+                 CompressedTerrainSwitchCheck.run(context, label, runId);
+             }
+             context.takeScreenshot(label + "-terrain-static-" + runId);
++            if (!OCCLUSION_SWEEP.isEmpty()) {
++                occlusionSweep(context);
++            }
+             int renderedSections = context.computeOnClient(mc -> mc.levelExtractor.countRenderedSections());
+             context.runOnClient(_ -> {
+                 FrameRecorder.startPhase();
+                 GpuProbe.reset();
++                net.ruthenium.render.chunk.TerrainOcclusion.resetTotals();
+             });
+             BenchmarkClientGameTest.waitSeconds(context, BenchmarkClientGameTest.STATIC_SECONDS);
+             results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("static", -1)));
+             if (GpuProbe.ENABLED) {
+                 context.runOnClient(_ -> GpuProbe.report("static"));
+             }
++            context.runOnClient(_ -> reportOcclusion("static"));
+             LOGGER.info(results.getLast().summaryLine());
+ 
+             context.runOnClient(_ -> {
+                 FrameRecorder.startPhase();
+                 GpuProbe.reset();
++                net.ruthenium.render.chunk.TerrainOcclusion.resetTotals();
+             });
+             pan(context, BenchmarkClientGameTest.STATIC_YAW, BenchmarkClientGameTest.PAN_SECONDS);
+             results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("pan", -1)));
+             if (GpuProbe.ENABLED) {
+                 context.runOnClient(_ -> GpuProbe.report("pan"));
+             }
++            context.runOnClient(_ -> reportOcclusion("pan"));
+             frameSeries.put("pan", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
+             LOGGER.info(results.getLast().summaryLine());
+ 
+@@ -384,6 +392,44 @@ final class TerrainBenchmark {
+         context.waitFor(_ -> !FrameRecorder.isPanning(), (int) (seconds * TICKS_PER_SECOND * 10));
+     }
+ 
++    /** Static view at each {@code TerrainOcclusion.minFacePixels} of {@code bench.occlusionSweep}, 3 s each */
++    private static void occlusionSweep(ClientGameTestContext context) {
++        float original = net.ruthenium.render.chunk.TerrainOcclusion.minFacePixels;
++        for (String value : OCCLUSION_SWEEP.split(",")) {
++            float pixels = Float.parseFloat(value.trim());
++            context.runOnClient(_ -> {
++                net.ruthenium.render.chunk.TerrainOcclusion.minFacePixels = pixels;
++                net.ruthenium.Initializer.CONFIG.terrainOcclusionCulling = pixels >= 0;
++            });
++            context.waitTicks(10);
++            context.runOnClient(_ -> {
++                FrameRecorder.startPhase();
++                net.ruthenium.render.chunk.TerrainOcclusion.resetTotals();
++            });
++            BenchmarkClientGameTest.waitSeconds(context, 3);
++            PhaseResult result = context.computeOnClient(_ -> FrameRecorder.stopPhase("sweep" + pixels, -1));
++            LOGGER.info("Sweep {}: {}", pixels, result.summaryLine());
++            context.runOnClient(_ -> reportOcclusion("sweep " + pixels));
++        }
++        context.runOnClient(_ -> {
++            net.ruthenium.render.chunk.TerrainOcclusion.minFacePixels = original;
++            net.ruthenium.Initializer.CONFIG.terrainOcclusionCulling = true;
++        });
++    }
++
++    /** Sections hidden by {@code TerrainOcclusion} per frame of the phase */
++    private static void reportOcclusion(String phase) {
++        long frames = net.ruthenium.render.chunk.TerrainOcclusion.totalFrames;
++        if (frames == 0) {
++            LOGGER.info("Occlusion {}: off", phase);
++            return;
++        }
++        LOGGER.info("Occlusion {}: {} of {} tested sections hidden, {} faces rasterized per frame ({} frames)", phase,
++                net.ruthenium.render.chunk.TerrainOcclusion.totalHidden / frames,
++                net.ruthenium.render.chunk.TerrainOcclusion.totalTested / frames,
++                net.ruthenium.render.chunk.TerrainOcclusion.totalFaces / frames, frames);
++    }
++
+     private static void setView(ClientGameTestContext context, float yaw) {
+         context.runOnClient(mc -> {
+             mc.player.setYRot(yaw);
+diff --git a/src/main/java/net/ruthenium/config/Config.java b/src/main/java/net/ruthenium/config/Config.java
+index 713077e..6269a48 100644
+--- a/src/main/java/net/ruthenium/config/Config.java
++++ b/src/main/java/net/ruthenium/config/Config.java
+@@ -27,6 +27,8 @@ public class Config {
+     public boolean skipIdleTicks = true;
+     /** Skips the terrain faces of a section that all face away from the camera */
+     public boolean terrainFaceCulling = true;
++    /** Leaves out terrain sections hidden behind the opaque faces of nearer ones, found on the CPU */
++    public boolean terrainOcclusionCulling = true;
+     /** Solid and cutout terrain vertices in 20 instead of 28 bytes */
+     public boolean compressedTerrain = true;
+     /** Biome tint blending computes each column's sample once per section instead of once per block */
+diff --git a/src/main/java/net/ruthenium/config/option/Options.java b/src/main/java/net/ruthenium/config/option/Options.java
+index 086ccfc..a8a9adc 100644
+--- a/src/main/java/net/ruthenium/config/option/Options.java
++++ b/src/main/java/net/ruthenium/config/option/Options.java
+@@ -182,6 +182,11 @@ public abstract class Options {
+                                 () -> config.terrainFaceCulling)
+                                 .setTooltip(value -> Component.translatable("ruthenium.options.terrainFaceCulling.tooltip"))
+                                 .setImpact(PerformanceImpact.HIGH),
++                        new SwitchOption(Component.translatable("ruthenium.options.terrainOcclusionCulling"),
++                                value -> config.terrainOcclusionCulling = value,
++                                () -> config.terrainOcclusionCulling)
++                                .setTooltip(value -> Component.translatable("ruthenium.options.terrainOcclusionCulling.tooltip"))
++                                .setImpact(PerformanceImpact.HIGH),
+                         new SwitchOption(Component.translatable("ruthenium.options.compressedTerrain"),
+                                 value -> {
+                                     config.compressedTerrain = value;
+diff --git a/src/main/java/net/ruthenium/interfaces/OccluderHolder.java b/src/main/java/net/ruthenium/interfaces/OccluderHolder.java
+new file mode 100644
+index 0000000..d888942
+--- /dev/null
++++ b/src/main/java/net/ruthenium/interfaces/OccluderHolder.java
+@@ -0,0 +1,12 @@
++package net.ruthenium.interfaces;
++
++import net.ruthenium.render.chunk.SectionOccluders;
++import org.jspecify.annotations.Nullable;
++
++/** The {@link SectionOccluders} of a section's compile results and of the compiled mesh made from them */
++public interface OccluderHolder {
++
++    @Nullable SectionOccluders ruthenium$getOccluders();
++
++    void ruthenium$setOccluders(SectionOccluders occluders);
++}
+diff --git a/src/main/java/net/ruthenium/mixin/render/blockentity/CompiledSectionMeshM.java b/src/main/java/net/ruthenium/mixin/render/blockentity/CompiledSectionMeshM.java
+index 03f6b48..1ec221a 100644
+--- a/src/main/java/net/ruthenium/mixin/render/blockentity/CompiledSectionMeshM.java
++++ b/src/main/java/net/ruthenium/mixin/render/blockentity/CompiledSectionMeshM.java
+@@ -9,8 +9,10 @@ import net.minecraft.world.level.block.entity.BlockEntity;
+ import net.ruthenium.interfaces.BlockEntityPositions;
+ import net.ruthenium.interfaces.CachedSectionSlices;
+ import net.ruthenium.interfaces.FaceGroupsHolder;
++import net.ruthenium.interfaces.OccluderHolder;
+ import net.ruthenium.render.blockentity.BlockEntityCulling;
+ import net.ruthenium.render.chunk.SectionFaceGroups;
++import net.ruthenium.render.chunk.SectionOccluders;
+ import org.jspecify.annotations.Nullable;
+ import org.spongepowered.asm.mixin.Final;
+ import org.spongepowered.asm.mixin.Mixin;
+@@ -25,10 +27,10 @@ import java.util.List;
+ /**
+  * The renderable block entity list of a compiled section never changes, so its positions are packed once (on the
+  * render thread, when culling first needs them). The mesh also keeps the face groups of its compile results and
+- * its cached place in the terrain buffers.
++ * its cached place in the terrain buffers, and its occluders.
+  */
+ @Mixin(CompiledSectionMesh.class)
+-public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHolder, CachedSectionSlices {
++public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHolder, CachedSectionSlices, OccluderHolder {
+     @Shadow @Final private List<BlockEntity> renderableBlockEntities;
+ 
+     @Unique private long[] positions;
+@@ -36,6 +38,7 @@ public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHol
+     // Allocated in code: initializers of these fields were not merged into the constructor before the injection ran
+     @Unique private SectionFaceGroups @Nullable [] faceGroups;
+     @Unique private SectionRenderDispatcher.RenderSectionBufferSlice @Nullable [] slices;
++    @Unique private @Nullable SectionOccluders occluders;
+ 
+     @Inject(method = "<init>", at = @At("RETURN"))
+     private void copyFaceGroups(TranslucencyPointOfView pointOfView, SectionCompiler.Results results, long compileTaskStartTimeNs,
+@@ -46,6 +49,17 @@ public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHol
+                 this.ruthenium$setFaceGroups(layer, groups);
+             }
+         }
++        this.occluders = ((OccluderHolder) (Object) results).ruthenium$getOccluders();
++    }
++
++    @Override
++    public @Nullable SectionOccluders ruthenium$getOccluders() {
++        return this.occluders;
++    }
++
++    @Override
++    public void ruthenium$setOccluders(SectionOccluders occluders) {
++        this.occluders = occluders;
+     }
+ 
+     @Override
+diff --git a/src/main/java/net/ruthenium/mixin/render/chunk/GameRendererM.java b/src/main/java/net/ruthenium/mixin/render/chunk/GameRendererM.java
+new file mode 100644
+index 0000000..b3293be
+--- /dev/null
++++ b/src/main/java/net/ruthenium/mixin/render/chunk/GameRendererM.java
+@@ -0,0 +1,22 @@
++package net.ruthenium.mixin.render.chunk;
++
++import com.llamalad7.mixinextras.sugar.Local;
++import net.minecraft.client.renderer.GameRenderer;
++import net.ruthenium.render.chunk.TerrainOcclusion;
++import org.joml.Matrix4f;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++@Mixin(GameRenderer.class)
++public class GameRendererM {
++
++    /** Terrain occlusion culling projects with the level's final projection, view bobbing and nausea included */
++    @Inject(method = "renderLevel", at = @At(value = "INVOKE",
++            target = "Lcom/mojang/blaze3d/systems/RenderSystem;setProjectionMatrix(Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;Lcom/mojang/blaze3d/ProjectionType;)V",
++            ordinal = 0))
++    private void captureProjection(CallbackInfo ci, @Local(ordinal = 0) Matrix4f projectionMatrix) {
++        TerrainOcclusion.setProjection(projectionMatrix);
++    }
++}
+diff --git a/src/main/java/net/ruthenium/mixin/render/chunk/LevelRendererM.java b/src/main/java/net/ruthenium/mixin/render/chunk/LevelRendererM.java
+index 29125fb..13db7aa 100644
+--- a/src/main/java/net/ruthenium/mixin/render/chunk/LevelRendererM.java
++++ b/src/main/java/net/ruthenium/mixin/render/chunk/LevelRendererM.java
+@@ -5,14 +5,18 @@ import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+ import com.llamalad7.mixinextras.sugar.Local;
+ import com.mojang.renderpearl.api.textures.GpuTextureView;
+ import it.unimi.dsi.fastutil.objects.ObjectArrayList;
++import com.mojang.blaze3d.pipeline.RenderTarget;
+ import net.minecraft.client.renderer.DynamicGpuData;
++import net.minecraft.client.renderer.GameRenderer;
+ import net.minecraft.client.renderer.LevelRenderer;
+ import net.minecraft.client.renderer.ViewArea;
+ import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+ import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
++import net.minecraft.client.renderer.chunk.CompiledSectionMesh;
+ import net.minecraft.client.renderer.chunk.SectionMesh;
+ import net.minecraft.client.renderer.chunk.SectionRenderDispatcher;
+ import net.minecraft.client.renderer.state.OptionsRenderState;
++import net.minecraft.client.renderer.state.level.CameraRenderState;
+ import net.minecraft.client.renderer.state.level.LevelRenderState;
+ import net.minecraft.client.renderer.texture.TextureAtlas;
+ import net.minecraft.client.renderer.texture.TextureManager;
+@@ -20,19 +24,24 @@ import net.minecraft.core.BlockPos;
+ import net.minecraft.world.phys.Vec3;
+ import net.ruthenium.Initializer;
+ import net.ruthenium.interfaces.FaceGroupsHolder;
++import net.ruthenium.interfaces.OccluderHolder;
+ import net.ruthenium.interfaces.SectionDispatcherReset;
+ import net.ruthenium.render.chunk.CompressedTerrain;
+ import net.ruthenium.render.chunk.SectionFaceGroups;
++import net.ruthenium.render.chunk.SectionOccluders;
+ import net.ruthenium.render.chunk.TerrainDrawList;
++import net.ruthenium.render.chunk.TerrainOcclusion;
+ import org.joml.Matrix4fc;
+ import org.jspecify.annotations.Nullable;
+ import org.spongepowered.asm.mixin.Final;
+ import org.spongepowered.asm.mixin.Mixin;
+ import org.spongepowered.asm.mixin.Overwrite;
+ import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.Unique;
+ import org.spongepowered.asm.mixin.injection.At;
+ import org.spongepowered.asm.mixin.injection.Inject;
+ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+ 
+ import java.util.List;
+ 
+@@ -41,6 +50,7 @@ public abstract class LevelRendererM implements SectionDispatcherReset {
+     @Shadow @Final private LevelRenderState levelRenderState;
+     @Shadow @Final private OptionsRenderState optionsRenderState;
+     @Shadow @Final private TextureManager textureManager;
++    @Shadow @Final private GameRenderer gameRenderer;
+     @Shadow @Final private ObjectArrayList<SectionRenderDispatcher.RenderSection> visibleSections;
+     @Shadow private @Nullable SectionRenderDispatcher sectionRenderDispatcher;
+     @Shadow private @Nullable ViewArea viewArea;
+@@ -73,25 +83,74 @@ public abstract class LevelRendererM implements SectionDispatcherReset {
+     /**
+      * @author Ruthenium
+      * @reason Builds the same multi-draw-indirect commands without the per-frame hash lookups and records
+-     * ({@link TerrainDrawList}), and with the face groups
++     * ({@link TerrainDrawList}), with the face groups and without the sections hidden by others
+      */
+     @Overwrite
+     public ChunkSectionsToRender prepareChunkRendersIndirect(final Matrix4fc modelViewMatrix, final boolean respectTranslucentOrder) {
+         GpuTextureView blockAtlas = this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
++        RenderTarget target = this.gameRenderer.mainRenderTarget();
+         return TerrainDrawList.prepare(this.sectionRenderDispatcher, this.visibleSections, this.levelRenderState.cameraRenderState.pos,
+                 this.optionsRenderState.chunkSectionFadeInTime, modelViewMatrix, blockAtlas.getWidth(0), blockAtlas.getHeight(0),
+-                respectTranslucentOrder);
++                respectTranslucentOrder, target.width, target.height, this.ruthenium$occlusionCulling());
++    }
++
++    /** Not in the debug views that show what culling leaves out, or that draw hidden geometry */
++    @Unique
++    private boolean ruthenium$occlusionCulling() {
++        CameraRenderState camera = this.levelRenderState.cameraRenderState;
++        return camera.smartCull && !camera.isFrustumCaptured && !camera.isPanoramicMode && !this.levelRenderState.renderWireframeTerrain;
++    }
++
++    /** Occlusion culling on the path without multi-draw-indirect, like {@link TerrainDrawList}'s */
++    @Inject(method = "prepareChunkRenders", at = @At("HEAD"))
++    private void beginOcclusion(Matrix4fc modelViewMatrix, boolean respectTranslucentOrder, CallbackInfoReturnable<ChunkSectionsToRender> cir) {
++        RenderTarget target = this.gameRenderer.mainRenderTarget();
++        TerrainOcclusion.begin(modelViewMatrix, target.width, target.height, this.ruthenium$occlusionCulling());
++    }
++
++    /** A hidden section has nothing to draw */
++    @WrapOperation(method = "extractSectionDrawGroups", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection;getSectionMesh()Lnet/minecraft/client/renderer/chunk/SectionMesh;"))
++    private SectionMesh skipHiddenSection(SectionRenderDispatcher.RenderSection section, Operation<SectionMesh> original) {
++        SectionMesh mesh = original.call(section);
++        if (TerrainOcclusion.isActive() && mesh instanceof OccluderHolder holder) {
++            SectionOccluders occluders = holder.ruthenium$getOccluders();
++            if (occluders != null && !TerrainOcclusion.isVisible(occluders, this.ruthenium$originX(section),
++                    this.ruthenium$originY(section), this.ruthenium$originZ(section))) {
++                return CompiledSectionMesh.EMPTY;
++            }
++        }
++        return mesh;
++    }
++
++    @Unique
++    private double ruthenium$originX(SectionRenderDispatcher.RenderSection section) {
++        return section.getRenderOrigin().getX() - this.levelRenderState.cameraRenderState.pos.x;
++    }
++
++    @Unique
++    private double ruthenium$originY(SectionRenderDispatcher.RenderSection section) {
++        return section.getRenderOrigin().getY() - this.levelRenderState.cameraRenderState.pos.y;
++    }
++
++    @Unique
++    private double ruthenium$originZ(SectionRenderDispatcher.RenderSection section) {
++        return section.getRenderOrigin().getZ() - this.levelRenderState.cameraRenderState.pos.z;
+     }
+ 
+     /**
+      * Replaces the draw of a section layer whose quads are grouped by facing with draws of the groups that can face
+-     * the camera, on the path without multi-draw-indirect.
++     * the camera, on the path without multi-draw-indirect. A drawn solid layer adds the section's occluders.
+      */
+     @SuppressWarnings({"rawtypes", "unchecked"})
+     @WrapOperation(method = "extractSectionDrawGroups", at = @At(value = "INVOKE", target = "Ljava/util/List;add(Ljava/lang/Object;)Z"))
+     private boolean addFacingGroupDraws(List list, Object element, Operation<Boolean> original,
+                                         @Local SectionRenderDispatcher.RenderSection section,
+                                         @Local ChunkSectionLayer layer, @Local SectionMesh sectionMesh) {
++        if (element instanceof DynamicGpuData.IndexedDraw && layer == ChunkSectionLayer.SOLID && TerrainOcclusion.isActive()
++                && sectionMesh instanceof OccluderHolder holder && holder.ruthenium$getOccluders() != null) {
++            TerrainOcclusion.addOccluders(holder.ruthenium$getOccluders(), this.ruthenium$originX(section),
++                    this.ruthenium$originY(section), this.ruthenium$originZ(section));
++        }
+         if (element instanceof DynamicGpuData.IndexedDraw draw && Initializer.CONFIG.terrainFaceCulling
+                 && sectionMesh instanceof FaceGroupsHolder holder) {
+             SectionFaceGroups groups = holder.ruthenium$getFaceGroups(layer);
+diff --git a/src/main/java/net/ruthenium/mixin/render/chunk/SectionCompilerM.java b/src/main/java/net/ruthenium/mixin/render/chunk/SectionCompilerM.java
+index 2081578..8b5ba76 100644
+--- a/src/main/java/net/ruthenium/mixin/render/chunk/SectionCompilerM.java
++++ b/src/main/java/net/ruthenium/mixin/render/chunk/SectionCompilerM.java
+@@ -17,9 +17,11 @@ import net.minecraft.core.SectionPos;
+ import net.ruthenium.interfaces.SectionLightWindow;
+ import net.ruthenium.Initializer;
+ import net.ruthenium.interfaces.FaceGroupsHolder;
++import net.ruthenium.interfaces.OccluderHolder;
+ import net.ruthenium.render.chunk.CompressedTerrain;
+ import net.ruthenium.render.chunk.CompressedTerrainBuilder;
+ import net.ruthenium.render.chunk.SectionFaceGroups;
++import net.ruthenium.render.chunk.SectionOccluders;
+ import org.spongepowered.asm.mixin.Mixin;
+ import org.spongepowered.asm.mixin.injection.At;
+ import org.spongepowered.asm.mixin.injection.Inject;
+@@ -37,10 +39,22 @@ public class SectionCompilerM {
+         ((SectionLightWindow) BlockModelLighterAccessor.ruthenium$getCache().get()).ruthenium$beginSection(sectionPos.origin());
+     }
+ 
+-    /** Groups the quads of each opaque layer's mesh by facing as it is added to the results */
++    /**
++     * Groups the quads of each opaque layer's mesh by facing as it is added to the results, and collects the
++     * section's occluders
++     */
+     @WrapOperation(method = "compile", at = @At(value = "INVOKE", target = "Ljava/util/Map;put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"))
+     private Object groupQuadsByFacing(Map<Object, Object> layers, Object layer, Object mesh, Operation<Object> original,
+                                       @Local SectionCompiler.Results results) {
++        if (layer instanceof ChunkSectionLayer sectionLayer && mesh instanceof MeshData meshData) {
++            OccluderHolder holder = (OccluderHolder) (Object) results;
++            SectionOccluders occluders = holder.ruthenium$getOccluders();
++            if (occluders == null) {
++                occluders = new SectionOccluders();
++                holder.ruthenium$setOccluders(occluders);
++            }
++            occluders.addLayer(sectionLayer, meshData);
++        }
+         if (Initializer.CONFIG.terrainFaceCulling && layer instanceof ChunkSectionLayer sectionLayer
+                 && !sectionLayer.translucent() && mesh instanceof MeshData meshData) {
+             ((FaceGroupsHolder) (Object) results).ruthenium$setFaceGroups(sectionLayer, SectionFaceGroups.sort(meshData));
+diff --git a/src/main/java/net/ruthenium/mixin/render/chunk/SectionCompilerResultsM.java b/src/main/java/net/ruthenium/mixin/render/chunk/SectionCompilerResultsM.java
+index a33d362..6712cd6 100644
+--- a/src/main/java/net/ruthenium/mixin/render/chunk/SectionCompilerResultsM.java
++++ b/src/main/java/net/ruthenium/mixin/render/chunk/SectionCompilerResultsM.java
+@@ -3,15 +3,18 @@ package net.ruthenium.mixin.render.chunk;
+ import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+ import net.minecraft.client.renderer.chunk.SectionCompiler;
+ import net.ruthenium.interfaces.FaceGroupsHolder;
++import net.ruthenium.interfaces.OccluderHolder;
+ import net.ruthenium.render.chunk.SectionFaceGroups;
++import net.ruthenium.render.chunk.SectionOccluders;
+ import org.jspecify.annotations.Nullable;
+ import org.spongepowered.asm.mixin.Mixin;
+ import org.spongepowered.asm.mixin.Unique;
+ 
+ @Mixin(SectionCompiler.Results.class)
+-public class SectionCompilerResultsM implements FaceGroupsHolder {
++public class SectionCompilerResultsM implements FaceGroupsHolder, OccluderHolder {
+     // Allocated in code rather than by an initializer (see CompiledSectionMeshM)
+     @Unique private SectionFaceGroups @Nullable [] faceGroups;
++    @Unique private @Nullable SectionOccluders occluders;
+ 
+     @Override
+     public @Nullable SectionFaceGroups ruthenium$getFaceGroups(ChunkSectionLayer layer) {
+@@ -25,4 +28,14 @@ public class SectionCompilerResultsM implements FaceGroupsHolder {
+         }
+         this.faceGroups[layer.ordinal()] = groups;
+     }
++
++    @Override
++    public @Nullable SectionOccluders ruthenium$getOccluders() {
++        return this.occluders;
++    }
++
++    @Override
++    public void ruthenium$setOccluders(SectionOccluders occluders) {
++        this.occluders = occluders;
++    }
+ }
+diff --git a/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java b/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
+index daf254f..3e8a265 100644
+--- a/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
++++ b/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
+@@ -78,7 +78,7 @@ public final class SectionFaceGroups {
+ 
+         float[] position = new float[12];
+         for (int q = 0; q < quadCount; q++) {
+-            readPositions(base + (long) q * quadBytes, stride, compressed, position);
++            readPositions(base + (long) q * quadBytes, stride, compressed, position, 4);
+             float x0 = position[0], y0 = position[1], z0 = position[2];
+             float x1 = position[3], y1 = position[4], z1 = position[5];
+             float x2 = position[6], y2 = position[7], z2 = position[8];
+@@ -137,9 +137,9 @@ public final class SectionFaceGroups {
+         return groups;
+     }
+ 
+-    /** The positions of a quad's 4 vertices, as the vertex shader sees them */
+-    private static void readPositions(long quad, int stride, boolean compressed, float[] out) {
+-        for (int i = 0; i < 4; i++) {
++    /** The positions of {@code count} consecutive vertices (a quad's 4), as the vertex shader sees them */
++    static void readPositions(long quad, int stride, boolean compressed, float[] out, int count) {
++        for (int i = 0; i < count; i++) {
+             long vertex = quad + (long) i * stride;
+             if (compressed) {
+                 long packed = MemoryUtil.memGetLong(vertex + CompressedTerrain.POSITION_OFFSET);
+diff --git a/src/main/java/net/ruthenium/render/chunk/SectionOccluders.java b/src/main/java/net/ruthenium/render/chunk/SectionOccluders.java
+new file mode 100644
+index 0000000..f31f5d1
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/chunk/SectionOccluders.java
+@@ -0,0 +1,239 @@
++package net.ruthenium.render.chunk;
++
++import com.mojang.blaze3d.vertex.DefaultVertexFormat;
++import com.mojang.blaze3d.vertex.MeshData;
++import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
++import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
++import org.lwjgl.system.MemoryUtil;
++
++import java.nio.ByteBuffer;
++import java.util.Arrays;
++
++/**
++ * What {@link TerrainOcclusion} needs of a compiled section: the bounds of all its vertices, and the opaque faces it
++ * draws, as rectangles.
++ * <p>
++ * The faces are the solid layer's quads that are a whole block face (a unit square on the block grid in an
++ * axis-aligned plane), merged per plane and facing into rectangles. They are taken from the mesh itself, so they are
++ * exactly what the GPU draws for the section: opaque (the solid layer neither blends nor discards), facing the way of
++ * their winding, and adjacent quads share their vertices, so a rectangle has no cracks.
++ * <p>
++ * Built on the compile worker of the section, read on the render thread once the mesh is published.
++ */
++public final class SectionOccluders {
++    /** Positive x, negative x, positive y, ... */
++    public static final int DIRECTIONS = 6;
++    private static final int PLANES = 17;
++
++    private static final ThreadLocal<short[]> ROWS = ThreadLocal.withInitial(() -> new short[DIRECTIONS * PLANES * 16]);
++    private static final int[] NO_FACES = new int[0];
++
++    /**
++     * Per rectangle, largest first: direction (3 bits), plane (5 bits), then the first and last block of its two
++     * in-plane axes (4 bits each). The in-plane axes are y and z for faces along x, x and z along y, and x and y
++     * along z.
++     */
++    int[] faces = NO_FACES;
++    /** Section-relative bounds of the vertices; empty (min > max) until a layer is added */
++    float minX = Float.POSITIVE_INFINITY, minY = Float.POSITIVE_INFINITY, minZ = Float.POSITIVE_INFINITY;
++    float maxX = Float.NEGATIVE_INFINITY, maxY = Float.NEGATIVE_INFINITY, maxZ = Float.NEGATIVE_INFINITY;
++    /** False if a layer's vertices couldn't be read; the section is then never treated as hidden */
++    boolean bounded = true;
++
++    public static int direction(int face) {
++        return face & 7;
++    }
++
++    public static int plane(int face) {
++        return face >>> 3 & 31;
++    }
++
++    public static int u0(int face) {
++        return face >>> 8 & 15;
++    }
++
++    public static int v0(int face) {
++        return face >>> 12 & 15;
++    }
++
++    /** Exclusive end */
++    public static int u1(int face) {
++        return (face >>> 16 & 15) + 1;
++    }
++
++    /** Exclusive end */
++    public static int v1(int face) {
++        return (face >>> 20 & 15) + 1;
++    }
++
++    /** In blocks */
++    public static int area(int face) {
++        return (u1(face) - u0(face)) * (v1(face) - v0(face));
++    }
++
++    public int[] faces() {
++        return this.faces;
++    }
++
++    public boolean isBounded() {
++        return this.bounded && this.minX <= this.maxX;
++    }
++
++    /** Adds a layer mesh of the section as the compiler finishes it */
++    public void addLayer(ChunkSectionLayer layer, MeshData mesh) {
++        MeshData.DrawState state = mesh.drawState();
++        boolean compressed = state.format() == CompressedTerrain.FORMAT;
++        if (state.format() != DefaultVertexFormat.BLOCK && !compressed) {
++            this.bounded = false;
++            return;
++        }
++        int stride = state.format().getVertexSize();
++        int vertexCount = state.vertexCount();
++        ByteBuffer vertices = mesh.vertexBuffer();
++        if (vertices.remaining() < vertexCount * stride) {
++            this.bounded = false;
++            return;
++        }
++        long base = MemoryUtil.memAddress(vertices);
++
++        float minX = this.minX, minY = this.minY, minZ = this.minZ;
++        float maxX = this.maxX, maxY = this.maxY, maxZ = this.maxZ;
++        float[] position = new float[12];
++        for (int v = 0; v < vertexCount; v += 4) {
++            int count = Math.min(4, vertexCount - v);
++            SectionFaceGroups.readPositions(base + (long) v * stride, stride, compressed, position, count);
++            for (int i = 0; i < count * 3; i += 3) {
++                minX = Math.min(minX, position[i]);
++                maxX = Math.max(maxX, position[i]);
++                minY = Math.min(minY, position[i + 1]);
++                maxY = Math.max(maxY, position[i + 1]);
++                minZ = Math.min(minZ, position[i + 2]);
++                maxZ = Math.max(maxZ, position[i + 2]);
++            }
++        }
++        this.minX = minX;
++        this.minY = minY;
++        this.minZ = minZ;
++        this.maxX = maxX;
++        this.maxY = maxY;
++        this.maxZ = maxZ;
++
++        if (layer == ChunkSectionLayer.SOLID && mesh.indexBuffer() == null && state.primitiveTopology() == PrimitiveTopology.QUADS) {
++            this.faces = findFaces(base, stride, compressed, vertexCount / 4, position);
++        }
++    }
++
++    private static int[] findFaces(long base, int stride, boolean compressed, int quadCount, float[] position) {
++        short[] rows = ROWS.get();
++        Arrays.fill(rows, (short) 0);
++        int found = 0;
++        for (int q = 0; q < quadCount; q++) {
++            SectionFaceGroups.readPositions(base + (long) q * 4 * stride, stride, compressed, position, 4);
++            int face = unitFace(position);
++            if (face >= 0) {
++                rows[face >>> 4] |= (short) (1 << (face & 15));
++                found++;
++            }
++        }
++        return found == 0 ? NO_FACES : merge(rows);
++    }
++
++    /**
++     * @return {@code ((direction * PLANES + plane) * 16 + v) * 16 + u} of a quad that covers exactly one block face,
++     * or -1
++     */
++    private static int unitFace(float[] p) {
++        // Normal of the quad's winding from its diagonals, like SectionFaceGroups
++        float ax = p[6] - p[0], ay = p[7] - p[1], az = p[8] - p[2];
++        float bx = p[9] - p[3], by = p[10] - p[4], bz = p[11] - p[5];
++        float nx = ay * bz - az * by;
++        float ny = az * bx - ax * bz;
++        float nz = ax * by - ay * bx;
++
++        int axis, u, v;
++        float normal;
++        if (p[0] == p[3] && p[0] == p[6] && p[0] == p[9]) {
++            axis = 0;
++            u = 1;
++            v = 2;
++            normal = nx;
++        } else if (p[1] == p[4] && p[1] == p[7] && p[1] == p[10]) {
++            axis = 1;
++            u = 0;
++            v = 2;
++            normal = ny;
++        } else if (p[2] == p[5] && p[2] == p[8] && p[2] == p[11]) {
++            axis = 2;
++            u = 0;
++            v = 1;
++            normal = nz;
++        } else {
++            return -1;
++        }
++        if (normal == 0.0f) {
++            return -1;
++        }
++
++        float plane = p[axis];
++        float u0 = Math.min(Math.min(p[u], p[u + 3]), Math.min(p[u + 6], p[u + 9]));
++        float v0 = Math.min(Math.min(p[v], p[v + 3]), Math.min(p[v + 6], p[v + 9]));
++        if (plane != (int) plane || plane < 0.0f || plane > 16.0f || u0 != (int) u0 || u0 < 0.0f || u0 > 15.0f
++                || v0 != (int) v0 || v0 < 0.0f || v0 > 15.0f) {
++            return -1;
++        }
++        // The 4 vertices must be the 4 corners of the unit square
++        int corners = 0;
++        for (int i = 0; i < 12; i += 3) {
++            float du = p[i + u] - u0, dv = p[i + v] - v0;
++            if (du != 0.0f && du != 1.0f || dv != 0.0f && dv != 1.0f) {
++                return -1;
++            }
++            corners |= 1 << ((int) du | (int) dv << 1);
++        }
++        if (corners != 15) {
++            return -1;
++        }
++        int direction = axis * 2 + (normal > 0.0f ? 0 : 1);
++        return ((direction * PLANES + (int) plane) * 16 + (int) v0) * 16 + (int) u0;
++    }
++
++    /** Greedy merge of each plane's unit faces into rectangles */
++    private static int[] merge(short[] rows) {
++        int[] faces = new int[32];
++        int count = 0;
++        for (int dp = 0; dp < DIRECTIONS * PLANES; dp++) {
++            int rowBase = dp * 16;
++            for (int v = 0; v < 16; v++) {
++                int row;
++                while ((row = rows[rowBase + v] & 0xFFFF) != 0) {
++                    int u0 = Integer.numberOfTrailingZeros(row);
++                    int u1 = u0 + Integer.numberOfTrailingZeros(~(row >>> u0));
++                    int run = ((1 << (u1 - u0)) - 1) << u0;
++                    int v1 = v + 1;
++                    while (v1 < 16 && (rows[rowBase + v1] & run) == run) {
++                        v1++;
++                    }
++                    for (int r = v; r < v1; r++) {
++                        rows[rowBase + r] &= (short) ~run;
++                    }
++                    if (count == faces.length) {
++                        faces = Arrays.copyOf(faces, count * 2);
++                    }
++                    int direction = dp / PLANES, plane = dp % PLANES;
++                    faces[count++] = direction | plane << 3 | u0 << 8 | v << 12 | (u1 - 1) << 16 | (v1 - 1) << 20;
++                }
++            }
++        }
++        // Largest first (stable), so a frame can stop at the first face too small to matter
++        Integer[] order = new Integer[count];
++        for (int i = 0; i < count; i++) {
++            order[i] = faces[i];
++        }
++        Arrays.sort(order, (a, b) -> Integer.compare(area(b), area(a)));
++        int[] sorted = new int[count];
++        for (int i = 0; i < count; i++) {
++            sorted[i] = order[i];
++        }
++        return sorted;
++    }
++}
+diff --git a/src/main/java/net/ruthenium/render/chunk/TerrainDrawList.java b/src/main/java/net/ruthenium/render/chunk/TerrainDrawList.java
+index b26f0f5..6a0cfad 100644
+--- a/src/main/java/net/ruthenium/render/chunk/TerrainDrawList.java
++++ b/src/main/java/net/ruthenium/render/chunk/TerrainDrawList.java
+@@ -18,6 +18,7 @@ import net.minecraft.world.phys.Vec3;
+ import net.ruthenium.Initializer;
+ import net.ruthenium.interfaces.CachedSectionSlices;
+ import net.ruthenium.interfaces.FaceGroupsHolder;
++import net.ruthenium.interfaces.OccluderHolder;
+ import org.joml.Matrix4fc;
+ import org.jspecify.annotations.Nullable;
+ import org.lwjgl.system.MemoryUtil;
+@@ -35,7 +36,7 @@ import java.util.List;
+  * being looked up in the uber buffers' hash maps, commands are collected in reused int arrays instead of a record
+  * per draw, and they are written to mapped memory in one copy per group. Draw groups, their order (translucent
+  * groups and draws back to front) and the commands are the same as vanilla's, plus the face groups of
+- * {@link SectionFaceGroups}.
++ * {@link SectionFaceGroups}, without the sections {@link TerrainOcclusion} finds hidden.
+  * <p>
+  * Render thread only.
+  */
+@@ -92,7 +93,8 @@ public final class TerrainDrawList {
+     public static ChunkSectionsToRender prepare(@Nullable SectionRenderDispatcher dispatcher,
+                                                 ObjectArrayList<SectionRenderDispatcher.RenderSection> visibleSections,
+                                                 Vec3 eye, double fadeInSeconds, Matrix4fc modelView,
+-                                                int atlasWidth, int atlasHeight, boolean respectTranslucentOrder) {
++                                                int atlasWidth, int atlasHeight, boolean respectTranslucentOrder,
++                                                int targetWidth, int targetHeight, boolean occlusionCulling) {
+         for (List<Group> groups : GROUPS) {
+             for (Group group : groups) {
+                 group.count = 0;
+@@ -106,6 +108,8 @@ public final class TerrainDrawList {
+             VERTEX_SIZES[layer.ordinal()] = layer.pipeline(false).getVertexFormatBinding(0).getVertexSize();
+         }
+ 
++        TerrainOcclusion.begin(modelView, targetWidth, targetHeight, occlusionCulling);
++
+         int largestIndexCount = 0;
+         if (dispatcher != null) {
+             dispatcher.lock();
+@@ -133,6 +137,7 @@ public final class TerrainDrawList {
+         long fadeDuration = Util.toMillis(fadeInSeconds);
+         long now = Util.getMillis();
+         boolean faceCulling = Initializer.CONFIG.terrainFaceCulling;
++        boolean occlusion = TerrainOcclusion.isActive();
+         int largestIndexCount = 0;
+         @Nullable Group lastTranslucent = null;
+ 
+@@ -143,6 +148,18 @@ public final class TerrainDrawList {
+             BlockPos origin = section.getRenderOrigin();
+             int sectionInfo = -1;
+ 
++            SectionOccluders occluders = occlusion && mesh instanceof OccluderHolder holder ? holder.ruthenium$getOccluders() : null;
++            double ox = 0.0, oy = 0.0, oz = 0.0;
++            if (occluders != null) {
++                ox = origin.getX() - eye.x;
++                oy = origin.getY() - eye.y;
++                oz = origin.getZ() - eye.z;
++                if (!TerrainOcclusion.isVisible(occluders, ox, oy, oz)) {
++                    continue;
++                }
++            }
++            boolean solidDrawn = false;
++
+             for (ChunkSectionLayer layer : LAYERS) {
+                 SectionMesh.SectionDraw draw = mesh.getSectionDraw(layer);
+                 if (draw == null) {
+@@ -209,6 +226,11 @@ public final class TerrainDrawList {
+                 } else {
+                     group.add(draw.indexCount(), firstIndex, baseVertex, sectionInfo);
+                 }
++                solidDrawn |= layer == ChunkSectionLayer.SOLID;
++            }
++
++            if (solidDrawn && occluders != null) {
++                TerrainOcclusion.addOccluders(occluders, ox, oy, oz);
+             }
+         }
+         return largestIndexCount;
+diff --git a/src/main/java/net/ruthenium/render/chunk/TerrainOcclusion.java b/src/main/java/net/ruthenium/render/chunk/TerrainOcclusion.java
+new file mode 100644
+index 0000000..6d98af2
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/chunk/TerrainOcclusion.java
+@@ -0,0 +1,467 @@
++package net.ruthenium.render.chunk;
++
++import net.ruthenium.Initializer;
++import org.joml.Matrix4f;
++import org.joml.Matrix4fc;
++
++import java.util.Arrays;
++
++/**
++ * Software occlusion culling of terrain sections, on the render thread while {@link TerrainDrawList} collects the
++ * frame's draws (front to back, in the order of vanilla's visible section list).
++ * <p>
++ * Each drawn section rasterizes its opaque faces ({@link SectionOccluders}) into a coverage buffer before the next
++ * sections are tested, and a section is left out when every pixel its vertex bounds could reach is covered by a
++ * face that is nearer than all of it. The faces are the section's own drawn solid quads, so a left out section is
++ * one whose fragments would all fail the depth test: no pixel changes.
++ * <p>
++ * To keep that exact, the buffer works on the GPU's samples, not on an approximation of them:
++ * <ul>
++ *     <li>The projection is the frame's own (with view bobbing and the nausea warp, {@link #setProjection}), so
++ *     the samples are the pixel centres of the main render target.</li>
++ *     <li>A tile is 8x8 samples. It keeps the depth (1/w, larger is nearer) that all its samples are known to be
++ *     covered at, plus a mask of samples covered by faces seen so far that don't cover the whole tile, with their
++ *     farthest depth. Faces that meet on a tile (the same plane in two sections, or a ledge in front of a slope)
++ *     fill it together.</li>
++ *     <li>A face covers a sample only if the sample is inside all its edges by 1/16 pixel (more than GPU vertex
++ *     snapping moves an edge), and its depth over a tile is taken at the tile's farthest sample corner.</li>
++ *     <li>Faces are clipped to w &ge; 0.1 (the near plane is at 0.05), and a section with a vertex nearer than that
++ *     is always drawn. Faces count only when the eye is 0.01 blocks in front of them, so the GPU doesn't cull them
++ *     as back faces.</li>
++ *     <li>A section is hidden only if it is behind the covering depth by a relative 1e-4.</li>
++ * </ul>
++ * Render thread only.
++ */
++public final class TerrainOcclusion {
++    private static final int TILE_SHIFT = 3;
++    private static final int TILE = 1 << TILE_SHIFT;
++    private static final double NEAR_W = 0.1;
++    private static final double EDGE_MARGIN = 1.0 / 16.0;
++    private static final double FACING_MARGIN = 0.01;
++    private static final double DEPTH_MARGIN = 1.0e-4;
++    private static final double BOUNDS_MARGIN = 0.5;
++    private static final int MAX_VERTICES = 8;
++
++    /** Faces smaller than this on screen (estimated, in pixels) are not rasterized */
++    public static float minFacePixels = Float.parseFloat(System.getProperty("ruthenium.occlusionMinPixels", "256"));
++
++    private static final Matrix4f projection = new Matrix4f();
++    private static final Matrix4f clip = new Matrix4f();
++    private static boolean projectionFresh;
++
++    /** Rows of the camera-relative position to pixel transform: x * w, y * w and w */
++    private static double xx, xy, xz, xw, yx, yy, yz, yw, wx, wy, wz, ww;
++    /** Centre of projection, camera-relative */
++    private static double eyeX, eyeY, eyeZ;
++    private static int width, height, tilesX, tilesY;
++    /** Pixels per block at distance 1 (vertically) */
++    private static double focal;
++    private static float[] full = new float[0];
++    private static float[] partialDepth = new float[0];
++    private static long[] partialMask = new long[0];
++    private static boolean active;
++
++    // Polygon scratch
++    private static final double[] px = new double[MAX_VERTICES], py = new double[MAX_VERTICES], pw = new double[MAX_VERTICES];
++    private static final double[] cx = new double[MAX_VERTICES], cy = new double[MAX_VERTICES], cw = new double[MAX_VERTICES];
++    private static final double[] edgeA = new double[MAX_VERTICES], edgeB = new double[MAX_VERTICES], edgeC = new double[MAX_VERTICES];
++
++    // Counters of the current frame, and totals over the frames culling was on (for the benchmark)
++    private static int tested, hidden, facesDrawn;
++    private static boolean counting;
++    public static long totalFrames, totalTested, totalHidden, totalFaces;
++
++    private TerrainOcclusion() {
++    }
++
++    /** The level projection of the frame being rendered, as {@code GameRenderer.renderLevel} sets it */
++    public static void setProjection(Matrix4fc matrix) {
++        projection.set(matrix);
++        projectionFresh = true;
++    }
++
++    /**
++     * Starts a frame.
++     *
++     * @param modelView the terrain's model view matrix (camera-relative positions to view space)
++     * @param width     the main render target's size in pixels
++     */
++    public static void begin(Matrix4fc modelView, int width, int height, boolean enabled) {
++        if (counting) {
++            totalFrames++;
++            totalTested += tested;
++            totalHidden += hidden;
++            totalFaces += facesDrawn;
++        }
++        tested = hidden = facesDrawn = 0;
++        counting = false;
++        active = false;
++        boolean fresh = projectionFresh;
++        projectionFresh = false;
++        if (!enabled || !fresh || !Initializer.CONFIG.terrainOcclusionCulling || width <= 0 || height <= 0) {
++            return;
++        }
++
++        Matrix4f m = projection.mul(modelView, clip);
++        double halfW = width * 0.5, halfH = height * 0.5;
++        // Clip rows (JOML is column major: mCR)
++        double rxX = m.m00(), rxY = m.m10(), rxZ = m.m20(), rxW = m.m30();
++        double ryX = m.m01(), ryY = m.m11(), ryZ = m.m21(), ryW = m.m31();
++        wx = m.m03();
++        wy = m.m13();
++        wz = m.m23();
++        ww = m.m33();
++        // Pixel x = (clip x / w * 0.5 + 0.5) * width, as the viewport maps it
++        xx = halfW * (rxX + wx);
++        xy = halfW * (rxY + wy);
++        xz = halfW * (rxZ + wz);
++        xw = halfW * (rxW + ww);
++        yx = halfH * (ryX + wx);
++        yy = halfH * (ryY + wy);
++        yz = halfH * (ryZ + wz);
++        yw = halfH * (ryW + ww);
++
++        // The eye is where clip x, y and w are all 0
++        double det = rxX * (ryY * wz - ryZ * wy) - rxY * (ryX * wz - ryZ * wx) + rxZ * (ryX * wy - ryY * wx);
++        if (Math.abs(det) < 1.0e-12) {
++            return;
++        }
++        double bx = -rxW, by = -ryW, bw = -ww;
++        eyeX = (bx * (ryY * wz - ryZ * wy) - rxY * (by * wz - ryZ * bw) + rxZ * (by * wy - ryY * bw)) / det;
++        eyeY = (rxX * (by * wz - ryZ * bw) - bx * (ryX * wz - ryZ * wx) + rxZ * (ryX * bw - by * wx)) / det;
++        eyeZ = (rxX * (ryY * bw - by * wy) - rxY * (ryX * bw - by * wx) + bx * (ryX * wy - ryY * wx)) / det;
++
++        TerrainOcclusion.width = width;
++        TerrainOcclusion.height = height;
++        focal = 0.5 * height * Math.abs(projection.m11());
++        int tx = (width + TILE - 1) >> TILE_SHIFT, ty = (height + TILE - 1) >> TILE_SHIFT;
++        if (tx * ty != full.length) {
++            full = new float[tx * ty];
++            partialDepth = new float[tx * ty];
++            partialMask = new long[tx * ty];
++        } else {
++            Arrays.fill(full, 0.0f);
++            Arrays.fill(partialMask, 0L);
++        }
++        tilesX = tx;
++        tilesY = ty;
++        active = true;
++        counting = true;
++    }
++
++    public static boolean isActive() {
++        return active;
++    }
++
++    public static void resetTotals() {
++        totalFrames = totalTested = totalHidden = totalFaces = 0;
++    }
++
++    /**
++     * @param ox the section origin relative to the camera
++     * @return false if every sample the section's vertices could reach is covered by nearer faces
++     */
++    public static boolean isVisible(SectionOccluders occluders, double ox, double oy, double oz) {
++        if (!occluders.isBounded()) {
++            return true;
++        }
++        tested++;
++        double minSx = Double.POSITIVE_INFINITY, minSy = Double.POSITIVE_INFINITY;
++        double maxSx = Double.NEGATIVE_INFINITY, maxSy = Double.NEGATIVE_INFINITY;
++        double nearest = 0.0;
++        for (int i = 0; i < 8; i++) {
++            double x = ox + ((i & 1) == 0 ? occluders.minX : occluders.maxX);
++            double y = oy + ((i & 2) == 0 ? occluders.minY : occluders.maxY);
++            double z = oz + ((i & 4) == 0 ? occluders.minZ : occluders.maxZ);
++            double w = wx * x + wy * y + wz * z + ww;
++            if (w < NEAR_W) {
++                return true;
++            }
++            double inv = 1.0 / w;
++            double sx = (xx * x + xy * y + xz * z + xw) * inv;
++            double sy = (yx * x + yy * y + yz * z + yw) * inv;
++            minSx = Math.min(minSx, sx);
++            maxSx = Math.max(maxSx, sx);
++            minSy = Math.min(minSy, sy);
++            maxSy = Math.max(maxSy, sy);
++            nearest = Math.max(nearest, inv);
++        }
++
++        // Samples (pixel centres i + 0.5) within the projected bounds
++        int i0 = Math.max(0, (int) Math.ceil(minSx - BOUNDS_MARGIN - 0.5));
++        int i1 = Math.min(width - 1, (int) Math.floor(maxSx + BOUNDS_MARGIN - 0.5));
++        int j0 = Math.max(0, (int) Math.ceil(minSy - BOUNDS_MARGIN - 0.5));
++        int j1 = Math.min(height - 1, (int) Math.floor(maxSy + BOUNDS_MARGIN - 0.5));
++        if (i0 > i1 || j0 > j1) {
++            // Off screen
++            hidden++;
++            return false;
++        }
++
++        float threshold = (float) (nearest * (1.0 + DEPTH_MARGIN));
++        float[] full = TerrainOcclusion.full;
++        int tx0 = i0 >> TILE_SHIFT, tx1 = i1 >> TILE_SHIFT;
++        for (int ty = j0 >> TILE_SHIFT, ty1 = j1 >> TILE_SHIFT; ty <= ty1; ty++) {
++            int row = ty * tilesX;
++            for (int tx = tx0; tx <= tx1; tx++) {
++                if (full[row + tx] <= threshold) {
++                    return true;
++                }
++            }
++        }
++        hidden++;
++        return false;
++    }
++
++    /** Rasterizes the faces of a section whose solid layer is drawn this frame */
++    public static void addOccluders(SectionOccluders occluders, double ox, double oy, double oz) {
++        int[] faces = occluders.faces();
++        double ex = eyeX - ox, ey = eyeY - oy, ez = eyeZ - oz;
++        // Nearest distance to the section, for the faces' largest possible size on screen
++        double dx = Math.max(0.0, Math.abs(ex - 8.0) - 8.0);
++        double dy = Math.max(0.0, Math.abs(ey - 8.0) - 8.0);
++        double dz = Math.max(0.0, Math.abs(ez - 8.0) - 8.0);
++        double distanceSquared = Math.max(1.0, dx * dx + dy * dy + dz * dz);
++        double minArea = minFacePixels * distanceSquared / (focal * focal);
++        for (int face : faces) {
++            if (SectionOccluders.area(face) < minArea) {
++                break;
++            }
++            int direction = SectionOccluders.direction(face);
++            int plane = SectionOccluders.plane(face);
++            double eye = switch (direction >> 1) {
++                case 0 -> ex;
++                case 1 -> ey;
++                default -> ez;
++            };
++            if ((direction & 1) == 0 ? eye <= plane + FACING_MARGIN : eye >= plane - FACING_MARGIN) {
++                continue;
++            }
++            int u0 = SectionOccluders.u0(face), v0 = SectionOccluders.v0(face);
++            int u1 = SectionOccluders.u1(face), v1 = SectionOccluders.v1(face);
++            switch (direction >> 1) {
++                case 0 -> {
++                    double x = ox + plane;
++                    corner(0, x, oy + u0, oz + v0);
++                    corner(1, x, oy + u1, oz + v0);
++                    corner(2, x, oy + u1, oz + v1);
++                    corner(3, x, oy + u0, oz + v1);
++                }
++                case 1 -> {
++                    double y = oy + plane;
++                    corner(0, ox + u0, y, oz + v0);
++                    corner(1, ox + u1, y, oz + v0);
++                    corner(2, ox + u1, y, oz + v1);
++                    corner(3, ox + u0, y, oz + v1);
++                }
++                default -> {
++                    double z = oz + plane;
++                    corner(0, ox + u0, oy + v0, z);
++                    corner(1, ox + u1, oy + v0, z);
++                    corner(2, ox + u1, oy + v1, z);
++                    corner(3, ox + u0, oy + v1, z);
++                }
++            }
++            facesDrawn++;
++            rasterize(4);
++        }
++    }
++
++    private static void corner(int i, double x, double y, double z) {
++        px[i] = xx * x + xy * y + xz * z + xw;
++        py[i] = yx * x + yy * y + yz * z + yw;
++        pw[i] = wx * x + wy * y + wz * z + ww;
++    }
++
++    /** Rasterizes the convex polygon in {@link #px}/{@link #py}/{@link #pw} (pixel coordinates times w, and w) */
++    private static void rasterize(int count) {
++        // Clip to w >= NEAR_W, which is linear in these coordinates
++        int n = 0;
++        for (int i = 0; i < count; i++) {
++            int j = i + 1 == count ? 0 : i + 1;
++            boolean in = pw[i] >= NEAR_W, nextIn = pw[j] >= NEAR_W;
++            if (in) {
++                cx[n] = px[i];
++                cy[n] = py[i];
++                cw[n] = pw[i];
++                n++;
++            }
++            if (in != nextIn) {
++                double t = (NEAR_W - pw[i]) / (pw[j] - pw[i]);
++                cx[n] = px[i] + (px[j] - px[i]) * t;
++                cy[n] = py[i] + (py[j] - py[i]) * t;
++                cw[n] = NEAR_W;
++                n++;
++            }
++        }
++        if (n < 3) {
++            return;
++        }
++
++        // To pixels; z is 1/w
++        double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY;
++        double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
++        for (int i = 0; i < n; i++) {
++            double inv = 1.0 / cw[i];
++            cx[i] *= inv;
++            cy[i] *= inv;
++            cw[i] = inv;
++            minX = Math.min(minX, cx[i]);
++            maxX = Math.max(maxX, cx[i]);
++            minY = Math.min(minY, cy[i]);
++            maxY = Math.max(maxY, cy[i]);
++        }
++        int i0 = Math.max(0, (int) Math.ceil(minX - 0.5)), i1 = Math.min(width - 1, (int) Math.floor(maxX - 0.5));
++        int j0 = Math.max(0, (int) Math.ceil(minY - 0.5)), j1 = Math.min(height - 1, (int) Math.floor(maxY - 0.5));
++        if (i0 > i1 || j0 > j1) {
++            return;
++        }
++
++        double area = 0.0;
++        for (int i = 0; i < n; i++) {
++            int j = i + 1 == n ? 0 : i + 1;
++            area += cx[i] * cy[j] - cx[j] * cy[i];
++        }
++        if (Math.abs(area) < 1.0e-6) {
++            return;
++        }
++        double orientation = area > 0.0 ? 1.0 : -1.0;
++        // Edge functions, positive inside, shifted inwards by the margin
++        for (int i = 0; i < n; i++) {
++            int j = i + 1 == n ? 0 : i + 1;
++            double a = -(cy[j] - cy[i]) * orientation;
++            double b = (cx[j] - cx[i]) * orientation;
++            edgeA[i] = a;
++            edgeB[i] = b;
++            edgeC[i] = -(a * cx[i] + b * cy[i]) - EDGE_MARGIN * Math.sqrt(a * a + b * b);
++        }
++
++        // Depth plane z = A x + B y + C from the triangle fan's largest triangle
++        int best = 1;
++        double bestArea = 0.0;
++        for (int k = 1; k + 1 < n; k++) {
++            double triangle = Math.abs((cx[k] - cx[0]) * (cy[k + 1] - cy[0]) - (cx[k + 1] - cx[0]) * (cy[k] - cy[0]));
++            if (triangle > bestArea) {
++                bestArea = triangle;
++                best = k;
++            }
++        }
++        double x0 = cx[0], y0 = cy[0], z0 = cw[0];
++        double dx1 = cx[best] - x0, dy1 = cy[best] - y0, dz1 = cw[best] - z0;
++        double dx2 = cx[best + 1] - x0, dy2 = cy[best + 1] - y0, dz2 = cw[best + 1] - z0;
++        double det = dx1 * dy2 - dx2 * dy1;
++        if (Math.abs(det) < 1.0e-9) {
++            return;
++        }
++        double depthA = (dz1 * dy2 - dz2 * dy1) / det;
++        double depthB = (dx1 * dz2 - dx2 * dz1) / det;
++        double depthC = z0 - depthA * x0 - depthB * y0;
++        double absA = Math.abs(depthA), absB = Math.abs(depthB);
++
++        float[] full = TerrainOcclusion.full;
++        for (int ty = j0 >> TILE_SHIFT, ty1 = j1 >> TILE_SHIFT; ty <= ty1; ty++) {
++            int sy0 = ty << TILE_SHIFT;
++            int rows = Math.min(TILE, height - sy0);
++            double hy = (rows - 1) * 0.5;
++            double centerY = sy0 + 0.5 + hy;
++            for (int tx = i0 >> TILE_SHIFT, tx1 = i1 >> TILE_SHIFT; tx <= tx1; tx++) {
++                int sx0 = tx << TILE_SHIFT;
++                int columns = Math.min(TILE, width - sx0);
++                double hx = (columns - 1) * 0.5;
++                double centerX = sx0 + 0.5 + hx;
++
++                boolean partial = false;
++                boolean outside = false;
++                for (int e = 0; e < n; e++) {
++                    double value = edgeA[e] * centerX + edgeB[e] * centerY + edgeC[e];
++                    double reach = Math.abs(edgeA[e]) * hx + Math.abs(edgeB[e]) * hy;
++                    if (value + reach < 0.0) {
++                        outside = true;
++                        break;
++                    }
++                    if (value - reach < 0.0) {
++                        partial = true;
++                    }
++                }
++                if (outside) {
++                    continue;
++                }
++
++                // Farthest depth of the face over the tile's samples
++                double depth = depthA * centerX + depthB * centerY + depthC - absA * hx - absB * hy;
++                int t = ty * tilesX + tx;
++                if (depth <= full[t]) {
++                    continue;
++                }
++                if (!partial) {
++                    full[t] = (float) depth;
++                    if (partialMask[t] != 0L && partialDepth[t] <= full[t]) {
++                        partialMask[t] = 0L;
++                    }
++                    continue;
++                }
++
++                long mask = coverage(n, sx0 + 0.5, sy0 + 0.5, columns, rows);
++                if (mask == 0L) {
++                    continue;
++                }
++                long previous = partialMask[t];
++                float merged = (float) depth;
++                if (previous != 0L) {
++                    mask |= previous;
++                    merged = Math.min(merged, partialDepth[t]);
++                }
++                if (mask == validMask(columns, rows)) {
++                    if (merged > full[t]) {
++                        full[t] = merged;
++                    }
++                    partialMask[t] = 0L;
++                } else if (merged > full[t]) {
++                    partialMask[t] = mask;
++                    partialDepth[t] = merged;
++                } else {
++                    partialMask[t] = 0L;
++                }
++            }
++        }
++    }
++
++    /** The tile's samples inside all edges: bit {@code row * 8 + column} */
++    private static long coverage(int edges, double x0, double y0, int columns, int rows) {
++        long mask = 0L;
++        for (int r = 0; r < rows; r++) {
++            double y = y0 + r;
++            double lo = 0.0, hi = columns - 1;
++            for (int e = 0; e < edges && lo <= hi; e++) {
++                // Inside where a * column + k >= 0
++                double a = edgeA[e];
++                double k = a * x0 + edgeB[e] * y + edgeC[e];
++                if (a > 1.0e-12) {
++                    lo = Math.max(lo, Math.ceil(-k / a));
++                } else if (a < -1.0e-12) {
++                    hi = Math.min(hi, Math.floor(k / -a));
++                } else if (k < 0.0) {
++                    hi = -1.0;
++                }
++            }
++            if (lo <= hi) {
++                int first = (int) lo, last = (int) hi;
++                long bits = (1L << (last - first + 1)) - 1L;
++                mask |= bits << first << (r << TILE_SHIFT);
++            }
++        }
++        return mask;
++    }
++
++    private static long validMask(int columns, int rows) {
++        if (columns == TILE && rows == TILE) {
++            return -1L;
++        }
++        long row = (1L << columns) - 1L;
++        long mask = 0L;
++        for (int r = 0; r < rows; r++) {
++            mask |= row << (r << TILE_SHIFT);
++        }
++        return mask;
++    }
++}
+diff --git a/src/main/resources/assets/ruthenium/lang/en_us.json b/src/main/resources/assets/ruthenium/lang/en_us.json
+index e15880f..c11d02a 100644
+--- a/src/main/resources/assets/ruthenium/lang/en_us.json
++++ b/src/main/resources/assets/ruthenium/lang/en_us.json
+@@ -37,6 +37,8 @@
+ 
+   "ruthenium.options.terrainFaceCulling": "Terrain Face Culling",
+   "ruthenium.options.terrainFaceCulling.tooltip": "Skips the block faces of a chunk section that all point away from the camera, which the GPU would discard anyway. Changing it reloads the chunks.",
++  "ruthenium.options.terrainOcclusionCulling": "Terrain Occlusion Culling",
++  "ruthenium.options.terrainOcclusionCulling.tooltip": "Skips chunk sections that are completely hidden behind the solid blocks of nearer ones, worked out on the CPU each frame. Only sections the GPU would not draw a single visible pixel of are skipped.",
+   "ruthenium.options.compressedTerrain": "Compressed Terrain Vertices",
+   "ruthenium.options.compressedTerrain.tooltip": "Stores solid and cutout block vertices in 20 instead of 28 bytes, so the GPU reads less memory per frame. Changing it reloads the chunks.",
+   "ruthenium.options.biomeBlendCache": "Fast Biome Blending",
+diff --git a/src/main/resources/ruthenium.mixins.json b/src/main/resources/ruthenium.mixins.json
+index 989f89c..ec1f0ea 100644
+--- a/src/main/resources/ruthenium.mixins.json
++++ b/src/main/resources/ruthenium.mixins.json
+@@ -17,6 +17,7 @@
+     "render.chunk.ChunkSectionLayerM",
+     "render.chunk.ChunkSectionsToRenderM",
+     "render.chunk.ClientLevelTintM",
++    "render.chunk.GameRendererM",
+     "render.chunk.LevelRendererM",
+     "render.chunk.RenderSectionRegionM",
+     "render.chunk.SectionCompilerM",

@@ -1,0 +1,208 @@
+diff --git a/src/main/java/net/ruthenium/interfaces/BlockEntityPositions.java b/src/main/java/net/ruthenium/interfaces/BlockEntityPositions.java
+index b00b3e4..fb050b4 100644
+--- a/src/main/java/net/ruthenium/interfaces/BlockEntityPositions.java
++++ b/src/main/java/net/ruthenium/interfaces/BlockEntityPositions.java
+@@ -11,4 +11,11 @@ public interface BlockEntityPositions {
+ 
+     /** @return whether the list's i-th block entity may be culled, see {@code BlockEntityCulling.isCullable} */
+     boolean[] ruthenium$getCullable();
++
++    /**
++     * @return per 4³ cell of the section ({@code BlockEntityCulling.cellIndex}), a bit set of the list indices of its
++     * cullable block entities (words of 64 indices; null for empty cells), followed at index 64 by the set of the
++     * block entities that aren't cullable or not in the section
++     */
++    long[][] ruthenium$getCellMasks();
+ }
+diff --git a/src/main/java/net/ruthenium/mixin/render/blockentity/CompiledSectionMeshM.java b/src/main/java/net/ruthenium/mixin/render/blockentity/CompiledSectionMeshM.java
+index 36cffae..8d5c5f9 100644
+--- a/src/main/java/net/ruthenium/mixin/render/blockentity/CompiledSectionMeshM.java
++++ b/src/main/java/net/ruthenium/mixin/render/blockentity/CompiledSectionMeshM.java
+@@ -5,6 +5,7 @@ import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
+ import net.minecraft.client.renderer.chunk.CompiledSectionMesh;
+ import net.minecraft.client.renderer.chunk.SectionCompiler;
+ import net.minecraft.client.renderer.chunk.TranslucencyPointOfView;
++import net.minecraft.core.BlockPos;
+ import net.minecraft.world.level.block.entity.BlockEntity;
+ import net.ruthenium.interfaces.BlockEntityPositions;
+ import net.ruthenium.interfaces.PackedSectionDraws;
+@@ -33,6 +34,7 @@ public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHol
+ 
+     @Unique private long[] positions;
+     @Unique private boolean[] cullable;
++    @Unique private long[][] cellMasks;
+     // Allocated in code: initializers of these fields were not merged into the constructor before the injection ran
+     @Unique private SectionFaceGroups @Nullable [] faceGroups;
+     @Unique private int @Nullable [] packedDraws;
+@@ -94,6 +96,32 @@ public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHol
+         return this.cullable;
+     }
+ 
++    @Override
++    public long[][] ruthenium$getCellMasks() {
++        if (this.cellMasks == null) {
++            long[] positions = this.ruthenium$getPositions();
++            boolean[] cullable = this.ruthenium$getCullable();
++            int words = (positions.length + 63) >>> 6;
++            long[][] masks = new long[BlockEntityCulling.CELLS + 1][];
++            masks[BlockEntityCulling.CELLS] = new long[words];
++            // The section of the first block entity; any block entity outside it is visited like a non-cullable one
++            long first = positions.length > 0 ? positions[0] : 0L;
++            int sx = BlockPos.getX(first) >> 4, sy = BlockPos.getY(first) >> 4, sz = BlockPos.getZ(first) >> 4;
++            for (int i = 0; i < positions.length; i++) {
++                long pos = positions[i];
++                int x = BlockPos.getX(pos), y = BlockPos.getY(pos), z = BlockPos.getZ(pos);
++                int cell = cullable[i] && x >> 4 == sx && y >> 4 == sy && z >> 4 == sz
++                        ? BlockEntityCulling.cellIndex(x, y, z) : BlockEntityCulling.CELLS;
++                if (masks[cell] == null) {
++                    masks[cell] = new long[words];
++                }
++                masks[cell][i >>> 6] |= 1L << i;
++            }
++            this.cellMasks = masks;
++        }
++        return this.cellMasks;
++    }
++
+     @Unique
+     private void pack() {
+         int size = this.renderableBlockEntities.size();
+diff --git a/src/main/java/net/ruthenium/mixin/render/blockentity/LevelExtractorM.java b/src/main/java/net/ruthenium/mixin/render/blockentity/LevelExtractorM.java
+index e3a6761..d5850cb 100644
+--- a/src/main/java/net/ruthenium/mixin/render/blockentity/LevelExtractorM.java
++++ b/src/main/java/net/ruthenium/mixin/render/blockentity/LevelExtractorM.java
+@@ -61,6 +61,10 @@ public class LevelExtractorM {
+     @Unique private final byte[] cellCull = new byte[64];
+     @Unique private final int[] cellStamps = new int[64];
+     @Unique private int sectionStamp;
++    /** Scratch of {@link #visibleIndices}; allocated in code (see the notes on mixin field initializers) */
++    @Unique private long[] visibleWords = new long[0];
++    @Unique private int[] indices = new int[256];
++    @Unique private int visibleCount;
+ 
+     /**
+      * @author Ruthenium
+@@ -97,16 +101,51 @@ public class LevelExtractorM {
+ 
+             long[] positions = null;
+             boolean[] cullable = null;
++            long[][] cellMasks = null;
+             if (frustum != null && mesh instanceof BlockEntityPositions packed) {
+                 positions = packed.ruthenium$getPositions();
+                 cullable = packed.ruthenium$getCullable();
++                if (BlockEntityCulling.CELL_MASKS) {
++                    cellMasks = packed.ruthenium$getCellMasks();
++                }
+             }
+ 
+             // Classified lazily on the first cullable block entity
+             int sectionCull = BlockEntityCulling.SECTION_UNKNOWN;
+             this.sectionStamp++;
+ 
+-            for (int i = 0, size = blockEntities.size(); i < size; i++) {
++            int size = blockEntities.size();
++            // The list indices to visit: all, or in sections that cross the frustum those of the cells that aren't
++            // outside it (in list order)
++            int[] order = null;
++            int count = size;
++            if (cellMasks != null && size >= BlockEntityCulling.CELL_MASK_MIN) {
++                sectionCull = BlockEntityCulling.classifySection(frustum, section.getRenderOrigin());
++                if (sectionCull == BlockEntityCulling.SECTION_PARTIAL) {
++                    order = this.visibleIndices(frustum, section.getRenderOrigin(), cellMasks);
++                    count = this.visibleCount;
++                    if (BlockEntityCulling.CHECK) {
++                        it.unimi.dsi.fastutil.ints.IntArrayList a = new it.unimi.dsi.fastutil.ints.IntArrayList(), b = new it.unimi.dsi.fastutil.ints.IntArrayList();
++                        for (int i = 0; i < size; i++) {
++                            if ((retained == null || !retained[i]) && (i >= positions.length || !cullable[i] || !this.isCulledInPartialSection(frustum, positions[i]))) a.add(i);
++                        }
++                        for (int k = 0; k < count; k++) {
++                            int i = order[k];
++                            if ((retained == null || !retained[i]) && (i >= positions.length || !cullable[i] || !this.isCulledInPartialSection(frustum, positions[i]))) b.add(i);
++                        }
++                        BlockEntityCulling.checked += a.size();
++                        BlockEntityCulling.skipped += size - count;
++                        if (!a.equals(b)) BlockEntityCulling.mismatches++;
++                        if (++BlockEntityCulling.sectionsChecked % 20000 == 0) {
++                            Initializer.LOGGER.info("Cell check: {} sections, {} kept, {} skipped by cells, {} mismatching sections",
++                                    BlockEntityCulling.sectionsChecked, BlockEntityCulling.checked, BlockEntityCulling.skipped, BlockEntityCulling.mismatches);
++                        }
++                    }
++                }
++            }
++
++            for (int k = 0; k < count; k++) {
++                int i = order != null ? order[k] : k;
+                 if (retained != null && retained[i]) {
+                     continue;
+                 }
+@@ -186,6 +225,51 @@ public class LevelExtractorM {
+         InstancedModels.clear();
+     }
+ 
++    /**
++     * The list indices of a section crossing the frustum whose cell isn't outside it, ascending, in {@link #indices}
++     * ({@link #visibleCount} of them); classifies the occupied cells into {@link #cellCull} for the section's stamp
++     */
++    @Unique
++    private int[] visibleIndices(Frustum frustum, BlockPos origin, long[][] cellMasks) {
++        long[] rest = cellMasks[BlockEntityCulling.CELLS];
++        int words = rest.length;
++        long[] visible = this.visibleWords;
++        if (visible.length < words) {
++            visible = this.visibleWords = new long[words];
++        }
++        System.arraycopy(rest, 0, visible, 0, words);
++        int ox = origin.getX(), oy = origin.getY(), oz = origin.getZ();
++        for (int c = 0; c < BlockEntityCulling.CELLS; c++) {
++            long[] mask = cellMasks[c];
++            if (mask == null) {
++                continue;
++            }
++            int cull = BlockEntityCulling.classifyCell(frustum, ox + (c & 3) * BlockEntityCulling.CELL_SIZE,
++                    oy + (c >> 2 & 3) * BlockEntityCulling.CELL_SIZE, oz + (c >> 4 & 3) * BlockEntityCulling.CELL_SIZE);
++            this.cellCull[c] = (byte) cull;
++            this.cellStamps[c] = this.sectionStamp;
++            if (cull != BlockEntityCulling.SECTION_OUTSIDE) {
++                for (int w = 0; w < words; w++) {
++                    visible[w] |= mask[w];
++                }
++            }
++        }
++        int[] indices = this.indices;
++        int count = 0;
++        for (int w = 0; w < words; w++) {
++            long bits = visible[w];
++            while (bits != 0) {
++                if (count == indices.length) {
++                    indices = this.indices = java.util.Arrays.copyOf(indices, indices.length * 2);
++                }
++                indices[count++] = w << 6 | Long.numberOfTrailingZeros(bits);
++                bits &= bits - 1;
++            }
++        }
++        this.visibleCount = count;
++        return indices;
++    }
++
+     @Unique
+     private boolean isCulledInPartialSection(Frustum frustum, long packed) {
+         int x = BlockPos.getX(packed), y = BlockPos.getY(packed), z = BlockPos.getZ(packed);
+diff --git a/src/main/java/net/ruthenium/render/blockentity/BlockEntityCulling.java b/src/main/java/net/ruthenium/render/blockentity/BlockEntityCulling.java
+index 73e07d7..9883dac 100644
+--- a/src/main/java/net/ruthenium/render/blockentity/BlockEntityCulling.java
++++ b/src/main/java/net/ruthenium/render/blockentity/BlockEntityCulling.java
+@@ -26,6 +26,14 @@ public final class BlockEntityCulling {
+     public static final int SECTION_OUTSIDE = 2;
+     public static final int SECTION_PARTIAL = 3;
+     public static final int CELL_SIZE = 4;
++    /** Cells per section */
++    public static final int CELLS = 64;
++    /** Sections with fewer block entities go through their whole list */
++    public static final int CELL_MASK_MIN = 16;
++    public static final boolean CHECK = Boolean.getBoolean("ruthenium.check.cells");
++    public static long checked, skipped, mismatches, sectionsChecked;
++    // TEMP experiment switch
++    public static final boolean CELL_MASKS = !Boolean.getBoolean("ruthenium.exp.noCellMasks");
+ 
+     private static final double MARGIN = 1.0;
+     private static final double EXTRA_TOP = 2.0;

@@ -1,0 +1,105 @@
+commit 17f2a57ae575ff864cd2e93da40bfb6d7640dffe
+Author: 6a0 <87043474+6a0@users.noreply.github.com>
+Date:   Wed Oct 28 14:06:27 2026 +0000
+
+    WIP front-to-back plane order
+
+diff --git a/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java b/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
+index 86b5f6f..f61bb65 100644
+--- a/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
++++ b/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
+@@ -67,9 +67,10 @@ public final class SectionFaceGroups {
+     }
+ 
+     /**
+-     * Like {@link #sort}, but also orders each facing group's quads by plane, nearest to the side the group faces
+-     * first, so a frame can draw only the quads whose plane the eye is in front of ({@link #visiblePlaneRuns}) instead
+-     * of the whole group when any of them can face the eye. Quads whose normal is within a tilt of 1e-5 of an axis and
++     * Like {@link #sort}, but also orders each facing group's quads by plane, farthest out on the side the group faces
++     * first, so a frame can draw only the quads whose plane the eye is in front of ({@link #visiblePlaneRuns}: a suffix
++     * of the group, drawn nearest to the eye first, which keeps the depth test rejecting what they hide) instead of the
++     * whole group when any of them can face the eye. Quads whose normal is within a tilt of 1e-5 of an axis and
+      * whose vertices are within 1e-4 blocks of a plane count as in that plane (rotated models: a rotation by a multiple
+      * of 90 degrees leaves coordinates like 6e-17 instead of 0); their plane is their outermost vertex coordinate
+      * towards the back, so the test stays conservative (the margin covers the tilt over thousands of blocks). The
+@@ -132,9 +133,10 @@ public final class SectionFaceGroups {
+             }
+             quadPlanes[q] = plane;
+             counts[group]++;
+-            // Nearest to the faced side first: ascending planes for positive facings, descending for negative ones
++            // Farthest out on the faced side first (descending planes for positive facings, ascending for negative ones):
++            // the planes the eye is in front of are then a suffix, drawn nearest to the eye first
+             int order = group == UNASSIGNED ? 0 : sortable(plane);
+-            if (group != UNASSIGNED && (group & 1) == 0) {
++            if (group != UNASSIGNED && (group & 1) == 1) {
+                 order = ~order;
+             }
+             keys[q] = (long) group << 52 | ((order ^ Integer.MIN_VALUE) & 0xFFFFFFFFL) << 20 | q;
+@@ -206,7 +208,7 @@ public final class SectionFaceGroups {
+ 
+     /**
+      * The runs of quads to draw for an eye position, of groups sorted by {@link #sortByPlanes}: of each facing group
+-     * the quads whose plane the eye can be in front of, merging adjacent runs.
++     * the quads whose plane the eye can be in front of (a suffix of the group), merging adjacent runs.
+      *
+      * @param eyeX eye position relative to the mesh's origin
+      * @param runs receives the first quad and quad count of each run ({@link #MAX_PLANE_RUNS} pairs at most)
+@@ -220,19 +222,51 @@ public final class SectionFaceGroups {
+         int runStart = 0;
+         int runEnd = this.starts[1];
+         for (int g = 1; g < GROUPS; g++) {
+-            int start = this.starts[g];
+-            int end = start;
++            int end = this.starts[g + 1];
+             int first = groupPlanes[g], last = groupPlanes[g + 1];
+             float eye = g <= WEST ? eyeX : g <= DOWN ? eyeY : eyeZ;
+-            if ((g & 1) == 1) {
+-                for (int p = first; p < last && eye > tests[p]; p++) {
+-                    end = ends[p];
++            // The planes the eye is behind are a prefix: count them (whole and empty groups without a search)
++            int hidden;
++            if (first == last) {
++                hidden = 0;
++            } else if ((g & 1) == 1) {
++                // Tests descending; a plane can face the eye if eye > test
++                if (eye > tests[first]) {
++                    hidden = 0;
++                } else if (!(eye > tests[last - 1])) {
++                    hidden = last - first;
++                } else {
++                    int lo = first + 1, hi = last - 1;
++                    while (lo < hi) {
++                        int mid = (lo + hi) >>> 1;
++                        if (eye > tests[mid]) {
++                            hi = mid;
++                        } else {
++                            lo = mid + 1;
++                        }
++                    }
++                    hidden = lo - first;
+                 }
+             } else {
+-                for (int p = first; p < last && eye < tests[p]; p++) {
+-                    end = ends[p];
++                // Tests ascending; a plane can face the eye if eye < test
++                if (eye < tests[first]) {
++                    hidden = 0;
++                } else if (!(eye < tests[last - 1])) {
++                    hidden = last - first;
++                } else {
++                    int lo = first + 1, hi = last - 1;
++                    while (lo < hi) {
++                        int mid = (lo + hi) >>> 1;
++                        if (eye < tests[mid]) {
++                            hi = mid;
++                        } else {
++                            lo = mid + 1;
++                        }
++                    }
++                    hidden = lo - first;
+                 }
+             }
++            int start = hidden == 0 ? this.starts[g] : ends[first + hidden - 1];
+             if (end == start) {
+                 continue;
+             }
