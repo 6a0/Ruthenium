@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-28 (fourteenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-28 (fifteenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -35,6 +35,12 @@ Fourteenth session (section 7, "Fourteenth session"): the entity scene's model p
 reuse the part poses of the model's first submit** (villager clothing, eyes, markings, collars, trims), part batches are
 found through arrays, and instanced submits fetch no vertex builder. Entity scene in the same tree, start -> end: static
 280.4 -> 310.0 fps (render thread 3.44 -> 3.16 ms), pan 1052.0 -> 1112.9; the server scene is unchanged.
+Fifteenth session (section 7, "Fifteenth session"): the entity scene's extraction and submission. **Entity culling
+without allocations or renderer lookups** (renderers kept on the entity type; the pan culls all ~1.3k loaded entities
+every frame) and **light kept per entity** until it moves or the client's light data changes. Name tag attribute reads
+and villager clothing identifiers were measured and binned (within noise). Entity scene in the same tree, start -> end:
+static 321.7 -> 331.5 fps (render thread 3.01 -> 2.95 ms), pan 1131.8 -> 1195.9 (p99 272.3 -> 294.0); the server scene
+is unchanged.
 
 ---
 
@@ -63,7 +69,7 @@ found through arrays, and instanced submits fetch no vertex builder. Entity scen
   screen or `-Dvulkanmod.instancedModels=false`. Since the ninth session armor stands are extracted into render
   states reused across frames (`ReusedRenderStates`, switch `-Dvulkanmod.reuseEntityStates`).
 - **Entity scene** (tenth session, `-Pbench.scene=entities`, section 6.9): ~1.3k entities of 30 types. Vanilla Vulkan
-  86 fps at its static view, VulkanMod ~310 (~280 before the fourteenth session, ~166 before the thirteenth, ~138
+  86 fps at its static view, VulkanMod ~330 (~310 before the fifteenth session, ~280 before the fourteenth, ~166 before the thirteenth, ~138
   before the eleventh's instanced parts). Mob parts, armor, items (dropped, framed, held, displays) and the block models of entities (item frames,
   block displays, minecart blocks) are drawn as GPU instances (`InstancedParts`; switches "Instanced Mob Parts",
   "Instanced Armor", "Instanced Items", "Instanced Entity Blocks"). The block model quads are cached across frames
@@ -72,7 +78,9 @@ found through arrays, and instanced submits fetch no vertex builder. Entity scen
   (`BufferBuilderM.putBakedQuad`, "Fast Item Vertices"; now only for items that aren't instanced). Since the
   fourteenth session model faces that draw nothing in their texture are skipped (`TransparentFaces`, "Transparent Face
   Culling") and layers reuse the part poses of the model's first submit (`ModelPoseReplay`, "Reuse Layer Poses").
-  Section 8 lists what is left there.
+  Since the fifteenth session entities are frustum culled without allocations or renderer lookups
+  (`EntityRendererCache`, "Fast Entity Culling") and keep their light across frames (`EntityLight`, "Keep Entity
+  Light"). Section 8 lists what is left there.
 - **The settings screen is ported** (fourth session): the video settings button opens VulkanMod's screen with Video,
   Graphics (vanilla options through their `OptionInstance`s) and Optimizations (the mod's switches, `Config`,
   `config/vulkanmod_settings.json`). `-Dvulkanmod.<field>=true|false` overrides any switch for a launch.
@@ -230,6 +238,8 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `render/entity/TransparentFaces.java` + `ModelCulling.textureAlpha` + `ModelPartCubeM` | **Transparent face culling** (fourteenth session, switch `transparentFaceCulling`, "Transparent Face Culling"). Model cube faces whose texels all draw nothing are not written by `ModelPartCubeM`'s direct path: alpha below the pipeline's `ALPHA_CUTOUT` (discarded before any color is applied; 8 bit alpha a counts if a < ceil(255 c - 0.01)), or alpha 0 in a `BlendFunction.TRANSLUCENT` pipeline without depth writes (the fragment's alpha stays 0, so it blends to the destination exactly). Only render types of vanilla's `core/entity` vertex and fragment shaders without `APPLY_TEXTURE_MATRIX`, `GLINT` or `DISSOLVE`, `TextureTransform.DEFAULT_TEXTURING`, only `Sampler0`, and a texture whose class is exactly `SimpleTexture` with one mip level and the resource's size (read once with `TextureContents.load`); never with improved transparency (OIT) or a UV mapping (atlas sprites). A face's UV rectangle is widened by one texel per side and every texel is tested at its repeated and its clamped position (nearest and linear filtering). Per render type a `TextureAlpha` (`IdentityHashMap`, last type cached), revalidated against the texture's `GpuTexture` and the texture manager's entry; per cube the masks of its last 4 texture alphas. Cleared on resource reload and when toggled. Spider and enderman eyes keep only the eye faces; horse markings lose their empty faces. Access widener: `RenderSetup.textures`, `RenderSetup$TextureBinding.location` |
 | `render/entity/ModelPoseReplay.java` + `mixin/render/entity/{EntityRenderStateM,model/ModelM,model/PoseAccessor}.java` + `interfaces/{PoseRecordHolder,LayeredModel,ReplayablePart}` | **Layer pose replay** (fourteenth session, switch `reuseLayerPoses`, "Reuse Layer Poses"). Layers that submit a model again with the same render state and pose (villager and zombie villager clothing, spider and enderman eyes, horse markings, collars, armor trims and glint) skip `setupAnim` and the part tree. While the world's features are prepared, every model submit stamps its `EntityRenderState` with a pooled `Record` (two slots per state; frame, state and model identity); a second submit of the same model and state marks the `Model` as layered. From then on the first submit of a layered model of a `net.minecraft.` class records each written part and a copy of its pose (`ModelPartM.compile`), and a later submit of that model and state whose submit pose matches bit for bit (matrix, normal matrix, JOML properties, `trustedNormals`) calls each recorded part's `compile` with the recorded pose (instanced or vanilla path). Exact because vanilla models pose their parts from the state alone (`Model.setupAnim` starts with `resetPose`; checked: every model's `setupAnim` calls it except the copper golem statue's, which isn't an entity state); a temporary check posed 2.8M replayed submits again: 0 mismatches in 23.4M parts |
 | `render/entity/LazyVertexBuilder.java` + `ModelFeatureRendererM` | Model submits whose parts become instances get a lazy vertex builder instead of the group's (a render type switch: `RenderType.prepare`, the draw lookup and a new `BufferBuilder`); it fetches the builder (wrapped by the UV mapping) only if a part is written after all, and `ModelPartM.compile` resolves it before writing cubes, so the direct writers see the `BufferBuilder`. Such submits add no empty draws. No switch (same image) |
+| `render/entity/EntityRendererCache.java` + `mixin/render/entity/{EntityTypeM,EntityRenderDispatcherM}.java` + `LevelExtractorEntityM.vulkanmod$fastCulling` + `interfaces/{EntityRendererHolder,EntityRendererMap}` | **Renderer kept on the entity type and cheaper entity culling** (fifteenth session). `EntityRenderDispatcher.getRenderer(Entity)` and `getRenderer(EntityRenderState)` look non-player renderers up in the dispatcher's `ImmutableMap` (culling, extraction, submission: up to three times per entity and frame); a `@WrapOperation` on that `Map.get` returns the renderer kept on the `EntityType` together with the map it came from (only while the dispatcher holds that map; only for `ImmutableMap`s). Each entry also classifies the renderer's culling: plain if no class below `EntityRenderer` (or `LivingEntityRenderer` for living ones) declares `shouldRender`, `affectedByCulling` or `getBoundingBoxForCulling` (reflection, once per type). A `@WrapOperation` on `isEntityVisible`'s `EntityRenderDispatcher.shouldRender` call answers for plain renderers (switch `fastEntityCulling`, "Fast Entity Culling"; players and mannequins excluded): `entity.shouldRender` (distance), then the interpolated box (`getInterpolatedBoundingBox`, virtual) through the frustum accessor without the inflated box allocations. Living renderers widen the box by another half block for a dragon head; instead of reading the head slot, the box with the widening is tested first (inside the frustum: visible either way; outside: hidden either way) and only when it crosses the edge the box without (visible: visible either way, else vanilla's path). Leash holders and non-finite boxes take vanilla's path. The frustum test is monotone in the box and the widened coordinates are computed in vanilla's `inflate` order. Checked: 16.8M answers equal vanilla's (AI on), 0.3% undecided |
+| `render/entity/EntityLight.java` + `mixin/render/entity/{EntityRendererLightM,EntityLightHolderM,LayerLightSectionStorageM}.java` + `interfaces/CachedEntityLight` | **Entity light kept across frames** (fifteenth session, switch `entityLightCache`, "Keep Entity Light"). `EntityRenderer.getSkyLightLevel`/`getBlockLightLevel` read `Level.getBrightness` at the light probe position for every entity and frame; a `@WrapOperation` on those two calls returns the values kept on the entity (`Entity` fields: level, packed position, generation, block and sky light + 1) while level, position and `EntityLight.generation()` are unchanged. Readers see light through each `LayerLightSectionStorage`'s visible map, which only changes when `swapSectionMap` publishes a new copy (writes copy each section into the updating map first); the client's storages (`chunkSource instanceof ClientChunkCache`) bump the generation at `swapSectionMap` HEAD when sections changed. Renderer overrides (fire, glow frames, displays) still run around the kept values. Render thread only. Checked with `bench.lightEvents`: 29.4M kept values equal fresh lookups (2.35M differ with the invalidation disabled) |
 
 Design rules used so far:
 - Hot paths use `@Overwrite` with an inlined vanilla fallback, because a cancellable `@Inject` allocates a
@@ -379,6 +389,24 @@ at rows ≥ 400 / threshold 12, and the full-frame threshold-40 map shows only c
 table books (red specks in the chest cube).
 
 ### 6.6 Profiling
+
+**Fifteenth session tools:**
+- The entity cost probe has a table of parts nested in extraction and submission (`parts of extraction and
+  submission`): culling, light, name tags and `shouldShowName`, shadows, item model resolves per display context, living
+  render types, `RenderTypes.entityCutout`, the villager, armor and held item layers, name display submits, and
+  attribute instances created on the render thread. Its mixins apply only with `-Pbench.entityCostParts=true` as well,
+  so plain `entityCost` runs stay comparable with earlier sessions. **Their wrappers box arguments** (MixinExtras
+  `Operation.call(Object...)`), adding ~50-100 ns per call, and they slow the pan from ~1085 to ~830 fps: compare parts
+  only between probe runs with the same mixins, as per call before/after numbers.
+- `-Pbench.staticView=k` (entity scene): the static phase at close-up position k (1 faces the villagers).
+- `-Pbench.lightEvents=true` (entity scene): after the pan, glowstone above the mob rows is placed and removed eight
+  times (light changes while entities are drawn; for checking kept light).
+- **JFR misattributed twice more:** 1.25% of the static frame under `AttributeSupplier.createInstance`, which a counter
+  showed is never called on the render thread; and 2.75% under `LivingEntityRenderer.extractNameTags` (1.47% self in
+  `Object2ObjectOpenHashMap.get`), but skipping those attribute reads changed nothing in an A/B. Light (2.9% in JFR)
+  measured 3.2% in the A/B. Rank with JFR, decide with A/Bs.
+- A foreground Bash command running longer than ~3 minutes is moved to the background; wait with a loop of at most
+  ~170 s per call, or with the background task's notification.
 
 **Fourteenth session tools:**
 - `java scripts/JfrTree.java <file.jfr> main [--from HH:MM:SS] [--to HH:MM:SS] [--under Class.method] [--depth N]`: the JFR
@@ -549,6 +577,9 @@ vanilla runs work without it), comparing both settings on the same frozen frame.
 to the game; Mojang's debug flags work in release builds with `-Pjvm.MC_DEBUG_ENABLED=true` plus
 `-Pjvm.MC_DEBUG_<FLAG>=true` (`MC_DEBUG_PRINT_PROPERTIES=true` lists them), e.g. `SHUFFLE_MODELS`, which shuffles the
 submit order of the reorderable feature phases every frame.
+Since the fifteenth session: `-Pbench.staticView=k` runs the static phase at close-up position k (1 faces the
+villagers; the pan stays at the overview), and `-Pbench.lightEvents=true` places and removes glowstone above the mob
+rows eight times after the pan (light changes while entities are drawn; not measured).
 
 ---
 
@@ -830,6 +861,56 @@ light profiler pairs followed (`-Pbench.lightProfile=5`): `prepareFeatures` 0.04
 render 0.283/0.289 vs 0.281/0.281, whole-phase CPU 0.78/0.73 vs 0.75/0.70: no regression (the view waits ~0.18 ms
 per frame on the GPU).
 
+### Fifteenth session (2026-10-28)
+Entity scene, section 8 item 1, "extraction and submission". Measured first at HEAD (`a98cb80`), static view (render
+thread ~3.1-3.5 ms): entity cost probe (`build/bench-logs/812-s15-probe0.log`) extraction 0.570 ms per frame (item frames
+~0.4 us, zombies/skeletons/endermen ~0.75-0.8, farm animals ~0.45-0.55), submission 0.496 (zombie villagers 1.25 us,
+villagers 0.95, zombies 0.87, items/item frames ~0.3-0.38). JFR at 1 ms (`results/entities-dev/s15/jfr0.jfr`): entity
+extraction loop 25% of the static render thread (culling 4.9%, light 2.9%, name tags 2.5%, renderer map lookups
+~2%), submission 20% (villager clothing layers 3.1%: three texture identifiers built per submit with string concatenation
+and path validation, then hashed afresh by `RenderTypes.entityCutout`'s memo; armor layers 1.7%; pose stack matrix math
+~3%). In the pan the culling of all 1332 entities was ~12% of the render thread and the loop ~3.6%. A new probe table
+(section 6.6) timed the parts; its numbers include the wrappers' boxing (below).
+
+Changes, each A/B tested in five interleaved pairs with `-Pbench.staticSeconds=10`, switch off vs on in the same build
+(median; `results/entities-dev/<dir>`):
+- **Entity culling without allocations or renderer lookups** (`c959ffa`, `s15-cull`, switch `fastEntityCulling`, together
+  with the renderer kept on the entity type): pan 1141.2 -> 1167.9 fps (every pair faster, p99 281.9 -> 288.3, render
+  thread 0.85 -> 0.82 ms), static 327.9 vs 327.0. Probe: `isEntityVisible` 111 -> 92 ns per entity in the pan, 170 -> 143
+  at the static view. The first version tested the box without the dragon head widening and then with it: no gain in the
+  pan (111 vs 112 ns), as the second frustum test cost what the head slot read had; testing the widened box first decides
+  most entities with one test. Check: 16.8M answers vs vanilla's with AI on, 0 mismatches, 0.3% undecided; 34M cached
+  renderers equal to the map lookup.
+- **Light kept per entity** (`14a6aad`, `s15-light`, switch `entityLightCache`): static 319.4 -> 329.6 (every pair faster,
+  render thread 3.02 -> 2.92 ms), pan 1153.3 -> 1169.0 (3 of 5). Probe: `getPackedLightCoords` 137 -> 91 ns (with the
+  wrapper); JFR 2.9% -> 1.2%. Check with `bench.lightEvents`: 29.4M kept values equal to fresh lookups; the same run with
+  the invalidation disabled found 2.35M mismatches, so the check sees stale light. Close-ups with either switch flipped
+  between shots of the same frame differ only like same-setting pairs (glint).
+- Tools (`f773c7a`, `d7e9f42`): the probe's parts table, `bench.staticView`, `bench.lightEvents` (section 6.6, 6.9).
+- **Rejected: name tag attribute instances kept on the entity.** JFR put 2% of the frame in `LivingEntity.getAttribute`
+  (two attribute map lookups per living entity: name tag and below name distance), with `AttributeSupplier.createInstance`
+  1.25% under it; a probe counted **0** `createInstance` calls on the render thread, so that attribution was impossible
+  (inlined code again). Keeping the instances on the entity: probe `extractNameTags` 285 -> 300 ns (noise). Not
+  committed.
+- **Rejected: name tags without the attribute reads** (`s15-nametags`, patch `nametags.patch` there): `shouldShowName`
+  before the name tag distance and the below name distance only when the scoreboard shows a below name objective (or the
+  entity class overrides `belowNameDisplay`); 5M name tags compared with vanilla's, 0 mismatches. JFR had 2.75% of the
+  static frame under `extractNameTags`, 1.47% of it as self time in `Object2ObjectOpenHashMap.get`. A/B: static 328.0 vs
+  328.2, pan 1180.3 vs 1167.9. So the attribute reads were not the cost JFR showed.
+- **Rejected: villager clothing identifiers kept per layer** (`s15-villager`, patch `villager-ids.patch` there):
+  `VillagerProfessionLayer.getIdentifier` results kept per kind and registry key. Probe: layer submits 958 -> 425 ns
+  (-46 us per frame); JFR 3.1% -> 1.4%. A/B with the static phase at the villager close-up (`bench.staticView=1`, static
+  ~430 fps): 428.7 vs 431.6 (3 of 5 pairs), pan 1171.8 vs 1210.2 (4 of 5, but villagers are a small part of the pan).
+  Within noise, so binned under the rules; it would matter most in villager-heavy places (trading halls).
+
+Session start (`a98cb80`) vs end (`d7e9f42`), checked out in turn in the same tree. Entity scene (five pairs,
+`results/entities-dev/s15-session`): static 321.7 -> 331.5 fps (4 of 5 pairs; p99 158.4 -> 157.7, render thread 3.01 ->
+2.95 ms), pan 1131.8 -> 1195.9 (every pair faster, p99 272.3 -> 294.0, render thread 0.85 -> 0.81). Probe at the end
+(without parts, `828-s15-probe-end-noparts.log`): extraction 0.570 -> 0.538 ms per frame, submission 0.496 -> 0.509
+(unchanged). Server scene (`results/s15-server`): static 1080.9 vs 1086.3 (render thread 0.71 vs 0.72 ms), pan 1023.9
+vs 1034.4, particles 915.1 vs 918.3, initial 742.8 vs 787.7 (that phase is noisy: runs 707-779 vs 733-809); four pairs,
+no regression.
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -958,11 +1039,12 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 - Mod compatibility of `ModelPoseReplay`: replayed layer submits bypass `setupAnim` and `ModelPart.render`, so a mod
   hooking those on a vanilla model class is skipped for layers (switch "Reuse Layer Poses").
 
-1. **Entity scene hot spots** (section 6.9; static ~3.0-3.2 ms render thread after the fourteenth session, section 7).
+1. **Entity scene hot spots** (section 6.9; static ~2.95 ms render thread after the fifteenth session, section 7).
    Done: block model mesh cache, hashed draw lookup, baked quads a quad at a time (10th), instanced parts (11th),
    instanced items, entity block models and armor, mesh submits without copies, item bounding boxes, part rotations,
    zero move collision queries (13th), transparent face culling, layer pose replay with array batch lookup, no vertex
-   builder for instanced submits (14th). Block displays now extract in 0.64 us; minecarts in ~1.3 us, a third of it
+   builder for instanced submits (14th), entity culling without allocations or renderer lookups and light kept
+   per entity (15th). Block displays now extract in 0.64 us; minecarts in ~1.3 us, a third of it
    vanilla's rail lookup (`OldMinecartBehavior.getPos`, two block reads), ~20 us per frame for 16, not worth more.
    Measured leads, entity cost probe at the end of the fourteenth session (per frame unless noted):
    - **Model prepares ~0.82 ms** (1.07 at the session's start): the part trees of first submits are ~0.38 ms
@@ -975,8 +1057,20 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
      copies at `endGroup`). Looking texture alphas up only when a cube is written (they are looked up per render type
      change, ~1% in JFR) measured within noise (section 7). Translucent and eyes types can't be instanced: their
      groups are strictly ordered and instancing reorders parts of different submits.
-   - **Extraction ~0.58 ms and submission ~0.50:** vanilla per entity work, ~0.3-0.8 us per mob. Generic render state
-     reuse was measured and rejected in the tenth session.
+   - **Extraction and submission** (fifteenth session, section 7): done: entity culling without allocations or renderer
+     lookups (the pan culls all ~1.3k loaded entities every frame), renderers kept on the entity type, light kept per
+     entity. What is left is a long tail of vanilla per-entity work, each item at or below the ~2% an A/B resolves (JFR
+     shares of the static render thread at the end of the session; JFR misattributed twice this session, see 6.6):
+     name tags ~2.7% (but skipping their attribute reads gained nothing), villager clothing identifiers ~3% (keeping them
+     cut the layer to 1.4% in JFR and -46 us in the probe, but the A/B was within noise; patch in
+     `results/entities-dev/s15-villager`), item frames' frame block model resolve ~1.2% (geometry key per frame), item
+     model resolves (~160 ns each, `ModelManager.getItemModel` hash lookups), armor layers ~2% (spread over render type
+     memo lookups, `EquipmentClientInfo.getLayers` and submit records), the pose stack's matrix math in submission ~3%
+     (`Matrix4f.rotateY`, `pushPose`), `LivingEntityRenderer.submit`'s `model.setupAnim` before layers ~1% (only layers
+     reading the parent model's poses need it, e.g. held items and head items; skipping it per layer class would be
+     typed), `SubmitNodeStorage.order` tree lookups ~0.4%, the culling's remaining distance test, section lookup and
+     leash check. A different approach would be needed for more: e.g. skipping extraction of entities whose render
+     state can't change (none is known to be safe generically; see the tenth session on state reuse).
    - **Client tick ~1.55 ms** (every ~12th frame at ~300 fps, so it sets the p95/p99): dropped items and experience
      orbs (block and entity collision checks every tick; floating items move by zero, items on the ground only every
      4th tick, so the scene overstates them), boats ~9 us each, the player ~0.13 ms.
