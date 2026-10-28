@@ -335,6 +335,11 @@ public abstract class Options {
                                 () -> config.textDisplayTextCache)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.textDisplayTextCache.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.textDisplayCulling"),
+                                value -> config.textDisplayCulling = value,
+                                () -> config.textDisplayCulling)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.textDisplayCulling.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)

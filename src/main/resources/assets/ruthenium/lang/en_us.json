@@ -73,6 +73,8 @@
   "ruthenium.options.nameTagTextCache.tooltip": "Name tags (players, named mobs, hologram armor stands) keep their text layout from one frame to the next while their text stays the same, instead of measuring, reordering and laying it out again every frame. Mods that change a name tag after it is shown may want it off.",
   "ruthenium.options.textDisplayTextCache": "Keep Text Display Text",
   "ruthenium.options.textDisplayTextCache.tooltip": "The lines of text displays (holograms) keep their glyph layout from one frame to the next while their text stays the same, as sign text does.",
+  "ruthenium.options.textDisplayCulling": "Cull Text Displays",
+  "ruthenium.options.textDisplayCulling.tooltip": "Text displays (holograms) that are out of view are skipped. Minecraft only skips them when their size is set, which hologram plugins leave at zero, so it lays out and draws every one in range wherever you look. The test uses the extent of their text, so nothing visible is skipped.",
   "ruthenium.options.reuseEntityStates": "Reuse Entity Render States",
   "ruthenium.options.reuseEntityStates.tooltip": "Armor stands reuse their render state from the previous frame instead of creating a new one every frame.",
   "ruthenium.options.blockModelMeshCache": "Cache Entity Block Models",

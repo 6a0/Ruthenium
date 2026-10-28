@@ -8,6 +8,8 @@ import net.minecraft.client.player.AbstractClientPlayer;
 import net.ruthenium.Initializer;
 import net.ruthenium.interfaces.EntityRendererMap;
 import net.ruthenium.render.entity.EntityRendererCache;
+import net.ruthenium.render.entity.TextDisplayCulling;
+import net.minecraft.world.entity.Display;
 import java.util.Map;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.LevelRenderer;
@@ -82,7 +84,12 @@ public class LevelExtractorEntityM {
                 }
             }
         }
-        return original.call(dispatcher, entity, frustum, camX, camY, camZ, partialTicks);
+        boolean visible = original.call(dispatcher, entity, frustum, camX, camY, camZ, partialTicks);
+        if (visible && entity instanceof Display.TextDisplay display
+                && TextDisplayCulling.isHidden(display, frustum, camX, camY, camZ, partialTicks)) {
+            return false;
+        }
+        return visible;
     }
 
     @Inject(method = {"setLevel", "allChanged"}, at = @At("HEAD"))
