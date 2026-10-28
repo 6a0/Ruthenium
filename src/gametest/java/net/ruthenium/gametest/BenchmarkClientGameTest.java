@@ -66,7 +66,8 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
             case "terrain" -> TerrainBenchmark.run(context, LABEL, RUN_ID);
             case "blockentities" -> BlockEntityBenchmark.run(context, LABEL, RUN_ID);
             case "entities" -> EntityBenchmark.run(context, LABEL, RUN_ID);
-            default -> throw new AssertionError("Unknown scene '" + SCENE + "' (mixed, terrain, blockentities or entities)");
+            case "players" -> PlayerBenchmark.run(context, LABEL, RUN_ID);
+            default -> throw new AssertionError("Unknown scene '" + SCENE + "' (mixed, terrain, blockentities, entities or players)");
         }
     }
 
