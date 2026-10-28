@@ -943,6 +943,21 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 
 ## 8. What's next (in priority order)
 
+### Pending user decisions
+- **`TransparentFaces` (7e76c79) is ~8% slower with instanced parts off** (independent verification after the
+  fourteenth session, `results/verify-s14/`): entity scene, `-Pvm.instancedParts=false`, 3 pairs, every pair slower
+  with the culling on: static 194.9 -> 179.7 fps (render thread 4.99 -> 5.37 ms), pan 987 -> 906. With defaults it
+  is a real gain (5 pairs: static 298.5 -> 313.7, 3.26 -> 3.05 ms). Likely (inferred, not profiled) cause: each cube
+  caches its face mask for only 4 textures (`ModelPartCubeM.transparentPolygons`), so models whose cubes see many
+  textures per frame (villager clothing, ~28) rescan the faces' UV rectangles on every miss. This also hits the
+  non-instanced fallbacks with defaults (translucent models with >4 textures, `MAX_BATCHES` overflow). Fix options: a
+  larger or per-texture cache, or giving up on a cube after repeated misses. Kept, as the gain with defaults is real.
+- The server scene's static render thread CPU read 0.71 -> 0.74 ms in all 4 verification pairs (4150777 vs a9aafe1),
+  fps unchanged (GPU bound); probably the per-submit `TransparentFaces.of` / `ModelPoseReplay.begin` checks across
+  the 296 armor stands (not profiled).
+- Mod compatibility of `ModelPoseReplay`: replayed layer submits bypass `setupAnim` and `ModelPart.render`, so a mod
+  hooking those on a vanilla model class is skipped for layers (switch "Reuse Layer Poses").
+
 1. **Entity scene hot spots** (section 6.9; static ~3.0-3.2 ms render thread after the fourteenth session, section 7).
    Done: block model mesh cache, hashed draw lookup, baked quads a quad at a time (10th), instanced parts (11th),
    instanced items, entity block models and armor, mesh submits without copies, item bounding boxes, part rotations,
