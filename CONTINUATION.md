@@ -75,7 +75,7 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   only rendering speed.
 - **TODO: the icon is to be changed.** `assets/ruthenium/vlogo.png` (mod list icon, `fabric.mod.json`) and
   `vlogo_transparent.png` (settings screen, `ModSettingsRegistry`) are still VulkanMod's logo.
-- **Still to decide:** the GitHub repository is still named `6a0/VulkanMod`; the issue templates in `.github/` and the
+- **Still to decide:** the issue templates in `.github/` and the
   Ko-fi button on the settings screen (`VOptionScreen.KOFI_URI`) still point to upstream VulkanMod; `fabric.mod.json`
   still lists `Collateral` as the author.
 - **Name history:** briefly Rubidium, then Thallium (both already used: Rubidium is a Forge Sodium port, Thallium a
@@ -1476,7 +1476,7 @@ blocks, plane culling and the mod compatibility trade-offs). Nothing is pending.
 
 - **Commits:** the user wants a commit after each change is benchmarked, with the numbers in the message. End
   commit messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Git user `6a0`. Remote
-  `origin` = `6a0/VulkanMod`, `upstream` = `xCollateral/VulkanMod`. Branch `26.3` is pushed to `origin` (since 2026-10-28) and tracks `origin/26.3`; nothing goes to `upstream`.
+  `origin` = `6a0/Ruthenium` (renamed from `6a0/VulkanMod` on 2026-10-28), `upstream` = `xCollateral/VulkanMod`. Branch `26.3` is pushed to `origin` (since 2026-10-28) and tracks `origin/26.3`; nothing goes to `upstream`.
 - **No Sodium code.** It is PolyForm Shield licensed.
 - **Safety of the culling:** `BlockEntityCulling` only handles `minecraft:` block entity types. If more types
   render outside block ±1 (+2 up), widen the box rather than special-casing.
