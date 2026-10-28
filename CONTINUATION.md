@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-28 (sixteenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-28 (seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -50,6 +50,15 @@ direct entity section lookup and an air-only skip of inside-block checks measure
 scene in the same tree, start -> end: client tick 1.596 -> 1.261 ms (pan 1.465 -> 1.168), static
 321.5 -> 331.1 fps (p95 219.3 -> 241.5, p99 155.2 -> 165.8), pan 1159.7 -> 1193.6; server
 scene client tick 1.23 -> 1.13-1.19 ms (animateTick), fps unchanged (static 1084.8 vs 1084.5, GPU bound).
+Seventeenth session (section 7, "Seventeenth session"): the server scene's per block entity cost (section 8 item 2).
+**Enchanting tables tick in one loop** (client tick 1.15 -> 0.93 ms, static p99 low 459 -> 505), **retained quads are
+drawn by plane** (179k -> 132k quads per frame; static 1063 -> 1095 fps, GPU bound), closed books compute their tilt once,
+**lecterns, bells and copper golem statues are retained** (new `blockEntityKinds=extras` scene: static 211 -> 1220 fps),
+**retained batches are only rebuilt when their blocks or light change** (extras p99 low 280 -> 715) and are kept 30 s
+behind the camera. Three attempts binned (sprite pipeline repeats, cell index masks, front-to-back plane order). Same
+tree, start -> end: server scene static 1085.0 -> 1126.5 fps (p99 446.3 -> 507.2), pan 1029.2 -> 1055.5 (p99 380.0 ->
+436.8), client tick 1.236 -> 0.931 ms; the block entity scene's static view lost 0.6% (1773.5 -> 1763.1, GPU, the plane
+order), the entity scene is unchanged.
 
 ---
 
@@ -67,7 +76,8 @@ scene client tick 1.23 -> 1.13-1.19 ms (animateTick), fps unchanged (static 1084
   (pan p99 low 18 → 294). Sodium 0.9.3-beta.1 on the same benchmark: 63 / 163. On vanilla's OpenGL backend
   (`benchVulkanModGl`) the static view ran at 344 fps (before the eighth session; not re-measured).
 - **Block entities at rest are retained on the GPU** (`RetainedBlockEntities`; chests since the third session, at
-  the user's choice, shulker boxes, decorated pots and skulls since the seventh, sign text since the eighth): their
+  the user's choice, shulker boxes, decorated pots and skulls since the seventh, sign text since the eighth, lecterns, bells and copper golem
+  statues since the seventeenth): their
   geometry lives in per-section vertex buffers and is drawn with copies of the entity and text pipelines that add
   `ModelOffset`. Switch
   ("Retained Block Entities"): Optimizations page of the settings screen, or `-Dvulkanmod.retainedChests=false`
@@ -114,8 +124,8 @@ scene client tick 1.23 -> 1.13-1.19 ms (animateTick), fps unchanged (static 1084
   `System.nanoTime` counters to rank work, and check each number another way before acting on it; section 6.6
   lists the traps found so far (the light profiler itself inflates per entity sections, Windows thread CPU time
   is quantised, a second worktree's run directory changes GPU time).
-- **Server scene, static view: ~0.78 ms render thread, ~0.875 ms GPU per frame** (twelfth session). It is close to
-  GPU bound, so CPU savings there show in the render thread time and the p99, not much in the average. Its p99 low
+- **Server scene, static view: ~0.72 ms render thread, ~0.84 ms GPU per frame** (seventeenth session; 0.78 / 0.875 in
+  the twelfth). It is GPU bound, so CPU savings there show in the render thread time and the p99, not much in the average. Its p99 low
   is set by the 2% of frames that run a client tick (~1.4 ms per tick); see section 7, "Twelfth session".
 - **Next:** see section 8.
 
@@ -255,6 +265,10 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `world/AnimateTick.java` + `mixin/world/{ClientLevelAnimateTickM,LegacyRandomSourceAccessor,EnvironmentAttributeSystemAccessor,EnvironmentValueSamplerAccessor}.java` | **Faster animateTick** (sixteenth session, switch `fastAnimateTick`, "Fast Block Animation Tick"). `ClientLevel.doAnimateTick` runs for 1334 random positions per tick. Its `nextInt` calls on the level's `LegacyRandomSource` (exact class) step the seed with `getPlain`/`setPlain` instead of a compare-and-set per call (same sequence; the CAS only detects use from two threads). Its ambient particle lookup (`environmentAttributes().getValue(AMBIENT_PARTICLES, pos)`: a fuzzy-zoomed biome lookup) is answered with the attribute's no-biome value (computed once per `animateTick`) when the biome palettes of the chunk sections holding the zoom's 2x2x2 quart corners (the only biomes it can pick; y clamped as `ChunkAccess.getNoiseBiome` does) contain no biome whose attribute map has an `AMBIENT_PARTICLES` entry (vanilla: four nether biomes), cached per section per call. Only while the attribute's sole positional layer is the biome lambda of `EnvironmentAttributeSystem` (checked through accessors on the sampler's layers); unloaded chunks take vanilla's lookup. Checked: 24M random results and seeds, 3.8M ambient values in the entity and terrain scenes, and the biome vanilla's zoom chose was always in a checked palette |
 | `mixin/world/AbstractBoatM.java` | **Boat ticks** (sixteenth session, switch `fastBoatTicks`, "Fast Boat Ticks"). In `getGroundFriction`, full cube collision shapes (`== Shapes.block()`) skip the moved shape and the `joinIsNotEmpty` with the bottom slice: separated by more than 1e-6 on an axis = false (vanilla's own early out uses 1e-7), overlapping by more than 1e-6 on all axes = true, anything else vanilla's join (redirects on `VoxelShape.move` and `Shapes.joinIsNotEmpty` there). The push search in `tick` (`getEntities(this, box, EntitySelector.pushableBy(this))`, which on the client only accepts local players) asks `ClientLevel.getPushableEntities` on the client, as vanilla's own living entity push does. Checked: 200k cube joins and 6.1k pushes equal to vanilla's |
 | `world/SupportingBlocks.java` + `mixin/world/{EntitySupportingBlockM,BlockChangeTrackingM,LevelChunkSectionM}.java` + `interfaces/SectionChangeStamp` | **Supporting block kept for resting entities** (sixteenth session, switch `fastSupportingBlocks`, "Keep Supporting Blocks"). `Entity.checkSupportingBlock`'s `findSupportingBlock` (a `BlockCollisions` sweep of a thin slab under the entity: orbs every tick, items every fourth, entities moved by server packets) is answered from the last result on the client while the slab, the entity's position and the chunk sections of the swept region (box +-1 block, at most 8 sections, the same objects) have the same change stamp. Each `LevelChunkSection` has a stamp, bumped by `LevelChunk.setBlockState` on client levels and for every section by `LevelChunk.replaceWithPacketData` (chunk data is read into the existing sections). Results are kept only when every block of the region has a collision shape that is neither dynamic (`Block.hasDynamicShape`) nor context dependent (no class below `BlockBehaviour` declares `getCollisionShape(BlockState, BlockGetter, BlockPos, CollisionContext)`), so the entity's collision context can't change it. A first version with one level-wide stamp hit ~65% (the integrated server sends ~4.5 block updates per second: grass and dirt random ticks); per section 99.5% at rest. The kept state lives in an object created on an entity's first search (`SupportingBlocks.Kept`; 13 fields on every `Entity` made the server scene's armor stand ticks ~0.02 ms slower per tick). Checked: 220k kept answers equal to a fresh search (gravity scene, with and without AI) |
+| `world/EnchantingTableBatch.java` + `LevelM`, `RebindableTickingBlockEntityWrapperM`, `BoundTickingBlockEntityM` (`ParkableTicker.vulkanmod$tryBatch`, `BlockEntityTicker.vulkanmod$getValidState`) | **Enchanting tables ticked in one loop** (seventeenth session, switch `batchTableTicks`, "Fast Enchanting Table Ticks"; needs parking and `cacheTickerStates`). On the client, `LevelM`'s loop parks the wrapper of a vanilla `EnchantingTableBlockEntity` whose bound ticker has a validated state of the exact `EnchantingTableBlock` class into the level's batch (arrays of wrappers, tables and packed positions, in joining order). After the list, the batch runs vanilla's guards (removed: the wrapper leaves; `shouldTickBlocksAt`, `hasLevel`, the world border) and, unless a player passing `EntitySelector.NO_SPECTATORS` (positions read once per tick) is within the 3 blocks `bookAnimationTick` searches, a statement for statement copy of its branch without a player; otherwise vanilla's `bookAnimationTick`. A wrapper leaves on rebind or unpark (`remove(slot)`; slots move as the batch compacts). Order among tables only matters for their shared unseeded random source, used only with a player near. Mod compatibility: mixins into `bookAnimationTick` don't run for tables without a player near |
+| `SectionFaceGroups.sortByPlanes`/`visiblePlaneRuns` (used by `RetainedBlockEntities`) | Retained batches are sorted by facing and, within a facing group, by plane (nearest to the faced side first; stable, so equal plane quads keep their order); each frame draws the prefix of each group whose planes (with the 0.25 margin) the eye can be in front of, merged into at most 7 runs. Quads within a 1e-5 tilt of an axis and 1e-4 blocks of a plane count as in it (rotated models), with their backmost coordinate as the plane. Terrain keeps `sort` and its packed per-group draws |
+| `RetainedBlockEntities` (seventeenth session) | Also retains lecterns, bells (not while `shaking`; `BellBlockEntityM` marks the section dirty on `triggerEvent`) and copper golem statues. **Change checks** (switch `retainedChangeChecks`): `LevelExtractor.setSectionDirty` now calls `markBlocksChanged`; a batch remembers its block entity objects and block states and its members' light (`LightCoordsUtil.getLightCoords` at the block entity and, for double chests, at the other half), and a block or light change, or a new compile of the section, rebuilds it only if any of these differ (`isUnchanged`). Neighbours are only checked when they hold a double chest whose other half is in another section (`linked`). Block entity events still force rebuilds (`markDirty`, with neighbours). Batches are freed after 1200 frames *and* 30 s unused, or 1200 frames when more than 64 blocks beyond their view distance. Mod compatibility: a mod changing what a retained block entity renders without a block entity event, block state or light change (e.g. a field set directly on the client) leaves the batch stale until the next rebuild |
+| `InstancedModels.tryAddClosedBook` | The closed book's constant 80 degree tilt: sine and cosine computed once with JOML's functions and applied with `rotateTowardsXY`, which `rotateZ` calls on a matrix that isn't a pure translation (pure translations keep `rotateZ`); bit-identical |
 
 Design rules used so far:
 - Hot paths use `@Overwrite` with an inlined vanilla fallback, because a cancellable `@Inject` allocates a
@@ -404,6 +418,21 @@ at rows ≥ 400 / threshold 12, and the full-frame threshold-40 map shows only c
 table books (red specks in the chest cube).
 
 ### 6.6 Profiling
+
+**Seventeenth session tools and traps:**
+- Elimination runs through temporary system properties ranked the server scene's costs (retained draws skipped or doubled,
+  enchanting table batch skipped); temporary counters in `RetainedBlockEntities.draw` counted batches, draws and quads (sign
+  text separately). Patches and results are under `results/s17-*` and `results/s17-dev/`.
+- **The parts table's "per tick" figures include calls made outside the tick**: `Level.getEntities(except, box, predicate)`
+  read 53 calls per tick at ~4 us, but a stack walk in the probe showed 49.5 of them were `Minecraft.pick` in
+  `renderFrame` (one per frame at ~1000 fps / 20 ticks). Check the caller before attributing a "per tick" part to the tick.
+- Experiment runs that skip drawing something show in the game window (the user saw the chests vanish during a retained
+  elimination run); say so in the notes when such runs are planned.
+- Pan frame spikes by cause: the pan CSV has `gcs` and `ticks` columns; frames over a threshold that are neither GC nor tick
+  frames isolate other stalls (here retained rebuilds after eviction). A temporary log of rebuilt sections per frame (time,
+  block entities, dirty or new mesh) found the extras scene's rebuild storm.
+- Tick changes below ~0.04 ms (the sprite pipeline repeats, ~0.03 ms in the probe) don't resolve in a 5 pair tick A/B on
+  the server scene; its static tick spreads ~±0.05 ms run to run.
 
 **Sixteenth session tools:**
 - The entity cost probe's parts table (`-Pbench.entityCostParts=true`) has a per tick table, `parts of the client's entity
@@ -593,6 +622,13 @@ coloured, bold, underlined and back side text, one glowing sign at x 4, which st
 events it also changes one sign's text on the client (`besign`). It hides part of the field, so don't compare its fps
 with runs without it. Crop the signs with `scripts/Crop.java` (`java scripts/Crop.java out.png x y w h
 scale in1.png in2.png`, around x 740 y 600) to compare glyphs.
+
+Since the seventeenth session: `-Pbench.blockEntityKinds=extras` fills the field with 3072 lecterns with books, 768 bells on
+stone and 1536 copper golem statues (poses, oxidation levels, facings) instead; the chest row stays and the run needs 5000
+block entities. Its events ring a bell and crack a lectern (`beevents`, while the bell swings) and reset (`bereset`, after
+the swing). Both kinds' events now end with glowstone placed above the field and removed (`belight`, `belightreset`): a light
+change in sections whose block entities don't change. The flat world's grass under the field turns to dirt by random
+ticks for minutes, i.e. block changes next to the block entities (real play has these too: crops, redstone, water).
 
 ### 6.9 Entity benchmark (tenth session)
 `-Pbench.scene=entities` on any bench task (`EntityBenchmark`): a fresh flat world, render distance 12
@@ -1026,6 +1062,91 @@ which led to `272da2e`. Against that, three pairs (`results/s16-server-kept`): t
 463.8), pan 1030.7 -> 1035.2 (p99 368.4 -> 383.3), particles 921.2 vs 918.3. No fps regression; the scene is close to
 GPU bound. The entity scene was compared against `7f4e28c`; `272da2e` only moved the kept state (probe above).
 
+### Seventeenth session (2026-10-28)
+Server scene, section 8 item 2, "per entity and block entity cost". The server was up the whole session. Measured first at
+HEAD (`77b631c`; light profiler depth 4 and GPU timestamps, `build/bench-logs/1152-s17-base-prof.log`), static view: frame
+0.944 ms, GPU frame 0.861 ms (solid terrain 0.412, retained block entities 0.156, instanced models 0.063, the rest ~0.23),
+render thread waiting ~0.17 ms per frame in `awaitGpu`; block entity extraction 0.089 ms, entity extraction 0.063; tick
+probe (no profiler) 1.11-1.19 ms per tick: block entities ~0.46 (5.6k enchanting tables), entities ~0.31, textures ~0.16,
+animateTick ~0.15. Second methods used below: elimination runs (skipping a part), the entity cost probe's parts table,
+temporary counters, GPU timestamps and frame time series.
+
+- **Retained draws by elimination** (`results/s17-dev/exp1`): skipping the retained draws took the static view from 1084
+  to 1224 fps (GPU frame 0.862 -> 0.725 ms), drawing them twice to 922 (retained 0.332 ms), so their GPU time is real and
+  proportional to their work. Counters: 15 batches, 49 draws, **178.8k quads per frame, 86.8k of them sign text** (the signs
+  inside the chest wall). Draw count is not the cost.
+- **Enchanting tables by elimination** (`s17-dev/exp1`): with all of them skipped the block entity tick is 0.075-0.082 ms,
+  so ~5.6k tables cost ~0.38 ms per tick (~70 ns each) on vanilla's path.
+
+Changes, each A/B tested in five interleaved pairs unless noted (median; `results/<dir>`):
+- **Enchanting tables ticked in one loop** (`4c51590`, `s17-tables2`, switch `batchTableTicks`, "Fast Enchanting Table
+  Ticks"): `EnchantingTableBatch`. Client tick 1.151 -> 0.929 ms (every pair; block entities ~0.45 -> 0.24), frames with a
+  tick 2.32 -> 2.04 ms, static p99 low 459 -> 505 fps (every pair), pan tick 1.409 -> 1.161. A first version that kept the
+  wrapper and read the position through the block entity measured 1.156 -> 1.020 ms (`s17-tables`); the scattered
+  wrapper and `BlockPos` objects were most of what was left (the batch now costs ~23 ns per table, elimination). Exact:
+  3.1M ticks compared with vanilla's `bookAnimationTick` on a copy, 0 differing bits (both versions).
+- **Retained quads drawn by plane** (`9c15ac0`, `s17-planes`, temporary switch): `SectionFaceGroups.sortByPlanes` and
+  `visiblePlaneRuns`. Quads per frame 178.8k -> 131.6k (text 86.8k -> 65.5k); static 1063.1 -> 1094.8 fps (every pair; GPU
+  frame 0.873 -> 0.837 ms, retained 0.156 -> 0.141), pan 999.1 -> 1008.0 (retained GPU 0.103 -> 0.077), particles 897.1 ->
+  922.3. Pixel-identical in the block entity scene on Vulkan and OpenGL (only the sky band that differs between runs).
+- **Closed books' tilt computed once** (`e02bd9f`, `s17-tilt`, facing the cube with `staticYaw=270`, temporary switch):
+  static 832.5 -> 846.8 fps (every B run above every A run; render thread 1.03 -> 0.99 ms), particles at that yaw 684.8 ->
+  715.5. 103.8M poses compared with `rotateZ`'s: 0 differences.
+- **Lecterns, bells and copper golem statues retained** (`62992f5`, scene `6f73bd8`, `s17-extras`, three pairs): block
+  entity scene with `-Pbench.blockEntityKinds=extras` (section 6.8), static 211.1 -> 1219.5 fps (render thread 4.58 -> 0.43
+  ms), pan 1479.9 -> 2118.8. Screenshots on vs off: 29 pixels at threshold 1 (14 at 12) on Vulkan and OpenGL, the rounding
+  difference the other retained types have.
+- **Retained batches rebuilt only when their blocks or light change** (`0f9b780`, `s17-changes`, switch
+  `retainedChangeChecks`, "Retained Change Checks"; glowstone events `ca6a80b`): found through a rebuild log in the extras
+  scene, whose static p99 low stayed ~100 fps: the flat world's covered grass turning to dirt (random ticks) rebuilt the
+  sections around each change, ~10 times a second, up to ~5 ms each. Extras scene: static 1472.9 -> 1625.3 fps, **p99 low
+  280.2 -> 715.2** (frames without a tick p99 3.0-5.1 -> 1.18-1.20 ms, every pair), pan 2289.3 -> 2419.4. Exact: 800 kept
+  batches rebuilt anyway by a temporary check, 0 CRC differences; screenshots with the switch flipped identical at
+  threshold 1 in both block entity scenes, including the new glowstone events.
+- **Retained batches kept 30 s behind the camera** (`aa618c3`, `s17-evict`, temporary switch): a 1200 frame eviction freed
+  the chest cube's batches during the pan (~1.2 s at ~1000 fps), so turning back rebuilt them (frames of 7-21 ms). Pan
+  frames over 7 ms that are neither GC nor tick frames, per run: 2/2/3/2/1 -> 0/0/1/0/1; fps unchanged (pan 1050.5 vs
+  1058.4).
+- **Rejected: pipeline set once per run of equal sprites in texture animation** (`s17-sprites`, patch there). Vanilla's
+  `SpriteContents.AnimationState.drawToAtlas` sets its pipeline before every sprite, which binds it again and makes the
+  frontend set every uniform again. The parts probe put the blocks atlas at 105/104 -> 129/146 us per tick without/with the
+  repeats (2 runs each), but the tick A/B (5 pairs) read static 0.953 vs 0.945 ms, pan 1.179 vs 1.143, not consistent across
+  pairs: within noise, binned.
+- **Rejected: front-to-back order within facing groups** (`s17-f2b-*`, five pairs each, patch there): planes sorted
+  farthest out first so the drawn suffix runs nearest to the eye first, with a binary search for the visible part; 0 of
+  400k draws differed from a per-quad brute force, but no measurable change (server static 1096.5 vs 1095.3, GPU 0.835
+  both; block entity scene 1731.6 vs 1735.1).
+- **Rejected: block entity extraction through per cell index masks** (`s17-cells`, patch there): sections crossing the
+  frustum visited only the list indices of cells not outside it (bit sets per mesh, list order kept; 260k sections compared
+  with the old loop, 0 differences). Extraction probe: static 92 us per frame for 22 sections, 14k listed, 9.3k retained,
+  4.7k visited (253 books, ~4.4k culled); the pan facing the cube 0.2-0.3 ms, mostly books. A/B: static 1102.7 vs 1105.4,
+  pan 1030.8 vs 1017.0 (render thread 0.83 vs 0.85 ms): no gain, binned.
+- **Measured, not pursued:** armor stand ticks (~0.23 ms per tick for 296 with the parts probe's wrappers, ~0.8 us each,
+  spread over `aiStep` ~0.25, base ticks ~0.35, `commonTick` 0.09, fluid checks 0.08: no single part worth a change); the local
+  player's tick (0.1-0.25 ms, `LocalPlayer.aiStep`, move, inside block checks and ambient sound handlers; once-per-tick code
+  warming up, section 6.6); the parts table's 53 `Level.getEntities` calls "per tick" at ~4 us were 49.5 per-frame
+  `Minecraft.pick` calls (a stack walk showed it), ~5 us per frame; glowing sign text (section 8); retained builds after
+  joining (single sections of ~450-2300 block entities take 9-43 ms while the code is cold, and a section is built in one go).
+
+Session start (`77b631c`) vs end (`aa618c3`), checked out in turn in the same tree, five pairs:
+- **Server scene** (`results/s17-session-server`): static 1085.0 -> 1126.5 fps (every pair; p99 low 446.3 -> 507.2), pan
+  1029.2 -> 1055.5 (p99 380.0 -> 436.8), particles 916.2 -> 941.2, initial 753.8 -> 818.8 (p99 126.2 -> 144.6); client tick
+  1.236 -> 0.931 ms (pan 1.384 -> 1.133), frames with a tick 2.29 -> 2.02 ms. On vanilla's OpenGL backend (two pairs,
+  `s17-session-server-gl`): static 866.2 -> 894.9, pan 844.0 -> 865.5.
+- **Block entity scene** (default kinds, `s17-session-be`): static 1773.5 -> 1763.1 fps (**-0.6%, every pair**; render
+  thread 0.27 ms on both sides, so GPU), pan 2602.1 vs 2600.7. A bisect (`s17-bisect-planes`, four pairs) put it on the
+  plane sorting (`9c15ac0`): 1727 -> 1714 fps, GPU frame 0.542 -> 0.546 ms, retained 0.295 -> 0.299 ms, although fewer
+  quads are drawn. Not the draw count (merging runs across gaps of hidden quads, `s17-dev/gap`: no better, worse with
+  large gaps) and not front-to-back order within a group (`s17-f2b-*`, five pairs each: BE 1731.6 vs 1735.1, server
+  1096.5 vs 1095.3, GPU equal; binned, patch there); grouping planes into 4 block slabs kept in build order (`s17-dev/slab-*`)
+  was within single-run noise in this scene and lost part of the server scene's gain (retained 0.138-0.141 exact planes,
+  0.142-0.148 slabs, 0.155-0.157 with 16 block slabs, i.e. the old per group culling). Inferred cause: plane order spreads
+  each block entity's quads through the buffer (less locality for the GPU). Kept: the server scene gains 15 us of GPU per
+  frame (+3%), this scene loses ~4 us (-0.6%). The extras kind isn't comparable across these commits (it didn't exist at
+  the start); its numbers are in the change list above.
+- **Entity scene** (`s17-session-entities`): static 323.7 vs 327.4 fps, pan 1173.9 vs 1184.6, client tick 1.287 vs 1.285 ms:
+  unchanged (none of the changes touch it).
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -1175,6 +1296,15 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
   dynamic-lights mod or a preview level whose light isn't backed by `ClientChunkCache`; `fastEntityCulling` bypasses
   mods hooking `EntityRenderDispatcher.shouldRender` / `EntityRenderer.shouldRender` for plain renderers. Leashed
   entities miss the light cache every frame (the leash reads light at the eye position).
+- Seventeenth session, mod compatibility only (each exact for vanilla, each with a switch): `batchTableTicks` runs the
+  idle branch of `EnchantingTableBlockEntity.bookAnimationTick` as a copy, so a mod injecting into that method is bypassed
+  for tables without a player near; `retainedChangeChecks` assumes a retained block entity's look only changes with its
+  block state, the light at it (and at a double chest's other half) or an event that marks it dirty (block events, data
+  packets, sign text, breaking progress), so a mod that changes a retained vanilla block entity's fields on the client
+  without one of these leaves its geometry stale until the next rebuild.
+- Seventeenth session, a trade-off kept: drawing retained quads by plane (`9c15ac0`) gains ~3% in the server scene (GPU
+  0.873 -> 0.837 ms) but costs the block entity scene's static view ~0.6% (GPU 0.542 -> 0.546 ms; section 7). Revisit if
+  a scene that matters more looks like the block entity field from outside (no section containing the eye).
 
 1. **Entity scene hot spots** (section 6.9; static ~2.95 ms render thread after the fifteenth session, section 7).
    Done: block model mesh cache, hashed draw lookup, baked quads a quad at a time (10th), instanced parts (11th),
@@ -1222,29 +1352,31 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
      cuboid collisions), and dropped items from fights cost ~1.1 us each. The frames with a tick are also slower outside
      the tick, most likely the benchmark harness's handshake and length-biased sampling (section 6.6).
    - Players and other translucent types stay vanilla (no player in the scene but the spectator).
-2. **Per entity and block entity cost in the server scene** (twelfth session measurements in section 7). The static
-   view is close to GPU bound (~0.875 ms GPU vs ~0.78 ms render thread), so CPU work there shows in the render
-   thread time and the p99; GPU work (terrain 0.42 ms, retained block entities 0.155) shows in the average. Done:
-   sign text retained, closed books without extraction, cached table light, reused armor stand states (8th/9th),
-   parked idle tickers, validated ticker states, typed armor stand pushes, retained faces by facing, packed terrain
-   draws (12th). Ruled out: cheaper entity culling, generic render state reuse (10th). Measured leads:
-   - **Block entity extraction** (~0.09 ms/frame at static, all block entities retained or instanced): ~4.7k visited
-     per frame, ~4.4k of them frustum culled (~14 ns each, ~0.06 ms; enchanting tables in retained sections and
-     sections partly beyond the view distance) and 253 closed books (~75 ns each, ~0.02 ms). Culling whole 4³ cells
-     from a per mesh list of non-member indices per cell (keeping index order for the output) could save ~0.03-0.04
-     ms; facing the cube there are ~1.1k books per frame.
-   - **Client tick** (~1.4 ms, sets the p99): block entities ~0.5 ms (~5.6k enchanting tables at ~90 ns: wrapper,
-     bound ticker and block entity loads, the world border check, profiler push/pop), entities ~0.34 (~300 armor
-     stands at ~1.1 us), animateTick ~0.27 (vanilla's 1334 random block lookups; ~0.1 ms less since the sixteenth
-     session's switches: the verification measured only ~0.05 ms per tick start -> end, 5 pairs, and 0.06-0.09 ms
-     switches off -> on, against a +-0.1 ms spread; the session's own 1.23 -> 1.13 ms did not reproduce), textures ~0.16 (animated texture
-     uploads), the rest ~0.1.
-   - **GPU:** retained block entities still 0.155 ms (vertex work; the entity vertex format is 36 B and its shader
-     does lighting per vertex); instanced models 0.065.
-   - **Other retainable block entities**: glowing sign text (its outline depends on the camera distance to the sign,
-     16 blocks; two variants), bells and lecterns at rest, copper golem statues; banners animate (wind), beds are
-     block models in 26.x, shelves and campfires render items.
-   - **Retained first-frame cost** after a teleport (budget 2048 block entities per frame).
+2. **Per entity and block entity cost in the server scene** (twelfth and seventeenth session measurements in section 7).
+   The static view is GPU bound (GPU frame ~0.84 ms, render thread ~0.72 ms), so CPU work there shows in the render thread
+   time and the p99 (tick frames); GPU work shows in the average. Done: sign text retained, closed books without
+   extraction, cached table light, reused armor stand states (8th/9th), parked idle tickers, validated ticker states, typed
+   armor stand pushes, retained faces by facing, packed terrain draws (12th), enchanting tables ticked in one loop,
+   retained quads drawn by plane, the books' tilt computed once, lecterns/bells/copper golem statues retained, retained
+   change checks and 30 s eviction (17th). Ruled out: cheaper entity culling, generic render state reuse (10th), sprite
+   pipeline repeats, cell index masks and front-to-back plane order (17th, within noise). What is left, measured:
+   - **GPU, retained 0.141 ms** for 131.6k quads per frame (static), half of them sign text of the signs inside the chest
+     wall, mostly hidden behind chests; there is no exact way to skip occluded quads (chests are 14/16 wide, renderpearl
+     has no occlusion queries). Instanced models 0.063 ms (armor stands are `entity_cutout`, drawn without culling).
+   - **Client tick ~0.93 ms** (static): armor stands ~0.23-0.32 ms (296 at ~0.8 us, a long tail of base tick, `aiStep`,
+     fluid checks and `commonTick`), the local player 0.1-0.25 ms (mostly once-per-tick code that is still warming up),
+     the enchanting table batch ~0.13 ms (~23 ns per table, mostly loading each table), texture animation 0.10-0.15 ms
+     (blocks atlas: ~42 sprites into 5 mip levels, a render pass each; native time), animateTick ~0.12, player sync ~0.04.
+     Tick frames also carry the harness's handshake (section 6.6).
+   - **Block entity extraction** ~0.09 ms per frame at the static view (hidden by the GPU wait); facing the chest cube
+     0.2-0.3 ms, mostly closed books (~3.6k at ~60-70 ns after the tilt change: pose math and the instance write).
+   - **Glowing sign text** (not retained): the text is full bright, and its outline depends on the camera being within 16
+     blocks (or scoping) unless the text is black. Retaining it needs the capture to accept outlined text (black glowing
+     text always has one) or, for other colours, a batch check each frame that drops glowing signs within ~18 blocks to
+     the vanilla path and an invalidation when scoping changes. Modest gain (glowing signs are usually read up close).
+   - **Retained builds after joining or teleporting**: a section is built in one go; with cold code ~450-2300 block
+     entities took 9-43 ms per frame right after the join (warm: ~4 us per block entity). Splitting a section's build
+     over frames would need partial parts kept across frames.
    - Occlusion culling of block entities is **not** exact (chests are 14/16 wide; the ones behind show through).
 3. **Allocation** (~0.35 MB/frame at static since the eighth session; was ~2.3): `Float` boxing of chest openness per submit, submit records,
    `PoseStack.Pose`, glyph instances of non-sign text, `CompactVectorArray` per sort.
