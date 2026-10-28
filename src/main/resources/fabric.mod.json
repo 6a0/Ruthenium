@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "rubidium",
+  "id": "thallium",
   "version": "${version}",
 
-  "name": "Rubidium",
+  "name": "Thallium",
   "description": "An all-in-one tweak designed to run as efficiently as possible: lower RAM usage, faster loading, bug fixes, and higher, more consistent frame rates with lower latency in every scenario.",
   "authors": [
     "Collateral"
@@ -13,18 +13,18 @@
     "sources": "https://github.com/6a0/VulkanMod"
   },
 
-  "icon": "assets/rubidium/vlogo.png",
+  "icon": "assets/thallium/vlogo.png",
 
   "environment": "client",
   "entrypoints": {
     "client": [
-      "net.rubidium.Initializer"
+      "net.thallium.Initializer"
     ]
   },
   "mixins": [
-    "rubidium.mixins.json"
+    "thallium.mixins.json"
   ],
-  "accessWidener" : "rubidium.accesswidener",
+  "accessWidener" : "thallium.accesswidener",
 
   "depends": {
     "fabricloader": ">=0.19.3",

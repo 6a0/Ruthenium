@@ -1,20 +1,20 @@
 {
   "schemaVersion": 1,
-  "id": "rubidium-gametest",
+  "id": "thallium-gametest",
   "version": "1.0.0",
-  "name": "Rubidium Benchmark Gametest",
+  "name": "Thallium Benchmark Gametest",
   "environment": "client",
   "entrypoints": {
     "client": [
-      "net.rubidium.gametest.StartupProbe"
+      "net.thallium.gametest.StartupProbe"
     ],
     "fabric-client-gametest": [
-      "net.rubidium.gametest.BenchmarkClientGameTest"
+      "net.thallium.gametest.BenchmarkClientGameTest"
     ]
   },
   "mixins": [
-    "rubidium-gametest.mixins.json",
-    "rubidium-gametest-probe.mixins.json"
+    "thallium-gametest.mixins.json",
+    "thallium-gametest-probe.mixins.json"
   ],
   "depends": {
     "fabric-client-gametest-api-v1": "*"
