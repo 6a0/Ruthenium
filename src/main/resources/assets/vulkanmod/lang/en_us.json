@@ -63,6 +63,8 @@
   "vulkanmod.options.mergeDraws.tooltip": "Puts entity and item geometry with the same texture and settings into one draw call, as vanilla intends but never does. Turn off if a mod's entity overlays flicker or disappear.",
   "vulkanmod.options.instancedParts": "Instanced Mob Parts",
   "vulkanmod.options.instancedParts.tooltip": "Keeps the shape of every mob body part on the GPU and only sends each part's position per frame, instead of all of its corners. Turn off if a mod's mobs look wrong.",
+  "vulkanmod.options.reuseLayerPoses": "Reuse Layer Poses",
+  "vulkanmod.options.reuseLayerPoses.tooltip": "Layers that draw a mob's model again (villager clothing, spider and enderman eyes, horse markings, collars) reuse the poses of its parts instead of posing the model again. Only for Minecraft's own models.",
   "vulkanmod.options.instancedItems": "Instanced Items",
   "vulkanmod.options.instancedArmor": "Instanced Armor",
   "vulkanmod.options.instancedArmor.tooltip": "Draws worn armor, saddles and horse armor like the mob parts under Instanced Mob Parts (which must be on). Turn off if armor or armor trims look wrong.",

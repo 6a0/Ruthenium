@@ -5,7 +5,9 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.model.geom.ModelPart;
 import net.vulkanmod.interfaces.InstancedPartHolder;
+import net.vulkanmod.interfaces.ReplayablePart;
 import net.vulkanmod.render.entity.InstancedParts;
+import net.vulkanmod.render.entity.ModelPoseReplay;
 import org.joml.Quaternionf;
 import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
@@ -17,11 +19,12 @@ import org.spongepowered.asm.mixin.Unique;
 import java.util.List;
 
 /**
- * Adds the part as an instance ({@link InstancedParts}) instead of writing its cubes when the model allows it, and
- * keeps the quaternion of its rotation while its angles stay the same.
+ * Adds the part as an instance ({@link InstancedParts}) instead of writing its cubes when the model allows it, records
+ * its pose for layers ({@link ModelPoseReplay}), and keeps the quaternion of its rotation while its angles stay the
+ * same.
  */
 @Mixin(ModelPart.class)
-public class ModelPartM implements InstancedPartHolder {
+public class ModelPartM implements InstancedPartHolder, ReplayablePart {
     @Shadow @Final private List<ModelPart.Cube> cubes;
     @Shadow public float x;
     @Shadow public float y;
@@ -33,7 +36,7 @@ public class ModelPartM implements InstancedPartHolder {
     @Shadow public float yScale;
     @Shadow public float zScale;
 
-    @Unique private InstancedParts.@Nullable PartBatch batch;
+    @Unique private InstancedParts.@Nullable PartBatches batches;
     /** The rotation of the angles below, built on the render thread (models are shared by all entities of a type) */
     @Unique private @Nullable Quaternionf rotation;
     @Unique private int rotationXBits;
@@ -83,6 +86,9 @@ public class ModelPartM implements InstancedPartHolder {
      */
     @Overwrite
     private void compile(PoseStack.Pose pose, VertexConsumer builder, int lightCoords, int overlayCoords, int color) {
+        if (ModelPoseReplay.isRecording() && !this.cubes.isEmpty()) {
+            ModelPoseReplay.record((ModelPart) (Object) this, pose);
+        }
         if (InstancedParts.addPart((ModelPart) (Object) this, this.cubes, pose, lightCoords, overlayCoords, color)) {
             return;
         }
@@ -92,12 +98,17 @@ public class ModelPartM implements InstancedPartHolder {
     }
 
     @Override
-    public InstancedParts.@Nullable PartBatch vulkanmod$getBatch() {
-        return this.batch;
+    public void vulkanmod$compile(PoseStack.Pose pose, VertexConsumer builder, int lightCoords, int overlayCoords, int color) {
+        this.compile(pose, builder, lightCoords, overlayCoords, color);
     }
 
     @Override
-    public void vulkanmod$setBatch(InstancedParts.PartBatch batch) {
-        this.batch = batch;
+    public InstancedParts.@Nullable PartBatches vulkanmod$getBatches() {
+        return this.batches;
+    }
+
+    @Override
+    public void vulkanmod$setBatches(InstancedParts.PartBatches batches) {
+        this.batches = batches;
     }
 }

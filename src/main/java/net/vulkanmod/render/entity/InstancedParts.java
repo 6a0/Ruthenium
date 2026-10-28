@@ -453,14 +453,46 @@ public final class InstancedParts {
         MemoryUtil.memPutFloat(ptr + 8, z);
     }
 
+    /**
+     * A model part's batches, one per render type and UV mapping. The keys are kept in an array of their own, so a
+     * lookup compares references without loading the batches: layered models (villager clothing) submit the same
+     * parts with dozens of textures.
+     */
+    public static final class PartBatches {
+        final int generation;
+        /** Render type and UV mapping of each batch, in pairs */
+        @Nullable Object[] keys = new Object[4];
+        PartBatch[] batches = new PartBatch[2];
+        int size;
+
+        PartBatches(int generation) {
+            this.generation = generation;
+        }
+
+        void add(PartBatch batch) {
+            if (this.size == this.batches.length) {
+                this.batches = Arrays.copyOf(this.batches, this.size * 2);
+                this.keys = Arrays.copyOf(this.keys, this.size * 4);
+            }
+            this.keys[this.size * 2] = batch.renderType;
+            this.keys[this.size * 2 + 1] = batch.uvMapping;
+            this.batches[this.size++] = batch;
+        }
+    }
+
     private static @Nullable PartBatch findBatch(ModelPart part, List<ModelPart.Cube> cubes) {
         InstancedPartHolder holder = (InstancedPartHolder) (Object) part;
-        PartBatch head = holder.vulkanmod$getBatch();
-        if (head != null && head.generation != generation) {
-            head = null;
+        PartBatches table = holder.vulkanmod$getBatches();
+        if (table == null || table.generation != generation) {
+            table = new PartBatches(generation);
+            holder.vulkanmod$setBatches(table);
         }
-        for (PartBatch batch = head; batch != null; batch = batch.next) {
-            if (batch.renderType == modelRenderType && batch.uvMapping == modelUvMapping) {
+        Object[] keys = table.keys;
+        RenderType renderType = modelRenderType;
+        UvMapping uvMapping = modelUvMapping;
+        for (int i = 0, n = table.size * 2; i < n; i += 2) {
+            if (keys[i] == renderType && keys[i + 1] == uvMapping) {
+                PartBatch batch = table.batches[i >> 1];
                 return batch.mesh != null ? batch : null;
             }
         }
@@ -468,8 +500,8 @@ public final class InstancedParts {
             return null;
         }
 
-        PartBatch batch = new PartBatch(modelRenderType, modelUvMapping, null, modelPipeline, generation, head);
-        holder.vulkanmod$setBatch(batch);
+        PartBatch batch = new PartBatch(modelRenderType, modelUvMapping, null, modelPipeline, generation, null);
+        table.add(batch);
         BATCHES.add(batch);
 
         try (ByteBufferBuilder bytes = new ByteBufferBuilder(cubes.size() * 24 * DefaultVertexFormat.ENTITY.getVertexSize())) {

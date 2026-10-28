@@ -7,6 +7,7 @@ import net.minecraft.client.renderer.feature.FeatureRenderDispatcher;
 import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
 import net.vulkanmod.render.entity.InstancedParts;
+import net.vulkanmod.render.entity.ModelPoseReplay;
 import net.vulkanmod.render.entity.ModelCulling;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -25,6 +26,7 @@ public class LevelRendererM {
     private void beginWorldFeatures(CallbackInfo ci) {
         ModelCulling.setWorldPass(true);
         InstancedParts.beginFrame();
+        ModelPoseReplay.beginFrame();
     }
 
     @Inject(method = "render", at = @At(value = "INVOKE", target = PREPARE_FRAME, shift = At.Shift.AFTER))

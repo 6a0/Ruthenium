@@ -44,6 +44,8 @@ public class Config {
     public boolean instancedArmor = true;
     public boolean instancedItems = true;
     public boolean instancedBlockModels = true;
+    /** Layers that submit a model again for the same render state reuse the part poses of its first submit */
+    public boolean reuseLayerPoses = true;
     /** Baked quads (items, block models) are written into vertex buffers a whole quad at a time */
     public boolean directBakedQuads = true;
     /** Skips the terrain faces of a section that all face away from the camera */

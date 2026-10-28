@@ -317,6 +317,11 @@ public abstract class Options {
                                 () -> config.instancedArmor)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.instancedArmor.tooltip"))
                                 .setImpact(PerformanceImpact.MEDIUM),
+                        new SwitchOption(Component.translatable("vulkanmod.options.reuseLayerPoses"),
+                                value -> config.reuseLayerPoses = value,
+                                () -> config.reuseLayerPoses)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.reuseLayerPoses.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM),
                         new SwitchOption(Component.translatable("vulkanmod.options.instancedItems"),
                                 value -> {
                                     config.instancedItems = value;

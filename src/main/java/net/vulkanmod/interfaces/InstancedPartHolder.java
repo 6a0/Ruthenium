@@ -5,7 +5,7 @@ import org.jspecify.annotations.Nullable;
 
 /** The meshes of a model part drawn as instances ({@link InstancedParts}), one per render type and UV mapping */
 public interface InstancedPartHolder {
-    InstancedParts.@Nullable PartBatch vulkanmod$getBatch();
+    InstancedParts.@Nullable PartBatches vulkanmod$getBatches();
 
-    void vulkanmod$setBatch(InstancedParts.PartBatch batch);
+    void vulkanmod$setBatches(InstancedParts.PartBatches batches);
 }

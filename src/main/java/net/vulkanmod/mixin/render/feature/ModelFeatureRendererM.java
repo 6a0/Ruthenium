@@ -10,6 +10,7 @@ import net.vulkanmod.render.blockentity.InstancedModels;
 import net.vulkanmod.render.entity.InstancedParts;
 import net.vulkanmod.render.entity.ModelCulling;
 import net.vulkanmod.render.entity.ModelGeometryCache;
+import net.vulkanmod.render.entity.ModelPoseReplay;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Overwrite;
@@ -22,7 +23,8 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
     /**
      * @author VulkanMod
      * @reason Instancing ({@link InstancedModels}), back face culling ({@link ModelCulling}), cached rest pose and
-     * model space geometry ({@link ModelGeometryCache}) and instanced parts of posed models ({@link InstancedParts});
+     * model space geometry ({@link ModelGeometryCache}), instanced parts of posed models ({@link InstancedParts}) and part
+     * poses of layers ({@link ModelPoseReplay});
      * otherwise the vanilla body
      */
     @Overwrite
@@ -59,8 +61,15 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
 
             boolean instancedParts = submit.sheetedDecalPose() == null && InstancedParts.beginModel(submit.renderType(), submit.uvMapping());
             try {
-                model.setupAnim(submit.state());
-                model.renderToBuffer(this.poseStack, buffer, submit.lightCoords(), submit.overlayCoords(), submit.tintedColor());
+                // A layer of a model posed earlier in this frame for the same state takes the recorded part poses
+                ModelPoseReplay.Record replay = ModelPoseReplay.begin(model, submit.state(), this.poseStack.last());
+                if (replay != null) {
+                    replay.replay(buffer, submit.lightCoords(), submit.overlayCoords(), submit.tintedColor());
+                } else {
+                    model.setupAnim(submit.state());
+                    model.renderToBuffer(this.poseStack, buffer, submit.lightCoords(), submit.overlayCoords(), submit.tintedColor());
+                    ModelPoseReplay.end();
+                }
             } finally {
                 if (instancedParts) {
                     InstancedParts.endModel();
