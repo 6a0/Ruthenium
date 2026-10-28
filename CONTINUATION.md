@@ -65,7 +65,7 @@ order), the entity scene is unchanged.
 `net.ruthenium`, assets namespace `ruthenium`, `ruthenium.mixins.json` / `ruthenium.accesswidener`, config
 `config/ruthenium_settings.json`, system properties `-Druthenium.<field>` / `-Druthenium.bench.<name>`, benchmark tasks
 `benchRuthenium` / `benchRutheniumGl` (labels and run dirs `ruthenium` / `ruthenium-gl`; results are now named `ruthenium-*`,
-older archives keep `vulkanmod-*`). The README was removed for now. The GUI's primary colour is **#cf2743**
+older archives keep `vulkanmod-*`). The README was removed, then rewritten by the user (`README.MD`, Ruthenium logo, description, credits). The GUI's primary colour is **#cf2743**
 (`VGuiConstants.PRIMARY_RGB` / `COLOR_PRIMARY`, used for the accents, the scrollbar and the mod name).
 Mentions of "VulkanMod" further down are history: the upstream mod, or this mod before the rename.
 
