@@ -1,6 +1,7 @@
-# <a href="https://github.com/6a0/Ruthenium"> <img src="./src/main/resources/assets/ruthenium/rlogo.png" width="125"/> </a>
-Ruthenium
-AI was used heavily for this project.
+<img src="./src/main/resources/assets/ruthenium/rlogo.png" width="125"/>
+
+# Ruthenium
+#### AI was used heavily for this project.
 An optimisation mod designed to consolidate previous efforts into a more compact and performant mod, plus some extras.
 26.3 only, for now :)
 ===========
