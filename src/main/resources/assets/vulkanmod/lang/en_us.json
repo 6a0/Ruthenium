@@ -63,6 +63,8 @@
   "vulkanmod.options.fastAnimateTick.tooltip": "The tick that picks random blocks around you for particles and sounds (torches, leaves, biome particles) skips biome lookups where no biome has ambient particles and draws its random numbers faster. Same particles.",
   "vulkanmod.options.fastBoatTicks": "Fast Boat Ticks",
   "vulkanmod.options.fastBoatTicks.tooltip": "Boats check the blocks under them and the players they push with less work each tick. Same results.",
+  "vulkanmod.options.fastSupportingBlocks": "Keep Supporting Blocks",
+  "vulkanmod.options.fastSupportingBlocks.tooltip": "Dropped items and experience orbs lying on the ground remember the block they rest on until a block near them changes, instead of searching for it every tick. Same results.",
   "vulkanmod.options.reuseEntityStates": "Reuse Entity Render States",
   "vulkanmod.options.reuseEntityStates.tooltip": "Armor stands reuse their render state from the previous frame instead of creating a new one every frame.",
   "vulkanmod.options.blockModelMeshCache": "Cache Entity Block Models",

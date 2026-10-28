@@ -307,6 +307,11 @@ public abstract class Options {
                                 () -> config.fastBoatTicks)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.fastBoatTicks.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.fastSupportingBlocks"),
+                                value -> config.fastSupportingBlocks = value,
+                                () -> config.fastSupportingBlocks)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.fastSupportingBlocks.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("vulkanmod.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)

@@ -41,6 +41,8 @@ public class Config {
     public boolean fastAnimateTick = true;
     /** Client boat ticks: full cube ground friction tests from boxes, push searches for the local player only */
     public boolean fastBoatTicks = true;
+    /** Resting entities keep their supporting block while no block of the client level changes */
+    public boolean fastSupportingBlocks = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */
