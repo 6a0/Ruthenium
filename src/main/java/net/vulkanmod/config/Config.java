@@ -33,6 +33,8 @@ public class Config {
     public boolean cacheTickerStates = true;
     /** Entity frustum culling without allocations or renderer lookups for renderers that keep vanilla's culling */
     public boolean fastEntityCulling = true;
+    /** Entities keep the block and sky light at their light probe position until it moves or light data changes */
+    public boolean entityLightCache = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */

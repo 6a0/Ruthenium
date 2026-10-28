@@ -12,6 +12,7 @@ import net.vulkanmod.config.gui.OptionBlock;
 import net.vulkanmod.interfaces.SectionDispatcherReset;
 import net.vulkanmod.interfaces.TickerParkingLevel;
 import net.vulkanmod.render.blockentity.InstancedModels;
+import net.vulkanmod.render.entity.EntityLight;
 import net.vulkanmod.render.entity.InstancedParts;
 import net.vulkanmod.render.entity.TransparentFaces;
 import net.vulkanmod.render.blockentity.RetainedBlockEntities;
@@ -282,6 +283,14 @@ public abstract class Options {
                                 value -> config.fastEntityCulling = value,
                                 () -> config.fastEntityCulling)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.fastEntityCulling.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("vulkanmod.options.entityLightCache"),
+                                value -> {
+                                    config.entityLightCache = value;
+                                    EntityLight.invalidate();
+                                },
+                                () -> config.entityLightCache)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.entityLightCache.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("vulkanmod.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,

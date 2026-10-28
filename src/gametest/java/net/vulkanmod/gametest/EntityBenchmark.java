@@ -43,6 +43,7 @@ final class EntityBenchmark {
     private static final boolean AI = Boolean.parseBoolean(BenchmarkClientGameTest.prop("entityAi", "false"));
     private static final int CLOSE_SHOTS = Integer.parseInt(BenchmarkClientGameTest.prop("closeShots", "0"));
     private static final String CLOSE_TOGGLE = BenchmarkClientGameTest.prop("closeToggle", "");
+    private static final boolean LIGHT_EVENTS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("lightEvents", "false"));
 
     /** Close-up camera positions (x, height above the floor, z, pitch), each looking along +z at a few mob rows */
     private static final float[][] CLOSE_UPS = {
@@ -117,6 +118,9 @@ final class EntityBenchmark {
             frameSeries.put("pan", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
             LOGGER.info(results.getLast().summaryLine());
 
+            if (LIGHT_EVENTS) {
+                lightEvents(context, server);
+            }
             if (CLOSE_SHOTS > 0) {
                 closeUps(context, server, label, runId);
             }
@@ -129,6 +133,24 @@ final class EntityBenchmark {
             environment.add("entities", entities);
             BenchmarkClientGameTest.writeResults(label + "-entities", results, environment, frameSeries);
         }
+    }
+
+    /**
+     * {@code bench.lightEvents=true}: after the pan, glowstone blocks are placed above the mob rows and removed again,
+     * in turn, so that the block and sky light at the mobs changes while they are drawn (for checking light kept across
+     * frames). Not measured.
+     */
+    private static void lightEvents(ClientGameTestContext context, TestServerContext server) {
+        for (int round = 0; round < 8; round++) {
+            String block = round % 2 == 0 ? "glowstone" : "air";
+            for (int x = MIN_X + 2; x < MAX_X; x += 5) {
+                for (int z = 8; z <= 32; z += 3) {
+                    server.runCommand("setblock %d %d %d minecraft:%s".formatted(x, FLOOR + 3, z, block));
+                }
+            }
+            context.waitTicks(30);
+        }
+        LOGGER.info("Light events done");
     }
 
     private static void closeUps(ClientGameTestContext context, TestServerContext server, String label, String runId) {
