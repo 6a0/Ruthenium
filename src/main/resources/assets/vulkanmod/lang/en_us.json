@@ -25,6 +25,8 @@
 
   "vulkanmod.options.retainedChests": "Retained Block Entities",
   "vulkanmod.options.retainedChests.tooltip": "Keeps the geometry of block entities at rest (closed chests and shulker boxes, decorated pots, skulls, sign text, lecterns, bells, copper golem statues) on the GPU across frames instead of rebuilding it every frame.",
+  "vulkanmod.options.retainedChangeChecks": "Retained Change Checks",
+  "vulkanmod.options.retainedChangeChecks.tooltip": "When blocks or light change near retained block entities (crops, grass, redstone), their geometry is only rebuilt if their blocks or light changed. Needs Retained Block Entities.",
 
   "vulkanmod.options.instancedModels": "Instanced Models",
   "vulkanmod.options.instancedModels.tooltip": "Draws closed enchanting table books and armor stands posed alike as GPU instances.",

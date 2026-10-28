@@ -42,6 +42,7 @@ import net.minecraft.client.renderer.blockentity.SkullBlockRenderer;
 import net.minecraft.client.renderer.blockentity.StandingSignRenderer;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
 import net.minecraft.client.renderer.chunk.SectionMesh;
+import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.TextureTransform;
@@ -136,6 +137,10 @@ public final class RetainedBlockEntities {
     private static final Vector4f WHITE = new Vector4f(1.0F, 1.0F, 1.0F, 1.0F);
     private static final Matrix4f IDENTITY = new Matrix4f();
     private static final Draw[] NO_DRAWS = new Draw[0];
+    private static final BlockEntity[] NO_BLOCK_ENTITIES = new BlockEntity[0];
+    private static final BlockState[] NO_STATES = new BlockState[0];
+    private static final int[] NO_INTS = new int[0];
+    private static final int NO_LIGHT = Integer.MIN_VALUE;
     private static final int[] RUNS = new int[SectionFaceGroups.MAX_PLANE_RUNS * 2];
 
     private static final int NOT_CANDIDATE = 0;
@@ -143,8 +148,10 @@ public final class RetainedBlockEntities {
     private static final int MOVING = 2;
 
     private static final Long2ObjectOpenHashMap<Batch> BATCHES = new Long2ObjectOpenHashMap<>();
-    /** Sections marked dirty, possibly from other threads; guarded by itself */
+    /** Sections marked dirty, possibly from other threads; guarded by itself, like the next one */
     private static final LongOpenHashSet PENDING_DIRTY = new LongOpenHashSet();
+    /** Sections whose blocks or light changed */
+    private static final LongOpenHashSet PENDING_CHANGED = new LongOpenHashSet();
     private static volatile boolean clearPending;
 
     private static final List<Batch> VISIBLE = new ArrayList<>();
@@ -266,7 +273,18 @@ public final class RetainedBlockEntities {
     private static final class Batch {
         final int originX, originY, originZ;
         @Nullable SectionMesh mesh;
+        /** Must be rebuilt (a block entity's content changed) */
         boolean dirty;
+        /** Blocks or light of the section changed; rebuilt only if {@link #isUnchanged} finds a difference */
+        boolean blocksChanged;
+        /** What the batch was built from: the block entity list, their block states and the light members were lit with */
+        BlockEntity[] built = NO_BLOCK_ENTITIES;
+        BlockState[] states = NO_STATES;
+        int[] lights = NO_INTS;
+        /** The light at the other half of a member double chest, or {@link #NO_LIGHT} */
+        int[] otherLights = NO_INTS;
+        /** Whether the other half of a member double chest is in another section, whose changes concern this batch too */
+        boolean linked;
         boolean[] members = new boolean[0];
         int memberCount;
         /** Block entities left out because they (or a chest's other half) move */
@@ -293,6 +311,17 @@ public final class RetainedBlockEntities {
     public static void markDirty(int sectionX, int sectionY, int sectionZ) {
         synchronized (PENDING_DIRTY) {
             PENDING_DIRTY.add(SectionPos.asLong(sectionX, sectionY, sectionZ));
+        }
+    }
+
+    /**
+     * Blocks or light of the section changed ({@code LevelExtractor.setSectionDirty}): its batch, and the batches of
+     * neighbours holding a double chest whose other half may be in it, are checked against what they were built from
+     * and rebuilt if anything differs
+     */
+    public static void markBlocksChanged(int sectionX, int sectionY, int sectionZ) {
+        synchronized (PENDING_DIRTY) {
+            PENDING_CHANGED.add(SectionPos.asLong(sectionX, sectionY, sectionZ));
         }
     }
 
@@ -344,6 +373,22 @@ public final class RetainedBlockEntities {
                 });
                 PENDING_DIRTY.clear();
             }
+            if (!PENDING_CHANGED.isEmpty()) {
+                PENDING_CHANGED.forEach((long key) -> {
+                    int x = SectionPos.x(key), y = SectionPos.y(key), z = SectionPos.z(key);
+                    Batch batch = BATCHES.get(key);
+                    if (batch != null) {
+                        batch.blocksChanged = true;
+                    }
+                    markLinkedChanged(x - 1, y, z);
+                    markLinkedChanged(x + 1, y, z);
+                    markLinkedChanged(x, y - 1, z);
+                    markLinkedChanged(x, y + 1, z);
+                    markLinkedChanged(x, y, z - 1);
+                    markLinkedChanged(x, y, z + 1);
+                });
+                PENDING_CHANGED.clear();
+            }
         }
 
         if ((frame & 255) == 0) {
@@ -356,6 +401,53 @@ public final class RetainedBlockEntities {
         if (batch != null) {
             batch.dirty = true;
         }
+    }
+
+    private static void markLinkedChanged(int x, int y, int z) {
+        Batch batch = BATCHES.get(SectionPos.asLong(x, y, z));
+        if (batch != null && batch.linked) {
+            batch.blocksChanged = true;
+        }
+    }
+
+    /**
+     * Whether a batch whose section's blocks or light changed (or whose section was compiled again) would be built
+     * the same: the same block entity objects in the same order, with the same block states, and its members lit the
+     * same (vanilla's light at the block entity, and for double chests also at the other half, which
+     * {@code BrightnessCombiner} combines with it). Everything else a build reads is block entity data, whose changes
+     * mark the batch {@link Batch#dirty}.
+     */
+    private static boolean isUnchanged(Batch batch, List<BlockEntity> blockEntities, ClientLevel level) {
+        BlockEntity[] built = batch.built;
+        int size = blockEntities.size();
+        if (size != built.length || batch.members.length != size) {
+            return false;
+        }
+        BlockState[] states = batch.states;
+        int[] lights = batch.lights;
+        int[] otherLights = batch.otherLights;
+        boolean[] members = batch.members;
+        for (int i = 0; i < size; i++) {
+            BlockEntity blockEntity = blockEntities.get(i);
+            if (blockEntity != built[i] || blockEntity.getBlockState() != states[i]) {
+                return false;
+            }
+            if (members[i]) {
+                BlockPos pos = blockEntity.getBlockPos();
+                if (LightCoordsUtil.getLightCoords(level, pos) != lights[i]) {
+                    return false;
+                }
+                if (otherLights[i] != NO_LIGHT && LightCoordsUtil.getLightCoords(level, otherHalf(pos, states[i])) != otherLights[i]) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /** The other half of a double chest, where {@code ChestBlock.combine} looks for it */
+    private static BlockPos otherHalf(BlockPos pos, BlockState state) {
+        return pos.relative(ChestBlock.getConnectedDirection(state));
     }
 
     private static void evict() {
@@ -400,7 +492,13 @@ public final class RetainedBlockEntities {
             }
         }
 
-        if (batch.dirty || batch.mesh != mesh) {
+        if (!batch.dirty && (batch.blocksChanged || batch.mesh != mesh) && batch.mesh != null
+                && Initializer.CONFIG.retainedChangeChecks && isUnchanged(batch, blockEntities, level)) {
+            // A block or light change that doesn't concern the batch, or the section compiled again with the same block entities
+            batch.mesh = mesh;
+            batch.blocksChanged = false;
+        }
+        if (batch.dirty || batch.blocksChanged || batch.mesh != mesh) {
             if (rebuiltThisFrame >= REBUILD_BUDGET) {
                 return null;
             }
@@ -519,12 +617,22 @@ public final class RetainedBlockEntities {
         batch.close();
         batch.mesh = mesh;
         batch.dirty = false;
+        batch.blocksChanged = false;
         batch.moving = List.of();
 
         int size = blockEntities.size();
         boolean[] members = batch.members.length == size ? batch.members : new boolean[size];
         Arrays.fill(members, false);
         batch.members = members;
+        BlockEntity[] built = batch.built.length == size ? batch.built : new BlockEntity[size];
+        BlockState[] states = batch.states.length == size ? batch.states : new BlockState[size];
+        int[] lights = batch.lights.length == size ? batch.lights : new int[size];
+        int[] otherLights = batch.otherLights.length == size ? batch.otherLights : new int[size];
+        batch.built = built;
+        batch.states = states;
+        batch.lights = lights;
+        batch.otherLights = otherLights;
+        boolean linked = false;
 
         List<BlockEntity> moving = null;
         int count = 0;
@@ -533,6 +641,9 @@ public final class RetainedBlockEntities {
         try {
             for (int i = 0; i < size; i++) {
                 BlockEntity blockEntity = blockEntities.get(i);
+                built[i] = blockEntity;
+                states[i] = blockEntity.getBlockState();
+                otherLights[i] = NO_LIGHT;
                 int candidate = candidate(blockEntity, level);
                 if (candidate == MOVING) {
                     if (moving == null) {
@@ -585,6 +696,15 @@ public final class RetainedBlockEntities {
                 viewDistance = distance;
                 members[i] = true;
                 count++;
+                lights[i] = LightCoordsUtil.getLightCoords(level, pos);
+                BlockState blockState = states[i];
+                if (blockEntity instanceof ChestBlockEntity && blockState.hasProperty(ChestBlock.TYPE)
+                        && blockState.getValue(ChestBlock.TYPE) != ChestType.SINGLE) {
+                    BlockPos other = otherHalf(pos, blockState);
+                    otherLights[i] = LightCoordsUtil.getLightCoords(level, other);
+                    linked |= SectionPos.blockToSectionCoord(other.getX()) != SectionPos.blockToSectionCoord(pos.getX())
+                            || SectionPos.blockToSectionCoord(other.getZ()) != SectionPos.blockToSectionCoord(pos.getZ());
+                }
             }
         } finally {
             batch.draws = finishParts();
@@ -593,6 +713,7 @@ public final class RetainedBlockEntities {
         }
 
         rebuiltThisFrame += count;
+        batch.linked = linked;
         batch.moving = moving != null ? moving : List.of();
         batch.viewDistance = viewDistance;
         if (count > 0 && batch.draws.length == 0) {

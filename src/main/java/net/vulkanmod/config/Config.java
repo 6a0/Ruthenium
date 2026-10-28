@@ -17,6 +17,8 @@ public class Config {
     public boolean blockEntityCulling = true;
     /** Closed chest geometry kept on the GPU across frames */
     public boolean retainedChests = true;
+    /** Retained block entity batches whose section's blocks or light changed are rebuilt only if their block entities' states or light did */
+    public boolean retainedChangeChecks = true;
     /** Closed enchanting table books and armor stands drawn as GPU instances */
     public boolean instancedModels = true;
     /** CPU skip of model faces and sign text the GPU would cull as back faces */

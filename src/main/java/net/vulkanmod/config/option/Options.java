@@ -230,6 +230,11 @@ public abstract class Options {
                                 () -> config.retainedChests)
                                 .setTooltip(value -> Component.translatable("vulkanmod.options.retainedChests.tooltip"))
                                 .setImpact(PerformanceImpact.HIGH),
+                        new SwitchOption(Component.translatable("vulkanmod.options.retainedChangeChecks"),
+                                value -> config.retainedChangeChecks = value,
+                                () -> config.retainedChangeChecks)
+                                .setTooltip(value -> Component.translatable("vulkanmod.options.retainedChangeChecks.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("vulkanmod.options.instancedModels"),
                                 value -> {
                                     config.instancedModels = value;
