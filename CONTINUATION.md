@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-28 (fifteenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-28 (sixteenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -41,6 +41,15 @@ every frame) and **light kept per entity** until it moves or the client's light 
 and villager clothing identifiers were measured and binned (within noise). Entity scene in the same tree, start -> end:
 static 321.7 -> 331.5 fps (render thread 3.01 -> 2.95 ms), pan 1131.8 -> 1195.9 (p99 272.3 -> 294.0); the server scene
 is unchanged.
+Sixteenth session (section 7, "Sixteenth session"): the entity scene's **client tick** (section 8 item 1), with Lithium
+consulted for ideas (none of its code). **Entity collision searches skip entity sections without collidable entities**
+(an idea from Lithium's entity class groups), **animateTick** skips ambient particle biome lookups where no biome has
+them and steps its random seed without compare-and-set, **boats** decide full cube ground tests from boxes and push only
+the local player, and **resting entities keep their supporting block** while their chunk sections don't change. Lithium's
+direct entity section lookup and an air-only skip of inside-block checks measured within noise and were binned. Entity
+scene in the same tree, start -> end: client tick 1.596 -> 1.261 ms (pan 1.465 -> 1.168), static
+321.5 -> 331.1 fps (p95 219.3 -> 241.5, p99 155.2 -> 165.8), pan 1159.7 -> 1193.6; server
+scene client tick 1.23 -> 1.13-1.19 ms (animateTick), fps unchanged (static 1084.8 vs 1084.5, GPU bound).
 
 ---
 
@@ -80,7 +89,9 @@ is unchanged.
   Culling") and layers reuse the part poses of the model's first submit (`ModelPoseReplay`, "Reuse Layer Poses").
   Since the fifteenth session entities are frustum culled without allocations or renderer lookups
   (`EntityRendererCache`, "Fast Entity Culling") and keep their light across frames (`EntityLight`, "Keep Entity
-  Light"). Section 8 lists what is left there.
+  Light"). Since the sixteenth session the client tick is cheaper: entity collision searches skip sections without
+  collidable entities ("Fast Entity Collisions"), animateTick ("Fast Block Animation Tick"), boats ("Fast Boat Ticks")
+  and the supporting block of resting entities ("Keep Supporting Blocks"). Section 8 lists what is left there.
 - **The settings screen is ported** (fourth session): the video settings button opens VulkanMod's screen with Video,
   Graphics (vanilla options through their `OptionInstance`s) and Optimizations (the mod's switches, `Config`,
   `config/vulkanmod_settings.json`). `-Dvulkanmod.<field>=true|false` overrides any switch for a launch.
@@ -240,6 +251,10 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `render/entity/LazyVertexBuilder.java` + `ModelFeatureRendererM` | Model submits whose parts become instances get a lazy vertex builder instead of the group's (a render type switch: `RenderType.prepare`, the draw lookup and a new `BufferBuilder`); it fetches the builder (wrapped by the UV mapping) only if a part is written after all, and `ModelPartM.compile` resolves it before writing cubes, so the direct writers see the `BufferBuilder`. Such submits add no empty draws. No switch (same image) |
 | `render/entity/EntityRendererCache.java` + `mixin/render/entity/{EntityTypeM,EntityRenderDispatcherM}.java` + `LevelExtractorEntityM.vulkanmod$fastCulling` + `interfaces/{EntityRendererHolder,EntityRendererMap}` | **Renderer kept on the entity type and cheaper entity culling** (fifteenth session). `EntityRenderDispatcher.getRenderer(Entity)` and `getRenderer(EntityRenderState)` look non-player renderers up in the dispatcher's `ImmutableMap` (culling, extraction, submission: up to three times per entity and frame); a `@WrapOperation` on that `Map.get` returns the renderer kept on the `EntityType` together with the map it came from (only while the dispatcher holds that map; only for `ImmutableMap`s). Each entry also classifies the renderer's culling: plain if no class below `EntityRenderer` (or `LivingEntityRenderer` for living ones) declares `shouldRender`, `affectedByCulling` or `getBoundingBoxForCulling` (reflection, once per type). A `@WrapOperation` on `isEntityVisible`'s `EntityRenderDispatcher.shouldRender` call answers for plain renderers (switch `fastEntityCulling`, "Fast Entity Culling"; players and mannequins excluded): `entity.shouldRender` (distance), then the interpolated box (`getInterpolatedBoundingBox`, virtual) through the frustum accessor without the inflated box allocations. Living renderers widen the box by another half block for a dragon head; instead of reading the head slot, the box with the widening is tested first (inside the frustum: visible either way; outside: hidden either way) and only when it crosses the edge the box without (visible: visible either way, else vanilla's path). Leash holders and non-finite boxes take vanilla's path. The frustum test is monotone in the box and the widened coordinates are computed in vanilla's `inflate` order. Checked: 16.8M answers equal vanilla's (AI on), 0.3% undecided |
 | `render/entity/EntityLight.java` + `mixin/render/entity/{EntityRendererLightM,EntityLightHolderM,LayerLightSectionStorageM}.java` + `interfaces/CachedEntityLight` | **Entity light kept across frames** (fifteenth session, switch `entityLightCache`, "Keep Entity Light"). `EntityRenderer.getSkyLightLevel`/`getBlockLightLevel` read `Level.getBrightness` at the light probe position for every entity and frame; a `@WrapOperation` on those two calls returns the values kept on the entity (`Entity` fields: level, packed position, generation, block and sky light + 1) while level, position and `EntityLight.generation()` are unchanged. Readers see light through each `LayerLightSectionStorage`'s visible map, which only changes when `swapSectionMap` publishes a new copy (writes copy each section into the updating map first); the client's storages (`chunkSource instanceof ClientChunkCache`) bump the generation at `swapSectionMap` HEAD when sections changed. Renderer overrides (fire, glow frames, displays) still run around the kept values. Render thread only. Checked with `bench.lightEvents`: 29.4M kept values equal fresh lookups (2.35M differ with the invalidation disabled) |
+| `world/CollidableEntities.java` + `mixin/world/{EntitySectionM,LevelEntityCollisionsM,LevelEntityGetterAdapterAccessor}.java` + `interfaces/CollidableEntityCount` | **Entity collision searches skip sections without collidable entities** (sixteenth session, switch `fastEntityCollisions`, "Fast Entity Collisions"; idea from Lithium's entity class groups, own code). `getEntityCollisions` (every moving entity's `collide`, every `noCollision`: experience orbs twice per tick, interpolated movement, player pose checks) only accepts entities whose class overrides `canBeCollidedWith(Entity)` (boats, shulkers, happy ghasts, modded ones; checked once per class by reflection). Each `EntitySection` counts those (`add`/`remove` injects, always on), and `Level` overrides the `EntityGetter` default method with vanilla's code whose search skips sections with a count of 0, through the section storage's own `forEachAccessibleNonEmptySection` and `EntitySection.getEntities` (same entities, same order), plus vanilla's dragon part loop. Only for a null source or a source using `Entity.canCollideWith` (boats and minecarts override it to collide with pushable entities: vanilla search). Checked: 800k searches on the client and the integrated server with mob AI, 0 differences. Mod compatibility: a mod injecting into `EntityGetter.getEntityCollisions` or `Entity.canBeCollidedWith` (instead of overriding it) is bypassed (Lithium touches the former) |
+| `world/AnimateTick.java` + `mixin/world/{ClientLevelAnimateTickM,LegacyRandomSourceAccessor,EnvironmentAttributeSystemAccessor,EnvironmentValueSamplerAccessor}.java` | **Faster animateTick** (sixteenth session, switch `fastAnimateTick`, "Fast Block Animation Tick"). `ClientLevel.doAnimateTick` runs for 1334 random positions per tick. Its `nextInt` calls on the level's `LegacyRandomSource` (exact class) step the seed with `getPlain`/`setPlain` instead of a compare-and-set per call (same sequence; the CAS only detects use from two threads). Its ambient particle lookup (`environmentAttributes().getValue(AMBIENT_PARTICLES, pos)`: a fuzzy-zoomed biome lookup) is answered with the attribute's no-biome value (computed once per `animateTick`) when the biome palettes of the chunk sections holding the zoom's 2x2x2 quart corners (the only biomes it can pick; y clamped as `ChunkAccess.getNoiseBiome` does) contain no biome whose attribute map has an `AMBIENT_PARTICLES` entry (vanilla: four nether biomes), cached per section per call. Only while the attribute's sole positional layer is the biome lambda of `EnvironmentAttributeSystem` (checked through accessors on the sampler's layers); unloaded chunks take vanilla's lookup. Checked: 24M random results and seeds, 3.8M ambient values in the entity and terrain scenes, and the biome vanilla's zoom chose was always in a checked palette |
+| `mixin/world/AbstractBoatM.java` | **Boat ticks** (sixteenth session, switch `fastBoatTicks`, "Fast Boat Ticks"). In `getGroundFriction`, full cube collision shapes (`== Shapes.block()`) skip the moved shape and the `joinIsNotEmpty` with the bottom slice: separated by more than 1e-6 on an axis = false (vanilla's own early out uses 1e-7), overlapping by more than 1e-6 on all axes = true, anything else vanilla's join (redirects on `VoxelShape.move` and `Shapes.joinIsNotEmpty` there). The push search in `tick` (`getEntities(this, box, EntitySelector.pushableBy(this))`, which on the client only accepts local players) asks `ClientLevel.getPushableEntities` on the client, as vanilla's own living entity push does. Checked: 200k cube joins and 6.1k pushes equal to vanilla's |
+| `world/SupportingBlocks.java` + `mixin/world/{EntitySupportingBlockM,BlockChangeTrackingM,LevelChunkSectionM}.java` + `interfaces/SectionChangeStamp` | **Supporting block kept for resting entities** (sixteenth session, switch `fastSupportingBlocks`, "Keep Supporting Blocks"). `Entity.checkSupportingBlock`'s `findSupportingBlock` (a `BlockCollisions` sweep of a thin slab under the entity: orbs every tick, items every fourth, entities moved by server packets) is answered from the last result on the client while the slab, the entity's position and the chunk sections of the swept region (box +-1 block, at most 8 sections, the same objects) have the same change stamp. Each `LevelChunkSection` has a stamp, bumped by `LevelChunk.setBlockState` on client levels and for every section by `LevelChunk.replaceWithPacketData` (chunk data is read into the existing sections). Results are kept only when every block of the region has a collision shape that is neither dynamic (`Block.hasDynamicShape`) nor context dependent (no class below `BlockBehaviour` declares `getCollisionShape(BlockState, BlockGetter, BlockPos, CollisionContext)`), so the entity's collision context can't change it. A first version with one level-wide stamp hit ~65% (the integrated server sends ~4.5 block updates per second: grass and dirt random ticks); per section 99.5% at rest. The kept state lives in an object created on an entity's first search (`SupportingBlocks.Kept`; 13 fields on every `Entity` made the server scene's armor stand ticks ~0.02 ms slower per tick). Checked: 220k kept answers equal to a fresh search (gravity scene, with and without AI) |
 
 Design rules used so far:
 - Hot paths use `@Overwrite` with an inlined vanilla fallback, because a cancellable `@Inject` allocates a
@@ -389,6 +404,34 @@ at rows ≥ 400 / threshold 12, and the full-frame threshold-40 map shows only c
 table books (red specks in the chest cube).
 
 ### 6.6 Profiling
+
+**Sixteenth session tools:**
+- The entity cost probe's parts table (`-Pbench.entityCostParts=true`) has a per tick table, `parts of the client's entity
+  tick`: base ticks, `move`, `recordMovement`, fluid interaction, `applyEffectsFromBlocks`, pushes, `Level.getEntities`
+  searches by box (extra = results), boat status, experience orb collision checks, interpolated zero moves,
+  `refreshDirtyAttributes` (extra = dirty attributes), attribute modifications on the render thread, the local player's
+  `aiStep` and ambient sound handlers, and each texture atlas's animation tick (extra = sprites drawn). The wrappers add
+  ~50-100 ns per call (items 670 -> 1000-1100 ns), so compare parts only between probe runs.
+- `python scripts/tick_ab.py build/run/bench/results/<dir> [phase ...]`: per run of an A/B directory the tick probe's ms
+  per tick and entities, the frames-with-a-tick split (avg and p99 of tick frames, avg of the others) and p95/p99 low,
+  with medians. `run-ab.sh` and `run-ab-commits.sh` now copy each run's game log into the side's directory for it. Tick
+  changes show here when fps can't: the static tick median moves by ~0.01-0.02 ms between identical sides.
+- The light profiler splits each phase by frame kind (`Split by frame kind`: ms per frame of the frames with a client
+  tick and of those without, per section). Two findings (both inferred, not proven): tick frames spend 0.11-0.2 ms in
+  `scheduledExecutables`, most likely the Fabric client gametest's per tick handshake with the test thread (JFR shows
+  its `postRunTasksHook` there; benchmark harness, not real play), and frames with a tick are also longer outside the
+  tick (+0.45 ms static, uniformly ~12-15% in every section; +0.95 ms pan), likely because slow frames are more likely
+  to contain a tick (length-biased sampling; in the pan the tick frames are mostly those facing the mobs) plus cache
+  effects of the tick.
+- `JfrTree.java --min PERCENT`: the tree's threshold (default 0.2% of the window).
+- `-Pbench.entityGravity=true` (entity scene): dropped items and experience orbs fall and rest on the floor as in real
+  play (by default they float with `NoGravity`, which skips most of their collision work). With `-Pbench.entityAi=true`
+  the scene accepts 1200 entities instead of 1300 (mobs fight while the chunks arrive; it failed the old threshold).
+- **Once-per-tick code is still warming up in a ~60 s benchmark**: in a 240 s static phase the local player's tick fell
+  from ~107 to ~63-87 us and the parts probe's pan tick from 1.90 to 1.77 ms. Per entity code runs ~26k times per second
+  and is compiled early; the player's tick, the ambient sound handlers and similar code run 20 times per second.
+- JFR doesn't see native time: the texture atlas animation was 0.06% in JFR but 0.18-0.2 ms per tick in the light
+  profiler (render passes in the Vulkan driver).
 
 **Fifteenth session tools:**
 - The entity cost probe has a table of parts nested in extraction and submission (`parts of extraction and
@@ -580,6 +623,9 @@ submit order of the reorderable feature phases every frame.
 Since the fifteenth session: `-Pbench.staticView=k` runs the static phase at close-up position k (1 faces the
 villagers; the pan stays at the overview), and `-Pbench.lightEvents=true` places and removes glowstone above the mob
 rows eight times after the pan (light changes while entities are drawn; not measured).
+Since the sixteenth session: `-Pbench.entityGravity=true` lets the dropped items and experience orbs fall and rest on the
+floor (real play) instead of floating with `NoGravity`; with `-Pbench.entityAi=true` the scene accepts 1200 entities
+(fights during setup).
 
 ---
 
@@ -911,6 +957,75 @@ Session start (`a98cb80`) vs end (`d7e9f42`), checked out in turn in the same tr
 vs 1034.4, particles 915.1 vs 918.3, initial 742.8 vs 787.7 (that phase is noisy: runs 707-779 vs 733-809); four pairs,
 no regression.
 
+### Sixteenth session (2026-10-28)
+Entity scene, section 8 item 1, "client tick". Measured first at HEAD (`6e1dc85`), static view, tick probe 1.60-1.73 ms per
+tick (entities 1.26-1.40), every ~12th frame. Entity cost probe (`build/bench-logs/943-s16-probe0.log`): experience orbs
+4.9 us each (315 us per tick), dropped items 0.7 us (178), the player 107 us, boats 8.3-8.8 us each (137), mobs 0.65-1.15
+us (~0.5 ms together). JFR at 1 ms (`results/entities-dev/s16/jfr0.jfr`, tick ~3.1% of the render thread): entity searches
+by box 0.60% (orb `noCollision` 0.37, the orbs' interpolated zero move 0.22, boat push searches 0.22), `pushEntities` ~0
+(26.3's `ClientLevel.getPushableEntities` already tests only the local player), `Entity.commonTick` 0.32% self, the rest
+spread over mob methods. The new per tick parts table (section 6.6; wrappers inflate it) confirmed it:
+`Level.getEntities` 157 calls per tick at ~1.6 us, orb `noCollision` 2.2 us, boat `getStatus` 3.8 us. Light profiler
+(depth 3-4): beyond entities the tick spends 0.19 ms in texture atlas animation and 0.19-0.2 ms in `animateTick`.
+
+Lithium (CaffeineMC/lithium, LGPL-3.0) was read for ideas only, through its mixin option list; no code was copied. Client
+relevant options and what became of them: `entity.collisions` / entity class groups (used: collidable section counts),
+`entity.fast_retrieval` (built, binned), `entity.collisions.block_effects` (a related idea built, binned), `shapes.*` and
+`entity.collisions.movement` (faster collision shapes and sweeps: not attempted, see section 8), `world.inline_*`,
+`math.*`, `alloc.*`, `collections.attributes` (single digit nanosecond effects, below the resolution). Most of Lithium
+(AI, hoppers, chunk ticking, block entity sleeping on the server) runs on the integrated server's thread.
+
+Changes, each A/B tested in five interleaved pairs with `-Pbench.staticSeconds=10`, switch off vs on in the same build,
+read with `scripts/tick_ab.py` (median; `results/entities-dev/<dir>`):
+- **Collidable entity sections** (`f4c2517`, `s16-collide`, switch `fastEntityCollisions`; idea from Lithium): client
+  tick 1.570 -> 1.410 ms (every pair; entities 1.236 -> 1.069), frames with a tick 4.95 -> 4.69 ms, p95 low 220.9 -> 225.6,
+  p99 153.9 -> 159.5; pan tick 1.459 -> 1.304, p99 275.5 -> 287.2. Probe: orbs 4.9 -> 2.1-2.5 us, `getEntities` calls per
+  tick 157 -> 28.
+- **animateTick** (`f7cc5f9`, `s16-animate`, switch `fastAnimateTick`): tick 1.413 -> 1.341 ms (every pair), frames with a
+  tick 4.79 -> 4.64, p95 229.3 -> 232.3, p99 156.9 -> 160.8; pan tick 1.301 -> 1.248. Light profiler pair: `animateTick`
+  0.188 -> 0.121 ms per tick. An elimination run first (ambient lookup replaced by an empty list) had put the lookup at
+  ~0.045 ms; JFR put the seed's compare-and-set at a third of `animateTick`.
+- **Boat ticks** (`b24c07b`, `s16-boats`, switch `fastBoatTicks`): tick 1.328 -> 1.291 ms (every pair; entities 1.053 ->
+  1.019), p95 230.6 -> 235.7; pan tick 1.207 -> 1.158. Probe pair: oak boats 8.5 -> 3.4 us, chest boats 8.0 -> 2.4 (16
+  boats: 132 -> 46 us per tick; the A/B's smaller tick difference is within its resolution of the probe's).
+- **Supporting block kept** (`0337357`, `s16-support`, switch `fastSupportingBlocks`), A/B with `-Pbench.entityGravity=true`
+  (the default scene's floating items never land): tick 1.487 -> 1.429 ms (4 of 5 pairs), p95 223.6 -> 227.5; pan tick
+  1.352 -> 1.293 (every pair), frames with a tick 3.20 -> 3.02. Probe pair: items 1178 -> 1065 ns, orbs 3402 -> 2787 ns.
+  JFR of that scene (`s16/jfr-grav.jfr`): `Entity.move` 0.49% of the render thread, half of it `checkSupportingBlock`, a
+  third `collide`'s block sweep.
+  The first version kept the state in 13 `Entity` fields; the server scene's entity ticks (armor stands) then read 0.308 ->
+  0.327 ms per tick in the session comparison (four pairs, inferred to be the larger objects), so it moved into an
+  object created on first use (`272da2e`; probe: items 1047 ns, orbs 2430 ns).
+- Tools (`eba9a88`, `2b24b07`, `67b10c3`, `7f4e28c`): section 6.6.
+- **Rejected: direct entity section lookups** (Lithium's `entity.fast_retrieval` idea, own code; `s16-sections`, patch
+  `EntitySectionStorageM.java.txt` there): small boxes looked their sections up by key in vanilla's iteration order (x
+  ascending, then z and y as unsigned 22/20 bit values) instead of walking the sorted set of all sections with that x;
+  500k+ calls compared with vanilla's walk, 0 differences (181k with several sections, 55k crossing coordinate 0). Tick
+  1.407 vs 1.405 ms, pan 1.291 vs 1.293: nothing to gain in this scene (few entity sections per x column); it would
+  matter with entities spread over a large area.
+- **Rejected: inside-block checks skipped at rest over air** (`s16-inside`, patch `EntityInsideBlocksM.java.txt`, related
+  to Lithium's `entity.collisions.block_effects`): `applyEffectsFromBlocks` of entities that didn't move visits the blocks
+  of their box and does nothing at air; when all of them were air the visit was skipped (exact for zero travel: vanilla
+  visits `BlockPos.betweenClosed` of the box deflated by 1e-5 at the target). Check: 300k skips, 0 with a non-air block;
+  a positive control (items resting in short grass, air test disabled) flagged 46k. Tick 1.398 vs 1.391, pan 1.282 vs
+  1.259: within noise.
+- **Not done (bench artifacts):** the experience orbs' `recordMovement` -> `AbstractInterpolationHandler.adjustInterpolationPosition`
+  `noCollision` for moves by zero (~45 us per tick) only happens to `NoGravity` orbs, which real play doesn't have; the
+  player's tick (~63-110 us) is mostly warm-up (section 6.6) and its parts (bubble column and biome ambient sound
+  handlers 8-24 us each, `aiStep` 20-40) are each below the resolution.
+
+Session start (`6e1dc85`) vs end (`7f4e28c`), checked out in turn in the same tree. Entity scene (five pairs,
+`results/entities-dev/s16-session`): client tick 1.596 -> 1.261 ms per tick (entities 1.270 -> 1.003),
+frames with a tick 4.95 -> 4.56 ms, static 321.5 -> 331.1 fps (p95 219.3 -> 241.5, p99
+155.2 -> 165.8), pan 1159.7 -> 1193.6 (tick 1.465 -> 1.168, p99 282.4 -> 299.9).
+Server scene, four pairs against `7f4e28c` (`results/s16-server`): client tick 1.231 -> 1.131 ms (static; pan 1.433 ->
+1.317, particles 1.337 -> 1.239: animateTick), fps static 1084.8 vs 1084.5, pan 1029.4 vs 1031.9 (p99 379.5 -> 393.3),
+particles 918.8 vs 918.9, initial 756.7 vs 771.2 (noisy). Its entity ticks (~300 armor stands) read 0.308 -> 0.327 ms,
+which led to `272da2e`. Against that, three pairs (`results/s16-server-kept`): tick 1.250 -> 1.186 ms, entities 0.307 ->
+0.319 (runs 0.298-0.307 vs 0.302-0.340; unresolved, ~40 ns per armor stand), static 1081.4 -> 1085.4 fps (p99 443.9 ->
+463.8), pan 1030.7 -> 1035.2 (p99 368.4 -> 383.3), particles 921.2 vs 918.3. No fps regression; the scene is close to
+GPU bound. The entity scene was compared against `7f4e28c`; `272da2e` only moved the kept state (probe above).
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -1038,6 +1153,13 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
   the 296 armor stands (not profiled).
 - Mod compatibility of `ModelPoseReplay`: replayed layer submits bypass `setupAnim` and `ModelPart.render`, so a mod
   hooking those on a vanilla model class is skipped for layers (switch "Reuse Layer Poses").
+- Sixteenth session, mod compatibility only (all four changes are exact for vanilla, each has a switch):
+  `fastEntityCollisions` overrides `EntityGetter.getEntityCollisions` in `Level`, so a mod injecting into that default
+  method (Lithium does) or into `Entity.canBeCollidedWith` (instead of overriding it in a class) is bypassed;
+  `fastSupportingBlocks` relies on client block changes going through `LevelChunk.setBlockState` or chunk data, and on
+  blocks with context dependent collision shapes overriding `getCollisionShape` (a mod changing shapes by mixin into
+  `BlockBehaviour` would be missed); `fastBoatTicks` pushes only `minecraft.player` on the client, as vanilla's own
+  `ClientLevel.getPushableEntities` assumes for living entities.
 - Fifteenth session, verified independently (`results/verify-s15/`: 0 mismatches over 23-39M answers per run on
   Vulkan, GL and the multiplayer server scene, incl. chunk unload/reload and light packets; each switch +3% in its
   phase, also with instanced parts off). Mod compatibility only: `entityLightCache` would serve stale light to a
@@ -1077,9 +1199,19 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
      typed), `SubmitNodeStorage.order` tree lookups ~0.4%, the culling's remaining distance test, section lookup and
      leash check. A different approach would be needed for more: e.g. skipping extraction of entities whose render
      state can't change (none is known to be safe generically; see the tenth session on state reuse).
-   - **Client tick ~1.55 ms** (every ~12th frame at ~300 fps, so it sets the p95/p99): dropped items and experience
-     orbs (block and entity collision checks every tick; floating items move by zero, items on the ground only every
-     4th tick, so the scene overstates them), boats ~9 us each, the player ~0.13 ms.
+   - **Client tick** (1.261 ms static after the sixteenth session, from 1.596; every ~12th frame at ~300 fps,
+     so it sets the p95/p99). Done: collidable entity sections, animateTick, boat ticks, supporting blocks kept (16th).
+     What is left, per tick (static view): entities ~1.0 ms, a long tail: ~600 mobs at ~0.6-1.0 us each (base tick and
+     fluid interaction, `aiStep`, `commonTick`'s interpolation and first touch of each entity; no single part above ~3%),
+     256 floating items ~0.17 ms and 64 `NoGravity` orbs ~0.13 ms (scene artifacts: zero moves still run `move`, inside
+     block checks and, for orbs, an interpolation `noCollision`), the player ~0.06-0.11 ms (warm-up, section 6.6), 16 boats
+     ~46 us. Texture atlas animation ~0.18-0.2 ms (blocks atlas 134 us: 56 animated sprites, ~42 drawn per tick into 5 mip
+     levels; particles 31 us for one sprite; ~30 us per render pass, native driver time; only drawing visible sprites, as
+     Sodium does, would not be exact), `animateTick` ~0.12 ms (1334 block reads and particle checks), player sync ~0.05.
+     In real play (`-Pbench.entityGravity=true`, `-Pbench.entityAi=true`) resting items and orbs also pay `collide`'s
+     block sweep (~1/3 of their `move`; a cache like the supporting block's could take it, or Lithium-style specialized
+     cuboid collisions), and dropped items from fights cost ~1.1 us each. The frames with a tick are also slower outside
+     the tick, most likely the benchmark harness's handshake and length-biased sampling (section 6.6).
    - Players and other translucent types stay vanilla (no player in the scene but the spectator).
 2. **Per entity and block entity cost in the server scene** (twelfth session measurements in section 7). The static
    view is close to GPU bound (~0.875 ms GPU vs ~0.78 ms render thread), so CPU work there shows in the render
@@ -1094,7 +1226,8 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
      ms; facing the cube there are ~1.1k books per frame.
    - **Client tick** (~1.4 ms, sets the p99): block entities ~0.5 ms (~5.6k enchanting tables at ~90 ns: wrapper,
      bound ticker and block entity loads, the world border check, profiler push/pop), entities ~0.34 (~300 armor
-     stands at ~1.1 us), animateTick ~0.27 (vanilla's 1334 random block lookups), textures ~0.16 (animated texture
+     stands at ~1.1 us), animateTick ~0.27 (vanilla's 1334 random block lookups; ~0.1 ms less since the sixteenth
+     session's `fastAnimateTick`: tick 1.23 -> 1.13 ms in that session's comparison), textures ~0.16 (animated texture
      uploads), the rest ~0.1.
    - **GPU:** retained block entities still 0.155 ms (vertex work; the entity vertex format is 36 B and its shader
      does lighting per vertex); instanced models 0.065.
