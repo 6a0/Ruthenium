@@ -26,7 +26,7 @@ import java.util.TreeMap;
 
 /**
  * Block entity benchmark ({@code -Pbench.scene=blockentities}): the block entities that {@code RetainedBlockEntities}
- * keeps besides chests, which the server scene doesn't have.
+ * keeps besides chests, which the mixed scene ({@link MixedBenchmark}) doesn't have.
  * <p>
  * A fresh flat world (Fabric's consistent test settings) gets a field of ~12.4k block entities in front of a
  * spectator: a row of chests, 6144 shulker boxes (all colours, three facings), 3072 decorated pots (blank and with

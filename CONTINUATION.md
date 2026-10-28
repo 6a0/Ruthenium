@@ -352,25 +352,32 @@ client-gametest-api-v1 `6.0.11+131f8d475d`).
 
 ## 6. Benchmark
 
-### 6.1 The user's protocol (fixed; don't change it)
-1. Join **`62.141.62.9:10002`** as **`6a0`**. It is an offline-mode Velocity proxy running 26.3, and `6a0` has op.
-   Offline UUID `476b897b-bd6d-3ab1-b22e-1c1126c9f94e`.
-2. Run `/tp 6a0 -98.5 69 189.5 0 0` and wait 5 s for FPS to settle. This is the "initial" phase, which is measured.
-3. Pan a full 360°.
-4. Run `/particle minecraft:happy_villager -97.5 68 199 2 2 2 1 500000` (the user calls it a hellish entity
-   stress test).
+### 6.1 The user's protocol
+**The benchmark server is gone (2026-10-28, eighteenth session); every scene is a singleplayer world.** The user's
+protocol lives on in the default **mixed scene** (`MixedBenchmark`, `-Pbench.scene=mixed`), a stand-in for the old
+server scene. Its numbers do not compare with the server scene's (labels `ruthenium-mixed`, `vanilla-vulkan-mixed`, ...),
+so the server scene numbers in this file are history.
+1. A fresh flat world: 296 armor stands ahead (yaw 0), a cube of 7168 chests with a layer of 1024 signs inside to the
+   east (yaw 270), 16 signs on its face, 5625 enchanting tables behind it (closed books), slime and honey blocks;
+   render distance 16, spectator at (0.5, -58, 0.5), pitch 0.
+2. "initial": the first 5 s after the teleport, while FPS settles (chunks and block entities still arriving).
+3. "pan": a full 360°.
+4. "static" facing the particle spot, then "particles": `/particle minecraft:happy_villager 1.5 -59 10 2 2 2 1 500000`
+   (the user calls it a hellish entity stress test). The run fails if the particle group doesn't fill (peak < 12k; one
+   run of the first build peaked at 1625 and wasn't reproduced; it is normally ~16.2k, as on the server).
 5. Report average, 95% low and 99% low FPS for each phase, plus allocation rate.
 
-Use the Fabric client gametest API and the `fast-ip-ping` mod; without it, literal IPs add a ~5 s reverse DNS stall.
+First runs (Vulkan, one each, 2026-10-28): initial 1167, pan 1608, static 1545, particles 1247 fps.
 
 ### 6.2 Implementation (`src/gametest`)
-- `BenchmarkClientGameTest`: sets options (Fancy preset, render distance 16, unlimited fps, no vsync), connects,
-  checks that `/tp` and `/particle` parse with the server's command tree (fails fast if `6a0` lost op), then
-  teleports and runs **initial (5 s) → pan (10 s, driven per frame) → static (5 s, added reference at the
-  particle spot) → particles (10 s)**. It writes JSON and TXT to `build/run/bench/results/<label>-<time>.*`, the
+- `BenchmarkClientGameTest`: sets options (Fancy preset, render distance 16, unlimited fps, no vsync) and runs the
+  scene `bench.scene` (mixed, terrain, blockentities, entities). `MixedBenchmark` builds its world, then runs
+  **initial (5 s) → pan (10 s, driven per frame) → static (5 s, reference at the particle spot) → particles (10 s)**.
+  Scenes write JSON and TXT to `build/run/bench/results/<label>-<scene>-<time>.*`, the
   pan's per-frame series (frame ms, yaw, entities, block entities, GCs so far) to
-  `results/frames/<label>-<time>-pan.csv`, and screenshots to `build/run/bench/<label>/screenshots/`: one at
-  yaw 270 (the chest cube, `bench.extraShotYaws`, taken between pan and static) and one of the static view.
+  `results/frames/<label>-<scene>-<time>-pan.csv`, and screenshots to `build/run/bench/<label>/screenshots/`: in the
+  mixed scene one at yaw 270 (the chest cube, `bench.extraShotYaws`, taken between pan and static) and one of the
+  static view.
 - `FrameRecorder`: frame times from a `Minecraft.renderFrame` HEAD hook, allocation via
   `ThreadMXBean.getTotalThreadAllocatedBytes` (all threads) and the render thread, GC counts, and entities and
   block entities per frame (hooked at the end of `LevelExtractor.extract`).
@@ -393,13 +400,13 @@ python scripts/bench_summary.py build/run/bench/results   # medians per label an
 Options: `-PbenchJfr` (JFR profile to `results/<label>.jfr`), `-PbenchWindow=WxH` (default 1920x1080),
 `-PbenchJavaVendor=microsoft -Porg.gradle.java.installations.paths=<jdk>` (run on another JDK), and
 `-Pbench.<name>=value` → `-Druthenium.bench.<name>` (`renderDistance`, `preset`, `panSeconds`, `initialSeconds`,
-`staticSeconds`, `particleSeconds`, `server`, `particleCommand`, `extraShotYaws`, `staticYaw`, `sectionProfile`,
+`staticSeconds`, `particleSeconds`, `scene`, `particleCommand`, `extraShotYaws`, `staticYaw`, `sectionProfile`,
 `chestEvents`, `zoomShot`, `settingsScreen`), and `-Pvm.<name>=value` → `-Druthenium.<name>`, which overrides that
 `Config` switch (`retainedChests=false`, `instancedModels=false`, `blockEntityCulling=false`, ...).
 `-Pbench.settingsScreen=true` skips the benchmark: from the title screen it opens the settings screen through the
 options screen's video button, screenshots each page (`settings-*`), toggles and applies a switch (checking
 `Config` and the written file), hovers an option for its tooltip, searches with Ctrl+L and opens vanilla's screen
-with Shift+P (`SettingsScreenCheck`). No server needed, ~20 s. `zoomShot` adds a 30° FOV screenshot at yaw 270 (`zoom270`), where the enchanting table
+with Shift+P (`SettingsScreenCheck`), ~20 s. `zoomShot` adds a 30° FOV screenshot at yaw 270 (`zoom270`), where the enchanting table
 books are large enough to compare.
 `chestEvents` opens the lid of a chest in the crosshair and adds breaking progress to another one (client-side)
 before the static phase, with `chestopen`/`chestclosed` screenshots; compare runs with `-Pvm.retainedChests=false`
@@ -425,8 +432,9 @@ run 3×, summarize, diff the static and yaw 270 screenshots, then commit with th
   Use medians of ≥3 runs and compare against the 7–8 run vanilla baseline.
 - Bench tasks set `outputs.upToDateWhen { false }`. Without it Gradle skipped re-runs as UP-TO-DATE.
 - The JFR render thread is named **`main`** (the game log calls it "Render thread").
-- The scene is **CPU-bound**: 296 armor stands, a wall of chests, slime/honey blocks, signs, and a building full
-  of chests on the left (~14k block entities extracted per frame by vanilla). The machine has an RTX 4060 Laptop
+- The old server scene was **CPU-bound** for vanilla: 296 armor stands, a wall of chests, slime/honey blocks, signs,
+  and a building full of chests on the left (~14k block entities extracted per frame by vanilla). The mixed scene
+  copies that mix (~13.8k block entities). The machine has an RTX 4060 Laptop
   GPU, Intel UHD iGPU (hybrid), a 3440×1440 primary display and a 2560×1600 @150% laptop panel.
 
 ### 6.5 Visual parity check
@@ -1389,6 +1397,7 @@ blocks, plane culling and the mod compatibility trade-offs). Nothing is pending.
      the tick, most likely the benchmark harness's handshake and length-biased sampling (section 6.6).
    - Players and other translucent types stay vanilla (no player in the scene but the spectator).
 2. **Per entity and block entity cost in the server scene** (twelfth and seventeenth session measurements in section 7).
+   The server is gone; the mixed scene (section 6.1) has the same mix and is where this continues.
    The static view is GPU bound (GPU frame ~0.84 ms, render thread ~0.72 ms), so CPU work there shows in the render thread
    time and the p99 (tick frames); GPU work shows in the average. Done: sign text retained, closed books without
    extraction, cached table light, reused armor stand states (8th/9th), parked idle tickers, validated ticker states, typed

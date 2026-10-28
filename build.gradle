@@ -71,9 +71,6 @@ dependencies {
 	includeModule("fabric-block-getter-api-v2")
 	includeModule("fabric-lifecycle-events-v1")
 	includeModule("fabric-transitive-access-wideners-v1")
-
-	// Literal server IPs otherwise stall ~5s on a reverse DNS lookup when connecting
-	gametestRuntimeOnly "maven.modrinth:fast-ip-ping:${project.fast_ip_ping_version}"
 }
 
 processResources {
@@ -104,8 +101,8 @@ jar {
 	}
 }
 
-// Benchmarks: production-like client runs driven by the client gametest in src/gametest.
-// Usage: ./gradlew benchRuthenium (or benchVanillaGl / benchVanillaVulkan / benchSodium)
+// Benchmarks: production-like client runs driven by the client gametest in src/gametest, in singleplayer worlds.
+// Usage: ./gradlew benchRuthenium (or benchVanillaGl / benchVanillaVulkan / benchSodium), -Pbench.scene=<scene>
 // Results are written to build/run/bench/results/
 def gametestJar = tasks.register("gametestJar", Jar) {
 	archiveClassifier = "gametest"
@@ -119,7 +116,6 @@ configurations {
 
 dependencies {
 	benchBaseMods "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
-	benchBaseMods "maven.modrinth:fast-ip-ping:${project.fast_ip_ping_version}"
 	benchSodiumMods "maven.modrinth:sodium:${project.sodium_version}"
 }
 

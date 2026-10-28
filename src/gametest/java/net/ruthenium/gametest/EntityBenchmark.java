@@ -17,14 +17,14 @@ import java.util.Map;
 import java.util.TreeMap;
 
 /**
- * Entity benchmark ({@code -Pbench.scene=entities}): the entity types that the server scene (armor stands only)
+ * Entity benchmark ({@code -Pbench.scene=entities}): the entity types that the mixed scene (armor stands only)
  * doesn't have.
  * <p>
  * A fresh flat world (Fabric's consistent test settings) gets ~1.3k entities in rows in front of a spectator, near to
  * far: dropped items, experience orbs, farm animals (some babies), villagers and zombie villagers, zombies and
  * skeletons (with unbreakable helmets, so they don't burn), creepers, spiders, endermen, illagers and witches, iron
  * golems, horses, wolves and cats, minecarts and boats, text/item/block displays, and a wall with item frames and
- * paintings (armor stands are in the server scene). Some mobs have visible name tags. Mobs have no AI unless {@code bench.entityAi=true},
+ * paintings (armor stands are in the mixed scene). Some mobs have visible name tags. Mobs have no AI unless {@code bench.entityAi=true},
  * so that runs compare. Phases: "static" ({@code bench.staticSeconds}) facing the field and "pan" (a 360 degree pan
  * over {@code bench.panSeconds}). Screenshot: the static view. Clouds are off so that screenshots of different runs
  * compare.
