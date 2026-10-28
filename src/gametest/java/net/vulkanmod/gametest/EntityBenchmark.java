@@ -43,7 +43,9 @@ final class EntityBenchmark {
     private static final boolean AI = Boolean.parseBoolean(BenchmarkClientGameTest.prop("entityAi", "false"));
     private static final int CLOSE_SHOTS = Integer.parseInt(BenchmarkClientGameTest.prop("closeShots", "0"));
     private static final String CLOSE_TOGGLE = BenchmarkClientGameTest.prop("closeToggle", "");
-    private static final boolean LIGHT_EVENTS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("lightEvents", "false"));
+    /** {@code bench.staticView=k}: the static phase runs at close-up position k instead of the overview (pan unchanged) */
+    private static final int STATIC_VIEW = Integer.parseInt(BenchmarkClientGameTest.prop("staticView", "-1"));
+    private static final boolean LIGHT_EVENTS =Boolean.parseBoolean(BenchmarkClientGameTest.prop("lightEvents", "false"));
 
     /** Close-up camera positions (x, height above the floor, z, pitch), each looking along +z at a few mob rows */
     private static final float[][] CLOSE_UPS = {
@@ -104,10 +106,18 @@ final class EntityBenchmark {
 
             context.takeScreenshot(label + "-entities-static-" + runId);
 
+            if (STATIC_VIEW >= 0) {
+                moveTo(context, server, CLOSE_UPS[STATIC_VIEW]);
+            }
             context.runOnClient(_ -> FrameRecorder.startPhase());
             BenchmarkClientGameTest.waitSeconds(context, BenchmarkClientGameTest.STATIC_SECONDS);
             results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("static", -1)));
             LOGGER.info(results.getLast().summaryLine());
+            if (STATIC_VIEW >= 0) {
+                server.runCommand("tp @a 0.5 %d -8.5 0 %s".formatted(FLOOR + 14, PITCH));
+                context.waitTicks(10);
+                setView(context, 0.0F);
+            }
 
             context.runOnClient(mc -> {
                 FrameRecorder.startPhase();
@@ -157,16 +167,7 @@ final class EntityBenchmark {
         server.runCommand("tick freeze");
         context.waitTicks(5);
         for (int k = 0; k < CLOSE_UPS.length; k++) {
-            float[] view = CLOSE_UPS[k];
-            server.runCommand("tp @a %s %s %s 0 %s".formatted(view[0], FLOOR + view[1], view[2], view[3]));
-            context.waitTicks(10);
-            context.runOnClient(mc -> {
-                mc.player.setYRot(0.0F);
-                mc.player.yRotO = 0.0F;
-                mc.player.setXRot(view[3]);
-                mc.player.xRotO = view[3];
-            });
-            context.waitTicks(5);
+            moveTo(context, server, CLOSE_UPS[k]);
             for (int n = 0; n < CLOSE_SHOTS; n++) {
                 boolean toggled = !CLOSE_TOGGLE.isEmpty() && n % 2 == 1;
                 if (toggled) {
@@ -179,6 +180,19 @@ final class EntityBenchmark {
             }
         }
         server.runCommand("tick unfreeze");
+    }
+
+    /** Moves the spectator to a close-up position (x, height above the floor, z, pitch), looking along +z */
+    private static void moveTo(ClientGameTestContext context, TestServerContext server, float[] view) {
+        server.runCommand("tp @a %s %s %s 0 %s".formatted(view[0], FLOOR + view[1], view[2], view[3]));
+        context.waitTicks(10);
+        context.runOnClient(mc -> {
+            mc.player.setYRot(0.0F);
+            mc.player.yRotO = 0.0F;
+            mc.player.setXRot(view[3]);
+            mc.player.xRotO = view[3];
+        });
+        context.waitTicks(5);
     }
 
     /** Flips the boolean {@code Config} field named by {@code bench.closeToggle}, by reflection (vanilla runs have no mod) */
