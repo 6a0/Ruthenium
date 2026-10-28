@@ -325,6 +325,16 @@ public abstract class Options {
                                 () -> config.fastSupportingBlocks)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.fastSupportingBlocks.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.nameTagTextCache"),
+                                value -> config.nameTagTextCache = value,
+                                () -> config.nameTagTextCache)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.nameTagTextCache.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.textDisplayTextCache"),
+                                value -> config.textDisplayTextCache = value,
+                                () -> config.textDisplayTextCache)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.textDisplayTextCache.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)

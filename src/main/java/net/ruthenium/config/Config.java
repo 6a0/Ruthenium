@@ -47,6 +47,10 @@ public class Config {
     public boolean fastBoatTicks = true;
     /** Resting entities keep their supporting block while no block of the client level changes */
     public boolean fastSupportingBlocks = true;
+    /** Name tags equal to the ones an entity showed last keep their width, visual order and prepared glyphs */
+    public boolean nameTagTextCache = true;
+    /** Text display lines keep their prepared glyphs across frames */
+    public boolean textDisplayTextCache = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */
