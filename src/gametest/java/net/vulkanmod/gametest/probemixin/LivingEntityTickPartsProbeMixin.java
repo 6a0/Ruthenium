@@ -44,4 +44,14 @@ public class LivingEntityTickPartsProbeMixin {
             EntityCostProbe.TICK_PARTS.add("LivingEntity.tickEffects", System.nanoTime() - start, 0);
         }
     }
+
+    @WrapMethod(method = "refreshDirtyAttributes")
+    private void timeDirtyAttributes(Operation<Void> original) {
+        int dirty = ((LivingEntity) (Object) this).getAttributes().getAttributesToUpdate().size();
+        long start = System.nanoTime();
+        original.call();
+        if (RenderSystem.isOnRenderThread()) {
+            EntityCostProbe.TICK_PARTS.add("LivingEntity.refreshDirtyAttributes", System.nanoTime() - start, dirty);
+        }
+    }
 }

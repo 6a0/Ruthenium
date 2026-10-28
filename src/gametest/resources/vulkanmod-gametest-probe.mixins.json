@@ -5,6 +5,7 @@
   "plugin": "net.vulkanmod.gametest.ProbeMixinPlugin",
   "compatibilityLevel": "JAVA_25",
   "client": [
+    "AttributeMapTickPartsProbeMixin",
     "AttributeSupplierPartsProbeMixin",
     "BoatTickPartsProbeMixin",
     "ClientLevelCostProbeMixin",
@@ -21,6 +22,7 @@
     "LevelTickPartsProbeMixin",
     "LivingEntityRendererPartsProbeMixin",
     "LivingEntityTickPartsProbeMixin",
+    "LocalPlayerTickPartsProbeMixin",
     "ModelFeatureCostProbeMixin",
     "OrbTickPartsProbeMixin",
     "RenderTypesPartsProbeMixin",
