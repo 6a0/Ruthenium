@@ -1038,6 +1038,12 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
   the 296 armor stands (not profiled).
 - Mod compatibility of `ModelPoseReplay`: replayed layer submits bypass `setupAnim` and `ModelPart.render`, so a mod
   hooking those on a vanilla model class is skipped for layers (switch "Reuse Layer Poses").
+- Fifteenth session, verified independently (`results/verify-s15/`: 0 mismatches over 23-39M answers per run on
+  Vulkan, GL and the multiplayer server scene, incl. chunk unload/reload and light packets; each switch +3% in its
+  phase, also with instanced parts off). Mod compatibility only: `entityLightCache` would serve stale light to a
+  dynamic-lights mod or a preview level whose light isn't backed by `ClientChunkCache`; `fastEntityCulling` bypasses
+  mods hooking `EntityRenderDispatcher.shouldRender` / `EntityRenderer.shouldRender` for plain renderers. Leashed
+  entities miss the light cache every frame (the leash reads light at the eye position).
 
 1. **Entity scene hot spots** (section 6.9; static ~2.95 ms render thread after the fifteenth session, section 7).
    Done: block model mesh cache, hashed draw lookup, baked quads a quad at a time (10th), instanced parts (11th),
