@@ -1305,6 +1305,16 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 - Seventeenth session, a trade-off kept: drawing retained quads by plane (`9c15ac0`) gains ~3% in the server scene (GPU
   0.873 -> 0.837 ms) but costs the block entity scene's static view ~0.6% (GPU 0.542 -> 0.546 ms; section 7). Revisit if
   a scene that matters more looks like the block entity field from outside (no section containing the eye).
+- Seventeenth session, verified independently (`results/v17-*`, `v17-vis/`): no correctness or visual issue in any
+  commit (code read against vanilla; scripted bell rings, lectern book removal/placement, statue pose and oxidation
+  changes, a sign edited by a server data packet and a double chest join all match retained off on Vulkan and OpenGL;
+  the change checks are pixel-identical on OpenGL too). Every gain reproduced: tables tick 1.225 -> 0.978 ms, plane
+  culling server static 1066.3 -> 1091.1 (GPU 0.866 -> 0.832 ms), book tilt 841.6 -> 856.3 facing the cube, extras
+  scene 214.0 -> 1283.6 with retained lecterns/bells/statues, change checks extras p99 low 264 -> 720. Start -> end:
+  server static 1087.8 -> 1126.1, block entity scene 1761.3 -> 1749.8 (-0.65%, 4 of 5 pairs), entity scene unchanged.
+  The plane culling commit alone costs the block entity scene only -0.1% (+1-2 us GPU), so most of the -0.65% is not
+  from it and is unattributed. Compare retained screenshots at threshold 12, not 1 (time-of-day drift dominates
+  threshold 1; retained types show 15-19 px at t12 vs retained off).
 
 1. **Entity scene hot spots** (section 6.9; static ~2.95 ms render thread after the fifteenth session, section 7).
    Done: block model mesh cache, hashed draw lookup, baked quads a quad at a time (10th), instanced parts (11th),
