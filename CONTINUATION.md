@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-29 (twenty-second session; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-29 (twenty-third session; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -94,6 +94,15 @@ computed on the CPU with vanilla's float operations. Exact: 0 mismatches in posi
 posed members; 0 pixels differ across the switch in frozen close-ups (Vulkan and OpenGL). Players static 523.6 -> 603.5 fps (render
 thread 1.86 -> 1.60 ms), 150 skins 514.1 -> 605.0, moving players 507.7 -> 581.1, lobby 351.6 -> 397.3 (2.76 -> 2.45 ms), OpenGL
 players 417.7 -> 465.0; mixed and entity scenes within noise.
+Twenty-third session (section 7, "Twenty-third session"): **labels are drawn from label-space glyph meshes and per-frame poses**
+(`RetainedLabels`, switch "Retained Labels"; section 8's bigger job 2): name tags, text display lines and other kept text are recorded
+once into a shared vertex buffer whose vertices name their label's region in a texel buffer of poses; each glyph run takes vanilla's
+draw (all phases, see-through included), unsorted draws are indirect multi-draws over arena ranges, sorted `text_polygon_offset` draws get
+vanilla's order from CPU centroids. Exact: 0 mismatches over 24M labels, 0 pixels across the switch in frozen close-ups (Vulkan and
+OpenGL; a new `bench.labelVariety` wall of special labels) except vanilla's obfuscated text. Lobby static 398.8 -> 479.1 fps (render
+thread 2.43 -> 2.03 ms), moving players 382.9 -> 457.6, holograms only 1226.9 -> 1721.0, OpenGL lobby 329.5 -> 392.7; mixed unchanged,
+entity scene ~1.5% lower (unexplained, at its resolution). Also: the nineteenth session's claim that text backgrounds draw before the
+translucent models was wrong (they draw after).
 
 
 **Renamed to Ruthenium (2026-10-28, eighteenth session).** The project is now **Ruthenium**: mod id `ruthenium`, package
@@ -207,6 +216,10 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   seventeenth session (~1770 -> ~1370 static) turned out to be the machine: the seventeenth session's build is as slow now, +0.17
   ms GPU per frame since a restart on 28/10 (section 7, nineteenth session, "After the merge"). GPU bound numbers compare only
   within a session.
+- **Twenty-third session** (section 7): labels retained ("Retained Labels", `retainedLabels`): label-space glyph meshes in one vertex
+  buffer, per-frame pose rows and light per label in a texel buffer, vanilla's draws and quad order (indirect multi-draws over arena
+  ranges for unsorted draws, CPU-sorted indices for `text_polygon_offset`). Lobby static +20% (2.43 -> 2.03 ms), holograms only +40%,
+  OpenGL lobby +19%; 0 mismatches over 24M labels, 0 pixels across the switch except obfuscated text.
 - **Next:** see section 8.
 
 ---
@@ -320,6 +333,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/render/blockentity/LevelExtractorM.java` + `FrustumAccessor.java` + `render/blockentity/BlockEntityCulling.java` | `@Overwrite extractVisibleBlockEntities`: vanilla's loop with per-block-entity frustum culling inlined. Conservative box: block ±1, +2 extra on top. **Vanilla block entity types only.** Each section is classified once (inside/outside/partial with the same margins), then 4³ cells of partial sections, and only block entities in partial cells are tested individually. Positions and cullability come from `CompiledSectionMeshM` (`interfaces/BlockEntityPositions`, packed once per compiled mesh) by list index, so culled block entities are not even loaded from the list. The destruction progress map is skipped while empty. Fabric API doesn't inject into this method (checked) |
 | `mixin/render/vertex/StagedVertexBufferSortM.java` + `render/vertex/SortOrderCache.java` + `render/vertex/SortedQuadIndices.java` | **Sort order reuse** (twenty-first session, switch `reuseSortOrder`, "Reuse Sort Order"). A `@WrapOperation` on `writeSortedIndexBuffer` in `StagedVertexBuffer.uploadDrawsToBuffers` sorts each sorted draw whose `VertexSorting` is a `DistanceSorting.Sorter` through a per buffer `SortOrderCache`: the draw is matched to an entry by quad count and the half-block cell of its first centroid, and `Sorter.sortFrom` insertion sorts from the entry's order (in place), falling back to the full sort after 4n+64 moves; no entry: full sort, new entry. Entries unused for 4 uploads are dropped (the level's and the hand's features share one buffer). Exact because every sort orders by the same strict total order (key, then quad index), whatever the start. Other `VertexSorting`s (mods) take the vanilla call. `SortedQuadIndices` holds the index writer `MeshDataSortStateM` used to keep |
 | `render/entity/PlayerPoseDraws.java` + `mixin/render/feature/{RenderTypeFeatureRendererM,RenderTypeFeatureRendererGroupM}.java` + `mixin/render/vertex/StagedVertexBufferDrawM.java` + `ModelPartM`/`ModelPartCubeM`/`ModelM`/`ModelFeatureRendererM` + `interfaces/{PosedDrawGroup,PosedDrawHolder,PosedPart,PoseLayoutHolder,TransparentCube}` + `assets/ruthenium/shaders/core/player_pose.vsh` | **Player bodies drawn from poses** (twenty-second session, switch `playerPoseDraws`, "GPU Player Poses"). A submit of the exact `PlayerModel` class with vanilla's `entity_translucent` pipeline (no UV mapping, no decal) in a strictly ordered group of the world's features (the translucent models phase), without OIT, is not written: `ModelFeatureRendererM.prepareModel` hands it to `PlayerPoseDraws.prepare`, which runs vanilla's `setupAnim` and part tree into a sink, and `ModelPart.compile` passes each written part's pose to `capturePart` instead of writing its cubes. Each `PlayerModel` instance (wide, slim, per renderer) gets a layout: one slot per part with cubes (max 12) and a static mesh of its cubes in part space (position, UV, normal as floats, member and slot as `RG16_SINT`), in 8 copies, one per member of a draw. Per member (1184 B of a std140 uniform block): light and overlay as the entity format's shorts, color, and per slot the pose rows and the normal matrix rows (w: normalize or not). The member joins the group's draws exactly as `getVertexBuilder` would place its vertices (`PosedDrawGroup`: a new staged draw via `getOrAddDraw`, or the group's last draw when the render type repeats, i.e. consecutive bodies of one skin share a draw as in vanilla); the staged draw stays empty (skipped on upload) and carries the posed draw (`StagedVertexBufferDrawM`), which `RenderTypeFeatureRendererM` draws in its place (a redirect of `executeGroup`'s `getExecuteInfo`): a copy of `entity_translucent` with `player_pose.vsh`, the draw's prepared transforms and textures, its uniform slice (`PlayerPoses`, offset aligned to `minUniformOffsetAlignment`, the full 9472 B block bound) and 16-bit indices from a ring buffer. **Order:** each face's centroid is computed on the CPU from the same JOML `transformPosition` of its vertices 0 and 2 and the same `(a + b) / 2.0F` as `MeshData.decodeQuadCentroids`, faces are numbered in vanilla's write order (part tree, cubes, polygons, minus the faces `TransparentFaces` skips, through `ModelPartCubeM`'s per texture masks), and the draw's own `VertexSorting` sorts them (`SortOrderCache` start orders with `reuseSortOrder`), after the world's features are prepared (`upload`). **GPU arithmetic:** positions in JOML's operation order with `precise` (as `instanced_part.vsh`); normals as vanilla writes them: `Matrix3f.transform` order, `normalize` only for untrusted normals, truncated to signed bytes and decoded through a table of `max(c / 127.0F, -1.0F)`. A vanilla write that joins a posed draw (same render type, consecutive) writes the posed members first with vanilla's path (`materialize`, from a redirect of the staged builder fetch in `Group.getVertexBuilder`); captures fail (vanilla path) for parts that aren't the layout's, a part written twice or any vertex written to the sink (mods), and a model whose captures fail 64 times in a row takes vanilla's path until the next clear. Max 64 layouts; cleared on resource reload and when toggled. Render thread only |
+| `render/text/RetainedLabels.java` + `SignTextCache.KeptText` + `mixin/render/text/TextFeatureRendererM.java` (visit redirect) + `RenderTypeFeatureRendererM`/`RenderTypeFeatureRendererGroupM`/`StagedVertexBufferDrawM` + `mixin/render/vertex/StagedVertexBufferAccessor.java` + `interfaces/LabelDrawHolder` + `assets/ruthenium/shaders/core/label_text.vsh` + access widener (`TextFeatureRenderer$GlyphRenderer`) | **Retained labels** (twenty-third session, switch `retainedLabels`, "Retained Labels"; section 8's bigger job 2). Text submits without outline whose prepared text `SignTextCache` keeps (name tags, text display lines, signs that aren't retained; never obfuscated text) are not written: from a kept text's second frame its quads are recorded once in label space (the coordinates handed to `addVertex(pose, x, y, z)`, UV, color; only `BakedSheetGlyph` glyph and effect instances, at most 2048 quads) into an arena vertex buffer (28 B per vertex, each tagged with the label's region; at most 16384 regions, a full arena is replaced next frame). Each run of glyphs with one render type picks the group's draw exactly as `Group.getVertexBuilder` would (`joiningDraw`/`getOrAddDraw`, so merged, new and strictly ordered draws are vanilla's) and joins that draw's `LabelDraw` if the draw holds no vertices; else it is written as vanilla writes it, and a vanilla write joining a label draw writes its labels first (`materialize`). Per label per frame: its pose rows and light into a texel buffer (64 B per region). Upload: unsorted draws as indirect multi-draws over ranges of the arena with the sequential quad index buffer (consecutive labels placed together are one range; gated like vanilla's terrain MDI), else 16/32-bit indices; sorted draws (`text_polygon_offset`, `text_grayscale_see_through`) get indices in the order of their own sorting over CPU centroids (JOML's `transformPosition` of vertices 0 and 2, `/ 2.0F`), kept from last frame when every input is bit-identical. Drawn in the staged draw's place with copies of the six world text pipelines and `label_text.vsh` (`precise` JOML-order position). Exact: 0 mismatches in positions, runs, UV, color, light and sort order over 24M labels; 0 pixels differ across the switch in frozen close-ups on Vulkan and OpenGL except vanilla's obfuscated text (random glyphs, also with an unrelated switch). Not with OIT. Cleared on resource reload and when toggled |
 | `mixin/render/vertex/MeshDataSortStateM.java` | `@Overwrite` `writeSortedIndexBuffer`/`buildSortedIndexBuffer`: sorted quad indices written with `MemoryUtil` puts instead of an `IntConsumer` per index. Sign text (`text_polygon_offset`) is sorted on upload and needs 32-bit indices with ~500 signs |
 | `render/text/SignTextCache.java` + `mixin/render/text/{SignTextM,AbstractSignRendererM,TextFeatureRendererM,FontSetM}.java` | `SignText.getRenderMessages` wraps each line (only when recomputed) in a `FormattedCharSequence` that carries its width and `Font.PreparedText` (plain/shadowed/outline, keyed by x/y/colours). Obfuscated lines are not cached; `FontSet.resetTextures` bumps a generation. A first version with a global identity map was slower than no cache. `AbstractSignRendererM` also skips the text of a sign side whose plane faces away from the eye by ≥ 0.55 blocks (`ModelCulling.isSignTextHidden`): polygon-offset text pipelines (and their OIT sets) cull back faces, checked at runtime. Glyph quads wind like (0,0),(0,1),(1,1), so the side's facing is `column1 × column0` of the pose |
 | `render/entity/ModelCulling.java` + `mixin/render/feature/LevelRendererM.java` | Flags the world's `FeatureRenderDispatcher.prepareFrame`, `LevelRenderer.submitBlockEntities` (for sign text) and the current model's render type. When the pipeline culls (`RenderPipeline.isCull()`), `ModelPartCubeM` skips faces the GPU would cull: `(v1-v0)x(v2-v0)` of the transformed corners points away from every eye position within 0.5 blocks of the origin (camera-relative positions; bobbing moves the eye ~0.1). Degenerate faces are kept. `skipDuplicateQuads()` is true for render types without blending or upload sorting (drawing a quad twice is then idempotent) |
@@ -816,6 +830,11 @@ are in every frame. `bench.playersKind`: `lobby` (default, both of the following
   or suffocation while frozen; removed afterwards). Frozen shots of one setting differ by the glint and the arm; to find what a
   switch changes, count pixels that are equal in all shots of each setting but differ across them (`java scripts/StableDiff.java
   2 map.png shot0 shot1 ...`, shots 0, 2, ... one setting and 1, 3, ... the other; with `closeShots=8` the glint left none).
+- Since the twenty-third session: `bench.labelVariety=true` adds a wall of special labels at x 34-47 (shadowed, see-through, half
+  opacity, red and no background, underlined / struck / italic, obfuscated, CJK and accented, wrapped and aligned, fixed and scaled
+  text displays, stacked and overlapping displays and hologram stands, a named pig, stained glass in front) and a third close-up
+  (`close2`) of it; it changes the scene's numbers. Obfuscated text differs stably between the two settings of any `closeToggle`
+  (its random glyphs depend on the frames drawn between shots): ignore the "Obf" label's pixels.
 
 ---
 
@@ -1490,8 +1509,9 @@ parts (`s5-probe-players.log`, `s5-probe-stand.log`; wrappers add ~50-100 ns per
 **Not tried, with the reasons:**
 - **The player body** (2.8 us per player, the largest single item, plus its per-frame quad sort and its own draw): it can't
   be instanced in place (strictly ordered translucent group, quads sorted on upload), and moving it to the solid phase is not
-  exact (vanilla draws translucent text backgrounds before the translucent models phase, so a player behind a hologram
-  background is hidden by the background's depth in vanilla). An exact path would keep each player's draw in its sorted
+  exact (the reason first given here, that vanilla draws translucent text backgrounds before the translucent models phase, is
+  wrong: the twenty-third session found the nameTags and texts phases drawn *after* the translucent models; moving the bodies would
+  still change their order against the other translucent models and sorted geometry). An exact path would keep each player's draw in its sorted
   place but take its vertices from a per-part GPU pose buffer, and only skip the quad sort for skins with no
   semi-transparent texels in drawn faces (then the order of opaque and discarded fragments doesn't matter). Large.
 - **Retained or instanced billboard text** (name tags and center-billboard text displays: each frame's geometry is the same
@@ -1855,6 +1875,140 @@ the same renderer); OIT (not accepted); the `normalize` branch of the normal emu
 normalized faces in the check) and the color conversion for non-white tints (bodies are white; GPU `UNORM8` decode assumed exact like
 Java's `c / 255.0F`); hardware other than the RTX 4060 Laptop (Vulkan and OpenGL); mods.
 
+### Twenty-third session (2026-10-29)
+Section 8 "Bigger jobs" job 2: retained billboard text. One agent on `26.3` (main tree). Results in `results/s23-labels-*` and
+`results/s23-dev/`, logs `build/bench-logs/s23-*.log`. Commit `4890a5d`.
+
+**The "find out first" questions** (answered by research before the session, re-checked in the 26.3 sources):
+- *Indirect multi-draw:* Vulkan always (`multiDrawIndirect`, `drawIndirectFirstInstance` are required features); OpenGL only with
+  `GL_ARB_multi_draw_indirect` (GL 3.3 is the minimum), base instance only with `GL_ARB_base_instance`, and `gl_DrawID` /
+  `gl_BaseInstance` only with `GL_ARB_shader_draw_parameters`. `RenderPass.drawIndexedIndirect(slice, count)` takes 5-int commands from
+  a `USAGE_INDIRECT_PARAMETERS` buffer; the frontend checks `drawIndirect` / `multiDrawIndirect` but not `maxDrawIndirectDrawCount`.
+  There are also direct multi-draws (`multiDrawIndexed`: Vulkan `VK_EXT_multi_draw` "interleaved", OpenGL `glMultiDrawElementsBaseVertex`
+  "separate", each on one backend only). **Texel buffers** (`samplerBuffer`, a whole buffer per binding, as the clouds use) work on both.
+- *Render types, phases, order:* 26.3 has no `text_background` / `text_intensity` types; backgrounds and effects use the white glyph
+  through the label's own glyph type. `text` (name tags: the non-sneaking NORMAL submit is opaque white and emissive, so the **solid**
+  phase; sneaking name tags the **nameTags** phase), `text_polygon_offset` (text displays and signs; lines at opacity 255 in the solid
+  phase, their `StandaloneBackground` and translucent lines in the **texts** phase; **sorted on upload**), `text_see_through` (the
+  non-sneaking SEE_THROUGH submit and see-through displays; the strictly ordered **see-through** phase, sorted by distance;
+  `text_grayscale_see_through` is also sorted on upload). Solid, nameTags and texts are `SimpleFeatureRenderPhase`s (one group per
+  feature type in submission order, may reorder: Ruthenium's `mergeDraws` merges equal types there); translucent order: shadows,
+  translucent models, **nameTags, texts**, custom geometry (`FeatureRenderDispatcher.executeTranslucent`), then outline, then see-through.
+  **Correction:** the nineteenth session's note that "vanilla draws translucent text backgrounds before the translucent models phase"
+  (section 7 "Players and holograms", section 8 job 1) is wrong: backgrounds (texts phase) and translucent name tags (nameTags phase) draw
+  *after* the translucent models. A player body behind a hologram background is drawn first and the background blends over it. The
+  twenty-second session's `PlayerPoseDraws` doesn't depend on that claim (it keeps each body's draw in vanilla's place).
+
+**Measured first** (elimination, `s23-dev/elim`, 2 pairs, lobby static, a temporary property that skipped `renderText` for kept lines
+in the world pass): 400.1 -> 532.2 fps, render thread 2.43 -> 1.82 ms. Labels cost **~0.61 ms per frame** in the lobby (~940 label
+submits per frame at the static view: glyph writes, their upload and sort, and their GPU work), more than the ~0.3-0.4 ms estimate.
+
+**Design as built** (`RetainedLabels`, switch `retainedLabels`, "Retained Labels"; section 4 row). Not the brief's indirect multi-draw
+of instance records: a per-vertex **region** index into a **texel buffer of poses**, so that a draw sorted on upload keeps vanilla's
+quad order across labels (with per-label sub-draws a sorted draw would need a sub-draw per run of consecutive quads of one label, and
+labels at similar distances interleave), and every vanilla draw stays one draw:
+- *Mesh:* a kept prepared text (`SignTextCache` lines: name tags, text display lines, signs that aren't retained) is wrapped in
+  `SignTextCache.KeptText`; from its second frame it gets a mesh: its glyph and effect quads recorded through a `VertexConsumer` that
+  takes the label-space coordinates handed to `addVertex(pose, x, y, z)` (only `BakedSheetGlyph`'s glyph and effect instances; anything
+  else, or more than 2048 quads, is vanilla's path), with their UV and color. Runs of renderables with one render type are computed per
+  display mode. Meshes are appended to one GPU vertex buffer (the arena; 28 B per vertex: position, UV, color, region), up to 16384
+  regions (four RGBA32F texels each, within the minimum texel buffer size); a full arena is replaced at the next frame and meshes are
+  placed again when next drawn.
+- *Per frame:* `TextFeatureRendererM` redirects the `PreparedText.visit` of a text submit without outline. Each run picks the group's
+  draw exactly as `Group.getVertexBuilder` would (`joiningDraw` or `getOrAddDraw`), and is added to that draw's `LabelDraw` (attached to
+  the staged draw like `PlayerPoseDraws`' posed draws) if the draw has no vertices; otherwise it is written as vanilla writes it. A
+  vanilla write joining a label draw writes its labels first (`materialize`). The label's region gets its pose rows and light (64 B).
+- *Upload* (after the world's features are prepared): new meshes go up with one `writeToBuffer`; unsorted draws become **indirect
+  commands over ranges of the arena** (consecutive labels placed one after the other are one range; the sequential quad index buffer,
+  base vertex per command, no instance data, so `nonZeroFirstInstance` isn't needed; gated like vanilla's terrain: `drawIndirect`,
+  `multiDrawIndirect`, no known MDI issues, split by `maxDrawIndirectDrawCount`), or 16/32-bit indices where MDI isn't available; sorted
+  draws get indices in the order of the draw's own sorting over centroids computed on the CPU with JOML's `transformPosition` of
+  vertices 0 and 2 and `/ 2.0F` (inlined in JOML's generic operation order, checked against JOML at startup), through a
+  `SortOrderCache` with `reuseSortOrder`. **A sorted draw whose inputs are bit for bit last frame's** (same meshes, places, quad ranges,
+  pose elements and JOML properties, same sorting) keeps last frame's order (the centroids would be the same floats).
+- *GPU:* copies of vanilla's six world text pipelines with `label_text.vsh` (vanilla's `text.vsh` with the position computed from the
+  region's rows with `precise` in JOML's order, the light from the texel buffer).
+
+Per frame in the lobby's static view (temporary counters): 940 labels in 3 draws (solid `text`, solid `text_polygon_offset` sorted with
+6078 quads, see-through), 15318 quads; upload 175 us with per-quad 32-bit indices for every draw, 96 us with MDI ranges (2-33 ranges for
+the two unsorted draws) and 16-bit indices, 39 us with the sorted order kept (sort 70 -> 13 us); submit ~0.1 us per label.
+
+**Exactness check** (temporary, `scripts/patches/s23-label-check.patch`, `-Pjvm.ruthenium.probe.labelCheck=true`): every retained label
+also visited with vanilla's renderables, pose and light into a recorder, compared with its mesh: vertex count, runs (render type and
+quads per vanilla draw selection), positions (JOML's transform of the mesh's coordinates and the shader's arithmetic in Java on the
+uploaded rows, bit for bit), UV, color, light; every sorted draw's order against a fresh full sort of JOML-computed centroids:
+
+| run | labels | vertices | sorted draws | sorted quads | mismatches |
+|---|---|---|---|---|---|
+| lobby + label variety, close-ups with the switch toggled | 9,777,436 | 637.3M | 13,177 | 61.0M | 0 |
+| moving players, label variety, `mergeDraws` and `reuseSortOrder` off | 7,918,336 | 516.1M | 331,246 | 50.8M | 0 |
+| lobby, with the kept sort order | 6,223,560 | 405.9M | 8,760 | 40.5M | 0 |
+
+24.0M labels in all.
+
+**Parity** (frozen close-ups, `closeShots=8`, `closeToggle=retainedLabels`, with the new `bench.labelVariety=true`: a wall of shadowed,
+see-through, half-opacity, red-background, background-less, underlined / struck / italic, obfuscated, CJK and accented, wrapped and aligned,
+fixed and scaled text displays, stacked and overlapping displays and name tags, a named mob, stained glass in front; `close2`), and
+`playersHurt`, `scripts/StableDiff.java`:
+
+| close-up | Vulkan stable px (1 / 2 levels) | OpenGL stable px (1 / 2 levels) |
+|---|---|---|
+| close0 (players, name tags over bodies) | 0 / 0 | 0 / 0 |
+| close1 (holograms) | 0 / 0 | 0 / 2 (2 levels, next to glint, unstable at 1 level) |
+| close2 (label variety) | 5 / 5 (obfuscated text) | 0 / 0 |
+
+The obfuscated text is vanilla's path in both settings; its random glyphs differ stably between the two settings' shots because the
+toggle changes how many frames are drawn between shots: a run toggling an unrelated switch (`fastBoatTicks`) shows 14 such pixels there.
+With `mergeDraws` off (vanilla's draw order) and 4 shots: only glint-noise pixels and the obfuscated text.
+Fallback writes and materialized draws (the patch's `labelFallback`: every other mesh written as vanilla does, so most draws mix and
+materialize; Vulkan, 8 shots): 0 stable pixels except the obfuscated text; its check: 5.6M labels, 0 mismatches.
+
+**A/B** (`-Pbench.staticSeconds=10`, switch off vs on in one build, interleaved; static / pan fps, p99 low, render thread ms per frame;
+medians):
+
+| | static off -> on | p99 low | render thread | pan off -> on | pan p99 | pan render thread |
+|---|---|---|---|---|---|---|
+| lobby, final code, 5 pairs (`s23-labels-final-lobby`) | 398.8 -> 479.1 (every pair) | 225.0 -> 259.4 | 2.43 -> 2.03 ms | 1573.4 -> 1596.7 (4 of 5) | 350.2 -> 398.0 | 0.52 -> 0.53 |
+| lobby, first code*, 5 pairs (`s23-labels-lobby`) | 404.2 -> 477.1 (every pair) | 226.9 -> 265.5 | 2.42 -> 2.03 | 1571.8 -> 1590.8 (4 of 5) | 357.5 -> 390.1 | 0.53 -> 0.53 |
+| lobby, moving players*, 3 pairs (`s23-labels-move`) | 382.9 -> 457.6 (every pair) | 218.2 -> 265.2 | 2.52 -> 2.14 | 1554.3 -> 1570.7 | 330.7 -> 374.8 | 0.53 -> 0.54 |
+| holograms only*, 3 pairs (`s23-labels-holograms`) | 1226.9 -> 1721.0 (every pair) | 658.3 -> 786.6 | 0.79 -> 0.55 | 2043.9 -> 2150.8 (every pair) | 873.9 -> 932.7 | 0.39 -> 0.36 |
+| OpenGL lobby, final code, 3 pairs (`s23-labels-final-gl`) | 329.5 -> 392.7 (every pair) | 193.6 -> 219.1 | 2.95 -> 2.47 | 1316.6 vs 1281.9 (3 of 3 lower) | 297.0 -> 324.1 | 0.74 vs 0.74 |
+| OpenGL lobby*, 3 pairs (`s23-labels-gl`; one on run 50 fps, see below) | 326.6 -> 395.0 | 195.9 -> 210.5 | 2.97 -> 2.46 | 1300.6 -> 1317.3 | 293.9 -> 325.6 | 0.74 -> 0.74 |
+| OpenGL lobby*, recheck, 2 pairs (`s23-dev/gl-recheck`) | 329.3 -> 391.7 | 187.5 -> 221.8 | 2.95 -> 2.46 | 1305.7 vs 1304.4 | 297.0 -> 320.4 | 0.74 vs 0.74 |
+| kept sort order off -> on*, 3 pairs (`s23-labels-sortreuse`) | 462.6 -> 473.4 (2 of 3) | 252.2 vs 251.9 | 2.08 -> 2.06 | 1581.1 vs 1583.7 | 391.3 vs 391.1 | 0.53 vs 0.53 |
+| entities, final code, 3 pairs (`s23-labels-final-entities`) | 344.6 vs 339.7 (2 of 3 lower) | 166.1 vs 167.9 | 2.84 vs 2.86 | 1231.6 vs 1211.2 (3 of 3 lower) | 317.5 vs 300.5 | 0.75 vs 0.77 |
+| entities*, 2 pairs (`s23-labels-entities`) | 348.7 vs 331.8 (2 of 2 lower) | 173.6 vs 162.3 | 2.78 vs 2.93 | 1241.1 vs 1217.4 (2 of 2 lower) | 309.1 vs 301.5 | 0.72 vs 0.74 |
+| mixed*, 2 pairs (`s23-labels-mixed`) | 1623.7 vs 1647.6 | 789.9 vs 804.0 | 0.54 vs 0.54 | 1666.3 vs 1679.9 | 723.9 vs 737.4 | 0.43 vs 0.43 |
+
+\* before the final fix of the arena growth and the fallback writes (below); the label path itself is the same. Earlier development
+A/B (`s23-dev/ab-v1`, 3 pairs, per-quad 32-bit indices for every draw, no MDI, no kept order): lobby static 392.6 -> 451.5.
+
+**Found by the OpenGL matrix:** one on run ran its static view at 50 fps (render thread 18.9 ms per frame, slow in proportion to the
+labels in view in its pan). Cause, reconstructed (not reproduced as such): the first arena was sized from too few live labels (64k
+vertices against the lobby's ~61k plus labels seen elsewhere), filled up, and the reset rule ("only if this frame's labels fit into half
+the arena") never let it grow, so every frame the overflowing labels were written through the generic `VertexConsumer` path, and each
+such write into a label draw materialized the whole merged draw (36k vertices) through it as well. Fixed in the commit: a full arena is
+replaced by one sized for twice the labels wanted that frame (placed or not) whenever that fits the 4M vertex cap, and the fallback
+writes go through `ExtendedVertexBuilder` as `BakedSheetGlyphM` writes (the same bytes). Checked with a temporary 4096 vertex first arena
+and the per-quad index path on OpenGL: one frame of fallback writes (548 runs), then a 131072 vertex arena holding all 940 labels; close-ups
+of that run, 8 shots: 0 stable pixels except the obfuscated text.
+
+**The entity scene** reads ~1.5% lower with the switch on in 5 of 5 pan pairs (3 of 5 static). Counters there: ~75 labels in 3 draws per
+frame at the static view, upload 5-8 us and label submits ~8 us per frame (with the timers' own cost), no fallback runs, no materialized
+draws, and almost no labels in the pan, so the label path costs less than the ~45 us of glyph writes it replaces. Not explained further
+(the entity scene's resolution is ~1.5-3% with 3 pairs, section 6.6); with both switch sides sharing every other hook, only the label
+path, its per-frame ring rotations (three `MappableRingBuffer`s once used) and its draws differ.
+
+**Mod compatibility** (exact for vanilla; switch "Retained Labels"): mods that act on the written text vertices (a `VertexConsumer`
+wrapper on the group's builder, mixins into `BakedSheetGlyph.render`, `BufferBuilder` or the upload's sort of those draws) don't see the
+vertices of retained labels; mods that replace glyphs with their own `TextRenderable`s, outline text or draw obfuscated text keep vanilla's
+path; a mod hooking `PreparedRenderType.drawFromBuffer` or `executeGroup`'s draws doesn't see label draws; shader packs that swap vanilla's
+text pipelines would not swap the `label_*` copies (as with the instanced, retained and posed pipelines).
+
+Not verified: OIT (not accepted: vanilla's path), hardware without indirect multi-draw (the per-quad index path ran on OpenGL with
+`noIndirect`: 0 stable pixels), TrueType fonts (the recorder takes any `BakedSheetGlyph`), hardware other than
+the RTX 4060 Laptop, mods.
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -1984,6 +2138,11 @@ vertex builder, so mods that act on those vertices (a `VertexConsumer` wrapper, 
 shader packs that swap vanilla's pipelines would not swap the `player_pose` copy (as with the instanced and retained pipelines).
 Posing mods (`setupAnim`, part fields, `translateAndRotate`), mods that draw inside `ModelPart.render` (detected: vanilla's path) and
 mods with their own model class or render type are unaffected.
+Twenty-third session, mod compatibility only (exact for vanilla, switch "Retained Labels"; not yet seen by the user): text submits of
+kept text are no longer written into the group's vertex builder, so mods that act on those vertices (a `VertexConsumer` wrapper, mixins
+into `BakedSheetGlyph.render` or `BufferBuilder`, or the upload's sort of those draws) or on the draw (`PreparedRenderType.drawFromBuffer`,
+`executeGroup`) don't see them; shader packs that swap vanilla's text pipelines would not swap the `label_*` copies. Mods with their own
+`TextRenderable`s, outlined or obfuscated text keep vanilla's path.
 The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
 been kept, its trade-off would have been: a mod that writes a downloaded skin's GPU texture without `DynamicTexture.upload`
 leaves stale masks (faces missing until the next upload or reload).
@@ -2118,7 +2277,12 @@ leaves stale masks (faces missing until the next upload or reload).
      index write, plus a draw per player (vanilla's count). Ideas, not measured: skip the part tree for players whose part angles
      and visibility didn't change (a still player's arms bob every frame, so only for hidden arms or spyglass holders); cover
      `entity_translucent_cull` (invisible players seen by teammates) with a culling copy of the pipeline.
-   - Retained/instanced billboard text for name tags (normal pass only; the see-through pass is sorted) and text displays. Large; see "Bigger jobs" at the end of this section.
+   - ~~Retained/instanced billboard text~~: done in the twenty-third session (`RetainedLabels`, "Bigger jobs" job 2, section 7): all
+     phases, the see-through pass and the sorted `text_polygon_offset` draws included, in vanilla's draws and order; lobby static 398.8 -> 479.1 fps (render thread 2.43 -> 2.03 ms), holograms only 1226.9 -> 1721.0. What is
+     left per label: vanilla's submission (`submitNameTag`/`submitText`: pose stack, a `Matrix4f` copy, content and submit records),
+     `SignTextCache`'s variant lookup, the draw selection and ~64 B of pose; per frame the sorted draw's centroids and sort while
+     anything moves. Standalone text display backgrounds (one quad each, `texts` phase, sorted) and outlined (glowing sign) text are
+     still written by vanilla's path.
    - Per player extraction (1.6 us) and layer submission (1.4 us) are a long tail of vanilla work.
 2. **Per entity and block entity cost in the server scene** (twelfth and seventeenth session measurements in section 7).
    The server is gone; the mixed scene (section 6.1) has the same mix and is where this continues.
@@ -2207,7 +2371,7 @@ leaves stale masks (faces missing until the next upload or reload).
    any more), the debug overlay and profiler HUD (`Gui` → `Hud`, `extractRenderState`), and
    `DebugEntryMemory` (`bytesToMebibytes`).
 
-### Bigger jobs: player bodies and billboard text (written up after the nineteenth session; job 1 done in the twenty-second)
+### Bigger jobs: player bodies and billboard text (written up after the nineteenth session; job 1 done in the twenty-second, job 2 in the twenty-third)
 Both are the large items of item 1b. The numbers come from the players scene (section 6.10, section 7 "Players and
 holograms"): lobby static ~326 fps, render thread ~2.96 ms of a ~3.1 ms frame, CPU bound (GPU 0.82 ms). Neither has been
 prototyped. The decompiled facts below come from that session's notes; check them against the 26.3 sources (section 5)
@@ -2226,8 +2390,9 @@ shorter decoded vector); and vanilla writes joining a posed draw must write its 
   only makes it cheaper for moving ones.
 - *Why the existing instancing doesn't cover it:* `PlayerModel` uses `entity_translucent`. That is a strictly ordered
   group in the translucent phase, sorted per draw on upload, so the bodies can't be merged into `InstancedParts`'
-  solid-phase batches. Moving them to the solid phase is not exact: vanilla draws the translucent text backgrounds
-  before the translucent models phase, so a player behind a hologram background is hidden by that background's depth.
+  solid-phase batches. Moving them to the solid phase is not exact (it changes their order against the other translucent
+  models; the reason first written here, that text backgrounds draw before the translucent models, is wrong, see the
+  twenty-third session: the nameTags and texts phases draw after them).
 - *Design:*
   - Keep one draw per player, in exactly the place vanilla's draw has in the group's order. vanilla already makes one
     draw per skin anyway.
@@ -2260,7 +2425,12 @@ shorter decoded vector); and vanilla writes joining a posed draw must write its 
   the cached layout, and fall back to the vanilla path otherwise. Fabric's render state data is untouched, because
   extraction and submission stay vanilla.
 
-**2. Retained or instanced billboard text** (name tags, and `center`-billboard text displays).
+**2. Retained or instanced billboard text** (name tags, and `center`-billboard text displays). Done in the twenty-third session
+(`RetainedLabels`; section 7, "Twenty-third session", which also answers the "find out first" questions and corrects the phase order
+claim of job 1). Two departures from the sketch below: labels are not instances (each vertex names its label's region in a texel buffer
+of poses, so the sorted `text_polygon_offset` draws keep vanilla's cross-label quad order and every vanilla draw stays one draw), and the
+see-through pass is covered too (its draws are kept as vanilla makes them; only their vertices are retained). The original write-up
+follows.
 - *What it would remove:* the per-frame glyph and background writes of each label. Measured: ~0.9 us per player name
   tag, ~0.67 us for an armor stand line's two name tag passes, and most of a text display line's ~1.0 us. In the lobby
   that is an upper bound of ~0.3–0.4 ms.
