@@ -2369,7 +2369,8 @@ later ones 2.5-3.2 vs 0.7-2.8 ms (the fresh 8 MB image's page faults dominate bo
 100-190 ms per callback on both paths: the gametest writes the PNG inside the callback.
 
 Still open: the stale groups with plates off (above); candidates 6 (small per-entity items) and 7 (trade-off idea) of the list above; the
-seven close-up pixels of the plate change.
+seven close-up pixels of the plate change; the plate change and the radix sort on the OpenGL backend (not measured). All are listed in
+section 8 item 2.
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
@@ -2487,7 +2488,8 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 ### Decisions and verification notes
 On 2026-10-28 the user reviewed the items below and **kept all of them** (transparent face culling, supporting
 blocks, plane culling and the mod compatibility trade-offs). On 2026-10-29 the user accepted the mod compatibility
-trade-offs of the nineteenth (both parts), twenty-first, twenty-second and twenty-third sessions as well. The notes stay as reference; the
+trade-offs of the nineteenth (both parts), twenty-first, twenty-second and twenty-third sessions as well, and those of the twenty-fifth
+session's part 2 (clouds and screenshots). The notes stay as reference; the
 `TransparentFaces` cache miss with instanced parts off was fixed in the nineteenth session (section 7).
 Twenty-first session, mod compatibility only (exact for vanilla, switch "Reuse Sort Order"): staged draws whose sorting is
 vanilla's distance sort no longer call `MeshData.SortState.writeSortedIndexBuffer` (already an `@Overwrite` since the first
@@ -2516,7 +2518,7 @@ transform), is affected. The radix sort and the direct gather of retained builds
 Twenty-fifth session, part 2, mod compatibility only (exact for vanilla: 0 px across the switches on Vulkan and OpenGL). **Accepted by the user
 on 2026-10-29:** switch "Cloud Face Texture": the clouds are drawn with the mod's copies of vanilla's cloud pipelines and a `ruthenium:`
 vertex shader, so shader packs and cloud mods that swap vanilla's cloud pipelines or `core/clouds` shader won't swap the copies (vanilla's
-texel buffer is still written, so mods that read it keep working). Switch "Fast Screenshots" (not yet reviewed by the user): full size
+texel buffer is still written, so mods that read it keep working). Switch "Fast Screenshots" (**accepted by the user on 2026-10-29**): full size
 screenshots no longer run vanilla's copy lambda in `Screenshot.takeScreenshot` (a cancelling `@Inject` at its head), so a mod injecting into
 that lambda is bypassed; downscaled shots keep it. The `InstancedModels` change touches no vanilla code.
 The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
@@ -2690,9 +2692,21 @@ leaves stale masks (faces missing until the next upload or reload).
      client tick is ~0.53 ms (not 0.93). Done: armor stand base plates as their own instances (static +12.5%), radix-sorted retained
      builds gathered into the upload; in part 2 clouds without a texel buffer (mixed static +3.4%, `queueSubmit` -21.7 us), instanced groups
      sharing ring, prepares and bindings (~0.8 us per group before; -4 us at 7 groups), row-wise screenshot readback (icon callback 24-33 ->
-     11-15 ms). Left: small per-entity items (`RenderTypes.entityCutout` memo lookups, `CrossbowItem.getChargeDuration` for empty stacks: a
-     trade-off), evicting unused `InstancedModels` groups (with plates off the server's byte-quantized yaw sync fills the 32 groups per model
-     with stale angles after ~60 s; section 7, twenty-fifth session, part 2). After the plate change the armor stands still cost ~63 us
+     11-15 ms). Left (all from the twenty-fifth session, section 7):
+     - **Bug, plates off:** evict unused `InstancedModels` groups. With `armorStandPlates=false` the server's byte-quantized yaw sync
+       fills the 32 groups per model with stale angles after ~60 s, so most stands fall back to vanilla's path (static ~1720 -> ~1460 fps;
+       the default, plates on, is unaffected). Groups are never evicted today. It also limits `ToggleAb` with plates off to ~3 static rounds.
+     - **The plate change's 7 close-up pixels** (8-55 levels against vanilla's path, depending on when the instance groups were built, not
+       on the switch's state; mechanism unknown; repro in the twenty-fifth session's entry: pixel 902,543 in `close2`, logs `2133`/`2134`).
+     - **Candidate 6:** small per-entity items, to probe before building: a front cache for `RenderTypes.entityCutout` and similar
+       `Util.memoize` lookups with `Pair` keys (exact), and skipping `CrossbowItem.getChargeDuration`'s enchantment iteration for empty stacks
+       during humanoid extraction (6.3% of render thread allocation; a trade-off: mods hooking `EnchantmentHelper.modifyCrossbowChargingTime`
+       are bypassed for empty stacks; needs the user's decision). Estimated +2-4% together.
+     - **Candidate 7 (trade-off idea only):** skip extraction and submission of armor stands whose inputs didn't change (dirty tracking;
+       not exact for mods). What it could save is below.
+     - **OpenGL not measured** for the plate change (`46a7390`) and the radix sort with direct gather (`cea8b4b`); both were measured on
+       Vulkan only (clouds, instanced groups and screenshots were checked on both).
+     After the plate change the armor stands still cost ~63 us
      extraction, ~38 us submission and ~60 us model prepare per frame; the static render thread is now ~0.39 ms per frame.
    - **Retained builds after joining or teleporting**: a section is built in one go; in the mixed scene's initial phase
      three frames build 2-2.7k block entities each in 95/38/27 ms (cold). Spreading builds over frames with a time budget
