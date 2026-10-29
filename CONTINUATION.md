@@ -2125,7 +2125,7 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 ### Decisions and verification notes
 On 2026-10-28 the user reviewed the items below and **kept all of them** (transparent face culling, supporting
 blocks, plane culling and the mod compatibility trade-offs). On 2026-10-29 the user accepted the mod compatibility
-trade-offs of the nineteenth (both parts), twenty-first and twenty-second sessions as well. The notes stay as reference; the
+trade-offs of the nineteenth (both parts), twenty-first, twenty-second and twenty-third sessions as well. The notes stay as reference; the
 `TransparentFaces` cache miss with instanced parts off was fixed in the nineteenth session (section 7).
 Twenty-first session, mod compatibility only (exact for vanilla, switch "Reuse Sort Order"): staged draws whose sorting is
 vanilla's distance sort no longer call `MeshData.SortState.writeSortedIndexBuffer` (already an `@Overwrite` since the first
@@ -2138,7 +2138,7 @@ vertex builder, so mods that act on those vertices (a `VertexConsumer` wrapper, 
 shader packs that swap vanilla's pipelines would not swap the `player_pose` copy (as with the instanced and retained pipelines).
 Posing mods (`setupAnim`, part fields, `translateAndRotate`), mods that draw inside `ModelPart.render` (detected: vanilla's path) and
 mods with their own model class or render type are unaffected.
-Twenty-third session, mod compatibility only (exact for vanilla, switch "Retained Labels"; not yet seen by the user): text submits of
+Twenty-third session, mod compatibility only (exact for vanilla, switch "Retained Labels"; accepted by the user on 2026-10-29): text submits of
 kept text are no longer written into the group's vertex builder, so mods that act on those vertices (a `VertexConsumer` wrapper, mixins
 into `BakedSheetGlyph.render` or `BufferBuilder`, or the upload's sort of those draws) or on the draw (`PreparedRenderType.drawFromBuffer`,
 `executeGroup`) don't see them; shader packs that swap vanilla's text pipelines would not swap the `label_*` copies. Mods with their own
