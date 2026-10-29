@@ -1,0 +1,846 @@
+diff --git a/src/gametest/java/net/ruthenium/gametest/FrameRecorder.java b/src/gametest/java/net/ruthenium/gametest/FrameRecorder.java
+index 061d385..d489bbe 100644
+--- a/src/gametest/java/net/ruthenium/gametest/FrameRecorder.java
++++ b/src/gametest/java/net/ruthenium/gametest/FrameRecorder.java
+@@ -126,6 +126,8 @@ public final class FrameRecorder {
+             GpuPassProbe.reset();
+         }
+         TickProbe.reset();
++        SlowFrameProbe.renderThread = Thread.currentThread();
++        SlowFrameProbe.resetPhase();
+         if (EntityCostProbe.ENABLED) {
+             EntityCostProbe.reset();
+         }
+diff --git a/src/gametest/java/net/ruthenium/gametest/LightProfiler.java b/src/gametest/java/net/ruthenium/gametest/LightProfiler.java
+index 1642da2..a75790b 100644
+--- a/src/gametest/java/net/ruthenium/gametest/LightProfiler.java
++++ b/src/gametest/java/net/ruthenium/gametest/LightProfiler.java
+@@ -29,6 +29,9 @@ import java.util.function.Supplier;
+ public final class LightProfiler implements ProfilerFiller {
+     public static final int MAX_DEPTH = Integer.parseInt(System.getProperty("ruthenium.bench.lightProfile", "0"));
+     public static final LightProfiler INSTANCE = new LightProfiler();
++    /** Loop iterations longer than this many ms log their sections (s25 slow frame dump; 0 = off) */
++    public static final double SLOW_FRAME_MS = Double.parseDouble(System.getProperty("ruthenium.bench.slowFrameMs", "0"));
++    private static final org.slf4j.Logger SLOW_LOGGER = org.slf4j.LoggerFactory.getLogger("Ruthenium Slow Frames");
+ 
+     private static final class Node {
+         final String name;
+@@ -134,6 +137,16 @@ public final class LightProfiler implements ProfilerFiller {
+         }
+     }
+ 
++    private void appendSlow(StringBuilder sb, Node node, int indent) {
++        if (!node.touched || node.pending < 200_000L) {
++            return;
++        }
++        sb.append(String.format(Locale.ROOT, "%-58s %9.3f%n", "  ".repeat(indent) + node.name, node.pending / 1.0e6));
++        for (Node child : node.order) {
++            appendSlow(sb, child, indent + 1);
++        }
++    }
++
+     private void append(StringBuilder sb, Node node, int indent) {
+         if (node.calls == 0) {
+             return;
+@@ -173,6 +186,15 @@ public final class LightProfiler implements ProfilerFiller {
+             this.root.nanos += nanos;
+             this.root.calls++;
+             this.frames++;
++            if (SLOW_FRAME_MS > 0 && nanos >= SLOW_FRAME_MS * 1.0e6) {
++                StringBuilder sb = new StringBuilder();
++                sb.append(String.format(Locale.ROOT, "Slow frame %d: %.2f ms, tick %s, %s%n", this.frames - 1, nanos / 1.0e6,
++                        this.ticked, SlowFrameProbe.frameSummary()));
++                for (Node child : this.root.order) {
++                    appendSlow(sb, child, 0);
++                }
++                SLOW_LOGGER.info("\n{}", sb);
++            }
+             if (this.ticked) {
+                 this.tickFrames++;
+                 this.root.tickNanos += nanos;
+@@ -190,6 +212,7 @@ public final class LightProfiler implements ProfilerFiller {
+             }
+         }
+         this.touched.clear();
++        SlowFrameProbe.endFrame();
+         this.ticked = false;
+         this.inTick = false;
+         this.depth = 0;
+diff --git a/src/gametest/java/net/ruthenium/gametest/MixedBenchmark.java b/src/gametest/java/net/ruthenium/gametest/MixedBenchmark.java
+index e83146c..091d525 100644
+--- a/src/gametest/java/net/ruthenium/gametest/MixedBenchmark.java
++++ b/src/gametest/java/net/ruthenium/gametest/MixedBenchmark.java
+@@ -56,6 +56,7 @@ final class MixedBenchmark {
+     private static final String[] EXTRA_SHOT_YAWS = BenchmarkClientGameTest.prop("extraShotYaws", "270").split(",");
+     private static final boolean ZOOM_SHOT = Boolean.parseBoolean(BenchmarkClientGameTest.prop("zoomShot", "false"));
+     private static final boolean CHEST_EVENTS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("chestEvents", "false"));
++    private static final boolean S25_SAME_YAW = Boolean.parseBoolean(BenchmarkClientGameTest.prop("s25SameYaw", "false"));
+     private static final boolean GLOWING_SIGNS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("glowingSigns", "false"));
+     /**
+      * Records vanilla's section profiler (the debug profiling report) during the static phase, into
+@@ -93,6 +94,9 @@ final class MixedBenchmark {
+         List<PhaseResult> results = new ArrayList<>();
+         Map<String, String> frameSeries = new HashMap<>();
+ 
++        if (Boolean.parseBoolean(BenchmarkClientGameTest.prop("s25NoClouds", "false"))) {
++            context.runOnClient(mc -> mc.options.cloudStatus().set(net.minecraft.client.CloudStatus.OFF));
++        }
+         try (TestSingleplayerContext world = context.worldBuilder().create()) {
+             TestServerContext server = world.getServer();
+             server.runCommand("time set 6000");
+@@ -143,6 +147,9 @@ final class MixedBenchmark {
+                 context.runOnClient(mc -> mc.options.fov().set(30));
+                 BenchmarkClientGameTest.setYaw(context, 270.0F);
+                 context.takeScreenshot(label + "-zoom270-" + runId);
++                // s25: armor stands magnified (small ones in rows 3 and 7)
++                BenchmarkClientGameTest.setYaw(context, 0.0F);
++                context.takeScreenshot(label + "-zoom0-" + runId);
+                 context.runOnClient(mc -> mc.options.fov().set(fov));
+             }
+             if (GLOWING_SIGNS) {
+@@ -231,7 +238,7 @@ final class MixedBenchmark {
+             for (int col = 0; col < 37; col++) {
+                 double x = -17.5 + col, z = 4.5 + 2 * row;
+                 String nbt = "{NoGravity:1b,Invulnerable:1b,Rotation:[%df,0f]%s%s}".formatted(
+-                        (col * 23) % 360, col % 3 == 0 ? ",ShowArms:1b" : "", row % 4 == 3 ? ",Small:1b" : "");
++                        S25_SAME_YAW ? 0 : (col * 23) % 360, col % 3 == 0 ? ",ShowArms:1b" : "", row % 4 == 3 ? ",Small:1b" : "");
+                 server.runCommand("summon minecraft:armor_stand %s %d %s %s".formatted(x, FLOOR, z, nbt));
+             }
+         }
+diff --git a/src/gametest/java/net/ruthenium/gametest/SlowFrameProbe.java b/src/gametest/java/net/ruthenium/gametest/SlowFrameProbe.java
+new file mode 100644
+index 0000000..5ca8411
+--- /dev/null
++++ b/src/gametest/java/net/ruthenium/gametest/SlowFrameProbe.java
+@@ -0,0 +1,124 @@
++package net.ruthenium.gametest;
++
++import java.lang.management.GarbageCollectorMXBean;
++import java.lang.management.ManagementFactory;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++
++/**
++ * s25 diagnostic: per loop iteration, the client's packet handling by packet class and the retained block entity
++ * builds, for the light profiler's slow frame dump ({@code -Pbench.slowFrameMs=N}); per phase, packet totals.
++ * Render thread only.
++ */
++public final class SlowFrameProbe {
++    public static final boolean ENABLED = LightProfiler.SLOW_FRAME_MS > 0;
++    private static final boolean HAS_MOD = net.fabricmc.loader.api.FabricLoader.getInstance().isModLoaded("ruthenium");
++    private static final List<GarbageCollectorMXBean> GC_BEANS = ManagementFactory.getGarbageCollectorMXBeans();
++    private static final Map<Class<?>, long[]> FRAME_PACKETS = new HashMap<>();
++    private static final Map<Class<?>, long[]> PHASE_PACKETS = new HashMap<>();
++    private static long frameGcs = -1;
++    private static final Map<Class<?>, long[]> FRAME_DESTROYED = new HashMap<>();
++    public static int builds;
++    public static int buildBlockEntities;
++    public static long buildNanos;
++    public static long buildMaxNanos;
++    public static int buildMaxSize;
++    public static Thread renderThread;
++
++    private SlowFrameProbe() {
++    }
++
++    public static void packet(Class<?> type, long nanos) {
++        long[] f = FRAME_PACKETS.computeIfAbsent(type, _ -> new long[2]);
++        f[0]++;
++        f[1] += nanos;
++        long[] p = PHASE_PACKETS.computeIfAbsent(type, _ -> new long[2]);
++        p[0]++;
++        p[1] += nanos;
++    }
++
++    public static void destroyed(Class<?> type, long bytes) {
++        long[] d = FRAME_DESTROYED.computeIfAbsent(type, _ -> new long[2]);
++        d[0]++;
++        d[1] += bytes;
++    }
++
++    public static void build(int blockEntities, long nanos) {
++        builds++;
++        buildBlockEntities += blockEntities;
++        buildNanos += nanos;
++        if (nanos > buildMaxNanos) {
++            buildMaxNanos = nanos;
++            buildMaxSize = blockEntities;
++        }
++    }
++
++    static String frameSummary() {
++        long[] b = HAS_MOD ? net.ruthenium.render.blockentity.RetainedBlockEntities.S25_BUILDS : new long[5];
++        builds = (int) b[0];
++        buildBlockEntities = (int) b[1];
++        buildNanos = b[2];
++        buildMaxNanos = b[3];
++        buildMaxSize = (int) b[4];
++        long gcs = gcCount();
++        StringBuilder sb = new StringBuilder();
++        sb.append("gcs +").append(frameGcs < 0 ? 0 : gcs - frameGcs);
++        sb.append(String.format(Locale.ROOT, ", retained builds %d (%d block entities, %.2f ms, max %.2f ms for %d)", builds,
++                buildBlockEntities, buildNanos / 1.0e6, buildMaxNanos / 1.0e6, buildMaxSize));
++        sb.append(", packets: ").append(top(FRAME_PACKETS, 8));
++        if (!FRAME_DESTROYED.isEmpty()) {
++            sb.append(", destroyed:");
++            FRAME_DESTROYED.forEach((type, d) -> sb.append(String.format(Locale.ROOT, " %s %d (%.1f MB)", type.getSimpleName(), d[0], d[1] / 1.0e6)));
++        }
++        return sb.toString();
++    }
++
++    static void endFrame() {
++        if (HAS_MOD) {
++            java.util.Arrays.fill(net.ruthenium.render.blockentity.RetainedBlockEntities.S25_BUILDS, 0);
++        }
++        FRAME_PACKETS.clear();
++        FRAME_DESTROYED.clear();
++        builds = 0;
++        buildBlockEntities = 0;
++        buildNanos = 0;
++        buildMaxNanos = 0;
++        buildMaxSize = 0;
++        frameGcs = gcCount();
++    }
++
++    static void resetPhase() {
++        PHASE_PACKETS.clear();
++    }
++
++    static String phaseReport() {
++        return "packets " + top(PHASE_PACKETS, 15);
++    }
++
++    private static String top(Map<Class<?>, long[]> packets, int n) {
++        List<Map.Entry<Class<?>, long[]>> entries = new ArrayList<>(packets.entrySet());
++        entries.sort((a, b) -> Long.compare(b.getValue()[1], a.getValue()[1]));
++        long total = 0, count = 0;
++        for (Map.Entry<Class<?>, long[]> e : entries) {
++            total += e.getValue()[1];
++            count += e.getValue()[0];
++        }
++        StringBuilder sb = new StringBuilder(String.format(Locale.ROOT, "%d in %.2f ms", count, total / 1.0e6));
++        for (int i = 0; i < Math.min(n, entries.size()); i++) {
++            Map.Entry<Class<?>, long[]> e = entries.get(i);
++            sb.append(String.format(Locale.ROOT, "; %s %d %.2f ms", e.getKey().getSimpleName(), e.getValue()[0], e.getValue()[1] / 1.0e6));
++        }
++        return sb.toString();
++    }
++
++    private static long gcCount() {
++        long count = 0;
++        for (GarbageCollectorMXBean bean : GC_BEANS) {
++            count += Math.max(0, bean.getCollectionCount());
++        }
++        return count;
++    }
++}
+diff --git a/src/gametest/java/net/ruthenium/gametest/mixin/DestructionQueueProbeMixin.java b/src/gametest/java/net/ruthenium/gametest/mixin/DestructionQueueProbeMixin.java
+new file mode 100644
+index 0000000..ab7c5a6
+--- /dev/null
++++ b/src/gametest/java/net/ruthenium/gametest/mixin/DestructionQueueProbeMixin.java
+@@ -0,0 +1,31 @@
++package net.ruthenium.gametest.mixin;
++
++import com.mojang.renderpearl.api.buffers.GpuBuffer;
++import com.mojang.renderpearl.backend.vulkan.DestructionQueue;
++import it.unimi.dsi.fastutil.objects.ReferenceArrayList;
++import it.unimi.dsi.fastutil.objects.ReferenceList;
++import net.ruthenium.gametest.SlowFrameProbe;
++import org.spongepowered.asm.mixin.Final;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++
++/** s25 diagnostic: what a rotation of the Vulkan destruction queue destroys (classes, buffer bytes) */
++@Mixin(DestructionQueue.class)
++public class DestructionQueueProbeMixin<T> {
++    @Shadow @Final private ReferenceList<ReferenceArrayList<T>> destructionQueues;
++    @Shadow private int currentDestructionQueueIndex;
++
++    @Inject(method = "rotate", at = @At("HEAD"))
++    private void describe(CallbackInfoReturnable<Boolean> cir) {
++        if (!SlowFrameProbe.ENABLED || Thread.currentThread() != SlowFrameProbe.renderThread) {
++            return;
++        }
++        ReferenceArrayList<T> next = this.destructionQueues.get((this.currentDestructionQueueIndex + 1) % this.destructionQueues.size());
++        for (T t : next) {
++            SlowFrameProbe.destroyed(t.getClass(), t instanceof GpuBuffer buffer ? buffer.size() : 0L);
++        }
++    }
++}
+diff --git a/src/gametest/java/net/ruthenium/gametest/mixin/PacketProcessorProbeMixin.java b/src/gametest/java/net/ruthenium/gametest/mixin/PacketProcessorProbeMixin.java
+new file mode 100644
+index 0000000..3746295
+--- /dev/null
++++ b/src/gametest/java/net/ruthenium/gametest/mixin/PacketProcessorProbeMixin.java
+@@ -0,0 +1,30 @@
++package net.ruthenium.gametest.mixin;
++
++import net.minecraft.network.protocol.Packet;
++import net.ruthenium.gametest.SlowFrameProbe;
++import org.spongepowered.asm.mixin.Final;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.Unique;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/** s25 diagnostic: times each packet handled on the render thread by packet class */
++@Mixin(targets = "net.minecraft.network.PacketProcessor$ListenerAndPacket")
++public class PacketProcessorProbeMixin {
++    @Shadow @Final private Packet<?> packet;
++    @Unique private long ruthenium$start;
++
++    @Inject(method = "handle", at = @At("HEAD"))
++    private void start(CallbackInfo ci) {
++        this.ruthenium$start = System.nanoTime();
++    }
++
++    @Inject(method = "handle", at = @At("RETURN"))
++    private void end(CallbackInfo ci) {
++        if (SlowFrameProbe.ENABLED && Thread.currentThread() == SlowFrameProbe.renderThread) {
++            SlowFrameProbe.packet(this.packet.getClass(), System.nanoTime() - this.ruthenium$start);
++        }
++    }
++}
+diff --git a/src/gametest/resources/ruthenium-gametest.mixins.json b/src/gametest/resources/ruthenium-gametest.mixins.json
+index ee9030a..8fa4685 100644
+--- a/src/gametest/resources/ruthenium-gametest.mixins.json
++++ b/src/gametest/resources/ruthenium-gametest.mixins.json
+@@ -5,6 +5,7 @@
+   "compatibilityLevel": "JAVA_25",
+   "client": [
+     "ClientMannequinMixin",
++    "DestructionQueueProbeMixin",
+     "DrawIndirectMixin",
+     "GpuPassProbeMixin",
+     "InstancedDrawProbeMixin",
+@@ -13,6 +14,7 @@
+     "LevelTickProfileMixin",
+     "MinecraftMixin",
+     "MinecraftProfilerMixin",
++    "PacketProcessorProbeMixin",
+     "ParticleEngineAccessor",
+     "RetainedDrawProbeMixin",
+     "SectionRenderDispatcherAccessor",
+diff --git a/src/main/java/net/ruthenium/mixin/render/feature/LevelRendererM.java b/src/main/java/net/ruthenium/mixin/render/feature/LevelRendererM.java
+index 35eaec7..613f372 100644
+--- a/src/main/java/net/ruthenium/mixin/render/feature/LevelRendererM.java
++++ b/src/main/java/net/ruthenium/mixin/render/feature/LevelRendererM.java
+@@ -36,19 +36,24 @@ public class LevelRendererM {
+     @Inject(method = "render", at = @At(value = "INVOKE", target = PREPARE_FRAME, shift = At.Shift.AFTER))
+     private void endWorldFeatures(CallbackInfo ci) {
+         ModelCulling.setWorldPass(false);
++        net.minecraft.util.profiling.Profiler.get().push("ruthenium:prepareDraws");
+         RetainedBlockEntities.prepareDraws();
+         InstancedModels.prepareDraws();
+         InstancedParts.upload();
+         PlayerPoseDraws.upload();
+         RetainedLabels.upload();
++        net.minecraft.util.profiling.Profiler.get().pop();
+     }
+ 
+     @Inject(method = "executeSolid", at = @At(value = "INVOKE", shift = At.Shift.AFTER,
+             target = "Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher$PreparedFrame;executeSolid(Lcom/mojang/renderpearl/api/commands/RenderPass;)V"))
+     private void drawRetainedBlockEntities(ChunkSectionsToRender chunkSectionsToRender, FeatureRenderDispatcher.PreparedFrame featureFrame,
+                                            RenderPass renderPass, CallbackInfo ci) {
++        net.minecraft.util.profiling.Profiler.get().push("ruthenium:retainedDraw");
+         RetainedBlockEntities.draw(renderPass);
++        net.minecraft.util.profiling.Profiler.get().popPush("ruthenium:instancedDraw");
+         InstancedModels.draw(renderPass);
++        net.minecraft.util.profiling.Profiler.get().pop();
+     }
+ 
+     @Inject(method = "submitBlockEntities", at = @At("HEAD"))
+diff --git a/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java b/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java
+index 319da22..aefd038 100644
+--- a/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java
++++ b/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java
+@@ -376,13 +376,61 @@ public final class InstancedModels {
+         }
+ 
+         model.setupAnim(submit.state());
+-        float[] snapshot = snapshot(model);
+-        Group group = findGroup(model, submit.state(), snapshot, pipeline, submit.renderType(), submit.uvMapping(),
+-                submit.overlayCoords(), submit.tintedColor());
++        // s25 prototype: the base plate (rotated by the armor stand's yaw) is its own instance, so the rest groups by pose alone
++        ModelPart plate = S25_PLATE && model instanceof ArmorStandModel ? model.root().getChild("base_plate") : null;
++        float plateYRot = 0.0F;
++        boolean plateVisible = false;
++        if (plate != null) {
++            plateYRot = plate.yRot;
++            plateVisible = plate.visible;
++            plate.yRot = 0.0F;
++            plate.visible = false;
++        }
++        Group group;
++        try {
++            float[] snapshot = snapshot(model);
++            group = findGroup(model, submit.state(), snapshot, pipeline, submit.renderType(), submit.uvMapping(),
++                    submit.overlayCoords(), submit.tintedColor());
++        } finally {
++            if (plate != null) {
++                plate.yRot = plateYRot;
++                plate.visible = plateVisible;
++            }
++        }
++        S25[16]++;
+         if (group == null) {
++            S25_FALLBACK++;
+             return false;
+         }
++        Group plateGroup = null;
++        if (plate != null && plateVisible && !plate.skipDraw) {
++            plateGroup = findGroup(model, submit.state(), S25_PLATE_KEY, pipeline, submit.renderType(), submit.uvMapping(),
++                    submit.overlayCoords(), submit.tintedColor());
++            if (plateGroup == null) {
++                S25_FALLBACK++;
++                return false;
++            }
++        }
++        if (plateGroup != null) {
++            // ModelPart.render: the root's and then the plate's translateAndRotate on the submit's pose; the plate's scale
++            // (0.5 on small armor stands) is in its mesh, so the instance stays a rotation
++            S25_PLATE_POSE.last().set(submit.pose());
++            model.root().translateAndRotate(S25_PLATE_POSE);
++            float xs = plate.xScale, ys = plate.yScale, zs = plate.zScale;
++            plate.xScale = plate.yScale = plate.zScale = 1.0F;
++            plate.translateAndRotate(S25_PLATE_POSE);
++            plate.xScale = xs;
++            plate.yScale = ys;
++            plate.zScale = zs;
++            if (!isOrthogonal(S25_PLATE_POSE.last().pose())) {
++                S25_FALLBACK++;
++                return false;
++            }
++        }
+         addInstance(group, submit.pose().pose(), submit.lightCoords());
++        if (plateGroup != null) {
++            addInstance(plateGroup, S25_PLATE_POSE.last().pose(), submit.lightCoords());
++        }
+         return true;
+     }
+ 
+@@ -472,7 +520,29 @@ public final class InstancedModels {
+             BufferBuilder builder = new BufferBuilder(bytes, PrimitiveTopology.QUADS, DefaultVertexFormat.ENTITY);
+             // Light comes from the instance; all faces, the pipeline culls
+             boolean written;
+-            if (key instanceof float[]) {
++            if (key == S25_PLATE_KEY) {
++                // The base plate alone in its own space
++                ModelPart plate = model.root().getChild("base_plate");
++                // storePose leaves out the scale, so it is restored separately
++                net.minecraft.client.model.geom.PartPose saved = plate.storePose();
++                float xs = plate.xScale, ys = plate.yScale, zs = plate.zScale;
++                boolean visible = plate.visible;
++                ModelCulling.endModel();
++                try {
++                    // Only the plate's scale: its offset and rotation are in the instance
++                    plate.loadPose(new net.minecraft.client.model.geom.PartPose(0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, xs, ys, zs));
++                    plate.visible = true;
++                    plate.render(new PoseStack(), uvMapping != null ? uvMapping.wrap(builder) : builder, 0, overlay, color);
++                    written = true;
++                } finally {
++                    plate.loadPose(saved);
++                    plate.xScale = xs;
++                    plate.yScale = ys;
++                    plate.zScale = zs;
++                    plate.visible = visible;
++                    ModelCulling.beginModel(renderType);
++                }
++            } else if (key instanceof float[]) {
+                 ModelCulling.endModel();
+                 try {
+                     // The parts are posed already (the snapshot was taken after setupAnim)
+@@ -510,18 +580,41 @@ public final class InstancedModels {
+     }
+ 
+     /** Uploads this frame's instances (after the features are prepared, before the passes) */
++    /** s25 diagnostic: [frames, groups, ringRotate, map+copy, prepare, tail, drawGroups, setPipeline, bindDefault, setUniformT, setIndex, textures, setVB, drawIndexed, debugGroups, instances] */
++    private static final long[] S25 = new long[17];
++    private static long S25_FALLBACK;
++    private static final boolean S25_PLATE = Boolean.getBoolean("ruthenium.s25.plate");
++    private static final Object S25_PLATE_KEY = new Object();
++    private static final PoseStack S25_PLATE_POSE = new PoseStack();
++    private static final org.slf4j.Logger S25_LOG = org.slf4j.LoggerFactory.getLogger("Ruthenium s25 instanced");
++
++    private static String s25GroupsByModel() {
++        java.util.Map<String, Integer> m = new java.util.TreeMap<>();
++        for (Group g : GROUPS) {
++            m.merge(g.model.getClass().getSimpleName() + "@" + Integer.toHexString(System.identityHashCode(g.model)), 1, Integer::sum);
++        }
++        return m.toString();
++    }
++
+     public static void prepareDraws() {
+         drawPending = false;
+         int maxIndexCount = 0;
++        long s25T = System.nanoTime();
++        S25[0]++;
+         for (Group group : GROUPS) {
++            S25[1]++;
+             group.instanceSlice = null;
+             if (group.ring != null) {
+                 // Fences the previous frame's use of the current buffer
+                 group.ring.rotate();
+             }
++            long s25N = System.nanoTime();
++            S25[2] += s25N - s25T;
++            s25T = s25N;
+             if (group.count == 0 || group.mesh == null) {
+                 continue;
+             }
++            S25[15] += group.count;
+ 
+             int size = group.count * INSTANCE_SIZE;
+             if (group.ring == null || group.ring.size() < size) {
+@@ -537,16 +630,21 @@ public final class InstancedModels {
+             try (GpuBufferSlice.MappedView view = buffer.slice(0, size).map(false, true)) {
+                 MemoryUtil.memCopy(MemoryUtil.memAddress0(group.instances), MemoryUtil.memAddress(view.data()), size);
+             }
++            long s25M = System.nanoTime();
++            S25[3] += s25M - s25T;
+             group.instanceSlice = buffer.slice(0, size);
+             group.prepared = group.renderType.prepare();
+             maxIndexCount = Math.max(maxIndexCount, group.indexCount);
+             drawPending = true;
++            s25T = System.nanoTime();
++            S25[4] += s25T - s25M;
+         }
+ 
+         if (drawPending) {
+             transform = RenderSystem.getDynamicUniforms().writeTransform(RenderSystem.getModelViewMatrixCopy());
+             RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS).getBuffer(maxIndexCount);
+         }
++        S25[5] += System.nanoTime() - s25T;
+     }
+ 
+     /** Draws the instances into the world's solid pass */
+@@ -555,8 +653,12 @@ public final class InstancedModels {
+             return;
+         }
+ 
++        long s25T = System.nanoTime();
+         renderPass.pushDebugGroup(() -> "Ruthenium instanced models");
+         RenderSystem.AutoStorageIndexBuffer indices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
++        long s25N = System.nanoTime();
++        S25[14] += s25N - s25T;
++        s25T = s25N;
+ 
+         for (Group group : GROUPS) {
+             if (group.instanceSlice == null) {
+@@ -566,17 +668,37 @@ public final class InstancedModels {
+             if (pipeline == null) {
+                 continue;
+             }
++            S25[6]++;
+             renderPass.setPipeline(pipeline);
++            s25N = System.nanoTime(); S25[7] += s25N - s25T; s25T = s25N;
+             RenderSystem.bindDefaultUniforms(renderPass);
++            s25N = System.nanoTime(); S25[8] += s25N - s25T; s25T = s25N;
+             renderPass.setUniform("DynamicTransforms", transform);
++            s25N = System.nanoTime(); S25[9] += s25N - s25T; s25T = s25N;
+             renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
++            s25N = System.nanoTime(); S25[10] += s25N - s25T; s25T = s25N;
+             for (PreparedRenderType.Texture texture : group.prepared.textures()) {
+                 renderPass.setUniform(texture.name(), texture.textureView(), texture.sampler());
+             }
++            s25N = System.nanoTime(); S25[11] += s25N - s25T; s25T = s25N;
+             renderPass.setVertexBuffer(0, group.mesh.slice());
+             renderPass.setVertexBuffer(1, group.instanceSlice);
++            s25N = System.nanoTime(); S25[12] += s25N - s25T; s25T = s25N;
+             renderPass.drawIndexed(group.indexCount, group.count, 0, 0, 0);
++            s25N = System.nanoTime(); S25[13] += s25N - s25T; s25T = s25N;
+         }
+         renderPass.popDebugGroup();
++        S25[14] += System.nanoTime() - s25T;
++        if ((S25[0] & 4095) == 0) {
++            double f = S25[0];
++            S25_LOG.info(String.format(java.util.Locale.ROOT,
++                    "per frame: groups %.2f instances %.1f | prepare us: rotate %.2f map+copy %.2f prepare %.2f tail %.2f | draw groups %.2f us: setPipeline %.2f bindDefault %.2f transforms %.2f index %.2f textures %.2f vertexBuffers %.2f drawIndexed %.2f debug+rest %.2f",
++                    S25[1] / f, S25[15] / f, S25[2] / f / 1e3, S25[3] / f / 1e3, S25[4] / f / 1e3, S25[5] / f / 1e3, S25[6] / f,
++                    S25[7] / f / 1e3, S25[8] / f / 1e3, S25[9] / f / 1e3, S25[10] / f / 1e3, S25[11] / f / 1e3, S25[12] / f / 1e3,
++                    S25[13] / f / 1e3, S25[14] / f / 1e3) + String.format(java.util.Locale.ROOT, " | posed submits %.1f, fallbacks %.1f per frame, groups by model %s",
++                    S25[16] / f, S25_FALLBACK / f, s25GroupsByModel()));
++            java.util.Arrays.fill(S25, 0);
++            S25_FALLBACK = 0;
++        }
+     }
+ }
+diff --git a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+index 7d8c429..a6a89f2 100644
+--- a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
++++ b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+@@ -211,6 +211,13 @@ public final class RetainedBlockEntities {
+     private static boolean textFiltering;
+     private static int frame;
+     private static int rebuiltThisFrame;
++    /** s25 diagnostic: builds, block entities, nanos, max nanos, size of the max */
++    public static final long[] S25_BUILDS = new long[5];
++    /** s25 diagnostic: nanos of one build's phases: checks, extract, submit, retainable, write, light, finish(build), sort, upload */
++    public static final long[] S25_PHASES = new long[16];
++    private static int s25Signs;
++    private static final int S25_REBUILD_EVERY = Integer.getInteger("ruthenium.s25.rebuildEvery", 0);
++    private static final org.slf4j.Logger S25_LOG = org.slf4j.LoggerFactory.getLogger("Ruthenium s25 builds");
+     private static double camX, camY, camZ;
+ 
+     private RetainedBlockEntities() {
+@@ -456,6 +463,9 @@ public final class RetainedBlockEntities {
+         if ((frame & 255) == 0) {
+             evict();
+         }
++        if (S25_REBUILD_EVERY > 0 && frame % S25_REBUILD_EVERY == 0) {
++            BATCHES.values().forEach(b -> b.dirty = true);
++        }
+     }
+ 
+     private static void markBatchDirty(int x, int y, int z) {
+@@ -572,7 +582,18 @@ public final class RetainedBlockEntities {
+             if (rebuiltThisFrame >= REBUILD_BUDGET) {
+                 return null;
+             }
++            long s25Start = System.nanoTime();
++            net.minecraft.util.profiling.Profiler.get().push("ruthenium:retainedBuild");
+             build(batch, mesh, blockEntities, level, dispatcher, partialTick, cameraPos, cameraState);
++            net.minecraft.util.profiling.Profiler.get().pop();
++            long s25Nanos = System.nanoTime() - s25Start;
++            S25_BUILDS[0]++;
++            S25_BUILDS[1] += blockEntities.size();
++            S25_BUILDS[2] += s25Nanos;
++            if (s25Nanos > S25_BUILDS[3]) {
++                S25_BUILDS[3] = s25Nanos;
++                S25_BUILDS[4] = blockEntities.size();
++            }
+         }
+ 
+         if (batch.memberCount == 0) {
+@@ -769,6 +790,10 @@ public final class RetainedBlockEntities {
+         int count = 0;
+         double viewDistance = -1.0;
+ 
++        java.util.Arrays.fill(S25_PHASES, 0);
++        java.util.Arrays.fill(SectionFaceGroups.S25_SORT, 0);
++        s25Signs = 0;
++        long s25T = System.nanoTime(), s25Begin = s25T;
+         try {
+             for (int i = 0; i < size; i++) {
+                 BlockEntity blockEntity = blockEntities.get(i);
+@@ -801,8 +826,16 @@ public final class RetainedBlockEntities {
+                     continue;
+                 }
+ 
++                long s25N = System.nanoTime();
++                S25_PHASES[0] += s25N - s25T;
++                s25T = s25N;
++                int s25o = blockEntity instanceof SignBlockEntity ? 9 : 0;
++                if (s25o != 0) s25Signs++;
+                 BlockEntityRenderState state = renderer.createRenderState();
+                 renderer.extractRenderState(blockEntity, state, partialTick, cameraPos, null);
++                s25N = System.nanoTime();
++                S25_PHASES[1 + s25o] += s25N - s25T;
++                s25T = s25N;
+                 boolean outlineDependent = false;
+                 if (state instanceof SignRenderState sign) {
+                     // Built without the outline of the camera's reach; frameMembers hands such signs to vanilla while it shows
+@@ -815,10 +848,16 @@ public final class RetainedBlockEntities {
+                 CAPTURE.reset();
+                 renderer.submit(state, POSE_STACK, CAPTURE, cameraState);
+                 POSE_STACK.popPose();
++                s25N = System.nanoTime();
++                S25_PHASES[2 + s25o] += s25N - s25T;
++                s25T = s25N;
+ 
+                 if (!CAPTURE.isModelsAndText() || !isRetainable(CAPTURE)) {
+                     continue;
+                 }
++                s25N = System.nanoTime();
++                S25_PHASES[3 + s25o] += s25N - s25T;
++                s25T = s25N;
+                 PartSet parts = outlineDependent ? SIGN_PARTS : PARTS;
+                 for (int m = 0; m < CAPTURE.modelCount; m++) {
+                     ModelSubmitCapture.ModelRecord model = CAPTURE.model(m);
+@@ -839,6 +878,9 @@ public final class RetainedBlockEntities {
+                     }
+                 }
+ 
++                s25N = System.nanoTime();
++                S25_PHASES[4 + s25o] += s25N - s25T;
++                s25T = s25N;
+                 viewDistance = distance;
+                 members[i] = true;
+                 count++;
+@@ -851,8 +893,12 @@ public final class RetainedBlockEntities {
+                     linked |= SectionPos.blockToSectionCoord(other.getX()) != SectionPos.blockToSectionCoord(pos.getX())
+                             || SectionPos.blockToSectionCoord(other.getZ()) != SectionPos.blockToSectionCoord(pos.getZ());
+                 }
++                s25N = System.nanoTime();
++                S25_PHASES[5 + s25o] += s25N - s25T;
++                s25T = s25N;
+             }
+         } finally {
++            S25_PHASES[0] += System.nanoTime() - s25T;
+             batch.draws = finishParts(PARTS);
+             batch.signDraws = finishParts(SIGN_PARTS);
+             batch.signs = SIGN_INDICES.isEmpty() ? NO_INTS : SIGN_INDICES.toIntArray();
+@@ -863,6 +909,18 @@ public final class RetainedBlockEntities {
+             GLYPH_TEXTS.clear();
+         }
+ 
++        long s25Total = System.nanoTime() - s25Begin;
++        if (s25Total > 3_000_000L) {
++            S25_LOG.info(String.format(java.util.Locale.ROOT, "build of %d (%d kept, %d signs): %.2f ms: checks %.2f extract %.2f submit %.2f retainable %.2f write %.2f light %.2f meshBuild %.2f sort %.2f upload %.2f | signs: extract %.2f submit %.2f retainable %.2f write %.2f light %.2f",
++                    size, count, s25Signs, s25Total / 1e6, S25_PHASES[0] / 1e6, S25_PHASES[1] / 1e6, S25_PHASES[2] / 1e6, S25_PHASES[3] / 1e6,
++                    S25_PHASES[4] / 1e6, S25_PHASES[5] / 1e6, S25_PHASES[6] / 1e6, S25_PHASES[7] / 1e6, S25_PHASES[8] / 1e6,
++                    S25_PHASES[10] / 1e6, S25_PHASES[11] / 1e6, S25_PHASES[12] / 1e6, S25_PHASES[13] / 1e6, S25_PHASES[14] / 1e6)
++                    + String.format(java.util.Locale.ROOT, " | radix checks %d sorts, %d quads, %d mismatches", SectionFaceGroups.S25_SORT_CHECKS[0],
++                    SectionFaceGroups.S25_SORT_CHECKS[1], SectionFaceGroups.S25_SORT_CHECKS[2])
++                    + String.format(java.util.Locale.ROOT, " | sort: %d quads %d planes keys %.2f sort %.2f planes %.2f gather %.2f",
++                    SectionFaceGroups.S25_SORT[0], SectionFaceGroups.S25_SORT[5], SectionFaceGroups.S25_SORT[1] / 1e6, SectionFaceGroups.S25_SORT[2] / 1e6,
++                    SectionFaceGroups.S25_SORT[3] / 1e6, SectionFaceGroups.S25_SORT[4] / 1e6));
++        }
+         rebuiltThisFrame += count;
+         batch.linked = linked;
+         batch.moving = moving != null ? moving : List.of();
+@@ -966,15 +1024,21 @@ public final class RetainedBlockEntities {
+         boolean signs = set == SIGN_PARTS;
+         for (int i = 0; i < set.count; i++) {
+             Part part = set.parts.get(i);
++            long s25A = System.nanoTime();
+             try (MeshData data = part.builder.build()) {
++                long s25B = System.nanoTime();
++                S25_PHASES[6] += s25B - s25A;
+                 if (data != null) {
+                     if (draws.length == 0) {
+                         draws = new Draw[set.count];
+                     }
+                     // Reorders the vertices before the upload
+                     SectionFaceGroups faces = !signs && part.pipeline.isCull() ? SectionFaceGroups.sortByPlanes(data) : null;
++                    long s25C = System.nanoTime();
++                    S25_PHASES[7] += s25C - s25B;
+                     GpuBuffer buffer = RenderSystem.getDevice().createBuffer(() -> "Ruthenium retained block entities",
+                             GpuBuffer.USAGE_VERTEX, data.vertexBuffer());
++                    S25_PHASES[8] += System.nanoTime() - s25C;
+                     draws[drawn++] = new Draw(part.pipeline, part.renderType, buffer, data.drawState().vertexCount() / 4 * 6, faces,
+                             signs ? part.signEnds.toIntArray() : null);
+                 }
+diff --git a/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java b/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
+index 7caa65a..93f71c9 100644
+--- a/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
++++ b/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
+@@ -66,6 +66,54 @@ public final class SectionFaceGroups {
+     private SectionFaceGroups() {
+     }
+ 
++    private static final boolean S25_RADIX = Boolean.getBoolean("ruthenium.s25.radix");
++    private static final boolean S25_RADIX_CHECK = Boolean.getBoolean("ruthenium.s25.radixCheck");
++    /** s25: radix sorts checked, quads checked, mismatching sorts */
++    public static final long[] S25_SORT_CHECKS = new long[3];
++    private static long[] s25Scratch = new long[0];
++    private static final int[] S25_COUNTS = new int[1 << 12];
++
++    /**
++     * s25 prototype: Arrays.sort's order of the keys, by a stable LSD radix sort of their group and plane bits (20..55) in three
++     * 12 bit passes. The keys come in ascending quad index order (bits 0..19), and a stable sort keeps that order among equal
++     * group and plane bits, so the result equals sorting the whole keys.
++     */
++    private static long[] s25RadixSort(long[] keys) {
++        int n = keys.length;
++        long[] a = keys;
++        long[] b = s25Scratch.length >= n ? s25Scratch : (s25Scratch = new long[n]);
++        int[] counts = S25_COUNTS;
++        for (int shift = 20; shift < 56; shift += 12) {
++            java.util.Arrays.fill(counts, 0);
++            for (int i = 0; i < n; i++) {
++                counts[(int) (a[i] >>> shift) & 0xFFF]++;
++            }
++            int sum = 0;
++            for (int d = 0; d < counts.length; d++) {
++                int c = counts[d];
++                counts[d] = sum;
++                sum += c;
++            }
++            for (int i = 0; i < n; i++) {
++                long k = a[i];
++                b[counts[(int) (k >>> shift) & 0xFFF]++] = k;
++            }
++            long[] t = a;
++            a = b;
++            b = t;
++        }
++        // Three passes: the result is in the scratch array; hand back a copy-free array of length n
++        if (a.length != n) {
++            a = java.util.Arrays.copyOf(a, n);
++        } else if (a == s25Scratch) {
++            s25Scratch = b;
++        }
++        return a;
++    }
++
++    /** s25 diagnostic: quads, keys ns, sort ns, planes ns, gather ns, plane count */
++    public static final long[] S25_SORT = new long[6];
++
+     /**
+      * Like {@link #sort}, but also orders each facing group's quads by plane, nearest to the side the group faces
+      * first, so a frame can draw only the quads whose plane the eye is in front of ({@link #visiblePlaneRuns}) instead
+@@ -93,6 +141,7 @@ public final class SectionFaceGroups {
+             return null;
+         }
+ 
++        long s25T0 = System.nanoTime();
+         long base = MemoryUtil.memAddress(vertices);
+         long[] keys = new long[quadCount];
+         float[] quadPlanes = new float[quadCount];
+@@ -142,7 +191,23 @@ public final class SectionFaceGroups {
+         if (counts[UNASSIGNED] == quadCount) {
+             return null;
+         }
+-        java.util.Arrays.sort(keys);
++        long s25T1 = System.nanoTime();
++        if (S25_RADIX) {
++            long[] reference = S25_RADIX_CHECK ? keys.clone() : null;
++            long[] sorted = s25RadixSort(keys);
++            if (reference != null) {
++                java.util.Arrays.sort(reference);
++                S25_SORT_CHECKS[0]++;
++                S25_SORT_CHECKS[1] += quadCount;
++                if (!java.util.Arrays.equals(reference, sorted)) {
++                    S25_SORT_CHECKS[2]++;
++                }
++            }
++            keys = sorted;
++        } else {
++            java.util.Arrays.sort(keys);
++        }
++        long s25T2 = System.nanoTime();
+ 
+         SectionFaceGroups groups = new SectionFaceGroups();
+         int[] starts = groups.starts;
+@@ -185,6 +250,7 @@ public final class SectionFaceGroups {
+         groups.planeTests = java.util.Arrays.copyOf(tests, planeCount);
+         groups.planeEnds = java.util.Arrays.copyOf(ends, planeCount);
+ 
++        long s25T3 = System.nanoTime();
+         long scratch = MemoryUtil.nmemAlloc((long) quadCount * quadBytes);
+         try {
+             for (int i = 0; i < quadCount; i++) {
+@@ -195,6 +261,13 @@ public final class SectionFaceGroups {
+         } finally {
+             MemoryUtil.nmemFree(scratch);
+         }
++        long s25T4 = System.nanoTime();
++        S25_SORT[0] += quadCount;
++        S25_SORT[1] += s25T1 - s25T0;
++        S25_SORT[2] += s25T2 - s25T1;
++        S25_SORT[3] += s25T3 - s25T2;
++        S25_SORT[4] += s25T4 - s25T3;
++        S25_SORT[5] += planeCount;
+         return groups;
+     }
+ 

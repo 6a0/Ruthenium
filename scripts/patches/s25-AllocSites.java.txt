@@ -1,0 +1,46 @@
+import jdk.jfr.consumer.*;
+import java.nio.file.*;
+import java.time.*;
+import java.util.*;
+
+public class AllocSites {
+    public static void main(String[] a) throws Exception {
+        LocalTime from = LocalTime.parse(a[1]), to = LocalTime.parse(a[2]);
+        int depth = a.length > 3 ? Integer.parseInt(a[3]) : 4;
+        Map<String, Long> sites = new HashMap<>();
+        Map<String, Long> classes = new HashMap<>();
+        long total = 0;
+        try (RecordingFile f = new RecordingFile(Path.of(a[0]))) {
+            while (f.hasMoreEvents()) {
+                RecordedEvent e = f.readEvent();
+                if (!e.getEventType().getName().equals("jdk.ObjectAllocationSample")) continue;
+                LocalTime t = LocalDateTime.ofInstant(e.getStartTime(), ZoneId.systemDefault()).toLocalTime();
+                if (t.isBefore(from) || !t.isBefore(to)) continue;
+                RecordedThread th = e.getThread("eventThread");
+                if (th == null || !"main".equals(th.getJavaName())) continue;
+                long w = e.getLong("weight");
+                total += w;
+                String cls = e.getClass("objectClass").getName();
+                StringBuilder sb = new StringBuilder(cls).append(" <- ");
+                RecordedStackTrace st = e.getStackTrace();
+                int n = 0;
+                if (st != null) for (RecordedFrame fr : st.getFrames()) {
+                    String tn = fr.getMethod().getType().getName();
+                    String m = tn.substring(tn.lastIndexOf('.') + 1) + "." + fr.getMethod().getName();
+                    if (n > 0) sb.append(" < ");
+                    sb.append(m);
+                    if (++n >= depth) break;
+                }
+                sites.merge(sb.toString(), w, Long::sum);
+                classes.merge(cls, w, Long::sum);
+            }
+        }
+        System.out.printf("total %.1f MB on the render thread%n", total / 1e6);
+        final long tot = total;
+        sites.entrySet().stream().sorted((x, y) -> Long.compare(y.getValue(), x.getValue())).limit(30)
+                .forEach(en -> System.out.printf("%5.1f%% %s%n", en.getValue() * 100.0 / tot, en.getKey()));
+        System.out.println("-- by class");
+        classes.entrySet().stream().sorted((x, y) -> Long.compare(y.getValue(), x.getValue())).limit(15)
+                .forEach(en -> System.out.printf("%5.1f%% %s%n", en.getValue() * 100.0 / tot, en.getKey()));
+    }
+}

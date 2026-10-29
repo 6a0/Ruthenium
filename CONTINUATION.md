@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-29 (twenty-fourth session; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-29 (twenty-fifth session; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -227,6 +227,12 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   OpenGL lobby +19%; 0 mismatches over 24M labels, 0 pixels across the switch except obfuscated text.
 - **Twenty-fourth session** (section 7): the entity scene's ~1.5% loss with Retained Labels was the texel buffer (a fixed ~20 us per
   frame in the NVIDIA driver's `vkQueueSubmit2`); poses now go through an RGBA32F texture. In-launch switch A/B (`bench.toggleField`).
+- **Twenty-fifth session** (section 7): the mixed static view is **CPU bound** (render thread ~0.6 ms vs GPU 0.36 ms), and 44% of it was the
+  armor stand chain: the base plate, which vanilla turns back by each stand's yaw, split the instanced armor stands into a group per yaw (65
+  groups for 244 instances). The plate is now an instance of its own ("Separate Armor Stand Plates", `armorStandPlates`): mixed static
+  1599 -> 1800 fps (+12.5%, every pair), render thread 0.54 -> 0.42 ms. Retained builds sort their plane keys with a radix sort and gather
+  straight into the upload (exact, no switch): warm 2048 block entity builds ~6.2 -> ~4.65 ms. Every Gradle command runs under the GPU lock
+  (`scripts/gpulock.py`, section 6.3).
 - **Next:** see section 8.
 
 ---
@@ -347,7 +353,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `render/entity/ModelGeometryCache.java` + `mixin/render/feature/ModelFeatureRendererM.java` | `@Overwrite prepareModel`. Models whose state is `Float` 0 (closed chests, …) are captured once per pose rotation + normal matrix, overlay, tint and `UvMapping` (translation removed, through a recording `VertexConsumer` on the vanilla path), then written with the translation added, the submit's light and precomputed face planes for the back-face test. **Model space entries** (`modelSpaceKey`: currently closed `BookModel.State`, openness 0, where the page flips move nothing) are captured with the identity pose and transformed per write: back faces are tested in model space (eye moved into model space when the pose's linear part is a similarity, else the transformed corners are tested), only corners of written quads are transformed, exact duplicate quads are skipped when allowed. Vertices are written as 4 longs + 1 int. Only rounding differs from vanilla; a temporary check against vanilla's model rendering of 214k book submits found no extra quads and only culled or duplicate missing ones. Max 16 entries per model; models whose capture fails are remembered |
 | `mixin/render/vertex/StagedVertexBufferM.java` + `render/vertex/ParallelUploadCopy.java` | Redirects the per-slice `ByteBuffer.put` in `StagedVertexBuffer.uploadDrawsToBuffers` to record the copies; a worker thread and the render thread copy them in 1 MB chunks, starting when the first sorted draw is decoded (sorting overlaps the copy) and joined before the staging buffer is unmapped. Each upload is its own `Job`, so a late worker can't take chunks of the next upload. 1 worker: 3.3 → 1.9 ms for 34 MB; more workers don't help (memory bandwidth) |
 | `render/blockentity/RetainedBlockEntities.java` + `ModelSubmitCapture.java` + `mixin/render/blockentity/{ClientLevelM,BlockEntityRenderDispatcherM,BlockEntityDataPacketM,RenderPipelinesM}.java` + `mixin/world/{ShulkerBoxBlockEntityM,DecoratedPotBlockEntityM}.java` + `assets/ruthenium/shaders/core/retained_entity.vsh` | Block entities at rest kept on the GPU. Candidates (exact vanilla classes and renderers): chests (lid idle incl. the other half of a double chest), shulker boxes (`CLOSED`, progress 0 at partial tick 0 and 1), decorated pots (no wobble, or game time - start > duration) and skulls (`getAnimation` constant, dragon/piglin heads not `POWERED`; heads with an owner profile never, their skin loads asynchronously). Others of these types are "moving": left out and re-checked every frame. Per render section (keyed by `SectionPos`), the real renderer runs into `ModelSubmitCapture` (a `SubmitNodeCollector` that records model submits; pots submit their 7 parts as `Model.Simple`; anything else, e.g. crumbling, rejects the block entity); a block entity is kept only if every model has no outline and a render type that maps to a retained pipeline (`entity_solid`/`_z_offset_forward`, `entity_cutout_cull`, `entity_cutout`/`_z_offset`) with `DEFAULT_TEXTURING`. Models are written with all faces, through `ModelGeometryCache` for `Float` 0 states, else with vanilla's `setupAnim` + `renderToBuffer`, relative to the section origin, into one vertex buffer per render type. `LevelExtractorM` skips members; batches are drawn after `featureFrame.executeSolid` in `LevelRendererM` with `PIPELINES` (vanilla entity pipelines + a vertex shader adding `DynamicTransforms.ModelOffset`; registered via `RenderPipelines.optionalPipelines`, so a compile failure just turns it off), the render type's textures (`prepare()` once per type per frame) and its layering transform applied to the model view (the skulls' z offset; `RenderType.state` and `RenderSetup`'s transforms are widened in the access widener). Transforms are written after `prepareFrame` with fresh vectors (`DynamicGpuDataStorageMapped` dedups against the last record by `equals`), and the sequential index buffer is grown there too (not inside a pass). Rebuilt when the section's mesh changes, when the section or a neighbour hits `LevelExtractor.setSectionDirty(IIIZ)` (block and light changes; a double chest's light can come from the neighbour), on chest, shulker box and pot `triggerEvent`, block entity data packets (pot sherds, skull profiles; they can arrive after the block), `ClientLevel.destroyBlockProgress`, and when a moving block entity comes to rest. Sections partly within the view distance (64) use the vanilla path that frame. Since the twelfth session, buffers of pipelines that cull back faces (chests, shulker boxes and pots: `entity_cutout_cull`; sign text: the polygon offset text pipelines) are sorted into `SectionFaceGroups` at build time and each frame draws only the runs of groups that can face the eye (switch `modelBackFaceCulling`; GPU 0.197 -> 0.155 ms at the server scene's static view, which was vertex bound: the same at 960x540). Budget 2048 block entities rebuilt per frame; batches unused for 1200 frames are freed. Cleared on level change, `allChanged` and resource reload. **Signs** (eighth session; `SignBlockEntity`/`HangingSignBlockEntity` with `StandingSignRenderer`/`HangingSignRenderer`, no glowing or obfuscated text on either side): `ModelSubmitCapture` records text submits; a text is retained only if vanilla would put it in the **solid** phase (`SubmitNodeCollection.canRenderAsSolid`: colour alpha 255, no background) with `POLYGON_OFFSET` and no outline, which is why the draw order can change. Its glyphs are prepared through `SignTextCache.prepareText` (as `TextFeatureRendererM` does) and written with `TextRenderable.render` into a part per render type (`renderType.format()`, POSITION_TEX_LIGHTMAP_COLOR), drawn with `TEXT`/`TEXT_GRAYSCALE`: copies of vanilla's `TEXT_POLYGON_OFFSET`/`TEXT_GRAYSCALE_POLYGON_OFFSET` (same state, built from a `Snippet` like `CompressedTerrain`) with `retained_text.vsh`. Extra rebuild triggers: `SignBlockEntity.setText` on the client (`SignBlockEntityM`; the edit screen calls it while typing), `FontSet.resetTextures` (`FontSetM`, clears everything) and a change of `Minecraft.isTextFilteringEnabled` (checked in `beginFrame`, clears) |
-| `render/blockentity/InstancedModels.java` + `assets/ruthenium/shaders/core/instanced_entity.vsh` | GPU instancing of models that only differ by pose. Two entry points: (1) the extraction (`LevelExtractorM`) calls `tryAdd(dispatcher, state, …)` after `tryExtractRenderState` for `EnchantTableRenderer`: the real renderer submits into `ModelSubmitCapture`, and a single model with a `modelSpaceKey` (closed book) becomes an instance instead of a submitted render state; (2) `ModelFeatureRendererM.prepareModel` calls `tryAdd(submit)` for models in `POSED_MODELS` (`ArmorStandModel`): after `setupAnim`, a snapshot of all parts' transforms/visibility keys the group (exact for pure `ModelPart` trees; max 32 groups per model) and the mesh is `model.root().render` with the identity pose and CPU culling off. An instance is 3 pose rows + light (52 B, `INSTANCE_FORMAT`, step rate 1). Poses must be orthogonal (rotations, or the `scale(-1,-1,1)` mirror of living entities, where vanilla's normal matrix equals the pose). Instanced copies of `entity_solid`, `entity_cutout` (per-face lighting, no cull) and `entity_cutout_cull` (`PIPELINES`). Per group (model, key, render type, UV mapping, overlay, tint): a model-space mesh from `ModelGeometryCache.writeModelSpace` (identity pose, all faces, duplicates skipped) and a `MappableRingBuffer` for the instances (rotated at the next prepare, so its fence covers the frame that used it). Drawn after `RetainedBlockEntities` with `PIPELINE` (vanilla `entity_solid` + an instanced vertex shader). Cleared with the retained chests. **Closed book fast path** (eighth session, `tryAddClosedBook`, called by `LevelExtractorM` before `tryExtractRenderState`): once one closed book went through the capture path (which records its group and renderer), vanilla `EnchantingTableBlockEntity`s with `open == oOpen == 0` and no breaking progress skip the render state and capture: the pose is built with the same JOML calls in the same order as the extraction + `EnchantTableRenderer.submit` (`translate` x3, `rotateY(-yRot)`, `rotateZ(80°)`; bit-identical, checked on 16.7M books), plus `shouldRender`'s distance test. The light and the `isValid` block state check are cached on the block entity (`EnchantingTableBlockEntityM`, `interfaces/CachedBlockEntityLight`) under a generation stamp that every `setSectionDirty` (and `clear`) bumps (`invalidateLight`); 69M cache hits matched fresh lookups |
+| `render/blockentity/InstancedModels.java` + `assets/ruthenium/shaders/core/instanced_entity.vsh` | GPU instancing of models that only differ by pose. Two entry points: (1) the extraction (`LevelExtractorM`) calls `tryAdd(dispatcher, state, …)` after `tryExtractRenderState` for `EnchantTableRenderer`: the real renderer submits into `ModelSubmitCapture`, and a single model with a `modelSpaceKey` (closed book) becomes an instance instead of a submitted render state; (2) `ModelFeatureRendererM.prepareModel` calls `tryAdd(submit)` for models in `POSED_MODELS` (`ArmorStandModel`): after `setupAnim`, a snapshot of all parts' transforms/visibility keys the group (exact for pure `ModelPart` trees; max 32 groups per model) and the mesh is `model.root().render` with the identity pose and CPU culling off. An instance is 3 pose rows + light (52 B, `INSTANCE_FORMAT`, step rate 1). Poses must be orthogonal (rotations, or the `scale(-1,-1,1)` mirror of living entities, where vanilla's normal matrix equals the pose). Instanced copies of `entity_solid`, `entity_cutout` (per-face lighting, no cull) and `entity_cutout_cull` (`PIPELINES`). Per group (model, key, render type, UV mapping, overlay, tint): a model-space mesh from `ModelGeometryCache.writeModelSpace` (identity pose, all faces, duplicates skipped) and a `MappableRingBuffer` for the instances (rotated at the next prepare, so its fence covers the frame that used it). Drawn after `RetainedBlockEntities` with `PIPELINE` (vanilla `entity_solid` + an instanced vertex shader). Cleared with the retained chests. **Closed book fast path** (eighth session, `tryAddClosedBook`, called by `LevelExtractorM` before `tryExtractRenderState`): once one closed book went through the capture path (which records its group and renderer), vanilla `EnchantingTableBlockEntity`s with `open == oOpen == 0` and no breaking progress skip the render state and capture: the pose is built with the same JOML calls in the same order as the extraction + `EnchantTableRenderer.submit` (`translate` x3, `rotateY(-yRot)`, `rotateZ(80°)`; bit-identical, checked on 16.7M books), plus `shouldRender`'s distance test. The light and the `isValid` block state check are cached on the block entity (`EnchantingTableBlockEntityM`, `interfaces/CachedBlockEntityLight`) under a generation stamp that every `setSectionDirty` (and `clear`) bumps (`invalidateLight`); 69M cache hits matched fresh lookups. **Base plates** (twenty-fifth session, switch `armorStandPlates`): the plate, which `setupAnim` turns back by the stand's yaw, is hidden and unturned while the body's snapshot and mesh are taken and drawn from a per-model plate group (`PLATE_KEY`: the plate alone at its scale; instance = submit pose x root and plate `translateAndRotate` without the scale), so stands posed alike share their groups whatever their yaw; read through `ArmorStandModelAccessor`; groups are dropped when the switch changes |
 | `render/entity/InstancedParts.java` + `mixin/render/entity/model/ModelPartM.java` + `mixin/render/feature/PreparedGroupM.java` + `interfaces/InstancedPartHolder.java` + `assets/ruthenium/shaders/core/instanced_part.vsh` | **Instanced parts of posed models** (eleventh session, switch `instancedParts`, "Instanced Mob Parts"). While the world's features are prepared (`ModelCulling.isWorldPass`), a `FeatureRenderDispatcher$PreparedGroup` that isn't strictly ordered activates it (`PreparedGroupM` on `prepare` HEAD/RETURN), and `ModelFeatureRendererM.prepareModel` turns it on around vanilla's `setupAnim` + `renderToBuffer` for submits without a sheeted decal whose render type uses `ENTITY_SOLID`, `ENTITY_CUTOUT` or `ENTITY_CUTOUT_CULL` (no blending, so always the solid phase). The `ModelPart.compile` overwrite then adds one instance per part instead of writing its cubes: the pose's rows, the normal matrix's rows, light + overlay (RGBA16_SINT) and color (96 B, `INSTANCE_FORMAT`). Meshes (`PartBatch`, per render type and UV mapping; since the fourteenth session each `ModelPart` keeps them in `PartBatches`, arrays of the batches and of their render type and UV mapping references, compared without loading the batches: villager parts have ~28) are the part's cubes written once with the identity pose, all faces; max 4096, dropped by `clear()` (resource reload, switch) through a generation stamp. At the group's `prepare` RETURN its batches' instances are copied into the frame's buffer as one draw per batch (render type prepared once per frame); the draws run at `PreparedGroup.execute` RETURN, i.e. right after that group's own draws, so they keep their place among submit orders (`order(n)`: villager clothing is the same model one order later and relies on equal depth) and phases. Instanced copies of the three pipelines with `instanced_part.vsh`, uploaded through a `MappableRingBuffer` after `prepareFrame`. **Positions are bit-identical to vanilla's:** the shader computes `m00*x + (m10*y + (m20*z + m30))` with `precise` (no contraction; `GL_ARB_gpu_shader5`), the same operations in the same order as JOML 1.10.9's `transformPosition` (no `Math.fma` unless `joml.useMathFma`). A first version with `dot()` broke the equal-depth ties of horse markings, which are drawn by vanilla (translucent) on the instanced body. Normals are transformed in full precision and normalized (vanilla quantizes them), which changes ≤5 pixels at threshold 1 per frozen close-up. **Thirteenth session:** (1) `armor_cutout_no_cull` (armor, plain trims with their UV mapping, saddles, horse armor) gets an instanced copy (`NO_OVERLAY`, no `SAMPLER1`, per face lighting, no cull; switch `instancedArmor`); decal trims (none in vanilla) stay vanilla and test depth for equality against it. (2) **Items** (`addItem`, from `ItemFeatureRendererM`'s `prepareSubmit` overwrite; switch `instancedItems`): an item submit without foil whose quads are all of one `item_cutout` type becomes one instance of an item-space mesh per quad list (vanilla's lists belong to baked models; `IdentityHashMap`) and tint colors, with the quads' tints in the mesh color and their light emission in UV2, raised to the instance's light in `instanced_item.vsh` as `LightCoordsUtil.lightCoordsWithEmission` does (vanilla's `core/item` fragment shader). Lists of other types are remembered as not instanced. (3) **Entity block models** (`addBlockMesh`, from `ExtendedBlockModelFeatureRendererM`, a `@Pseudo` redirect of the `Mesh.outputTo` call in Indigo's `ExtendedBlockModelFeatureRenderer.buildGroup`; switch `instancedBlockModels`): per cached mesh (stable since `BlockModelRenderStateM`), render type of its first layer and tint colors, a mesh with the colors, normals (vertex or face) and light Indigo's `bufferQuad` writes; each vertex's light is raised to the submit's in the shader as Indigo's `minLightmap` (`ExtraLightCoordsUtil.smoothMax`) does, emissive quads at full brightness. `item_cutout` types use `ITEM_CUTOUT_MESH`, `entity_solid` and `entity_solid_z_offset_forward` (item frames submit their frame with it) `SOLID_MESH`, both with the `MESH_LIGHT` shader variant. All of these were pixel-identical to vanilla's path in frozen close-ups with the switch flipped, on the Vulkan and OpenGL backends |
 | `render/entity/ReusedRenderStates.java` + `mixin/render/entity/{LevelExtractorEntityM,EntityRendererAccessor}.java` | `@Overwrite LevelExtractor.extractEntity`: vanilla `ArmorStand`s with `ArmorStandRenderer` are extracted into render states kept from the previous frame (a pool reset at the head of `extractVisibleEntities`) instead of `createRenderState(entity, partialTicks)`: `extractRenderState` + `finalizeRenderState` (invoker) into the reused state. Vanilla's call took ~1.05 us per armor stand, the reused one ~0.27 us: allocating the state and extracting into it in the same compiled method made the extraction ~5x slower (each step alone, or extracting into an existing state, was 0.07-0.25 us; not JIT tiers, deopts, stack banging or a mixin, all checked). States are submitted and cleared in the frame they are extracted in (`LevelRenderer.submitFeatures`). The extraction overwrites every field except `nameTagAttachment`, `distanceToCameraSq`/`nameTag`/`scoreText` (only with a camera) and `ArmedEntityRenderState`'s arm poses (hidden by the armor stand's own `Rotations` fields, only set by humanoid mobs), which are reset to a new state's values. A temporary reflective deep compare of 2.4M reused states against fresh vanilla ones (139 fields each, incl. the item states) found no difference. Exceptions fall back to vanilla's path (which reports them). Cleared on `setLevel`/`allChanged`. Switch: "Reuse Entity Render States", `-Druthenium.reuseEntityStates` |
 | `render/entity/BlockModelMeshCache.java` + `mixin/render/entity/BlockStateModelWrapperM.java` | The Fabric Renderer API overwrites `BlockStateModelWrapper.update` to emit the model's quads into a new `MutableMesh` on every call, i.e. per item frame, block display, minecart block and enderman's block per frame (decoding and encoding every baked quad; ~2 us per item frame). A `@WrapOperation` on its `emitQuads` call (priority 1100, after Fabric's overwrite; `require = 0`, so without the overwrite nothing changes) looks the output up by the model's geometry key (`FabricBlockStateModel.createGeometryKey` with a random of its own seeded like `update`'s, `@Local(argsOnly)` seed; by FRAPI's contract the key determines `emitQuads`' output for a cull test that culls nothing, which `update` passes), wrapped in `OpaqueKey` when Fabric's default `emitQuads` forces leaves to the solid layer (`ModelBlockRenderer.forceOpaque` with the cutout leaves option). A miss emits into a private `MutableMesh` and stores `immutableCopy()`. Since the thirteenth session the render state keeps the cached mesh itself (`BlockModelRenderStateM`, `interfaces/CachedMeshRenderState`): its own mesh stays empty, so the Fabric Renderer API's submit (which copies the render state's mesh into a new immutable one per submit) does nothing, and `BlockModelRenderStateM`'s `submitModel` HEAD inject (priority 1100) submits the cached mesh as the FRAPI one would, with no copy (item frame extraction 1.17 -> 0.42 us, allocation 935 -> 536 MB/s in the entity scene). Models without a key (custom models) keep Fabric's path. Render thread only, max 4096 entries, cleared on resource reload and when toggled. Switch `blockModelMeshCache`. A temporary check compared 1.5M hits against a fresh emission word for word: identical. **Mixin pitfall seen here:** `BlockAndTintGetter` is `net.minecraft.client.renderer.block.BlockAndTintGetter` in 26.3; with the wrong package in the target the `require = 0` injector silently did nothing |
@@ -369,7 +375,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/world/AbstractBoatM.java` | **Boat ticks** (sixteenth session, switch `fastBoatTicks`, "Fast Boat Ticks"). In `getGroundFriction`, full cube collision shapes (`== Shapes.block()`) skip the moved shape and the `joinIsNotEmpty` with the bottom slice: separated by more than 1e-6 on an axis = false (vanilla's own early out uses 1e-7), overlapping by more than 1e-6 on all axes = true, anything else vanilla's join (redirects on `VoxelShape.move` and `Shapes.joinIsNotEmpty` there). The push search in `tick` (`getEntities(this, box, EntitySelector.pushableBy(this))`, which on the client only accepts local players) asks `ClientLevel.getPushableEntities` on the client, as vanilla's own living entity push does. Checked: 200k cube joins and 6.1k pushes equal to vanilla's |
 | `world/SupportingBlocks.java` + `mixin/world/{EntitySupportingBlockM,BlockChangeTrackingM,LevelChunkSectionM}.java` + `interfaces/SectionChangeStamp` | **Supporting block kept for resting entities** (sixteenth session, switch `fastSupportingBlocks`, "Keep Supporting Blocks"). `Entity.checkSupportingBlock`'s `findSupportingBlock` (a `BlockCollisions` sweep of a thin slab under the entity: orbs every tick, items every fourth, entities moved by server packets) is answered from the last result on the client while the slab, the entity's position and the chunk sections of the swept region (box +-1 block, at most 8 sections, the same objects) have the same change stamp. Each `LevelChunkSection` has a stamp, bumped by `LevelChunk.setBlockState` on client levels and for every section by `LevelChunk.replaceWithPacketData` (chunk data is read into the existing sections). Results are kept only when every block of the region has a collision shape that is neither dynamic (`Block.hasDynamicShape`) nor context dependent (no class below `BlockBehaviour` declares `getCollisionShape(BlockState, BlockGetter, BlockPos, CollisionContext)`), so the entity's collision context can't change it. A first version with one level-wide stamp hit ~65% (the integrated server sends ~4.5 block updates per second: grass and dirt random ticks); per section 99.5% at rest. The kept state lives in an object created on an entity's first search (`SupportingBlocks.Kept`; 13 fields on every `Entity` made the server scene's armor stand ticks ~0.02 ms slower per tick). Checked: 220k kept answers equal to a fresh search (gravity scene, with and without AI) |
 | `world/EnchantingTableBatch.java` + `LevelM`, `RebindableTickingBlockEntityWrapperM`, `BoundTickingBlockEntityM` (`ParkableTicker.ruthenium$tryBatch`, `BlockEntityTicker.ruthenium$getValidState`) | **Enchanting tables ticked in one loop** (seventeenth session, switch `batchTableTicks`, "Fast Enchanting Table Ticks"; needs parking and `cacheTickerStates`). On the client, `LevelM`'s loop parks the wrapper of a vanilla `EnchantingTableBlockEntity` whose bound ticker has a validated state of the exact `EnchantingTableBlock` class into the level's batch (arrays of wrappers, tables and packed positions, in joining order). After the list, the batch runs vanilla's guards (removed: the wrapper leaves; `shouldTickBlocksAt`, `hasLevel`, the world border) and, unless a player passing `EntitySelector.NO_SPECTATORS` (positions read once per tick) is within the 3 blocks `bookAnimationTick` searches, a statement for statement copy of its branch without a player; otherwise vanilla's `bookAnimationTick`. A wrapper leaves on rebind or unpark (`remove(slot)`; slots move as the batch compacts). Order among tables only matters for their shared unseeded random source, used only with a player near. Mod compatibility: mixins into `bookAnimationTick` don't run for tables without a player near |
-| `SectionFaceGroups.sortByPlanes`/`visiblePlaneRuns` (used by `RetainedBlockEntities`) | Retained batches are sorted by facing and, within a facing group, by plane (nearest to the faced side first; stable, so equal plane quads keep their order); each frame draws the prefix of each group whose planes (with the 0.25 margin) the eye can be in front of, merged into at most 7 runs. Quads within a 1e-5 tilt of an axis and 1e-4 blocks of a plane count as in it (rotated models), with their backmost coordinate as the plane. Terrain keeps `sort` and its packed per-group draws |
+| `SectionFaceGroups.sortByPlanes`/`visiblePlaneRuns` (used by `RetainedBlockEntities`) | Retained batches are sorted by facing and, within a facing group, by plane (nearest to the faced side first; stable, so equal plane quads keep their order); each frame draws the prefix of each group whose planes (with the 0.25 margin) the eye can be in front of, merged into at most 7 runs. Quads within a 1e-5 tilt of an axis and 1e-4 blocks of a plane count as in it (rotated models), with their backmost coordinate as the plane. Terrain keeps `sort` and its packed per-group draws. Since the twenty-fifth session the keys are sorted with a stable LSD radix sort of bits 20..55 (the same order as `Arrays.sort`: keys arrive in quad order) and the quads are gathered straight into the buffer that is uploaded (`sortByPlanes(mesh, target)`) |
 | `RetainedBlockEntities` (seventeenth session) | Also retains lecterns, bells (not while `shaking`; `BellBlockEntityM` marks the section dirty on `triggerEvent`) and copper golem statues. **Change checks** (switch `retainedChangeChecks`): `LevelExtractor.setSectionDirty` now calls `markBlocksChanged`; a batch remembers its block entity objects and block states and its members' light (`LightCoordsUtil.getLightCoords` at the block entity and, for double chests, at the other half), and a block or light change, or a new compile of the section, rebuilds it only if any of these differ (`isUnchanged`). Neighbours are only checked when they hold a double chest whose other half is in another section (`linked`). Block entity events still force rebuilds (`markDirty`, with neighbours). Batches are freed after 1200 frames *and* 30 s unused, or 1200 frames when more than 64 blocks beyond their view distance. Mod compatibility: a mod changing what a retained block entity renders without a block entity event, block state or light change (e.g. a field set directly on the client) leaves the batch stale until the next rebuild |
 | `InstancedModels.tryAddClosedBook` | The closed book's constant 80 degree tilt: sine and cosine computed once with JOML's functions and applied with `rotateTowardsXY`, which `rotateZ` calls on a matrix that isn't a pure translation (pure translations keep `rotateZ`); bit-identical |
 | `render/text/EntityTextCache.java` + `mixin/render/text/{EntityRendererNameTagM,EntityNameTagHolderM,MutableComponentM,SubmitNodeCollectionNameTagM}.java` + `interfaces/{KeptNameTags,NameTagLayout}` | **Name tag text kept** (nineteenth session, switch `nameTagTextCache`, "Keep Name Tag Text"). `EntityRenderer.extractNameTags` builds the name tag (`getNameTag` -> `getDisplayName`: team formatting, hover event, insertion) and the below-name line anew every frame; a `@WrapOperation` on both replaces a result that is `equals` (deep) to the component the entity showed last (`Entity` fields) by that kept component. `SubmitNodeCollection.submitNameTag` then measures it (`Font.width`) and orders it (`getVisualOrderText`: ICU bidi and Arabic shaping); the width is kept on the `MutableComponent` (per font, language and `SignTextCache` generation), vanilla's own visual order cache applies to the kept instance, and the visual order is wrapped once in a `SignTextCache` line (`NAME_TAG`), so `TextFeatureRendererM` reuses the prepared glyphs of both submits. Equal components lay out the same; obfuscated text is still laid out every time |
@@ -480,6 +486,17 @@ Default `dark_red` text color and no glow otherwise, so default numbers stay com
   It was used to bisect the startup crashes.
 
 ### 6.3 Running it
+**Every Gradle command, compiles included, runs under the machine-wide GPU lock** (`scripts/gpulock.py`, since `681f1f2`), so only one
+Minecraft instance runs at a time, across worktrees and agents:
+```bash
+python scripts/gpulock.py ./gradlew --console=plain benchRuthenium -Pbench.scene=mixed
+python scripts/gpulock.py sh scripts/run-ab.sh 3 mixed-dev/x "benchRuthenium" "-Pvm.x=true" ""
+```
+It holds an OS file lock in `%LOCALAPPDATA%/ruthenium-gpu.lock` (released by the OS however the holder exits; holder details in
+`ruthenium-gpu.lock.info`), waits until no Minecraft JVM is running, then runs the command with `RUTHENIUM_GPU_LOCK` set. Bench tasks refuse
+to start without it; `-PbenchNoLock` overrides (don't use it while anyone else may run the game). Never start two Gradle commands at once,
+and don't run Gradle in the background while running another; the idle Gradle daemon is fine. The plain commands below are shown without
+the wrapper for brevity.
 ```bash
 ./gradlew benchRuthenium          # this mod on vanilla's Vulkan backend (label ruthenium)
 ./gradlew benchVanillaVulkan      # baselines: benchVanillaGl, benchVanillaVulkan, benchSodium (default backend = GL)
@@ -513,6 +530,10 @@ run 3×, summarize, diff the static and yaw 270 screenshots, then commit with th
 `staticYaw=270`, `sectionProfile` or temporary instrumentation go to `results/heavy270/` or `results/sectprof/`.
 
 ### 6.4 Gotchas
+- **Run everything through `scripts/gpulock.py`** (section 6.3). A second game instance (another worktree, another agent, a leftover
+  `KnotClient`) changes GPU bound numbers and can collide on the world's `session.lock`; the lock also waits for leftover game JVMs.
+- **Move the results of plain runs out of `results/` before `run-ab.sh`**: it moves every `ruthenium-*` result it finds into the side it
+  just ran (twenty-fifth session: three close-up runs landed in an A/B's side a and had to be moved out by timestamp).
 - **A rejected or interrupted Bash command can leave its Gradle build running** (the daemon keeps going). Check
   `jps -l` for a `KnotClient` before starting runs; a running one holds the terrain world's `session.lock`.
 - **Don't compile or run anything CPU-heavy while a benchmark matrix is running.** Each bench task also rebuilds
@@ -600,6 +621,16 @@ table books (red specks in the chest cube).
   measured 3.2% in the A/B. Rank with JFR, decide with A/Bs.
 - A foreground Bash command running longer than ~3 minutes is moved to the background; wait with a loop of at most
   ~170 s per call, or with the background task's notification.
+
+**Twenty-fifth session tools:**
+- The mixed scene has `bench.toggleField` (`ToggleAb` after the particle phase, once the particles are gone; resets to the static yaw,
+  pans from yaw 0) and frozen close-ups of the armor stands (`bench.closeShots`, `bench.closeToggle`, which there takes comma-separated
+  fields, e.g. `instancedModels,instancedParts` for vanilla's path; clouds off; 13 extra stands summoned for them). Neither changes the
+  measured phases.
+- `scripts/patches/s25-diagnostics.patch` (against `681f1f2`): `-Pbench.slowFrameMs=N` logs every frame slower than N ms with its profiler
+  tree (`SlowFrameProbe`), per-packet timing, destroy queue contents, retained build timers per phase, `InstancedModels` counters,
+  `-Pjvm.ruthenium.s25.rebuildEvery=N` (warm retained builds). `scripts/patches/s25-radix-check.patch`: the radix sort's check mode.
+- **The mixed static view is CPU bound** (unlike the old server scene): CPU savings show in its fps.
 
 **Twenty-fourth session tools:**
 - **In-launch A/B of a switch** (`ToggleAb`): `-Pbench.toggleField=<Config field>` (entity and players scenes) adds, after the scene's
@@ -2098,6 +2129,158 @@ tick 2.796 vs 2.809 ms): the label upload (one `writeToTexture` and two ring map
 the ~15 us of glyph writes saved there. Skipping the pose upload when the rows are bit-identical to last frame's would only help static
 views; not done. The submit split and `ToggleAb` stay in the harness.
 
+### Twenty-fifth session (2026-10-29)
+The mixed scene, two agents on `26.3` (main tree), one after the other, every Gradle command under the GPU lock (`scripts/gpulock.py`,
+section 6.3). First an investigation (nothing committed; report `results/s25-dev/ideas-report.md`, results `results/s25-dev/`, logs
+`build/bench-logs/2073-2101`, patches `scripts/patches/s25-*`), then the builder: its candidates 1 and 3. Commits `46a7390` and `cea8b4b`.
+
+**Investigation: where the mixed static frame goes.** The mixed static view is **CPU bound**, unlike the old server scene (yaw 0: GPU
+0.358 ms vs render thread ~0.6 ms; yaw 270: 0.425 vs 0.644), so CPU savings show in fps. Its client tick is ~0.53 ms (the 0.93 ms in
+section 8 item 2 was the server scene). Light profiler at depth 8, confirmed by the entity cost probe and counters:
+- Armor stand chain ~0.27 ms (44%): extraction 0.082 ms (probe 261 ns x 242), `submitFeatures` 0.032, `prepare/Entity Model` 0.088 (396 ns
+  x 242), `InstancedModels.prepareDraws` 0.028 (ring map and copy 16 us, `RenderType.prepare` 9, rotate 2.6), `InstancedModels.draw`
+  0.051 (65 draws: `setPipeline` 18 us, `drawIndexed` 15, vertex buffers 7, textures 4.5, default uniforms 4).
+- The cause of the instanced part: `ArmorStandModel.setupAnim` sets `basePlate.yRot = -yRot`, so each distinct stand yaw (37 in the scene)
+  gave a different part snapshot and its own group: 65 groups per frame for 244 instances, 22 of 242 visible stands over the 32 groups
+  per model cap (vanilla's path), ~1.4 us of CPU per group per frame.
+- Other: `queueSubmit` 0.057 ms (clouds' texel buffer, below), `awaitGpu` 0.039, `present` 0.031, GUI 0.027, `setupFrameGraph` 0.028,
+  sky 0.015, retained draw recording 0.011, block entity extraction 0.012.
+- Yaw 270: block entities 0.122 ms, mostly ~3.6k closed books at ~30 ns; still CPU bound. GPU by pass: yaw 0 retained 0.071 / instanced
+  0.067 / solid terrain 0.089 ms of 0.358; yaw 270 0.137 / 0.042 / 0.110 of 0.425; not the limiter.
+- Tick 0.53-0.54 ms: entities 0.22 (armor stands 114 us, the local player 104-113 us, mostly cold once-per-tick code), table batch 0.08,
+  blocks atlas animation 134 us, animateTick ~0.12. Tick frames take 1.24-1.46 ms (0.55-0.62 without) and set the p99; a long tail.
+- Allocation (JFR, render thread ~310 MB/s, ~0.19 MB/frame): armor stand submit pose copies 20.5% (`Matrix4f` 11.3, `Matrix3f` 6.0, `Pose`
+  3.2), `ModelFeatureRenderer$Submit` 6.7, `InstancedModels.prepareDraws` per-group objects ~16, `CrossbowItem.getChargeDuration`'s
+  enchantment iterator for empty stacks 6.3, `VkWriteDescriptorSet` 5.2-5.9, `DynamicGpuData$ChunkSectionInfo` 5.8, `RenderTypes.entityCutout`
+  memo 7.8, `BlockPos.containing` in `getPackedLightCoords` 2.9 (`scripts/patches/s25-AllocSites.java.txt` lists samples by site).
+
+**Join and teleport frames** (`-Pbench.slowFrameMs=8` from the diagnostics patch: every frame over 8 ms logged with its profiler tree):
+- Frame 0 (108-155 ms): `submit/destroyQueue` 20-41 ms is vanilla's new-world auto icon (`GameRenderer.takeAutoScreenshot` ->
+  `Screenshot.takeScreenshot`: a per-pixel `getInt`/`setPixelABGR` loop over 2M pixels, run as a destroy-queue callback; confirmed by a destroy
+  queue probe and JFR); the first (cold) extraction of 296 armor stands 12-13 ms, their cold model prepare 12-17 ms, chat 2-3 ms.
+- The next tick: packets 44-54 ms (19 `SectionBlocksUpdate` 33-38 ms, 1040 `BlockEntityData` 5-8 ms): the scene's construction; tick 16 ms cold.
+- Frame 1: `runLightUpdates` 13.6 ms, `sectionUpdates` 7 ms (vanilla). Later: `updateSectionOcclusion` 8 ms (vanilla) and GC frames.
+- Frames 3-6: retained builds, 2-3 per frame, ~170 ms in all, ~85% JIT-cold (the first 520 block entity build 55-63 ms). Warm, the same 8192
+  block entities take ~25 ms. A warm 2048 build (1792 chests + 256 signs) 6.6 ms: `SectionFaceGroups.sortByPlanes` 3.3 (keys 0.58,
+  `Arrays.sort` 1.6, planes 0.22, gather 0.97), upload 1.05, vertex writes 0.77, checks 0.37, extract 0.24, submit 0.30, retainable 0.28,
+  light 0.14. The pan's first view of a section: an 11 ms build.
+
+**Ranked candidates** (the report has designs and traps):
+1. Armor stand base plate as its own instance: done (below).
+2. Clouds without a texel buffer: vanilla's `CloudRenderer` binds its faces as a texel buffer, which costs ~20 us per frame in `vkQueueSubmit2`
+   (twenty-fourth session) plus a `VkBufferView` per draw. Clouds off vs on (single runs, not interleaved): `queueSubmit` 0.0566 -> 0.0273 ms,
+   frame 0.608 -> 0.563 ms. Exact design: the same 3 bytes per face in an integer R8 2D texture read with `texelFetch`, written when the mesh
+   rebuilds; needs copies of `CLOUDS`, `FLAT_CLOUDS` and the two OIT sets. Expected ~4-5% mixed static after candidate 1. Not done.
+3. Radix sort in `SectionFaceGroups.sortByPlanes`: done (below).
+4. `InstancedModels` per-group overhead (~1.4 us per group per frame; ~15 us after candidate 1): one shared instance ring, `prepare()` cached
+   per render type, no state rebinding between groups sharing a pipeline, or one indirect multi-draw per pipeline. ~2% after 1. Not done.
+5. Screenshot readback (`Screenshot.takeScreenshot`, 20-40 ms per F2 and on a new world's first join): an exact bulk row copy, ~1-3 ms. Not done.
+6. Small per-entity items, not measured individually: a front cache for `RenderTypes.entityCutout`'s memoize lookups; skipping the empty-stack
+   enchantment iteration in `CrossbowItem.getChargeDuration` (trade-off: bypasses mods hooking `modifyCrossbowChargingTime` for empty stacks).
+7. Trade-off idea only: skip extraction and submission of unchanged armor stands (not exact for mods).
+
+**Dead ends:** retained GPU work and hidden sign text (CPU bound, nothing to gain); closed books on the GPU (not exact: JOML's `rotateY` uses
+`Math.sin`, and reusing rotations across tables works only because the bench places them in one tick); the tick (long tail); vanilla's join
+work (packets, light, occlusion, scene construction; builds are ~85% JIT-cold; spreading builds was binned in the nineteenth session);
+particles (the 500k packet 94 ms + 22 ms drain; lowering the cap changes vanilla's acceptance odds); the frame series' block entity column
+reads 0 in the mixed scene (everything is retained or instanced; harmless).
+
+**New diagnostics** (all in `scripts/patches/s25-diagnostics.patch`, not committed): `-Pbench.slowFrameMs=N` (`SlowFrameProbe`: each slower
+frame's profiler tree), per-packet timing, destroy queue contents, retained build timers per phase (logged for builds over 3 ms), profiler
+sections `ruthenium:retainedBuild`/`prepareDraws`/`retainedDraw`/`instancedDraw`, `InstancedModels` counters every 4096 frames,
+`-Pjvm.ruthenium.s25.rebuildEvery=N` (every retained batch rebuilt every N frames: warm build times), mixed scene options `bench.s25NoClouds`,
+`bench.s25SameYaw` and a `zoom0` shot with `zoomShot`.
+
+**Armor stand base plate as its own instance** (`46a7390`, switch `armorStandPlates`, "Separate Armor Stand Plates", needs Instanced Models).
+`ArmorStandModel.setupAnim` turns the plate back by the stand's yaw (it keeps its world orientation). With the switch on,
+`InstancedModels.tryAdd(Submit)` hides and unturns the plate (`visible`, `yRot`) while the body's snapshot is taken and its group found
+(its mesh is then the body without the plate), restores them, and adds the plate to a per-model plate group (`PLATE_KEY`): its mesh is the
+plate alone at its scale (offset and rotation zeroed by hand and restored; `storePose`/`loadPose` would drop the scale: the prototype's
+trap), recorded in the group; its instance is the submit pose times the root's and the plate's `translateAndRotate` with the plate's scale
+set to 1 for the call (a rotation; `isOrthogonal` checked). A plate whose scale differs from its group's, a non-rotation, or a full group
+cap takes vanilla's path for the whole stand. Both groups are found before any instance is added; both use the submit's light. The plate is
+read through an accessor of `ArmorStandModel.basePlate` (no lookup per submit). Groups are dropped at the next frame when the switch
+changes, also when it is flipped by reflection (`ToggleAb`, close-ups), since the groups' keys differ between the settings. In the mixed
+scene: 7 groups for 508 instances, 0 fallbacks (the investigation's counters on the prototype).
+
+Harness: the mixed scene got `bench.toggleField` (`ToggleAb` after the particle phase, once the particles are gone) and frozen close-ups
+(`bench.closeShots`, `bench.closeToggle`, comma-separated fields allowed, clouds off): `close0` the grid's first rows, `close1` the grid
+from above (small stands in rows 3 and 7), `close2`/`close3` 13 stands summoned for them behind the camera (arms and poses, small, no base
+plate, invisible, invisible small, marker, small marker with arms; 1.25 blocks apart so plates don't overlap) from the front and from above.
+Neither changes the measured phases.
+
+*Exactness* (frozen close-ups, 8 shots per position, `scripts/StableDiff.java`; `s25-dev/plate-parity`, logs `2102-2104`):
+
+| close-up | on vs off, 1 level | on vs off, 2 levels | vanilla path\* vs switch on, 1 / 2 levels | vanilla path\* vs switch off, 1 / 2 levels |
+|---|---|---|---|---|
+| close0 (grid, front) | 24817 | 0 | 251567 / 3 | 272844 / 3 |
+| close1 (grid, above) | 24631 | 0 | 220966 / 8 | 239902 / 8 |
+| close2 (variety, front) | 3377 | 0 | 23332 / 6 | 43543 / 157 |
+| close3 (variety, above) | 1499 | 0 | 10834 / 1 | 19885 / 117 |
+
+\* `closeToggle=instancedModels,instancedParts`: every other shot draws the stands through vanilla's writes. Across the switch, every
+differing pixel is 1 level and on a plate's side face: the plate's normal is quantized to bytes before the instance's rotation (axis-aligned,
+exact) instead of after the stand's yaw and the counter-turn (switch off: quantized in a diagonal direction, a shorter vector after the
+rotation; vanilla: quantized after both, close to axis-aligned). Against vanilla's path the switch on has fewer 1-level pixels than off in
+every close-up and none of off's 2-level pixels (157 and 117: plate sides at diagonal yaws). The ~0.25M 1-level pixels against vanilla's path are the existing
+instancing's rounding of the bodies (section 4, `InstancedModels`: "the normal is quantized before the transform instead of after it"); the
+large-difference pixels shared by both runs (close0 3, close1 8) are silhouette edges.
+
+**Not explained:** 7 pixels differ from vanilla's path by 8-55 levels in the switch-on run only (close2: 5 px on a texel edge between body
+and shoulder of the small marker stand with arms, 1 px on the invisible stand's ghost; close3: 1 px), while the switch-off run has them as
+vanilla does. They don't follow the switch's current state: a launch starting with the switch off and toggling it (`2133`, 4 shots: off, on,
+off, on) shows vanilla's values in its first shot only and the switch-on values in the three later shots, the second switch-off shot
+included; a launch with the switch off throughout that toggles only `instancedModels` (`2134`; that toggle doesn't clear the groups) shows
+vanilla's values in all shots. So they follow when the groups were built (during the benchmark, or at the close-ups, which a change of
+`armorStandPlates` forces), not the plate split itself; the mechanism (some state in the group mesh build or the draw that depends on the
+build's moment) was not found. Open; reproduce with `-Pbench.closeShots=4 -Pbench.closeToggle=armorStandPlates -Pvm.armorStandPlates=false`
+and `scripts/StableDiff.java` at threshold 3 on `close2` (or compare pixel 902,543 across the shots).
+
+*Numbers* (switch off -> on, fps; render thread ms per frame):
+
+| | static | pan | initial | particles |
+|---|---|---|---|---|
+| mixed, 3 interleaved pairs (`s25-plate-mixed`) | 1599.2 -> 1799.5 (every pair), p99 781.0 -> 845.6, 0.54 -> 0.42 | 1651.6 -> 1715.4 (every pair), 0.44 -> 0.37 | 1114.1 -> 1270.8 | 1281.3 -> 1432.2 |
+| mixed, in-launch, 8 rounds (`s25-plate-toggle-mixed`) | 1632.9 -> 1827.5 (8 of 8), 0.538 -> 0.419 | 1694.2 -> 1742.5 (8 of 8), 0.429 -> 0.384 | | |
+| entities, in-launch, 8 rounds (`s25-plate-toggle-entities`; no armor stands) | off/on 1.0017 (7 of 8; mean 1.0023) | off/on 1.0019 (4 of 8) | | |
+
+The prototype's numbers (investigation, 4 pairs: static ~1600 -> ~1800 every pair, render thread 0.56 -> 0.42) reproduced. The upper bound
+(every stand at yaw 0, `bench.s25SameYaw`: 1594 -> 1829) is about the same: the plate split recovers nearly all of the grouping loss.
+
+**Radix sort in `SectionFaceGroups.sortByPlanes`** (`cea8b4b`, no switch: exact by construction, internal to the mod's own retained path,
+like the twenty-fourth session's texture change). The keys (group << 52 | sortable plane << 20 | quad index) arrive in ascending quad
+order, so a stable LSD radix sort of bits 20..55 (three 12-bit passes after one histogram pass, a pass skipped when its digit is the same in
+every key) gives `Arrays.sort`'s order. The reordered quads are also gathered straight into the buffer that `createBuffer` uploads
+(`sortByPlanes(mesh, target)`; the mesh stays untouched) instead of a scratch copy copied back into the mesh: the optional item of the
+report, simple and measurable. Warm builds (temporary timers, every batch rebuilt every 40 frames, medians of the builds after the first
+third of each run, ABBA, `s25-radix-time`, `s25-gather-time`):
+
+| step | 2048 block entities | 1536 | 520 |
+|---|---|---|---|
+| `Arrays.sort` -> radix: sort step | 1.50 -> 0.28 ms | 1.07 -> 0.21 | 0.35 -> 0.08 |
+| `Arrays.sort` -> radix: build | 6.27 / 6.20 -> 5.69 / 4.94 | 4.67 / 4.66 -> 4.27 / 3.69 | 1.55 / 1.55 -> 1.44 / 1.24 |
+| copy back -> direct gather: build | 5.09 / 5.07 -> 4.63 / 4.68 | 3.70 / 3.78 -> 3.46 / 3.50 | 1.26 / 1.27 -> 1.19 / 1.20 |
+
+(The report's 6.68 -> 5.50 ms and sort 1.6 -> 0.35 reproduced within run-to-run spread; build medians move ~0.5 ms between runs of one side,
+the sort step doesn't.) Exactness (`scripts/patches/s25-radix-check.patch`, `-Pjvm.ruthenium.radixCheck=true -Pjvm.ruthenium.rebuildEvery=40`,
+`s25-radix-check`): 10515 sorts over 185.9M quads, and with glowing signs and chest events 19470 sorts over 343.9M quads, 0 mismatches; in
+that run the gathered bytes and groups also equalled the old in-place path's in 9735 of 9735 builds (a temporary check not in the patch).
+Mixed scene, commit A/B `46a7390` vs `cea8b4b`, 3 pairs (`s25-radix-mixed`): static 1801.8 vs 1811.2, pan 1718.2 vs 1709.5, initial 1259.2
+vs 1264.4 (p99 309.8 vs 334.9), particles 1433.9 vs 1460.8: no regression. The scene's builds happen cold, after the join (~85% JIT), so
+the gain shows in warm rebuilds (block changes, a section's first view in a pan), not in the initial phase.
+
+**Files:** `results/s25-plate-mixed`, `s25-plate-toggle-{mixed,entities}`, `s25-dev/plate-parity`, `s25-radix-time`, `s25-gather-time`,
+`s25-radix-check`, `s25-radix-mixed`; logs `build/bench-logs/2102-2125` and `s25-*.out`. Patches: `s25-diagnostics.patch` (against
+`681f1f2`; it touches `InstancedModels` and `SectionFaceGroups`, so expect conflicts after this session), `s25-AllocSites.java.txt`,
+`s25-radix-check.patch` (against `cea8b4b`). The prototypes `s25-armor-stand-plate.patch` and `s25-radix-sort.patch` are superseded by the
+commits.
+
+**Found on the way:** results of plain runs left in `results/` are swept into side a by the next `run-ab.sh` (it moves every `ruthenium-*`
+file; here three close-up runs landed in the plate A/B's side a and were moved out by timestamp). Move them out first (section 6.4).
+
+Still open: candidates 2 (clouds without a texel buffer), 4 (per-group overhead), 5 (screenshot readback) and 6 of the list above; the
+OpenGL backend was not measured for either change.
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -2232,6 +2415,14 @@ kept text are no longer written into the group's vertex builder, so mods that ac
 into `BakedSheetGlyph.render` or `BufferBuilder`, or the upload's sort of those draws) or on the draw (`PreparedRenderType.drawFromBuffer`,
 `executeGroup`) don't see them; shader packs that swap vanilla's text pipelines would not swap the `label_*` copies. Mods with their own
 `TextRenderable`s, outlined or obfuscated text keep vanilla's path.
+Twenty-fifth session, mod compatibility only (switch "Separate Armor Stand Plates"; the same rounding class as the instanced armor stands
+it extends: across the switch only 1-level differences on the plates' side faces, and closer to vanilla's path than without it; 7 pixels in
+the close-ups that follow when the groups were built are open, section 7): vanilla `ArmorStandModel` submits now set the base plate's
+`yRot` to 0 and `visible` to false for the moment the body's snapshot is taken and its group found, and render the plate alone with zeroed
+offset and rotation when its group's mesh is built (all restored at once). A mod that changes the plate's scale per stand takes vanilla's
+path for those stands (checked); a mod that observes those fields during `InstancedModels`' group build, or changes the plate's offset,
+rotation or cubes per stand in ways other than through the fields the instance reads (`x`, `y`, `z`, `xRot`, `yRot`, `zRot` and the root's
+transform), is affected. The radix sort and the direct gather of retained builds touch no vanilla code.
 The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
 been kept, its trade-off would have been: a mod that writes a downloaded skin's GPU texture without `DynamicTexture.upload`
 leaves stale masks (faces missing until the next upload or reload).
@@ -2398,11 +2589,22 @@ leaves stale masks (faces missing until the next upload or reload).
      0.2-0.3 ms, mostly closed books (~3.6k at ~60-70 ns after the tilt change: pose math and the instance write).
    - **Glowing sign text**: retained since the nineteenth session (`a4651b2`); coloured glowing signs within the outline
      reach take the vanilla path frame by frame.
+   - **Twenty-fifth session (section 7): the mixed scene replaces the server scene here, and its static view is CPU bound** (yaw 0:
+     render thread ~0.6 ms, GPU 0.358 ms; yaw 270: 0.644 vs 0.425), so the GPU and server scene numbers in this item are history. Its
+     client tick is ~0.53 ms (not 0.93). Done: armor stand base plates as their own instances (static +12.5%), radix-sorted retained
+     builds gathered into the upload. Left, ranked (section 7, twenty-fifth session, has designs): clouds without a texel buffer (~20-29 us
+     per frame whenever clouds are on, expected ~4-5% mixed static), `InstancedModels` per-group overhead (~1.4 us per group, ~2%), the
+     screenshot readback (20-40 ms per F2 and on a new world's first frame), small per-entity items (`RenderTypes.entityCutout` memo
+     lookups, `CrossbowItem.getChargeDuration` for empty stacks: a trade-off). After the plate change the armor stands still cost ~63 us
+     extraction, ~38 us submission and ~60 us model prepare per frame.
    - **Retained builds after joining or teleporting**: a section is built in one go; in the mixed scene's initial phase
      three frames build 2-2.7k block entities each in 95/38/27 ms (cold). Spreading builds over frames with a time budget
      was built, verified exact and binned (nineteenth session, `scripts/patches/s19-spread-builds.patch`): the unbuilt
      chests' vanilla path made more slow frames than it saved. The phase's largest frames (~120 ms, frames 0-3 after the
-     teleport) are not builds and were not investigated; that is the lead for join smoothness.
+     teleport) are not builds and were not investigated; that is the lead for join smoothness. **Investigated in the twenty-fifth
+     session:** frame 0 is vanilla's new-world icon (`Screenshot.takeScreenshot`, 20-41 ms) plus the cold first extraction and model
+     prepare of the armor stands; the next tick's packets (44-54 ms) and frame 1's light updates (13.6 ms) are vanilla's; frames 3-6 are
+     retained builds, ~85% JIT-cold (warm, the same 8192 block entities take ~25 ms).
    - Occlusion culling of block entities is **not** exact (chests are 14/16 wide; the ones behind show through).
 3. **Allocation** (~0.35 MB/frame at static since the eighth session; was ~2.3): `Float` boxing of chest openness per submit, submit records,
    `PoseStack.Pose`, glyph instances of non-sign text, `CompactVectorArray` per sort.

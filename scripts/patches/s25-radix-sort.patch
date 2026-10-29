@@ -1,0 +1,81 @@
+--- a/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
++++ b/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
+@@ -66,6 +66,52 @@
+     private SectionFaceGroups() {
+     }
+ 
++    // s25 prototype: -Druthenium.s25.radix=true sorts the plane keys with a radix sort, -Druthenium.s25.radixCheck=true also
++    // sorts them with Arrays.sort and counts differences
++    private static final boolean RADIX = Boolean.getBoolean("ruthenium.s25.radix");
++    private static final boolean RADIX_CHECK = Boolean.getBoolean("ruthenium.s25.radixCheck");
++    private static final long[] RADIX_CHECKS = new long[3];
++    /** Render thread only (retained block entity builds) */
++    private static long[] radixScratch = new long[0];
++    private static final int[] RADIX_COUNTS = new int[1 << 12];
++
++    /**
++     * {@code Arrays.sort}'s order of the plane keys: a stable LSD radix sort of their group and plane bits (20..55) in three
++     * 12 bit passes. The keys come in ascending quad index order (bits 0..19, unique), and the stable passes keep that order
++     * among equal group and plane bits, so the result equals sorting the whole keys.
++     */
++    private static long[] radixSort(long[] keys) {
++        int n = keys.length;
++        long[] a = keys;
++        long[] b = radixScratch.length >= n ? radixScratch : (radixScratch = new long[n]);
++        int[] counts = RADIX_COUNTS;
++        for (int shift = 20; shift < 56; shift += 12) {
++            java.util.Arrays.fill(counts, 0);
++            for (int i = 0; i < n; i++) {
++                counts[(int) (a[i] >>> shift) & 0xFFF]++;
++            }
++            int sum = 0;
++            for (int d = 0; d < counts.length; d++) {
++                int c = counts[d];
++                counts[d] = sum;
++                sum += c;
++            }
++            for (int i = 0; i < n; i++) {
++                long k = a[i];
++                b[counts[(int) (k >>> shift) & 0xFFF]++] = k;
++            }
++            long[] t = a;
++            a = b;
++            b = t;
++        }
++        // After three passes the result is in the scratch array: hand it out and keep the keys array as the next scratch
++        if (a.length != n) {
++            return java.util.Arrays.copyOf(a, n);
++        }
++        radixScratch = b;
++        return a;
++    }
++
+     /**
+      * Like {@link #sort}, but also orders each facing group's quads by plane, nearest to the side the group faces
+      * first, so a frame can draw only the quads whose plane the eye is in front of ({@link #visiblePlaneRuns}) instead
+@@ -142,7 +188,24 @@
+         if (counts[UNASSIGNED] == quadCount) {
+             return null;
+         }
+-        java.util.Arrays.sort(keys);
++        if (RADIX) {
++            long[] reference = RADIX_CHECK ? keys.clone() : null;
++            keys = radixSort(keys);
++            if (reference != null) {
++                java.util.Arrays.sort(reference);
++                RADIX_CHECKS[0]++;
++                RADIX_CHECKS[1] += quadCount;
++                if (!java.util.Arrays.equals(reference, keys)) {
++                    RADIX_CHECKS[2]++;
++                }
++                if ((RADIX_CHECKS[0] & 63) == 0) {
++                    org.slf4j.LoggerFactory.getLogger("Ruthenium").info("s25 radix check: {} sorts, {} quads, {} mismatches",
++                            RADIX_CHECKS[0], RADIX_CHECKS[1], RADIX_CHECKS[2]);
++                }
++            }
++        } else {
++            java.util.Arrays.sort(keys);
++        }
+ 
+         SectionFaceGroups groups = new SectionFaceGroups();
+         int[] starts = groups.starts;

@@ -1,0 +1,63 @@
+# Twenty-fifth session: check that the radix sort in SectionFaceGroups.sortByPlanes gives Arrays.sort's order (cea8b4b).
+# Apply with git apply, run e.g. benchRuthenium -Pjvm.ruthenium.radixCheck=true -Pjvm.ruthenium.rebuildEvery=40 -Pbench.glowingSigns=true
+# and read the last 'radix check:' line of the log (0 mismatches expected). Revert before committing.
+diff --git a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+index 9121695..0fa14b4 100644
+--- a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
++++ b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+@@ -213,6 +213,7 @@ public final class RetainedBlockEntities {
+     private static boolean textFiltering;
+     private static int frame;
+     private static int rebuiltThisFrame;
++    private static final int REBUILD_EVERY = Integer.getInteger("ruthenium.rebuildEvery", 0);
+     private static double camX, camY, camZ;
+ 
+     private RetainedBlockEntities() {
+@@ -458,6 +459,10 @@ public final class RetainedBlockEntities {
+         if ((frame & 255) == 0) {
+             evict();
+         }
++        // s25 check: -Druthenium.rebuildEvery=N rebuilds every batch every N frames (warm builds for the radix check)
++        if (REBUILD_EVERY > 0 && frame % REBUILD_EVERY == 0) {
++            BATCHES.values().forEach(b -> b.dirty = true);
++        }
+     }
+ 
+     private static void markBatchDirty(int x, int y, int z) {
+diff --git a/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java b/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
+index ca73dfc..69e805e 100644
+--- a/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
++++ b/src/main/java/net/ruthenium/render/chunk/SectionFaceGroups.java
+@@ -145,7 +145,21 @@ public final class SectionFaceGroups {
+         if (counts[UNASSIGNED] == quadCount) {
+             return null;
+         }
++        // s25 check (scripts/patches/s25-radix-check.patch): -Druthenium.radixCheck=true also sorts the keys with Arrays.sort
++        long[] checkReference = RADIX_CHECK ? keys.clone() : null;
+         keys = sortKeys(keys);
++        if (checkReference != null) {
++            java.util.Arrays.sort(checkReference);
++            RADIX_CHECKS[0]++;
++            RADIX_CHECKS[1] += quadCount;
++            if (!java.util.Arrays.equals(checkReference, keys)) {
++                RADIX_CHECKS[2]++;
++            }
++            if ((RADIX_CHECKS[0] & 255) == 0) {
++                org.slf4j.LoggerFactory.getLogger("Ruthenium").info("radix check: {} sorts, {} quads, {} mismatches",
++                        RADIX_CHECKS[0], RADIX_CHECKS[1], RADIX_CHECKS[2]);
++            }
++        }
+ 
+         SectionFaceGroups groups = new SectionFaceGroups();
+         int[] starts = groups.starts;
+@@ -207,6 +221,10 @@ public final class SectionFaceGroups {
+      *
+      * @return the sorted keys: the given array or a new one
+      */
++    private static final boolean RADIX_CHECK = Boolean.getBoolean("ruthenium.radixCheck");
++    /** Sorts checked, quads, mismatching sorts (render thread) */
++    private static final long[] RADIX_CHECKS = new long[3];
++
+     private static long[] sortKeys(long[] keys) {
+         int n = keys.length;
+         int[] counts = new int[3 << 12];
