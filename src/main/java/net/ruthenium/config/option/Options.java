@@ -338,6 +338,26 @@ public abstract class Options {
                                 () -> config.fastRestingCollisions)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.fastRestingCollisions.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.nameTagTextCache"),
+                                value -> config.nameTagTextCache = value,
+                                () -> config.nameTagTextCache)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.nameTagTextCache.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.textDisplayTextCache"),
+                                value -> config.textDisplayTextCache = value,
+                                () -> config.textDisplayTextCache)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.textDisplayTextCache.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.textDisplayCulling"),
+                                value -> config.textDisplayCulling = value,
+                                () -> config.textDisplayCulling)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.textDisplayCulling.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.emptyArmorStandLayers"),
+                                value -> config.emptyArmorStandLayers = value,
+                                () -> config.emptyArmorStandLayers)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.emptyArmorStandLayers.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)

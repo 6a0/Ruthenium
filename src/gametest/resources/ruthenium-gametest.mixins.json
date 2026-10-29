@@ -4,6 +4,7 @@
   "package": "net.ruthenium.gametest.mixin",
   "compatibilityLevel": "JAVA_25",
   "client": [
+    "ClientMannequinMixin",
     "DrawIndirectMixin",
     "GpuPassProbeMixin",
     "InstancedDrawProbeMixin",

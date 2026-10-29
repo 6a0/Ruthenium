@@ -59,6 +59,23 @@ behind the camera. Three attempts binned (sprite pipeline repeats, cell index ma
 tree, start -> end: server scene static 1085.0 -> 1126.5 fps (p99 446.3 -> 507.2), pan 1029.2 -> 1055.5 (p99 380.0 ->
 436.8), client tick 1.236 -> 0.931 ms; the block entity scene's static view lost 0.6% (1773.5 -> 1763.1, GPU, the plane
 order), the entity scene is unchanged.
+Nineteenth session (section 7, "Nineteenth session"), two agents in parallel from `3c04a06`, merged into `26.3` afterwards.
+Part 1 (on `26.3`), the four open items of section 8: **transparent face masks are kept per texture** (instanced parts
+off: static 196.0 -> 221.6 fps), **glowing sign text is retained** (mixed scene with `-Pbench.glowingSigns=true`: static
+773.9 -> 1288.8), **resting entities keep their block collision answer** (client tick 1.429 -> 1.360 ms with gravity);
+retained builds spread over frames were binned. Part 2 (branch `worktree-agent-aa744c1ec3f1ed79f`, section 7 "Players and
+holograms"): other players and holograms, which no scene had. A **players scene** (`-Pbench.scene=players`, section 6.10: 150 mannequins on
+the remote player render path with every player layer, 120 armor stand and text display holograms of 4 lines). Players
+were largely vanilla (their body is translucent, so not instanced; everything they wear was already instanced), name
+tags and text displays fully so. **Name tags keep their text layout** (vanilla rebuilt the display name and ran ICU bidi
+and two glyph layouts per name tag and frame; lobby static 269.8 -> 318.6 fps), **text display lines keep theirs**
+(text holograms 1160.6 -> 1293.8), **text displays are culled by the extent of their text** (vanilla never culls size-0
+displays, i.e. every hologram plugin's; lobby pan 1066.3 -> 1438.9) and **empty armor stands skip their layers** (stand
+holograms 902.4 -> 949.2). Lobby: vanilla 153.6 / 613.2 fps (static / pan); Ruthenium in the same tree, start -> end
+(five pairs): static 271.6 -> 326.4 (render thread 3.57 -> 2.96 ms), pan 959.8 -> 1438.5; entity scene pan 1148.8 ->
+1184.4, mixed scene unchanged. Found: `TransparentFaces` costs 150 players with resource skins 0.5 ms per frame (the cache
+miss of section 8; fixed by part 1, not measured in the players scene yet), and each player body's quads are sorted every
+frame (1.8 us per player).
 
 
 **Renamed to Ruthenium (2026-10-28, eighteenth session).** The project is now **Ruthenium**: mod id `ruthenium`, package
@@ -152,9 +169,14 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
 - **Server scene, static view: ~0.72 ms render thread, ~0.84 ms GPU per frame** (seventeenth session; 0.78 / 0.875 in
   the twelfth). It is GPU bound, so CPU savings there show in the render thread time and the p99, not much in the average. Its p99 low
   is set by the 2% of frames that run a client tick (~1.4 ms per tick); see section 7, "Twelfth session".
-- **Nineteenth session** (section 7): the four open items. Kept: transparent face masks per texture, glowing sign text
+- **Nineteenth session, part 1** (section 7, "Nineteenth session"): the four open items. Kept: transparent face masks per texture, glowing sign text
   retained (mixed scene with `-Pbench.glowingSigns=true`: static 774 -> 1289 fps), resting block collisions (client tick
   1.429 -> 1.360 ms with gravity). Binned: retained builds spread over frames (more slow frames after a join, not fewer).
+- **Nineteenth session, part 2: players and holograms** (`-Pbench.scene=players`, section 6.10 and section 7 "Players and
+  holograms"): name tags and text display lines keep their text layout ("Keep Name Tag Text", "Keep Text Display Text"),
+  text displays are culled by their text ("Cull Text Displays"), empty armor stands skip their layers ("Skip Empty Armor
+  Stand Layers"). A player costs ~12 us of render thread per frame (vanilla ~30), a hologram line ~1-1.7 us (vanilla
+  ~1.8-3.5); the player body (translucent, 2.8 us) is the largest item left.
 - **Next:** see section 8.
 
 ---
@@ -297,6 +319,11 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `SectionFaceGroups.sortByPlanes`/`visiblePlaneRuns` (used by `RetainedBlockEntities`) | Retained batches are sorted by facing and, within a facing group, by plane (nearest to the faced side first; stable, so equal plane quads keep their order); each frame draws the prefix of each group whose planes (with the 0.25 margin) the eye can be in front of, merged into at most 7 runs. Quads within a 1e-5 tilt of an axis and 1e-4 blocks of a plane count as in it (rotated models), with their backmost coordinate as the plane. Terrain keeps `sort` and its packed per-group draws |
 | `RetainedBlockEntities` (seventeenth session) | Also retains lecterns, bells (not while `shaking`; `BellBlockEntityM` marks the section dirty on `triggerEvent`) and copper golem statues. **Change checks** (switch `retainedChangeChecks`): `LevelExtractor.setSectionDirty` now calls `markBlocksChanged`; a batch remembers its block entity objects and block states and its members' light (`LightCoordsUtil.getLightCoords` at the block entity and, for double chests, at the other half), and a block or light change, or a new compile of the section, rebuilds it only if any of these differ (`isUnchanged`). Neighbours are only checked when they hold a double chest whose other half is in another section (`linked`). Block entity events still force rebuilds (`markDirty`, with neighbours). Batches are freed after 1200 frames *and* 30 s unused, or 1200 frames when more than 64 blocks beyond their view distance. Mod compatibility: a mod changing what a retained block entity renders without a block entity event, block state or light change (e.g. a field set directly on the client) leaves the batch stale until the next rebuild |
 | `InstancedModels.tryAddClosedBook` | The closed book's constant 80 degree tilt: sine and cosine computed once with JOML's functions and applied with `rotateTowardsXY`, which `rotateZ` calls on a matrix that isn't a pure translation (pure translations keep `rotateZ`); bit-identical |
+| `render/text/EntityTextCache.java` + `mixin/render/text/{EntityRendererNameTagM,EntityNameTagHolderM,MutableComponentM,SubmitNodeCollectionNameTagM}.java` + `interfaces/{KeptNameTags,NameTagLayout}` | **Name tag text kept** (nineteenth session, switch `nameTagTextCache`, "Keep Name Tag Text"). `EntityRenderer.extractNameTags` builds the name tag (`getNameTag` -> `getDisplayName`: team formatting, hover event, insertion) and the below-name line anew every frame; a `@WrapOperation` on both replaces a result that is `equals` (deep) to the component the entity showed last (`Entity` fields) by that kept component. `SubmitNodeCollection.submitNameTag` then measures it (`Font.width`) and orders it (`getVisualOrderText`: ICU bidi and Arabic shaping); the width is kept on the `MutableComponent` (per font, language and `SignTextCache` generation), vanilla's own visual order cache applies to the kept instance, and the visual order is wrapped once in a `SignTextCache` line (`NAME_TAG`), so `TextFeatureRendererM` reuses the prepared glyphs of both submits. Equal components lay out the same; obfuscated text is still laid out every time |
+| `render/text/SignTextCache.java` (nineteenth session) | Lines keep up to 4 prepared variants (kind, x, y, colour, background, includeEmpty) instead of one per kind; lines know their source (`SIGN` always on, `NAME_TAG`, `TEXT_DISPLAY` follow their switches) |
+| `mixin/render/text/TextDisplayRendererM.java` | **Text display lines kept** (nineteenth session, switch `textDisplayTextCache`, "Keep Text Display Text"): `TextDisplayRenderer.splitLines` (called only when the display's text or line width changes, `TextDisplay.cacheDisplay`) wraps each line in a `SignTextCache` line (`@ModifyArg` on `CachedLine.<init>`) |
+| `render/entity/TextDisplayCulling.java` + `mixin/render/entity/TextDisplayAccessor.java` + `LevelExtractorEntityM.ruthenium$fastCulling` | **Text displays culled by their text** (nineteenth session, switch `textDisplayCulling`, "Cull Text Displays"). Vanilla culls displays only with a width and height set (`Display.noCulling`); hologram plugins leave them at 0, so every text display in range was extracted, submitted and its text written every frame. After vanilla's test passes, a `TextDisplay` without passenger offset, name tag, shadow or glow, with a constant transformation and split text (`clientDisplayCache`), is tested as a sphere: the text rectangle (widest line x line count, +1 px background, +8 px glyph margin, 1 px depth) x 1/40, times the transformation (`|t| + ||A||_F |v|`), any billboard rotation; box widened by 0.5 + 2% of the distance (bobbing). Off while the camera entity is hurt/dying or under nausea/portal |
+| `mixin/render/entity/LivingEntityRendererLayersM.java` | **Empty armor stand layers skipped** (nineteenth session, switch `emptyArmorStandLayers`): `LivingEntityRenderer.submit`'s `shouldRenderLayers` answers false for vanilla's `ArmorStandRenderer` with exactly its four vanilla layers when the state's equipment, hands, head item and worn head are all empty (the layers draw nothing; the model's own submit poses the model again when prepared) |
 
 Design rules used so far:
 - Hot paths use `@Overwrite` with an inlined vanilla fallback, because a cancellable `@Inject` allocates a
@@ -381,7 +408,7 @@ Default `dark_red` text color and no glow otherwise, so default numbers stay com
 
 ### 6.2 Implementation (`src/gametest`)
 - `BenchmarkClientGameTest`: sets options (Fancy preset, render distance 16, unlimited fps, no vsync) and runs the
-  scene `bench.scene` (mixed, terrain, blockentities, entities). `MixedBenchmark` builds its world, then runs
+  scene `bench.scene` (mixed, terrain, blockentities, entities, players: section 6.10). `MixedBenchmark` builds its world, then runs
   **initial (5 s) → pan (10 s, driven per frame) → static (5 s, reference at the particle spot) → particles (10 s)**.
   Scenes write JSON and TXT to `build/run/bench/results/<label>-<scene>-<time>.*`, the
   pan's per-frame series (frame ms, yaw, entities, block entities, GCs so far) to
@@ -704,6 +731,45 @@ rows eight times after the pan (light changes while entities are drawn; not meas
 Since the sixteenth session: `-Pbench.entityGravity=true` lets the dropped items and experience orbs fall and rest on the
 floor (real play) instead of floating with `NoGravity`; with `-Pbench.entityAi=true` the scene accepts 1200 entities
 (fights during setup).
+
+### 6.10 Players and holograms benchmark (nineteenth session)
+`-Pbench.scene=players` on any bench task (`PlayerBenchmark`): a server lobby in a fresh flat world, render distance 12
+(`playersRenderDistance`), clouds off, time 6000. The camera is a **flying creative player** at (0.5, -58, -7.5), yaw 0,
+pitch 8 (a spectator would see the holograms' invisible armor stands as ghosts), so the first-person arm and the hotbar
+are in every frame. `bench.playersKind`: `lobby` (default, both of the following), `players` or `holograms`.
+- **Players** (`bench.playerCount`, 150; 15 per row, 1.5 x 2 blocks apart, facing the camera): `minecraft:mannequin`s. The
+  client extracts a `ClientMannequin` with an `AvatarRenderer` from `mannequinRenderers` and submits its
+  `AvatarRenderState` through `EntityRenderDispatcher.getRenderer(AvatarRenderState)`, i.e. the **same player renderers
+  and layers as remote players** (`AvatarRenderer`: body with outer layers in `entity_translucent`, armor and trims,
+  held items, arrows, Deadmau5 ears, cape, head items, elytra, shoulder parrots, spin attack, bee stingers; name tag and
+  below-name line). Wide and slim models alternate over the 9 default skins, registered by the harness as
+  `DynamicTexture`s (processed like a downloaded 64x64 skin: base layer opaque), which is how real players' skins are
+  held (`bench.playerSkins=resource` uses the skin resources, `SimpleTexture`s). Every third player has a cape (a
+  texture in the gametest resources), every seventh elytra, 3 of 5 armor (iron with trims, diamond with trims and
+  enchanted leggings (glint), netherite helmet and boots), most hold items (swords, bows, tridents, blocks, ...), shields
+  or torches in the off hand, some hide the hat/jacket or sleeves, every 15th crouches. Name tags with team prefixes and
+  colours (`[VIP] `, `[MVP+] `, `[ADMIN] `), every other player a below-name line (the mannequin's description, e.g. `19 ❤`,
+  standing in for a below-name score). Arrows (every 4th) and bee stingers (every 9th) are set on the server before each
+  phase (they wear off). **Shoulder parrots**: `ClientMannequin` never has any, so the gametest mixin `ClientMannequinMixin`
+  overwrites `getParrotVariantOnShoulder` to return variants the scene sets on the client entity (`BenchParrots`; 40 of
+  150 players).
+  **How representative:** the render path is the remote player's. Differences: mannequins stand still (no walk
+  animation, no position interpolation; static is the best case for anything kept across frames), they tick as
+  `ClientMannequin` (a living entity: `LivingEntity.tick`, no `Player.tick`), their name is a custom name (the display name
+  is built by `Entity.getDisplayName`, a player's by `Player.getDisplayName`, which adds a click event), and the culling
+  and renderer lookups differ only in which map holds the renderer. Client-side `RemotePlayer`s in the client level were
+  not used.
+- **Holograms** (`bench.hologramCount`, 120, `bench.hologramLines`, 4; 9 per row, 3 blocks apart, the lowest line 3 blocks
+  above the floor, 0.25 between lines): in turn (`bench.hologramKind=mixed`) a stack of invisible marker armor stands with
+  visible custom names (one per line, the classic plugin hologram), a stack of text displays (one per line) and one text
+  display holding all lines; all billboard `center` with the default background, coloured and bold lines. `stand`,
+  `text`, `multiline` use one kind for all. 480 lines; in the lobby 160 armor stands and 200 text displays.
+- Phases: static (facing the crowd) and a 360 degree pan. Screenshot: the static view; `bench.closeShots=N` and
+  `bench.closeToggle=<Config field>` take frozen close-ups of the first rows of players (`close0`) and holograms
+  (`close1`) as in the entity scene. Results are labelled `<label>-players-<kind>`. The enchanted leggings' glint and the
+  first-person arm differ between frozen shots of one frame (a few hundred to ~10k pixels at threshold 1): compare text
+  and models, not pixel counts.
+- The layer probe (`-Pbench.entityCostParts=true`) also times cape, elytra, parrot and stuck-in-body layers.
 
 ---
 
@@ -1190,6 +1256,11 @@ Session start (`77b631c`) vs end (`aa618c3`), checked out in turn in the same tr
   unchanged (none of the changes touch it).
 
 ### Nineteenth session (2026-10-28/29)
+Two agents worked in parallel from `3c04a06`: part 1 (the open items of section 8) on `26.3`, part 2 (players and
+holograms) on branch `worktree-agent-aa744c1ec3f1ed79f` in its own worktree. The branch was merged into `26.3` afterwards
+(a `--no-ff` merge; conflicts only in the switch lists and these notes).
+
+#### Part 1: the open items of section 8
 The four open items of section 8 (transparent face cache misses, glowing sign text, retained builds after a join, resting
 items and orbs). The machine was shared with another agent's benchmarks: every Gradle command ran under a shared GPU lock
 (a `mkdir` lock in the session's scratchpad), whole matrices per lock. Results in `results/s19-*` and `results/s19-dev/`, logs
@@ -1261,6 +1332,143 @@ mixin fail to apply; one redirecting the same call is wrapped), and has `fastSup
 on the client go through `LevelChunk.setBlockState` or chunk data, and context dependent collision shapes override
 `getCollisionShape` in the block class. `TransparentFaces`' per cube tables hold texture alphas until a reload (at most
 128 per cube).
+
+#### Part 2: Players and holograms
+The question was whether other players and holograms were optimised yet. A new scene (`-Pbench.scene=players`, section
+6.10; mannequins on the remote player render path, armor stand and text display holograms) measured it. Its own worktree
+and branch (`worktree-agent-aa744c1ec3f1ed79f`), all runs in that tree; another agent benchmarked on the machine at the same
+time, serialised by a shared lock. The user saw the screen turn off briefly during one run; no run has a frame over 32 ms,
+and the only candidate outlier is noted with its A/B below.
+
+**What was already optimised before this session** (code read, then checked with the probes):
+- Players: the body (`PlayerModel`, `entity_translucent`, so the translucent phase, strictly ordered and sorted on upload)
+  keeps vanilla's vertex path with `ModelPartCubeM`'s direct cube writes; no back face skip (the pipeline doesn't cull), no
+  instancing (strictly ordered groups), no pose replay (no layer submits the body model again). `TransparentFaces` applies
+  only to `SimpleTexture` skins (default skin resources), not to downloaded skins (`DynamicTexture`), and with many skins
+  it is a loss (below). Everything a player wears or carries is already instanced: armor and trims and elytra
+  (`armor_cutout_no_cull`), cape and shield/trident (`entity_solid`), parrots (`entity_cutout`), arrows and bee stingers
+  (`entity_cutout_cull`), held items (instanced items); only the armor glint (`armor_cutout_no_cull_glint`) is not. Light is
+  kept per entity (`EntityLight`). Culling of avatars stays vanilla's (`EntityRendererCache` skips players and mannequins,
+  whose renderer comes from the skin's model). Name tags: nothing (fifteenth session: attribute reads binned).
+- Holograms: armor stands are extracted into reused render states (`ReusedRenderStates`) and culled cheaply; their name
+  tags and all text displays took vanilla's path except the direct glyph writes (`BakedSheetGlyphM`). Text displays with
+  the default size 0 were never frustum culled (vanilla, see below).
+- Ticks: the general entity tick work of the sixteenth session applies (typed armor stand pushes, collision sections, ...).
+
+**Baselines** (lobby: 150 players, 160 armor stands and 200 text displays = 480 hologram lines, 510 entities drawn at the
+static view; static / pan fps, render thread ms per frame at the static view):
+
+| | static | p99 low | render thread | GPU frame | pan |
+|---|---|---|---|---|---|
+| vanilla Vulkan (3 runs) | 153.6 | 93.1 | 6.17 ms | 1.50 ms | 613.2 |
+| Ruthenium at the session start (text changes off, 1 run) | 263.7 | 151.9 | 3.66 ms | 0.98 ms | 924.2 |
+| Ruthenium at the end (15 runs) | 318.6 | 185.9 | 3.04 ms | 0.82 ms | 1435.4 |
+
+Per kind (one run each, static; render thread minus the empty scene's 0.22 ms, divided by the count):
+
+| | vanilla static / pan | Ruthenium static / pan | render thread per unit (vanilla -> Ruthenium) | GPU per unit |
+|---|---|---|---|---|
+| empty flat world | 2260.9 / 2176.6 | 2409.6 / 2354.6 | - | - |
+| 150 players | 210.4 / 1264.3 | 473.2 / 1549.5 | 29.7 -> 12.2 us per player | 5.5 -> 1.5 us |
+| 480 lines, mixed kinds | 687.0 / 1015.0 | 1080.2 / 1847.8 | 2.5 -> 1.4 us per line | ~0.04 us |
+| 480 armor stand lines | 505.8 / 1511.5 | 937.6 / 1804.8 | 3.5 -> 1.7 us per line | 0.16 -> 0.06 us |
+| 480 text display lines | 865.9 / 863.1 | 1291.3 / 1894.1 | 1.8 -> 1.1 us per line | ~0 |
+| 120 text displays of 4 lines | 772.2 / 743.2 | 1327.9 / 1892.0 | 2.1 -> 1.0 us per line | ~0 |
+
+The lobby is CPU bound (GPU 0.82 ms of a 3.1 ms frame). Vanilla's pan is no faster than its static view for text
+displays: it processes all of them whatever the view direction. Client tick (tick probe, static): lobby 0.63 ms per tick
+(entities 0.35, of which the local player ~0.15-0.2), every ~16th frame; per entity ~0.3 us for mannequins and armor
+stands, ~0.1 us for text displays (stand holograms: entities 0.39 vs empty 0.20 ms per tick for 480 stands, vanilla 0.67).
+Frames with a tick: 4.0 vs 3.1 ms (tick 0.63 ms plus the harness's handshake, section 6.6).
+
+**Where the time goes** (lobby static, all changes on). Light profiler depth 6 (`build/bench-logs/s5-mod-light6.log`), per
+frame of 3.2 ms: entity extraction 0.47 ms, entity submission (`submitFeatures`) 0.34, `prepareFeatures` 1.74 (group
+prepares 1.14, `uploadSharedVertexBuffer` 0.51, sort 0.05), frame graph execution 0.20, GUI and hand ~0.06, tick 0.07 on
+average. Upload probe (new upload table of `-Pbench.entityCost=true`, `s6-upload-*.log`): the lobby uploads ~3.2 MB of
+vertices per frame in 3 uploads (world, hand, GUI) of ~154 draws; 147 draws are sorted on upload (the 145 player bodies,
+`entity_translucent`, and see-through name tag text), 113 quads each on average: decoding their quad centroids 100 us and
+sorting plus writing their indices 273 us of the upload's 507 us per frame (probe timings). With players only: 145 sorted
+draws of 72 quads, **1.8 us per player body per frame** (sort and indices 1.4, centroids 0.37). Entity cost probe with
+parts (`s5-probe-players.log`, `s5-probe-stand.log`; wrappers add ~50-100 ns per wrapped call):
+- **Per player ~12 us** of render thread: culling 0.18 us (vanilla path), extraction 1.6 (name tag 0.55, held item models
+  ~0.2, the rest spread over `AvatarRenderer`/`HumanoidMobRenderer` extraction: arm poses, flight and cape state, armor
+  copies), submission 2.5 (layers ~1.4: held items 0.40, armor 0.37, arrows 0.22, parrots 0.14, stingers 0.11, elytra and
+  cape 0.08 each; name display 0.22), **body prepare 2.8** (72 faces written, a render type switch per player for its own
+  skin), armor 1.1 (instanced, ~0.6 per piece-set), glint 0.2, arrows/parrots/cape ~0.8, name tag glyphs 0.9, shadow 0.1,
+  plus its share of the upload (the body's 72 quads are sorted every frame, `entity_translucent` sorts on upload) and of the
+  draws (one per skin). GPU ~1.5 us. Tick ~0.3 us (mannequin; a remote player's `Player.tick` is not measured).
+- **Per armor stand hologram line ~1.7 us**: extraction 0.94 (name tag 0.28, light 0.09, empty hand items 0.09, the reused
+  armor stand state ~0.45), submission 0.29 (name display 0.14), culling 0.11, glyphs of its two name tag passes ~0.67.
+  Tick ~0.4 us. **Per text display line ~1.0-1.1 us**: extraction 0.25, submission 0.32 (per display), glyphs and
+  background. Text displays are the cheaper hologram, on the CPU and in the tick.
+
+**Changes**, each A/B tested in five interleaved pairs with `-Pbench.staticSeconds=10`, switch off vs on in the same build
+(median; `build/run/bench/results/<dir>` of the worktree):
+- **Name tag text kept** (`279021d`, `p-nametag`, switch `nameTagTextCache`): lobby static 269.8 -> 318.6 fps (every pair;
+  render thread 3.55 -> 3.04 ms, p99 low 155.7 -> 185.1), pan 1391.8 -> 1444.8 (every pair). Probe: name display submit 970
+  -> 192 ns per named entity, name tag extraction 520 -> 584 ns (the equality test). Vanilla builds the display name every
+  frame (`Entity.getDisplayName`: team formatting copy, hover event, insertion), so its own visual order cache never hits,
+  and runs ICU bidi + Arabic shaping (`FormattedBidiReorder`) and two glyph layouts per name tag and frame.
+- **Text display lines kept** (`279021d`, switch `textDisplayTextCache`): lobby (`p-textdisplay`) static 305.9 -> 317.7 (3 of 5
+  pairs; 3.13 -> 3.04 ms, 4 of 5); text display holograms only (`p-textdisplay-text`, 480 lines) static 1160.6 -> 1293.8
+  (every pair; 0.82 -> 0.74 ms, ~0.17 us per line), pan 1902.9 -> 1963.9 (every pair).
+- Checks for both (temporary, `scripts/patches/s19-check-TextCacheCheck.java.txt`): 3.2M kept widths, 1.6M visual orders
+  of kept vs fresh equal components and 5.4M prepared texts rendered into a recorder against fresh layouts: 0 mismatches.
+  Frozen close-ups with either switch flipped: text identical.
+- **Text displays culled by their text** (`955cd51`, `p-tdcull`, switch `textDisplayCulling`): lobby pan 1066.3 -> 1438.9 fps
+  (every pair; render thread 0.88 -> 0.58 ms, p99 low 281.2 -> 300.2), static 317.5 -> 323.3 (3 of 5; some holograms are off
+  screen at the sides). Vanilla never frustum culls a display entity whose width or height is 0 (`Display.noCulling`), the
+  default and what hologram plugins use, so every text display within its view range (64 blocks x view range x entity
+  distance scale) is extracted, submitted and its text written every frame. Check (temporary,
+  `scripts/patches/s19-check-TextDisplayCullingCheckM.java.txt`): 462k drawn displays, 58.6M glyph and background vertices, all inside the bounding sphere
+  (at most 0.51 of its radius). Close-ups with holograms cut by the screen edges, switch flipped: identical text.
+- **Empty armor stand layers skipped** (`8b2cf0f`, `p-standlayers`, switch `emptyArmorStandLayers`): stand holograms only
+  (480 lines) static 902.4 -> 949.2 (4 of 5 pairs; 1.05 -> 1.00 ms, 4 of 5), pan 1851.6 vs 1876.5. Pair 2's off run (959.8,
+  above every other off run, one 31.5 ms frame) may be the run during which the screen went off; without that pair 900.9 ->
+  954.8. Close-ups with the switch flipped: holograms identical.
+- Close-up pixel counts: the first-person arm's outline and the enchanted leggings' glint differ between frozen shots of
+  one frame with the same setting (up to ~10k pixels at threshold 1); every diff map of a switch flip showed only those.
+
+**Measured, not changed:**
+- **`TransparentFaces` costs players with resource skins 0.5 ms per frame** (`p-tf-resource`, 150 players with
+  `bench.playerSkins=resource`, switch `transparentFaceCulling` off -> on): static 476.6 -> 382.1 fps (-20%, every pair; render
+  thread 2.03 -> 2.53 ms, ~3.3 us per player), pan 1572.4 -> 1501.5. Each `PlayerModel` cube sees 9 skins per model, more than
+  the 4 texture masks a cube keeps (`ModelPartCubeM.transparentPolygons`, section 8 "Decisions"), so every player's cubes
+  rescan their faces' texels every frame. This is the cache miss noted in section 8; part 1 added a per texture
+  mask cache (`a4d2751`, on `26.3`; merged, but not measured in this scene yet). Downloaded skins (`DynamicTexture`) are not tested by
+  `TransparentFaces` at all, so real online players neither lose nor gain; extending it to them (their `NativeImage` is
+  kept by the texture) would let empty outer-layer faces be skipped exactly once the cache holds many skins.
+- The lobby's GPU frame is 0.82 ms (vanilla 1.50): the hologram text and backgrounds and the players are cheap on the GPU.
+- Probe overheads: with parts the probe slows the lobby from ~320 to ~260 fps; numbers above are per call and rank work only.
+
+**Not tried, with the reasons:**
+- **The player body** (2.8 us per player, the largest single item, plus its per-frame quad sort and its own draw): it can't
+  be instanced in place (strictly ordered translucent group, quads sorted on upload), and moving it to the solid phase is not
+  exact (vanilla draws translucent text backgrounds before the translucent models phase, so a player behind a hologram
+  background is hidden by the background's depth in vanilla). An exact path would keep each player's draw in its sorted
+  place but take its vertices from a per-part GPU pose buffer, and only skip the quad sort for skins with no
+  semi-transparent texels in drawn faces (then the order of opaque and discarded fragments doesn't matter). Large.
+- **Retained or instanced billboard text** (name tags and center-billboard text displays: each frame's geometry is the same
+  label-space quads under a new matrix): would remove most of the remaining glyph writes and upload, but the see-through
+  name tag pass is sorted and needs vanilla's order, and per-label draws would cost more than the writes unless drawn with
+  multi-draw indirect and per-draw instance offsets. Large.
+- Avatar render state reuse (as `ReusedRenderStates` does for armor stands): not tried; the tenth session found no gain
+  for other living entities, and players are where mods attach render state data (Fabric's render state data map), which a
+  reused state would carry over.
+- A display name shortcut (skip building the display name when team, custom name and team prefix/suffix/colour are the
+  same objects): ~0.25 us per name tag, but a mod that injects into `getDisplayName` would show stale names.
+- The player body's per-frame quad sort (1.8 us per player): skipping it for skins without semi-transparent texels is
+  **not** exact (the arm's inner face touches the body's side, and such coplanar faces z-fight in vanilla's per-frame sort
+  order). Reusing last frame's order when a sorted draw's decoded centroids are bit-identical (a still player under a still
+  camera; bobbing is in the projection, not the positions) would be exact, at a hash and compare per sorted draw.
+
+Session start (`011dec9`, the scene only) vs end (`8b2cf0f`), checked out in turn in the worktree:
+- **Lobby** (five pairs, `sess-lobby`): static 271.6 -> 326.4 fps (every pair; render thread 3.57 -> 2.96 ms, p99 low 161.3
+  -> 197.4), pan 959.8 -> 1438.5 (every pair; 0.99 -> 0.56 ms, p99 low 249.8 -> 301.0).
+- **Entity scene** (three pairs, `sess-entities`; ~21 text displays and some named mobs): static 338.6 vs 339.4 (render
+  thread 2.87 -> 2.81 ms), pan 1148.8 -> 1184.4 (every pair; 0.80 -> 0.76 ms).
+- **Mixed scene** (three pairs, `sess-mixed`): static 1567.5 vs 1561.2, pan 1512.5 vs 1507.5, particles 1256.6 vs 1264.5,
+  initial 1113.1 vs 1124.4: unchanged.
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
@@ -1377,7 +1585,8 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 
 ### Decisions and verification notes
 On 2026-10-28 the user reviewed the items below and **kept all of them** (transparent face culling, supporting
-blocks, plane culling and the mod compatibility trade-offs). Nothing is pending. The notes stay as reference; the
+blocks, plane culling and the mod compatibility trade-offs). Nothing from before the nineteenth session is pending (the
+nineteenth session's switches are not reviewed yet). The notes stay as reference; the
 `TransparentFaces` cache miss with instanced parts off was fixed in the nineteenth session (section 7).
 - **`TransparentFaces` (7e76c79) is ~8% slower with instanced parts off** (independent verification after the
   fourteenth session, `results/verify-s14/`): entity scene, `-Pvm.instancedParts=false`, 3 pairs, every pair slower
@@ -1434,6 +1643,16 @@ blocks, plane culling and the mod compatibility trade-offs). Nothing is pending.
   The plane culling commit alone costs the block entity scene only -0.1% (+1-2 us GPU), so most of the -0.65% is not
   from it and is unattributed. Compare retained screenshots at threshold 12, not 1 (time-of-day drift dominates
   threshold 1; retained types show 15-19 px at t12 vs retained off).
+- Nineteenth session, part 1: mod compatibility notes at the end of its entry in section 7 (not reviewed by the user yet).
+- Nineteenth session, part 2 (players and holograms, not reviewed by the user yet), mod compatibility only; each switch is exact
+  for vanilla and can be turned off: `nameTagTextCache` hands the renderer the component the entity showed last when the new
+  one is `equals` to it, so a mod that mutates the name tag component in place after extraction would mutate the kept one,
+  and a mod that relies on a new instance each frame sees the same one (mods that return different names each frame only
+  miss the cache); `textDisplayTextCache` wraps text display lines in a `FormattedCharSequence` of its own, as sign lines
+  already are; `textDisplayCulling` assumes everything a text display draws comes from `TextDisplayRenderer.submitInner`
+  (a mod drawing more for a text display, outside its text, would lose it while the text is off screen; vanilla's own
+  `shouldRender` and mods hooking it still run first); `emptyArmorStandLayers` bypasses mods that inject into vanilla's
+  four armor stand layers to draw something for an armor stand with nothing equipped (mods that add a layer are respected).
 
 1. **Entity scene hot spots** (section 6.9; static ~2.95 ms render thread after the fifteenth session, section 7).
    Done: block model mesh cache, hashed draw lookup, baked quads a quad at a time (10th), instanced parts (11th),
@@ -1482,7 +1701,21 @@ blocks, plane culling and the mod compatibility trade-offs). Nothing is pending.
      Don't A/B ticks with `-Pbench.entityAi=true`: fights and explosions make every run a different scene (creepers left
      3-18, items 419-465 over five runs). The frames with a tick are also slower outside
      the tick, most likely the benchmark harness's handshake and length-biased sampling (section 6.6).
-   - Players and other translucent types stay vanilla (no player in the scene but the spectator).
+   - Players: measured in the players scene (nineteenth session, section 7 "Players and holograms"). Their name tags are
+     done; their body stays on vanilla's translucent vertex path (the largest item per player, 2.8 us plus a per-frame quad
+     sort and a draw of its own), see item 1b. Other translucent types stay vanilla.
+1b. **Players and holograms, next** (section 7 "Players and holograms", in order of expected gain):
+   - `TransparentFaces` with many skins: confirm part 1's per texture mask cache (`a4d2751`, merged) in the players scene with
+     `-Pbench.playerSkins=resource` (here -0.5 ms per frame for 150 players without it), then consider testing downloaded
+     skins too (`DynamicTexture.getPixels`; a skin's empty outer-layer faces would be skipped, exactly).
+   - The shared vertex buffer upload is 0.51 ms of the lobby's 3.2 ms frame (light profiler depth 6), ~0.37 ms of it the
+     sorted draws (upload table of `-Pbench.entityCost=true`, added this session); each player body's 72 quads are sorted
+     every frame (1.8 us per player). Reusing last frame's order for sorted draws with bit-identical centroids is exact;
+     skipping the sort for opaque skins is not (coplanar touching faces, section 7).
+   - The player body as a per-player draw fed from a GPU pose buffer, in its sorted place (exact only with vanilla's quad
+     order or for skins without semi-transparent texels). Large.
+   - Retained/instanced billboard text for name tags (normal pass only; the see-through pass is sorted) and text displays.
+   - Per player extraction (1.6 us) and layer submission (1.4 us) are a long tail of vanilla work.
 2. **Per entity and block entity cost in the server scene** (twelfth and seventeenth session measurements in section 7).
    The server is gone; the mixed scene (section 6.1) has the same mix and is where this continues.
    The static view is GPU bound (GPU frame ~0.84 ms, render thread ~0.72 ms), so CPU work there shows in the render thread
@@ -1581,7 +1814,9 @@ blocks, plane culling and the mod compatibility trade-offs). Nothing is pending.
   `DistanceSorting` uses a `ThreadLocal` because sorting can run on worker threads. `SignTextCache`,
   `ModelCulling`, `ModelGeometryCache`, `ParallelUploadCopy` and `RetainedBlockEntities` are static, render-thread-only
   state (`ParallelUploadCopy`'s worker only copies chunks of the current job; `RetainedBlockEntities.markDirty`/`clear`
-  may be called from other threads and only queue work).
+  may be called from other threads and only queue work). `EntityTextCache` keeps name tags in `Entity` and
+  `MutableComponent` fields and only reads or writes them on the render thread (`RenderSystem.isOnRenderThread()`); a
+  name tag built elsewhere (a GUI preview on another thread) takes vanilla's path.
 - **Assumptions of the model caches/culling:** world features are camera-relative (eye at the origin) and
   drawn with a perspective projection; `Float`-state models are pure functions of that state in `setupAnim`;
   atlas sprites are replaced (not mutated) on resource reload, so identity keys stay valid.

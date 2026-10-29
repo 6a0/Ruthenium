@@ -51,6 +51,14 @@ public class Config {
     public boolean fastSupportingBlocks = true;
     /** Resting entities keep the block collision answer of their move while no block of the client level near them changes */
     public boolean fastRestingCollisions = true;
+    /** Name tags equal to the ones an entity showed last keep their width, visual order and prepared glyphs */
+    public boolean nameTagTextCache = true;
+    /** Text display lines keep their prepared glyphs across frames */
+    public boolean textDisplayTextCache = true;
+    /** Text displays without a culling size are frustum culled by the extent of their text */
+    public boolean textDisplayCulling = true;
+    /** Armor stands with empty equipment skip their (vanilla) layers and the model pose for them */
+    public boolean emptyArmorStandLayers = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */

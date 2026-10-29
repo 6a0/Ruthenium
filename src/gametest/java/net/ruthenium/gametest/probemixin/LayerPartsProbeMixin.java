@@ -4,13 +4,17 @@ import com.llamalad7.mixinextras.injector.wrapmethod.WrapMethod;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.entity.layers.CapeLayer;
 import net.minecraft.client.renderer.entity.layers.HumanoidArmorLayer;
 import net.minecraft.client.renderer.entity.layers.ItemInHandLayer;
+import net.minecraft.client.renderer.entity.layers.ParrotOnShoulderLayer;
+import net.minecraft.client.renderer.entity.layers.StuckInBodyLayer;
+import net.minecraft.client.renderer.entity.layers.WingsLayer;
 import net.minecraft.client.renderer.entity.state.EntityRenderState;
 import net.ruthenium.gametest.EntityCostProbe;
 import org.spongepowered.asm.mixin.Mixin;
 
-@Mixin({HumanoidArmorLayer.class, ItemInHandLayer.class})
+@Mixin({HumanoidArmorLayer.class, ItemInHandLayer.class, CapeLayer.class, WingsLayer.class, ParrotOnShoulderLayer.class, StuckInBodyLayer.class})
 public class LayerPartsProbeMixin {
     @WrapMethod(method = "submit(Lcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/SubmitNodeCollector;ILnet/minecraft/client/renderer/entity/state/EntityRenderState;FF)V")
     private void timeLayer(PoseStack poseStack, SubmitNodeCollector collector, int light, EntityRenderState state, float yRot, float xRot,
