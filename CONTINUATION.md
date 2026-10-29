@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-29 (twenty-third session; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-29 (twenty-fourth session; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -101,8 +101,13 @@ draw (all phases, see-through included), unsorted draws are indirect multi-draws
 vanilla's order from CPU centroids. Exact: 0 mismatches over 24M labels, 0 pixels across the switch in frozen close-ups (Vulkan and
 OpenGL; a new `bench.labelVariety` wall of special labels) except vanilla's obfuscated text. Lobby static 398.8 -> 479.1 fps (render
 thread 2.43 -> 2.03 ms), moving players 382.9 -> 457.6, holograms only 1226.9 -> 1721.0, OpenGL lobby 329.5 -> 392.7; mixed unchanged,
-entity scene ~1.5% lower (unexplained, at its resolution). Also: the nineteenth session's claim that text backgrounds draw before the
-translucent models was wrong (they draw after).
+entity scene ~1.5% lower (explained and fixed in the twenty-fourth). Also: the nineteenth session's claim that text backgrounds draw
+before the translucent models was wrong (they draw after).
+Twenty-fourth session (section 7, "Twenty-fourth session"): the entity scene's regression with Retained Labels was **a fixed ~20 us per
+frame in `vkQueueSubmit2` that the NVIDIA Vulkan driver charges any submit using a texel buffer** (vanilla pays it too with clouds on), plus
+the per-push `VkBufferView`; label poses are now an RGBA32F texture. Entity scene with the switch: pan lower in 5 of 5 pairs before, now
+1198.5 -> 1203.4 (4 of 5 higher), static 339.9 -> 344.1; lobby static 390.0 -> 478.2, pan 1521.6 -> 1574.1. New tool: an in-launch A/B
+of a switch (`bench.toggleField`, section 6.6), which resolves ~0.5% where 5 interleaved launches resolve ~1.5%.
 
 
 **Renamed to Ruthenium (2026-10-28, eighteenth session).** The project is now **Ruthenium**: mod id `ruthenium`, package
@@ -217,9 +222,11 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   ms GPU per frame since a restart on 28/10 (section 7, nineteenth session, "After the merge"). GPU bound numbers compare only
   within a session.
 - **Twenty-third session** (section 7): labels retained ("Retained Labels", `retainedLabels`): label-space glyph meshes in one vertex
-  buffer, per-frame pose rows and light per label in a texel buffer, vanilla's draws and quad order (indirect multi-draws over arena
+  buffer, per-frame pose rows and light per label in a pose texture (a texel buffer until the twenty-fourth session), vanilla's draws and quad order (indirect multi-draws over arena
   ranges for unsorted draws, CPU-sorted indices for `text_polygon_offset`). Lobby static +20% (2.43 -> 2.03 ms), holograms only +40%,
   OpenGL lobby +19%; 0 mismatches over 24M labels, 0 pixels across the switch except obfuscated text.
+- **Twenty-fourth session** (section 7): the entity scene's ~1.5% loss with Retained Labels was the texel buffer (a fixed ~20 us per
+  frame in the NVIDIA driver's `vkQueueSubmit2`); poses now go through an RGBA32F texture. In-launch switch A/B (`bench.toggleField`).
 - **Next:** see section 8.
 
 ---
@@ -333,7 +340,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/render/blockentity/LevelExtractorM.java` + `FrustumAccessor.java` + `render/blockentity/BlockEntityCulling.java` | `@Overwrite extractVisibleBlockEntities`: vanilla's loop with per-block-entity frustum culling inlined. Conservative box: block ±1, +2 extra on top. **Vanilla block entity types only.** Each section is classified once (inside/outside/partial with the same margins), then 4³ cells of partial sections, and only block entities in partial cells are tested individually. Positions and cullability come from `CompiledSectionMeshM` (`interfaces/BlockEntityPositions`, packed once per compiled mesh) by list index, so culled block entities are not even loaded from the list. The destruction progress map is skipped while empty. Fabric API doesn't inject into this method (checked) |
 | `mixin/render/vertex/StagedVertexBufferSortM.java` + `render/vertex/SortOrderCache.java` + `render/vertex/SortedQuadIndices.java` | **Sort order reuse** (twenty-first session, switch `reuseSortOrder`, "Reuse Sort Order"). A `@WrapOperation` on `writeSortedIndexBuffer` in `StagedVertexBuffer.uploadDrawsToBuffers` sorts each sorted draw whose `VertexSorting` is a `DistanceSorting.Sorter` through a per buffer `SortOrderCache`: the draw is matched to an entry by quad count and the half-block cell of its first centroid, and `Sorter.sortFrom` insertion sorts from the entry's order (in place), falling back to the full sort after 4n+64 moves; no entry: full sort, new entry. Entries unused for 4 uploads are dropped (the level's and the hand's features share one buffer). Exact because every sort orders by the same strict total order (key, then quad index), whatever the start. Other `VertexSorting`s (mods) take the vanilla call. `SortedQuadIndices` holds the index writer `MeshDataSortStateM` used to keep |
 | `render/entity/PlayerPoseDraws.java` + `mixin/render/feature/{RenderTypeFeatureRendererM,RenderTypeFeatureRendererGroupM}.java` + `mixin/render/vertex/StagedVertexBufferDrawM.java` + `ModelPartM`/`ModelPartCubeM`/`ModelM`/`ModelFeatureRendererM` + `interfaces/{PosedDrawGroup,PosedDrawHolder,PosedPart,PoseLayoutHolder,TransparentCube}` + `assets/ruthenium/shaders/core/player_pose.vsh` | **Player bodies drawn from poses** (twenty-second session, switch `playerPoseDraws`, "GPU Player Poses"). A submit of the exact `PlayerModel` class with vanilla's `entity_translucent` pipeline (no UV mapping, no decal) in a strictly ordered group of the world's features (the translucent models phase), without OIT, is not written: `ModelFeatureRendererM.prepareModel` hands it to `PlayerPoseDraws.prepare`, which runs vanilla's `setupAnim` and part tree into a sink, and `ModelPart.compile` passes each written part's pose to `capturePart` instead of writing its cubes. Each `PlayerModel` instance (wide, slim, per renderer) gets a layout: one slot per part with cubes (max 12) and a static mesh of its cubes in part space (position, UV, normal as floats, member and slot as `RG16_SINT`), in 8 copies, one per member of a draw. Per member (1184 B of a std140 uniform block): light and overlay as the entity format's shorts, color, and per slot the pose rows and the normal matrix rows (w: normalize or not). The member joins the group's draws exactly as `getVertexBuilder` would place its vertices (`PosedDrawGroup`: a new staged draw via `getOrAddDraw`, or the group's last draw when the render type repeats, i.e. consecutive bodies of one skin share a draw as in vanilla); the staged draw stays empty (skipped on upload) and carries the posed draw (`StagedVertexBufferDrawM`), which `RenderTypeFeatureRendererM` draws in its place (a redirect of `executeGroup`'s `getExecuteInfo`): a copy of `entity_translucent` with `player_pose.vsh`, the draw's prepared transforms and textures, its uniform slice (`PlayerPoses`, offset aligned to `minUniformOffsetAlignment`, the full 9472 B block bound) and 16-bit indices from a ring buffer. **Order:** each face's centroid is computed on the CPU from the same JOML `transformPosition` of its vertices 0 and 2 and the same `(a + b) / 2.0F` as `MeshData.decodeQuadCentroids`, faces are numbered in vanilla's write order (part tree, cubes, polygons, minus the faces `TransparentFaces` skips, through `ModelPartCubeM`'s per texture masks), and the draw's own `VertexSorting` sorts them (`SortOrderCache` start orders with `reuseSortOrder`), after the world's features are prepared (`upload`). **GPU arithmetic:** positions in JOML's operation order with `precise` (as `instanced_part.vsh`); normals as vanilla writes them: `Matrix3f.transform` order, `normalize` only for untrusted normals, truncated to signed bytes and decoded through a table of `max(c / 127.0F, -1.0F)`. A vanilla write that joins a posed draw (same render type, consecutive) writes the posed members first with vanilla's path (`materialize`, from a redirect of the staged builder fetch in `Group.getVertexBuilder`); captures fail (vanilla path) for parts that aren't the layout's, a part written twice or any vertex written to the sink (mods), and a model whose captures fail 64 times in a row takes vanilla's path until the next clear. Max 64 layouts; cleared on resource reload and when toggled. Render thread only |
-| `render/text/RetainedLabels.java` + `SignTextCache.KeptText` + `mixin/render/text/TextFeatureRendererM.java` (visit redirect) + `RenderTypeFeatureRendererM`/`RenderTypeFeatureRendererGroupM`/`StagedVertexBufferDrawM` + `mixin/render/vertex/StagedVertexBufferAccessor.java` + `interfaces/LabelDrawHolder` + `assets/ruthenium/shaders/core/label_text.vsh` + access widener (`TextFeatureRenderer$GlyphRenderer`) | **Retained labels** (twenty-third session, switch `retainedLabels`, "Retained Labels"; section 8's bigger job 2). Text submits without outline whose prepared text `SignTextCache` keeps (name tags, text display lines, signs that aren't retained; never obfuscated text) are not written: from a kept text's second frame its quads are recorded once in label space (the coordinates handed to `addVertex(pose, x, y, z)`, UV, color; only `BakedSheetGlyph` glyph and effect instances, at most 2048 quads) into an arena vertex buffer (28 B per vertex, each tagged with the label's region; at most 16384 regions, a full arena is replaced next frame). Each run of glyphs with one render type picks the group's draw exactly as `Group.getVertexBuilder` would (`joiningDraw`/`getOrAddDraw`, so merged, new and strictly ordered draws are vanilla's) and joins that draw's `LabelDraw` if the draw holds no vertices; else it is written as vanilla writes it, and a vanilla write joining a label draw writes its labels first (`materialize`). Per label per frame: its pose rows and light into a texel buffer (64 B per region). Upload: unsorted draws as indirect multi-draws over ranges of the arena with the sequential quad index buffer (consecutive labels placed together are one range; gated like vanilla's terrain MDI), else 16/32-bit indices; sorted draws (`text_polygon_offset`, `text_grayscale_see_through`) get indices in the order of their own sorting over CPU centroids (JOML's `transformPosition` of vertices 0 and 2, `/ 2.0F`), kept from last frame when every input is bit-identical. Drawn in the staged draw's place with copies of the six world text pipelines and `label_text.vsh` (`precise` JOML-order position). Exact: 0 mismatches in positions, runs, UV, color, light and sort order over 24M labels; 0 pixels differ across the switch in frozen close-ups on Vulkan and OpenGL except vanilla's obfuscated text (random glyphs, also with an unrelated switch). Not with OIT. Cleared on resource reload and when toggled |
+| `render/text/RetainedLabels.java` + `SignTextCache.KeptText` + `mixin/render/text/TextFeatureRendererM.java` (visit redirect) + `RenderTypeFeatureRendererM`/`RenderTypeFeatureRendererGroupM`/`StagedVertexBufferDrawM` + `mixin/render/vertex/StagedVertexBufferAccessor.java` + `interfaces/LabelDrawHolder` + `assets/ruthenium/shaders/core/label_text.vsh` + access widener (`TextFeatureRenderer$GlyphRenderer`) | **Retained labels** (twenty-third session, switch `retainedLabels`, "Retained Labels"; section 8's bigger job 2). Text submits without outline whose prepared text `SignTextCache` keeps (name tags, text display lines, signs that aren't retained; never obfuscated text) are not written: from a kept text's second frame its quads are recorded once in label space (the coordinates handed to `addVertex(pose, x, y, z)`, UV, color; only `BakedSheetGlyph` glyph and effect instances, at most 2048 quads) into an arena vertex buffer (28 B per vertex, each tagged with the label's region; at most 16384 regions, a full arena is replaced next frame). Each run of glyphs with one render type picks the group's draw exactly as `Group.getVertexBuilder` would (`joiningDraw`/`getOrAddDraw`, so merged, new and strictly ordered draws are vanilla's) and joins that draw's `LabelDraw` if the draw holds no vertices; else it is written as vanilla writes it, and a vanilla write joining a label draw writes its labels first (`materialize`). Per label per frame: its pose rows and light (64 B per region) into an RGBA32F pose texture (256 x 256 texels, four per region, row r holding regions 64r to 64r + 63; the rows in use written with `writeToTexture` each frame, read with `texelFetch`; ordered after the last frame's label draws by the full barrier that ends every Vulkan render pass). Not a texel buffer: on the NVIDIA Vulkan driver any texel buffer in a submit costs ~20 us in `vkQueueSubmit2` (twenty-fourth session). Upload: unsorted draws as indirect multi-draws over ranges of the arena with the sequential quad index buffer (consecutive labels placed together are one range; gated like vanilla's terrain MDI), else 16/32-bit indices; sorted draws (`text_polygon_offset`, `text_grayscale_see_through`) get indices in the order of their own sorting over CPU centroids (JOML's `transformPosition` of vertices 0 and 2, `/ 2.0F`), kept from last frame when every input is bit-identical. Drawn in the staged draw's place with copies of the six world text pipelines and `label_text.vsh` (`precise` JOML-order position). Exact: 0 mismatches in positions, runs, UV, color, light and sort order over 24M labels; 0 pixels differ across the switch in frozen close-ups on Vulkan and OpenGL except vanilla's obfuscated text (random glyphs, also with an unrelated switch). Not with OIT. Cleared on resource reload and when toggled |
 | `mixin/render/vertex/MeshDataSortStateM.java` | `@Overwrite` `writeSortedIndexBuffer`/`buildSortedIndexBuffer`: sorted quad indices written with `MemoryUtil` puts instead of an `IntConsumer` per index. Sign text (`text_polygon_offset`) is sorted on upload and needs 32-bit indices with ~500 signs |
 | `render/text/SignTextCache.java` + `mixin/render/text/{SignTextM,AbstractSignRendererM,TextFeatureRendererM,FontSetM}.java` | `SignText.getRenderMessages` wraps each line (only when recomputed) in a `FormattedCharSequence` that carries its width and `Font.PreparedText` (plain/shadowed/outline, keyed by x/y/colours). Obfuscated lines are not cached; `FontSet.resetTextures` bumps a generation. A first version with a global identity map was slower than no cache. `AbstractSignRendererM` also skips the text of a sign side whose plane faces away from the eye by ≥ 0.55 blocks (`ModelCulling.isSignTextHidden`): polygon-offset text pipelines (and their OIT sets) cull back faces, checked at runtime. Glyph quads wind like (0,0),(0,1),(1,1), so the side's facing is `column1 × column0` of the pose |
 | `render/entity/ModelCulling.java` + `mixin/render/feature/LevelRendererM.java` | Flags the world's `FeatureRenderDispatcher.prepareFrame`, `LevelRenderer.submitBlockEntities` (for sign text) and the current model's render type. When the pipeline culls (`RenderPipeline.isCull()`), `ModelPartCubeM` skips faces the GPU would cull: `(v1-v0)x(v2-v0)` of the transformed corners points away from every eye position within 0.5 blocks of the origin (camera-relative positions; bobbing moves the eye ~0.1). Degenerate faces are kept. `skipDuplicateQuads()` is true for render types without blending or upload sorting (drawing a quad twice is then idempotent) |
@@ -593,6 +600,24 @@ table books (red specks in the chest cube).
   measured 3.2% in the A/B. Rank with JFR, decide with A/Bs.
 - A foreground Bash command running longer than ~3 minutes is moved to the background; wait with a loop of at most
   ~170 s per call, or with the background task's notification.
+
+**Twenty-fourth session tools:**
+- **In-launch A/B of a switch** (`ToggleAb`): `-Pbench.toggleField=<Config field>` (entity and players scenes) adds, after the scene's
+  phases, `bench.toggleRounds` rounds (default 8) of the static view and of the pan (`bench.togglePhases=static,pan`), each round both
+  settings in ABBA order: the field is set by reflection (no `clear()`), `bench.toggleWarmup` seconds (1) discarded, then
+  `bench.toggleSeconds` (3) of the static view or a full pan of `bench.togglePanSeconds` (5). Logs each round (`static-on-3`, ...; also in
+  the JSON) and a summary line `Toggle A/B static <field>: ... off/on per round [...] (median, mean, k of n higher)`. Both settings run on
+  code compiled for both, so it measures the switch's direct cost, not JIT shape. Resolution: rounds spread ~+-1% (static) and the first
+  one or two rounds drift (warm-up); a 2.4% effect showed in 10 of 10 rounds, a ~0.5% one in 7 of 10. With `-Pbench.lightProfile=9` each
+  round's profiler tree is logged; a small script that parses the `Light profile of <phase>-<on|off>-<n>` blocks and prints the mean
+  ms/frame difference per section path, largest first, found the cause in one launch (`profdiff.py`, kept as
+  `scripts/profdiff.py`). Use 2 s scene phases (`-Pbench.staticSeconds=2 -Pbench.panSeconds=2`); ~1m45s per launch with static rounds only.
+- **The light profiler splits `submit` further** (`VulkanCommandEncoderProfileMixin`): `awaitGpu`, `endCommandBuffer`, `queueSubmit`
+  (`VulkanQueue$Submission.close`, i.e. `vkQueueSubmit2`), `destroyQueue`, `poolReset`, `transientEnd`, `transientBegin`.
+- `-Pbench.entityClouds=true`: fancy clouds in the entity scene (off by default; screenshots of different runs then differ).
+- **Driver cost to know:** on the NVIDIA Vulkan driver (RTX 4060 Laptop) a submit that uses any texel buffer costs ~20 us more in
+  `vkQueueSubmit2` (0.042 -> 0.062 ms per frame), the same for 1 or 5 draws per pipeline and with device-local buffers; vanilla's clouds
+  pay it. Prefer textures (`texelFetch`) or uniform buffers for per-frame data read by shaders.
 
 **Fourteenth session tools:**
 - `java scripts/JfrTree.java <file.jfr> main [--from HH:MM:SS] [--to HH:MM:SS] [--under Class.method] [--depth N]`: the JFR
@@ -1752,7 +1777,7 @@ under the shared GPU lock (another agent benchmarked a block entity scene at the
   slice's offset and range). **Texel buffers** (`samplerBuffer`; vanilla's clouds read one with `gl_VertexIndex` and no vertex
   buffer, on both backends) take only a whole buffer (`FrontendRenderPass`: "Uniform texel buffers do not support a slice of a
   buffer"), and on Vulkan every descriptor push with a texel buffer bound creates a `VkBufferView` and queues its destruction
-  (`VulkanRenderPass.pushDescriptors`), i.e. one driver call per draw here. So: one uniform slice per draw, no per-part sub-draws.
+  (`VulkanRenderPass.pushDescriptors`), i.e. one driver call per draw here. (Twenty-fourth session: on the NVIDIA driver any texel buffer in a submit also costs a fixed ~20 us in `vkQueueSubmit2`.) So: one uniform slice per draw, no per-part sub-draws.
 - *How is the sorted draw's index buffer produced?* `StagedVertexBuffer.uploadDrawsToBuffers` decodes each sorted draw's centroids
   from its written vertex slices (`decodeSortingPoints` -> `MeshData.decodeQuadCentroids`: per quad `(v0 + v2) / 2.0F`), builds
   `MeshData.SortState` and writes the indices into the staging buffer (`writeSortedIndexBuffer`, wrapped by `StagedVertexBufferSortM`);
@@ -1997,7 +2022,8 @@ of that run, 8 shots: 0 stable pixels except the obfuscated text.
 frame at the static view, upload 5-8 us and label submits ~8 us per frame (with the timers' own cost), no fallback runs, no materialized
 draws, and almost no labels in the pan, so the label path costs less than the ~45 us of glyph writes it replaces. Not explained further
 (the entity scene's resolution is ~1.5-3% with 3 pairs, section 6.6); with both switch sides sharing every other hook, only the label
-path, its per-frame ring rotations (three `MappableRingBuffer`s once used) and its draws differ.
+path, its per-frame ring rotations (three `MappableRingBuffer`s once used) and its draws differ. **Explained in the twenty-fourth session:**
+the texel buffer of poses (a fixed ~20 us per frame in the NVIDIA driver's `vkQueueSubmit2`); fixed by a pose texture.
 
 **Mod compatibility** (exact for vanilla; switch "Retained Labels"): mods that act on the written text vertices (a `VertexConsumer`
 wrapper on the group's builder, mixins into `BakedSheetGlyph.render`, `BufferBuilder` or the upload's sort of those draws) don't see the
@@ -2008,6 +2034,69 @@ text pipelines would not swap the `label_*` copies (as with the instanced, retai
 Not verified: OIT (not accepted: vanilla's path), hardware without indirect multi-draw (the per-quad index path ran on OpenGL with
 `noIndirect`: 0 stable pixels), TrueType fonts (the recorder takes any `BakedSheetGlyph`), hardware other than
 the RTX 4060 Laptop, mods.
+
+### Twenty-fourth session (2026-10-29)
+The twenty-third session's open issue: the entity scene ran ~1.5% slower with `retainedLabels` on (5 of 5 pan pairs, 3 of 5 static), although
+counters put the label path at ~15 us per frame, less than the glyph writes it replaces. One agent on `26.3` (main tree). Results in
+`results/s24-dev/`, `results/s24-labels-entities`, `results/s24-labels-lobby`, `results/s24-final-toggle-*`, logs `build/bench-logs/s24-*.log`.
+Commit `48af349`.
+
+**Method.** An in-launch A/B (`bench.toggleField=retainedLabels`, new, section 6.6) first: 10 rounds, entity scene, off/on fps per round
+median **1.0242 static (10 of 10 off faster), 1.0261 pan (10 of 10)**, render thread 2.79 -> 2.85 ms. So the cost is real, direct (both
+settings on the same compiled code, not JIT shape) and on the render thread's CPU: frames without a tick 2.77 -> 2.83 ms. The light profiler
+at depth 9 per round (on minus off, mean of the later rounds): `frame/submit` **+23-25 us** (0.052 -> 0.076 ms), of which the new
+`queueSubmit` split (`vkQueueSubmit2`) **+20 us** (0.042 -> 0.062); `executeFrameGraph` +12 us (label draws recorded; `renderSolidFeatures/Text`
++6 us), label upload +4 us, `present` +5 us; against `prepare/Text` -14 us (the glyph writes saved). Eliminations, each one launch of 8 rounds
+(temporary properties in `RetainedLabels.draw`/`upload` and the entity scene, removed):
+
+| variant (on side) | off/on static median | `queueSubmit` on - off |
+|---|---|---|
+| as committed in `4890a5d` | 1.017-1.024 | +20 us |
+| label draws skipped (labels invisible) | 0.991 (on faster) | ~0 |
+| state bound, no draw call (no descriptor push) | 0.999 | ~0 |
+| no indirect draws (16/32-bit indices) | 1.019 | +20 us (not MDI) |
+| each draw issued 5 times, with a new push (and `VkBufferView`) each | 1.012 | +20 us (does not scale) |
+| each draw issued 5 times, one push | 1.013 | +22 us |
+| poses written into a device-local buffer (`writeToBuffer`) | 1.023 | +21 us (not mapped memory) |
+| poses, indices and commands all device-local | 1.017 | +21 us |
+| **clouds on** (vanilla's clouds read a texel buffer) | **1.002** | **~0**: vanilla's `queueSubmit` is 0.063 ms on both sides |
+| **poses in an RGBA32F texture** (the fix) | 0.991 | +0.2 us |
+
+**Cause:** on this NVIDIA Vulkan driver, a submit whose command buffer uses any texel buffer costs a fixed ~20 us more in `vkQueueSubmit2`,
+whatever the number of draws or buffer views (vanilla's clouds pay it whenever clouds are on, and then the switch's own cost is ~0); plus
+~5 us per frame of recording, most likely the `VkBufferView` that `VulkanRenderPass.pushDescriptors` creates for every push with a texel
+buffer bound (`renderSolidFeatures/Text` +6.3 us before, +0.7 us after). The lobby's gain hid it (its pan gain was +1.5% then, +3.4% now).
+Not checked: AMD/Intel drivers. The OpenGL lobby's pan was lower with the switch on in 3 of 3 pairs in the twenty-third session and is
+higher in 4 of 4 in-launch rounds now, which suggests a texel buffer cost on OpenGL too (not measured separately).
+
+**Fix** (`48af349`): the pose rows and light go into an RGBA32F texture, 256 x 256 (four texels per region; region r at texels 4r..4r+3,
+texel t at (t & 255, t >> 8)), created once; each frame `writeToTexture` uploads the rows holding regions 0..maxRegion (whole rows of
+`poseBytes`; other regions' texels are never read that frame), and `label_text.vsh` reads them with `texelFetch(sampler2D, ivec2, 0)` (nearest,
+clamp). Same bytes, same shader arithmetic, so the positions stay bit-identical. A single texture is safe: the copy is recorded outside
+render passes and every Vulkan render pass ends with an ALL_COMMANDS memory barrier (`submitRenderPass`), so last frame's label draws are
+ordered before it; OpenGL synchronizes `glTexSubImage2D` itself. The pose `MappableRingBuffer` is gone (the index and command rings stay).
+
+**Exactness:** frozen close-ups, `closeToggle=retainedLabels`, 8 shots, `StableDiff` at 1 and 2 levels: players lobby with `labelVariety` and
+`playersHurt`: close0 and close1 0 stable pixels on Vulkan and OpenGL, close2 only the obfuscated "Obf" label (2 px Vulkan, 9 px OpenGL,
+checked on crops; random glyphs, see the twenty-third session); entity scene close0-7 0 stable pixels (Vulkan; with 4 shots one 2-level
+pixel on a dropped item's edge in close7, gone with 8). The CPU-side data (pose rows, light, indices, sort orders) is unchanged, so
+`scripts/patches/s23-label-check.patch` was not re-run; the label path was active on both backends (the `prepare/Text` savings in the
+profiler, the OpenGL lobby gain).
+
+**Numbers** (switch off -> on; fps; render thread ms per frame):
+
+| | static | pan |
+|---|---|---|
+| entities, in-launch, 10 rounds, before (`s24-dev/toggle1`) | off/on 1.0242 (10 of 10 off faster) | 1.0261 (10 of 10) |
+| entities, in-launch, 10 rounds, after (`s24-final-toggle-entities`) | 346.0 vs 345.1, off/on 1.0062 (7 of 10), 2.82 vs 2.82 ms | 1184.2 -> 1186.3, 1.0004 (5 of 10) |
+| entities, 5 interleaved pairs, `staticSeconds=10` (`s24-labels-entities`) | 339.9 -> 344.1 (3 of 5 higher), p99 158.0 -> 168.6, 2.85 -> 2.80 | 1198.5 -> 1203.4 (4 of 5), p99 301.1 -> 303.7 |
+| lobby, 3 pairs (`s24-labels-lobby`) | 390.0 -> 478.2 (every pair), p99 228.8 -> 257.8, 2.49 -> 2.00 | 1521.6 -> 1574.1 (every pair), 0.54 -> 0.53 |
+| OpenGL lobby, in-launch, 4 rounds (`s24-final-toggle-gl-lobby`) | 317.7 -> 400.1 (every round), 3.02 -> 2.44 | 1271.2 -> 1302.8 (every round) |
+
+Still open: a ~0.3-0.6% static residual in the entity scene's in-launch A/B (7 of 10 rounds, about 1-2 standard errors; frames without a
+tick 2.796 vs 2.809 ms): the label upload (one `writeToTexture` and two ring maps every frame, ~4-5 us) and the label submits roughly cancel
+the ~15 us of glyph writes saved there. Skipping the pose upload when the rows are bit-identical to last frame's would only help static
+views; not done. The submit split and `ToggleAb` stay in the harness.
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
