@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-29 (twenty-first session; twentieth session; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-29 (twenty-second session; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -87,6 +87,13 @@ Twenty-first session (section 7, "Twenty-first session"): **sorted draws start t
 (`SortOrderCache`, switch "Reuse Sort Order"; exact: the sort's order is unique, so the start only changes its speed). Players
 static 482.7 -> 540.6 fps (render thread 1.99 -> 1.80 ms), lobby 328.0 -> 352.9 (2.96 -> 2.73), moving players 465.3 -> 511.1.
 "Still" players are not bit-identical frame to frame (idle arm bob), so reuse keyed on identical centroids would have missed.
+Twenty-second session (section 7, "Twenty-second session"): **player bodies are drawn from a part-space mesh and per-frame part
+poses** (`PlayerPoseDraws`, switch "GPU Player Poses"; section 8's bigger job 1): each body keeps its draw's place in the strictly
+ordered translucent group, the GPU poses a static mesh from a uniform slice per draw, and the faces are sorted from centroids
+computed on the CPU with vanilla's float operations. Exact: 0 mismatches in positions, centroids, normals and index order over 5.86M
+posed members; 0 pixels differ across the switch in frozen close-ups (Vulkan and OpenGL). Players static 523.6 -> 603.5 fps (render
+thread 1.86 -> 1.60 ms), 150 skins 514.1 -> 605.0, moving players 507.7 -> 581.1, lobby 351.6 -> 397.3 (2.76 -> 2.45 ms), OpenGL
+players 417.7 -> 465.0; mixed and entity scenes within noise.
 
 
 **Renamed to Ruthenium (2026-10-28, eighteenth session).** The project is now **Ruthenium**: mod id `ruthenium`, package
@@ -193,6 +200,10 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
 - **Twenty-first session** (section 7): sorted draws (player bodies, see-through name tags) start an insertion sort from their
   order in the last upload ("Reuse Sort Order", `reuseSortOrder`): players static +12%, lobby +7.6%, moving players +10%; 0
   mismatches against vanilla's sort over 4.97M draws.
+- **Twenty-second session** (section 7): player bodies drawn from a GPU pose buffer ("GPU Player Poses", `playerPoseDraws`):
+  a static part-space mesh per `PlayerModel`, per-frame part poses in a uniform slice per draw, each body's draw in vanilla's place
+  and quad order (CPU centroids with vanilla's float operations). Players static +15%, 150 skins +18%, moving +14%, lobby +13%,
+  OpenGL +11%; 0 mismatches over 5.86M members, 0 pixels across the switch.
 - **Next:** see section 8.
 
 ---
@@ -305,6 +316,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/render/particle/ParticleEngineM.java` + `ClientPacketListenerM.java` + `interfaces/ParticleSpawnLimiter.java` | Drops particles whose group is full (exact) and caps queued candidates per group per tick at 8×16384 (peak count within ~1% of vanilla). The packet loop stops once dropping starts |
 | `mixin/render/blockentity/LevelExtractorM.java` + `FrustumAccessor.java` + `render/blockentity/BlockEntityCulling.java` | `@Overwrite extractVisibleBlockEntities`: vanilla's loop with per-block-entity frustum culling inlined. Conservative box: block ±1, +2 extra on top. **Vanilla block entity types only.** Each section is classified once (inside/outside/partial with the same margins), then 4³ cells of partial sections, and only block entities in partial cells are tested individually. Positions and cullability come from `CompiledSectionMeshM` (`interfaces/BlockEntityPositions`, packed once per compiled mesh) by list index, so culled block entities are not even loaded from the list. The destruction progress map is skipped while empty. Fabric API doesn't inject into this method (checked) |
 | `mixin/render/vertex/StagedVertexBufferSortM.java` + `render/vertex/SortOrderCache.java` + `render/vertex/SortedQuadIndices.java` | **Sort order reuse** (twenty-first session, switch `reuseSortOrder`, "Reuse Sort Order"). A `@WrapOperation` on `writeSortedIndexBuffer` in `StagedVertexBuffer.uploadDrawsToBuffers` sorts each sorted draw whose `VertexSorting` is a `DistanceSorting.Sorter` through a per buffer `SortOrderCache`: the draw is matched to an entry by quad count and the half-block cell of its first centroid, and `Sorter.sortFrom` insertion sorts from the entry's order (in place), falling back to the full sort after 4n+64 moves; no entry: full sort, new entry. Entries unused for 4 uploads are dropped (the level's and the hand's features share one buffer). Exact because every sort orders by the same strict total order (key, then quad index), whatever the start. Other `VertexSorting`s (mods) take the vanilla call. `SortedQuadIndices` holds the index writer `MeshDataSortStateM` used to keep |
+| `render/entity/PlayerPoseDraws.java` + `mixin/render/feature/{RenderTypeFeatureRendererM,RenderTypeFeatureRendererGroupM}.java` + `mixin/render/vertex/StagedVertexBufferDrawM.java` + `ModelPartM`/`ModelPartCubeM`/`ModelM`/`ModelFeatureRendererM` + `interfaces/{PosedDrawGroup,PosedDrawHolder,PosedPart,PoseLayoutHolder,TransparentCube}` + `assets/ruthenium/shaders/core/player_pose.vsh` | **Player bodies drawn from poses** (twenty-second session, switch `playerPoseDraws`, "GPU Player Poses"). A submit of the exact `PlayerModel` class with vanilla's `entity_translucent` pipeline (no UV mapping, no decal) in a strictly ordered group of the world's features (the translucent models phase), without OIT, is not written: `ModelFeatureRendererM.prepareModel` hands it to `PlayerPoseDraws.prepare`, which runs vanilla's `setupAnim` and part tree into a sink, and `ModelPart.compile` passes each written part's pose to `capturePart` instead of writing its cubes. Each `PlayerModel` instance (wide, slim, per renderer) gets a layout: one slot per part with cubes (max 12) and a static mesh of its cubes in part space (position, UV, normal as floats, member and slot as `RG16_SINT`), in 8 copies, one per member of a draw. Per member (1184 B of a std140 uniform block): light and overlay as the entity format's shorts, color, and per slot the pose rows and the normal matrix rows (w: normalize or not). The member joins the group's draws exactly as `getVertexBuilder` would place its vertices (`PosedDrawGroup`: a new staged draw via `getOrAddDraw`, or the group's last draw when the render type repeats, i.e. consecutive bodies of one skin share a draw as in vanilla); the staged draw stays empty (skipped on upload) and carries the posed draw (`StagedVertexBufferDrawM`), which `RenderTypeFeatureRendererM` draws in its place (a redirect of `executeGroup`'s `getExecuteInfo`): a copy of `entity_translucent` with `player_pose.vsh`, the draw's prepared transforms and textures, its uniform slice (`PlayerPoses`, offset aligned to `minUniformOffsetAlignment`, the full 9472 B block bound) and 16-bit indices from a ring buffer. **Order:** each face's centroid is computed on the CPU from the same JOML `transformPosition` of its vertices 0 and 2 and the same `(a + b) / 2.0F` as `MeshData.decodeQuadCentroids`, faces are numbered in vanilla's write order (part tree, cubes, polygons, minus the faces `TransparentFaces` skips, through `ModelPartCubeM`'s per texture masks), and the draw's own `VertexSorting` sorts them (`SortOrderCache` start orders with `reuseSortOrder`), after the world's features are prepared (`upload`). **GPU arithmetic:** positions in JOML's operation order with `precise` (as `instanced_part.vsh`); normals as vanilla writes them: `Matrix3f.transform` order, `normalize` only for untrusted normals, truncated to signed bytes and decoded through a table of `max(c / 127.0F, -1.0F)`. A vanilla write that joins a posed draw (same render type, consecutive) writes the posed members first with vanilla's path (`materialize`, from a redirect of the staged builder fetch in `Group.getVertexBuilder`); captures fail (vanilla path) for parts that aren't the layout's, a part written twice or any vertex written to the sink (mods), and a model whose captures fail 64 times in a row takes vanilla's path until the next clear. Max 64 layouts; cleared on resource reload and when toggled. Render thread only |
 | `mixin/render/vertex/MeshDataSortStateM.java` | `@Overwrite` `writeSortedIndexBuffer`/`buildSortedIndexBuffer`: sorted quad indices written with `MemoryUtil` puts instead of an `IntConsumer` per index. Sign text (`text_polygon_offset`) is sorted on upload and needs 32-bit indices with ~500 signs |
 | `render/text/SignTextCache.java` + `mixin/render/text/{SignTextM,AbstractSignRendererM,TextFeatureRendererM,FontSetM}.java` | `SignText.getRenderMessages` wraps each line (only when recomputed) in a `FormattedCharSequence` that carries its width and `Font.PreparedText` (plain/shadowed/outline, keyed by x/y/colours). Obfuscated lines are not cached; `FontSet.resetTextures` bumps a generation. A first version with a global identity map was slower than no cache. `AbstractSignRendererM` also skips the text of a sign side whose plane faces away from the eye by ≥ 0.55 blocks (`ModelCulling.isSignTextHidden`): polygon-offset text pipelines (and their OIT sets) cull back faces, checked at runtime. Glyph quads wind like (0,0),(0,1),(1,1), so the side's facing is `column1 × column0` of the pose |
 | `render/entity/ModelCulling.java` + `mixin/render/feature/LevelRendererM.java` | Flags the world's `FeatureRenderDispatcher.prepareFrame`, `LevelRenderer.submitBlockEntities` (for sign text) and the current model's render type. When the pipeline culls (`RenderPipeline.isCull()`), `ModelPartCubeM` skips faces the GPU would cull: `(v1-v0)x(v2-v0)` of the transformed corners points away from every eye position within 0.5 blocks of the origin (camera-relative positions; bobbing moves the eye ~0.1). Degenerate faces are kept. `skipDuplicateQuads()` is true for render types without blending or upload sorting (drawing a quad twice is then idempotent) |
@@ -795,6 +807,12 @@ are in every frame. `bench.playersKind`: `lobby` (default, both of the following
   38 is in the third row of `close0`). `bench.emptyOuterLayers=true` clears every outer layer. `bench.skinEdit=true` edits the
   skins of players 7 and 8 after the close-ups (in place, and through `setPixels`; both uploaded) and takes the close-ups again
   (`close<k>-<n>-<run>-edited`).
+- Since the twenty-second session: `bench.playersHurt=true` sets every third player's hurt time during the close-ups (the red
+  overlay of a hurt flash; frozen ticks keep it), and `bench.playersGlass=true` places, while ticks are frozen for the close-ups,
+  two stained glass walls through the first row in front of `close0` and water around its players at x 4.5 to 7.5 (no fluid spread
+  or suffocation while frozen; removed afterwards). Frozen shots of one setting differ by the glint and the arm; to find what a
+  switch changes, count pixels that are equal in all shots of each setting but differ across them (`java scripts/StableDiff.java
+  2 map.png shot0 shot1 ...`, shots 0, 2, ... one setting and 1, 3, ... the other; with `closeShots=8` the glint left none).
 
 ---
 
@@ -1682,6 +1700,142 @@ Not verified: the OpenGL backend; OIT (no sorted draws then, so nothing to do); 
 the hand's upload separately (counted in the totals); a real remote player's movement interpolation (mannequins moved by the
 server stand in for it).
 
+### Twenty-second session (2026-10-29)
+Section 8 "Bigger jobs" job 1: player bodies drawn from a GPU pose buffer. One agent on `26.3` (main tree), every Gradle command
+under the shared GPU lock (another agent benchmarked a block entity scene at the same time). Results in `results/s22-pose-*` and
+`results/s22-pose-dev/`, logs `build/bench-logs/s22-*.log`. Commit `e52b45d`.
+
+**The "find out first" questions** (26.3 sources):
+- *Can a vertex shader read a per-draw buffer?* renderpearl binds three kinds of uniforms (`UniformType`): combined image samplers,
+  uniform buffers and texel buffers; no storage buffers. **Uniform buffer slices work per draw on both backends**:
+  `RenderPass.setUniform(name, GpuBufferSlice)` takes any slice whose offset is a multiple of `minUniformOffsetAlignment` (vanilla's
+  `DynamicTransforms` is a per-draw slice; GL binds it with `glBindBufferRange`, Vulkan pushes it as a push descriptor with the
+  slice's offset and range). **Texel buffers** (`samplerBuffer`; vanilla's clouds read one with `gl_VertexIndex` and no vertex
+  buffer, on both backends) take only a whole buffer (`FrontendRenderPass`: "Uniform texel buffers do not support a slice of a
+  buffer"), and on Vulkan every descriptor push with a texel buffer bound creates a `VkBufferView` and queues its destruction
+  (`VulkanRenderPass.pushDescriptors`), i.e. one driver call per draw here. So: one uniform slice per draw, no per-part sub-draws.
+- *How is the sorted draw's index buffer produced?* `StagedVertexBuffer.uploadDrawsToBuffers` decodes each sorted draw's centroids
+  from its written vertex slices (`decodeSortingPoints` -> `MeshData.decodeQuadCentroids`: per quad `(v0 + v2) / 2.0F`), builds
+  `MeshData.SortState` and writes the indices into the staging buffer (`writeSortedIndexBuffer`, wrapped by `StagedVertexBufferSortM`);
+  nothing takes external centroids or an order. Not needed: the posed draw keeps an *empty* staged draw (skipped by the upload) in
+  its place in the group and is drawn in that place with its own index buffer, sorted by the staged draw's own `VertexSorting`
+  (through a `SortOrderCache` of its own) from centroids computed on the CPU with the same float operations. No vanilla code path is
+  copied beyond that arithmetic.
+
+**Design as built** (`PlayerPoseDraws`, switch `playerPoseDraws`, "GPU Player Poses"; section 4 row):
+- *Which submits:* the exact `PlayerModel` class, vanilla's `entity_translucent` pipeline, no UV mapping or decal, a strictly ordered
+  group of the world's features (the translucent models phase), no OIT. Everything else is vanilla's path, among it invisible
+  players seen by teammates (`entity_translucent_cull`), the first-person arm (hand features), GUI paperdolls, glint and other models.
+- *Mesh:* per `PlayerModel` instance (wide and slim are different instances, per renderer) a layout: one slot per part with cubes
+  (12; at most 12 allowed), the cubes' faces in part space (vertex position, UV and polygon normal as floats, member and slot as
+  `RG16_SINT`), 8 copies (one per member of a draw), 36 B per vertex, built once.
+- *Per frame:* `ModelFeatureRendererM.prepareModel` hands an accepted submit to `PlayerPoseDraws.prepare`: vanilla's `setupAnim`
+  and part tree run into a sink, and `ModelPart.compile` passes each written part's pose to `capturePart` (`visible`, `skipDraw`,
+  the outer layer toggles and spectators are vanilla's tree's business). Per member a 1184 B std140 block: light and overlay as the
+  entity format's shorts, color, and per slot three pose rows and three normal matrix rows (w: whether vanilla normalizes). Per
+  face of the written parts, minus the faces `TransparentFaces` skips (`ModelPartCubeM`'s per texture masks, exposed through
+  `TransparentCube`), the centroid: the corners transformed with JOML's `transformPosition` (8 per cube), then `(a + b) / 2.0F` of
+  vertices 0 and 2. Faces are numbered in vanilla's write order.
+- *Draws:* the member is placed where `Group.getVertexBuilder` would put its vertices (`PosedDrawGroup`): a new staged draw from
+  `getOrAddDraw` (its prepared transforms and textures are the draw's), or the group's last draw when the render type repeats
+  (consecutive bodies with one skin share a draw and one sort, as in vanilla; up to 8). After the world's features are prepared
+  (`upload`), each posed draw's faces are sorted by the draw's `VertexSorting` (`SortOrderCache.sort` with `reuseSortOrder`) and 16
+  bit indices `member * vertices + face * 4 + (0 1 2 2 3 0)` are written; blocks and indices go up through two ring buffers.
+  `RenderTypeFeatureRendererM` redirects `executeGroup`'s `getExecuteInfo`: a posed draw is drawn there (a copy of `entity_translucent`
+  with `player_pose.vsh`, the block's slice at its full declared 9472 B, `drawIndexed`), in the empty staged draw's place.
+- *Shader arithmetic:* positions as `instanced_part.vsh` (`precise`, JOML's order). Normals as vanilla writes them: `Matrix3f.transform`
+  order, `Vector3f.normalize` only when the pose's normals aren't trusted (players' are: the `(-1, -1, 1)` mirror keeps them), truncated
+  to signed bytes (`(int) (clamp(c) * 127)`) and decoded through a table of the bits of `max(c / 127.0F, -1.0F)`. A first version
+  normalized in full precision (as instanced parts do): ~200-500 px per close-up differed by 2-4 levels (vanilla lights with the
+  shorter decoded vector); the emulation removed them.
+- *Fallbacks:* a capture fails (the submit is written by vanilla's path; `setupAnim` runs again) when a written part isn't the
+  layout's or is written twice, or anything writes a vertex to the sink (a mod drawing in `ModelPart.render`); a model whose
+  captures fail 64 times in a row takes vanilla's path until the next clear. A vanilla write that joins a posed draw (same render
+  type, consecutive: a player head with the same skin, a failed capture, a ninth member) first writes the posed members with
+  vanilla's path (`materialize`, from a redirect of the staged builder fetch in `Group.getVertexBuilder`), so the draw is vanilla's. Max 64 layouts. Cleared on
+  resource reload and when toggled.
+
+**Exactness check** (temporary, `scripts/patches/s22-pose-check.patch`, `-Pjvm.ruthenium.probe.poseCheck=true`): every posed member
+also written through the switch-off path (`ModelPartCubeM`'s direct writes into a `BufferBuilder`) and through vanilla's own
+`Cube.compile` arithmetic (a wrapper that isn't a `BufferBuilder`, all faces); the shader's position and normal arithmetic emulated in
+Java floats from the uploaded rows and the mesh; centroids compared with those decoded from the direct write; each draw's order
+compared with vanilla's sort (keys, stable `IntArrays.mergeSort` by `Floats.compare`, descending) of the decoded centroids:
+
+| run | members posed | faces | draws (several members) | mismatches |
+|---|---|---|---|---|
+| players kind | 902,532 | 62.3M | 863,134 (39,398) | 0 |
+| moving players | 1,015,242 | 70.1M | 974,637 (40,545) | 0 |
+| 150 skins | 1,010,378 | 69.8M | 1,010,378 (0) | 0 |
+| lobby | 797,683 | 55.1M | 764,207 (33,476) | 0 |
+| lobby, hurt players in the close-ups | 687,192 | 47.4M | 659,312 (27,880) | 0 |
+| players, hurt, glass and water, normal emulation | 761,285 | 52.6M | 729,283 (32,002) | 0 (also 0 normal byte mismatches) |
+| forced failures (every 7th capture), polished code | 683,440 (130,035 failed) | 47.3M | 429 materialized | 0 |
+
+"Mismatches" covers positions against the direct write and against vanilla's arithmetic (bit for bit; no signed zero cases), face
+counts, centroids (bit for bit), UVs, light/overlay/color, quantized normal bytes (after the emulation) and index order. The
+first-version normal error was at most 1/127 (quantization). Forced failures exercise the fallback and materialization paths
+(every failed join materialized its draw).
+
+**Parity** (frozen close-ups, `closeShots=4`, `closeToggle=playerPoseDraws`: shots 0 and 2 on, 1 and 3 off; new bench options
+`playersHurt` (every third player red during the close-ups) and `playersGlass` (stained glass through and water around first row
+players, placed while ticks are frozen)). Same-setting pairs differ by the glint and the first-person arm (thousands of px); a pixel
+counts as caused by the switch only if it is equal within each setting and differs across them (`scripts/StableDiff.java` at 2
+levels, `ImageDiff`'s threshold 1):
+
+| close-up | on vs off | same-setting pairs | stable across the switch |
+|---|---|---|---|
+| Vulkan players (hurt, glass, water) close0 / close1 | 3383 / 4992 | 2212-6899 / 1605-5203 | 297 / 8, all inside or next to glint |
+| Vulkan lobby (hurt; holograms, name tags over bodies) | 7822 / 4398 | 2925-9023 / 3629-5610 | 0 / 0 |
+| OpenGL players (hurt, glass, water) | 7725 / 2418 | 1303-10350 / 4616-5796 | 0 / 0 |
+| OpenGL lobby (hurt) | 8425 / 190 | 3279-9327 / 152-205 | 404 / 0, inside or next to glint |
+
+Final code, 8 shots per position (`s22-pose-dev/parity8-*`, `scripts/StableDiff.java`: equal in all four shots of each setting, different
+across): Vulkan players (hurt, glass, water) and OpenGL lobby (hurt): **0 pixels** in both close-ups, at a difference of 2 levels and
+also of 1 level. The first-version normals (full precision) showed as ~200-500 stable pixels of 2-4 levels per close-up.
+
+**A/B** (5 interleaved pairs unless noted, `-Pbench.staticSeconds=10`, switch off vs on in one build; static / pan fps, p99 low,
+render thread ms per frame; medians):
+
+| | static off -> on | p99 low | render thread | pan off -> on | pan p99 | pan render thread |
+|---|---|---|---|---|---|---|
+| players kind (`s22-pose-players`) | 523.6 -> 603.5 (every pair) | 311.2 -> 371.6 | 1.86 -> 1.60 ms | 1631.3 -> 1682.2 (every pair) | 439.7 -> 494.2 | 0.48 -> 0.47 |
+| players kind, first hooks (`s22-pose-players-v1`) | 522.4 -> 609.2 (every pair) | 302.8 -> 355.4 | 1.85 -> 1.58 | 1625.2 -> 1676.3 (every pair) | 424.9 -> 491.9 | 0.48 -> 0.47 |
+| players, 150 skins* (`s22-pose-players150`) | 514.1 -> 605.0 (every pair) | 308.7 -> 343.3 | 1.88 -> 1.61 | 1622.2 -> 1681.1 (every pair) | 428.0 -> 483.2 | 0.49 -> 0.47 |
+| moving players* (`s22-pose-move`) | 507.7 -> 581.1 (every pair) | 324.6 -> 347.9 | 1.92 -> 1.67 | 1608.5 -> 1668.9 (every pair) | 416.1 -> 466.5 | 0.49 -> 0.48 |
+| lobby* (`s22-pose-lobby`) | 351.6 -> 397.3 (every pair) | 193.7 -> 225.6 | 2.76 -> 2.45 | 1485.7 -> 1514.5 (every pair) | 314.2 -> 338.7 | 0.57 -> 0.54 |
+| OpenGL, players kind* (`s22-pose-gl-players`) | 417.7 -> 465.0 (every pair) | 247.2 -> 270.1 | 2.31 -> 2.08 | 1417.8 -> 1461.2 (4 of 5) | 379.3 -> 396.2 | 0.68 -> 0.66 |
+| mixed, 3 pairs (`s22-pose-mixed`) | 1569.4 vs 1598.0 | 705.5 vs 724.1 | 0.54 vs 0.55 | 1621.3 vs 1609.3 | 612.2 vs 560.8 | 0.42 vs 0.44 |
+| mixed, first hooks (`s22-pose-mixed-v1`) | 1582.0 vs 1586.0 | 743.4 vs 734.5 | 0.55 vs 0.56 | 1627.8 vs 1609.1 (3 of 3 lower) | 617.2 vs 588.7 | 0.43 vs 0.44 |
+| entities, 3 pairs (`s22-pose-entities`) | 348.1 vs 340.3 (3 of 3 lower) | 169.8 vs 169.3 | 2.77 vs 2.84 | 1215.0 vs 1192.1 (3 of 3 lower) | 309.9 vs 305.2 | 0.74 vs 0.76 |
+| entities, first hooks (`s22-pose-entities-v1`) | 340.8 vs 342.5 | 169.3 vs 170.1 | 2.87 vs 2.84 | 1204.8 vs 1194.2 (2 of 3 lower) | 302.8 vs 298.7 | 0.76 vs 0.76 |
+| entities, commit A/B `111db82` vs `e52b45d` (`s22-pose-entities-commits`) | 345.0 vs 334.6 (2 of 3 lower) | 170.6 vs 165.1 | 2.82 vs 2.90 | 1202.3 vs 1197.9 (2 of 3 lower) | 311.6 vs 293.6 | 0.73 vs 0.76 |
+
+\* measured with the first variant of the two group hooks (an `@Inject` at `Group.getVertexBuilder` HEAD and an `@WrapOperation` around
+`executeGroup`'s `getExecuteInfo`); both became `@Redirect`s (no per-call callback or wrapper object) after the mixed and entity scenes'
+pans read lower in all pairs, and the players kind, mixed and entity matrices were run again with them (rows without "first hooks").
+Within an off/on A/B the scenes without players differ only in `accepts()`'s checks per model submit (now pipeline first); every other
+hook runs on both sides. The commit A/B covers all of them. The entity cost probe on both commits (one run each, `s22-pose-dev/probe-
+entities-commits`) put the differences in run-to-run drift: extraction and submission, which the change doesn't touch, were 6.5% and
+4.7% slower in the new commit's run (0.567 -> 0.604, 0.468 -> 0.490 ms per frame), model prepares, where the new checks are, 1.4%
+(0.736 -> 0.746; part trees 0.334 -> 0.340). Not resolved further: the entity scene's 3 pair resolution is ~1.5-3% (section 6.6).
+
+Per player (players kind, render thread): 1.86 -> 1.60 ms for 150 players is ~1.7 us per player of the body's ~3.5 us (vertex writes
+2.8 us, centroid decoding 0.35, sort 0.3); upload bytes per body go from ~10.4 KB of vertices to 1.2 KB of poses (indices unchanged).
+
+**Mod compatibility** (exact for vanilla; switch "GPU Player Poses"): mods that act on the player body's written vertices (a
+`VertexConsumer` wrapper on the group's builder, mixins into `Cube.compile` / `ModelPartCubeM` or `BufferBuilder`) don't see them;
+mods that pose parts (`setupAnim`, `ModelPart` fields, `translateAndRotate`) or hide them work, as do mods drawing in
+`ModelPart.render` (detected through the sink: vanilla's path) and mods with their own model class or render type (not accepted);
+a mod hooking `PreparedRenderType.drawFromBuffer` or `RenderTypeFeatureRenderer.executeGroup`'s draws doesn't see posed draws;
+shader packs that replace vanilla's pipelines (Iris-like) would not replace `player_pose`'s copy of `entity_translucent` (the same
+holds for the instanced and retained pipelines).
+
+Not verified: invisible players seen translucent by teammates or spectators (`entity_translucent_cull`: not accepted, vanilla's path
+by the pipeline check; the scene can't make a mannequin translucent to a creative camera); real `RemotePlayer`s (mannequins take
+the same renderer); OIT (not accepted); the `normalize` branch of the normal emulation (players' poses have trusted normals: 0
+normalized faces in the check) and the color conversion for non-white tints (bodies are white; GPU `UNORM8` decode assumed exact like
+Java's `c / 255.0F`); hardware other than the RTX 4060 Laptop (Vulkan and OpenGL); mods.
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -1798,12 +1952,19 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 ### Decisions and verification notes
 On 2026-10-28 the user reviewed the items below and **kept all of them** (transparent face culling, supporting
 blocks, plane culling and the mod compatibility trade-offs). On 2026-10-29 the user accepted the mod compatibility
-trade-offs of the nineteenth (both parts) and twenty-first sessions as well, so nothing is pending. The notes stay as reference; the
+trade-offs of the nineteenth (both parts) and twenty-first sessions as well; only the twenty-second session's (below) is pending. The notes stay as reference; the
 `TransparentFaces` cache miss with instanced parts off was fixed in the nineteenth session (section 7).
 Twenty-first session, mod compatibility only (exact for vanilla, switch "Reuse Sort Order"): staged draws whose sorting is
 vanilla's distance sort no longer call `MeshData.SortState.writeSortedIndexBuffer` (already an `@Overwrite` since the first
 sessions), so a mod injecting there or into `VertexSorting.sort` is bypassed for them; a mod handing the group its own
 `VertexSorting` keeps vanilla's call.
+Twenty-second session, **mod compatibility, to be decided by the user** (exact for vanilla, switch "GPU Player Poses"): player
+body submits of the exact `PlayerModel` class with vanilla's `entity_translucent` pipeline are no longer written into the group's
+vertex builder, so mods that act on those vertices (a `VertexConsumer` wrapper, mixins into `Cube.compile`, `ModelPartCubeM` or
+`BufferBuilder`) or on the draw (`PreparedRenderType.drawFromBuffer`, `RenderTypeFeatureRenderer.executeGroup`) don't see them;
+shader packs that swap vanilla's pipelines would not swap the `player_pose` copy (as with the instanced and retained pipelines).
+Posing mods (`setupAnim`, part fields, `translateAndRotate`), mods that draw inside `ModelPart.render` (detected: vanilla's path) and
+mods with their own model class or render type are unaffected.
 The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
 been kept, its trade-off would have been: a mod that writes a downloaded skin's GPU texture without `DynamicTexture.upload`
 leaves stale masks (faces missing until the next upload or reload).
@@ -1921,8 +2082,8 @@ leaves stale masks (faces missing until the next upload or reload).
      3-18, items 419-465 over five runs). The frames with a tick are also slower outside
      the tick, most likely the benchmark harness's handshake and length-biased sampling (section 6.6).
    - Players: measured in the players scene (nineteenth session, section 7 "Players and holograms"). Their name tags are
-     done; their body stays on vanilla's translucent vertex path (the largest item per player, 2.8 us plus a per-frame quad
-     sort and a draw of its own), see item 1b. Other translucent types stay vanilla.
+     done; their body is drawn from a GPU pose buffer since the twenty-second session (`PlayerPoseDraws`), still one draw per
+     player in its sorted place. Other translucent types stay vanilla.
 1b. **Players and holograms, next** (section 7 "Players and holograms", in order of expected gain):
    - ~~`TransparentFaces` with many skins~~: done in the twentieth session. Part 1's cache fixed the resource skin loss (now
      neutral to +1.5%); testing downloaded skins was built and binned (no gain: the exactness margin leaves almost no outer
@@ -1932,8 +2093,12 @@ leaves stale masks (faces missing until the next upload or reload).
      lobby static 328.0 -> 352.9 fps. What is left of the sorted draws: decoding the centroids (~0.37 us per player, vanilla's
      `decodeSortingPoints` with `ByteBuffer.getFloat` and a new `CompactVectorArray`), the key computation in the sort and the
      index write. Skipping the sort for opaque skins is still not exact (coplanar touching faces, section 7).
-   - The player body as a per-player draw fed from a GPU pose buffer, in its sorted place (exact only with vanilla's quad
-     order or for skins without semi-transparent texels). Large; see "Bigger jobs" at the end of this section.
+   - ~~The player body from a GPU pose buffer~~: done in the twenty-second session ("Bigger jobs" job 1, section 7): players static
+     523.6 -> 603.5 fps, lobby 351.6 -> 397.3. What is left per body: vanilla's `setupAnim` and part tree walk (the capture runs
+     it into a sink), ~12 pose writes and 72 centroids (8 corner transforms per cube), the sort from its start order and the
+     index write, plus a draw per player (vanilla's count). Ideas, not measured: skip the part tree for players whose part angles
+     and visibility didn't change (a still player's arms bob every frame, so only for hidden arms or spyglass holders); cover
+     `entity_translucent_cull` (invisible players seen by teammates) with a culling copy of the pipeline.
    - Retained/instanced billboard text for name tags (normal pass only; the see-through pass is sorted) and text displays. Large; see "Bigger jobs" at the end of this section.
    - Per player extraction (1.6 us) and layer submission (1.4 us) are a long tail of vanilla work.
 2. **Per entity and block entity cost in the server scene** (twelfth and seventeenth session measurements in section 7).
@@ -2022,13 +2187,19 @@ leaves stale masks (faces missing until the next upload or reload).
    any more), the debug overlay and profiler HUD (`Gui` → `Hud`, `extractRenderState`), and
    `DebugEntryMemory` (`bytesToMebibytes`).
 
-### Bigger jobs: player bodies and billboard text (written up after the nineteenth session, not started)
+### Bigger jobs: player bodies and billboard text (written up after the nineteenth session; job 1 done in the twenty-second)
 Both are the large items of item 1b. The numbers come from the players scene (section 6.10, section 7 "Players and
 holograms"): lobby static ~326 fps, render thread ~2.96 ms of a ~3.1 ms frame, CPU bound (GPU 0.82 ms). Neither has been
 prototyped. The decompiled facts below come from that session's notes; check them against the 26.3 sources (section 5)
 before designing on them.
 
-**1. Player bodies from a GPU pose buffer.**
+**1. Player bodies from a GPU pose buffer.** Done in the twenty-second session (`e52b45d`; section 7, "Twenty-second session",
+answers both "find out first" questions: uniform buffer slices per draw on both backends, texel buffers only whole and with a
+`VkBufferView` per descriptor push on Vulkan; the upload's sort reads centroids from the written vertices, so the posed draw keeps an
+empty staged draw in its place and draws itself with its own sorted indices). The sketch below held, with three corrections:
+consecutive bodies of one skin share a draw and one sort in vanilla (handled: up to 8 members per draw, mesh copies per member);
+normals had to be quantized as vanilla writes them (vanilla's player normals are trusted, not renormalized, so lighting uses the
+shorter decoded vector); and vanilla writes joining a posed draw must write its members first. The original write-up follows.
 - *What it would remove:* the body's vertex writes, 2.8 us per player per frame (72 faces through `ModelPartCubeM`'s
   direct writes), plus most of their upload bytes. That is ~0.42 ms for the lobby's 150 players. The per-frame quad sort
   (1.8 us per player) is a separate cost: item 1b's "reuse last frame's order" takes it for still players, and this job

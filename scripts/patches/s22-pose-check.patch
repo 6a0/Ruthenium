@@ -1,0 +1,473 @@
+diff --git a/src/main/java/net/ruthenium/render/entity/PlayerPoseCheck.java b/src/main/java/net/ruthenium/render/entity/PlayerPoseCheck.java
+new file mode 100644
+index 0000000..0d16271
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/entity/PlayerPoseCheck.java
+@@ -0,0 +1,333 @@
++package net.ruthenium.render.entity;
++
++import com.google.common.primitives.Floats;
++import com.mojang.blaze3d.vertex.BufferBuilder;
++import com.mojang.blaze3d.vertex.ByteBufferBuilder;
++import com.mojang.blaze3d.vertex.CompactVectorArray;
++import com.mojang.blaze3d.vertex.DefaultVertexFormat;
++import com.mojang.blaze3d.vertex.MeshData;
++import com.mojang.blaze3d.vertex.PoseStack;
++import com.mojang.blaze3d.vertex.VertexConsumer;
++import com.mojang.blaze3d.vertex.VertexSorting;
++import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
++import it.unimi.dsi.fastutil.ints.IntArrays;
++import net.minecraft.client.model.Model;
++import net.minecraft.client.model.geom.ModelPart;
++import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
++import net.ruthenium.Initializer;
++import net.ruthenium.render.vertex.DistanceSorting;
++import org.joml.Vector3f;
++import org.lwjgl.system.MemoryUtil;
++
++import java.nio.ByteBuffer;
++import java.util.Arrays;
++
++/**
++ * TEMPORARY exactness check of {@link PlayerPoseDraws} ({@code -Druthenium.probe.poseCheck=true}). Every posed member is
++ * also written through the path drawn with the switch off ({@code ModelPartCubeM}'s direct writes, with transparent face
++ * culling) and through vanilla's own {@code Cube.compile} arithmetic (all faces); the GPU's position arithmetic is
++ * emulated in Java floats from the uploaded rows and the mesh positions, and compared bit for bit; the centroids are
++ * compared bit for bit with those decoded from the direct write; each draw's quad order is compared with vanilla's
++ * sort of the decoded centroids (keys, stable merge sort by {@code Floats.compare}, descending).
++ */
++public final class PlayerPoseCheck {
++    public static final boolean ENABLED = Boolean.getBoolean("ruthenium.probe.poseCheck");
++    /** Every n-th capture fails on purpose (a vanilla write that may join a posed draw: materialization) */
++    static final int FAIL_EVERY = Integer.getInteger("ruthenium.probe.poseFail", 0);
++    static long failCounter, joinAttempts, joinFailures;
++
++    static long members, faces, vanillaFaces, positionMismatches, vanillaPositionMismatches, faceCountMismatches, centroidMismatches, uvMismatches,
++            headerMismatches, draws, multiMemberDraws, orderMismatches, orderQuads, orderUnchecked, materializations, captureFailures, accepted;
++    static long normalMismatches, normalized;
++    static int signedZeroOnly;
++    private static long uploads;
++
++    private PlayerPoseCheck() {
++    }
++
++    /** A capture of {@code submit} succeeded: compare the member's faces with the vanilla writes */
++    @SuppressWarnings({"rawtypes", "unchecked"})
++    static void member(PlayerPoseDraws.PoseDraw draw, int member, int quadStart, PlayerPoseDraws.Layout layout, long block, int[] slotOrder, int slotCount,
++                       ModelFeatureRenderer.Submit<?> submit, PoseStack poseStack) {
++        members++;
++        Model model = submit.model();
++        int light = submit.lightCoords(), overlay = submit.overlayCoords(), color = submit.tintedColor();
++
++        // The switch-off path: direct writes into a BufferBuilder
++        float[] direct;
++        int[] directInts;
++        try (ByteBufferBuilder bytes = new ByteBufferBuilder(1 << 16)) {
++            BufferBuilder builder = new BufferBuilder(bytes, PrimitiveTopology.QUADS, DefaultVertexFormat.ENTITY);
++            model.renderToBuffer(poseStack, builder, light, overlay, color);
++            try (MeshData data = builder.build()) {
++                if (data == null) {
++                    direct = new float[0];
++                    directInts = new int[0];
++                } else {
++                    ByteBuffer buffer = data.vertexBuffer();
++                    int n = buffer.remaining() / 4;
++                    direct = new float[n];
++                    directInts = new int[n];
++                    long ptr = MemoryUtil.memAddress(buffer);
++                    for (int i = 0; i < n; i++) {
++                        direct[i] = MemoryUtil.memGetFloat(ptr + i * 4L);
++                        directInts[i] = MemoryUtil.memGetInt(ptr + i * 4L);
++                    }
++                }
++            }
++        }
++        // Vanilla's Cube.compile arithmetic (ModelPartCubeM's fallback for builders it can't write directly): all faces
++        float[] vanilla;
++        try (ByteBufferBuilder bytes = new ByteBufferBuilder(1 << 16)) {
++            BufferBuilder builder = new BufferBuilder(bytes, PrimitiveTopology.QUADS, DefaultVertexFormat.ENTITY);
++            model.renderToBuffer(poseStack, new Wrapper(builder), light, overlay, color);
++            try (MeshData data = builder.build()) {
++                if (data == null) {
++                    vanilla = new float[0];
++                } else {
++                    ByteBuffer buffer = data.vertexBuffer();
++                    int n = buffer.remaining() / 4;
++                    vanilla = new float[n];
++                    long ptr = MemoryUtil.memAddress(buffer);
++                    for (int i = 0; i < n; i++) {
++                        vanilla[i] = MemoryUtil.memGetFloat(ptr + i * 4L);
++                    }
++                }
++            }
++        }
++
++        // Header: light and overlay shorts, color
++        if (MemoryUtil.memGetInt(block) != (short) light || MemoryUtil.memGetInt(block + 4) != (short) (light >>> 16)
++                || MemoryUtil.memGetInt(block + 8) != (short) overlay || MemoryUtil.memGetInt(block + 12) != (short) (overlay >>> 16)) {
++            headerMismatches++;
++        }
++
++        // Faces of the member, in the direct write's order
++        int quads = draw.quadCount - quadStart;
++        int directQuads = direct.length / 36;
++        faces += quads;
++        if (quads != directQuads) {
++            faceCountMismatches++;
++            if (faceCountMismatches <= 10) {
++                Initializer.LOGGER.warn("Pose check: {} faces posed, {} written", quads, directQuads);
++            }
++        } else {
++            for (int q = 0; q < quads; q++) {
++                int vertex = draw.quadVertices[quadStart + q] - member * layout.vertexCount;
++                int meshQuad = vertex / 4;
++                ModelPart.Polygon polygon = layout.meshPolygons[meshQuad];
++                long rows = block + 32 + (long) layout.meshSlots[meshQuad] * 6 * 16;
++                int base = q * 36;
++                boolean signedZero = true;
++                boolean mismatch = false;
++                for (int v = 0; v < 4; v++) {
++                    ModelPart.Vertex mv = polygon.vertices()[v];
++                    float[] pos = emulate(rows, mv.worldX(), mv.worldY(), mv.worldZ());
++                    int o = base + v * 9;
++                    for (int c = 0; c < 3; c++) {
++                        if (Float.floatToRawIntBits(pos[c]) != Float.floatToRawIntBits(direct[o + c])) {
++                            mismatch = true;
++                            signedZero &= pos[c] == direct[o + c];
++                        }
++                    }
++                    if (Float.floatToRawIntBits(mv.u()) != Float.floatToRawIntBits(direct[o + 4]) || Float.floatToRawIntBits(mv.v()) != Float.floatToRawIntBits(direct[o + 5])) {
++                        uvMismatches++;
++                    }
++                    if (directInts[o + 3] != net.minecraft.util.ARGB.toABGR(color) || directInts[o + 6] != overlay || directInts[o + 7] != light) {
++                        headerMismatches++;
++                    }
++                    // The GPU's normal (the shader's arithmetic in floats), against vanilla's quantized bytes
++                    int packed = directInts[o + 8];
++                    int emulated = normalBytes(rows, polygon.normal().x(), polygon.normal().y(), polygon.normal().z());
++                    if ((packed & 0xFFFFFF) != emulated) {
++                        normalMismatches++;
++                    }
++                }
++                if (mismatch) {
++                    positionMismatches++;
++                    if (signedZero) {
++                        signedZeroOnly++;
++                    }
++                    if (positionMismatches <= 10) {
++                        Initializer.LOGGER.warn("Pose check: position mismatch in face {} of a member (signed zero only: {})", q, signedZero);
++                    }
++                }
++                // The centroid vanilla's upload decodes from the direct write
++                float cx = (direct[base] + direct[base + 18]) / 2.0F;
++                float cy = (direct[base + 1] + direct[base + 19]) / 2.0F;
++                float cz = (direct[base + 2] + direct[base + 20]) / 2.0F;
++                int i = (quadStart + q) * 3;
++                if (Float.floatToRawIntBits(cx) != Float.floatToRawIntBits(draw.centroids[i]) || Float.floatToRawIntBits(cy) != Float.floatToRawIntBits(draw.centroids[i + 1])
++                        || Float.floatToRawIntBits(cz) != Float.floatToRawIntBits(draw.centroids[i + 2])) {
++                    centroidMismatches++;
++                }
++                draw.checkCentroids = draw.checkCentroids == null || draw.checkCentroids.length < i + 3 ? Arrays.copyOf(draw.checkCentroids == null ? new float[0] : draw.checkCentroids, Math.max(i + 3, 216)) : draw.checkCentroids;
++                draw.checkCentroids[i] = cx;
++                draw.checkCentroids[i + 1] = cy;
++                draw.checkCentroids[i + 2] = cz;
++            }
++        }
++
++        // Vanilla's own arithmetic, every face of the written parts in compile order
++        int k = 0;
++        for (int s = 0; s < slotCount; s++) {
++            int slot = slotOrder[s];
++            long rows = block + 32 + (long) slot * 6 * 16;
++            for (PlayerPoseDraws.CubeInfo cube : layout.cubeInfos[slot]) {
++                for (int p = 0; p < cube.polygons; p++) {
++                    ModelPart.Polygon polygon = layout.meshPolygons[cube.quadBase + p];
++                    for (int v = 0; v < 4; v++, k++) {
++                        if ((k + 1) * 9 > vanilla.length) {
++                            vanillaPositionMismatches++;
++                            continue;
++                        }
++                        ModelPart.Vertex mv = polygon.vertices()[v];
++                        float[] pos = emulate(rows, mv.worldX(), mv.worldY(), mv.worldZ());
++                        for (int c = 0; c < 3; c++) {
++                            if (Float.floatToRawIntBits(pos[c]) != Float.floatToRawIntBits(vanilla[k * 9 + c])) {
++                                vanillaPositionMismatches++;
++                                break;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        vanillaFaces += k / 4;
++        if (k * 9 != vanilla.length) {
++            vanillaPositionMismatches++;
++        }
++        if (quads != directQuads) {
++            draw.checkBroken = true;
++        }
++    }
++
++    /** The shader's position: m00*x + (m10*y + (m20*z + m30)) per row, in floats */
++    private static float[] emulate(long rows, float x, float y, float z) {
++        float[] out = new float[3];
++        for (int r = 0; r < 3; r++) {
++            long row = rows + r * 16L;
++            float a = MemoryUtil.memGetFloat(row), b = MemoryUtil.memGetFloat(row + 4), c = MemoryUtil.memGetFloat(row + 8), d = MemoryUtil.memGetFloat(row + 12);
++            out[r] = a * x + (b * y + (c * z + d));
++        }
++        return out;
++    }
++
++    /** The shader's normal: rows times the mesh normal in JOML's order, normalized if flagged, quantized to bytes */
++    private static int normalBytes(long rows, float x, float y, float z) {
++        float[] out = new float[3];
++        for (int r = 0; r < 3; r++) {
++            long row = rows + (3 + r) * 16L;
++            out[r] = MemoryUtil.memGetFloat(row) * x + (MemoryUtil.memGetFloat(row + 4) * y + MemoryUtil.memGetFloat(row + 8) * z);
++        }
++        if (MemoryUtil.memGetFloat(rows + 3 * 16L + 12) != 0.0F) {
++            normalized++;
++            float scale = 1.0F / (float) Math.sqrt(out[0] * out[0] + (out[1] * out[1] + out[2] * out[2]));
++            for (int r = 0; r < 3; r++) {
++                out[r] *= scale;
++            }
++        }
++        int packed = 0;
++        for (int r = 0; r < 3; r++) {
++            packed |= ((int) (Math.clamp(out[r], -1.0F, 1.0F) * 127.0F) & 0xFF) << (8 * r);
++        }
++        return packed;
++    }
++
++    /** The draw's sorted order against vanilla's sort of the decoded centroids */
++    static void order(PlayerPoseDraws.PoseDraw draw, int[] order, VertexSorting sorting) {
++        draws++;
++        if (draw.members > 1) {
++            multiMemberDraws++;
++        }
++        int size = draw.quadCount;
++        if (draw.checkBroken || draw.checkCentroids == null || !(sorting instanceof DistanceSorting.Sorter sorter)) {
++            orderUnchecked++;
++            return;
++        }
++        VertexSorting.DistanceFunction function = sorter.function();
++        Vector3f point = new Vector3f();
++        float[] keys = new float[size];
++        int[] indices = new int[size];
++        for (int i = 0; i < size; indices[i] = i++) {
++            keys[i] = function.apply(point.set(draw.checkCentroids[i * 3], draw.checkCentroids[i * 3 + 1], draw.checkCentroids[i * 3 + 2]));
++        }
++        IntArrays.mergeSort(indices, (o1, o2) -> Floats.compare(keys[o2], keys[o1]));
++        orderQuads += size;
++        if (!Arrays.equals(indices, 0, size, order, 0, size)) {
++            orderMismatches++;
++            if (orderMismatches <= 10) {
++                Initializer.LOGGER.warn("Pose check: order mismatch in a draw of {} quads", size);
++            }
++        }
++    }
++
++    static void upload() {
++        if (++uploads % 2000 == 0) {
++            Initializer.LOGGER.info("Pose check: {} accepted submits, {} members posed ({} faces; vanilla arithmetic {} faces), {} capture failures, {} materializations ({} joins, {} failed); "
++                            + "positions: {} faces differ from the direct write ({} by signed zeros only), {} vertices differ from vanilla's arithmetic; "
++                            + "{} face count mismatches, {} centroid mismatches, {} UV mismatches, {} header mismatches, {} normal mismatches ({} normalized); "
++                            + "orders: {} draws ({} with several members), {} quads compared, {} mismatches, {} unchecked",
++                    accepted, members, faces, vanillaFaces, captureFailures, materializations, joinAttempts, joinFailures, positionMismatches, signedZeroOnly, vanillaPositionMismatches,
++                    faceCountMismatches, centroidMismatches, uvMismatches, headerMismatches, normalMismatches, normalized, draws, multiMemberDraws, orderQuads, orderMismatches,
++                    orderUnchecked);
++        }
++    }
++
++    /** Not a BufferBuilder: ModelPartCubeM writes it with vanilla's Cube.compile arithmetic */
++    private record Wrapper(VertexConsumer delegate) implements VertexConsumer {
++        @Override
++        public VertexConsumer addVertex(float x, float y, float z) {
++            this.delegate.addVertex(x, y, z);
++            return this;
++        }
++
++        @Override
++        public VertexConsumer setColor(int r, int g, int b, int a) {
++            this.delegate.setColor(r, g, b, a);
++            return this;
++        }
++
++        @Override
++        public VertexConsumer setColor(int color) {
++            this.delegate.setColor(color);
++            return this;
++        }
++
++        @Override
++        public VertexConsumer setUv(float u, float v) {
++            this.delegate.setUv(u, v);
++            return this;
++        }
++
++        @Override
++        public VertexConsumer setUv1(int u, int v) {
++            this.delegate.setUv1(u, v);
++            return this;
++        }
++
++        @Override
++        public VertexConsumer setUv2(int u, int v) {
++            this.delegate.setUv2(u, v);
++            return this;
++        }
++
++        @Override
++        public VertexConsumer setUv3(float u, float v) {
++            this.delegate.setUv3(u, v);
++            return this;
++        }
++
++        @Override
++        public VertexConsumer setNormal(float x, float y, float z) {
++            this.delegate.setNormal(x, y, z);
++            return this;
++        }
++
++        @Override
++        public VertexConsumer setLineWidth(float width) {
++            this.delegate.setLineWidth(width);
++            return this;
++        }
++    }
++}
+diff --git a/src/main/java/net/ruthenium/render/entity/PlayerPoseDraws.java b/src/main/java/net/ruthenium/render/entity/PlayerPoseDraws.java
+index d5af195..48ff8d3 100644
+--- a/src/main/java/net/ruthenium/render/entity/PlayerPoseDraws.java
++++ b/src/main/java/net/ruthenium/render/entity/PlayerPoseDraws.java
+@@ -152,6 +152,7 @@ public final class PlayerPoseDraws {
+     private static float[] transformed = new float[24 * 3];
+     private static final CaptureSink SINK = new CaptureSink();
+     private static final PoseStack MATERIALIZE_POSE = new PoseStack();
++    private static int[] captureOrder = new int[MAX_SLOTS]; private static int captureOrderCount; private static PoseDraw checkDraw; private static int checkMember, checkQuadStart; private static long checkBlock; // CHECK
+ 
+     private PlayerPoseDraws() {
+     }
+@@ -195,6 +196,7 @@ public final class PlayerPoseDraws {
+         @Nullable GpuBuffer mesh;
+         @Nullable GpuBufferSlice meshSlice;
+         int failures;
++        ModelPart.Polygon[] meshPolygons; int[] meshSlots; // CHECK
+ 
+         Layout(int generation, int slotCount, List<?>[] cubes, CubeInfo[][] cubeInfos, int vertexCount) {
+             this.generation = generation;
+@@ -240,6 +242,7 @@ public final class PlayerPoseDraws {
+         int[] quadVertices = new int[72];
+         int firstIndex;
+         int indexCount;
++        float[] checkCentroids; boolean checkBroken; // CHECK
+ 
+         void reset(Layout layout, int uboOffset) {
+             this.layout = layout;
+@@ -250,6 +253,7 @@ public final class PlayerPoseDraws {
+             this.uboOffset = uboOffset;
+             this.quadCount = 0;
+             this.indexCount = 0;
++            this.checkCentroids = null; this.checkBroken = false; // CHECK
+         }
+ 
+         void clear() {
+@@ -405,6 +409,7 @@ public final class PlayerPoseDraws {
+             ((PoseLayoutHolder) (Object) model).ruthenium$setPoseLayout(NO_LAYOUT);
+         }
+         ModelPoseReplay.end();
++        if (PlayerPoseCheck.ENABLED) { PlayerPoseCheck.accepted++; if (posed) PlayerPoseCheck.member(checkDraw, checkMember, checkQuadStart, layout, checkBlock, captureOrder, captureOrderCount, submit, poseStack); else PlayerPoseCheck.captureFailures++; } // CHECK
+         if (!posed) {
+             VertexConsumer buffer = builders.apply(submit.renderType());
+             // Writing a joined draw's posed members first may have posed the model for another state
+@@ -431,6 +436,7 @@ public final class PlayerPoseDraws {
+                 return false;
+             }
+             member = target.members;
++            if (PlayerPoseCheck.ENABLED) PlayerPoseCheck.joinAttempts++; // CHECK
+         } else {
+             if (drawCount == DRAWS.size()) {
+                 DRAWS.add(new PoseDraw());
+@@ -464,6 +470,7 @@ public final class PlayerPoseDraws {
+         captureDraw = target;
+         captureVertexBase = member * layout.vertexCount;
+         captureSeen = 0;
++        captureOrderCount = 0; // CHECK
+         captureRows = ptr + HEADER_SIZE;
+         captureAlpha = ModelCulling.textureAlpha();
+         captureFailed = false;
+@@ -477,8 +484,10 @@ public final class PlayerPoseDraws {
+             captureDraw = null;
+             captureAlpha = null;
+         }
++        if (PlayerPoseCheck.FAIL_EVERY > 0 && ++PlayerPoseCheck.failCounter % PlayerPoseCheck.FAIL_EVERY == 0) captureFailed = true; // CHECK
+         captureFailed |= SINK.written;
+         if (captureFailed) {
++            if (PlayerPoseCheck.ENABLED && joining != null) PlayerPoseCheck.joinFailures++; // CHECK
+             target.quadCount = quadStart;
+             if (joining == null) {
+                 target.clear();
+@@ -499,6 +508,7 @@ public final class PlayerPoseDraws {
+         target.members = member + 1;
+         poseSize = offset + MEMBER_SIZE;
+         layout.failures = 0;
++        checkDraw = target; checkMember = member; checkQuadStart = quadStart; checkBlock = ptr; // CHECK
+         return true;
+     }
+ 
+@@ -519,6 +529,7 @@ public final class PlayerPoseDraws {
+             return;
+         }
+         captureSeen |= 1 << slot;
++        captureOrder[captureOrderCount++] = slot; // CHECK
+ 
+         long ptr = captureRows + (long) slot * SLOT_ROWS * 16;
+         Matrix4f m = pose.pose();
+@@ -599,6 +610,7 @@ public final class PlayerPoseDraws {
+         Arrays.fill(draw.submits, null);
+         draw.members = 0;
+         draw.quadCount = 0;
++        if (PlayerPoseCheck.ENABLED) PlayerPoseCheck.materializations++; // CHECK
+     }
+ 
+     private static @Nullable Layout layoutOf(PlayerModel model) {
+@@ -711,6 +723,7 @@ public final class PlayerPoseDraws {
+                 }
+             }
+             Layout layout = new Layout(generation, slotCount, cubeLists.toArray(new List<?>[0]), infos, vertexCount);
++            layout.meshPolygons = new ModelPart.Polygon[quads]; layout.meshSlots = new int[quads]; for (int s = 0, q = 0; s < slotCount; s++) for (ModelPart.Cube cube : cubeLists.get(s)) for (ModelPart.Polygon polygon : cube.polygons) { layout.meshPolygons[q] = polygon; layout.meshSlots[q++] = s; } // CHECK
+             layout.mesh = RenderSystem.getDevice().createBuffer(() -> "Ruthenium player pose mesh", GpuBuffer.USAGE_VERTEX, mesh);
+             layout.meshSlice = layout.mesh.slice();
+             for (int s = 0; s < slotCount; s++) {
+@@ -765,6 +778,7 @@ public final class PlayerPoseDraws {
+                 continue;
+             }
+             int[] order = sort(draw, quads, reuseOrder);
++            if (PlayerPoseCheck.ENABLED) PlayerPoseCheck.order(draw, order, draw.sorting); // CHECK
+             int bytes = quads * 6 * 2;
+             if (indexBytes.capacity() < indexSize + bytes) {
+                 indexBytes = MemoryUtil.memRealloc(indexBytes, Math.max(indexBytes.capacity() * 2, indexSize + bytes));
+@@ -785,6 +799,7 @@ public final class PlayerPoseDraws {
+             draw.indexCount = quads * 6;
+             indexSize += bytes;
+         }
++        if (PlayerPoseCheck.ENABLED) PlayerPoseCheck.upload(); // CHECK
+         if (indexSize == 0) {
+             return;
+         }
+diff --git a/src/main/java/net/ruthenium/render/vertex/DistanceSorting.java b/src/main/java/net/ruthenium/render/vertex/DistanceSorting.java
+index 6865aba..f8b1963 100644
+--- a/src/main/java/net/ruthenium/render/vertex/DistanceSorting.java
++++ b/src/main/java/net/ruthenium/render/vertex/DistanceSorting.java
+@@ -39,6 +39,10 @@ public final class DistanceSorting {
+             this.function = function;
+         }
+ 
++        public DistanceFunction function() { // CHECK
++            return this.function;
++        }
++
+         @Override
+         public int[] sort(CompactVectorArray values) {
+             int size = values.size();
