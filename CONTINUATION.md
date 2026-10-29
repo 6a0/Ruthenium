@@ -1470,6 +1470,23 @@ Session start (`011dec9`, the scene only) vs end (`8b2cf0f`), checked out in tur
 - **Mixed scene** (three pairs, `sess-mixed`): static 1567.5 vs 1561.2, pan 1512.5 vs 1507.5, particles 1256.6 vs 1264.5,
   initial 1113.1 vs 1124.4: unchanged.
 
+#### After the merge (`33bff56`)
+Checks on the merged tree in the main worktree (`results/s19-merge/`; another agent's runs serialised by the GPU lock):
+- Every scene passes and its screenshots look right: players lobby (3 runs, `staticSeconds=10`) static 328.8 fps, pan
+  1530.4 (part 2's final numbers in its worktree: 326.4 / 1438.5); the four part 2 switches off (2 runs) 275.7 / 991.1, so
+  they apply on the merged tree; mixed (3 runs) static 1622.9, pan 1661.8, particles 1319.6 (part 1: ~1514-1526 static);
+  entities static 333.0, pan 1221.7; block entities static 1387.2, pan 1868.3.
+- Pre-merge `26.3` (`5a90842`) vs the merge, 2 pairs each: block entity scene static 1372.1 vs 1368.8, pan 1864.3 vs 1861.5;
+  mixed static 1593.5 vs 1661.6, particles 1275.6 vs 1336.7, pan 1667.3 vs 1665.5 (both pairs higher with the merge; most
+  likely `emptyArmorStandLayers` on the scene's 296 empty armor stands, not verified). The mixed scene ran higher today than
+  in either part's runs (1525 / 1561 static) on both builds, so compare it only within one session.
+- Open: the block entity scene runs at ~1360-1390 static / ~1860 pan on `3c04a06`, `5a90842` and the merge, against
+  1750-1775 / ~2600 at the end of the seventeenth session (same blocks, same chat line in the shot, render thread 0.23 vs
+  0.25 ms, so not CPU). Part 1's parity runs (`s19-dev/par-be-on`, with signs) were already low. Not from the merge; not
+  bisected (eighteenth session commits or the machine).
+- Not measured yet: `TransparentFaces`' per texture cache (part 1) in the players scene with `bench.playerSkins=resource`
+  (section 8, item 1b).
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -1725,6 +1742,9 @@ nineteenth session's switches are not reviewed yet). The notes stay as reference
    retained quads drawn by plane, the books' tilt computed once, lecterns/bells/copper golem statues retained, retained
    change checks and 30 s eviction (17th). Ruled out: cheaper entity culling, generic render state reuse (10th), sprite
    pipeline repeats, cell index masks and front-to-back plane order (17th, within noise). What is left, measured:
+   - **Block entity scene slower than at the end of the seventeenth session** (section 7, nineteenth session, "After the
+     merge"): static ~1370 vs ~1770 fps, pan ~1860 vs ~2600, also on `3c04a06`; render thread unchanged. Bisect the
+     eighteenth session's commits (or rule out the machine with a seventeenth session build) before trusting its numbers.
    - **GPU, retained 0.141 ms** for 131.6k quads per frame (static), half of them sign text of the signs inside the chest
      wall, mostly hidden behind chests; there is no exact way to skip occluded quads (chests are 14/16 wide, renderpearl
      has no occlusion queries). Instanced models 0.063 ms (armor stands are `entity_cutout`, drawn without culling).
