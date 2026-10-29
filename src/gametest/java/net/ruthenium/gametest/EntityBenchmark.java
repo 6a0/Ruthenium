@@ -47,6 +47,8 @@ final class EntityBenchmark {
     private static final String CLOSE_TOGGLE = BenchmarkClientGameTest.prop("closeToggle", "");
     /** {@code bench.staticView=k}: the static phase runs at close-up position k instead of the overview (pan unchanged) */
     private static final int STATIC_VIEW = Integer.parseInt(BenchmarkClientGameTest.prop("staticView", "-1"));
+    /** {@code bench.entityClouds=true}: fancy clouds instead of none (screenshots of different runs then differ) */
+    private static final boolean CLOUDS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("entityClouds", "false"));
     private static final boolean LIGHT_EVENTS =Boolean.parseBoolean(BenchmarkClientGameTest.prop("lightEvents", "false"));
 
     /** Close-up camera positions (x, height above the floor, z, pitch), each looking along +z at a few mob rows */
@@ -80,7 +82,7 @@ final class EntityBenchmark {
     static void run(ClientGameTestContext context, String label, String runId) {
         context.runOnClient(mc -> {
             mc.options.renderDistance().set(RENDER_DISTANCE);
-            mc.options.cloudStatus().set(CloudStatus.OFF);
+            mc.options.cloudStatus().set(CLOUDS ? CloudStatus.FANCY : CloudStatus.OFF);
         });
 
         List<PhaseResult> results = new ArrayList<>();
@@ -131,6 +133,9 @@ final class EntityBenchmark {
             frameSeries.put("pan", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
             LOGGER.info(results.getLast().summaryLine());
 
+            if (ToggleAb.enabled()) {
+                ToggleAb.run(context, results, () -> setView(context, 0.0F), 0.0F, PITCH);
+            }
             if (LIGHT_EVENTS) {
                 lightEvents(context, server);
             }

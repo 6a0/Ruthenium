@@ -11,6 +11,10 @@ import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.renderpearl.api.commands.RenderPass;
 import com.mojang.renderpearl.api.device.DeviceInfo;
+import com.mojang.renderpearl.api.device.GpuDevice;
+import com.mojang.renderpearl.api.textures.FilterMode;
+import com.mojang.renderpearl.api.textures.GpuTexture;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
 import com.mojang.renderpearl.api.pipeline.BindGroupLayout;
 import com.mojang.renderpearl.api.pipeline.ColorTargetState;
 import com.mojang.renderpearl.api.pipeline.CompiledRenderPipeline;
@@ -61,7 +65,9 @@ import java.util.Optional;
  * kept prepared text ({@link SignTextCache.KeptText}) gets a mesh once (from its second frame on): the quads vanilla writes,
  * recorded in label space (the positions vanilla hands to {@code addVertex(pose, x, y, z)}), with their UV and color, in a
  * shared GPU buffer (the arena), each vertex tagged with the label's region. Each frame only the region's pose rows and
- * light are written (a texel buffer the vertex shader reads, {@code label_text.vsh}).
+ * light are written (a texture the vertex shader reads texels of, {@code label_text.vsh}; not a texel buffer: on the
+ * NVIDIA Vulkan driver a submit that uses any texel buffer costs ~20 us more in {@code vkQueueSubmit}, see section 7 of
+ * the notes, "Twenty-fourth session").
  * <p>
  * Exactness: the draws are vanilla's. Each run of glyphs of one render type picks the group's draw exactly as
  * {@code Group.getVertexBuilder} would (joining the last draw, or {@code getOrAddDraw}: merged, new, strictly ordered,
@@ -87,15 +93,18 @@ public final class RetainedLabels {
             .addAttribute("LabelRegion", GpuFormat.RG16_SINT)
             .build();
     private static final int VERTEX_SIZE = MESH_FORMAT.getVertexSize();
-    /** Regions per arena: four RGBA32F texels each, within the 65536 texels every texel buffer supports */
+    /** Regions per arena: four RGBA32F texels each, 64 regions per row of the pose texture */
     private static final int MAX_REGIONS = 16384;
     private static final int REGION_SIZE = 64;
+    /** The pose texture: 256 x 256 RGBA32F texels (within the 4096 every device supports), region r's texels at 4r to 4r + 3 */
+    private static final int POSE_TEXTURE_WIDTH = 256;
+    private static final int POSE_ROW_BYTES = POSE_TEXTURE_WIDTH * 16;
     /** Quads per label at most (longer texts take vanilla's path) */
     private static final int MAX_LABEL_QUADS = 2048;
     private static final int MIN_ARENA_VERTICES = 1 << 16;
     private static final int MAX_ARENA_VERTICES = 1 << 22;
     private static final BindGroupLayout POSES = BindGroupLayout.builder()
-            .withUniform("LabelPoses", UniformType.TEXEL_BUFFER, GpuFormat.RGBA32_FLOAT).build();
+            .withUniform("LabelPoses", UniformType.COMBINED_IMAGE_SAMPLER).build();
 
     /** Vanilla's world text pipelines and their copies with the label vertex shader */
     private static final Map<RenderPipeline, RenderPipeline> COPIES = new IdentityHashMap<>();
@@ -147,19 +156,21 @@ public final class RetainedLabels {
     private static int labelCount;
     private static final List<LabelDraw> DRAWS = new ArrayList<>();
     private static int drawCount;
-    /** The regions' pose rows and light (the texel buffer's layout) */
+    /** The regions' pose rows and light (the pose texture's layout, row after row) */
     private static @Nullable ByteBuffer poseBytes;
     private static int maxRegion;
     private static ByteBuffer indexBytes = MemoryUtil.memAlloc(1 << 16);
     private static int indexSize;
-    private static @Nullable MappableRingBuffer poseRing;
+    /** Written each frame with {@code writeToTexture} (staged, ordered after the last frame's draws) */
+    private static @Nullable GpuTexture poseTexture;
+    private static @Nullable GpuTextureView poseView;
     private static @Nullable MappableRingBuffer indexRing;
     private static ByteBuffer commandBytes = MemoryUtil.memAlloc(1 << 12);
     private static int commandSize;
     private static @Nullable MappableRingBuffer commandRing;
     private static @Nullable Boolean multiDrawIndirect;
     private static int maxIndirectDraws;
-    private static @Nullable GpuBuffer framePoses;
+    private static @Nullable GpuTextureView framePoses;
     private static @Nullable GpuBuffer frameIndices;
     private static @Nullable GpuBuffer frameCommands;
     private static @Nullable GpuBuffer frameArena;
@@ -823,11 +834,8 @@ public final class RetainedLabels {
         frameCommands = null;
         frameArena = null;
         COMPILED.clear();
-        if (poseRing != null) {
-            // Fences the previous frame's use of the current buffers
-            poseRing.rotate();
-        }
         if (indexRing != null) {
+            // Fences the previous frame's use of the current buffers
             indexRing.rotate();
         }
         if (commandRing != null) {
@@ -895,15 +903,16 @@ public final class RetainedLabels {
             RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS).getBuffer(largestRange * 6);
         }
 
-        if (poseRing == null) {
-            poseRing = new MappableRingBuffer(() -> "Ruthenium label poses", GpuBuffer.USAGE_UNIFORM_TEXEL_BUFFER | GpuBuffer.USAGE_MAP_WRITE,
-                    MAX_REGIONS * REGION_SIZE);
+        GpuDevice device = RenderSystem.getDevice();
+        if (poseTexture == null) {
+            poseTexture = device.createTexture(() -> "Ruthenium label poses", GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING,
+                    GpuFormat.RGBA32_FLOAT, POSE_TEXTURE_WIDTH, MAX_REGIONS * REGION_SIZE / POSE_ROW_BYTES, 1, 1);
+            poseView = device.createTextureView(poseTexture);
         }
-        GpuBuffer poses = poseRing.currentBuffer();
-        int poseSize = (maxRegion + 1) * REGION_SIZE;
-        try (GpuBufferSlice.MappedView view = poses.slice(0, poseSize).map(false, true)) {
-            MemoryUtil.memCopy(MemoryUtil.memAddress0(poseBytes), MemoryUtil.memAddress(view.data()), poseSize);
-        }
+        // The rows holding this frame's regions (whole rows; the other regions' texels are never read this frame)
+        int rows = ((maxRegion + 1) * REGION_SIZE + POSE_ROW_BYTES - 1) / POSE_ROW_BYTES;
+        device.createCommandEncoder().writeToTexture(poseTexture, MemoryUtil.memByteBuffer(MemoryUtil.memAddress0(poseBytes), rows * POSE_ROW_BYTES),
+                0, 0, 0, 0, POSE_TEXTURE_WIDTH, rows);
         if (indexSize > 0) {
             if (indexRing == null || indexRing.size() < indexSize) {
                 if (indexRing != null) {
@@ -932,7 +941,7 @@ public final class RetainedLabels {
             }
             frameCommands = commands;
         }
-        framePoses = poses;
+        framePoses = poseView;
         frameArena = arenaBuffer;
     }
 
@@ -1137,7 +1146,7 @@ public final class RetainedLabels {
 
     /** Draws a label draw in its group draw's place ({@code PreparedRenderType.draw} with the arena and the indices) */
     public static void draw(RenderPass renderPass, LabelDraw draw) {
-        GpuBuffer poses = framePoses;
+        GpuTextureView poses = framePoses;
         GpuBuffer arenaBuffer = frameArena;
         PreparedRenderType prepared = draw.prepared;
         if (draw.uses == 0 || (draw.indexCount == 0 && draw.commandCount == 0) || poses == null || arenaBuffer == null || prepared == null) {
@@ -1168,7 +1177,7 @@ public final class RetainedLabels {
         for (PreparedRenderType.Texture texture : prepared.textures()) {
             renderPass.setUniform(texture.name(), texture.textureView(), texture.sampler());
         }
-        renderPass.setUniform("LabelPoses", poses);
+        renderPass.setUniform("LabelPoses", poses, RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
         if (draw.commandCount > 0) {
             RenderSystem.AutoStorageIndexBuffer sequential = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
             renderPass.setIndexBuffer(sequential.getBuffer(), sequential.type());

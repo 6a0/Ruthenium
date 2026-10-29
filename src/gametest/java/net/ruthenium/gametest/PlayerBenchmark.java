@@ -211,6 +211,18 @@ final class PlayerBenchmark {
             frameSeries.put("pan", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
             LOGGER.info(results.getLast().summaryLine());
 
+            if (ToggleAb.enabled()) {
+                ToggleAb.run(context, results, () -> {
+                    context.runOnClient(mc -> {
+                        mc.player.setYRot(0.0F);
+                        mc.player.yRotO = 0.0F;
+                        mc.player.setXRot(PITCH);
+                        mc.player.xRotO = PITCH;
+                    });
+                    context.waitTicks(10);
+                }, 0.0F, PITCH);
+            }
+
             moving = false;
             if (CLOSE_SHOTS > 0) {
                 closeUps(context, server, sceneLabel, runId);

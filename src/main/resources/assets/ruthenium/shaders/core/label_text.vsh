@@ -12,13 +12,17 @@
 
 // Ruthenium: vanilla's core/text.vsh for a label's glyphs kept in label space (RetainedLabels). Each vertex names its
 // label's region; the region's pose rows (camera-relative) and light are this frame's, in LabelPoses (4 texels per
-// region: three pose rows, then the light as UV2's two values)
+// region: three pose rows, then the light as UV2's two values; texel t at (t % 256, t / 256) of an RGBA32F texture)
 layout(location = 0) in vec3 Position;
 layout(location = 1) in vec4 Color;
 layout(location = 2) in vec2 UV0;
 layout(location = 3) in ivec2 LabelRegion;
 
-uniform samplerBuffer LabelPoses;
+uniform sampler2D LabelPoses;
+
+vec4 labelTexel(int t) {
+    return texelFetch(LabelPoses, ivec2(t & 255, t >> 8), 0);
+}
 
 #if !defined(IS_GUI) && !defined(IS_SEE_THROUGH)
 uniform sampler2D Sampler2;
@@ -31,9 +35,9 @@ layout(location = 3) out vec2 texCoord0;
 
 void main() {
     int base = LabelRegion.x * 4;
-    vec4 row0 = texelFetch(LabelPoses, base);
-    vec4 row1 = texelFetch(LabelPoses, base + 1);
-    vec4 row2 = texelFetch(LabelPoses, base + 2);
+    vec4 row0 = labelTexel(base);
+    vec4 row1 = labelTexel(base + 1);
+    vec4 row2 = labelTexel(base + 2);
     // The same operations in the same order as JOML's Matrix4f.transformPosition (no fused multiply-add), so the
     // position is bit-identical to the one vanilla writes into the vertex
     precise vec3 pos;
@@ -43,7 +47,7 @@ void main() {
     gl_Position = ProjMat * ModelViewMat * vec4(pos, 1.0);
 
 #if !defined(IS_GUI) && !defined(IS_SEE_THROUGH)
-    ivec2 uv2 = ivec2(texelFetch(LabelPoses, base + 3).xy);
+    ivec2 uv2 = ivec2(labelTexel(base + 3).xy);
     sphericalVertexDistance = fog_spherical_distance(pos);
     cylindricalVertexDistance = fog_cylindrical_distance(pos);
     vertexColor = Color * sample_lightmap(Sampler2, uv2);
