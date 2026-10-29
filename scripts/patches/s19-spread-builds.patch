@@ -1,0 +1,448 @@
+diff --git a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+index 7d8c429..3f9587c 100644
+--- a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
++++ b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+@@ -125,7 +125,11 @@ import java.util.function.Consumer;
+  * A batch is rebuilt when the section's compiled mesh changes (block entity list), when the section or a neighbour
+  * is marked dirty (block and light changes, which is where the light comes from), on block events of chests,
+  * shulker boxes, pots and bells (lids, wobbles, swings), on block entity data updates and sign text changes, when breaking progress
+- * changes, and when a left out block entity comes to rest. Everything is dropped when fonts reload or the text
++ * changes, and when a left out block entity comes to rest. Builds take at most {@link #BUILD_BUDGET_NANOS} of a frame: a
++ * section whose build doesn't finish continues next frame (one at a time, its vertices so far kept) and its block
++ * entities take the vanilla path until it is done. The build starts over if its section's block entity list or one of
++ * its block entities changes meanwhile; after block or light changes it is checked with {@link #isUnchanged} when done.
++ * Everything is dropped when fonts reload or the text
+  * filtering setting changes. Batches of sections only partly within the view distance aren't drawn; their
+  * block entities take the vanilla path that frame.
+  * <p>
+@@ -144,8 +148,13 @@ public final class RetainedBlockEntities {
+     public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT_CULL, CUTOUT, TEXT, TEXT_GRAYSCALE, TEXT_NORMAL,
+             TEXT_GRAYSCALE_NORMAL);
+ 
+-    /** Block entities rebuilt per frame at most; sections over budget take the vanilla path until they are built */
+-    private static final int REBUILD_BUDGET = 2048;
++    /**
++     * Build time per frame at most, checked after each block entity. A section of ~2k chests takes ~8 ms to build warm and
++     * up to ~40 ms while the code is still cold (just after joining), so its build is spread over frames.
++     */
++    private static final long BUILD_BUDGET_NANOS = 1_000_000L;
++    /** Frames a build in progress is kept while its section isn't extracted (it can drop out of the visible sections for a frame) */
++    private static final int BUILD_KEEP_FRAMES = 10;
+     /**
+      * Batches unused for this many frames and seconds are freed, or for this many frames alone when their section is
+      * beyond {@link #EVICT_DISTANCE} blocks past their view distance. A frame count alone freed the batches behind the
+@@ -210,7 +219,16 @@ public final class RetainedBlockEntities {
+     };
+     private static boolean textFiltering;
+     private static int frame;
+-    private static int rebuiltThisFrame;
++    /** Build time spent this frame */
++    private static long buildNanos;
++    /** The batch whose build continues over frames (its vertices so far are in the part sets), or null, and its progress */
++    private static @Nullable Batch building;
++    private static @Nullable List<BlockEntity> buildList;
++    private static int buildIndex;
++    private static int buildCount;
++    private static @Nullable List<BlockEntity> buildMoving;
++    private static double buildViewDistance;
++    private static boolean buildLinked;
+     private static double camX, camY, camZ;
+ 
+     private RetainedBlockEntities() {
+@@ -400,7 +418,7 @@ public final class RetainedBlockEntities {
+     public static void beginFrame(Vec3 cameraPos) {
+         frame++;
+         frameNanos = System.nanoTime();
+-        rebuiltThisFrame = 0;
++        buildNanos = 0;
+         VISIBLE.clear();
+         camX = cameraPos.x();
+         camY = cameraPos.y();
+@@ -413,6 +431,10 @@ public final class RetainedBlockEntities {
+             clearPending = true;
+         }
+ 
++        if (building != null && (clearPending || frame - building.lastFrame > BUILD_KEEP_FRAMES)) {
++            // Its section wasn't extracted for a while: let others build
++            abandonBuild();
++        }
+         if (clearPending) {
+             clearPending = false;
+             pipelineAvailable = null;
+@@ -522,7 +544,7 @@ public final class RetainedBlockEntities {
+         ObjectIterator<Long2ObjectMap.Entry<Batch>> iterator = BATCHES.long2ObjectEntrySet().fastIterator();
+         while (iterator.hasNext()) {
+             Batch batch = iterator.next().getValue();
+-            if (frame - batch.lastFrame > EVICT_AFTER_FRAMES
++            if (frame - batch.lastFrame > EVICT_AFTER_FRAMES && batch != building
+                     && (frameNanos - batch.lastNanos > EVICT_AFTER_NANOS || isFar(batch))) {
+                 batch.close();
+                 iterator.remove();
+@@ -562,17 +584,17 @@ public final class RetainedBlockEntities {
+             }
+         }
+ 
+-        if (!batch.dirty && (batch.blocksChanged || batch.mesh != mesh) && batch.mesh != null
++        if (!batch.dirty && (batch.blocksChanged || batch.mesh != mesh) && batch.mesh != null && batch != building
+                 && Initializer.CONFIG.retainedChangeChecks && isUnchanged(batch, blockEntities, level)) {
+             // A block or light change that doesn't concern the batch, or the section compiled again with the same block entities
+             batch.mesh = mesh;
+             batch.blocksChanged = false;
+         }
+-        if (batch.dirty || batch.blocksChanged || batch.mesh != mesh) {
+-            if (rebuiltThisFrame >= REBUILD_BUDGET) {
++        if (batch.dirty || batch.blocksChanged || batch.mesh != mesh || batch == building) {
++            if (!build(batch, mesh, blockEntities, level, dispatcher, partialTick, cameraPos, cameraState)) {
++                // Not built yet: the vanilla path this frame
+                 return null;
+             }
+-            build(batch, mesh, blockEntities, level, dispatcher, partialTick, cameraPos, cameraState);
+         }
+ 
+         if (batch.memberCount == 0) {
+@@ -742,9 +764,50 @@ public final class RetainedBlockEntities {
+                 || type == LecternRenderer.class || type == BellRenderer.class || type == CopperGolemStatueBlockRenderer.class;
+     }
+ 
+-    @SuppressWarnings({"rawtypes", "unchecked"})
+-    private static void build(Batch batch, SectionMesh mesh, List<BlockEntity> blockEntities, ClientLevel level,
+-                              BlockEntityRenderDispatcher dispatcher, float partialTick, Vec3 cameraPos, CameraRenderState cameraState) {
++    /**
++     * Builds the batch, or continues its build, for at most the rest of this frame's {@link #BUILD_BUDGET_NANOS}.
++     *
++     * @return whether the batch is built; if not, its block entities take the vanilla path this frame
++     */
++    private static boolean build(Batch batch, SectionMesh mesh, List<BlockEntity> blockEntities, ClientLevel level,
++                                 BlockEntityRenderDispatcher dispatcher, float partialTick, Vec3 cameraPos, CameraRenderState cameraState) {
++        if (batch == building && (batch.dirty || batch.mesh != mesh || buildList != blockEntities)) {
++            // A block entity it read or the list changed
++            abandonBuild();
++        }
++        if (batch != building) {
++            if (building != null || buildNanos >= BUILD_BUDGET_NANOS) {
++                return false;
++            }
++            startBuild(batch, mesh, blockEntities);
++        }
++
++        long start = System.nanoTime();
++        boolean done;
++        try {
++            done = buildSteps(batch, blockEntities, level, dispatcher, partialTick, cameraPos, cameraState, start);
++        } catch (RuntimeException | Error e) {
++            abandonBuild();
++            throw e;
++        }
++        if (done && batch.blocksChanged) {
++            // Blocks or light changed during the build: what was read before the change must still hold
++            if (Initializer.CONFIG.retainedChangeChecks && isUnchanged(batch, blockEntities, level)) {
++                batch.blocksChanged = false;
++            } else {
++                abandonBuild();
++                done = false;
++            }
++        }
++        buildNanos += System.nanoTime() - start;
++        if (!done) {
++            return false;
++        }
++        finishBuild(batch);
++        return true;
++    }
++
++    private static void startBuild(Batch batch, SectionMesh mesh, List<BlockEntity> blockEntities) {
+         batch.close();
+         batch.mesh = mesh;
+         batch.dirty = false;
+@@ -755,126 +818,168 @@ public final class RetainedBlockEntities {
+         boolean[] members = batch.members.length == size ? batch.members : new boolean[size];
+         Arrays.fill(members, false);
+         batch.members = members;
+-        BlockEntity[] built = batch.built.length == size ? batch.built : new BlockEntity[size];
+-        BlockState[] states = batch.states.length == size ? batch.states : new BlockState[size];
+-        int[] lights = batch.lights.length == size ? batch.lights : new int[size];
+-        int[] otherLights = batch.otherLights.length == size ? batch.otherLights : new int[size];
+-        batch.built = built;
+-        batch.states = states;
+-        batch.lights = lights;
+-        batch.otherLights = otherLights;
+-        boolean linked = false;
+-
+-        List<BlockEntity> moving = null;
+-        int count = 0;
+-        double viewDistance = -1.0;
+-
+-        try {
+-            for (int i = 0; i < size; i++) {
+-                BlockEntity blockEntity = blockEntities.get(i);
+-                built[i] = blockEntity;
+-                states[i] = blockEntity.getBlockState();
+-                otherLights[i] = NO_LIGHT;
+-                int candidate = candidate(blockEntity, level);
+-                if (candidate == MOVING) {
+-                    if (moving == null) {
+-                        moving = new ArrayList<>();
+-                    }
+-                    moving.add(blockEntity);
+-                    continue;
+-                } else if (candidate != CANDIDATE) {
+-                    continue;
+-                }
+-
+-                BlockPos pos = blockEntity.getBlockPos();
+-                if (!blockEntity.hasLevel() || !blockEntity.getType().isValid(blockEntity.getBlockState())
+-                        || level.destructionProgress().containsKey(pos.asLong())) {
+-                    continue;
+-                }
+-
+-                BlockEntityRenderer renderer = dispatcher.getRenderer(blockEntity);
+-                if (renderer == null || !isRetainedRenderer(renderer) || renderer.shouldRenderOffScreen()) {
+-                    continue;
+-                }
+-                double distance = renderer.getViewDistance();
+-                if (viewDistance >= 0.0 && distance != viewDistance) {
+-                    continue;
+-                }
+-
+-                BlockEntityRenderState state = renderer.createRenderState();
+-                renderer.extractRenderState(blockEntity, state, partialTick, cameraPos, null);
+-                boolean outlineDependent = false;
+-                if (state instanceof SignRenderState sign) {
+-                    // Built without the outline of the camera's reach; frameMembers hands such signs to vanilla while it shows
+-                    outlineDependent = isOutlineDependent(sign);
+-                    sign.drawOutline = false;
+-                }
+-
+-                POSE_STACK.pushPose();
+-                POSE_STACK.translate((float) (pos.getX() - batch.originX), (float) (pos.getY() - batch.originY), (float) (pos.getZ() - batch.originZ));
+-                CAPTURE.reset();
+-                renderer.submit(state, POSE_STACK, CAPTURE, cameraState);
+-                POSE_STACK.popPose();
++        batch.built = batch.built.length == size ? batch.built : new BlockEntity[size];
++        batch.states = batch.states.length == size ? batch.states : new BlockState[size];
++        batch.lights = batch.lights.length == size ? batch.lights : new int[size];
++        batch.otherLights = batch.otherLights.length == size ? batch.otherLights : new int[size];
++
++        building = batch;
++        buildList = blockEntities;
++        buildIndex = 0;
++        buildCount = 0;
++        buildMoving = null;
++        buildViewDistance = -1.0;
++        buildLinked = false;
++    }
+ 
+-                if (!CAPTURE.isModelsAndText() || !isRetainable(CAPTURE)) {
+-                    continue;
+-                }
+-                PartSet parts = outlineDependent ? SIGN_PARTS : PARTS;
+-                for (int m = 0; m < CAPTURE.modelCount; m++) {
+-                    ModelSubmitCapture.ModelRecord model = CAPTURE.model(m);
+-                    write(model, part(parts, model.renderType).builder);
+-                }
+-                // TextFeatureRenderer's glyph renderer
+-                for (int g = 0; g < GLYPHS.size(); g++) {
+-                    TextRenderable glyph = GLYPHS.get(g);
+-                    int entry = GLYPH_TEXTS.getInt(g);
+-                    ModelSubmitCapture.TextRecord text = CAPTURE.text(entry >> 1);
+-                    glyph.render(text.pose, part(parts, glyph.renderType(glyphMode(entry))).builder, text.lightCoords, false);
+-                }
+-                if (outlineDependent) {
+-                    SIGN_INDICES.add(i);
+-                    for (int p = 0; p < SIGN_PARTS.count; p++) {
+-                        Part part = SIGN_PARTS.parts.get(p);
+-                        part.signEnds.add(((BufferBuilderAccessor) part.builder).ruthenium$getVertices() / 4);
+-                    }
+-                }
++    /** Drops the build in progress; its batch is built again from the start */
++    private static void abandonBuild() {
++        Batch batch = building;
++        if (batch == null) {
++            return;
++        }
++        discardParts(PARTS);
++        discardParts(SIGN_PARTS);
++        SIGN_INDICES.clear();
++        GLYPHS.clear();
++        GLYPH_TEXTS.clear();
++        Arrays.fill(batch.members, false);
++        batch.dirty = true;
++        building = null;
++        buildList = null;
++        buildMoving = null;
++    }
+ 
+-                viewDistance = distance;
+-                members[i] = true;
+-                count++;
+-                lights[i] = LightCoordsUtil.getLightCoords(level, pos);
+-                BlockState blockState = states[i];
+-                if (blockEntity instanceof ChestBlockEntity && blockState.hasProperty(ChestBlock.TYPE)
+-                        && blockState.getValue(ChestBlock.TYPE) != ChestType.SINGLE) {
+-                    BlockPos other = otherHalf(pos, blockState);
+-                    otherLights[i] = LightCoordsUtil.getLightCoords(level, other);
+-                    linked |= SectionPos.blockToSectionCoord(other.getX()) != SectionPos.blockToSectionCoord(pos.getX())
+-                            || SectionPos.blockToSectionCoord(other.getZ()) != SectionPos.blockToSectionCoord(pos.getZ());
+-                }
+-            }
+-        } finally {
++    private static void finishBuild(Batch batch) {
++        try {
+             batch.draws = finishParts(PARTS);
+             batch.signDraws = finishParts(SIGN_PARTS);
+             batch.signs = SIGN_INDICES.isEmpty() ? NO_INTS : SIGN_INDICES.toIntArray();
+             batch.signsNear = batch.signsNear.length == batch.signs.length ? batch.signsNear : new boolean[batch.signs.length];
+             batch.anyNear = false;
++        } finally {
+             SIGN_INDICES.clear();
+             GLYPHS.clear();
+             GLYPH_TEXTS.clear();
++            building = null;
++            buildList = null;
+         }
+ 
+-        rebuiltThisFrame += count;
+-        batch.linked = linked;
+-        batch.moving = moving != null ? moving : List.of();
+-        batch.viewDistance = viewDistance;
++        int count = buildCount;
++        batch.linked = buildLinked;
++        batch.moving = buildMoving != null ? buildMoving : List.of();
++        buildMoving = null;
++        batch.viewDistance = buildViewDistance;
+         if (count > 0 && batch.draws.length == 0 && batch.signDraws.length == 0) {
+             // Only empty models
+-            Arrays.fill(members, false);
++            Arrays.fill(batch.members, false);
+             count = 0;
+         }
+         batch.memberCount = count;
+     }
+ 
++    /** Builds block entities from {@link #buildIndex} on until the list ends (true) or the frame's budget is spent */
++    @SuppressWarnings({"rawtypes", "unchecked"})
++    private static boolean buildSteps(Batch batch, List<BlockEntity> blockEntities, ClientLevel level, BlockEntityRenderDispatcher dispatcher,
++                                      float partialTick, Vec3 cameraPos, CameraRenderState cameraState, long start) {
++        int size = blockEntities.size();
++        boolean[] members = batch.members;
++        BlockEntity[] built = batch.built;
++        BlockState[] states = batch.states;
++        int[] lights = batch.lights;
++        int[] otherLights = batch.otherLights;
++        long budget = BUILD_BUDGET_NANOS - buildNanos;
++
++        for (int i = buildIndex; i < size; i++) {
++            if (i > buildIndex && System.nanoTime() - start >= budget) {
++                buildIndex = i;
++                return false;
++            }
++            BlockEntity blockEntity = blockEntities.get(i);
++            built[i] = blockEntity;
++            states[i] = blockEntity.getBlockState();
++            otherLights[i] = NO_LIGHT;
++            int candidate = candidate(blockEntity, level);
++            if (candidate == MOVING) {
++                if (buildMoving == null) {
++                    buildMoving = new ArrayList<>();
++                }
++                buildMoving.add(blockEntity);
++                continue;
++            } else if (candidate != CANDIDATE) {
++                continue;
++            }
++
++            BlockPos pos = blockEntity.getBlockPos();
++            if (!blockEntity.hasLevel() || !blockEntity.getType().isValid(blockEntity.getBlockState())
++                    || level.destructionProgress().containsKey(pos.asLong())) {
++                continue;
++            }
++
++            BlockEntityRenderer renderer = dispatcher.getRenderer(blockEntity);
++            if (renderer == null || !isRetainedRenderer(renderer) || renderer.shouldRenderOffScreen()) {
++                continue;
++            }
++            double distance = renderer.getViewDistance();
++            if (buildViewDistance >= 0.0 && distance != buildViewDistance) {
++                continue;
++            }
++
++            BlockEntityRenderState state = renderer.createRenderState();
++            renderer.extractRenderState(blockEntity, state, partialTick, cameraPos, null);
++            boolean outlineDependent = false;
++            if (state instanceof SignRenderState sign) {
++                // Built without the outline of the camera's reach; frameMembers hands such signs to vanilla while it shows
++                outlineDependent = isOutlineDependent(sign);
++                sign.drawOutline = false;
++            }
++
++            POSE_STACK.pushPose();
++            POSE_STACK.translate((float) (pos.getX() - batch.originX), (float) (pos.getY() - batch.originY), (float) (pos.getZ() - batch.originZ));
++            CAPTURE.reset();
++            renderer.submit(state, POSE_STACK, CAPTURE, cameraState);
++            POSE_STACK.popPose();
++
++            if (!CAPTURE.isModelsAndText() || !isRetainable(CAPTURE)) {
++                continue;
++            }
++            PartSet parts = outlineDependent ? SIGN_PARTS : PARTS;
++            for (int m = 0; m < CAPTURE.modelCount; m++) {
++                ModelSubmitCapture.ModelRecord model = CAPTURE.model(m);
++                write(model, part(parts, model.renderType).builder);
++            }
++            // TextFeatureRenderer's glyph renderer
++            for (int g = 0; g < GLYPHS.size(); g++) {
++                TextRenderable glyph = GLYPHS.get(g);
++                int entry = GLYPH_TEXTS.getInt(g);
++                ModelSubmitCapture.TextRecord text = CAPTURE.text(entry >> 1);
++                glyph.render(text.pose, part(parts, glyph.renderType(glyphMode(entry))).builder, text.lightCoords, false);
++            }
++            if (outlineDependent) {
++                SIGN_INDICES.add(i);
++                for (int p = 0; p < SIGN_PARTS.count; p++) {
++                    Part part = SIGN_PARTS.parts.get(p);
++                    part.signEnds.add(((BufferBuilderAccessor) part.builder).ruthenium$getVertices() / 4);
++                }
++            }
++
++            buildViewDistance = distance;
++            members[i] = true;
++            buildCount++;
++            lights[i] = LightCoordsUtil.getLightCoords(level, pos);
++            BlockState blockState = states[i];
++            if (blockEntity instanceof ChestBlockEntity && blockState.hasProperty(ChestBlock.TYPE)
++                    && blockState.getValue(ChestBlock.TYPE) != ChestType.SINGLE) {
++                BlockPos other = otherHalf(pos, blockState);
++                otherLights[i] = LightCoordsUtil.getLightCoords(level, other);
++                buildLinked |= SectionPos.blockToSectionCoord(other.getX()) != SectionPos.blockToSectionCoord(pos.getX())
++                        || SectionPos.blockToSectionCoord(other.getZ()) != SectionPos.blockToSectionCoord(pos.getZ());
++            }
++        }
++        buildIndex = size;
++        return true;
++    }
++
+     /** Checks the captured submits and prepares the glyphs of the captured text into {@link #GLYPHS} */
+     private static boolean isRetainable(ModelSubmitCapture capture) {
+         for (int m = 0; m < capture.modelCount; m++) {
+@@ -956,6 +1061,21 @@ public final class RetainedBlockEntities {
+         return part;
+     }
+ 
++    /** Releases the parts' builders without uploading anything */
++    private static void discardParts(PartSet set) {
++        for (int i = 0; i < set.count; i++) {
++            Part part = set.parts.get(i);
++            try (MeshData _ = part.builder.build()) {
++                // dropped
++            }
++            part.builder = null;
++            part.renderType = null;
++            part.pipeline = null;
++            part.signEnds.clear();
++        }
++        set.count = 0;
++    }
++
+     /**
+      * Uploads the parts' vertices, one draw per render type, and releases the builders. Sign parts keep their order
+      * (sign by sign) and are drawn without the per plane culling.

@@ -100,7 +100,7 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   (`benchRutheniumGl`) the static view ran at 344 fps (before the eighth session; not re-measured).
 - **Block entities at rest are retained on the GPU** (`RetainedBlockEntities`; chests since the third session, at
   the user's choice, shulker boxes, decorated pots and skulls since the seventh, sign text since the eighth, lecterns, bells and copper golem
-  statues since the seventeenth): their
+  statues since the seventeenth, glowing sign text since the nineteenth, switch "Retained Glowing Sign Text"): their
   geometry lives in per-section vertex buffers and is drawn with copies of the entity and text pipelines that add
   `ModelOffset`. Switch
   ("Retained Block Entities"): Optimizations page of the settings screen, or `-Druthenium.retainedChests=false`
@@ -124,7 +124,9 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   (`EntityRendererCache`, "Fast Entity Culling") and keep their light across frames (`EntityLight`, "Keep Entity
   Light"). Since the sixteenth session the client tick is cheaper: entity collision searches skip sections without
   collidable entities ("Fast Entity Collisions"), animateTick ("Fast Block Animation Tick"), boats ("Fast Boat Ticks")
-  and the supporting block of resting entities ("Keep Supporting Blocks"). Section 8 lists what is left there.
+  and the supporting block of resting entities ("Keep Supporting Blocks"); since the nineteenth resting entities also keep
+  their block collision answer ("Keep Resting Collisions") and transparent face culling keeps its masks per texture (it was
+  slower than no culling with instanced parts off). Section 8 lists what is left there.
 - **The settings screen is ported** (fourth session): the video settings button opens VulkanMod's screen with Video,
   Graphics (vanilla options through their `OptionInstance`s) and Optimizations (the mod's switches, `Config`,
   `config/ruthenium_settings.json`). `-Druthenium.<field>=true|false` overrides any switch for a launch.
@@ -150,6 +152,9 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
 - **Server scene, static view: ~0.72 ms render thread, ~0.84 ms GPU per frame** (seventeenth session; 0.78 / 0.875 in
   the twelfth). It is GPU bound, so CPU savings there show in the render thread time and the p99, not much in the average. Its p99 low
   is set by the 2% of frames that run a client tick (~1.4 ms per tick); see section 7, "Twelfth session".
+- **Nineteenth session** (section 7): the four open items. Kept: transparent face masks per texture, glowing sign text
+  retained (mixed scene with `-Pbench.glowingSigns=true`: static 774 -> 1289 fps), resting block collisions (client tick
+  1.429 -> 1.360 ms with gravity). Binned: retained builds spread over frames (more slow frames after a join, not fewer).
 - **Next:** see section 8.
 
 ---
@@ -368,6 +373,11 @@ so the server scene numbers in this file are history.
 5. Report average, 95% low and 99% low FPS for each phase, plus allocation rate.
 
 First runs (Vulkan, one each, 2026-10-28): initial 1167, pan 1608, static 1545, particles 1247 fps.
+Since the nineteenth session the initial phase also writes its frame series (`results/frames/*-initial.csv`), and
+`-Pbench.glowingSigns=true` gives the signs glowing text (inside the cube black and coloured groups, the face red, black,
+lime and light blue; `dark_red` is no dye colour and would read as black) and adds yaw 270 shots 7.5 blocks farther
+(`glow270x-7`, no face sign within the 16 block outline reach) and 4 closer (`glow270x4`); it changes the scene's numbers.
+Default `dark_red` text color and no glow otherwise, so default numbers stay comparable.
 
 ### 6.2 Implementation (`src/gametest`)
 - `BenchmarkClientGameTest`: sets options (Fancy preset, render distance 16, unlimited fps, no vsync) and runs the
@@ -649,7 +659,8 @@ client-side events before measuring: a shulker box opened, a pot wobbled and bre
 (`beevents` screenshot after 30 ticks), then closed/removed again (`bereset`). Compare with
 `-Pvm.retainedChests=false`. `-Pbench.blockEntitySigns=true` (eighth session) adds a row of signs ~10 blocks in front
 of the camera at z -4/-5 (standing signs on a stone row, wall signs on its north face, hanging signs below it; plain,
-coloured, bold, underlined and back side text, one glowing sign at x 4, which stays on the vanilla path); with the
+coloured, bold, underlined and back side text, one glowing sign at x 4, black, so always outlined; retained since the
+nineteenth session); with the
 events it also changes one sign's text on the client (`besign`). It hides part of the field, so don't compare its fps
 with runs without it. Crop the signs with `scripts/Crop.java` (`java scripts/Crop.java out.png x y w h
 scale in1.png in2.png`, around x 740 y 600) to compare glyphs.
@@ -1178,6 +1189,79 @@ Session start (`77b631c`) vs end (`aa618c3`), checked out in turn in the same tr
 - **Entity scene** (`s17-session-entities`): static 323.7 vs 327.4 fps, pan 1173.9 vs 1184.6, client tick 1.287 vs 1.285 ms:
   unchanged (none of the changes touch it).
 
+### Nineteenth session (2026-10-28/29)
+The four open items of section 8 (transparent face cache misses, glowing sign text, retained builds after a join, resting
+items and orbs). The machine was shared with another agent's benchmarks: every Gradle command ran under a shared GPU lock
+(a `mkdir` lock in the session's scratchpad), whole matrices per lock. Results in `results/s19-*` and `results/s19-dev/`, logs
+`build/bench-logs/s19-*.log`.
+
+- **Transparent face masks per texture** (`a4d2751`, `s19-tf-*`): confirmed with temporary counters first: with
+  `-Pvm.instancedParts=false` the entity scene missed `ModelPartCubeM`'s 4 entry cache 826 times per frame at ~1.06 us (~0.88 ms
+  per frame, villager clothing cubes see ~28 textures); with defaults 0 misses, but `TransparentFaces.of` ran for all ~1306
+  model submits per frame (~60 us with the timers) although most are instanced and write no cube. Each cube now keeps a hash
+  table per `TextureAlpha` (id hashed, grows to 128 slots, starts over when full or when `TransparentFaces.clear` bumps the
+  generation), and `ModelCulling` looks the alpha up when the first cube of a submit is written (1306 -> 103 lookups per frame).
+  Same masks, so same output. Instanced parts off, culling off vs on (5 pairs): static 196.0 -> 221.6 fps (every pair; render
+  thread 4.92 -> 4.37 ms), pan 954.9 -> 997.6. The culling is now a gain there too (it was ~8% slower). Defaults, commit vs
+  commit: entity scene 324.7 vs 320.2, then 329.3 vs 337.6 with `staticSeconds=10` (pan 1131 vs 1151): within noise both
+  times; mixed scene unchanged.
+- **Glowing sign text retained** (`a4651b2`, `s19-glow-mixed`, switch `retainedGlowingText`, "Retained Glowing Sign Text"):
+  `isRetainable` accepts outlined text (the 8 outline copies go to retained copies of vanilla's `text` / `text_grayscale`
+  pipelines, `TEXT_NORMAL`, `TEXT_GRAYSCALE_NORMAL`; outline and text are separated by the polygon offset, so their order
+  doesn't matter). Black glowing text is always outlined, so it is plain retained geometry. Other colours are outlined only
+  while `AbstractSignRenderer.isOutlineVisible` (camera entity within 16 blocks of the block centre, or first person
+  scoping): such signs are built with `drawOutline = false` into separate parts kept in sign order (`SIGN_PARTS`, quad counts
+  per sign through a `BufferBuilder` accessor), and every frame a visible batch whose box is within 17 blocks of the camera
+  entity (or while scoping) calls vanilla's `isOutlineVisible` (invoker) per such sign; those it outlines are left out of the
+  members returned to the extraction (vanilla path) and of the draws (runs of consecutive signs). No invalidation is needed for
+  scoping: the check runs every frame. The mixed scene got `-Pbench.glowingSigns=true` (section 6.1). Parity, retained on vs
+  off: zoom shot 0 px at threshold 12; yaw 270 and the shots 7.5 blocks farther (no outlines) and 4 closer (outlined face
+  signs on the vanilla path, up to 8 per pan frame) differ only in clouds; the block entity scene with signs and events (its
+  black glowing sign now retained) 19 px at threshold 12 in every shot, as before. A first parity run passed for the wrong
+  reason: the face signs' `dark_red` is no `DyeColor`, so they read as black (always outlined) and no sign took the vanilla
+  path (extraction count 0 in every frame); the option now gives the face valid dye colours. A/B with `glowingSigns` (5
+  pairs, switch off vs on): static 773.9 -> 1288.8 fps, pan 853.2 -> 1245.0, initial 498.3 -> 954.4, particles 657.7 ->
+  1083.3, every pair (render thread static 1.27 -> 0.60 ms). Default mixed scene: unchanged (static 1514.2 vs 1525.7).
+- **Rejected: retained builds spread over frames** (`s19-builds2`, `s19-budget`, patch `scripts/patches/s19-spread-builds.patch`).
+  Measured first (temporary build timer, `s19-dev/p3-build`): in the mixed scene's initial phase three consecutive frames
+  built 2056, 2048 and 2664 block entities in 95, 38 and 27 ms (frames 4-6 of the phase, 112/49/37 ms; the phase max of
+  125 ms is frame 0, which builds nothing); later builds are warm (a 1536 chest section took 10.5 ms in the pan). The patch
+  replaces the 2048 block entity per frame budget by a time budget (1 ms, checked after each block entity): one build at a
+  time continues across frames with its vertices kept in the part sets, its block entities take the vanilla path until it
+  is done, it starts over when its list or a block entity changes, and after block or light changes it is checked with
+  `isUnchanged` when done. Exact: builds that spanned frames were rebuilt in one go in the same run and their part CRCs
+  compared, 12 of 12 equal (with glowing signs too; CRCs don't compare across runs, glyph atlas positions depend on the
+  order glyphs are first baked). A first version that restarted on every light change and when its section missed one
+  frame never finished while chunks arrived. Result (5 pairs, initial phase, budget 1 ms vs unlimited in the same build):
+  p99 low 302.0 -> 199.5 fps, frames over 10 ms 10 -> 19, over 5 ms ~25 -> ~55, time over 5 ms 457 -> 469 ms, max 138.8 ->
+  125.6 (frame 0 dominates); pan and static unchanged. While a section is unbuilt its ~2000 chests take the cold vanilla
+  path every frame, so one 30-90 ms frame becomes dozens of 5-20 ms frames. Binned; the initial spikes worth chasing are the
+  first frames after the teleport (not builds; not investigated).
+- **Resting block collisions kept** (`9f2c06d`, `s19-resting-noai`, switch `fastRestingCollisions`, "Keep Resting Collisions";
+  idea from Lithium's collision work, own code): the entity cost probe got `Entity.collide` / `collideBoundingBox` parts per
+  kind (items, orbs, other); with gravity and AI, `collideBoundingBox` was ~1.0 us per item move and ~0.7 us per orb move,
+  ~164 us per tick of the probe's 2.07 ms. `RestingCollisions` keeps an entity's last `collideBoundingBox` answer (wrapped
+  in `Entity.collide`, client levels, only without entity colliders) while the box and movement repeat, the world border is
+  not close, and the swept region passes `SupportingBlocks.capture` / `unchanged` (no dynamic or context dependent shape,
+  same sections and change stamps); the region is captured only on the second identical call, so moving entities only
+  compare fields. Exact: a temporary check computed vanilla's answer on every hit (gravity, AI, explosions, light events):
+  131k hits, 0 mismatches. A/B with `-Pbench.entityGravity=true -Pbench.staticSeconds=10` (5 pairs): static client tick
+  1.429 -> 1.360 ms (every pair; entities 1.151 -> 1.087), pan tick 1.292 -> 1.246, fps unchanged within noise. With AI too
+  (`s19-resting`, secondary) the scene differs run to run (creepers left 3-18, items 419-465, explosions crater the
+  floor): static tick 1.821 vs 1.830 ms with runs from 1.69 to 1.91, no conclusion; don't use AI runs for tick A/Bs.
+- Tools: the mixed scene writes the initial phase's frame series (`*-initial.csv`) and has `-Pbench.glowingSigns=true`
+  (section 6.1); the entity cost probe's tick parts include `collide` and `collideBoundingBox` per kind.
+
+Mod compatibility (each change has a switch; all exact for vanilla): `retainedGlowingText` calls vanilla's
+`AbstractSignRenderer.isOutlineVisible` each frame for retained coloured glowing signs near the camera, so a mod changing
+the outline rule there is followed, but one that changes it in `submitSignText` or the render state is not (as for other
+retained sign text, mods drawing extra sign content through other submits make the sign non-retainable).
+`fastRestingCollisions` wraps the `collideBoundingBox` call in `Entity.collide` (a mod overwriting `collide` makes the
+mixin fail to apply; one redirecting the same call is wrapped), and has `fastSupportingBlocks`' assumptions: block changes
+on the client go through `LevelChunk.setBlockState` or chunk data, and context dependent collision shapes override
+`getCollisionShape` in the block class. `TransparentFaces`' per cube tables hold texture alphas until a reload (at most
+128 per cube).
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -1294,15 +1378,16 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 ### Decisions and verification notes
 On 2026-10-28 the user reviewed the items below and **kept all of them** (transparent face culling, supporting
 blocks, plane culling and the mod compatibility trade-offs). Nothing is pending. The notes stay as reference; the
-`TransparentFaces` cache miss with instanced parts off is still worth fixing as an ordinary optimisation.
+`TransparentFaces` cache miss with instanced parts off was fixed in the nineteenth session (section 7).
 - **`TransparentFaces` (7e76c79) is ~8% slower with instanced parts off** (independent verification after the
   fourteenth session, `results/verify-s14/`): entity scene, `-Pvm.instancedParts=false`, 3 pairs, every pair slower
   with the culling on: static 194.9 -> 179.7 fps (render thread 4.99 -> 5.37 ms), pan 987 -> 906. With defaults it
   is a real gain (5 pairs: static 298.5 -> 313.7, 3.26 -> 3.05 ms). Likely (inferred, not profiled) cause: each cube
   caches its face mask for only 4 textures (`ModelPartCubeM.transparentPolygons`), so models whose cubes see many
   textures per frame (villager clothing, ~28) rescan the faces' UV rectangles on every miss. This also hits the
-  non-instanced fallbacks with defaults (translucent models with >4 textures, `MAX_BATCHES` overflow). Fix options: a
-  larger or per-texture cache, or giving up on a cube after repeated misses. Kept (user, 2026-10-28).
+  non-instanced fallbacks with defaults (translucent models with >4 textures, `MAX_BATCHES` overflow). Kept (user,
+  2026-10-28). **Fixed (nineteenth session, `a4d2751`):** confirmed (826 misses per frame at ~1.06 us); per texture hash
+  tables per cube, instanced parts off culling off -> on now 196.0 -> 221.6 fps.
 - The server scene's static render thread CPU read 0.71 -> 0.74 ms in all 4 verification pairs (4150777 vs a9aafe1),
   fps unchanged (GPU bound); probably the per-submit `TransparentFaces.of` / `ModelPoseReplay.begin` checks across
   the 296 armor stands (not profiled).
@@ -1391,9 +1476,11 @@ blocks, plane culling and the mod compatibility trade-offs). Nothing is pending.
      ~46 us. Texture atlas animation ~0.18-0.2 ms (blocks atlas 134 us: 56 animated sprites, ~42 drawn per tick into 5 mip
      levels; particles 31 us for one sprite; ~30 us per render pass, native driver time; only drawing visible sprites, as
      Sodium does, would not be exact), `animateTick` ~0.12 ms (1334 block reads and particle checks), player sync ~0.05.
-     In real play (`-Pbench.entityGravity=true`, `-Pbench.entityAi=true`) resting items and orbs also pay `collide`'s
-     block sweep (~1/3 of their `move`; a cache like the supporting block's could take it, or Lithium-style specialized
-     cuboid collisions), and dropped items from fights cost ~1.1 us each. The frames with a tick are also slower outside
+     In real play (`-Pbench.entityGravity=true`) resting items and orbs also paid `collide`'s block sweep; kept since the
+     nineteenth session (`RestingCollisions`, tick 1.429 -> 1.360 ms with gravity). What is left of their `move` is mostly
+     `checkSupportingBlock` (kept) and the rest of vanilla's move bookkeeping. Dropped items from fights cost ~1.1 us each.
+     Don't A/B ticks with `-Pbench.entityAi=true`: fights and explosions make every run a different scene (creepers left
+     3-18, items 419-465 over five runs). The frames with a tick are also slower outside
      the tick, most likely the benchmark harness's handshake and length-biased sampling (section 6.6).
    - Players and other translucent types stay vanilla (no player in the scene but the spectator).
 2. **Per entity and block entity cost in the server scene** (twelfth and seventeenth session measurements in section 7).
@@ -1415,13 +1502,13 @@ blocks, plane culling and the mod compatibility trade-offs). Nothing is pending.
      Tick frames also carry the harness's handshake (section 6.6).
    - **Block entity extraction** ~0.09 ms per frame at the static view (hidden by the GPU wait); facing the chest cube
      0.2-0.3 ms, mostly closed books (~3.6k at ~60-70 ns after the tilt change: pose math and the instance write).
-   - **Glowing sign text** (not retained): the text is full bright, and its outline depends on the camera being within 16
-     blocks (or scoping) unless the text is black. Retaining it needs the capture to accept outlined text (black glowing
-     text always has one) or, for other colours, a batch check each frame that drops glowing signs within ~18 blocks to
-     the vanilla path and an invalidation when scoping changes. Modest gain (glowing signs are usually read up close).
-   - **Retained builds after joining or teleporting**: a section is built in one go; with cold code ~450-2300 block
-     entities took 9-43 ms per frame right after the join (warm: ~4 us per block entity). Splitting a section's build
-     over frames would need partial parts kept across frames.
+   - **Glowing sign text**: retained since the nineteenth session (`a4651b2`); coloured glowing signs within the outline
+     reach take the vanilla path frame by frame.
+   - **Retained builds after joining or teleporting**: a section is built in one go; in the mixed scene's initial phase
+     three frames build 2-2.7k block entities each in 95/38/27 ms (cold). Spreading builds over frames with a time budget
+     was built, verified exact and binned (nineteenth session, `scripts/patches/s19-spread-builds.patch`): the unbuilt
+     chests' vanilla path made more slow frames than it saved. The phase's largest frames (~120 ms, frames 0-3 after the
+     teleport) are not builds and were not investigated; that is the lead for join smoothness.
    - Occlusion culling of block entities is **not** exact (chests are 14/16 wide; the ones behind show through).
 3. **Allocation** (~0.35 MB/frame at static since the eighth session; was ~2.3): `Float` boxing of chest openness per submit, submit records,
    `PoseStack.Pose`, glyph instances of non-sign text, `CompactVectorArray` per sort.

@@ -16,5 +16,6 @@ after the rename; results and logs stay in `build/run/bench/results/<dir>`.
 | `s17-cells.patch` | 17th, `s17-cells` | HEAD |
 | `s17-f2b.patch` | 17th, `s17-f2b-*` | HEAD |
 | `s17-sprites.patch` | 17th, `s17-sprites` | HEAD |
+| `s19-spread-builds.patch` | 19th, `s19-builds2`, `s19-budget` | `8fbc095`-era `RetainedBlockEntities` (`git apply --3way` on HEAD) |
 
 The two old patches (5th, 7th) fail on HEAD because the code moved on; `git apply --3way` gets most of the way.
