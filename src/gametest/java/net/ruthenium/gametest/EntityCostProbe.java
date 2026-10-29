@@ -25,7 +25,8 @@ public final class EntityCostProbe {
     public static final Table ITEMS = new Table("prepare items (per display context, extra = quads)", false);
     public static final Table PARTS = new Table("parts of extraction and submission (per method, nested in the above)", false);
     public static final Table TICK_PARTS = new Table("parts of the client's entity tick (per method, nested in the above)", true);
-    private static final List<Table> TABLES = List.of(EXTRACT, SUBMIT, PARTS, FEATURE_GROUPS, MODELS, SETUP_ANIM, MODEL_RENDER, ITEMS, TICK,
+    public static final Table UPLOAD = new Table("shared vertex buffer upload (per frame)", false);
+    private static final List<Table> TABLES = List.of(EXTRACT, SUBMIT, PARTS, FEATURE_GROUPS, MODELS, SETUP_ANIM, MODEL_RENDER, ITEMS, UPLOAD, TICK,
             TICK_PARTS);
 
     private EntityCostProbe() {

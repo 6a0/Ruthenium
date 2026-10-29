@@ -25,6 +25,7 @@
     "LocalPlayerTickPartsProbeMixin",
     "ModelFeatureCostProbeMixin",
     "OrbTickPartsProbeMixin",
+    "StagedVertexBufferCostProbeMixin",
     "RenderTypesPartsProbeMixin",
     "TextureAtlasTickPartsProbeMixin",
     "VillagerProfessionLayerPartsProbeMixin"
