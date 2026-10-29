@@ -1797,8 +1797,8 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 
 ### Decisions and verification notes
 On 2026-10-28 the user reviewed the items below and **kept all of them** (transparent face culling, supporting
-blocks, plane culling and the mod compatibility trade-offs). Nothing from before the nineteenth session is pending (the
-nineteenth session's switches are not reviewed yet). The notes stay as reference; the
+blocks, plane culling and the mod compatibility trade-offs). On 2026-10-29 the user accepted the mod compatibility
+trade-offs of the nineteenth (both parts) and twenty-first sessions as well, so nothing is pending. The notes stay as reference; the
 `TransparentFaces` cache miss with instanced parts off was fixed in the nineteenth session (section 7).
 Twenty-first session, mod compatibility only (exact for vanilla, switch "Reuse Sort Order"): staged draws whose sorting is
 vanilla's distance sort no longer call `MeshData.SortState.writeSortedIndexBuffer` (already an `@Overwrite` since the first
@@ -1862,8 +1862,8 @@ leaves stale masks (faces missing until the next upload or reload).
   The plane culling commit alone costs the block entity scene only -0.1% (+1-2 us GPU), so most of the -0.65% is not
   from it and is unattributed. Compare retained screenshots at threshold 12, not 1 (time-of-day drift dominates
   threshold 1; retained types show 15-19 px at t12 vs retained off).
-- Nineteenth session, part 1: mod compatibility notes at the end of its entry in section 7 (not reviewed by the user yet).
-- Nineteenth session, part 2 (players and holograms, not reviewed by the user yet), mod compatibility only; each switch is exact
+- Nineteenth session, part 1: mod compatibility notes at the end of its entry in section 7 (accepted by the user on 2026-10-29).
+- Nineteenth session, part 2 (players and holograms, accepted by the user on 2026-10-29), mod compatibility only; each switch is exact
   for vanilla and can be turned off: `nameTagTextCache` hands the renderer the component the entity showed last when the new
   one is `equals` to it, so a mod that mutates the name tag component in place after extraction would mutate the kept one,
   and a mod that relies on a new instance each frame sees the same one (mods that return different names each frame only
