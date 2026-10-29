@@ -36,9 +36,16 @@ import java.util.TreeMap;
  *     <li>"particles": {@code bench.particleSeconds} after spawning 500k happy_villager particles in view
  *     ({@code bench.particleCommand}).</li>
  * </ol>
- * Screenshots: yaw 270 (the chest cube; {@code bench.extraShotYaws}) and the static view. {@code bench.zoomShot}
+ * The initial and pan phases write their per-frame series. Screenshots: yaw 270 (the chest cube;
+ * {@code bench.extraShotYaws}) and the static view. {@code bench.zoomShot}
  * adds a 30 degree field of view shot at yaw 270, {@code bench.chestEvents} opens a chest lid and shows breaking
  * progress on another chest before the static phase ({@code chestopen}, {@code chestclosed}).
+ * <p>
+ * {@code bench.glowingSigns=true} gives the signs glowing text: every other group of the signs inside the cube black
+ * (always outlined), the others coloured (outlined only within 16 blocks of the camera entity), the face's signs in turn
+ * red, black, lime and light blue (the face's usual dark_red is no dye colour, so it reads as black), and
+ * adds yaw 270 screenshots from farther away ({@code glow270x-7}, no face sign in reach) and closer ({@code glow270x4}).
+ * It changes the scene, so don't compare its numbers with runs without it.
  */
 final class MixedBenchmark {
     private static final Logger LOGGER = LoggerFactory.getLogger("Ruthenium Mixed Benchmark");
@@ -49,6 +56,7 @@ final class MixedBenchmark {
     private static final String[] EXTRA_SHOT_YAWS = BenchmarkClientGameTest.prop("extraShotYaws", "270").split(",");
     private static final boolean ZOOM_SHOT = Boolean.parseBoolean(BenchmarkClientGameTest.prop("zoomShot", "false"));
     private static final boolean CHEST_EVENTS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("chestEvents", "false"));
+    private static final boolean GLOWING_SIGNS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("glowingSigns", "false"));
     /**
      * Records vanilla's section profiler (the debug profiling report) during the static phase, into
      * {@code debug/profiling/} of the run directory. Times are measured per section, unlike JFR samples, but the
@@ -73,6 +81,9 @@ final class MixedBenchmark {
     private static final int TABLES_MIN_X = 48, TABLES_MIN_Z = -37, TABLES_SIZE = 75;
 
     private static final String[] WOODS = {"oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry"};
+    /** Text colours of the glowing sign groups inside the cube (with glowingSigns) */
+    private static final String[] GLOW_COLORS = {"black", "light_blue", "black", "yellow", "black", "lime", "black", "red"};
+    private static final String[] FACE_GLOW_COLORS = {"red", "black", "lime", "light_blue"};
 
     private MixedBenchmark() {
     }
@@ -97,6 +108,7 @@ final class MixedBenchmark {
             context.runOnClient(_ -> FrameRecorder.startPhase());
             BenchmarkClientGameTest.waitSeconds(context, INITIAL_SECONDS);
             results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("initial", -1)));
+            frameSeries.put("initial", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
             LOGGER.info(results.getLast().summaryLine());
 
             TerrainBenchmark.waitForVisibleCompiled(context);
@@ -132,6 +144,9 @@ final class MixedBenchmark {
                 BenchmarkClientGameTest.setYaw(context, 270.0F);
                 context.takeScreenshot(label + "-zoom270-" + runId);
                 context.runOnClient(mc -> mc.options.fov().set(fov));
+            }
+            if (GLOWING_SIGNS) {
+                glowShots(context, server, label, runId);
             }
             BenchmarkClientGameTest.setYaw(context, BenchmarkClientGameTest.STATIC_YAW);
 
@@ -193,12 +208,14 @@ final class MixedBenchmark {
             int x0 = CUBE_MIN_X + 4 * i;
             server.runCommand("fill %d %d %d %d %d %d minecraft:%s_sign[rotation=4]{front_text:%s,back_text:%s}"
                     .formatted(x0, SIGN_LAYER, CUBE_MIN_Z, x0 + 3, SIGN_LAYER, CUBE_MAX_Z, WOODS[i],
-                            signText("Inside " + i, "black"), signText("Back " + i, "dark_blue")));
+                            signText("Inside " + i, GLOWING_SIGNS ? GLOW_COLORS[i] : "black", GLOWING_SIGNS),
+                            signText("Back " + i, "dark_blue", false)));
         }
         // Standing signs on the ground along the cube's west face, facing the camera at yaw 270
         for (int z = CUBE_MIN_Z; z <= CUBE_MAX_Z; z += 2) {
             server.runCommand("setblock %d %d %d minecraft:%s_sign[rotation=4]{front_text:%s}"
-                    .formatted(CUBE_MIN_X - 1, FLOOR, z, WOODS[Math.floorMod(z, WOODS.length)], signText("Face " + z, "dark_red")));
+                    .formatted(CUBE_MIN_X - 1, FLOOR, z, WOODS[Math.floorMod(z, WOODS.length)], signText("Face " + z,
+                            GLOWING_SIGNS ? FACE_GLOW_COLORS[Math.floorMod(z / 2, FACE_GLOW_COLORS.length)] : "dark_red", GLOWING_SIGNS)));
         }
 
         // Enchanting tables: far enough that their books stay closed
@@ -222,8 +239,24 @@ final class MixedBenchmark {
         server.runCommand("forceload remove all");
     }
 
-    private static String signText(String first, String color) {
-        return "{messages:[\"%s\",\"Ruthenium\",\"mixed scene\",\"0123456789\"],color:\"%s\"}".formatted(first, color);
+    private static String signText(String first, String color, boolean glowing) {
+        return "{messages:[\"%s\",\"Ruthenium\",\"mixed scene\",\"0123456789\"],color:\"%s\"%s}".formatted(first, color,
+                glowing ? ",has_glowing_text:true" : "");
+    }
+
+    /**
+     * Yaw 270 screenshots from 7.5 blocks farther from the cube (no face sign within 16 blocks of the camera entity) and
+     * 4 blocks closer (more of them), then back at the start
+     */
+    private static void glowShots(ClientGameTestContext context, TestServerContext server, String label, String runId) {
+        for (double x : new double[]{CAMERA_X - 7.0, CAMERA_X + 4.0, CAMERA_X}) {
+            server.runCommand("tp @a %s %s %s 270 0".formatted(x, CAMERA_Y, CAMERA_Z));
+            context.waitFor(mc -> mc.player != null && mc.player.distanceToSqr(x, CAMERA_Y, CAMERA_Z) < 0.01, 10 * TICKS_PER_SECOND);
+            BenchmarkClientGameTest.setYaw(context, 270.0F);
+            if (x != CAMERA_X) {
+                context.takeScreenshot(label + "-glow270x" + (int) Math.floor(x) + "-" + runId);
+            }
+        }
     }
 
     /** Opens a chest lid and shows breaking progress on another chest (client side), screenshots open and closed */

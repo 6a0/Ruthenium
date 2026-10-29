@@ -19,6 +19,8 @@ public class Config {
     public boolean retainedChests = true;
     /** Retained block entity batches whose section's blocks or light changed are rebuilt only if their block entities' states or light did */
     public boolean retainedChangeChecks = true;
+    /** Signs with glowing text are retained too (with retainedChests); those vanilla outlines near the camera take its path while it does */
+    public boolean retainedGlowingText = true;
     /** Closed enchanting table books and armor stands drawn as GPU instances */
     public boolean instancedModels = true;
     /** CPU skip of model faces and sign text the GPU would cull as back faces */

@@ -26,6 +26,8 @@
   "ruthenium.options.retainedChests": "Retained Block Entities",
   "ruthenium.options.retainedChests.tooltip": "Keeps the geometry of block entities at rest (closed chests and shulker boxes, decorated pots, skulls, sign text, lecterns, bells, copper golem statues) on the GPU across frames instead of rebuilding it every frame.",
   "ruthenium.options.retainedChangeChecks": "Retained Change Checks",
+  "ruthenium.options.retainedGlowingText": "Retained Glowing Sign Text",
+  "ruthenium.options.retainedGlowingText.tooltip": "Signs with glowing text are kept on the GPU too. Coloured glowing text gets its outline only within 16 blocks of the camera, so those signs are drawn the normal way while you are close. Needs Retained Block Entities.",
   "ruthenium.options.retainedChangeChecks.tooltip": "When blocks or light change near retained block entities (crops, grass, redstone), their geometry is only rebuilt if their blocks or light changed. Needs Retained Block Entities.",
 
   "ruthenium.options.instancedModels": "Instanced Models",

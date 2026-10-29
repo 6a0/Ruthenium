@@ -235,6 +235,14 @@ public abstract class Options {
                                 () -> config.retainedChangeChecks)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.retainedChangeChecks.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.retainedGlowingText"),
+                                value -> {
+                                    config.retainedGlowingText = value;
+                                    RetainedBlockEntities.clear();
+                                },
+                                () -> config.retainedGlowingText)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.retainedGlowingText.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.instancedModels"),
                                 value -> {
                                     config.instancedModels = value;

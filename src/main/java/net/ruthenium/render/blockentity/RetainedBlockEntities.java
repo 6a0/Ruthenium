@@ -41,6 +41,7 @@ import net.minecraft.client.renderer.blockentity.ShulkerBoxRenderer;
 import net.minecraft.client.renderer.blockentity.SkullBlockRenderer;
 import net.minecraft.client.renderer.blockentity.StandingSignRenderer;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
+import net.minecraft.client.renderer.blockentity.state.SignRenderState;
 import net.minecraft.client.renderer.chunk.SectionMesh;
 import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
@@ -71,12 +72,16 @@ import net.minecraft.world.level.block.entity.SignText;
 import net.minecraft.world.level.block.entity.SignTextSlot;
 import net.minecraft.world.level.block.entity.SkullBlockEntity;
 import net.minecraft.world.level.block.entity.TrappedChestBlockEntity;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.ChestType;
 import net.minecraft.world.phys.Vec3;
 import net.ruthenium.Initializer;
 import net.ruthenium.render.chunk.SectionFaceGroups;
 import net.ruthenium.interfaces.IdleTicker;
+import net.ruthenium.mixin.render.text.AbstractSignRendererAccessor;
+import net.ruthenium.mixin.render.vertex.BufferBuilderAccessor;
 import net.ruthenium.render.entity.ModelGeometryCache;
 import net.ruthenium.render.text.SignTextCache;
 import org.joml.Matrix4f;
@@ -97,15 +102,19 @@ import java.util.function.Consumer;
  * building it every frame.
  * <p>
  * Handled are the vanilla classes and renderers of chests (lid closed and staying closed), shulker boxes (closed),
- * decorated pots (not wobbling), skulls (not animating, no player skin), signs (no glowing or obfuscated text),
- * lecterns, bells (not swinging) and copper golem statues.
+ * decorated pots (not wobbling), skulls (not animating, no player skin), signs (no obfuscated text), lecterns, bells
+ * (not swinging) and copper golem statues.
  * Per render section, their vertices are built once, relative to the section origin, by running the real renderer
  * into a {@link ModelSubmitCapture}: every submitted model (pots submit their parts as models) is written with all
  * faces, through {@link ModelGeometryCache} for rest pose models and with vanilla's model rendering otherwise, and
  * every submitted text the way {@code TextFeatureRenderer} writes it, into one vertex buffer per render type. A block
  * entity is only kept if all its submits are models in a cutout or solid entity pipeline with the default texture
  * transform and no outline, or opaque polygon offset text without background or outline: text vanilla itself draws
- * with the solid features, where the order doesn't matter. The extraction then skips those block entities, and the
+ * with the solid features, where the order doesn't matter. Glowing sign text is full bright and drawn with an outline
+ * (8 copies without polygon offset, behind the text by depth) if it is black, or while the camera entity is within 16
+ * blocks of the sign or scoping ({@code AbstractSignRenderer.isOutlineVisible}). Signs whose outline depends on the
+ * camera are built without it into separate draws ({@link Batch#signs}), and each frame those that vanilla would
+ * outline take the vanilla path while the draws leave out their quads. The extraction then skips those block entities, and the
  * batches are drawn right after the world's solid features with copies of vanilla's entity and text pipelines
  * ({@link #PIPELINES}) whose vertex shader adds {@code ModelOffset} (section origin minus camera) to the position;
  * the render type's textures and its layering transform (the z offset of skulls) are applied as vanilla does.
@@ -129,7 +138,11 @@ public final class RetainedBlockEntities {
     public static final RenderPipeline TEXT = retainedTextPipeline(RenderPipelines.TEXT_POLYGON_OFFSET, "text_polygon_offset");
     public static final RenderPipeline TEXT_GRAYSCALE = retainedTextPipeline(RenderPipelines.TEXT_GRAYSCALE_POLYGON_OFFSET,
             "text_grayscale_polygon_offset");
-    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT_CULL, CUTOUT, TEXT, TEXT_GRAYSCALE);
+    /** Text without polygon offset: the outline of glowing sign text */
+    public static final RenderPipeline TEXT_NORMAL = retainedTextPipeline(RenderPipelines.TEXT, "text");
+    public static final RenderPipeline TEXT_GRAYSCALE_NORMAL = retainedTextPipeline(RenderPipelines.TEXT_GRAYSCALE, "text_grayscale");
+    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT_CULL, CUTOUT, TEXT, TEXT_GRAYSCALE, TEXT_NORMAL,
+            TEXT_GRAYSCALE_NORMAL);
 
     /** Block entities rebuilt per frame at most; sections over budget take the vanilla path until they are built */
     private static final int REBUILD_BUDGET = 2048;
@@ -148,7 +161,10 @@ public final class RetainedBlockEntities {
     private static final BlockEntity[] NO_BLOCK_ENTITIES = new BlockEntity[0];
     private static final BlockState[] NO_STATES = new BlockState[0];
     private static final int[] NO_INTS = new int[0];
+    private static final boolean[] NO_BOOLEANS = new boolean[0];
     private static final int NO_LIGHT = Integer.MIN_VALUE;
+    /** AbstractSignRenderer.OUTLINE_RENDER_DISTANCE plus a block of margin, for skipping batches without a sign in reach */
+    private static final double OUTLINE_REACH_SQ = 17.0 * 17.0;
     private static final int[] RUNS = new int[SectionFaceGroups.MAX_PLANE_RUNS * 2];
 
     private static final int NOT_CANDIDATE = 0;
@@ -171,11 +187,17 @@ public final class RetainedBlockEntities {
     private static final ModelSubmitCapture CAPTURE = new ModelSubmitCapture();
     private static final PoseStack POSE_STACK = new PoseStack();
     private static final PoseStack WRITE_POSE = new PoseStack();
-    /** Vertex builders of the batch being built, one per render type; the first {@link #partCount} are in use */
-    private static final List<Part> PARTS = new ArrayList<>();
-    private static int partCount;
+    /** Vertex builders of the batch being built, one per render type */
+    private static final PartSet PARTS = new PartSet();
+    /** Vertex builders of the batch's signs whose outline depends on the camera, in build order */
+    private static final PartSet SIGN_PARTS = new PartSet();
+    /** List indices of the signs written into {@link #SIGN_PARTS} */
+    private static final IntArrayList SIGN_INDICES = new IntArrayList();
     private static @Nullable Boolean pipelineAvailable;
-    /** Glyphs of the block entity being built and the index of the text each belongs to */
+    /**
+     * Glyphs of the block entity being built and the index of the text each belongs to, shifted left by one, with the
+     * low bit set for outline glyphs (drawn without polygon offset)
+     */
     private static final List<TextRenderable> GLYPHS = new ArrayList<>();
     private static final IntArrayList GLYPH_TEXTS = new IntArrayList();
     private static int glyphText;
@@ -256,6 +278,10 @@ public final class RetainedBlockEntities {
             return TEXT;
         } else if (vanilla == RenderPipelines.TEXT_GRAYSCALE_POLYGON_OFFSET) {
             return TEXT_GRAYSCALE;
+        } else if (vanilla == RenderPipelines.TEXT) {
+            return TEXT_NORMAL;
+        } else if (vanilla == RenderPipelines.TEXT_GRAYSCALE) {
+            return TEXT_GRAYSCALE_NORMAL;
         } else if (vanilla == RenderPipelines.ENTITY_CUTOUT_CULL) {
             return CUTOUT_CULL;
         } else if (vanilla == RenderPipelines.ENTITY_CUTOUT || vanilla == RenderPipelines.ENTITY_CUTOUT_Z_OFFSET) {
@@ -266,9 +292,12 @@ public final class RetainedBlockEntities {
         return null;
     }
 
-    /** @param faces the quads grouped by facing, for pipelines that cull back faces */
+    /**
+     * @param faces    the quads grouped by facing, for pipelines that cull back faces
+     * @param signEnds for draws of {@link Batch#signDraws}: the quad count after each of {@link Batch#signs}
+     */
     private record Draw(RenderPipeline pipeline, RenderType renderType, GpuBuffer buffer, int indexCount,
-                        @Nullable SectionFaceGroups faces) {
+                        @Nullable SectionFaceGroups faces, int @Nullable [] signEnds) {
     }
 
     private static final class Part {
@@ -276,6 +305,14 @@ public final class RetainedBlockEntities {
         @Nullable RenderType renderType;
         @Nullable RenderPipeline pipeline;
         @Nullable BufferBuilder builder;
+        /** In {@link #SIGN_PARTS}: the quad count after each sign written so far */
+        final IntArrayList signEnds = new IntArrayList();
+    }
+
+    /** One vertex builder per render type; the first {@link #count} are in use */
+    private static final class PartSet {
+        final List<Part> parts = new ArrayList<>();
+        int count;
     }
 
     private static final class Batch {
@@ -298,6 +335,15 @@ public final class RetainedBlockEntities {
         /** Block entities left out because they (or a chest's other half) move */
         List<BlockEntity> moving = List.of();
         Draw[] draws = NO_DRAWS;
+        /** Members whose glowing text vanilla outlines near the camera (list indices), built without the outline */
+        int[] signs = NO_INTS;
+        /** The draws of {@link #signs}, quads in sign order */
+        Draw[] signDraws = NO_DRAWS;
+        /** Which of {@link #signs} take the vanilla path this frame, if {@link #anyNear} */
+        boolean[] signsNear = NO_BOOLEANS;
+        boolean anyNear;
+        /** {@link #members} without the signs near the camera */
+        boolean[] frameMembers = NO_BOOLEANS;
         double viewDistance;
         int lastFrame;
         long lastNanos;
@@ -312,7 +358,13 @@ public final class RetainedBlockEntities {
             for (Draw draw : this.draws) {
                 draw.buffer.close();
             }
+            for (Draw draw : this.signDraws) {
+                draw.buffer.close();
+            }
             this.draws = NO_DRAWS;
+            this.signDraws = NO_DRAWS;
+            this.signs = NO_INTS;
+            this.anyNear = false;
             this.memberCount = 0;
         }
     }
@@ -536,7 +588,7 @@ public final class RetainedBlockEntities {
         double limit = batch.viewDistance * batch.viewDistance;
         if (far < limit) {
             VISIBLE.add(batch);
-            return batch.members;
+            return batch.signs.length == 0 ? batch.members : frameMembers(batch);
         } else if (near >= limit) {
             // None would be rendered
             return batch.members;
@@ -546,6 +598,66 @@ public final class RetainedBlockEntities {
 
     private static double sq(double v) {
         return v * v;
+    }
+
+    /**
+     * The members the extraction skips this frame: all but the {@link Batch#signs} whose outline vanilla draws this
+     * frame ({@code AbstractSignRenderer.isOutlineVisible}, which the extraction would call), which take the vanilla
+     * path while {@link #draw} leaves out their quads
+     */
+    private static boolean[] frameMembers(Batch batch) {
+        int[] signs = batch.signs;
+        boolean[] near = batch.signsNear;
+        boolean anyNear = false;
+        if (mayShowOutlines(batch)) {
+            BlockEntity[] built = batch.built;
+            for (int k = 0; k < signs.length; k++) {
+                near[k] = AbstractSignRendererAccessor.invokeIsOutlineVisible(built[signs[k]].getBlockPos());
+                anyNear |= near[k];
+            }
+        }
+        batch.anyNear = anyNear;
+        if (!anyNear) {
+            return batch.members;
+        }
+        boolean[] members = batch.frameMembers;
+        if (members.length != batch.members.length) {
+            members = batch.frameMembers = new boolean[batch.members.length];
+        }
+        System.arraycopy(batch.members, 0, members, 0, members.length);
+        for (int k = 0; k < signs.length; k++) {
+            if (near[k]) {
+                members[signs[k]] = false;
+            }
+        }
+        return members;
+    }
+
+    /** False if no sign of the batch can be outlined: no scoping and every block centre beyond reach of the camera entity */
+    private static boolean mayShowOutlines(Batch batch) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player != null && minecraft.options.getCameraType().isFirstPerson() && minecraft.player.isScoping()) {
+            return true;
+        }
+        Entity camera = minecraft.getCameraEntity();
+        if (camera == null) {
+            return false;
+        }
+        double x = camera.getX(), y = camera.getY(), z = camera.getZ();
+        double minX = batch.originX + 0.5, minY = batch.originY + 0.5, minZ = batch.originZ + 0.5;
+        double dx = Math.max(0.0, Math.max(minX - x, x - (minX + 15.0)));
+        double dy = Math.max(0.0, Math.max(minY - y, y - (minY + 15.0)));
+        double dz = Math.max(0.0, Math.max(minZ - z, z - (minZ + 15.0)));
+        return dx * dx + dy * dy + dz * dz < OUTLINE_REACH_SQ;
+    }
+
+    /** Whether vanilla draws an outline around a side of the sign only near the camera: glowing text that isn't black */
+    private static boolean isOutlineDependent(SignRenderState state) {
+        return isOutlineDependent(state.frontText) || isOutlineDependent(state.backText);
+    }
+
+    private static boolean isOutlineDependent(@Nullable SignText text) {
+        return text != null && text.hasGlowingText() && text.getColor().getTextColor() != DyeColor.BLACK.getTextColor();
     }
 
     private static int candidate(BlockEntity blockEntity, ClientLevel level) {
@@ -596,11 +708,12 @@ public final class RetainedBlockEntities {
             // A rung bell swings for 50 ticks
             return blockEntity.isRemoved() || ((BellBlockEntity) blockEntity).shaking ? MOVING : CANDIDATE;
         } else if (type == SignBlockEntity.class || type == HangingSignBlockEntity.class) {
-            // Glowing text draws an outline depending on the camera distance; obfuscated text changes every frame
+            // Obfuscated text changes every frame
             SignBlockEntity sign = (SignBlockEntity) blockEntity;
             SignText front = sign.getText(SignTextSlot.FRONT);
             SignText back = sign.getText(SignTextSlot.BACK);
-            if (front.hasGlowingText() || back.hasGlowingText() || hasObfuscated(front) || hasObfuscated(back)) {
+            if (!Initializer.CONFIG.retainedGlowingText && (front.hasGlowingText() || back.hasGlowingText())
+                    || hasObfuscated(front) || hasObfuscated(back)) {
                 return NOT_CANDIDATE;
             }
             return blockEntity.isRemoved() ? MOVING : CANDIDATE;
@@ -690,6 +803,12 @@ public final class RetainedBlockEntities {
 
                 BlockEntityRenderState state = renderer.createRenderState();
                 renderer.extractRenderState(blockEntity, state, partialTick, cameraPos, null);
+                boolean outlineDependent = false;
+                if (state instanceof SignRenderState sign) {
+                    // Built without the outline of the camera's reach; frameMembers hands such signs to vanilla while it shows
+                    outlineDependent = isOutlineDependent(sign);
+                    sign.drawOutline = false;
+                }
 
                 POSE_STACK.pushPose();
                 POSE_STACK.translate((float) (pos.getX() - batch.originX), (float) (pos.getY() - batch.originY), (float) (pos.getZ() - batch.originZ));
@@ -700,15 +819,24 @@ public final class RetainedBlockEntities {
                 if (!CAPTURE.isModelsAndText() || !isRetainable(CAPTURE)) {
                     continue;
                 }
+                PartSet parts = outlineDependent ? SIGN_PARTS : PARTS;
                 for (int m = 0; m < CAPTURE.modelCount; m++) {
                     ModelSubmitCapture.ModelRecord model = CAPTURE.model(m);
-                    write(model, part(model.renderType).builder);
+                    write(model, part(parts, model.renderType).builder);
                 }
                 // TextFeatureRenderer's glyph renderer
                 for (int g = 0; g < GLYPHS.size(); g++) {
                     TextRenderable glyph = GLYPHS.get(g);
-                    ModelSubmitCapture.TextRecord text = CAPTURE.text(GLYPH_TEXTS.getInt(g));
-                    glyph.render(text.pose, part(glyph.renderType(text.displayMode)).builder, text.lightCoords, false);
+                    int entry = GLYPH_TEXTS.getInt(g);
+                    ModelSubmitCapture.TextRecord text = CAPTURE.text(entry >> 1);
+                    glyph.render(text.pose, part(parts, glyph.renderType(glyphMode(entry))).builder, text.lightCoords, false);
+                }
+                if (outlineDependent) {
+                    SIGN_INDICES.add(i);
+                    for (int p = 0; p < SIGN_PARTS.count; p++) {
+                        Part part = SIGN_PARTS.parts.get(p);
+                        part.signEnds.add(((BufferBuilderAccessor) part.builder).ruthenium$getVertices() / 4);
+                    }
                 }
 
                 viewDistance = distance;
@@ -725,7 +853,12 @@ public final class RetainedBlockEntities {
                 }
             }
         } finally {
-            batch.draws = finishParts();
+            batch.draws = finishParts(PARTS);
+            batch.signDraws = finishParts(SIGN_PARTS);
+            batch.signs = SIGN_INDICES.isEmpty() ? NO_INTS : SIGN_INDICES.toIntArray();
+            batch.signsNear = batch.signsNear.length == batch.signs.length ? batch.signsNear : new boolean[batch.signs.length];
+            batch.anyNear = false;
+            SIGN_INDICES.clear();
             GLYPHS.clear();
             GLYPH_TEXTS.clear();
         }
@@ -734,7 +867,7 @@ public final class RetainedBlockEntities {
         batch.linked = linked;
         batch.moving = moving != null ? moving : List.of();
         batch.viewDistance = viewDistance;
-        if (count > 0 && batch.draws.length == 0) {
+        if (count > 0 && batch.draws.length == 0 && batch.signDraws.length == 0) {
             // Only empty models
             Arrays.fill(members, false);
             count = 0;
@@ -756,21 +889,33 @@ public final class RetainedBlockEntities {
         Font font = Minecraft.getInstance().font;
         for (int t = 0; t < capture.textCount; t++) {
             ModelSubmitCapture.TextRecord text = capture.text(t);
-            // SubmitNodeCollection.canRenderAsSolid, and no outline (TextFeatureRenderer would draw it separately)
+            // SubmitNodeCollection.canRenderAsSolid
             if (text.displayMode != Font.DisplayMode.POLYGON_OFFSET || ARGB.alpha(text.color) != 255
-                    || ARGB.alpha(text.backgroundColor) != 0 || text.outlineColor != 0) {
+                    || ARGB.alpha(text.backgroundColor) != 0) {
                 return false;
             }
-            glyphText = t;
-            SignTextCache.prepareText(font, text.string, text.x, text.y, text.color, text.dropShadow, false, text.backgroundColor)
-                    .visit(GLYPH_COLLECTOR);
+            if (text.outlineColor == 0) {
+                glyphText = t << 1;
+                SignTextCache.prepareText(font, text.string, text.x, text.y, text.color, text.dropShadow, false, text.backgroundColor)
+                        .visit(GLYPH_COLLECTOR);
+            } else {
+                // TextFeatureRenderer.renderText: the outline without polygon offset, then the text without shadow or background
+                glyphText = t << 1 | 1;
+                SignTextCache.prepare8xTextOutline(font, text.string, text.x, text.y, text.outlineColor).visit(GLYPH_COLLECTOR);
+                glyphText = t << 1;
+                SignTextCache.prepareText(font, text.string, text.x, text.y, text.color, false, false, 0).visit(GLYPH_COLLECTOR);
+            }
         }
         for (int g = 0; g < GLYPHS.size(); g++) {
-            if (retainedPipeline(GLYPHS.get(g).renderType(Font.DisplayMode.POLYGON_OFFSET)) == null) {
+            if (retainedPipeline(GLYPHS.get(g).renderType(glyphMode(GLYPH_TEXTS.getInt(g)))) == null) {
                 return false;
             }
         }
         return true;
+    }
+
+    private static Font.DisplayMode glyphMode(int glyphText) {
+        return (glyphText & 1) != 0 ? Font.DisplayMode.NORMAL : Font.DisplayMode.POLYGON_OFFSET;
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
@@ -789,46 +934,57 @@ public final class RetainedBlockEntities {
                 record.overlayCoords, record.tintedColor);
     }
 
-    private static Part part(RenderType renderType) {
-        for (int i = 0; i < partCount; i++) {
-            Part part = PARTS.get(i);
+    private static Part part(PartSet set, RenderType renderType) {
+        for (int i = 0; i < set.count; i++) {
+            Part part = set.parts.get(i);
             if (part.renderType == renderType) {
                 return part;
             }
         }
-        if (partCount == PARTS.size()) {
-            PARTS.add(new Part());
+        if (set.count == set.parts.size()) {
+            set.parts.add(new Part());
         }
-        Part part = PARTS.get(partCount++);
+        Part part = set.parts.get(set.count++);
         part.renderType = renderType;
         part.pipeline = retainedPipeline(renderType);
         part.builder = new BufferBuilder(part.bytes, PrimitiveTopology.QUADS, renderType.format());
+        part.signEnds.clear();
+        if (set == SIGN_PARTS) {
+            // No quads for the signs before this one
+            part.signEnds.size(SIGN_INDICES.size());
+        }
         return part;
     }
 
-    /** Uploads the parts' vertices, one draw per render type, and releases the builders */
-    private static Draw[] finishParts() {
+    /**
+     * Uploads the parts' vertices, one draw per render type, and releases the builders. Sign parts keep their order
+     * (sign by sign) and are drawn without the per plane culling.
+     */
+    private static Draw[] finishParts(PartSet set) {
         Draw[] draws = NO_DRAWS;
         int drawn = 0;
-        for (int i = 0; i < partCount; i++) {
-            Part part = PARTS.get(i);
+        boolean signs = set == SIGN_PARTS;
+        for (int i = 0; i < set.count; i++) {
+            Part part = set.parts.get(i);
             try (MeshData data = part.builder.build()) {
                 if (data != null) {
                     if (draws.length == 0) {
-                        draws = new Draw[partCount];
+                        draws = new Draw[set.count];
                     }
                     // Reorders the vertices before the upload
-                    SectionFaceGroups faces = part.pipeline.isCull() ? SectionFaceGroups.sortByPlanes(data) : null;
+                    SectionFaceGroups faces = !signs && part.pipeline.isCull() ? SectionFaceGroups.sortByPlanes(data) : null;
                     GpuBuffer buffer = RenderSystem.getDevice().createBuffer(() -> "Ruthenium retained block entities",
                             GpuBuffer.USAGE_VERTEX, data.vertexBuffer());
-                    draws[drawn++] = new Draw(part.pipeline, part.renderType, buffer, data.drawState().vertexCount() / 4 * 6, faces);
+                    draws[drawn++] = new Draw(part.pipeline, part.renderType, buffer, data.drawState().vertexCount() / 4 * 6, faces,
+                            signs ? part.signEnds.toIntArray() : null);
                 }
             }
             part.builder = null;
             part.renderType = null;
             part.pipeline = null;
+            part.signEnds.clear();
         }
-        partCount = 0;
+        set.count = 0;
         return drawn == draws.length ? draws : Arrays.copyOf(draws, drawn);
     }
 
@@ -851,7 +1007,7 @@ public final class RetainedBlockEntities {
         MODEL_VIEWS.clear();
         int count = 0;
         for (Batch batch : VISIBLE) {
-            count += batch.draws.length;
+            count += batch.draws.length + batch.signDraws.length;
         }
         if (count == 0) {
             return;
@@ -862,12 +1018,14 @@ public final class RetainedBlockEntities {
         int maxIndexCount = 0;
         int i = 0;
         for (Batch batch : VISIBLE) {
-            for (Draw draw : batch.draws) {
-                // Fresh vectors: the uniform storage compares against the last record it wrote
-                Vector3f offset = new Vector3f((float) (batch.originX - camX), (float) (batch.originY - camY), (float) (batch.originZ - camZ));
-                data[i++] = new DynamicGpuData.Transform(modelView(draw.renderType, modelView), WHITE, offset, IDENTITY);
-                maxIndexCount = Math.max(maxIndexCount, draw.indexCount);
-                PREPARED.computeIfAbsent(draw.renderType, RenderType::prepare);
+            for (int set = 0; set < 2; set++) {
+                for (Draw draw : set == 0 ? batch.draws : batch.signDraws) {
+                    // Fresh vectors: the uniform storage compares against the last record it wrote
+                    Vector3f offset = new Vector3f((float) (batch.originX - camX), (float) (batch.originY - camY), (float) (batch.originZ - camZ));
+                    data[i++] = new DynamicGpuData.Transform(modelView(draw.renderType, modelView), WHITE, offset, IDENTITY);
+                    maxIndexCount = Math.max(maxIndexCount, draw.indexCount);
+                    PREPARED.computeIfAbsent(draw.renderType, RenderType::prepare);
+                }
             }
         }
         transforms = RenderSystem.getDynamicUniforms().writeTransforms(data);
@@ -902,38 +1060,68 @@ public final class RetainedBlockEntities {
         int i = 0;
         for (Batch batch : VISIBLE) {
             float eyeX = (float) (camX - batch.originX), eyeY = (float) (camY - batch.originY), eyeZ = (float) (camZ - batch.originZ);
-            for (Draw draw : batch.draws) {
-                GpuBufferSlice transform = transforms[i++];
-                if (draw.pipeline != boundPipeline) {
-                    CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(draw.pipeline);
-                    if (pipeline == null) {
-                        continue;
+            for (int set = 0; set < 2; set++) {
+                for (Draw draw : set == 0 ? batch.draws : batch.signDraws) {
+                    GpuBufferSlice transform = transforms[i++];
+                    if (draw.pipeline != boundPipeline) {
+                        CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(draw.pipeline);
+                        if (pipeline == null) {
+                            continue;
+                        }
+                        boundPipeline = draw.pipeline;
+                        boundType = null;
+                        renderPass.setPipeline(pipeline);
+                        RenderSystem.bindDefaultUniforms(renderPass);
+                        renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
                     }
-                    boundPipeline = draw.pipeline;
-                    boundType = null;
-                    renderPass.setPipeline(pipeline);
-                    RenderSystem.bindDefaultUniforms(renderPass);
-                    renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
-                }
-                if (draw.renderType != boundType) {
-                    boundType = draw.renderType;
-                    for (PreparedRenderType.Texture texture : PREPARED.get(boundType).textures()) {
-                        renderPass.setUniform(texture.name(), texture.textureView(), texture.sampler());
+                    if (draw.renderType != boundType) {
+                        boundType = draw.renderType;
+                        for (PreparedRenderType.Texture texture : PREPARED.get(boundType).textures()) {
+                            renderPass.setUniform(texture.name(), texture.textureView(), texture.sampler());
+                        }
                     }
-                }
-                renderPass.setUniform("DynamicTransforms", transform);
-                renderPass.setVertexBuffer(0, draw.buffer.slice());
-                if (faceCulling && draw.faces != null) {
-                    // Quads that face away from the eye would be culled by the pipeline
-                    int runs = draw.faces.visiblePlaneRuns(eyeX, eyeY, eyeZ, RUNS);
-                    for (int r = 0; r < runs; r++) {
-                        renderPass.drawIndexed(RUNS[r * 2 + 1] * 6, 1, 0, RUNS[r * 2] * 4, 0);
+                    renderPass.setUniform("DynamicTransforms", transform);
+                    renderPass.setVertexBuffer(0, draw.buffer.slice());
+                    if (draw.signEnds != null && batch.anyNear) {
+                        drawSignsNotNear(renderPass, draw.signEnds, batch.signsNear);
+                    } else if (faceCulling && draw.faces != null) {
+                        // Quads that face away from the eye would be culled by the pipeline
+                        int runs = draw.faces.visiblePlaneRuns(eyeX, eyeY, eyeZ, RUNS);
+                        for (int r = 0; r < runs; r++) {
+                            renderPass.drawIndexed(RUNS[r * 2 + 1] * 6, 1, 0, RUNS[r * 2] * 4, 0);
+                        }
+                    } else {
+                        renderPass.drawIndexed(draw.indexCount, 1, 0, 0, 0);
                     }
-                } else {
-                    renderPass.drawIndexed(draw.indexCount, 1, 0, 0, 0);
                 }
             }
         }
         renderPass.popDebugGroup();
+    }
+
+    /** Draws the quads of the signs that stay retained this frame, in runs of consecutive signs */
+    private static void drawSignsNotNear(RenderPass renderPass, int[] signEnds, boolean[] near) {
+        int start = 0;
+        int runStart = -1;
+        for (int k = 0; k < signEnds.length; k++) {
+            if (!near[k]) {
+                if (runStart < 0) {
+                    runStart = start;
+                }
+            } else if (runStart >= 0) {
+                drawQuads(renderPass, runStart, start - runStart);
+                runStart = -1;
+            }
+            start = signEnds[k];
+        }
+        if (runStart >= 0) {
+            drawQuads(renderPass, runStart, start - runStart);
+        }
+    }
+
+    private static void drawQuads(RenderPass renderPass, int first, int count) {
+        if (count > 0) {
+            renderPass.drawIndexed(count * 6, 1, 0, first * 4, 0);
+        }
     }
 }
