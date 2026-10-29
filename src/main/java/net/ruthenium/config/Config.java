@@ -49,6 +49,8 @@ public class Config {
     public boolean fastBoatTicks = true;
     /** Resting entities keep their supporting block while no block of the client level changes */
     public boolean fastSupportingBlocks = true;
+    /** Resting entities keep the block collision answer of their move while no block of the client level near them changes */
+    public boolean fastRestingCollisions = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */

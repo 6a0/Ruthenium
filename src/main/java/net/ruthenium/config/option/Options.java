@@ -333,6 +333,11 @@ public abstract class Options {
                                 () -> config.fastSupportingBlocks)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.fastSupportingBlocks.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.fastRestingCollisions"),
+                                value -> config.fastRestingCollisions = value,
+                                () -> config.fastRestingCollisions)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.fastRestingCollisions.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)
