@@ -232,7 +232,10 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   groups for 244 instances). The plate is now an instance of its own ("Separate Armor Stand Plates", `armorStandPlates`): mixed static
   1599 -> 1800 fps (+12.5%, every pair), render thread 0.54 -> 0.42 ms. Retained builds sort their plane keys with a radix sort and gather
   straight into the upload (exact, no switch): warm 2048 block entity builds ~6.2 -> ~4.65 ms. Every Gradle command runs under the GPU lock
-  (`scripts/gpulock.py`, section 6.3).
+  (`scripts/gpulock.py`, section 6.3). Part 2: clouds read their faces from an R8_SINT texture instead of a texel buffer ("Cloud Face
+  Texture", `cloudFaceTexture`): `vkQueueSubmit2` -21.7 us per frame, mixed static 1786.7 -> 1847.6 fps (+3.4%, every pair), OpenGL +1.8%;
+  instanced groups share one instance ring, one prepare per render type and their bindings (exact): ~0.8 us per group, -4 us at the default 7
+  groups; full size screenshots copy rows ("Fast Screenshots", `fastScreenshots`): the new world's icon readback 24-33 -> 11-15 ms.
 - **Next:** see section 8.
 
 ---
@@ -383,6 +386,8 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/render/text/TextDisplayRendererM.java` | **Text display lines kept** (nineteenth session, switch `textDisplayTextCache`, "Keep Text Display Text"): `TextDisplayRenderer.splitLines` (called only when the display's text or line width changes, `TextDisplay.cacheDisplay`) wraps each line in a `SignTextCache` line (`@ModifyArg` on `CachedLine.<init>`) |
 | `render/entity/TextDisplayCulling.java` + `mixin/render/entity/TextDisplayAccessor.java` + `LevelExtractorEntityM.ruthenium$fastCulling` | **Text displays culled by their text** (nineteenth session, switch `textDisplayCulling`, "Cull Text Displays"). Vanilla culls displays only with a width and height set (`Display.noCulling`); hologram plugins leave them at 0, so every text display in range was extracted, submitted and its text written every frame. After vanilla's test passes, a `TextDisplay` without passenger offset, name tag, shadow or glow, with a constant transformation and split text (`clientDisplayCache`), is tested as a sphere: the text rectangle (widest line x line count, +1 px background, +8 px glyph margin, 1 px depth) x 1/40, times the transformation (`|t| + ||A||_F |v|`), any billboard rotation; box widened by 0.5 + 2% of the distance (bobbing). Off while the camera entity is hurt/dying or under nausea/portal |
 | `mixin/render/entity/LivingEntityRendererLayersM.java` | **Empty armor stand layers skipped** (nineteenth session, switch `emptyArmorStandLayers`): `LivingEntityRenderer.submit`'s `shouldRenderLayers` answers false for vanilla's `ArmorStandRenderer` with exactly its four vanilla layers when the state's equipment, hands, head item and worn head are all empty (the layers draw nothing; the model's own submit poses the model again when prepared) |
+| `render/sky/CloudFaceTexture.java` + `mixin/render/sky/CloudRendererM.java` + `assets/ruthenium/shaders/core/clouds.vsh` | **Cloud faces in a texture** (twenty-fifth session, part 2, switch `cloudFaceTexture`, "Cloud Face Texture"): `CloudRenderer.buildMesh` writes into a scratch buffer (`@ModifyArg`), which is copied into vanilla's mapped texel buffer (so the switch can change at any frame) and uploaded with `writeToTexture` into an R8_SINT 2D texture (byte i at (i % 1024, i / 1024)) when the mesh rebuilds; `render(RenderPass, RenderPipeline)` draws with copies of `CLOUDS`, `FLAT_CLOUDS` and the OIT sets whose `CloudInfo` layout binds the texture (`COMBINED_IMAGE_SAMPLER`), and `ruthenium:core/clouds` reads it with `texelFetch(isampler2D)`. Turning the switch on forces a mesh rebuild so the texture is current |
+| `render/ScreenshotReadback.java` + `mixin/render/ScreenshotM.java` | **Fast screenshots** (twenty-fifth session, part 2, switch `fastScreenshots`, "Fast Screenshots"): full size `Screenshot.takeScreenshot` of 4 byte formats copies the read back frame two pixels per long (alpha ORed, rows flipped) instead of vanilla's per pixel `getInt`/`setPixelABGR`; downscaled shots keep vanilla's path |
 
 Design rules used so far:
 - Hot paths use `@Overwrite` with an inlined vanilla fallback, because a cancellable `@Inject` allocates a
@@ -631,6 +636,13 @@ table books (red specks in the chest cube).
   tree (`SlowFrameProbe`), per-packet timing, destroy queue contents, retained build timers per phase, `InstancedModels` counters,
   `-Pjvm.ruthenium.s25.rebuildEvery=N` (warm retained builds). `scripts/patches/s25-radix-check.patch`: the radix sort's check mode.
 - **The mixed static view is CPU bound** (unlike the old server scene): CPU savings show in its fps.
+- Part 2: `bench.cloudShots=N` (mixed scene, after the phases, ticks frozen): N shots each of 8 cloud views (`cloud<k>-<n>`: fancy from
+  below, inside the layer and above, fast from below and above, improved transparency fancy below and inside, fast below), toggled by
+  `bench.closeToggle` like the close-ups. `scripts/patches/s25-screenshot-check.patch` (against `5307cfd`):
+  `-Pjvm.ruthenium.screenshotCheck=true` runs vanilla's screenshot loop on the same read back pixels and compares, and the patch times every
+  readback callback on both paths. **`ToggleAb` in the mixed scene with `armorStandPlates=false` is only valid for ~60 s after the scene
+  is built** (about 3 static rounds): the server's rotation sync then re-sends the stands' yaws byte-quantized, and the instanced groups
+  hit their cap (section 7, twenty-fifth session, part 2).
 
 **Twenty-fourth session tools:**
 - **In-launch A/B of a switch** (`ToggleAb`): `-Pbench.toggleField=<Config field>` (entity and players scenes) adds, after the scene's
@@ -2278,8 +2290,86 @@ commits.
 **Found on the way:** results of plain runs left in `results/` are swept into side a by the next `run-ab.sh` (it moves every `ruthenium-*`
 file; here three close-up runs landed in the plate A/B's side a and were moved out by timestamp). Move them out first (section 6.4).
 
-Still open: candidates 2 (clouds without a texel buffer), 4 (per-group overhead), 5 (screenshot readback) and 6 of the list above; the
-OpenGL backend was not measured for either change.
+Still open after the first builder: candidates 2 (clouds without a texel buffer), 4 (per-group overhead), 5 (screenshot readback) and 6 of
+the list above; the OpenGL backend was not measured for either change. Part 2 below did 2, 4 and 5.
+
+#### Part 2: clouds, instanced groups, screenshots (second builder)
+A second builder agent on `26.3` (main tree), after the first, every Gradle command under the GPU lock. Commits `1897102`, `7193e1d`,
+`5307cfd`. Results in `results/s25b-dev/` (parity maps, check runs), `s25b-cloud-toggle-mixed`, `s25b-cloud-mixed` (A/B),
+`s25b-cloud-toggle-gl`, `s25b-groups-toggle` (all task 2 runs with their logs), `s25b-shot-time`; logs `build/bench-logs/2135-2165`,
+`s25b-*.out`.
+
+**Clouds without a texel buffer** (`1897102`, switch `cloudFaceTexture`, "Cloud Face Texture"; candidate 2). With the switch on,
+`CloudRenderer.buildMesh` writes its faces into a scratch buffer (`@ModifyArg` on the call in `prepare`), which is copied into vanilla's
+mapped texel buffer as it would have been written (vanilla's state is unchanged and the switch can flip at any frame) and uploaded with
+`writeToTexture` into an R8_SINT 2D texture, 1024 texels wide, byte i at (i % 1024, i / 1024), whole rows; only when the mesh rebuilds (cell
+change, camera crossing the layer, cloud setting change; turning the switch on forces one). The draw (`render(RenderPass, RenderPipeline)`,
+used by `render` and every OIT stage) uses copies of `CLOUDS`, `FLAT_CLOUDS` and the three pipelines of `OIT_CLOUDS` and
+`OIT_FLAT_CLOUDS`, whose `CloudInfo` bind group layout has `CloudFaces` as a `COMBINED_IMAGE_SAMPLER` (nearest, clamp), and the vertex
+shader `ruthenium:core/clouds` (vanilla's with `texelFetch(isampler2D, ivec2(i & 1023, i >> 10), 0).r`: the same sign-extended ints and
+arithmetic). One texture suffices as with the label poses (twenty-fourth session): the copy is recorded outside render passes, which end
+with a full barrier on Vulkan; OpenGL orders `glTexSubImage2D` itself. A copy that isn't compiled leaves vanilla's draw.
+
+*Exactness:* frozen cloud shots (`bench.cloudShots=8`, `bench.closeToggle=cloudFaceTexture`; ticks frozen, so all 8 shots of a view are
+identical unless the switch changes them), `StableDiff` at threshold 1: **0 px in all 8 views on Vulkan and on OpenGL** (fancy below,
+inside, above; fast below and above; improved transparency fancy below and inside, fast below). A temporary log showed every copy drawing
+(`clouds`, `flat_clouds`, `oit_{depth_bounds,transmittance,accumulate}_{clouds,flat_clouds}`) on both backends.
+
+*Numbers* (switch off -> on):
+
+| | static | pan | initial | particles |
+|---|---|---|---|---|
+| mixed, in-launch, 8 rounds, light profiler (`s25b-cloud-toggle-mixed`) | 1781.0 -> 1827.5 (8 of 8), 0.444 -> 0.401 ms | 1729.0 -> 1733.6 (5 of 8; GPU bound) | | |
+| mixed, 3 interleaved pairs (`s25b-cloud-mixed`) | 1786.7 -> 1847.6 (every pair), p99 805.2 -> 810.0, 0.45 -> 0.39 ms | 1712.0 -> 1731.4 (every pair), 0.40 -> 0.36 | 1280.0 -> 1350.3 | 1446.3 -> 1491.7 |
+| OpenGL mixed, in-launch, 8 rounds (`s25b-cloud-toggle-gl`) | 1575.4 -> 1604.2 (7 of 8), 0.617 -> 0.612 ms | 1617.5 -> 1636.3 (7 of 8) | | |
+
+Light profiler, on minus off, both phases: `submit/queueSubmit` **0.0457 -> 0.0240 ms (-21.7 us)**, `executeFrameGraph/main` -3.5 us (the
+`VkBufferView` per push), `present` -4 us; in the pan `awaitGpu` grows by as much (GPU bound there), in the static view the frame is 15 us
+shorter. The report's estimate (~4-5% static) was a little high; +3.4% measured.
+
+**`InstancedModels` per-group overhead** (`7193e1d`, no switch: exact, the mod's own draw path; candidate 4). Every group's instances
+now go into one ring buffer per frame (a slice per group), each render type is prepared once per frame (`RenderType.prepare` writes a
+dynamic transform and builds a texture list each call; only the textures are used), and the draws keep the pipeline's bindings while the
+pipeline and the prepared render type stay the same, as `InstancedParts.draw` already did. Since a Vulkan `setUniform` marks the descriptors
+dirty even with the same value, the old per-group rebinding pushed descriptors (a `VkWriteDescriptorSet`) for every draw; now only on a
+pipeline or texture change. Measured with temporary switches and `ToggleAb` plus temporary profiler sections around `prepareDraws` and
+`draw` (light profiler at depth 9), each part off with the others on:
+
+| part (65 groups: `armorStandPlates=false`, 244 instances; rounds 0-2) | draw | prepareDraws | static fps off -> on | render thread alloc MB/s |
+|---|---|---|---|---|
+| all three | 36.6 -> 7.5 us | 17.1 -> 12.7 us | per round 1733/1699/1721 -> 1762/1774/1750 | 318 -> 256 |
+| bindings kept | 46.9 -> 7.4 | = | 1679.5 -> 1720.9 (3 of 3) | 246 -> 238 |
+| one prepare per render type | 20.3 -> 7.1 (shared textures let the bindings stay) | 18.9 -> 12.0 | 1728.2 -> 1739.8 (3 of 3) | 291.6 -> 241.4 |
+| one instance ring | 8.1 -> 6.9 | 16.0 -> 12.2 | 1732.1 -> 1748.7 (2 of 3) | 258.4 -> 242.5 |
+| all three, default (plates on, 7 groups, 508 instances), 8 rounds | 5.7 -> 2.9 | 8.3 -> 6.9 | off/on 0.9990 (noise) | 251 -> 246 |
+
+So the uninstrumented cost was ~0.8 us per group (53.7 us for 65 groups), mostly the draws' rebinding, not the ~1.4 us the investigation's
+per-step timers gave; at the default 7 groups the change saves ~4 us per frame (not resolvable in fps). All three parts measured in their
+sections or in allocation, so all were kept. *Exactness:* frozen close-ups (`closeShots=8`, toggling all three), `StableDiff` threshold 1:
+0 px in close0-3 on Vulkan, OpenGL and Vulkan with plates off. The entity scene has no `InstancedModels` groups (no armor stands or
+enchanting tables), and `InstancedParts` already shared its ring and bindings, so the many-groups case was measured in the mixed scene with
+plates off.
+
+**Found on the way: stale instanced groups with plates off.** ~60 s after the stands spawn, the server's periodic rotation sync re-sends
+their yaws quantized to a byte, so with `armorStandPlates=false` every stand's plate angle (part 9's `yRot` in the snapshot) changes, the
+32 groups per model are already full of the old angles (groups are never evicted), and most stands take vanilla's path from then on (1 group
+drawn instead of 65; static ~1720 -> ~1460 fps). The default (plates on) doesn't depend on the yaw. Evicting groups unused for some frames
+would fix it; not done. It also limits `ToggleAb` with plates off to ~3 static rounds (section 6.6).
+
+**Screenshot readback** (`5307cfd`, switch `fastScreenshots`, "Fast Screenshots"; candidate 5). `Screenshot.takeScreenshot` at full size
+with a 4 byte color format: the read back frame is copied two pixels per long (`memGetLong | 0xFF000000FF000000`, row `height - 1 - y`),
+the same bytes as vanilla's `getInt`/`setPixelABGR` loop on a little-endian machine with a native-order mapped buffer (both checked;
+otherwise vanilla's loop). Downscaled shots (panorama) and other formats keep vanilla's path. *Exactness:* check mode
+(`scripts/patches/s25-screenshot-check.patch`): 27 of 27 readbacks identical to vanilla's loop on Vulkan and 27 of 27 on OpenGL (the icon,
+scene shots, close-ups, cloud shots; 183 to 115k source pixels per frame had alpha below 255, so the OR matters); the PNGs of frozen shots
+across the switch are byte-identical files (20 of 20). *Numbers:* the new world's icon readback callback (frame 0), 2 interleaved pairs:
+vanilla 23.8 / 32.6 ms, bulk 10.9 / 14.5 ms. The copy alone on the same pixels: first readback 12.0-14.4 ms (vanilla loop) vs 8.3-9.1 ms;
+later ones 2.5-3.2 vs 0.7-2.8 ms (the fresh 8 MB image's page faults dominate both). The investigation's 20-41 ms was the whole callback
+(map, image, loop), not the loop; frame 0 (110-140 ms) is too noisy to show ~13-18 ms in 2 pairs. The benchmark's own screenshots take
+100-190 ms per callback on both paths: the gametest writes the PNG inside the callback.
+
+Still open: the stale groups with plates off (above); candidates 6 (small per-entity items) and 7 (trade-off idea) of the list above; the
+seven close-up pixels of the plate change.
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
@@ -2423,6 +2513,12 @@ offset and rotation when its group's mesh is built (all restored at once). A mod
 path for those stands (checked); a mod that observes those fields during `InstancedModels`' group build, or changes the plate's offset,
 rotation or cubes per stand in ways other than through the fields the instance reads (`x`, `y`, `z`, `xRot`, `yRot`, `zRot` and the root's
 transform), is affected. The radix sort and the direct gather of retained builds touch no vanilla code.
+Twenty-fifth session, part 2, mod compatibility only (exact for vanilla: 0 px across the switches on Vulkan and OpenGL). **Accepted by the user
+on 2026-10-29:** switch "Cloud Face Texture": the clouds are drawn with the mod's copies of vanilla's cloud pipelines and a `ruthenium:`
+vertex shader, so shader packs and cloud mods that swap vanilla's cloud pipelines or `core/clouds` shader won't swap the copies (vanilla's
+texel buffer is still written, so mods that read it keep working). Switch "Fast Screenshots" (not yet reviewed by the user): full size
+screenshots no longer run vanilla's copy lambda in `Screenshot.takeScreenshot` (a cancelling `@Inject` at its head), so a mod injecting into
+that lambda is bypassed; downscaled shots keep it. The `InstancedModels` change touches no vanilla code.
 The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
 been kept, its trade-off would have been: a mod that writes a downloaded skin's GPU texture without `DynamicTexture.upload`
 leaves stale masks (faces missing until the next upload or reload).
@@ -2592,11 +2688,12 @@ leaves stale masks (faces missing until the next upload or reload).
    - **Twenty-fifth session (section 7): the mixed scene replaces the server scene here, and its static view is CPU bound** (yaw 0:
      render thread ~0.6 ms, GPU 0.358 ms; yaw 270: 0.644 vs 0.425), so the GPU and server scene numbers in this item are history. Its
      client tick is ~0.53 ms (not 0.93). Done: armor stand base plates as their own instances (static +12.5%), radix-sorted retained
-     builds gathered into the upload. Left, ranked (section 7, twenty-fifth session, has designs): clouds without a texel buffer (~20-29 us
-     per frame whenever clouds are on, expected ~4-5% mixed static), `InstancedModels` per-group overhead (~1.4 us per group, ~2%), the
-     screenshot readback (20-40 ms per F2 and on a new world's first frame), small per-entity items (`RenderTypes.entityCutout` memo
-     lookups, `CrossbowItem.getChargeDuration` for empty stacks: a trade-off). After the plate change the armor stands still cost ~63 us
-     extraction, ~38 us submission and ~60 us model prepare per frame.
+     builds gathered into the upload; in part 2 clouds without a texel buffer (mixed static +3.4%, `queueSubmit` -21.7 us), instanced groups
+     sharing ring, prepares and bindings (~0.8 us per group before; -4 us at 7 groups), row-wise screenshot readback (icon callback 24-33 ->
+     11-15 ms). Left: small per-entity items (`RenderTypes.entityCutout` memo lookups, `CrossbowItem.getChargeDuration` for empty stacks: a
+     trade-off), evicting unused `InstancedModels` groups (with plates off the server's byte-quantized yaw sync fills the 32 groups per model
+     with stale angles after ~60 s; section 7, twenty-fifth session, part 2). After the plate change the armor stands still cost ~63 us
+     extraction, ~38 us submission and ~60 us model prepare per frame; the static render thread is now ~0.39 ms per frame.
    - **Retained builds after joining or teleporting**: a section is built in one go; in the mixed scene's initial phase
      three frames build 2-2.7k block entities each in 95/38/27 ms (cold). Spreading builds over frames with a time budget
      was built, verified exact and binned (nineteenth session, `scripts/patches/s19-spread-builds.patch`): the unbuilt
