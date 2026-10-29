@@ -1,0 +1,446 @@
+diff --git a/src/main/java/net/ruthenium/interfaces/UploadedAlpha.java b/src/main/java/net/ruthenium/interfaces/UploadedAlpha.java
+new file mode 100644
+index 0000000..7628db4
+--- /dev/null
++++ b/src/main/java/net/ruthenium/interfaces/UploadedAlpha.java
+@@ -0,0 +1,15 @@
++package net.ruthenium.interfaces;
++
++import org.jspecify.annotations.Nullable;
++
++/**
++ * The alpha of the pixels a downloaded {@link net.minecraft.client.renderer.texture.DynamicTexture} (player skins, capes,
++ * elytra) last uploaded to the GPU, for {@link net.ruthenium.render.entity.TransparentFaces}. Render thread only.
++ */
++public interface UploadedAlpha {
++    /** Starts keeping the alpha of every upload, beginning with the pixels uploaded so far (the texture's constructor) */
++    void ruthenium$keepUploadedAlpha();
++
++    /** One byte per texel, row by row, of the last upload; null if not kept. Never changed once handed out. */
++    byte @Nullable [] ruthenium$uploadedAlpha();
++}
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/DynamicTextureM.java b/src/main/java/net/ruthenium/mixin/render/entity/DynamicTextureM.java
+new file mode 100644
+index 0000000..cf97e88
+--- /dev/null
++++ b/src/main/java/net/ruthenium/mixin/render/entity/DynamicTextureM.java
+@@ -0,0 +1,61 @@
++package net.ruthenium.mixin.render.entity;
++
++import com.mojang.blaze3d.platform.NativeImage;
++import net.minecraft.client.renderer.texture.DynamicTexture;
++import net.ruthenium.interfaces.UploadedAlpha;
++import org.jspecify.annotations.Nullable;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.Unique;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/**
++ * Keeps the alpha of what a downloaded texture uploaded ({@link UploadedAlpha}). A copy is taken right after each
++ * {@code upload()}, so it is what the GPU holds whatever is later done to the {@link NativeImage}: edits and
++ * {@code setPixels} change nothing on the GPU until the next upload, which takes a new copy.
++ */
++@Mixin(DynamicTexture.class)
++public class DynamicTextureM implements UploadedAlpha {
++    @Shadow private NativeImage pixels;
++
++    @Unique private boolean ruthenium$keepAlpha;
++    @Unique private byte @Nullable [] ruthenium$alpha;
++
++    @Inject(method = "upload", at = @At("RETURN"))
++    private void ruthenium$copyAlpha(CallbackInfo ci) {
++        if (this.ruthenium$keepAlpha) {
++            this.ruthenium$alpha = this.ruthenium$readAlpha();
++        }
++    }
++
++    @Override
++    public void ruthenium$keepUploadedAlpha() {
++        if (!this.ruthenium$keepAlpha) {
++            this.ruthenium$keepAlpha = true;
++            this.ruthenium$alpha = this.ruthenium$readAlpha();
++        }
++    }
++
++    @Override
++    public byte @Nullable [] ruthenium$uploadedAlpha() {
++        return this.ruthenium$alpha;
++    }
++
++    @Unique
++    private byte @Nullable [] ruthenium$readAlpha() {
++        NativeImage image = this.pixels;
++        if (image == null || image.isClosed() || image.format() != NativeImage.Format.RGBA) {
++            return null;
++        }
++        int width = image.getWidth(), height = image.getHeight();
++        byte[] alpha = new byte[width * height];
++        for (int y = 0; y < height; y++) {
++            for (int x = 0; x < width; x++) {
++                alpha[y * width + x] = (byte) (image.getPixel(x, y) >>> 24);
++            }
++        }
++        return alpha;
++    }
++}
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/SkinTextureDownloaderM.java b/src/main/java/net/ruthenium/mixin/render/entity/SkinTextureDownloaderM.java
+new file mode 100644
+index 0000000..52f2f65
+--- /dev/null
++++ b/src/main/java/net/ruthenium/mixin/render/entity/SkinTextureDownloaderM.java
+@@ -0,0 +1,27 @@
++package net.ruthenium.mixin.render.entity;
++
++import net.minecraft.client.renderer.texture.AbstractTexture;
++import net.minecraft.client.renderer.texture.SkinTextureDownloader;
++import net.ruthenium.interfaces.UploadedAlpha;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.ModifyArg;
++
++/**
++ * Downloaded skins, capes and elytra keep the alpha of what they uploaded ({@link UploadedAlpha}), so that
++ * {@link net.ruthenium.render.entity.TransparentFaces} can test them. The texture is registered right after its
++ * constructor uploaded the processed image (legacy skins converted, the base layer made opaque), so the pixels it
++ * holds then are the GPU's. Optional: if the lambda is not found, downloaded textures are just not tested.
++ */
++@Mixin(SkinTextureDownloader.class)
++public class SkinTextureDownloaderM {
++    @ModifyArg(method = "lambda$registerTextureInManager$0", require = 0, at = @At(value = "INVOKE",
++            target = "Lnet/minecraft/client/renderer/texture/TextureManager;register(Lnet/minecraft/resources/Identifier;Lnet/minecraft/client/renderer/texture/AbstractTexture;)V"),
++            index = 1)
++    private AbstractTexture ruthenium$keepAlpha(AbstractTexture texture) {
++        if (texture instanceof UploadedAlpha uploaded) {
++            uploaded.ruthenium$keepUploadedAlpha();
++        }
++        return texture;
++    }
++}
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/model/ModelPartCubeM.java b/src/main/java/net/ruthenium/mixin/render/entity/model/ModelPartCubeM.java
+index b938b3c..badc3f9 100644
+--- a/src/main/java/net/ruthenium/mixin/render/entity/model/ModelPartCubeM.java
++++ b/src/main/java/net/ruthenium/mixin/render/entity/model/ModelPartCubeM.java
+@@ -44,15 +44,8 @@ public class ModelPartCubeM {
+     @Unique private byte[] cornerIndices;
+     @Unique private float[] transformedCorners;
+     @Unique private final Vector3f scratch = new Vector3f();
+-    /**
+-     * Hash table of texture alphas ({@link TransparentFaces}) and the polygons that draw nothing in them, bit per
+-     * polygon. It grows with the number of textures the cube is drawn with: a villager's cubes see ~28 per frame
+-     * (types, professions and levels).
+-     */
+-    @Unique private TransparentFaces.TextureAlpha[] transparentKeys;
+-    @Unique private int[] transparentMasks;
+-    @Unique private int transparentCount;
+-    @Unique private int transparentGeneration;
++    /** This cube's key for the masks the texture alphas keep ({@link TransparentFaces}), 0 until first needed */
++    @Unique private long transparentId;
+ 
+     /**
+      * @author Ruthenium
+@@ -78,7 +71,11 @@ public class ModelPartCubeM {
+         int skipped = 0;
+         TransparentFaces.TextureAlpha textureAlpha = ModelCulling.textureAlpha();
+         if (textureAlpha != null && mapping == null) {
+-            skipped = this.transparentPolygons(textureAlpha);
++            long id = this.transparentId;
++            if (id == 0L) {
++                id = this.transparentId = TransparentFaces.newCubeId();
++            }
++            skipped = textureAlpha.transparentPolygons(id, this.polygons);
+             if (skipped == (1 << this.polygons.length) - 1) {
+                 return;
+             }
+@@ -160,60 +157,6 @@ public class ModelPartCubeM {
+         return behind > 0.0f && behind * behind >= EYE_MARGIN_SQ * (nx * nx + ny * ny + nz * nz);
+     }
+ 
+-    /** The transparent polygons of this cube in a texture, kept per texture */
+-    @Unique
+-    private int transparentPolygons(TransparentFaces.TextureAlpha textureAlpha) {
+-        TransparentFaces.TextureAlpha[] keys = this.transparentKeys;
+-        if (keys == null || this.transparentGeneration != TransparentFaces.generation()) {
+-            keys = this.resetTransparent(4);
+-        }
+-        int bits = Integer.numberOfTrailingZeros(keys.length);
+-        int slot = textureAlpha.id * 0x9E3779B9 >>> 32 - bits;
+-        for (TransparentFaces.TextureAlpha key; (key = keys[slot]) != null; slot = slot + 1 & keys.length - 1) {
+-            if (key == textureAlpha) {
+-                return this.transparentMasks[slot];
+-            }
+-        }
+-
+-        int mask = textureAlpha.transparentPolygons(this.polygons);
+-        // At most half full; a table of 128 that fills up (texture alphas replaced by reloads) starts over
+-        if ((this.transparentCount + 1) * 2 > keys.length) {
+-            TransparentFaces.TextureAlpha[] oldKeys = keys;
+-            int[] oldMasks = this.transparentMasks;
+-            keys = this.resetTransparent(keys.length < 128 ? keys.length * 2 : 4);
+-            if (keys.length > oldKeys.length) {
+-                for (int i = 0; i < oldKeys.length; i++) {
+-                    if (oldKeys[i] != null) {
+-                        this.putTransparent(oldKeys[i], oldMasks[i]);
+-                    }
+-                }
+-            }
+-        }
+-        this.putTransparent(textureAlpha, mask);
+-        return mask;
+-    }
+-
+-    @Unique
+-    private TransparentFaces.TextureAlpha[] resetTransparent(int capacity) {
+-        this.transparentKeys = new TransparentFaces.TextureAlpha[capacity];
+-        this.transparentMasks = new int[capacity];
+-        this.transparentCount = 0;
+-        this.transparentGeneration = TransparentFaces.generation();
+-        return this.transparentKeys;
+-    }
+-
+-    @Unique
+-    private void putTransparent(TransparentFaces.TextureAlpha textureAlpha, int mask) {
+-        TransparentFaces.TextureAlpha[] keys = this.transparentKeys;
+-        int slot = textureAlpha.id * 0x9E3779B9 >>> 32 - Integer.numberOfTrailingZeros(keys.length);
+-        while (keys[slot] != null) {
+-            slot = slot + 1 & keys.length - 1;
+-        }
+-        keys[slot] = textureAlpha;
+-        this.transparentMasks[slot] = mask;
+-        this.transparentCount++;
+-    }
+-
+     /** Vanilla's Cube.compile */
+     @Unique
+     private void compileVanilla(PoseStack.Pose pose, VertexConsumer builder, int lightCoords, int overlayCoords, int color) {
+diff --git a/src/main/java/net/ruthenium/render/entity/TransparentFaces.java b/src/main/java/net/ruthenium/render/entity/TransparentFaces.java
+index 0f9a4cf..2f27b35 100644
+--- a/src/main/java/net/ruthenium/render/entity/TransparentFaces.java
++++ b/src/main/java/net/ruthenium/render/entity/TransparentFaces.java
+@@ -14,10 +14,12 @@ import net.minecraft.client.renderer.rendertype.RenderSetup;
+ import net.minecraft.client.renderer.rendertype.RenderType;
+ import net.minecraft.client.renderer.rendertype.TextureTransform;
+ import net.minecraft.client.renderer.texture.AbstractTexture;
++import net.minecraft.client.renderer.texture.DynamicTexture;
+ import net.minecraft.client.renderer.texture.SimpleTexture;
+ import net.minecraft.client.renderer.texture.TextureContents;
+ import net.minecraft.resources.Identifier;
+ import net.ruthenium.Initializer;
++import net.ruthenium.interfaces.UploadedAlpha;
+ import org.jspecify.annotations.Nullable;
+ 
+ import java.util.IdentityHashMap;
+@@ -32,10 +34,12 @@ import java.util.Optional;
+  * faces empty too. Those faces are not written ({@code ModelPartCubeM}).
+  * <p>
+  * Only for render types of vanilla's {@code core/entity} shaders without a texture matrix, glint, dissolve or improved
+- * transparency (OIT), whose {@code Sampler0} is a plain resource texture ({@link SimpleTexture}): its alpha is read
+- * from the resource once. The UV rectangle of a face is widened by one texel on each side, and both repeated and
+- * clamped addressing are tested, so nearest and linear filtering are covered. Render thread only; cleared on
+- * resource reload.
++ * transparency (OIT), whose {@code Sampler0} is either a plain resource texture ({@link SimpleTexture}), whose alpha
++ * is read from the resource once, or a downloaded skin, cape or elytra ({@link DynamicTexture} registered by
++ * {@code SkinTextureDownloader}), whose alpha is copied after each of its uploads ({@link UploadedAlpha}): what the GPU
++ * holds after vanilla's skin processing (legacy skins converted, base layer opaque) or anything a mod uploads later.
++ * The UV rectangle of a face is widened by one texel on each side, and both repeated and clamped addressing are
++ * tested, so nearest and linear filtering are covered. Render thread only; cleared on resource reload.
+  */
+ public final class TransparentFaces {
+     private static final Identifier ENTITY_SHADER = Identifier.withDefaultNamespace("core/entity");
+@@ -45,17 +49,17 @@ public final class TransparentFaces {
+     private static final Map<RenderType, Object> BY_RENDER_TYPE = new IdentityHashMap<>();
+     private static @Nullable RenderType lastRenderType;
+     private static @Nullable TextureAlpha lastAlpha;
+-    /** Bumped by {@link #clear}, so that caches keyed by {@link TextureAlpha} drop the old ones */
+-    private static int generation;
+-    private static int nextId;
++    /** The last id handed out by {@link #newCubeId}; 0 means none. A long, so that ids are never reused */
++    private static long lastCubeId;
+ 
+     private TransparentFaces() {
+     }
+ 
+     /** A texture's alpha and the 8 bit alpha below which a texel draws nothing in a pipeline */
+     public static final class TextureAlpha {
+-        /** Distinct per texture alpha, for hashing */
+-        public final int id = nextId++;
++        /** Most cubes whose masks are kept; a table that fills up (cubes created over and over) starts over */
++        private static final int MAX_CUBES = 1024;
++
+         final byte[] alpha;
+         final int width;
+         final int height;
+@@ -64,8 +68,20 @@ public final class TransparentFaces {
+         final Identifier location;
+         final AbstractTexture texture;
+         final GpuTexture gpuTexture;
++        /** The downloaded texture whose upload {@link #alpha} is, or null for a resource texture */
++        final @Nullable UploadedAlpha uploaded;
++        /**
++         * The masks of the cubes drawn with this texture so far: cube ids ({@link #newCubeId}, 0 for an empty slot) and
++         * the polygons that draw nothing, bit per polygon, in an open addressing table at most half full. Kept per
++         * texture rather than per cube, so a cube drawn with any number of textures (skins of every player on a
++         * server, villager clothing) finds its mask in one probe, and the masks go with the texture alpha.
++         */
++        private long[] cubeIds = new long[16];
++        private int[] cubeMasks = new int[16];
++        private int cubeCount;
+ 
+-        TextureAlpha(byte[] alpha, int width, int height, int threshold, Identifier location, AbstractTexture texture, GpuTexture gpuTexture) {
++        TextureAlpha(byte[] alpha, int width, int height, int threshold, Identifier location, AbstractTexture texture, GpuTexture gpuTexture,
++                     @Nullable UploadedAlpha uploaded) {
+             this.alpha = alpha;
+             this.width = width;
+             this.height = height;
+@@ -73,14 +89,64 @@ public final class TransparentFaces {
+             this.location = location;
+             this.texture = texture;
+             this.gpuTexture = gpuTexture;
++            this.uploaded = uploaded;
+         }
+ 
+         boolean isCurrent() {
+-            return this.texture.getTexture() == this.gpuTexture && Minecraft.getInstance().getTextureManager().getTexture(this.location) == this.texture;
++            // A new upload of a downloaded texture comes with a new alpha array
++            return this.texture.getTexture() == this.gpuTexture && Minecraft.getInstance().getTextureManager().getTexture(this.location) == this.texture
++                    && (this.uploaded == null || this.uploaded.ruthenium$uploadedAlpha() == this.alpha);
++        }
++
++        /**
++         * Bit {@code p} is set if polygon {@code p} of the cube draws nothing. {@code cubeId} is the cube's
++         * {@link #newCubeId}, which keys its mask.
++         */
++        public int transparentPolygons(long cubeId, ModelPart.Polygon[] polygons) {
++            long[] ids = this.cubeIds;
++            int slot = slot(cubeId, ids.length);
++            for (long id; (id = ids[slot]) != 0L; slot = slot + 1 & ids.length - 1) {
++                if (id == cubeId) {
++                    return this.cubeMasks[slot];
++                }
++            }
++
++            int mask = this.scan(polygons);
++            if ((this.cubeCount + 1) * 2 > ids.length) {
++                long[] oldIds = ids;
++                int[] oldMasks = this.cubeMasks;
++                boolean grow = this.cubeCount < MAX_CUBES;
++                ids = this.cubeIds = new long[grow ? oldIds.length * 2 : 16];
++                this.cubeMasks = new int[ids.length];
++                this.cubeCount = 0;
++                if (grow) {
++                    for (int i = 0; i < oldIds.length; i++) {
++                        if (oldIds[i] != 0L) {
++                            this.put(oldIds[i], oldMasks[i]);
++                        }
++                    }
++                }
++            }
++            this.put(cubeId, mask);
++            return mask;
+         }
+ 
+-        /** Bit {@code p} is set if polygon {@code p} of the cube draws nothing */
+-        public int transparentPolygons(ModelPart.Polygon[] polygons) {
++        private void put(long cubeId, int mask) {
++            long[] ids = this.cubeIds;
++            int slot = slot(cubeId, ids.length);
++            while (ids[slot] != 0L) {
++                slot = slot + 1 & ids.length - 1;
++            }
++            ids[slot] = cubeId;
++            this.cubeMasks[slot] = mask;
++            this.cubeCount++;
++        }
++
++        private static int slot(long cubeId, int length) {
++            return (int) (cubeId * 0x9E3779B97F4A7C15L >>> 64 - Integer.numberOfTrailingZeros(length));
++        }
++
++        private int scan(ModelPart.Polygon[] polygons) {
+             int mask = 0;
+             for (int p = 0; p < polygons.length; p++) {
+                 ModelPart.Vertex[] vertices = polygons[p].vertices();
+@@ -129,17 +195,17 @@ public final class TransparentFaces {
+         BY_RENDER_TYPE.clear();
+         lastRenderType = null;
+         lastAlpha = null;
+-        generation++;
+     }
+ 
+-    /** Changes whenever the texture alphas handed out so far are dropped */
+-    public static int generation() {
+-        return generation;
++    /** A new cube id for {@link TextureAlpha#transparentPolygons}, never 0 and never handed out before */
++    public static long newCubeId() {
++        return ++lastCubeId;
+     }
+ 
+     /** The texture alpha of a render type whose transparent faces may be left out, or null */
+     public static @Nullable TextureAlpha of(RenderType renderType) {
+-        if (renderType == lastRenderType) {
++        // Checked again even for the same render type: a downloaded texture may have uploaded new pixels
++        if (renderType == lastRenderType && (lastAlpha == null || lastAlpha.isCurrent())) {
+             return lastAlpha;
+         }
+         TextureAlpha alpha = lookUp(renderType);
+@@ -227,6 +293,16 @@ public final class TransparentFaces {
+     private static @Nullable TextureAlpha load(Identifier location, int threshold) {
+         Minecraft minecraft = Minecraft.getInstance();
+         AbstractTexture texture = minecraft.getTextureManager().getTexture(location);
++        if (texture instanceof DynamicTexture && texture instanceof UploadedAlpha uploaded) {
++            // Downloaded skins, capes and elytra: the alpha of their last upload
++            byte[] alpha = uploaded.ruthenium$uploadedAlpha();
++            GpuTexture gpuTexture = texture.getTexture();
++            int width = gpuTexture.getWidth(0), height = gpuTexture.getHeight(0);
++            if (alpha == null || alpha.length != width * height || gpuTexture.getMipLevels() != 1) {
++                return null;
++            }
++            return new TextureAlpha(alpha, width, height, threshold, location, texture, gpuTexture, uploaded);
++        }
+         if (texture.getClass() != SimpleTexture.class) {
+             return null;
+         }
+@@ -243,7 +319,7 @@ public final class TransparentFaces {
+                     alpha[y * width + x] = (byte) (image.getPixel(x, y) >>> 24);
+                 }
+             }
+-            return new TextureAlpha(alpha, width, height, threshold, location, texture, texture.getTexture());
++            return new TextureAlpha(alpha, width, height, threshold, location, texture, texture.getTexture(), null);
+         } catch (Exception e) {
+             return null;
+         }
+diff --git a/src/main/resources/assets/ruthenium/lang/en_us.json b/src/main/resources/assets/ruthenium/lang/en_us.json
+index 2c204a5..6133ba8 100644
+--- a/src/main/resources/assets/ruthenium/lang/en_us.json
++++ b/src/main/resources/assets/ruthenium/lang/en_us.json
+@@ -36,7 +36,7 @@
+   "ruthenium.options.modelBackFaceCulling": "Model Backface Culling",
+   "ruthenium.options.modelBackFaceCulling.tooltip": "Leaves out entity and block entity faces, and sign text, that face away from the camera on the CPU. The GPU would discard them anyway.",
+   "ruthenium.options.transparentFaceCulling": "Transparent Face Culling",
+-  "ruthenium.options.transparentFaceCulling.tooltip": "Leaves out the faces of entity models whose texture is fully transparent there (spider and enderman eyes, horse markings, ...). They draw nothing. Reads those textures from the resource packs once.",
++  "ruthenium.options.transparentFaceCulling.tooltip": "Leaves out the faces of entity models whose texture is fully transparent there (spider and enderman eyes, horse markings, ...). They draw nothing. Also tests downloaded player skins (empty outer layer faces). Reads resource textures once and keeps a copy of each downloaded skin's alpha.",
+ 
+   "ruthenium.options.particleSpawnLimit": "Particle Spawn Limit",
+   "ruthenium.options.particleSpawnLimit.tooltip": "Drops new particles when there are already as many as the game can show, instead of queueing them to be discarded later.",
+diff --git a/src/main/resources/ruthenium.mixins.json b/src/main/resources/ruthenium.mixins.json
+index 6e3d80e..f069939 100644
+--- a/src/main/resources/ruthenium.mixins.json
++++ b/src/main/resources/ruthenium.mixins.json
+@@ -24,6 +24,7 @@
+     "render.chunk.SectionCompilerResultsM",
+     "render.entity.BlockModelRenderStateM",
+     "render.entity.BlockStateModelWrapperM",
++    "render.entity.DynamicTextureM",
+     "render.entity.EntityRenderDispatcherM",
+     "render.entity.EntityRendererAccessor",
+     "render.entity.EntityLightHolderM",
+@@ -33,6 +34,7 @@
+     "render.entity.ExtendedBlockModelFeatureRendererM",
+     "render.entity.LevelExtractorEntityM",
+     "render.entity.LivingEntityRendererLayersM",
++    "render.entity.SkinTextureDownloaderM",
+     "render.entity.TextDisplayAccessor",
+     "render.entity.model.ModelPartCubeM",
+     "render.entity.model.ModelPartM",

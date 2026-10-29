@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-28 (seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-29 (twentieth session; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -76,6 +76,13 @@ holograms 902.4 -> 949.2). Lobby: vanilla 153.6 / 613.2 fps (static / pan); Ruth
 1184.4, mixed scene unchanged. Found: `TransparentFaces` costs 150 players with resource skins 0.5 ms per frame (the cache
 miss of section 8; fixed by part 1, not measured in the players scene yet), and each player body's quads are sorted every
 frame (1.8 us per player).
+Twentieth session (section 7, "Twentieth session"): part 1's per texture mask cache measured in the players scene: the -20%
+with resource skins is gone (players static 477.3 -> 484.5 fps with the culling on, lobby 326.7 -> 331.6). Transparent face
+culling of **downloaded skins** (`DynamicTexture`, alpha copied after each upload, masks kept per texture alpha for 100+ skins)
+was built, checked exact (also across re-uploads) and **binned**: no gain (150 distinct skins static 482.1 vs 474.8, lobby 323.8
+vs 325.1), because the one-texel margin that keeps the test exact leaves almost no outer layer face skippable once the base
+layer is opaque (patch `scripts/patches/s20-downloaded-skins.patch`). The players scene now registers its skins through
+vanilla's skin downloader and has `bench.skinVariants`, `bench.emptyOuterLayers` and `bench.skinEdit`. No `src/main` change.
 
 
 **Renamed to Ruthenium (2026-10-28, eighteenth session).** The project is now **Ruthenium**: mod id `ruthenium`, package
@@ -177,6 +184,8 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   text displays are culled by their text ("Cull Text Displays"), empty armor stands skip their layers ("Skip Empty Armor
   Stand Layers"). A player costs ~12 us of render thread per frame (vanilla ~30), a hologram line ~1-1.7 us (vanilla
   ~1.8-3.5); the player body (translucent, 2.8 us) is the largest item left.
+- **Twentieth session** (section 7): transparent face culling is neutral to +1.5% with many resource skins now; extending it to
+  downloaded skins was built, checked exact and binned (no gain, `scripts/patches/s20-downloaded-skins.patch`).
 - **Next:** see section 8.
 
 ---
@@ -306,7 +315,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/world/EntityM.java` | `Entity.collide` queries the entities around an entity for their collision shapes (`Level.getEntityCollisions`) before it knows whether it moves; with zero movement it returns the movement and never reads them (the step up needs a collision). The redirect skips the query for zero movement (floating dropped items, experience orbs, boats move by zero every tick). Client and server; no switch (same result) |
 | `render/entity/ItemBoundingBoxes.java` + `mixin/render/item/{ItemStackRenderStateM,ItemStackRenderStateLayerM}.java` + `interfaces/ItemLayerExtents` | `ItemStackRenderState.getModelBoundingBox` (dropped items, every frame) caches in the render state, which is extracted anew each frame, so it transformed every model point (each distinct quad vertex) per item and frame. A layer's box is kept per points array (`IdentityHashMap`, chained by item transform identity, hand and local transform), the state's box is the union (float min/max like `AABB.Builder`, so identical; 720k boxes checked). Off the render thread, vanilla's way. Cleared on resource reload. No switch (same result) |
 | `mixin/render/entity/model/ModelPartM.java` (`translateAndRotate`) | Keeps each part's rotation `Quaternionf` with the raw bits of its three angles and rebuilds it only when they change (render thread only), instead of three sines and three cosines per rotated part per submit. Same quaternion, so the same pose. No switch |
-| `render/entity/TransparentFaces.java` + `ModelCulling.textureAlpha` + `ModelPartCubeM` | **Transparent face culling** (fourteenth session, switch `transparentFaceCulling`, "Transparent Face Culling"). Model cube faces whose texels all draw nothing are not written by `ModelPartCubeM`'s direct path: alpha below the pipeline's `ALPHA_CUTOUT` (discarded before any color is applied; 8 bit alpha a counts if a < ceil(255 c - 0.01)), or alpha 0 in a `BlendFunction.TRANSLUCENT` pipeline without depth writes (the fragment's alpha stays 0, so it blends to the destination exactly). Only render types of vanilla's `core/entity` vertex and fragment shaders without `APPLY_TEXTURE_MATRIX`, `GLINT` or `DISSOLVE`, `TextureTransform.DEFAULT_TEXTURING`, only `Sampler0`, and a texture whose class is exactly `SimpleTexture` with one mip level and the resource's size (read once with `TextureContents.load`); never with improved transparency (OIT) or a UV mapping (atlas sprites). A face's UV rectangle is widened by one texel per side and every texel is tested at its repeated and its clamped position (nearest and linear filtering). Per render type a `TextureAlpha` (`IdentityHashMap`, last type cached), revalidated against the texture's `GpuTexture` and the texture manager's entry; per cube the masks of its last 4 texture alphas. Cleared on resource reload and when toggled. Spider and enderman eyes keep only the eye faces; horse markings lose their empty faces. Access widener: `RenderSetup.textures`, `RenderSetup$TextureBinding.location` |
+| `render/entity/TransparentFaces.java` + `ModelCulling.textureAlpha` + `ModelPartCubeM` | **Transparent face culling** (fourteenth session, switch `transparentFaceCulling`, "Transparent Face Culling"). Model cube faces whose texels all draw nothing are not written by `ModelPartCubeM`'s direct path: alpha below the pipeline's `ALPHA_CUTOUT` (discarded before any color is applied; 8 bit alpha a counts if a < ceil(255 c - 0.01)), or alpha 0 in a `BlendFunction.TRANSLUCENT` pipeline without depth writes (the fragment's alpha stays 0, so it blends to the destination exactly). Only render types of vanilla's `core/entity` vertex and fragment shaders without `APPLY_TEXTURE_MATRIX`, `GLINT` or `DISSOLVE`, `TextureTransform.DEFAULT_TEXTURING`, only `Sampler0`, and a texture whose class is exactly `SimpleTexture` with one mip level and the resource's size (read once with `TextureContents.load`); never with improved transparency (OIT) or a UV mapping (atlas sprites). A face's UV rectangle is widened by one texel per side and every texel is tested at its repeated and its clamped position (nearest and linear filtering). Per render type a `TextureAlpha` (`IdentityHashMap`, last type cached), revalidated against the texture's `GpuTexture` and the texture manager's entry; per cube the masks of its last 4 texture alphas (since the nineteenth session, `a4d2751`, a hash table of up to 64 texture alphas per cube, 128 slots; it starts over when full, so one model drawn with more than 64 textures per frame rescans: the twentieth session's binned downloaded skin culling hit that). Cleared on resource reload and when toggled. Spider and enderman eyes keep only the eye faces; horse markings lose their empty faces. Access widener: `RenderSetup.textures`, `RenderSetup$TextureBinding.location` |
 | `render/entity/ModelPoseReplay.java` + `mixin/render/entity/{EntityRenderStateM,model/ModelM,model/PoseAccessor}.java` + `interfaces/{PoseRecordHolder,LayeredModel,ReplayablePart}` | **Layer pose replay** (fourteenth session, switch `reuseLayerPoses`, "Reuse Layer Poses"). Layers that submit a model again with the same render state and pose (villager and zombie villager clothing, spider and enderman eyes, horse markings, collars, armor trims and glint) skip `setupAnim` and the part tree. While the world's features are prepared, every model submit stamps its `EntityRenderState` with a pooled `Record` (two slots per state; frame, state and model identity); a second submit of the same model and state marks the `Model` as layered. From then on the first submit of a layered model of a `net.minecraft.` class records each written part and a copy of its pose (`ModelPartM.compile`), and a later submit of that model and state whose submit pose matches bit for bit (matrix, normal matrix, JOML properties, `trustedNormals`) calls each recorded part's `compile` with the recorded pose (instanced or vanilla path). Exact because vanilla models pose their parts from the state alone (`Model.setupAnim` starts with `resetPose`; checked: every model's `setupAnim` calls it except the copper golem statue's, which isn't an entity state); a temporary check posed 2.8M replayed submits again: 0 mismatches in 23.4M parts |
 | `render/entity/LazyVertexBuilder.java` + `ModelFeatureRendererM` | Model submits whose parts become instances get a lazy vertex builder instead of the group's (a render type switch: `RenderType.prepare`, the draw lookup and a new `BufferBuilder`); it fetches the builder (wrapped by the UV mapping) only if a part is written after all, and `ModelPartM.compile` resolves it before writing cubes, so the direct writers see the `BufferBuilder`. Such submits add no empty draws. No switch (same image) |
 | `render/entity/EntityRendererCache.java` + `mixin/render/entity/{EntityTypeM,EntityRenderDispatcherM}.java` + `LevelExtractorEntityM.ruthenium$fastCulling` + `interfaces/{EntityRendererHolder,EntityRendererMap}` | **Renderer kept on the entity type and cheaper entity culling** (fifteenth session). `EntityRenderDispatcher.getRenderer(Entity)` and `getRenderer(EntityRenderState)` look non-player renderers up in the dispatcher's `ImmutableMap` (culling, extraction, submission: up to three times per entity and frame); a `@WrapOperation` on that `Map.get` returns the renderer kept on the `EntityType` together with the map it came from (only while the dispatcher holds that map; only for `ImmutableMap`s). Each entry also classifies the renderer's culling: plain if no class below `EntityRenderer` (or `LivingEntityRenderer` for living ones) declares `shouldRender`, `affectedByCulling` or `getBoundingBoxForCulling` (reflection, once per type). A `@WrapOperation` on `isEntityVisible`'s `EntityRenderDispatcher.shouldRender` call answers for plain renderers (switch `fastEntityCulling`, "Fast Entity Culling"; players and mannequins excluded): `entity.shouldRender` (distance), then the interpolated box (`getInterpolatedBoundingBox`, virtual) through the frustum accessor without the inflated box allocations. Living renderers widen the box by another half block for a dragon head; instead of reading the head slot, the box with the widening is tested first (inside the frustum: visible either way; outside: hidden either way) and only when it crosses the edge the box without (visible: visible either way, else vanilla's path). Leash holders and non-finite boxes take vanilla's path. The frustum test is monotone in the box and the widened coordinates are computed in vanilla's `inflate` order. Checked: 16.8M answers equal vanilla's (AI on), 0.3% undecided |
@@ -770,6 +779,14 @@ are in every frame. `bench.playersKind`: `lobby` (default, both of the following
   first-person arm differ between frozen shots of one frame (a few hundred to ~10k pixels at threshold 1): compare text
   and models, not pixel counts.
 - The layer probe (`-Pbench.entityCostParts=true`) also times cape, elytra, parrot and stuck-in-body layers.
+- Since the twentieth session the downloaded skins go through vanilla's `SkinTextureDownloader.downloadAndRegisterSkin` from local
+  copies in `bench-skins/` of the run directory (`processLegacySkin`, then the downloader's `DynamicTexture`; nothing is
+  downloaded). `bench.skinVariants=N` (default 18 = the 9 defaults, wide and slim; player i gets variant i % N, model wide for
+  even variants) adds tinted copies whose six outer layer regions are each kept, cleared, faded below the cutout (alpha 20),
+  semi-transparent (alpha 100) or checkered, and every tenth of them (wide) is a legacy 64x32 skin (variants 18, 28, 38, ...;
+  38 is in the third row of `close0`). `bench.emptyOuterLayers=true` clears every outer layer. `bench.skinEdit=true` edits the
+  skins of players 7 and 8 after the close-ups (in place, and through `setPixels`; both uploaded) and takes the close-ups again
+  (`close<k>-<n>-<run>-edited`).
 
 ---
 
@@ -1484,8 +1501,101 @@ Checks on the merged tree in the main worktree (`results/s19-merge/`; another ag
   1750-1775 / ~2600 at the end of the seventeenth session (same blocks, same chat line in the shot, render thread 0.23 vs
   0.25 ms, so not CPU). Part 1's parity runs (`s19-dev/par-be-on`, with signs) were already low. Not from the merge; not
   bisected (eighteenth session commits or the machine).
-- Not measured yet: `TransparentFaces`' per texture cache (part 1) in the players scene with `bench.playerSkins=resource`
-  (section 8, item 1b).
+- Measured in the twentieth session (section 7, "Twentieth session"): the -20% is gone (players 477.3 -> 484.5 fps static).
+
+### Twentieth session (2026-10-29)
+Section 8 item 1b's first bullet: transparent face culling with many skins. One agent on `26.3` (main tree), every Gradle
+command under the shared GPU lock. Results in `results/s20-*` and `results/s20-dev/`, logs `build/bench-logs/s20-*.log`.
+**Net code change: none in `src/main`** (both changes were binned, `scripts/patches/s20-downloaded-skins.patch`); the
+players scene got new skin options.
+
+**1. Part 1's per texture mask cache (`a4d2751`) in the players scene** (`s20-tf-resource-*`, `-Pbench.playerSkins=resource
+-Pbench.staticSeconds=10`, switch `transparentFaceCulling` off vs on, 5 pairs each, tree `e20b43e`). The -20% of the nineteenth
+session (476.6 -> 382.1 static, measured without `a4d2751`) is gone; the culling is now neutral to slightly positive:
+
+| resource skins | static | p99 low | render thread | pan | pan p99 | pan render thread |
+|---|---|---|---|---|---|---|
+| players kind, off | 477.3 | 300.1 | 2.03 ms | 1633.9 | 431.3 | 0.51 ms |
+| players kind, on | 484.5 (3 of 5 pairs) | 291.4 | 2.01 ms | 1645.1 | 430.2 | 0.50 ms |
+| lobby, off | 326.7 | 197.4 | 2.97 ms | 1519.7 | 305.5 | 0.56 ms |
+| lobby, on | 331.6 (3 of 5) | 200.3 | 2.94 ms | 1516.8 | 309.4 | 0.55 ms |
+
+Temporary counters (single runs): 1726 cube tests per frame for 150 players (~11.5 per player), 0 mask rescans, 878 faces
+skipped per frame (of ~10.8k body faces).
+
+**2. Downloaded skins (`DynamicTexture`) tested too: built, exact, measured, binned.**
+- *What the GPU samples* (26.3 sources): `SkinTextureDownloader.downloadAndRegisterSkin` reads the PNG (or its local copy),
+  runs `processLegacySkin` for skins (64x32 converted to 64x64: top half copied, bottom half cleared, arms and legs mirrored
+  into the new slots, `doNotchTransparencyHack` on the hat if it is fully opaque, then `setNoAlpha` on the head, body/arms/legs
+  base regions: (0,0)-(32,16), (0,16)-(64,32), (16,48)-(48,64)), then `registerTextureInManager` makes a `DynamicTexture`
+  whose constructor uploads `pixels` (RGBA8, 1 mip, repeat nearest sampler) and registers it. Capes and elytra take the same
+  path without `processLegacySkin`. Vanilla never touches a skin texture again (`SkinManager`'s texture caches keep every
+  skin of the session; nothing releases them).
+- *Changes to the pixels* (`DynamicTexture`): `getPixels()` hands out the `NativeImage` (editable in place), `setPixels`
+  replaces it (closing the old one), `upload()` writes `pixels` to the GPU texture. The GPU only changes at `upload()` (or a
+  direct `writeToTexture` on `getTexture()`, which nothing in vanilla does for skins). So the design was: a `@ModifyArg` on the
+  `TextureManager.register` call in `SkinTextureDownloader.lambda$registerTextureInManager$0` (`require = 0`) marks the texture
+  and copies its alpha (its constructor just uploaded the processed pixels); a `DynamicTextureM` `upload()` RETURN inject copies
+  the alpha again for marked textures (a new array each time); `TransparentFaces.load` uses that copy for marked
+  `DynamicTexture`s, and `TextureAlpha.isCurrent` (now also checked when the render type repeats) compares the array's identity,
+  so a re-upload replaces the masks. Edits in place or `setPixels` without an upload change nothing on the GPU and nothing in
+  the copy. Exact for anything going through `upload()`; a mod writing the GPU texture directly would leave stale masks
+  (compatibility trade-off, moot now). Memory: 4 KB per skin (the alpha copy; vanilla keeps 16 KB of pixels plus the GPU
+  texture per skin).
+- *The per cube cache of `a4d2751` doesn't cope with many skins*: a cube's table holds 64 texture alphas (128 slots, half full)
+  and starts over when full, and every `PlayerModel` cube of a model type sees every skin of that type each frame. With 150
+  distinct skins (75 per model) the counters showed 1500 of 1726 cube tests per frame rescanning texels, static 356.0 fps
+  against 490.2 with 18 skins (single runs). Replaced in the attempt by **masks kept per texture alpha**: each `TextureAlpha`
+  keeps an open addressing table of cube ids (`long`, from a counter, so never reused; 16 slots, grows to 2048, starts over
+  past 1024 cubes) and masks; the cube keeps only its id. 0 rescans with 150 skins, static 473.5.
+- *Bench support* (kept, `4798bd6`, `970dcc5`; section 6.10): the scene's downloaded skins now go through vanilla's downloader
+  from local copies, `bench.skinVariants=N` adds tinted variants with cleared, faded (alpha 20, below the 0.1 cutout),
+  semi-transparent (alpha 100) or checkered outer layer regions and legacy 64x32 skins, `bench.emptyOuterLayers=true` clears
+  every outer layer, `bench.skinEdit=true` edits and re-uploads two skins after the close-ups and takes them again.
+- *Parity* (`s20-parity`, 150 variants incl. the legacy variant 38 in the third row, `closeShots=4`,
+  `closeToggle=transparentFaceCulling`, `skinEdit=true`): on vs off differs by 9481 / 3434 px at threshold 1 (players /
+  holograms close-ups), same-setting pairs by 8788-11073 / 3013-3405, and the diff maps show the same places (enchanted
+  leggings' glint, glinting items, the first-person arm's outline). After the edit and re-upload (which changed 58k px at
+  threshold 12: the formerly empty pants and sleeves of players 7 and 8 now drawn) on vs off still match (7549 vs 9126-9274 px
+  same-setting), so the masks followed the upload.
+- *Result*: no gain. 5 pairs each, switch off vs on, `staticSeconds=10`, players kind unless noted:
+
+| downloaded skins | static off -> on | p99 low | render thread | pan off -> on | pan p99 | pan render thread |
+|---|---|---|---|---|---|---|
+| 18 (defaults), `s20-dyn-players` | 486.1 -> 479.4 (2 of 5 lower) | 303.6 -> 295.9 | 1.99 -> 2.01 ms | 1651.3 -> 1641.7 | 445.7 -> 433.8 | 0.47 -> 0.49 ms |
+| 150 variants, `s20-dyn-players150` | 482.1 -> 474.8 (4 of 5 lower) | 289.7 -> 278.9 | 1.99 -> 2.02 ms | 1652.3 -> 1644.0 | 435.1 -> 432.5 | 0.48 -> 0.48 ms |
+| 150, empty outer layers, `s20-dyn-players150-empty` | 489.1 -> 489.6 (4 of 5 higher) | 284.3 -> 298.3 | 1.98 -> 1.99 ms | 1643.3 -> 1652.2 | 443.5 -> 446.1 | 0.49 -> 0.48 ms |
+| lobby, 18, `s20-dyn-lobby` | 323.8 -> 325.1 | 184.7 -> 190.2 | 2.99 -> 2.99 ms | 1522.8 -> 1521.2 | 303.7 -> 302.9 | 0.55 -> 0.54 ms |
+
+  Elimination (`s20-dev/elim-*`, 150 variants, 4 pairs, a temporary property that looked the masks up but skipped nothing):
+  off 477.7 (2.02 ms) vs lookups only 475.8 (2.05 ms); lookups only 477.0 (2.03) vs on 475.8 (2.03). The lookups cost at most
+  ~0.03 ms for 150 players and the skipped faces save about as much.
+- *Why so little is skipped*: faces skipped per frame were 744 (18 defaults), 550 (150 variants) and only **1485 with every
+  outer layer empty** (~10 per player, where an empty outer layer has 36 faces). `TransparentFaces` widens a face's UV
+  rectangle by one texel and also tests the repeated position, and the skin layout puts every outer layer region next to the
+  opaque base layer (rows 16, 32 and 48; the hat beside the head; the top rows wrap to row 63, the left leg's base), so almost
+  no outer layer face has a fully transparent one-texel border. The margin is needed for exactness even with nearest
+  sampling: a pixel centre exactly on a face's edge samples the next texel (u = b/w is texel b). With the base layer forced
+  opaque on download, a downloaded skin can only lose a handful of faces. Resource skins are no different in kind (878 per
+  frame for the defaults).
+- *The per texture alpha tables alone* (commit A/B, `970dcc5` vs a WIP commit with only the table change, `s20-c3-*`):
+  entities with `-Pvm.instancedParts=false` (5 pairs) static 230.0 -> 226.4 (render thread 4.24 -> 4.32 ms, 3 of 5 lower), pan
+  1118.2 -> 1101.6 (4 of 5 lower); entities defaults (3 pairs) 337.1 vs 347.9 (2.86 vs 2.81 ms), pan 1237.8 vs 1229.3; lobby with
+  resource skins (3 pairs) 329.8 vs 329.7, pan 1522.4 vs 1521.2; mixed (3 pairs) static 1607.5 vs 1646.6, pan 1669.3 vs 1676.5,
+  initial 1148.4 vs 1140.2, particles 1316.3 vs 1298.0. A gain only past 64 textures per cube, which no vanilla case reaches
+  without the downloaded skins, and slightly slower in the villager clothing case. Binned with the skin part; both are in
+  `scripts/patches/s20-downloaded-skins.patch` (applies to `970dcc5`/HEAD with `git apply`). Worth revisiting only together
+  with a resource pack or mod that gives one model >64 textures (random mob textures), or if the margin rule changes.
+- Not verified: real downloaded skins from Mojang's servers (the bench's local copies take the same code path after the
+  download), capes and elytra through the downloader (their render types are instanced or not tested anyway), the OpenGL
+  backend, and mods that write skin textures directly.
+
+For the next agent (item 1b, reuse last frame's quad sort order for still player bodies): `TransparentFaces` is unchanged from
+`a4d2751`, so a player body draws all 72 faces minus the few the culling skips (~5 for the default skins, none of which
+change from frame to frame for a still player); the skipped set depends only on the skin and the cube, so the decoded
+centroids of a still player are bit-identical frame to frame with the culling on or off. Use `-Pbench.playersKind=players`
+(150 players, `staticSeconds=10`); with `skinVariants=150` every player has its own skin (and draw) as on a real server. The
+upload table of `-Pbench.entityCost=true` times the sorted draws (section 7, "Players and holograms").
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
@@ -1605,6 +1715,9 @@ On 2026-10-28 the user reviewed the items below and **kept all of them** (transp
 blocks, plane culling and the mod compatibility trade-offs). Nothing from before the nineteenth session is pending (the
 nineteenth session's switches are not reviewed yet). The notes stay as reference; the
 `TransparentFaces` cache miss with instanced parts off was fixed in the nineteenth session (section 7).
+The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
+been kept, its trade-off would have been: a mod that writes a downloaded skin's GPU texture without `DynamicTexture.upload`
+leaves stale masks (faces missing until the next upload or reload).
 - **`TransparentFaces` (7e76c79) is ~8% slower with instanced parts off** (independent verification after the
   fourteenth session, `results/verify-s14/`): entity scene, `-Pvm.instancedParts=false`, 3 pairs, every pair slower
   with the culling on: static 194.9 -> 179.7 fps (render thread 4.99 -> 5.37 ms), pan 987 -> 906. With defaults it
@@ -1722,9 +1835,9 @@ nineteenth session's switches are not reviewed yet). The notes stay as reference
      done; their body stays on vanilla's translucent vertex path (the largest item per player, 2.8 us plus a per-frame quad
      sort and a draw of its own), see item 1b. Other translucent types stay vanilla.
 1b. **Players and holograms, next** (section 7 "Players and holograms", in order of expected gain):
-   - `TransparentFaces` with many skins: confirm part 1's per texture mask cache (`a4d2751`, merged) in the players scene with
-     `-Pbench.playerSkins=resource` (here -0.5 ms per frame for 150 players without it), then consider testing downloaded
-     skins too (`DynamicTexture.getPixels`; a skin's empty outer-layer faces would be skipped, exactly).
+   - ~~`TransparentFaces` with many skins~~: done in the twentieth session. Part 1's cache fixed the resource skin loss (now
+     neutral to +1.5%); testing downloaded skins was built and binned (no gain: the exactness margin leaves almost no outer
+     layer face skippable; `scripts/patches/s20-downloaded-skins.patch`). Nothing left here.
    - The shared vertex buffer upload is 0.51 ms of the lobby's 3.2 ms frame (light profiler depth 6), ~0.37 ms of it the
      sorted draws (upload table of `-Pbench.entityCost=true`, added this session); each player body's 72 quads are sorted
      every frame (1.8 us per player). Reusing last frame's order for sorted draws with bit-identical centroids is exact;
