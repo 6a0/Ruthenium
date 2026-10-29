@@ -194,6 +194,10 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 		}
 
 		doFirst {
+			// Only one Minecraft instance at a time: bench runs go through scripts/gpulock.py (-PbenchNoLock overrides)
+			if (System.getenv("RUTHENIUM_GPU_LOCK") == null && !project.hasProperty("benchNoLock")) {
+				throw new GradleException("Run benchmarks under the GPU lock: python scripts/gpulock.py ./gradlew ${name} ...")
+			}
 			def eula = runDir.get().file("eula.txt").asFile
 			eula.parentFile.mkdirs()
 			eula.text = "eula=true\n"
