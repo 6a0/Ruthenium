@@ -4,6 +4,7 @@ import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.ruthenium.render.blockentity.InstancedModels;
 import net.ruthenium.render.entity.InstancedParts;
+import net.ruthenium.render.entity.PlayerPoseDraws;
 import net.ruthenium.render.blockentity.RetainedBlockEntities;
 import net.ruthenium.render.chunk.CompressedTerrain;
 import org.spongepowered.asm.mixin.Mixin;
@@ -26,6 +27,7 @@ public class RenderPipelinesM {
         pipelines.addAll(RetainedBlockEntities.PIPELINES);
         pipelines.addAll(InstancedModels.PIPELINES);
         pipelines.addAll(InstancedParts.PIPELINES);
+        pipelines.addAll(PlayerPoseDraws.PIPELINES);
         pipelines.addAll(CompressedTerrain.PIPELINES);
         cir.setReturnValue(pipelines);
     }

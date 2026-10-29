@@ -6,12 +6,14 @@ import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.model.Model;
 import net.minecraft.client.renderer.feature.ModelFeatureRenderer;
 import net.minecraft.client.renderer.feature.RenderTypeFeatureRenderer;
+import net.minecraft.client.renderer.rendertype.RenderType;
 import net.ruthenium.render.blockentity.InstancedModels;
 import net.ruthenium.render.entity.InstancedParts;
 import net.ruthenium.render.entity.LazyVertexBuilder;
 import net.ruthenium.render.entity.ModelCulling;
 import net.ruthenium.render.entity.ModelGeometryCache;
 import net.ruthenium.render.entity.ModelPoseReplay;
+import net.ruthenium.render.entity.PlayerPoseDraws;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Overwrite;
@@ -19,17 +21,20 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.jspecify.annotations.Nullable;
 
+import java.util.function.Function;
+
 @Mixin(ModelFeatureRenderer.class)
 public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<ModelFeatureRenderer.Submit<?>> {
     @Shadow @Final private PoseStack poseStack;
     /** The vertex builder of submits whose parts become instances, reused for each */
     @Unique private @Nullable LazyVertexBuilder lazyBuilder;
+    @Unique private @Nullable Function<RenderType, VertexConsumer> vertexBuilders;
 
     /**
      * @author Ruthenium
      * @reason Instancing ({@link InstancedModels}), back face culling ({@link ModelCulling}), cached rest pose and
-     * model space geometry ({@link ModelGeometryCache}), instanced parts of posed models ({@link InstancedParts}) and part
-     * poses of layers ({@link ModelPoseReplay});
+     * model space geometry ({@link ModelGeometryCache}), instanced parts of posed models ({@link InstancedParts}), part
+     * poses of layers ({@link ModelPoseReplay}) and player bodies drawn from poses ({@link PlayerPoseDraws});
      * otherwise the vanilla body
      */
     @Overwrite
@@ -41,6 +46,14 @@ public abstract class ModelFeatureRendererM extends RenderTypeFeatureRenderer<Mo
             }
 
             this.poseStack.last().set(submit.pose());
+            if (PlayerPoseDraws.accepts(submit)) {
+                Function<RenderType, VertexConsumer> builders = this.vertexBuilders;
+                if (builders == null) {
+                    builders = this.vertexBuilders = this::getVertexBuilder;
+                }
+                PlayerPoseDraws.prepare(submit, this.poseStack, builders);
+                return;
+            }
             Model<? super S> model = submit.model();
             boolean decal = submit.sheetedDecalPose() != null;
             VertexConsumer buffer = null;

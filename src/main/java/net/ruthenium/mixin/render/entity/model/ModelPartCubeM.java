@@ -8,6 +8,7 @@ import net.minecraft.client.renderer.SpriteCoordinateExpander;
 import net.minecraft.client.renderer.texture.UvMapping;
 import net.minecraft.util.ARGB;
 import net.ruthenium.interfaces.ExtendedVertexBuilder;
+import net.ruthenium.interfaces.TransparentCube;
 import net.ruthenium.render.entity.ModelCulling;
 import net.ruthenium.render.entity.TransparentFaces;
 import org.joml.Matrix4f;
@@ -32,7 +33,7 @@ import java.util.Arrays;
  * Like vanilla model parts this is not thread safe; models are only rendered from the render thread.
  */
 @Mixin(ModelPart.Cube.class)
-public class ModelPartCubeM {
+public class ModelPartCubeM implements TransparentCube {
     @Unique private static final int VERTEX_SIZE = 36;
     @Unique private static final float EYE_MARGIN_SQ = ModelCulling.EYE_MARGIN * ModelCulling.EYE_MARGIN;
 
@@ -158,6 +159,11 @@ public class ModelPartCubeM {
         // Distance of the eye behind the face plane, times |n|
         float behind = nx * x0 + ny * y0 + nz * z0;
         return behind > 0.0f && behind * behind >= EYE_MARGIN_SQ * (nx * nx + ny * ny + nz * nz);
+    }
+
+    @Override
+    public int ruthenium$transparentPolygons(TransparentFaces.TextureAlpha textureAlpha) {
+        return this.transparentPolygons(textureAlpha);
     }
 
     /** The transparent polygons of this cube in a texture, kept per texture */

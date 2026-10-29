@@ -81,6 +81,8 @@
   "ruthenium.options.textDisplayCulling.tooltip": "Text displays (holograms) that are out of view are skipped. Minecraft only skips them when their size is set, which hologram plugins leave at zero, so it lays out and draws every one in range wherever you look. The test uses the extent of their text, so nothing visible is skipped.",
   "ruthenium.options.reuseSortOrder": "Reuse Sort Order",
   "ruthenium.options.reuseSortOrder.tooltip": "Translucent entities such as player bodies, and see-through name tags, start sorting their faces from the order they had in the previous frame, which is usually already right, instead of sorting them from scratch every frame. Same order as before.",
+  "ruthenium.options.playerPoseDraws": "GPU Player Poses",
+  "ruthenium.options.playerPoseDraws.tooltip": "Player bodies are kept on the GPU in the pose they were modelled in, and each frame only the position and rotation of each body part is sent, instead of every corner of every face. Same image and same drawing order.",
   "ruthenium.options.emptyArmorStandLayers": "Skip Empty Armor Stand Layers",
   "ruthenium.options.emptyArmorStandLayers.tooltip": "Armor stands without armor or items (such as the invisible ones hologram plugins use for each line of text) skip the armor, item and head layers, which would draw nothing. Mods that add something to those layers for empty armor stands may want it off.",
   "ruthenium.options.reuseEntityStates": "Reuse Entity Render States",

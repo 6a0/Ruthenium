@@ -88,6 +88,10 @@ final class PlayerBenchmark {
      * walks a small circle around its spot (0.3 blocks, ~16 s per lap), so their bodies change every frame
      */
     private static final boolean PLAYERS_MOVE = Boolean.parseBoolean(BenchmarkClientGameTest.prop("playersMove", "false"));
+    /** Close-ups show every third player hurt (the red overlay of a hurt flash) */
+    private static final boolean PLAYERS_HURT = Boolean.parseBoolean(BenchmarkClientGameTest.prop("playersHurt", "false"));
+    /** Close-ups with stained glass through and water around some players of the first row */
+    private static final boolean PLAYERS_GLASS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("playersGlass", "false"));
     private static volatile boolean moving;
     private static final Map<Integer, double[]> SPOTS = new HashMap<>();
 
@@ -611,6 +615,18 @@ final class PlayerBenchmark {
     private static void closeUps(ClientGameTestContext context, TestServerContext server, String label, String runId) {
         server.runCommand("tick freeze");
         context.waitTicks(5);
+        if (PLAYERS_HURT) {
+            context.runOnClient(mc -> setHurt(mc, 10));
+        }
+        if (PLAYERS_GLASS) {
+            // Placed while ticks are frozen: no fluid spread, no suffocation. Stained glass walls through the first row
+            // (z = 2) and water around its players at x 4.5 to 7.5
+            server.runCommand("fill -4 %d 1 -1 %d 1 minecraft:light_blue_stained_glass".formatted(FLOOR, FLOOR + 1));
+            server.runCommand("fill 0 %d 1 3 %d 1 minecraft:red_stained_glass".formatted(FLOOR, FLOOR + 1));
+            server.runCommand("fill 4 %d 1 8 %d 2 minecraft:water".formatted(FLOOR, FLOOR + 1));
+            context.waitTicks(10);
+            TerrainBenchmark.waitForVisibleCompiled(context);
+        }
         for (int k = 0; k < CLOSE_UPS.length; k++) {
             float[] view = CLOSE_UPS[k];
             moveCamera(context, server, view[0], view[1], view[2], view[3]);
@@ -625,7 +641,24 @@ final class PlayerBenchmark {
                 }
             }
         }
+        if (PLAYERS_HURT) {
+            context.runOnClient(mc -> setHurt(mc, 0));
+        }
+        if (PLAYERS_GLASS) {
+            server.runCommand("fill -4 %d 1 8 %d 2 minecraft:air".formatted(FLOOR, FLOOR + 1));
+            context.waitTicks(10);
+        }
         server.runCommand("tick unfreeze");
+    }
+
+    /** Every third player's hurt time (red overlay while it is above 0; frozen ticks keep it) */
+    private static void setHurt(Minecraft mc, int hurtTime) {
+        for (Entity entity : mc.level.entitiesForRendering()) {
+            if (entity instanceof ClientMannequin mannequin && playerIndex(mannequin) % 3 == 0) {
+                mannequin.hurtTime = hurtTime;
+                mannequin.hurtDuration = Math.max(hurtTime, 1);
+            }
+        }
     }
 
     /** Moves the flying creative camera player (x, height above the floor, z, pitch), looking along +z */

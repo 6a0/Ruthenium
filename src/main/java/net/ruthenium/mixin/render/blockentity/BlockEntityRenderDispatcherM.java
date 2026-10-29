@@ -7,6 +7,7 @@ import net.ruthenium.render.entity.InstancedParts;
 import net.ruthenium.render.blockentity.RetainedBlockEntities;
 import net.ruthenium.render.entity.BlockModelMeshCache;
 import net.ruthenium.render.entity.ItemBoundingBoxes;
+import net.ruthenium.render.entity.PlayerPoseDraws;
 import net.ruthenium.render.entity.TransparentFaces;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -21,6 +22,7 @@ public class BlockEntityRenderDispatcherM {
         RetainedBlockEntities.clear();
         InstancedModels.clear();
         InstancedParts.clear();
+        PlayerPoseDraws.clear();
         BlockModelMeshCache.clear();
         ItemBoundingBoxes.clear();
         TransparentFaces.clear();

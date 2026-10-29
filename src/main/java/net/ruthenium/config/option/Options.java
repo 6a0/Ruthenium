@@ -14,6 +14,7 @@ import net.ruthenium.interfaces.TickerParkingLevel;
 import net.ruthenium.render.blockentity.InstancedModels;
 import net.ruthenium.render.entity.EntityLight;
 import net.ruthenium.render.entity.InstancedParts;
+import net.ruthenium.render.entity.PlayerPoseDraws;
 import net.ruthenium.render.entity.TransparentFaces;
 import net.ruthenium.render.blockentity.RetainedBlockEntities;
 import net.ruthenium.render.entity.BlockModelMeshCache;
@@ -358,6 +359,14 @@ public abstract class Options {
                                 () -> config.reuseSortOrder)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.reuseSortOrder.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.playerPoseDraws"),
+                                value -> {
+                                    config.playerPoseDraws = value;
+                                    PlayerPoseDraws.clear();
+                                },
+                                () -> config.playerPoseDraws)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.playerPoseDraws.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM),
                         new SwitchOption(Component.translatable("ruthenium.options.emptyArmorStandLayers"),
                                 value -> config.emptyArmorStandLayers = value,
                                 () -> config.emptyArmorStandLayers)

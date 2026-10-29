@@ -59,6 +59,8 @@ public class Config {
     public boolean textDisplayCulling = true;
     /** Sorted translucent draws start their quad sort from their order in the previous frame */
     public boolean reuseSortOrder = true;
+    /** Player bodies are drawn from a part-space mesh and per-frame part poses instead of writing their vertices */
+    public boolean playerPoseDraws = true;
     /** Armor stands with empty equipment skip their (vanilla) layers and the model pose for them */
     public boolean emptyArmorStandLayers = true;
     /** Armor stands extracted into render states reused across frames */

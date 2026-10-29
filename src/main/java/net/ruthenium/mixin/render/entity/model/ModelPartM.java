@@ -5,10 +5,12 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.model.geom.ModelPart;
 import net.ruthenium.interfaces.InstancedPartHolder;
+import net.ruthenium.interfaces.PosedPart;
 import net.ruthenium.interfaces.ReplayablePart;
 import net.ruthenium.render.entity.InstancedParts;
 import net.ruthenium.render.entity.LazyVertexBuilder;
 import net.ruthenium.render.entity.ModelPoseReplay;
+import net.ruthenium.render.entity.PlayerPoseDraws;
 import org.joml.Quaternionf;
 import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
@@ -20,12 +22,12 @@ import org.spongepowered.asm.mixin.Unique;
 import java.util.List;
 
 /**
- * Adds the part as an instance ({@link InstancedParts}) instead of writing its cubes when the model allows it, records
- * its pose for layers ({@link ModelPoseReplay}), and keeps the quaternion of its rotation while its angles stay the
- * same.
+ * Adds the part as an instance ({@link InstancedParts}) or hands its pose to a posed player draw ({@link PlayerPoseDraws})
+ * instead of writing its cubes when the model allows it, records its pose for layers ({@link ModelPoseReplay}), and
+ * keeps the quaternion of its rotation while its angles stay the same.
  */
 @Mixin(ModelPart.class)
-public class ModelPartM implements InstancedPartHolder, ReplayablePart {
+public class ModelPartM implements InstancedPartHolder, ReplayablePart, PosedPart {
     @Shadow @Final private List<ModelPart.Cube> cubes;
     @Shadow public float x;
     @Shadow public float y;
@@ -43,6 +45,9 @@ public class ModelPartM implements InstancedPartHolder, ReplayablePart {
     @Unique private int rotationXBits;
     @Unique private int rotationYBits;
     @Unique private int rotationZBits;
+    /** The part's {@link PlayerPoseDraws} layout and slot in it */
+    @Unique private @Nullable Object poseLayout;
+    @Unique private int poseSlot;
 
     /**
      * @author Ruthenium
@@ -83,12 +88,18 @@ public class ModelPartM implements InstancedPartHolder, ReplayablePart {
 
     /**
      * @author Ruthenium
-     * @reason Instanced parts; otherwise the vanilla body
+     * @reason Instanced parts and posed player draws; otherwise the vanilla body
      */
     @Overwrite
     private void compile(PoseStack.Pose pose, VertexConsumer builder, int lightCoords, int overlayCoords, int color) {
         if (ModelPoseReplay.isRecording() && !this.cubes.isEmpty()) {
             ModelPoseReplay.record((ModelPart) (Object) this, pose);
+        }
+        if (PlayerPoseDraws.isCapturing()) {
+            if (!this.cubes.isEmpty()) {
+                PlayerPoseDraws.capturePart((ModelPart) (Object) this, this.cubes, pose);
+            }
+            return;
         }
         if (InstancedParts.addPart((ModelPart) (Object) this, this.cubes, pose, lightCoords, overlayCoords, color)) {
             return;
@@ -114,5 +125,26 @@ public class ModelPartM implements InstancedPartHolder, ReplayablePart {
     @Override
     public void ruthenium$setBatches(InstancedParts.PartBatches batches) {
         this.batches = batches;
+    }
+
+    @Override
+    public @Nullable Object ruthenium$poseLayout() {
+        return this.poseLayout;
+    }
+
+    @Override
+    public int ruthenium$poseSlot() {
+        return this.poseSlot;
+    }
+
+    @Override
+    public void ruthenium$setPoseLayout(@Nullable Object layout, int slot) {
+        this.poseLayout = layout;
+        this.poseSlot = slot;
+    }
+
+    @Override
+    public List<ModelPart.Cube> ruthenium$cubes() {
+        return this.cubes;
     }
 }

@@ -9,6 +9,7 @@ import net.ruthenium.render.blockentity.RetainedBlockEntities;
 import net.ruthenium.render.entity.InstancedParts;
 import net.ruthenium.render.entity.ModelPoseReplay;
 import net.ruthenium.render.entity.ModelCulling;
+import net.ruthenium.render.entity.PlayerPoseDraws;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -27,6 +28,7 @@ public class LevelRendererM {
         ModelCulling.setWorldPass(true);
         InstancedParts.beginFrame();
         ModelPoseReplay.beginFrame();
+        PlayerPoseDraws.beginFrame();
     }
 
     @Inject(method = "render", at = @At(value = "INVOKE", target = PREPARE_FRAME, shift = At.Shift.AFTER))
@@ -35,6 +37,7 @@ public class LevelRendererM {
         RetainedBlockEntities.prepareDraws();
         InstancedModels.prepareDraws();
         InstancedParts.upload();
+        PlayerPoseDraws.upload();
     }
 
     @Inject(method = "executeSolid", at = @At(value = "INVOKE", shift = At.Shift.AFTER,
