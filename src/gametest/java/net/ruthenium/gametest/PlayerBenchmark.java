@@ -8,6 +8,8 @@ import net.minecraft.client.CloudStatus;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.entity.ClientMannequin;
 import net.minecraft.client.renderer.texture.DynamicTexture;
+import net.minecraft.client.renderer.texture.SkinTextureDownloader;
+import net.minecraft.client.resources.SkinManager;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.util.ARGB;
@@ -19,12 +21,16 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Field;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Players and holograms benchmark ({@code -Pbench.scene=players}): what a server lobby shows that the other scenes
@@ -63,6 +69,8 @@ final class PlayerBenchmark {
     private static final int HOLOGRAM_LINES = Integer.parseInt(BenchmarkClientGameTest.prop("hologramLines", "4"));
     private static final String HOLOGRAM_KIND = BenchmarkClientGameTest.prop("hologramKind", "mixed");
     private static final boolean DOWNLOADED_SKINS = BenchmarkClientGameTest.prop("playerSkins", "downloaded").equals("downloaded");
+    /** Distinct skins: the 18 defaults (9 skins, wide and slim), then tinted copies with other outer layers */
+    private static final int SKIN_VARIANTS = DOWNLOADED_SKINS ? Integer.parseInt(BenchmarkClientGameTest.prop("skinVariants", "18")) : 18;
     private static final int RENDER_DISTANCE = Integer.parseInt(BenchmarkClientGameTest.prop("playersRenderDistance", "12"));
     private static final int CLOSE_SHOTS = Integer.parseInt(BenchmarkClientGameTest.prop("closeShots", "0"));
     private static final String CLOSE_TOGGLE = BenchmarkClientGameTest.prop("closeToggle", "");
@@ -111,10 +119,10 @@ final class PlayerBenchmark {
         context.runOnClient(mc -> {
             mc.options.renderDistance().set(RENDER_DISTANCE);
             mc.options.cloudStatus().set(CloudStatus.OFF);
-            if (DOWNLOADED_SKINS) {
-                registerDownloadedSkins(mc);
-            }
         });
+        if (DOWNLOADED_SKINS) {
+            registerDownloadedSkins(context);
+        }
 
         List<PhaseResult> results = new ArrayList<>();
         Map<String, String> frameSeries = new HashMap<>();
@@ -177,6 +185,7 @@ final class PlayerBenchmark {
             environment.addProperty("hologramLines", lines);
             environment.addProperty("hologramKind", HOLOGRAM_KIND);
             environment.addProperty("playerSkins", DOWNLOADED_SKINS ? "downloaded" : "resource");
+            environment.addProperty("skinVariants", SKIN_VARIANTS);
             var entities = new com.google.gson.JsonObject();
             counts.forEach(entities::addProperty);
             environment.add("entities", entities);
@@ -185,37 +194,111 @@ final class PlayerBenchmark {
     }
 
     /**
-     * Registers the default skins as {@link DynamicTexture}s under {@code ruthenium-gametest:textures/skins/<model>/<name>.png},
-     * processed like a downloaded 64x64 skin ({@code SkinTextureDownloader.processLegacySkin}: the base layer opaque),
-     * which is how the textures of real players' skins are held.
+     * Registers the skins through vanilla's skin downloader ({@code SkinTextureDownloader.downloadAndRegisterSkin}) from
+     * local copies written into {@code bench-skins/} of the run directory, so nothing is downloaded but everything after
+     * the download is a downloaded skin's path: {@code processLegacySkin} (64x32 skins converted, the base layer made
+     * opaque) and a {@link DynamicTexture} registered under {@code ruthenium-gametest:textures/skins/v<variant>.png}.
+     * Variants 0-17 are the default skins (wide and slim in turn); later ones ({@code bench.skinVariants}) are tinted
+     * copies whose outer layer regions are each kept, cleared (alpha 0), faded below the cutout (alpha 20),
+     * semi-transparent (alpha 100) or cleared on every other texel, and every tenth of them (wide ones) a legacy 64x32 skin.
      */
-    private static void registerDownloadedSkins(Minecraft mc) {
-        for (String model : new String[]{"wide", "slim"}) {
-            for (String skin : SKINS) {
-                Identifier source = Identifier.withDefaultNamespace("textures/entity/player/%s/%s.png".formatted(model, skin));
-                Identifier target = Identifier.fromNamespaceAndPath("ruthenium-gametest", "textures/skins/%s/%s.png".formatted(model, skin));
-                try (InputStream in = mc.getResourceManager().open(source)) {
-                    NativeImage image = NativeImage.read(in);
-                    if (image.getWidth() != 64 || image.getHeight() != 64) {
-                        throw new AssertionError("Unexpected skin size of " + source);
+    private static void registerDownloadedSkins(ClientGameTestContext context) {
+        Path dir = context.computeOnClient(mc -> {
+            Path skins = mc.gameDirectory.toPath().resolve("bench-skins");
+            try {
+                Files.createDirectories(skins);
+                for (int v = 0; v < SKIN_VARIANTS; v++) {
+                    try (NativeImage image = skinImage(mc, v)) {
+                        image.writeToFile(skins.resolve("v" + v + ".png"));
                     }
-                    setNoAlpha(image, 0, 0, 32, 16);
-                    setNoAlpha(image, 0, 16, 64, 32);
-                    setNoAlpha(image, 16, 48, 48, 64);
-                    mc.getTextureManager().register(target, new DynamicTexture(target::toString, image));
-                } catch (IOException e) {
-                    throw new AssertionError("Can't read " + source, e);
+                }
+            } catch (IOException e) {
+                throw new AssertionError("Can't write the bench skins", e);
+            }
+            return skins;
+        });
+        SkinTextureDownloader downloader = context.computeOnClient(mc -> {
+            try {
+                Field field = SkinManager.class.getDeclaredField("skinTextureDownloader");
+                field.setAccessible(true);
+                return (SkinTextureDownloader) field.get(mc.getSkinManager());
+            } catch (ReflectiveOperationException e) {
+                throw new AssertionError("No skin downloader", e);
+            }
+        });
+        List<CompletableFuture<?>> futures = new ArrayList<>();
+        for (int v = 0; v < SKIN_VARIANTS; v++) {
+            Identifier texture = Identifier.fromNamespaceAndPath("ruthenium-gametest", "textures/skins/v" + v + ".png");
+            futures.add(downloader.downloadAndRegisterSkin(texture, dir.resolve("v" + v + ".png"), "https://bench.invalid/skins/v" + v, true));
+        }
+        context.waitFor(_ -> futures.stream().allMatch(CompletableFuture::isDone), 60 * TICKS_PER_SECOND);
+        futures.forEach(CompletableFuture::join);
+        LOGGER.info("{} skins registered through the skin downloader ({} legacy)", SKIN_VARIANTS,
+                java.util.stream.IntStream.range(0, SKIN_VARIANTS).filter(PlayerBenchmark::isLegacySkin).count());
+    }
+
+    private static String skinModel(int variant) {
+        return variant % 2 == 0 ? "wide" : "slim";
+    }
+
+    /** Whether a skin variant is a legacy 64x32 skin */
+    private static boolean isLegacySkin(int variant) {
+        return variant >= 18 && variant % 2 == 0 && variant / 2 % 5 == 4;
+    }
+
+    /** The skin file of a variant, before vanilla's processing */
+    private static NativeImage skinImage(Minecraft mc, int variant) throws IOException {
+        String base = SKINS[variant / 2 % SKINS.length];
+        Identifier source = Identifier.withDefaultNamespace("textures/entity/player/%s/%s.png".formatted(skinModel(variant), base));
+        NativeImage image;
+        try (InputStream in = mc.getResourceManager().open(source)) {
+            image = NativeImage.read(in);
+        }
+        if (image.getWidth() != 64 || image.getHeight() != 64) {
+            throw new AssertionError("Unexpected skin size of " + source);
+        }
+        if (variant < 18) {
+            return image;
+        }
+        int hash = variant * 0x9E3779B9;
+        float r = 0.55F + (hash >>> 8 & 0xFF) / 570.0F, g = 0.55F + (hash >>> 16 & 0xFF) / 570.0F, b = 0.55F + (hash >>> 24) / 570.0F;
+        for (int y = 0; y < 64; y++) {
+            for (int x = 0; x < 64; x++) {
+                int pixel = image.getPixel(x, y);
+                image.setPixel(x, y, ARGB.color(ARGB.alpha(pixel), (int) (ARGB.red(pixel) * r), (int) (ARGB.green(pixel) * g), (int) (ARGB.blue(pixel) * b)));
+            }
+        }
+        // Outer layer regions: hat, jacket, right sleeve, right pants, left sleeve, left pants
+        int[][] regions = {{32, 0, 64, 16}, {16, 32, 40, 48}, {40, 32, 56, 48}, {0, 32, 16, 48}, {48, 48, 64, 64}, {0, 48, 16, 64}};
+        int ops = Integer.rotateLeft(hash, 11) & Integer.MAX_VALUE;
+        for (int[] region : regions) {
+            int op = ops % 5;
+            ops /= 5;
+            for (int y = region[1]; y < region[3]; y++) {
+                for (int x = region[0]; x < region[2]; x++) {
+                    int pixel = image.getPixel(x, y);
+                    int alpha = switch (op) {
+                        case 1 -> 0;
+                        case 2 -> 20;
+                        case 3 -> 100;
+                        case 4 -> (x + y) % 2 == 0 ? 0 : 255;
+                        default -> ARGB.alpha(pixel);
+                    };
+                    image.setPixel(x, y, ARGB.color(alpha, pixel));
                 }
             }
         }
-    }
-
-    private static void setNoAlpha(NativeImage image, int x0, int y0, int x1, int y1) {
-        for (int x = x0; x < x1; x++) {
-            for (int y = y0; y < y1; y++) {
-                image.setPixel(x, y, ARGB.opaque(image.getPixel(x, y)));
+        if (isLegacySkin(variant)) {
+            NativeImage legacy = new NativeImage(64, 32, false);
+            for (int y = 0; y < 32; y++) {
+                for (int x = 0; x < 64; x++) {
+                    legacy.setPixel(x, y, image.getPixel(x, y));
+                }
             }
+            image.close();
+            return legacy;
         }
+        return image;
     }
 
     private static int buildPlayers(TestServerContext server) {
@@ -232,14 +315,14 @@ final class PlayerBenchmark {
         for (int i = 0; i < PLAYER_COUNT; i++) {
             double x = PLAYER_MIN_X + PLAYER_DX * (i % COLUMNS);
             double z = PLAYER_MIN_Z + PLAYER_DZ * (i / COLUMNS);
-            String model = i % 2 == 0 ? "wide" : "slim";
-            String skin = SKINS[(i / 2) % SKINS.length];
+            int variant = i % SKIN_VARIANTS;
+            String model = skinModel(variant);
+            String skin = DOWNLOADED_SKINS ? "ruthenium-gametest:skins/v" + variant
+                    : "minecraft:entity/player/%s/%s".formatted(model, SKINS[variant / 2 % SKINS.length]);
             boolean elytra = i % 7 == 2;
             boolean cape = i % 3 == 0 && !elytra;
 
-            StringBuilder profile = new StringBuilder("profile:{texture:\"")
-                    .append(DOWNLOADED_SKINS ? "ruthenium-gametest:skins/%s/%s" : "minecraft:entity/player/%s/%s").append("\",model:\"%s\"");
-            String profileNbt = profile.toString().formatted(model, skin, model);
+            String profileNbt = "profile:{texture:\"%s\",model:\"%s\"".formatted(skin, model);
             if (cape) {
                 profileNbt += ",cape:\"ruthenium-gametest:entity/cape/bench\"";
             }
