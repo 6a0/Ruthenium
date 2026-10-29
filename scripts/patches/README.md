@@ -16,5 +16,7 @@ after the rename; results and logs stay in `build/run/bench/results/<dir>`.
 | `s17-cells.patch` | 17th, `s17-cells` | HEAD |
 | `s17-f2b.patch` | 17th, `s17-f2b-*` | HEAD |
 | `s17-sprites.patch` | 17th, `s17-sprites` | HEAD |
+| `s19-check-TextCacheCheck.java.txt` | 19th check of the name tag and text display caches (worktree `s1`, `s3/verify`) | `render/text/`; call it where the kept width, kept component and kept prepared text are returned (`-Druthenium.verifyTextCache=true`) |
+| `s19-check-TextDisplayCullingCheckM.java.txt` | 19th check of the text display culling radius (`s3/verify`) | a mixin source for `mixin/render/entity/` (`-Druthenium.verifyTextDisplayCulling=true`) |
 
 The two old patches (5th, 7th) fail on HEAD because the code moved on; `git apply --3way` gets most of the way.
