@@ -253,6 +253,14 @@ public abstract class Options {
                                 () -> config.instancedModels)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.instancedModels.tooltip"))
                                 .setImpact(PerformanceImpact.HIGH),
+                        new SwitchOption(Component.translatable("ruthenium.options.armorStandPlates"),
+                                value -> {
+                                    config.armorStandPlates = value;
+                                    InstancedModels.clear();
+                                },
+                                () -> config.armorStandPlates)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.armorStandPlates.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM),
                         new SwitchOption(Component.translatable("ruthenium.options.modelBackFaceCulling"),
                                 value -> config.modelBackFaceCulling = value,
                                 () -> config.modelBackFaceCulling)

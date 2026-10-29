@@ -23,6 +23,8 @@ public class Config {
     public boolean retainedGlowingText = true;
     /** Closed enchanting table books and armor stands drawn as GPU instances */
     public boolean instancedModels = true;
+    /** An armor stand's base plate, which vanilla turns by the stand's yaw, is an instance of its own (with instancedModels) */
+    public boolean armorStandPlates = true;
     /** CPU skip of model faces and sign text the GPU would cull as back faces */
     public boolean modelBackFaceCulling = true;
     /** CPU skip of model faces whose texels all draw nothing (alpha cutout, or alpha 0 with translucent blending) */

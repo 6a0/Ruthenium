@@ -46,6 +46,12 @@ import java.util.TreeMap;
  * red, black, lime and light blue (the face's usual dark_red is no dye colour, so it reads as black), and
  * adds yaw 270 screenshots from farther away ({@code glow270x-7}, no face sign in reach) and closer ({@code glow270x4}).
  * It changes the scene, so don't compare its numbers with runs without it.
+ * <p>
+ * After the phases (once the particles are gone), {@code bench.toggleField=<switch>} runs an in-launch A/B ({@link ToggleAb}), and
+ * {@code bench.closeShots=N} takes N frozen close-ups of the armor stands per position ({@code close<k>-<n>}; with
+ * {@code bench.closeToggle=<switch>[,<switch>...]} every other shot with the switches flipped, as in the entity scene), clouds off: the grid from the
+ * front and from above, and a row of stands summoned for them behind the camera (arms and poses, small, no base plate, invisible,
+ * marker) from the front and from above. Neither changes the measured phases.
  */
 final class MixedBenchmark {
     private static final Logger LOGGER = LoggerFactory.getLogger("Ruthenium Mixed Benchmark");
@@ -57,6 +63,32 @@ final class MixedBenchmark {
     private static final boolean ZOOM_SHOT = Boolean.parseBoolean(BenchmarkClientGameTest.prop("zoomShot", "false"));
     private static final boolean CHEST_EVENTS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("chestEvents", "false"));
     private static final boolean GLOWING_SIGNS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("glowingSigns", "false"));
+    private static final int CLOSE_SHOTS = Integer.parseInt(BenchmarkClientGameTest.prop("closeShots", "0"));
+    private static final String CLOSE_TOGGLE = BenchmarkClientGameTest.prop("closeToggle", "");
+    /** Close-up camera positions: x, height above the floor, z, yaw, pitch */
+    private static final float[][] CLOSE_UPS = {
+            {0.5F, 1.7F, 1.5F, 0.0F, 20.0F},     // the grid's first rows: big stands, arms, many yaws
+            {0.5F, 4.5F, 3.5F, 0.0F, 55.0F},     // the grid from above, small stands in rows 3 and 7
+            {0.0F, 1.5F, -3.5F, 180.0F, 20.0F},  // the summoned variety rows
+            {0.0F, 4.0F, -5.0F, 180.0F, 60.0F},  // the same from above
+    };
+    /** Stands summoned for the close-ups behind the camera: x, z, NBT (plates 1.25 blocks apart, so they don't overlap) */
+    private static final String[][] VARIETY_STANDS = {
+            {"-3.75", "-7.5", "Rotation:[0f,0f]"},
+            {"-2.5", "-7.5", "Rotation:[37f,0f],ShowArms:1b"},
+            {"-1.25", "-7.5", "Rotation:[90f,0f],ShowArms:1b,Pose:{Head:[15f,30f,0f],Body:[0f,20f,0f],LeftArm:[-90f,0f,0f],"
+                    + "RightArm:[-30f,20f,10f],LeftLeg:[-20f,0f,0f],RightLeg:[20f,0f,0f]}"},
+            {"0.0", "-7.5", "Rotation:[200f,0f],Small:1b"},
+            {"1.25", "-7.5", "Rotation:[315f,0f],Small:1b,ShowArms:1b"},
+            {"2.5", "-7.5", "Rotation:[45f,0f],NoBasePlate:1b"},
+            {"3.75", "-7.5", "Rotation:[123f,0f],Small:1b,NoBasePlate:1b"},
+            {"-3.125", "-10.0", "Rotation:[10f,0f],Invisible:1b"},
+            {"-1.875", "-10.0", "Rotation:[270f,0f],Marker:1b"},
+            {"-0.625", "-10.0", "Rotation:[160f,0f],Marker:1b,Small:1b,ShowArms:1b"},
+            {"0.625", "-10.0", "Rotation:[77f,0f],Small:1b,ShowArms:1b,Pose:{Head:[-20f,0f,10f],RightArm:[-120f,0f,0f],LeftLeg:[10f,0f,5f]}"},
+            {"1.875", "-10.0", "Rotation:[11.25f,0f],ShowArms:1b,Pose:{Body:[10f,0f,-5f],LeftArm:[0f,0f,-60f]}"},
+            {"3.125", "-10.0", "Rotation:[359f,0f],Invisible:1b,Small:1b"},
+    };
     /**
      * Records vanilla's section profiler (the debug profiling report) during the static phase, into
      * {@code debug/profiling/} of the run directory. Times are measured per section, unlike JFR samples, but the
@@ -184,6 +216,17 @@ final class MixedBenchmark {
             results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("particles", finalPeak)));
             LOGGER.info(results.getLast().summaryLine());
 
+            if (ToggleAb.enabled() || CLOSE_SHOTS > 0) {
+                // The particles are around the armor stands
+                context.waitFor(mc -> BenchmarkClientGameTest.countParticles(mc) == 0, 60 * TICKS_PER_SECOND);
+            }
+            if (ToggleAb.enabled()) {
+                ToggleAb.run(context, results, () -> BenchmarkClientGameTest.setYaw(context, BenchmarkClientGameTest.STATIC_YAW), 0.0F, 0.0F);
+            }
+            if (CLOSE_SHOTS > 0) {
+                closeUps(context, server, label, runId);
+            }
+
             var environment = context.computeOnClient(BenchmarkClientGameTest::describeEnvironment);
             environment.addProperty("label", sceneLabel);
             var blockEntityCounts = new com.google.gson.JsonObject();
@@ -237,6 +280,58 @@ final class MixedBenchmark {
         }
 
         server.runCommand("forceload remove all");
+    }
+
+    /** Frozen close-ups of the armor stands, clouds off (after the measured phases) */
+    private static void closeUps(ClientGameTestContext context, TestServerContext server, String label, String runId) {
+        for (String[] stand : VARIETY_STANDS) {
+            server.runCommand("summon minecraft:armor_stand %s %d %s {NoGravity:1b,Invulnerable:1b,%s}".formatted(stand[0], FLOOR, stand[1], stand[2]));
+        }
+        context.runOnClient(mc -> mc.options.cloudStatus().set(net.minecraft.client.CloudStatus.OFF));
+        context.waitTicks(10);
+        server.runCommand("tick freeze");
+        context.waitTicks(5);
+        for (int k = 0; k < CLOSE_UPS.length; k++) {
+            float[] view = CLOSE_UPS[k];
+            server.runCommand("tp @a %s %s %s %s %s".formatted(view[0], FLOOR + view[1], view[2], view[3], view[4]));
+            context.waitTicks(10);
+            context.runOnClient(mc -> {
+                mc.player.setYRot(view[3]);
+                mc.player.yRotO = view[3];
+                mc.player.setXRot(view[4]);
+                mc.player.xRotO = view[4];
+            });
+            context.waitTicks(5);
+            for (int n = 0; n < CLOSE_SHOTS; n++) {
+                boolean toggled = !CLOSE_TOGGLE.isEmpty() && n % 2 == 1;
+                if (toggled) {
+                    toggleConfig(context);
+                }
+                context.takeScreenshot("%s-mixed-close%d-%d-%s".formatted(label, k, n, runId));
+                if (toggled) {
+                    toggleConfig(context);
+                }
+            }
+        }
+        server.runCommand("tick unfreeze");
+    }
+
+    /**
+     * Flips the boolean {@code Config} fields named by {@code bench.closeToggle} (comma separated), by reflection (vanilla runs
+     * have no mod)
+     */
+    private static void toggleConfig(ClientGameTestContext context) {
+        context.runOnClient(_ -> {
+            try {
+                Object config = Class.forName("net.ruthenium.Initializer").getField("CONFIG").get(null);
+                for (String name : CLOSE_TOGGLE.split(",")) {
+                    var field = config.getClass().getField(name.trim());
+                    field.setBoolean(config, !field.getBoolean(config));
+                }
+            } catch (ReflectiveOperationException e) {
+                throw new AssertionError("Can't toggle " + CLOSE_TOGGLE, e);
+            }
+        });
     }
 
     private static String signText(String first, String color, boolean glowing) {

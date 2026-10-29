@@ -37,6 +37,7 @@
     "render.entity.model.ModelPartCubeM",
     "render.entity.model.ModelPartM",
     "render.entity.model.ModelM",
+    "render.entity.model.ArmorStandModelAccessor",
     "render.entity.model.PoseAccessor",
     "render.entity.EntityRenderStateM",
     "render.feature.ItemFeatureRendererM",

@@ -40,6 +40,7 @@ import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.EnchantingTableBlockEntity;
 import net.ruthenium.Initializer;
 import net.ruthenium.interfaces.CachedBlockEntityLight;
+import net.ruthenium.mixin.render.entity.model.ArmorStandModelAccessor;
 import net.ruthenium.render.entity.ModelCulling;
 import net.ruthenium.render.entity.ModelGeometryCache;
 import org.joml.Matrix4f;
@@ -64,7 +65,11 @@ import java.util.Set;
  * capture: their pose and light are computed from the block entity like the renderer does ({@link #tryAddClosedBook}).
  * Armor stands are taken from their prepared model submits instead: after
  * {@code setupAnim}, the transforms of all their parts ({@link #snapshot}) key the group, whose mesh is the
- * model rendered once with the identity pose. The instances are drawn after the world's solid features with
+ * model rendered once with the identity pose. {@code ArmorStandModel.setupAnim} turns the base plate back by the
+ * stand's yaw (it keeps its world orientation), so with {@code armorStandPlates} the plate is left out of the snapshot
+ * and the mesh and drawn as an instance
+ * of its own ({@link #PLATE_KEY}): stands posed alike share their groups whichever way they face. The instances are
+ * drawn after the world's solid features with
  * instanced copies of vanilla's entity pipelines, whose vertex shader applies the instance's pose to the position
  * and normal. The only difference to vanilla is rounding: the normal is quantized before the transform instead of
  * after it.
@@ -94,6 +99,14 @@ public final class InstancedModels {
     private static final float ROTATION_TOLERANCE = 1.0e-4f;
 
     private static final List<Group> GROUPS = new ArrayList<>();
+    /**
+     * Group key of an armor stand model's base plate: the plate alone at its scale (0.5 on small stands), without its
+     * offset and rotation, which are in the instance
+     */
+    private static final Object PLATE_KEY = new Object();
+    private static final PoseStack PLATE_POSE = new PoseStack();
+    /** {@code armorStandPlates} when the groups were made; they are dropped when it changes (the groups' keys differ) */
+    private static boolean groupsWithPlates;
     private static float[] snapshotScratch = new float[0];
     private static final ModelSubmitCapture CAPTURE = new ModelSubmitCapture();
     private static final PoseStack POSE_STACK = new PoseStack();
@@ -182,6 +195,8 @@ public final class InstancedModels {
         @Nullable MappableRingBuffer ring;
         @Nullable GpuBufferSlice instanceSlice;
         @Nullable PreparedRenderType prepared;
+        /** Of a {@link #PLATE_KEY} group: the plate's scale in its mesh */
+        float plateXScale, plateYScale, plateZScale;
 
         Group(Model<?> model, Object key, RenderPipeline pipeline, RenderType renderType, @Nullable UvMapping uvMapping, int overlay, int color) {
             this.model = model;
@@ -225,8 +240,10 @@ public final class InstancedModels {
     }
 
     public static void beginFrame() {
-        if (clearPending) {
+        boolean plates = Initializer.CONFIG.armorStandPlates;
+        if (clearPending || plates != groupsWithPlates) {
             clearPending = false;
+            groupsWithPlates = plates;
             pipelineAvailable = null;
             GROUPS.forEach(Group::close);
             GROUPS.clear();
@@ -376,14 +393,67 @@ public final class InstancedModels {
         }
 
         model.setupAnim(submit.state());
-        float[] snapshot = snapshot(model);
-        Group group = findGroup(model, submit.state(), snapshot, pipeline, submit.renderType(), submit.uvMapping(),
-                submit.overlayCoords(), submit.tintedColor());
+        // The base plate is turned back by the stand's yaw: with armorStandPlates it is left out of the snapshot and the mesh
+        // (hidden and unturned while they are taken) and drawn as an instance of its own
+        ModelPart plate = groupsWithPlates && model instanceof ArmorStandModel ? ((ArmorStandModelAccessor) model).ruthenium$basePlate() : null;
+        Group group;
+        Group plateGroup = null;
+        if (plate == null) {
+            group = findGroup(model, submit.state(), snapshot(model), pipeline, submit.renderType(), submit.uvMapping(),
+                    submit.overlayCoords(), submit.tintedColor());
+        } else {
+            float plateYRot = plate.yRot;
+            boolean plateVisible = plate.visible;
+            plate.yRot = 0.0F;
+            plate.visible = false;
+            try {
+                group = findGroup(model, submit.state(), snapshot(model), pipeline, submit.renderType(), submit.uvMapping(),
+                        submit.overlayCoords(), submit.tintedColor());
+            } finally {
+                plate.yRot = plateYRot;
+                plate.visible = plateVisible;
+            }
+            if (group != null && plateVisible && !plate.skipDraw) {
+                plateGroup = findGroup(model, submit.state(), PLATE_KEY, pipeline, submit.renderType(), submit.uvMapping(),
+                        submit.overlayCoords(), submit.tintedColor());
+                if (plateGroup == null || !platePose(model, plate, plateGroup, submit.pose())) {
+                    return false;
+                }
+            }
+        }
         if (group == null) {
             return false;
         }
         addInstance(group, submit.pose().pose(), submit.lightCoords());
+        if (plateGroup != null) {
+            addInstance(plateGroup, PLATE_POSE.last().pose(), submit.lightCoords());
+        }
         return true;
+    }
+
+    /**
+     * The plate's instance pose into {@link #PLATE_POSE}: what {@code ModelPart.render} multiplies onto the submit's pose
+     * for it (the root's and the plate's {@code translateAndRotate}) without the plate's scale, which is in its mesh, so
+     * the pose stays a rotation.
+     *
+     * @return false if the plate isn't drawn like that (another scale than its mesh's, or not a rotation)
+     */
+    private static boolean platePose(Model<?> model, ModelPart plate, Group plateGroup, PoseStack.Pose pose) {
+        float xScale = plate.xScale, yScale = plate.yScale, zScale = plate.zScale;
+        if (xScale != plateGroup.plateXScale || yScale != plateGroup.plateYScale || zScale != plateGroup.plateZScale) {
+            return false;
+        }
+        PLATE_POSE.last().set(pose);
+        model.root().translateAndRotate(PLATE_POSE);
+        plate.xScale = plate.yScale = plate.zScale = 1.0F;
+        try {
+            plate.translateAndRotate(PLATE_POSE);
+        } finally {
+            plate.xScale = xScale;
+            plate.yScale = yScale;
+            plate.zScale = zScale;
+        }
+        return isOrthogonal(PLATE_POSE.last().pose());
     }
 
     /** The transforms and visibility of every part, which (with the model) decide its model space geometry */
@@ -472,7 +542,33 @@ public final class InstancedModels {
             BufferBuilder builder = new BufferBuilder(bytes, PrimitiveTopology.QUADS, DefaultVertexFormat.ENTITY);
             // Light comes from the instance; all faces, the pipeline culls
             boolean written;
-            if (key instanceof float[]) {
+            if (key == PLATE_KEY) {
+                // The plate alone at its scale: its offset and rotation are in the instance. The scale is left as it is
+                // (PartPose, as storePose/loadPose use it, doesn't carry it)
+                ModelPart plate = ((ArmorStandModelAccessor) model).ruthenium$basePlate();
+                float x = plate.x, y = plate.y, z = plate.z, xRot = plate.xRot, yRot = plate.yRot, zRot = plate.zRot;
+                boolean visible = plate.visible;
+                group.plateXScale = plate.xScale;
+                group.plateYScale = plate.yScale;
+                group.plateZScale = plate.zScale;
+                ModelCulling.endModel();
+                try {
+                    plate.x = plate.y = plate.z = 0.0F;
+                    plate.xRot = plate.yRot = plate.zRot = 0.0F;
+                    plate.visible = true;
+                    plate.render(new PoseStack(), uvMapping != null ? uvMapping.wrap(builder) : builder, 0, overlay, color);
+                    written = true;
+                } finally {
+                    plate.x = x;
+                    plate.y = y;
+                    plate.z = z;
+                    plate.xRot = xRot;
+                    plate.yRot = yRot;
+                    plate.zRot = zRot;
+                    plate.visible = visible;
+                    ModelCulling.beginModel(renderType);
+                }
+            } else if (key instanceof float[]) {
                 ModelCulling.endModel();
                 try {
                     // The parts are posed already (the snapshot was taken after setupAnim)
