@@ -1730,8 +1730,8 @@ nineteenth session's switches are not reviewed yet). The notes stay as reference
      every frame (1.8 us per player). Reusing last frame's order for sorted draws with bit-identical centroids is exact;
      skipping the sort for opaque skins is not (coplanar touching faces, section 7).
    - The player body as a per-player draw fed from a GPU pose buffer, in its sorted place (exact only with vanilla's quad
-     order or for skins without semi-transparent texels). Large.
-   - Retained/instanced billboard text for name tags (normal pass only; the see-through pass is sorted) and text displays.
+     order or for skins without semi-transparent texels). Large; see "Bigger jobs" at the end of this section.
+   - Retained/instanced billboard text for name tags (normal pass only; the see-through pass is sorted) and text displays. Large; see "Bigger jobs" at the end of this section.
    - Per player extraction (1.6 us) and layer submission (1.4 us) are a long tail of vanilla work.
 2. **Per entity and block entity cost in the server scene** (twelfth and seventeenth session measurements in section 7).
    The server is gone; the mixed scene (section 6.1) has the same mix and is where this continues.
@@ -1818,6 +1818,87 @@ nineteenth session's switches are not reviewed yet). The notes stay as reference
 8. **Smaller ports.** Clouds (mixin vanilla `CloudRenderer` `prepare`/`render`; there is no separate clouds pass
    any more), the debug overlay and profiler HUD (`Gui` → `Hud`, `extractRenderState`), and
    `DebugEntryMemory` (`bytesToMebibytes`).
+
+### Bigger jobs: player bodies and billboard text (written up after the nineteenth session, not started)
+Both are the large items of item 1b. The numbers come from the players scene (section 6.10, section 7 "Players and
+holograms"): lobby static ~326 fps, render thread ~2.96 ms of a ~3.1 ms frame, CPU bound (GPU 0.82 ms). Neither has been
+prototyped. The decompiled facts below come from that session's notes; check them against the 26.3 sources (section 5)
+before designing on them.
+
+**1. Player bodies from a GPU pose buffer.**
+- *What it would remove:* the body's vertex writes, 2.8 us per player per frame (72 faces through `ModelPartCubeM`'s
+  direct writes), plus most of their upload bytes. That is ~0.42 ms for the lobby's 150 players. The per-frame quad sort
+  (1.8 us per player) is a separate cost: item 1b's "reuse last frame's order" takes it for still players, and this job
+  only makes it cheaper for moving ones.
+- *Why the existing instancing doesn't cover it:* `PlayerModel` uses `entity_translucent`. That is a strictly ordered
+  group in the translucent phase, sorted per draw on upload, so the bodies can't be merged into `InstancedParts`'
+  solid-phase batches. Moving them to the solid phase is not exact: vanilla draws the translucent text backgrounds
+  before the translucent models phase, so a player behind a hologram background is hidden by that background's depth.
+- *Design:*
+  - Keep one draw per player, in exactly the place vanilla's draw has in the group's order. vanilla already makes one
+    draw per skin anyway.
+  - Feed it from a part-space mesh instead of written vertices. The mesh is the `PlayerModel`'s cubes, written once per
+    model layout (wide/slim) and UV mapping, with a part index per vertex. The `PartBatch` meshes of `InstancedParts`
+    are the starting point.
+  - Each frame write only the poses: ~12 parts × (pose rows + normal rows) per player, plus light, overlay and color,
+    into a pose buffer. The vertex shader looks the pose up by part index. Use `instanced_part.vsh`'s `precise`
+    transform in JOML's operation order, so positions stay bit-identical; normals then differ only in quantisation, as
+    with instanced parts (≤5 px per close-up).
+  - Sorting stays exact if the index order is vanilla's. Vanilla's comparator runs on quad centroids decoded from the
+    written vertices, so compute the same centroids on the CPU from the posed corners: 4 position transforms per quad
+    instead of a full vertex write. Then write the index buffer in that order. For still players, item 1b's
+    order reuse skips even that.
+  - Respect the parts vanilla hides (`visible`, `skipDraw`), the faces `TransparentFaces` skips (they must be absent
+    from the mesh or masked per skin), and the hat and sleeve layer toggles. A changed visibility set selects a
+    different index range, not a new mesh.
+- *To find out first:*
+  - Does renderpearl give a vertex shader indexed access to a per-draw buffer: a uniform buffer slice per draw, or a
+    storage or texel buffer? `InstancedParts` only used per-instance vertex attributes. If not, the fallback is one
+    instanced sub-draw per part. That keeps the order but adds ~12 draws per player, which probably costs more than it
+    saves.
+  - Does the upload's sort read centroids from the vertex data, or can it be handed precomputed ones without copying
+    vanilla's code path?
+- *Exactness checks:* frozen close-ups of every skin, layer and pose with the switch flipped. A temporary check that
+  compares the CPU-side centroids and index order with vanilla's for every player draw. Players behind hologram
+  backgrounds, and players inside other translucent geometry (water, stained glass).
+- *Compatibility:* skin-layer, emote and avatar mods (3D skin layers, Emotecraft, Figura and the like) replace or extend
+  `PlayerModel` parts or `ModelPart` rendering. Engage only for vanilla `PlayerModel` classes whose part tree matches
+  the cached layout, and fall back to the vanilla path otherwise. Fabric's render state data is untouched, because
+  extraction and submission stay vanilla.
+
+**2. Retained or instanced billboard text** (name tags, and `center`-billboard text displays).
+- *What it would remove:* the per-frame glyph and background writes of each label. Measured: ~0.9 us per player name
+  tag, ~0.67 us for an armor stand line's two name tag passes, and most of a text display line's ~1.0 us. In the lobby
+  that is an upper bound of ~0.3–0.4 ms.
+- *What makes it possible:* a label's quads are the same in label space every frame. Only the billboard matrix (camera
+  rotation, scale, translation) changes. The text is already kept across frames (`nameTagTextCache`,
+  `textDisplayTextCache`, `SignTextCache` lines with prepared glyphs), so a label-space mesh can be cached on the same key
+  and dropped with it.
+- *Design:*
+  - Write each kept label's glyph and background quads once, in label space, into a shared text mesh buffer (one region
+    per label, freed with the cache).
+  - Each frame, per label: one matrix (3 pose rows), light and colors, and a reference to its region.
+  - Draw them with one indirect multi-draw per (render type, font page), with a per-draw base instance into the matrix
+    buffer. Without multi-draw indirect, per-label draws cost more than the writes they replace: the reason it was not
+    tried in the nineteenth session.
+  - Positions again use the `precise` JOML-order transform.
+- *Hard constraint, ordering:* the see-through name tag pass is sorted and depends on vanilla's order, so only the
+  normal pass and text displays are candidates. First find out which phase and group each text render type
+  (`text`, `text_see_through`, `text_background`, `text_intensity`, the polygon offset variants) goes to, and whether
+  vanilla may reorder it. If a type is strictly ordered, merging labels into one draw reorders overlapping labels. That
+  is exact only where the type doesn't blend or the labels can't overlap on screen, which is easy to break with
+  holograms stacked in a column.
+- *To find out first:* indirect multi-draw and base-instance support in renderpearl, on both the Vulkan and OpenGL
+  backends; the render type and phase facts above; obfuscated text, which is laid out every frame and must stay on the
+  vanilla path.
+- *Exactness checks:* frozen close-ups of stacked holograms, of labels overlapping players and each other, and of
+  coloured, bold and shadowed text, with the switch flipped.
+- *Compatibility:* mods that draw their own name tags, or change them in `submitNameTag` or the text renderer, would
+  be bypassed. Engage only for vanilla's submit paths, and keep a switch.
+
+**Order:** do item 1b's sort-order reuse first. It gives part of job 1's gain exactly, and it shows how much the sort
+still costs for moving players. Of the two jobs, start with job 1 if the player count matters most (servers, lobbies),
+and with job 2 for hologram-heavy hubs. Answer both "find out first" questions before writing code.
 
 ---
 
