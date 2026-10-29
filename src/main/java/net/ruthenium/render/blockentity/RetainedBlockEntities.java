@@ -88,7 +88,9 @@ import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
 import org.jspecify.annotations.Nullable;
+import org.lwjgl.system.MemoryUtil;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.IdentityHashMap;
@@ -971,10 +973,22 @@ public final class RetainedBlockEntities {
                     if (draws.length == 0) {
                         draws = new Draw[set.count];
                     }
-                    // Reorders the vertices before the upload
-                    SectionFaceGroups faces = !signs && part.pipeline.isCull() ? SectionFaceGroups.sortByPlanes(data) : null;
-                    GpuBuffer buffer = RenderSystem.getDevice().createBuffer(() -> "Ruthenium retained block entities",
-                            GpuBuffer.USAGE_VERTEX, data.vertexBuffer());
+                    // Reorders the vertices into the buffer that is uploaded
+                    SectionFaceGroups faces = null;
+                    ByteBuffer sorted = null;
+                    if (!signs && part.pipeline.isCull()) {
+                        sorted = MemoryUtil.memAlloc(data.vertexBuffer().remaining());
+                        faces = SectionFaceGroups.sortByPlanes(data, sorted);
+                    }
+                    GpuBuffer buffer;
+                    try {
+                        buffer = RenderSystem.getDevice().createBuffer(() -> "Ruthenium retained block entities",
+                                GpuBuffer.USAGE_VERTEX, faces != null ? sorted : data.vertexBuffer());
+                    } finally {
+                        if (sorted != null) {
+                            MemoryUtil.memFree(sorted);
+                        }
+                    }
                     draws[drawn++] = new Draw(part.pipeline, part.renderType, buffer, data.drawState().vertexCount() / 4 * 6, faces,
                             signs ? part.signEnds.toIntArray() : null);
                 }

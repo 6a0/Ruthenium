@@ -74,10 +74,13 @@ public final class SectionFaceGroups {
      * of 90 degrees leaves coordinates like 6e-17 instead of 0); their plane is their outermost vertex coordinate
      * towards the back, so the test stays conservative (the margin covers the tilt over thousands of blocks). The
      * order only changes between quads of different planes or facings: equal plane quads keep their order.
+     * <p>
+     * The mesh is left as it is: the reordered vertices go to {@code target} (at least as many bytes as the mesh's vertex buffer has
+     * remaining from its position), which is then uploaded instead of the mesh. Nothing is written when this returns null.
      *
      * @return the groups, or null if the mesh isn't one this handles or has no quad in an axis-aligned plane
      */
-    public static @Nullable SectionFaceGroups sortByPlanes(MeshData mesh) {
+    public static @Nullable SectionFaceGroups sortByPlanes(MeshData mesh, ByteBuffer target) {
         MeshData.DrawState state = mesh.drawState();
         VertexFormat format = state.format();
         boolean floatPosition = format == DefaultVertexFormat.BLOCK || format == DefaultVertexFormat.ENTITY
@@ -142,7 +145,7 @@ public final class SectionFaceGroups {
         if (counts[UNASSIGNED] == quadCount) {
             return null;
         }
-        java.util.Arrays.sort(keys);
+        keys = sortKeys(keys);
 
         SectionFaceGroups groups = new SectionFaceGroups();
         int[] starts = groups.starts;
@@ -185,17 +188,60 @@ public final class SectionFaceGroups {
         groups.planeTests = java.util.Arrays.copyOf(tests, planeCount);
         groups.planeEnds = java.util.Arrays.copyOf(ends, planeCount);
 
-        long scratch = MemoryUtil.nmemAlloc((long) quadCount * quadBytes);
-        try {
-            for (int i = 0; i < quadCount; i++) {
-                int q = (int) (keys[i] & 0xFFFFF);
-                MemoryUtil.memCopy(base + (long) q * quadBytes, scratch + (long) i * quadBytes, quadBytes);
-            }
-            MemoryUtil.memCopy(scratch, base, (long) quadCount * quadBytes);
-        } finally {
-            MemoryUtil.nmemFree(scratch);
+        long dst = MemoryUtil.memAddress(target);
+        for (int i = 0; i < quadCount; i++) {
+            int q = (int) (keys[i] & 0xFFFFF);
+            MemoryUtil.memCopy(base + (long) q * quadBytes, dst + (long) i * quadBytes, quadBytes);
         }
+        // Any bytes after the last whole quad stay where they were
+        long sortedBytes = (long) quadCount * quadBytes;
+        MemoryUtil.memCopy(base + sortedBytes, dst + sortedBytes, vertices.remaining() - sortedBytes);
         return groups;
+    }
+
+    /**
+     * The keys of {@link #sortByPlanes} in ascending order, as {@code Arrays.sort} puts them: a stable LSD radix sort of their
+     * group and plane bits (20..55) in three 12 bit passes, skipping a pass whose digit is the same in every key. The keys come
+     * in ascending quad index order (bits 0..19, unique), and stable passes keep that order among keys of equal group and plane,
+     * so the result is the order of the whole keys.
+     *
+     * @return the sorted keys: the given array or a new one
+     */
+    private static long[] sortKeys(long[] keys) {
+        int n = keys.length;
+        int[] counts = new int[3 << 12];
+        for (int i = 0; i < n; i++) {
+            long k = keys[i];
+            counts[(int) (k >>> 20) & 0xFFF]++;
+            counts[(1 << 12) + ((int) (k >>> 32) & 0xFFF)]++;
+            counts[(2 << 12) + ((int) (k >>> 44) & 0xFFF)]++;
+        }
+        long[] a = keys;
+        long[] b = null;
+        for (int pass = 0; pass < 3; pass++) {
+            int shift = 20 + 12 * pass;
+            int offset = pass << 12;
+            if (counts[offset + ((int) (a[0] >>> shift) & 0xFFF)] == n) {
+                continue;
+            }
+            if (b == null) {
+                b = new long[n];
+            }
+            int sum = 0;
+            for (int d = offset; d < offset + (1 << 12); d++) {
+                int c = counts[d];
+                counts[d] = sum;
+                sum += c;
+            }
+            for (int i = 0; i < n; i++) {
+                long k = a[i];
+                b[counts[offset + ((int) (k >>> shift) & 0xFFF)]++] = k;
+            }
+            long[] t = a;
+            a = b;
+            b = t;
+        }
+        return a;
     }
 
     /** An int whose signed order is the float's order */
