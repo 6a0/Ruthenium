@@ -74,6 +74,13 @@ final class PlayerBenchmark {
     private static final int RENDER_DISTANCE = Integer.parseInt(BenchmarkClientGameTest.prop("playersRenderDistance", "12"));
     private static final int CLOSE_SHOTS = Integer.parseInt(BenchmarkClientGameTest.prop("closeShots", "0"));
     private static final String CLOSE_TOGGLE = BenchmarkClientGameTest.prop("closeToggle", "");
+    /**
+     * After the close-ups, edits the skins of players 7 and 8 (in the middle of the first row) and takes them again
+     * ({@code close<k>-<n>-edited}): variant 7 in place and uploaded, variant 8 through {@code setPixels} and uploaded
+     */
+    /** {@code bench.emptyOuterLayers=true}: every skin's outer layer cleared (skins that don't use the second layer) */
+    private static final boolean EMPTY_OUTER_LAYERS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("emptyOuterLayers", "false"));
+    private static final boolean SKIN_EDIT = Boolean.parseBoolean(BenchmarkClientGameTest.prop("skinEdit", "false"));
 
     /** The flat world's surface */
     private static final int FLOOR = -60;
@@ -176,6 +183,10 @@ final class PlayerBenchmark {
 
             if (CLOSE_SHOTS > 0) {
                 closeUps(context, server, sceneLabel, runId);
+                if (SKIN_EDIT && DOWNLOADED_SKINS) {
+                    context.runOnClient(PlayerBenchmark::editSkins);
+                    closeUps(context, server, sceneLabel, runId + "-edited");
+                }
             }
 
             var environment = context.computeOnClient(BenchmarkClientGameTest::describeEnvironment);
@@ -186,6 +197,7 @@ final class PlayerBenchmark {
             environment.addProperty("hologramKind", HOLOGRAM_KIND);
             environment.addProperty("playerSkins", DOWNLOADED_SKINS ? "downloaded" : "resource");
             environment.addProperty("skinVariants", SKIN_VARIANTS);
+            environment.addProperty("emptyOuterLayers", EMPTY_OUTER_LAYERS);
             var entities = new com.google.gson.JsonObject();
             counts.forEach(entities::addProperty);
             environment.add("entities", entities);
@@ -257,7 +269,18 @@ final class PlayerBenchmark {
         if (image.getWidth() != 64 || image.getHeight() != 64) {
             throw new AssertionError("Unexpected skin size of " + source);
         }
-        if (variant < 18) {
+        // Outer layer regions: hat, jacket, right sleeve, right pants, left sleeve, left pants
+        int[][] regions = {{32, 0, 64, 16}, {16, 32, 40, 48}, {40, 32, 56, 48}, {0, 32, 16, 48}, {48, 48, 64, 64}, {0, 48, 16, 64}};
+        if (EMPTY_OUTER_LAYERS) {
+            for (int[] region : regions) {
+                for (int y = region[1]; y < region[3]; y++) {
+                    for (int x = region[0]; x < region[2]; x++) {
+                        image.setPixel(x, y, ARGB.color(0, image.getPixel(x, y)));
+                    }
+                }
+            }
+        }
+        if (variant < 18 || EMPTY_OUTER_LAYERS) {
             return image;
         }
         int hash = variant * 0x9E3779B9;
@@ -268,8 +291,6 @@ final class PlayerBenchmark {
                 image.setPixel(x, y, ARGB.color(ARGB.alpha(pixel), (int) (ARGB.red(pixel) * r), (int) (ARGB.green(pixel) * g), (int) (ARGB.blue(pixel) * b)));
             }
         }
-        // Outer layer regions: hat, jacket, right sleeve, right pants, left sleeve, left pants
-        int[][] regions = {{32, 0, 64, 16}, {16, 32, 40, 48}, {40, 32, 56, 48}, {0, 32, 16, 48}, {48, 48, 64, 64}, {0, 48, 16, 64}};
         int ops = Integer.rotateLeft(hash, 11) & Integer.MAX_VALUE;
         for (int[] region : regions) {
             int op = ops % 5;
@@ -500,6 +521,34 @@ final class PlayerBenchmark {
 
     private static void summon(TestServerContext server, String type, double x, double y, double z, String nbt) {
         server.runCommand("summon minecraft:%s %s %s %s {%s}".formatted(type, x, y, z, nbt));
+    }
+
+    /** Fills every outer layer region of two skins with opaque colours and uploads them ({@link #SKIN_EDIT}) */
+    private static void editSkins(Minecraft mc) {
+        int[][] regions = {{32, 0, 64, 16}, {16, 32, 40, 48}, {40, 32, 56, 48}, {0, 32, 16, 48}, {48, 48, 64, 64}, {0, 48, 16, 64}};
+        for (int variant : new int[]{7, 8}) {
+            Identifier location = Identifier.fromNamespaceAndPath("ruthenium-gametest", "textures/skins/v" + variant % SKIN_VARIANTS + ".png");
+            if (!(mc.getTextureManager().getTexture(location) instanceof DynamicTexture texture)) {
+                throw new AssertionError(location + " is no DynamicTexture");
+            }
+            NativeImage image = texture.getPixels();
+            if (variant == 8) {
+                NativeImage copy = new NativeImage(image.getWidth(), image.getHeight(), false);
+                copy.copyFrom(image);
+                texture.setPixels(copy);
+                image = copy;
+            }
+            for (int r = 0; r < regions.length; r++) {
+                int color = ARGB.color(255, 255 * (r & 1), 255 * (r >> 1 & 1), variant == 7 ? 255 : 0);
+                for (int y = regions[r][1]; y < regions[r][3]; y++) {
+                    for (int x = regions[r][0]; x < regions[r][2]; x++) {
+                        image.setPixel(x, y, (x + y) % 3 == 0 ? color : ARGB.color(255, image.getPixel(x, y)));
+                    }
+                }
+            }
+            texture.upload();
+        }
+        LOGGER.info("Skins of variants 7 and 8 edited and uploaded");
     }
 
     private static void closeUps(ClientGameTestContext context, TestServerContext server, String label, String runId) {
