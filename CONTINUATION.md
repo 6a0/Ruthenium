@@ -193,6 +193,9 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
 - **Twenty-first session** (section 7): sorted draws (player bodies, see-through name tags) start an insertion sort from their
   order in the last upload ("Reuse Sort Order", `reuseSortOrder`): players static +12%, lobby +7.6%, moving players +10%; 0
   mismatches against vanilla's sort over 4.97M draws.
+- **Twenty-second session:** the block entity scene's drop since the seventeenth session (~1770 -> ~1370 static) is the
+  machine: the seventeenth session's build is as slow now, +0.17 ms GPU per frame since a restart on 28/10 (section 7,
+  nineteenth session, "After the merge"). GPU bound numbers compare only within a session.
 - **Next:** see section 8.
 
 ---
@@ -1509,6 +1512,22 @@ Checks on the merged tree in the main worktree (`results/s19-merge/`; another ag
   1750-1775 / ~2600 at the end of the seventeenth session (same blocks, same chat line in the shot, render thread 0.23 vs
   0.25 ms, so not CPU). Part 1's parity runs (`s19-dev/par-be-on`, with signs) were already low. Not from the merge; not
   bisected (eighteenth session commits or the machine).
+- **Resolved (twenty-second session): the machine, not the code.** The seventeenth session's last commit (`8dee171`, built as
+  it was: `benchVulkanMod`, fast-ip-ping loaded, `vulkanmod` run directory) runs as slow as `26.3` HEAD (`111db82`) now, both
+  built and run in turn in one worktree, 3 ABBA pairs (`results/s22-be-old-new`, warm-up pair in `s22-be-warm`): static
+  1371.9 vs 1369.2 fps, pan 1851.1 vs 1851.7 (the seventeenth session: 1763.1 / 2600.7 with the same arguments). The GPU frame
+  probe (`s22-be-gpuframe`) reads static 0.72 ms (0.543 on 28/10, `v17-planes-be`) and pan 0.52 (0.351): **+0.17 ms per frame
+  in both views**, while the probed main pass parts are unchanged (solid terrain 0.124 vs 0.132, retained 0.32 vs 0.30
+  static, 0.115 vs 0.113 pan), so it is a fixed per-frame GPU cost outside them (the probe's interval also contains the wait
+  on the swapchain acquire, which the blit's command buffer waits on with `ALL_COMMANDS`; GPU work or presentation, not
+  told apart). The last fast run was 28/10 16:19, the first slow one 22:34; in between the machine was restarted by the
+  user (21:21, no Windows update then) and the repository moved to `D:\dev\Ruthenium`. Same driver (617.42) before and
+  after; now 2490-2505 MHz at 95-97% GPU utilization, ~85 W of 125 W, AC, Balanced + "Best performance" overlay (no clocks
+  were recorded before, and the Lenovo thermal / GPU overclock / MUX state can't be read without admin). The 29/10 05:39
+  update (KB5127936) came after the slowdown. Details: `results/s22-be-old-new/environment.txt`. Consequence: block entity
+  scene numbers from before 28/10 21:21 (and any other GPU bound view's) don't compare with later ones; compare within a
+  session. Which setting changed with the restart is unknown (candidates: the presentation path, e.g. independent flip vs
+  composed, the Lenovo GPU mode or overclock, an NVIDIA app setting).
 - Measured in the twentieth session (section 7, "Twentieth session"): the -20% is gone (players 477.3 -> 484.5 fps static).
 
 ### Twentieth session (2026-10-29)
@@ -1945,9 +1964,10 @@ leaves stale masks (faces missing until the next upload or reload).
    retained quads drawn by plane, the books' tilt computed once, lecterns/bells/copper golem statues retained, retained
    change checks and 30 s eviction (17th). Ruled out: cheaper entity culling, generic render state reuse (10th), sprite
    pipeline repeats, cell index masks and front-to-back plane order (17th, within noise). What is left, measured:
-   - **Block entity scene slower than at the end of the seventeenth session** (section 7, nineteenth session, "After the
-     merge"): static ~1370 vs ~1770 fps, pan ~1860 vs ~2600, also on `3c04a06`; render thread unchanged. Bisect the
-     eighteenth session's commits (or rule out the machine with a seventeenth session build) before trusting its numbers.
+   - **Block entity scene slower than at the end of the seventeenth session: resolved, the machine** (twenty-second
+     session, section 7, nineteenth session, "After the merge"): the seventeenth session's own build (`8dee171`) runs at the
+     same ~1370 static / ~1850 pan as HEAD now (3 pairs); the GPU frame is +0.17 ms in every view since a restart on 28/10
+     ~21:21, outside the probed passes. Not ours; compare GPU bound numbers only within a session.
    - **GPU, retained 0.141 ms** for 131.6k quads per frame (static), half of them sign text of the signs inside the chest
      wall, mostly hidden behind chests; there is no exact way to skip occluded quads (chests are 14/16 wide, renderpearl
      has no occlusion queries). Instanced models 0.063 ms (armor stands are `entity_cutout`, drawn without culling).
