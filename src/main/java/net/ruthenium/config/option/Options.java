@@ -340,6 +340,11 @@ public abstract class Options {
                                 () -> config.textDisplayCulling)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.textDisplayCulling.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.emptyArmorStandLayers"),
+                                value -> config.emptyArmorStandLayers = value,
+                                () -> config.emptyArmorStandLayers)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.emptyArmorStandLayers.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)

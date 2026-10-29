@@ -32,6 +32,7 @@
     "render.entity.LayerLightSectionStorageM",
     "render.entity.ExtendedBlockModelFeatureRendererM",
     "render.entity.LevelExtractorEntityM",
+    "render.entity.LivingEntityRendererLayersM",
     "render.entity.TextDisplayAccessor",
     "render.entity.model.ModelPartCubeM",
     "render.entity.model.ModelPartM",
