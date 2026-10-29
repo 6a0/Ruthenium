@@ -51,6 +51,7 @@
     "render.particle.ClientPacketListenerM",
     "render.particle.ParticleEngineM",
     "render.particle.QuadParticleRenderStateM",
+    "render.sky.CloudRendererM",
     "render.text.AbstractSignRendererAccessor",
     "render.text.AbstractSignRendererM",
     "render.text.BakedSheetGlyphM",

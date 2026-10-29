@@ -63,6 +63,8 @@ public class Config {
     public boolean reuseSortOrder = true;
     /** Player bodies are drawn from a part-space mesh and per-frame part poses instead of writing their vertices */
     public boolean playerPoseDraws = true;
+    /** Clouds read their faces from a texture instead of vanilla's texel buffer (which costs every submit on some drivers) */
+    public boolean cloudFaceTexture = true;
     /** Name tags and text display lines are drawn from a label-space mesh of their glyphs and a per-frame pose */
     public boolean retainedLabels = true;
     /** Armor stands with empty equipment skip their (vanilla) layers and the model pose for them */

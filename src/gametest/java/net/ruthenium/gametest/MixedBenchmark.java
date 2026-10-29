@@ -51,7 +51,9 @@ import java.util.TreeMap;
  * {@code bench.closeShots=N} takes N frozen close-ups of the armor stands per position ({@code close<k>-<n>}; with
  * {@code bench.closeToggle=<switch>[,<switch>...]} every other shot with the switches flipped, as in the entity scene), clouds off: the grid from the
  * front and from above, and a row of stands summoned for them behind the camera (arms and poses, small, no base plate, invisible,
- * marker) from the front and from above. Neither changes the measured phases.
+ * marker) from the front and from above. {@code bench.cloudShots=N} takes N frozen shots of the clouds per view ({@code cloud<k>-<n>},
+ * toggled by {@code bench.closeToggle} in the same way): fancy from below, inside and above, fast from below and above, and with improved
+ * transparency. Neither changes the measured phases.
  */
 final class MixedBenchmark {
     private static final Logger LOGGER = LoggerFactory.getLogger("Ruthenium Mixed Benchmark");
@@ -65,6 +67,18 @@ final class MixedBenchmark {
     private static final boolean GLOWING_SIGNS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("glowingSigns", "false"));
     private static final int CLOSE_SHOTS = Integer.parseInt(BenchmarkClientGameTest.prop("closeShots", "0"));
     private static final String CLOSE_TOGGLE = BenchmarkClientGameTest.prop("closeToggle", "");
+    private static final int CLOUD_SHOTS = Integer.parseInt(BenchmarkClientGameTest.prop("cloudShots", "0"));
+    /** Cloud close-up views: height above the floor, pitch, fancy clouds, improved transparency */
+    private static final Object[][] CLOUD_VIEWS = {
+            {200.0, -35.0F, true, false},   // below the clouds
+            {252.5, 15.0F, true, false},    // inside the cloud layer (y 192.33 to 196.33 in the overworld; interior faces)
+            {300.0, 35.0F, true, false},    // above
+            {200.0, -35.0F, false, false},  // fast clouds from below
+            {300.0, 35.0F, false, false},   // and from above
+            {200.0, -35.0F, true, true},    // improved transparency (OIT)
+            {252.5, 15.0F, true, true},
+            {200.0, -35.0F, false, true},
+    };
     /** Close-up camera positions: x, height above the floor, z, yaw, pitch */
     private static final float[][] CLOSE_UPS = {
             {0.5F, 1.7F, 1.5F, 0.0F, 20.0F},     // the grid's first rows: big stands, arms, many yaws
@@ -216,7 +230,7 @@ final class MixedBenchmark {
             results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("particles", finalPeak)));
             LOGGER.info(results.getLast().summaryLine());
 
-            if (ToggleAb.enabled() || CLOSE_SHOTS > 0) {
+            if (ToggleAb.enabled() || CLOSE_SHOTS > 0 || CLOUD_SHOTS > 0) {
                 // The particles are around the armor stands
                 context.waitFor(mc -> BenchmarkClientGameTest.countParticles(mc) == 0, 60 * TICKS_PER_SECOND);
             }
@@ -225,6 +239,9 @@ final class MixedBenchmark {
             }
             if (CLOSE_SHOTS > 0) {
                 closeUps(context, server, label, runId);
+            }
+            if (CLOUD_SHOTS > 0) {
+                cloudShots(context, server, label, runId);
             }
 
             var environment = context.computeOnClient(BenchmarkClientGameTest::describeEnvironment);
@@ -313,6 +330,53 @@ final class MixedBenchmark {
                 }
             }
         }
+        server.runCommand("tick unfreeze");
+    }
+
+    /** Frozen shots of the clouds (after the measured phases), each view with its cloud and transparency settings */
+    private static void cloudShots(ClientGameTestContext context, TestServerContext server, String label, String runId) {
+        server.runCommand("tick freeze");
+        context.waitTicks(5);
+        for (int k = 0; k < CLOUD_VIEWS.length; k++) {
+            Object[] view = CLOUD_VIEWS[k];
+            double height = (Double) view[0];
+            float pitch = (Float) view[1];
+            boolean fancy = (Boolean) view[2];
+            boolean oit = (Boolean) view[3];
+            context.runOnClient(mc -> {
+                mc.options.cloudStatus().set(fancy ? net.minecraft.client.CloudStatus.FANCY : net.minecraft.client.CloudStatus.FAST);
+                if (mc.options.improvedTransparency().get() != oit) {
+                    mc.options.improvedTransparency().set(oit);
+                }
+            });
+            server.runCommand("tp @a %s %s %s 30 %s".formatted(CAMERA_X, FLOOR + height, CAMERA_Z, pitch));
+            context.waitTicks(20);
+            context.runOnClient(mc -> {
+                mc.player.setYRot(30.0F);
+                mc.player.yRotO = 30.0F;
+                mc.player.setXRot(pitch);
+                mc.player.xRotO = pitch;
+            });
+            context.waitTicks(5);
+            LOGGER.info("Cloud view {}: y {}, pitch {}, {}{}", k, FLOOR + height, pitch, fancy ? "fancy" : "fast", oit ? ", improved transparency" : "");
+            for (int n = 0; n < CLOUD_SHOTS; n++) {
+                boolean toggled = !CLOSE_TOGGLE.isEmpty() && n % 2 == 1;
+                if (toggled) {
+                    toggleConfig(context);
+                }
+                context.takeScreenshot("%s-mixed-cloud%d-%d-%s".formatted(label, k, n, runId));
+                if (toggled) {
+                    toggleConfig(context);
+                }
+            }
+        }
+        context.runOnClient(mc -> {
+            mc.options.cloudStatus().set(net.minecraft.client.CloudStatus.FANCY);
+            if (mc.options.improvedTransparency().get()) {
+                mc.options.improvedTransparency().set(false);
+            }
+        });
+        server.runCommand("tp @a %s %s %s 0 0".formatted(CAMERA_X, CAMERA_Y, CAMERA_Z));
         server.runCommand("tick unfreeze");
     }
 

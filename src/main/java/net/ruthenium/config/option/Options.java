@@ -384,6 +384,11 @@ public abstract class Options {
                                 () -> config.retainedLabels)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.retainedLabels.tooltip"))
                                 .setImpact(PerformanceImpact.MEDIUM),
+                        new SwitchOption(Component.translatable("ruthenium.options.cloudFaceTexture"),
+                                value -> config.cloudFaceTexture = value,
+                                () -> config.cloudFaceTexture)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.cloudFaceTexture.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.emptyArmorStandLayers"),
                                 value -> config.emptyArmorStandLayers = value,
                                 () -> config.emptyArmorStandLayers)

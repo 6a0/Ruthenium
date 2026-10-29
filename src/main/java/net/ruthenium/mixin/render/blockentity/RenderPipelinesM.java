@@ -8,6 +8,7 @@ import net.ruthenium.render.entity.PlayerPoseDraws;
 import net.ruthenium.render.text.RetainedLabels;
 import net.ruthenium.render.blockentity.RetainedBlockEntities;
 import net.ruthenium.render.chunk.CompressedTerrain;
+import net.ruthenium.render.sky.CloudFaceTexture;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -17,7 +18,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Compiles {@link RetainedBlockEntities#PIPELINES}, {@link InstancedModels#PIPELINES} and {@link CompressedTerrain#PIPELINES}
+ * Compiles {@link RetainedBlockEntities#PIPELINES}, {@link InstancedModels#PIPELINES}, {@link CompressedTerrain#PIPELINES},
+ * {@link CloudFaceTexture#PIPELINES} and the others
  * with the other pipelines on resource reload; if one fails, that feature stays off
  */
 @Mixin(RenderPipelines.class)
@@ -31,6 +33,7 @@ public class RenderPipelinesM {
         pipelines.addAll(PlayerPoseDraws.PIPELINES);
         pipelines.addAll(RetainedLabels.PIPELINES);
         pipelines.addAll(CompressedTerrain.PIPELINES);
+        pipelines.addAll(CloudFaceTexture.PIPELINES);
         cir.setReturnValue(pipelines);
     }
 }
