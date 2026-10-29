@@ -65,6 +65,8 @@ public class Config {
     public boolean playerPoseDraws = true;
     /** Clouds read their faces from a texture instead of vanilla's texel buffer (which costs every submit on some drivers) */
     public boolean cloudFaceTexture = true;
+    /** Full size screenshots (F2, a new world's icon) copy the read back frame a row at a time instead of a pixel at a time */
+    public boolean fastScreenshots = true;
     /** Name tags and text display lines are drawn from a label-space mesh of their glyphs and a per-frame pose */
     public boolean retainedLabels = true;
     /** Armor stands with empty equipment skip their (vanilla) layers and the model pose for them */

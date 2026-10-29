@@ -1,0 +1,110 @@
+diff --git a/src/main/java/net/ruthenium/mixin/render/ScreenshotM.java b/src/main/java/net/ruthenium/mixin/render/ScreenshotM.java
+index f617ed3..2eb5544 100644
+--- a/src/main/java/net/ruthenium/mixin/render/ScreenshotM.java
++++ b/src/main/java/net/ruthenium/mixin/render/ScreenshotM.java
+@@ -14,6 +14,17 @@ import java.util.function.Consumer;
+ /** Full size screenshots copy the read back frame a row at a time ({@link ScreenshotReadback}) */
+ @Mixin(Screenshot.class)
+ public class ScreenshotM {
++    @org.spongepowered.asm.mixin.injection.ModifyArg(method = "takeScreenshot(Lcom/mojang/blaze3d/pipeline/RenderTarget;ILjava/util/function/Consumer;)V",
++            at = @At(value = "INVOKE", target = "Lcom/mojang/renderpearl/api/commands/CommandEncoder;copyTextureToBuffer(Lcom/mojang/renderpearl/api/textures/GpuTexture;Lcom/mojang/renderpearl/api/buffers/GpuBuffer;JLjava/lang/Runnable;I)V"),
++            index = 3)
++    private static Runnable ruthenium$timeVanillaCallback(Runnable callback) {
++        return () -> {
++            long t = System.nanoTime();
++            callback.run();
++            net.ruthenium.Initializer.LOGGER.info("Screenshot callback (vanilla path) {} ms", String.format("%.3f", (System.nanoTime() - t) / 1e6));
++        };
++    }
++
+     @Inject(method = "takeScreenshot(Lcom/mojang/blaze3d/pipeline/RenderTarget;ILjava/util/function/Consumer;)V", at = @At("HEAD"), cancellable = true)
+     private static void ruthenium$bulkReadback(RenderTarget target, int downscaleFactor, Consumer<NativeImage> callback, CallbackInfo ci) {
+         if (ScreenshotReadback.take(target, downscaleFactor, callback)) {
+diff --git a/src/main/java/net/ruthenium/render/ScreenshotReadback.java b/src/main/java/net/ruthenium/render/ScreenshotReadback.java
+index 444147a..5ecda2f 100644
+--- a/src/main/java/net/ruthenium/render/ScreenshotReadback.java
++++ b/src/main/java/net/ruthenium/render/ScreenshotReadback.java
+@@ -23,6 +23,9 @@ public final class ScreenshotReadback {
+     /** The alpha byte of both pixels of a little-endian long */
+     private static final long ALPHA_PAIR = 0xFF000000FF000000L;
+ 
++    private static final boolean CHECK = Boolean.getBoolean("ruthenium.screenshotCheck");
++    private static int CHECKS, FAILED;
++
+     private ScreenshotReadback() {
+     }
+ 
+@@ -40,16 +43,73 @@ public final class ScreenshotReadback {
+         int height = target.height;
+         GpuBuffer buffer = RenderSystem.getDevice().createBuffer(() -> "Screenshot buffer", 9, (long) width * height * 4);
+         RenderSystem.getDevice().createCommandEncoder().copyTextureToBuffer(sourceTexture, buffer, 0L, () -> {
++            long tc = System.nanoTime();
+             try (GpuBufferSlice.MappedView read = buffer.map(true, false)) {
+                 NativeImage image = new NativeImage(width, height, false);
++                boolean vanillaFirst = CHECK && (CHECKS & 1) == 1;
++                NativeImage vanilla = CHECK ? new NativeImage(width, height, false) : null;
++                long t2 = 0, t3 = 0;
++                if (vanillaFirst) {
++                    t2 = System.nanoTime();
++                    vanillaLoop(read.data(), vanilla, width, height, sourceTexture.getFormat().blockSize());
++                    t3 = System.nanoTime();
++                }
++                long t0 = System.nanoTime();
+                 copy(read.data(), image, width, height);
++                long t1 = System.nanoTime();
++                if (CHECK) {
++                    ByteBuffer data = read.data();
++                    if (!vanillaFirst) {
++                        t2 = System.nanoTime();
++                        vanillaLoop(data, vanilla, width, height, sourceTexture.getFormat().blockSize());
++                        t3 = System.nanoTime();
++                    }
++                    long a = image.getPointer(), b = vanilla.getPointer(), n = (long) width * height * 4;
++                    long mismatches = 0;
++                    for (long i = 0; i < n; i += 8) {
++                        if (MemoryUtil.memGetLong(a + i) != MemoryUtil.memGetLong(b + i)) {
++                            mismatches++;
++                        }
++                    }
++                    long alphaNot255 = 0;
++                    long src = MemoryUtil.memAddress0(data);
++                    for (long i = 3; i < n; i += 4) {
++                        if (MemoryUtil.memGetByte(src + i) != (byte) 0xFF) {
++                            alphaNot255++;
++                        }
++                    }
++                    CHECKS++;
++                    if (mismatches != 0) {
++                        FAILED++;
++                    }
++                    Initializer.LOGGER.info("Screenshot check {}: {}x{} {}, vanilla loop first " + vanillaFirst + ", bulk {} ms, vanilla loop {} ms, {} differing longs, source pixels with alpha != 255: {} (checks {}, failed {})",
++                            CHECKS, width, height, data.order(), String.format("%.3f", (t1 - t0) / 1e6), String.format("%.3f", (t3 - t2) / 1e6),
++                            mismatches, alphaNot255, CHECKS, FAILED);
++                    vanilla.close();
++                } else {
++                    if (vanilla != null) {
++                        vanilla.close();
++                    }
++                    Initializer.LOGGER.info("Screenshot readback: {}x{}, bulk {} ms", width, height, String.format("%.3f", (t1 - t0) / 1e6));
++                }
+                 callback.accept(image);
+             }
+             buffer.close();
++            Initializer.LOGGER.info("Screenshot callback (bulk path) {} ms", String.format("%.3f", (System.nanoTime() - tc) / 1e6));
+         }, 0);
+         return true;
+     }
+ 
++    /** Vanilla's loop (Screenshot.takeScreenshot with downscaleFactor 1), for the check */
++    private static void vanillaLoop(ByteBuffer data, NativeImage vanilla, int width, int height, int blockSize) {
++        for (int y = 0; y < height; y++) {
++            for (int x = 0; x < width; x++) {
++                int argb = data.getInt((x + y * width) * blockSize);
++                vanilla.setPixelABGR(x, height - y - 1, argb | 0xFF000000);
++            }
++        }
++    }
++
+     /** The read back pixels into the image, rows flipped and alpha set, as vanilla's loop writes them */
+     static void copy(ByteBuffer data, NativeImage image, int width, int height) {
+         if (data.order() != ByteOrder.nativeOrder() || image.format() != NativeImage.Format.RGBA) {

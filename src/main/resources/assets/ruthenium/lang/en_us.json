@@ -89,6 +89,8 @@
   "ruthenium.options.retainedLabels.tooltip": "Name tags, hologram lines and other kept text are stored on the GPU once, and each frame only where each label is and how bright it is gets sent, instead of every corner of every letter. Same image and same drawing order. Mods that change how text is drawn may want it off.",
   "ruthenium.options.cloudFaceTexture": "Cloud Face Texture",
   "ruthenium.options.cloudFaceTexture.tooltip": "Clouds read their faces from a small texture instead of a texel buffer, which on some graphics drivers (NVIDIA on Vulkan) makes every frame's submit slower while clouds are on. Same image. Shader packs and mods that change cloud rendering may want it off.",
+  "ruthenium.options.fastScreenshots": "Fast Screenshots",
+  "ruthenium.options.fastScreenshots.tooltip": "Screenshots (F2, and the icon of a new world on its first frame) copy the frame a row at a time instead of a pixel at a time, which shortens the hitch they cause. Same image. Mods that change how screenshots are taken may want it off.",
   "ruthenium.options.emptyArmorStandLayers": "Skip Empty Armor Stand Layers",
   "ruthenium.options.emptyArmorStandLayers.tooltip": "Armor stands without armor or items (such as the invisible ones hologram plugins use for each line of text) skip the armor, item and head layers, which would draw nothing. Mods that add something to those layers for empty armor stands may want it off.",
   "ruthenium.options.reuseEntityStates": "Reuse Entity Render States",
