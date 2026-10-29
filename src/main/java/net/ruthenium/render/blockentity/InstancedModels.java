@@ -50,7 +50,9 @@ import org.lwjgl.system.MemoryUtil;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -134,6 +136,10 @@ public final class InstancedModels {
     private static @Nullable Boolean pipelineAvailable;
     private static @Nullable GpuBufferSlice transform;
     private static boolean drawPending;
+    /** This frame's instances of every group, one after the other */
+    private static @Nullable MappableRingBuffer ring;
+    /** This frame's prepared render types (their textures), one per render type */
+    private static final Map<RenderType, PreparedRenderType> PREPARED = new IdentityHashMap<>();
 
     private InstancedModels() {
     }
@@ -192,8 +198,9 @@ public final class InstancedModels {
 
         ByteBuffer instances = MemoryUtil.memAlloc(64 * 52);
         int count;
-        @Nullable MappableRingBuffer ring;
         @Nullable GpuBufferSlice instanceSlice;
+        /** This frame's instances' offset in the shared instance buffer */
+        int instanceOffset;
         @Nullable PreparedRenderType prepared;
         /** Of a {@link #PLATE_KEY} group: the plate's scale in its mesh */
         float plateXScale, plateYScale, plateZScale;
@@ -218,10 +225,6 @@ public final class InstancedModels {
             if (this.mesh != null) {
                 this.mesh.close();
                 this.mesh = null;
-            }
-            if (this.ring != null) {
-                this.ring.close();
-                this.ring = null;
             }
             MemoryUtil.memFree(this.instances);
         }
@@ -605,44 +608,61 @@ public final class InstancedModels {
         return available;
     }
 
-    /** Uploads this frame's instances (after the features are prepared, before the passes) */
+    /**
+     * Uploads this frame's instances (after the features are prepared, before the passes): every group's instances one
+     * after the other in one buffer, each render type prepared once
+     */
     public static void prepareDraws() {
         drawPending = false;
         int maxIndexCount = 0;
+        PREPARED.clear();
+        if (ring != null) {
+            // Fences the previous frame's use of the current buffer
+            ring.rotate();
+        }
+        int total = 0;
         for (Group group : GROUPS) {
             group.instanceSlice = null;
-            if (group.ring != null) {
-                // Fences the previous frame's use of the current buffer
-                group.ring.rotate();
-            }
             if (group.count == 0 || group.mesh == null) {
                 continue;
             }
-
-            int size = group.count * INSTANCE_SIZE;
-            if (group.ring == null || group.ring.size() < size) {
-                if (group.ring != null) {
-                    group.ring.close();
-                }
-                int capacity = Math.max(size * 2, 64 * INSTANCE_SIZE);
-                group.ring = new MappableRingBuffer(() -> "Ruthenium model instances",
-                        GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_MAP_WRITE, capacity);
+            group.instanceOffset = total;
+            total += group.count * INSTANCE_SIZE;
+            // The same textures for every group of a render type (the draws then keep their bindings)
+            PreparedRenderType prepared = PREPARED.get(group.renderType);
+            if (prepared == null) {
+                prepared = group.renderType.prepare();
+                PREPARED.put(group.renderType, prepared);
             }
-
-            GpuBuffer buffer = group.ring.currentBuffer();
-            try (GpuBufferSlice.MappedView view = buffer.slice(0, size).map(false, true)) {
-                MemoryUtil.memCopy(MemoryUtil.memAddress0(group.instances), MemoryUtil.memAddress(view.data()), size);
-            }
-            group.instanceSlice = buffer.slice(0, size);
-            group.prepared = group.renderType.prepare();
+            group.prepared = prepared;
             maxIndexCount = Math.max(maxIndexCount, group.indexCount);
             drawPending = true;
         }
-
-        if (drawPending) {
-            transform = RenderSystem.getDynamicUniforms().writeTransform(RenderSystem.getModelViewMatrixCopy());
-            RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS).getBuffer(maxIndexCount);
+        if (!drawPending) {
+            return;
         }
+
+        if (ring == null || ring.size() < total) {
+            if (ring != null) {
+                ring.close();
+            }
+            ring = new MappableRingBuffer(() -> "Ruthenium model instances", GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_MAP_WRITE,
+                    Math.max(total * 2, 256 * INSTANCE_SIZE));
+        }
+        GpuBuffer buffer = ring.currentBuffer();
+        try (GpuBufferSlice.MappedView view = buffer.slice(0, total).map(false, true)) {
+            long target = MemoryUtil.memAddress(view.data());
+            for (Group group : GROUPS) {
+                if (group.count == 0 || group.mesh == null) {
+                    continue;
+                }
+                int size = group.count * INSTANCE_SIZE;
+                MemoryUtil.memCopy(MemoryUtil.memAddress0(group.instances), target + group.instanceOffset, size);
+                group.instanceSlice = buffer.slice(group.instanceOffset, size);
+            }
+        }
+        transform = RenderSystem.getDynamicUniforms().writeTransform(RenderSystem.getModelViewMatrixCopy());
+        RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS).getBuffer(maxIndexCount);
     }
 
     /** Draws the instances into the world's solid pass */
@@ -653,21 +673,30 @@ public final class InstancedModels {
 
         renderPass.pushDebugGroup(() -> "Ruthenium instanced models");
         RenderSystem.AutoStorageIndexBuffer indices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
-
+        RenderPipeline lastPipeline = null;
+        PreparedRenderType lastPrepared = null;
         for (Group group : GROUPS) {
             if (group.instanceSlice == null) {
                 continue;
             }
-            CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(group.pipeline);
-            if (pipeline == null) {
-                continue;
+            // Bindings are kept between draws of one pipeline (the same values vanilla's per draw binding would set)
+            if (group.pipeline != lastPipeline) {
+                CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(group.pipeline);
+                if (pipeline == null) {
+                    continue;
+                }
+                renderPass.setPipeline(pipeline);
+                RenderSystem.bindDefaultUniforms(renderPass);
+                renderPass.setUniform("DynamicTransforms", transform);
+                renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
+                lastPipeline = group.pipeline;
+                lastPrepared = null;
             }
-            renderPass.setPipeline(pipeline);
-            RenderSystem.bindDefaultUniforms(renderPass);
-            renderPass.setUniform("DynamicTransforms", transform);
-            renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
-            for (PreparedRenderType.Texture texture : group.prepared.textures()) {
-                renderPass.setUniform(texture.name(), texture.textureView(), texture.sampler());
+            if (group.prepared != lastPrepared) {
+                for (PreparedRenderType.Texture texture : group.prepared.textures()) {
+                    renderPass.setUniform(texture.name(), texture.textureView(), texture.sampler());
+                }
+                lastPrepared = group.prepared;
             }
             renderPass.setVertexBuffer(0, group.mesh.slice());
             renderPass.setVertexBuffer(1, group.instanceSlice);
