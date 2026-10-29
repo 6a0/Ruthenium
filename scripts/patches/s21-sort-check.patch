@@ -1,0 +1,118 @@
+--- a/src/main/java/net/ruthenium/render/vertex/SortOrderCache.java
++++ b/src/main/java/net/ruthenium/render/vertex/SortOrderCache.java
+@@ -33,6 +33,7 @@
+ 
+     /** Called at the start of each upload */
+     public void beginUpload() {
++        if (SortOrderCheck.ENABLED) SortOrderCheck.upload(); // CHECK
+         int keep = this.generation - KEEP_UPLOADS;
+         this.generation++;
+         if (!this.entries.isEmpty()) {
+@@ -53,12 +54,17 @@
+ 
+         long key = key(centroids, size);
+         Entry entry = this.entries.get(key);
++        boolean used; int startKind = 0; // CHECK
+         if (entry != null && entry.order.length == size) {
+-            sorter.sortFrom(centroids, entry.order, entry.order);
++            used = sorter.sortFrom(centroids, entry.order, entry.order);
++            if (SortOrderCheck.ENABLED) { SortOrderCheck.entryStarts++; if (entry.checkCentroids != null) { SortOrderCheck.entryStartsChecked++; if (java.util.Arrays.equals(entry.checkCentroids, SortOrderCheck.copy(centroids))) SortOrderCheck.identicalCentroids++; } } // CHECK
+         } else {
+-            entry = new Entry(sorter.sort(centroids));
++            int[] order = sorter.sort(centroids);
++            used = true; if (SortOrderCheck.ENABLED) SortOrderCheck.noStarts++; // CHECK
++            entry = new Entry(order);
+             this.entries.put(key, entry);
+         }
++        if (SortOrderCheck.ENABLED) { if (!used) { if (startKind == 0) SortOrderCheck.fallbacks++; else SortOrderCheck.sizeFallbacks++; } SortOrderCheck.compare(sorter, centroids, entry.order); entry.checkCentroids = SortOrderCheck.copy(centroids); } // CHECK
+ 
+         entry.lastUsed = this.generation;
+         return entry.order;
+@@ -79,6 +85,7 @@
+     private static final class Entry {
+         final int[] order;
+         int lastUsed;
++        float[] checkCentroids; // CHECK
+ 
+         Entry(int[] order) {
+             this.order = order;
+--- a/src/main/java/net/ruthenium/render/vertex/DistanceSorting.java
++++ b/src/main/java/net/ruthenium/render/vertex/DistanceSorting.java
+@@ -39,6 +39,10 @@
+             this.function = function;
+         }
+ 
++        DistanceFunction function() {
++            return this.function;
++        }
++
+         @Override
+         public int[] sort(CompactVectorArray values) {
+             int size = values.size();
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/vertex/SortOrderCheck.java
+@@ -0,0 +1,64 @@
++package net.ruthenium.render.vertex;
++
++import com.google.common.primitives.Floats;
++import com.mojang.blaze3d.vertex.CompactVectorArray;
++import com.mojang.blaze3d.vertex.VertexSorting;
++import it.unimi.dsi.fastutil.ints.IntArrays;
++import net.ruthenium.Initializer;
++import org.joml.Vector3f;
++
++import java.util.Arrays;
++
++/**
++ * TEMPORARY exactness check of {@link SortOrderCache} ({@code -Druthenium.probe.sortCheck=true}): every sorted draw is
++ * also sorted with vanilla's algorithm ({@code VertexSorting.byDistance}: keys, stable merge sort by
++ * {@code Floats.compare}, descending) and compared; plus counters of how the start order was found.
++ */
++public final class SortOrderCheck {
++    public static final boolean ENABLED = Boolean.getBoolean("ruthenium.probe.sortCheck");
++
++    static long draws, quads, mismatches, entryStarts, sizeStarts, noStarts, fallbacks, sizeFallbacks, identicalCentroids, entryStartsChecked;
++    private static long uploads;
++
++    private SortOrderCheck() {
++    }
++
++    static void compare(DistanceSorting.Sorter sorter, CompactVectorArray centroids, int[] order) {
++        int size = centroids.size();
++        VertexSorting.DistanceFunction function = sorter.function();
++        Vector3f scratch = new Vector3f();
++        float[] keys = new float[size];
++        int[] indices = new int[size];
++        for (int i = 0; i < size; indices[i] = i++) {
++            keys[i] = function.apply(centroids.get(i, scratch));
++        }
++        IntArrays.mergeSort(indices, (o1, o2) -> Floats.compare(keys[o2], keys[o1]));
++
++        draws++;
++        quads += size;
++        if (!Arrays.equals(indices, order)) {
++            mismatches++;
++            if (mismatches <= 10) {
++                Initializer.LOGGER.warn("Sort order mismatch: {} quads, vanilla {} vs {}", size, Arrays.toString(indices), Arrays.toString(order));
++            }
++        }
++    }
++
++    static float[] copy(CompactVectorArray centroids) {
++        int size = centroids.size();
++        float[] copy = new float[size * 3];
++        for (int i = 0; i < size; i++) {
++            copy[3 * i] = centroids.getX(i);
++            copy[3 * i + 1] = centroids.getY(i);
++            copy[3 * i + 2] = centroids.getZ(i);
++        }
++        return copy;
++    }
++
++    static void upload() {
++        if (++uploads % 5000 == 0) {
++            Initializer.LOGGER.info("Sort order check: {} draws ({} quads) compared, {} mismatches; starts: entry {} (bit-identical centroids {} of {}), size {}, none {}; fallbacks from entries {}, from size starts {}",
++                    draws, quads, mismatches, entryStarts, identicalCentroids, entryStartsChecked, sizeStarts, noStarts, fallbacks, sizeFallbacks);
++        }
++    }
++}

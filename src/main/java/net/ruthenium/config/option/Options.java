@@ -353,6 +353,11 @@ public abstract class Options {
                                 () -> config.textDisplayCulling)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.textDisplayCulling.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.reuseSortOrder"),
+                                value -> config.reuseSortOrder = value,
+                                () -> config.reuseSortOrder)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.reuseSortOrder.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.emptyArmorStandLayers"),
                                 value -> config.emptyArmorStandLayers = value,
                                 () -> config.emptyArmorStandLayers)

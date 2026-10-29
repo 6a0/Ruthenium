@@ -20,5 +20,6 @@ after the rename; results and logs stay in `build/run/bench/results/<dir>`.
 | `s19-check-TextCacheCheck.java.txt` | 19th check of the name tag and text display caches (worktree `s1`, `s3/verify`) | `render/text/`; call it where the kept width, kept component and kept prepared text are returned (`-Druthenium.verifyTextCache=true`) |
 | `s19-check-TextDisplayCullingCheckM.java.txt` | 19th check of the text display culling radius (`s3/verify`) | a mixin source for `mixin/render/entity/` (`-Druthenium.verifyTextDisplayCulling=true`) |
 | `s20-downloaded-skins.patch` | 20th, `s20-dyn-*`, `s20-c3-*`: transparent face culling of downloaded skins (`DynamicTexture`, alpha copied after each upload) and face masks kept per texture alpha | `970dcc5` / HEAD (`git apply`) |
+| `s21-sort-check.patch` | 21st exactness check of `reuseSortOrder` (`build/bench-logs/s21-check-*.log`): every sorted staged draw also sorted with vanilla's merge sort and compared, plus counters of the start orders and of bit-identical centroids | HEAD after the sort order commit (`git apply`; `-Pjvm.ruthenium.probe.sortCheck=true`) |
 
 The two old patches (5th, 7th) fail on HEAD because the code moved on; `git apply --3way` gets most of the way.

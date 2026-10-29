@@ -2,6 +2,7 @@ package net.ruthenium.gametest;
 
 import com.mojang.blaze3d.platform.NativeImage;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestServerContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
 import net.minecraft.client.CloudStatus;
@@ -12,6 +13,7 @@ import net.minecraft.client.renderer.texture.SkinTextureDownloader;
 import net.minecraft.client.resources.SkinManager;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.ARGB;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.animal.parrot.Parrot;
@@ -81,6 +83,13 @@ final class PlayerBenchmark {
     /** {@code bench.emptyOuterLayers=true}: every skin's outer layer cleared (skins that don't use the second layer) */
     private static final boolean EMPTY_OUTER_LAYERS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("emptyOuterLayers", "false"));
     private static final boolean SKIN_EDIT = Boolean.parseBoolean(BenchmarkClientGameTest.prop("skinEdit", "false"));
+    /**
+     * {@code bench.playersMove=true}: from the static phase on, every player turns (4 degrees per tick, body and head) and
+     * walks a small circle around its spot (0.3 blocks, ~16 s per lap), so their bodies change every frame
+     */
+    private static final boolean PLAYERS_MOVE = Boolean.parseBoolean(BenchmarkClientGameTest.prop("playersMove", "false"));
+    private static volatile boolean moving;
+    private static final Map<Integer, double[]> SPOTS = new HashMap<>();
 
     /** The flat world's surface */
     private static final int FLOOR = -60;
@@ -166,6 +175,9 @@ final class PlayerBenchmark {
             context.takeScreenshot(sceneLabel + "-static-" + runId);
 
             setStuckArrows(server);
+            if (PLAYERS_MOVE) {
+                startMoving(context);
+            }
             context.runOnClient(_ -> FrameRecorder.startPhase());
             BenchmarkClientGameTest.waitSeconds(context, BenchmarkClientGameTest.STATIC_SECONDS);
             results.add(context.computeOnClient(_ -> FrameRecorder.stopPhase("static", -1)));
@@ -181,6 +193,7 @@ final class PlayerBenchmark {
             frameSeries.put("pan", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
             LOGGER.info(results.getLast().summaryLine());
 
+            moving = false;
             if (CLOSE_SHOTS > 0) {
                 closeUps(context, server, sceneLabel, runId);
                 if (SKIN_EDIT && DOWNLOADED_SKINS) {
@@ -198,6 +211,7 @@ final class PlayerBenchmark {
             environment.addProperty("playerSkins", DOWNLOADED_SKINS ? "downloaded" : "resource");
             environment.addProperty("skinVariants", SKIN_VARIANTS);
             environment.addProperty("emptyOuterLayers", EMPTY_OUTER_LAYERS);
+            environment.addProperty("playersMove", PLAYERS_MOVE);
             var entities = new com.google.gson.JsonObject();
             counts.forEach(entities::addProperty);
             environment.add("entities", entities);
@@ -321,6 +335,49 @@ final class PlayerBenchmark {
         }
         return image;
     }
+
+    /** {@code bench.playersMove}: turns and moves the mannequins on the server every tick until {@link #moving} is cleared */
+    private static void startMoving(ClientGameTestContext context) {
+        SPOTS.clear();
+        moving = true;
+        if (!movingRegistered) {
+            movingRegistered = true;
+            ServerTickEvents.END_SERVER_TICK.register(server -> {
+                if (!moving) {
+                    return;
+                }
+                ServerLevel level = server.overworld();
+                long time = level.getGameTime();
+                for (Entity entity : level.getAllEntities()) {
+                    if (entity instanceof Mannequin mannequin) {
+                        double[] spot = SPOTS.computeIfAbsent(mannequin.getId(), _ -> new double[]{mannequin.getX(), mannequin.getZ(),
+                                mannequin.getYRot(), mannequin.getId() * 0.7});
+                        double angle = time * 0.02 + spot[3];
+                        float yaw = (float) ((spot[2] + time * 4.0) % 360.0);
+                        mannequin.snapTo(spot[0] + 0.3 * Math.cos(angle), mannequin.getY(), spot[1] + 0.3 * Math.sin(angle), yaw, 0.0F);
+                        mannequin.setYHeadRot(yaw);
+                        mannequin.setYBodyRot(yaw);
+                    }
+                }
+            });
+        }
+        // Let the movement reach the client before measuring
+        context.waitTicks(TICKS_PER_SECOND);
+        String before = context.computeOnClient(PlayerBenchmark::firstMannequinPose);
+        context.waitTicks(10);
+        LOGGER.info("Players moving: first mannequin {} -> {}", before, context.computeOnClient(PlayerBenchmark::firstMannequinPose));
+    }
+
+    private static String firstMannequinPose(Minecraft mc) {
+        for (Entity entity : mc.level.entitiesForRendering()) {
+            if (entity instanceof ClientMannequin mannequin) {
+                return "%.3f %.3f yaw %.1f".formatted(mannequin.getX(), mannequin.getZ(), mannequin.getYRot());
+            }
+        }
+        return "none";
+    }
+
+    private static boolean movingRegistered;
 
     private static int buildPlayers(TestServerContext server) {
         server.runCommand("team add vip");

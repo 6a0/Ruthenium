@@ -64,6 +64,7 @@
     "render.vertex.BufferBuilderM",
     "render.vertex.MeshDataSortStateM",
     "render.vertex.StagedVertexBufferM",
+    "render.vertex.StagedVertexBufferSortM",
     "render.vertex.VertexSortingM",
     "screen.OptionInstanceAccessor",
     "screen.OptionsScreenM",

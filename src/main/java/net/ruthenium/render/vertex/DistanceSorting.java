@@ -13,6 +13,11 @@ import java.util.Arrays;
  * in ascending index order, matching {@link Float#compare} semantics).
  * <p>
  * Scratch arrays are kept per thread; only the returned index array is allocated per sort.
+ * <p>
+ * {@link Sorter#sortFrom} sorts starting from a given order of the quads (last frame's order of the same draw,
+ * {@link SortOrderCache}) by insertion. Every algorithm here sorts by the same strict total order (distance key, then
+ * quad index), whose sorted permutation is unique, so the starting order changes only how long the sort takes, never
+ * its result.
  */
 public final class DistanceSorting {
     private static final int RADIX_THRESHOLD = 256;
@@ -23,22 +28,79 @@ public final class DistanceSorting {
     }
 
     public static VertexSorting byDistance(VertexSorting.DistanceFunction function) {
-        return values -> sort(values, function);
+        return new Sorter(function);
     }
 
-    private static int[] sort(CompactVectorArray values, VertexSorting.DistanceFunction function) {
-        int size = values.size();
-        Scratch scratch = SCRATCH.get();
-        scratch.ensureCapacity(size);
+    /** A sort by distance: vanilla's {@code VertexSorting.byDistance} with the same function */
+    public static final class Sorter implements VertexSorting {
+        private final DistanceFunction function;
 
-        // Keys whose unsigned ascending order is vanilla's descending distance order
+        private Sorter(DistanceFunction function) {
+            this.function = function;
+        }
+
+        @Override
+        public int[] sort(CompactVectorArray values) {
+            int size = values.size();
+            Scratch scratch = SCRATCH.get();
+            computeKeys(scratch, values, size, this.function);
+            return size < RADIX_THRESHOLD ? sortPacked(scratch.keys, size) : radixSort(scratch, size);
+        }
+
+        /**
+         * Sorts the quads into {@code out} (which may be {@code start}) starting from the order {@code start}, a
+         * permutation of {@code 0..values.size()-1}. The result is the same as {@link #sort}'s; when the start is far
+         * from sorted it falls back to {@link #sort}'s algorithm after a bounded number of moves. Returns {@code true}
+         * if the start was close enough to be used.
+         */
+        public boolean sortFrom(CompactVectorArray values, int[] start, int[] out) {
+            int size = values.size();
+            Scratch scratch = SCRATCH.get();
+            computeKeys(scratch, values, size, this.function);
+            int[] keys = scratch.keys;
+
+            long[] packed = scratch.packed;
+            for (int j = 0; j < size; j++) {
+                int i = start[j];
+                packed[j] = ((long) (keys[i] ^ Integer.MIN_VALUE) << 32) | i;
+            }
+
+            // Insertion sort; the values are distinct (they hold the quad index)
+            int budget = (size << 2) + 64;
+            for (int j = 1; j < size; j++) {
+                long value = packed[j];
+                int k = j - 1;
+                if (packed[k] < value) {
+                    continue;
+                }
+                do {
+                    packed[k + 1] = packed[k];
+                    k--;
+                } while (k >= 0 && packed[k] > value);
+                packed[k + 1] = value;
+                budget -= j - 1 - k;
+                if (budget < 0) {
+                    int[] sorted = size < RADIX_THRESHOLD ? sortPacked(keys, size) : radixSort(scratch, size);
+                    System.arraycopy(sorted, 0, out, 0, size);
+                    return false;
+                }
+            }
+
+            for (int j = 0; j < size; j++) {
+                out[j] = (int) packed[j];
+            }
+            return true;
+        }
+    }
+
+    /** Keys whose unsigned ascending order is vanilla's descending distance order */
+    private static void computeKeys(Scratch scratch, CompactVectorArray values, int size, VertexSorting.DistanceFunction function) {
+        scratch.ensureCapacity(size);
         int[] keys = scratch.keys;
         Vector3f point = scratch.point;
         for (int i = 0; i < size; i++) {
             keys[i] = ~sortableBits(function.apply(values.get(i, point))) ^ Integer.MIN_VALUE;
         }
-
-        return size < RADIX_THRESHOLD ? sortPacked(keys, size) : radixSort(scratch, size);
     }
 
     private static int[] sortPacked(int[] keys, int size) {
@@ -121,6 +183,7 @@ public final class DistanceSorting {
         int[] keys = new int[0];
         int[] keysTmp = new int[0];
         int[] indicesTmp = new int[0];
+        long[] packed = new long[0];
 
         void ensureCapacity(int size) {
             if (this.keys.length < size) {
@@ -128,6 +191,7 @@ public final class DistanceSorting {
                 this.keys = new int[capacity];
                 this.keysTmp = new int[capacity];
                 this.indicesTmp = new int[capacity];
+                this.packed = new long[capacity];
             }
         }
     }
