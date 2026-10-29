@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-29 (twentieth session; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-29 (twenty-first session; twentieth session; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -83,6 +83,10 @@ was built, checked exact (also across re-uploads) and **binned**: no gain (150 d
 vs 325.1), because the one-texel margin that keeps the test exact leaves almost no outer layer face skippable once the base
 layer is opaque (patch `scripts/patches/s20-downloaded-skins.patch`). The players scene now registers its skins through
 vanilla's skin downloader and has `bench.skinVariants`, `bench.emptyOuterLayers` and `bench.skinEdit`. No `src/main` change.
+Twenty-first session (section 7, "Twenty-first session"): **sorted draws start their quad sort from their last order**
+(`SortOrderCache`, switch "Reuse Sort Order"; exact: the sort's order is unique, so the start only changes its speed). Players
+static 482.7 -> 540.6 fps (render thread 1.99 -> 1.80 ms), lobby 328.0 -> 352.9 (2.96 -> 2.73), moving players 465.3 -> 511.1.
+"Still" players are not bit-identical frame to frame (idle arm bob), so reuse keyed on identical centroids would have missed.
 
 
 **Renamed to Ruthenium (2026-10-28, eighteenth session).** The project is now **Ruthenium**: mod id `ruthenium`, package
@@ -186,6 +190,9 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   ~1.8-3.5); the player body (translucent, 2.8 us) is the largest item left.
 - **Twentieth session** (section 7): transparent face culling is neutral to +1.5% with many resource skins now; extending it to
   downloaded skins was built, checked exact and binned (no gain, `scripts/patches/s20-downloaded-skins.patch`).
+- **Twenty-first session** (section 7): sorted draws (player bodies, see-through name tags) start an insertion sort from their
+  order in the last upload ("Reuse Sort Order", `reuseSortOrder`): players static +12%, lobby +7.6%, moving players +10%; 0
+  mismatches against vanilla's sort over 4.97M draws.
 - **Next:** see section 8.
 
 ---
@@ -297,6 +304,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `mixin/render/vertex/VertexSortingM.java` + `render/vertex/DistanceSorting.java` | Replaces `VertexSorting.byDistance` with a packed-long sort (<256) or a stable LSD radix sort with per-thread scratch. Output is **identical** to vanilla (tested against the real 26.3 class) |
 | `mixin/render/particle/ParticleEngineM.java` + `ClientPacketListenerM.java` + `interfaces/ParticleSpawnLimiter.java` | Drops particles whose group is full (exact) and caps queued candidates per group per tick at 8×16384 (peak count within ~1% of vanilla). The packet loop stops once dropping starts |
 | `mixin/render/blockentity/LevelExtractorM.java` + `FrustumAccessor.java` + `render/blockentity/BlockEntityCulling.java` | `@Overwrite extractVisibleBlockEntities`: vanilla's loop with per-block-entity frustum culling inlined. Conservative box: block ±1, +2 extra on top. **Vanilla block entity types only.** Each section is classified once (inside/outside/partial with the same margins), then 4³ cells of partial sections, and only block entities in partial cells are tested individually. Positions and cullability come from `CompiledSectionMeshM` (`interfaces/BlockEntityPositions`, packed once per compiled mesh) by list index, so culled block entities are not even loaded from the list. The destruction progress map is skipped while empty. Fabric API doesn't inject into this method (checked) |
+| `mixin/render/vertex/StagedVertexBufferSortM.java` + `render/vertex/SortOrderCache.java` + `render/vertex/SortedQuadIndices.java` | **Sort order reuse** (twenty-first session, switch `reuseSortOrder`, "Reuse Sort Order"). A `@WrapOperation` on `writeSortedIndexBuffer` in `StagedVertexBuffer.uploadDrawsToBuffers` sorts each sorted draw whose `VertexSorting` is a `DistanceSorting.Sorter` through a per buffer `SortOrderCache`: the draw is matched to an entry by quad count and the half-block cell of its first centroid, and `Sorter.sortFrom` insertion sorts from the entry's order (in place), falling back to the full sort after 4n+64 moves; no entry: full sort, new entry. Entries unused for 4 uploads are dropped (the level's and the hand's features share one buffer). Exact because every sort orders by the same strict total order (key, then quad index), whatever the start. Other `VertexSorting`s (mods) take the vanilla call. `SortedQuadIndices` holds the index writer `MeshDataSortStateM` used to keep |
 | `mixin/render/vertex/MeshDataSortStateM.java` | `@Overwrite` `writeSortedIndexBuffer`/`buildSortedIndexBuffer`: sorted quad indices written with `MemoryUtil` puts instead of an `IntConsumer` per index. Sign text (`text_polygon_offset`) is sorted on upload and needs 32-bit indices with ~500 signs |
 | `render/text/SignTextCache.java` + `mixin/render/text/{SignTextM,AbstractSignRendererM,TextFeatureRendererM,FontSetM}.java` | `SignText.getRenderMessages` wraps each line (only when recomputed) in a `FormattedCharSequence` that carries its width and `Font.PreparedText` (plain/shadowed/outline, keyed by x/y/colours). Obfuscated lines are not cached; `FontSet.resetTextures` bumps a generation. A first version with a global identity map was slower than no cache. `AbstractSignRendererM` also skips the text of a sign side whose plane faces away from the eye by ≥ 0.55 blocks (`ModelCulling.isSignTextHidden`): polygon-offset text pipelines (and their OIT sets) cull back faces, checked at runtime. Glyph quads wind like (0,0),(0,1),(1,1), so the side's facing is `column1 × column0` of the pose |
 | `render/entity/ModelCulling.java` + `mixin/render/feature/LevelRendererM.java` | Flags the world's `FeatureRenderDispatcher.prepareFrame`, `LevelRenderer.submitBlockEntities` (for sign text) and the current model's render type. When the pipeline culls (`RenderPipeline.isCull()`), `ModelPartCubeM` skips faces the GPU would cull: `(v1-v0)x(v2-v0)` of the transformed corners points away from every eye position within 0.5 blocks of the origin (camera-relative positions; bobbing moves the eye ~0.1). Degenerate faces are kept. `skipDuplicateQuads()` is true for render types without blending or upload sorting (drawing a quad twice is then idempotent) |
@@ -1597,6 +1605,83 @@ centroids of a still player are bit-identical frame to frame with the culling on
 (150 players, `staticSeconds=10`); with `skinVariants=150` every player has its own skin (and draw) as on a real server. The
 upload table of `-Pbench.entityCost=true` times the sorted draws (section 7, "Players and holograms").
 
+### Twenty-first session (2026-10-29)
+Section 8 item 1b's second bullet: the per-frame quad sort of sorted draws (player bodies, see-through name tag text). One agent
+on `26.3` (main tree), every Gradle command under the shared GPU lock. Results in `results/s21-*` and `results/s21-dev/`, logs
+`build/bench-logs/s21-*.log`. Commit `e0ee013`.
+
+**What the 26.3 sort reads** (decompiled): `RenderTypeFeatureRenderer$Group.getOrAddDraw` gives a draw a sorting when
+`renderType.sortOnUpload()` and improved transparency (OIT) is off: `RenderSystem.getProjectionType().vertexSorting()`, i.e. the
+constants `VertexSorting.DISTANCE_TO_ORIGIN` (`byDistance(new Vector3f(0,0,0))`, `origin::distanceSquared`) or `ORTHOGRAPHIC_Z`
+(`-z`). `StagedVertexBuffer.uploadDrawsToBuffers` decodes each sorted draw's quad centroids (`decodeSortingPoints`: the mean of
+vertices 0 and 2 of each quad, from the written vertex positions), builds `MeshData.SortState(centroids,
+IndexType.least(vertexCount))` and calls `writeSortedIndexBuffer(buffer, sorting)`: `sorting.sort(centroids)` (vanilla: keys
+from the distance function, stable `IntArrays.mergeSort` by `Floats.compare` descending; here `DistanceSorting`, identical
+output) and 6 indices per quad relative to the draw's base vertex. So the inputs are the centroid floats, the sorting's function
+and the index type (from the quad count). World vertex positions are camera-relative and unrotated: the view rotation is in the
+model-view matrix (`LevelRenderer`: `modelViewStack.mul(viewRotationMatrix)`) and view bobbing in the projection
+(`GameRenderer.renderLevel`: `projectionMatrix.mul(bobStack)`), so a turning camera at a fixed spot changes no world centroid.
+The first-person hand's bobbing is in its pose stack (positions), but that is the hand's own upload.
+
+**Finding: "still" players are not bit-identical.** `HumanoidModel.setupAnim` always adds `AnimationUtils.bobModelPart` to both
+arms (`ageInTicks` = tick count + partial tick, so it changes every frame) unless the arm holds a spyglass. The temporary check
+counted bit-identical centroids against the matched draw's last frame: **1.6%** of the matched draws (29k of 1.86M; not broken
+down by draw, most likely not player bodies, which are ~99% of the draws). A reuse keyed on identical centroids would almost never hit.
+
+**Design kept: start the sort from last frame's order.** The sorted permutation is unique: every sort here (vanilla's stable
+merge sort, `DistanceSorting`'s packed-long and radix sorts) orders by the strict total order "distance key as `Float.compare`
+descending, then quad index ascending", so *any* algorithm sorting by that order from *any* start returns the same indices. So
+`DistanceSorting.Sorter.sortFrom` computes this frame's keys, packs (key, index) longs in the start order and insertion sorts
+them, giving up after 4n+64 moves for the normal sort with the same keys. The cache (`SortOrderCache`, one per
+`StagedVertexBuffer`) only supplies a start, so finding the "same" draw can be a guess: quad count plus the half-block cell of the
+first centroid. A wrong match (another draw with as many quads in the same cell) or a far-off start costs time, never
+correctness; a start is always a previous sort's output of the same length (a permutation). No entry: full sort, new entry.
+Entries unused for 4 uploads are dropped (the level's and the hand's features evidently share the dispatcher's buffer, two uploads
+per frame; the first version dropped after one upload and matched only 0.01% of draws). Draws whose `VertexSorting` is not a
+`DistanceSorting.Sorter` (a mod's) take the vanilla call. Memory: one `int[n]` per live sorted draw.
+
+**Exactness check** (temporary, `scripts/patches/s21-sort-check.patch`, `-Pjvm.ruthenium.probe.sortCheck=true`): every sorted
+draw also sorted with a copy of vanilla's algorithm (keys, `IntArrays.mergeSort`, `Floats.compare`) and compared. Players kind
+1.86M draws (133M quads), moving players 1.87M (133M quads; started by a matched entry 99.9%, 1 fallback), lobby 1.24M (140M quads,
+incl. see-through name tag draws of ~3k quads): **0 mismatches**. Frozen close-ups (`s21-parity`, lobby, `closeShots=4`,
+`closeToggle=reuseSortOrder`): on vs off 8339 / 7151 px (players) and 2314 / 4418 (holograms) at threshold 1, same-setting pairs
+9598 / 10043 and 3310 / 4649; the diff maps show only the glint and the first-person arm's outline.
+
+**A/B** (5 interleaved pairs, `-Pbench.staticSeconds=10`, switch off vs on in one build, medians; `s21-<dir>`):
+
+| | static off -> on | p99 low | render thread | pan off -> on | pan p99 | pan render thread |
+|---|---|---|---|---|---|---|
+| players kind (`s21-players`) | 482.7 -> 540.6 (every pair) | 303.4 -> 314.6 | 1.99 -> 1.80 ms | 1645.7 -> 1689.8 (every pair) | 441.9 -> 484.9 | 0.48 -> 0.47 |
+| players, 150 skins (`s21-players150`) | 474.8 -> 522.3 (every pair) | 292.3 -> 324.4 | 2.02 -> 1.85 | 1639.9 -> 1672.2 | 429.3 -> 471.3 | 0.49 -> 0.49 |
+| lobby (`s21-lobby`) | 328.0 -> 352.9 (every pair) | 186.5 -> 206.5 | 2.96 -> 2.73 | 1516.5 -> 1546.4 | 307.1 -> 324.4 | 0.55 -> 0.55 |
+| moving players (`s21-move`) | 465.3 -> 511.1 (every pair) | 278.4 -> 327.1 | 2.09 -> 1.91 | 1632.5 -> 1658.7 | 416.5 -> 454.5 | 0.48 -> 0.48 |
+| entities, 3 pairs (`s21-entities`) | 345.6 vs 348.0 | 167.2 vs 172.9 | 2.80 vs 2.78 | 1231.5 vs 1243.2 | 305.2 vs 312.6 | 0.74 |
+| mixed, 3 pairs (`s21-mixed`) | 1628.9 vs 1638.8 | 795.9 vs 791.8 | 0.55 vs 0.54 | 1670.8 vs 1666.2 | 719.7 vs 724.5 | 0.42 / 0.43 |
+
+Mixed: initial 1155.3 vs 1119.9, particles 1340.6 vs 1336.5 (pairs mixed both ways; the scene has no sorted entity draws). The
+first `s21-players/a` runs were five earlier check runs swept in by `run-ab.sh`; they were moved to `s21-dev/check/`.
+`bench.playersMove=true` (new, `PlayerBenchmark`): from the static phase on a server tick listener turns every mannequin 4 degrees
+per tick (body and head) and walks it round a 0.3 block circle, so every body changes every frame (walk animation too); the log
+line `Players moving: first mannequin ...` shows it on the client.
+
+**Upload table** (`-Pbench.entityCost=true`, one run each, `s21-upload`): players kind, sort and write indices **212.5 -> 45.6
+us/frame** (1465 -> 314 ns per draw of 71.5 quads), decode 53 us unchanged, `uploadDrawsToBuffers` 347 -> 179 us; lobby sort
+280.1 -> 71.0 us (1905 -> 483 ns per draw of 113 quads), upload 522 -> 304 us. The A/B's render thread gain (0.19 ms for 150
+players, 0.23 ms in the lobby) is about what the table shows (0.17 / 0.21 ms), plus less allocation (no packed `long[]` and
+result `int[]` per sort).
+
+**Miss path** (temporary property, 3 pairs each, players kind, off vs forced, `s21-dev/miss-*`): every lookup missing (the key
+salted per upload: full sort, new entry, map insert and eviction) static 499.2 vs 484.4 fps, render thread 1.95 vs 2.01 ms (2 of
+3 pairs slower); every start reversed (worst insertion start: 4n+64 moves, then the full sort) 485.8 vs 470.3, 2.02 vs 2.05 ms.
+So a scene where nothing matches pays up to ~0.2-0.4 us per sorted draw (~3% in this 150 player scene, at the noise floor), where
+a match saves ~1.2 us. Neither happens in the scenes measured: moving players, the pan (turning camera) and the lobby's name tags
+matched 99.9%. A camera moving fast through a crowd changes the first centroid's half-block cell every few frames (flying at 10
+blocks/s and 500 fps: every ~25 frames), so it mostly matches too; not measured.
+
+Not verified: the OpenGL backend; OIT (no sorted draws then, so nothing to do); mods that change `getOrAddDraw`'s sorting;
+the hand's upload separately (counted in the totals); a real remote player's movement interpolation (mannequins moved by the
+server stand in for it).
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -1715,6 +1800,10 @@ On 2026-10-28 the user reviewed the items below and **kept all of them** (transp
 blocks, plane culling and the mod compatibility trade-offs). Nothing from before the nineteenth session is pending (the
 nineteenth session's switches are not reviewed yet). The notes stay as reference; the
 `TransparentFaces` cache miss with instanced parts off was fixed in the nineteenth session (section 7).
+Twenty-first session, mod compatibility only (exact for vanilla, switch "Reuse Sort Order"): staged draws whose sorting is
+vanilla's distance sort no longer call `MeshData.SortState.writeSortedIndexBuffer` (already an `@Overwrite` since the first
+sessions), so a mod injecting there or into `VertexSorting.sort` is bypassed for them; a mod handing the group its own
+`VertexSorting` keeps vanilla's call.
 The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
 been kept, its trade-off would have been: a mod that writes a downloaded skin's GPU texture without `DynamicTexture.upload`
 leaves stale masks (faces missing until the next upload or reload).
@@ -1838,10 +1927,11 @@ leaves stale masks (faces missing until the next upload or reload).
    - ~~`TransparentFaces` with many skins~~: done in the twentieth session. Part 1's cache fixed the resource skin loss (now
      neutral to +1.5%); testing downloaded skins was built and binned (no gain: the exactness margin leaves almost no outer
      layer face skippable; `scripts/patches/s20-downloaded-skins.patch`). Nothing left here.
-   - The shared vertex buffer upload is 0.51 ms of the lobby's 3.2 ms frame (light profiler depth 6), ~0.37 ms of it the
-     sorted draws (upload table of `-Pbench.entityCost=true`, added this session); each player body's 72 quads are sorted
-     every frame (1.8 us per player). Reusing last frame's order for sorted draws with bit-identical centroids is exact;
-     skipping the sort for opaque skins is not (coplanar touching faces, section 7).
+   - ~~Reuse last frame's sort order~~: done in the twenty-first session, as a start order rather than a bit-identical reuse
+     (players' idle arms bob every frame, so centroids are never identical): sort and indices 1465 -> 314 ns per player body,
+     lobby static 328.0 -> 352.9 fps. What is left of the sorted draws: decoding the centroids (~0.37 us per player, vanilla's
+     `decodeSortingPoints` with `ByteBuffer.getFloat` and a new `CompactVectorArray`), the key computation in the sort and the
+     index write. Skipping the sort for opaque skins is still not exact (coplanar touching faces, section 7).
    - The player body as a per-player draw fed from a GPU pose buffer, in its sorted place (exact only with vanilla's quad
      order or for skins without semi-transparent texels). Large; see "Bigger jobs" at the end of this section.
    - Retained/instanced billboard text for name tags (normal pass only; the see-through pass is sorted) and text displays. Large; see "Bigger jobs" at the end of this section.
