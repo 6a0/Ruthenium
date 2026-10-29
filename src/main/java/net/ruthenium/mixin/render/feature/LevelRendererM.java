@@ -10,6 +10,7 @@ import net.ruthenium.render.entity.InstancedParts;
 import net.ruthenium.render.entity.ModelPoseReplay;
 import net.ruthenium.render.entity.ModelCulling;
 import net.ruthenium.render.entity.PlayerPoseDraws;
+import net.ruthenium.render.text.RetainedLabels;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -29,6 +30,7 @@ public class LevelRendererM {
         InstancedParts.beginFrame();
         ModelPoseReplay.beginFrame();
         PlayerPoseDraws.beginFrame();
+        RetainedLabels.beginFrame();
     }
 
     @Inject(method = "render", at = @At(value = "INVOKE", target = PREPARE_FRAME, shift = At.Shift.AFTER))
@@ -38,6 +40,7 @@ public class LevelRendererM {
         InstancedModels.prepareDraws();
         InstancedParts.upload();
         PlayerPoseDraws.upload();
+        RetainedLabels.upload();
     }
 
     @Inject(method = "executeSolid", at = @At(value = "INVOKE", shift = At.Shift.AFTER,

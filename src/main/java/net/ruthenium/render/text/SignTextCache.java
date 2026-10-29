@@ -3,7 +3,9 @@ package net.ruthenium.render.text;
 import net.minecraft.client.gui.Font;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.FormattedCharSink;
+import net.minecraft.client.gui.navigation.ScreenRectangle;
 import net.ruthenium.Initializer;
+import org.jspecify.annotations.Nullable;
 
 /**
  * Caches the width and prepared glyphs of text lines across frames: sign lines, and since the players and holograms
@@ -66,7 +68,7 @@ public final class SignTextCache {
         }
 
         prepared = new Prepared(kind, x, y, color, includeEmpty, backgroundColor,
-                font.prepareText(line, x, y, color, drawShadow, includeEmpty, backgroundColor));
+                new KeptText(font.prepareText(line, x, y, color, drawShadow, includeEmpty, backgroundColor)));
         cached.add(prepared);
         return prepared.text;
     }
@@ -81,7 +83,7 @@ public final class SignTextCache {
             return prepared.text;
         }
 
-        prepared = new Prepared(Prepared.OUTLINE, x, y, outlineColor, false, 0, font.prepare8xTextOutline(line, x, y, outlineColor));
+        prepared = new Prepared(Prepared.OUTLINE, x, y, outlineColor, false, 0, new KeptText(font.prepare8xTextOutline(line, x, y, outlineColor)));
         cached.add(prepared);
         return prepared.text;
     }
@@ -168,6 +170,32 @@ public final class SignTextCache {
                 java.util.Arrays.fill(this.prepared, null);
                 this.next = 0;
             }
+        }
+    }
+
+    /**
+     * A prepared text kept by a line: it lays out the same glyphs every time it is visited, so {@link RetainedLabels} keeps
+     * its label-space mesh on it
+     */
+    public static final class KeptText implements Font.PreparedText {
+        private final Font.PreparedText text;
+        /** The retained label's mesh (or a marker), see {@link RetainedLabels} */
+        public @Nullable Object label;
+        /** The frame this text was first drawn in by {@link RetainedLabels} */
+        public int firstFrame = -1;
+
+        KeptText(Font.PreparedText text) {
+            this.text = text;
+        }
+
+        @Override
+        public void visit(Font.GlyphVisitor visitor) {
+            this.text.visit(visitor);
+        }
+
+        @Override
+        public @Nullable ScreenRectangle bounds() {
+            return this.text.bounds();
         }
     }
 

@@ -15,6 +15,7 @@ import net.ruthenium.render.blockentity.InstancedModels;
 import net.ruthenium.render.entity.EntityLight;
 import net.ruthenium.render.entity.InstancedParts;
 import net.ruthenium.render.entity.PlayerPoseDraws;
+import net.ruthenium.render.text.RetainedLabels;
 import net.ruthenium.render.entity.TransparentFaces;
 import net.ruthenium.render.blockentity.RetainedBlockEntities;
 import net.ruthenium.render.entity.BlockModelMeshCache;
@@ -366,6 +367,14 @@ public abstract class Options {
                                 },
                                 () -> config.playerPoseDraws)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.playerPoseDraws.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM),
+                        new SwitchOption(Component.translatable("ruthenium.options.retainedLabels"),
+                                value -> {
+                                    config.retainedLabels = value;
+                                    RetainedLabels.clear();
+                                },
+                                () -> config.retainedLabels)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.retainedLabels.tooltip"))
                                 .setImpact(PerformanceImpact.MEDIUM),
                         new SwitchOption(Component.translatable("ruthenium.options.emptyArmorStandLayers"),
                                 value -> config.emptyArmorStandLayers = value,

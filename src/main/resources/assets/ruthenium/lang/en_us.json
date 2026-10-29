@@ -83,6 +83,8 @@
   "ruthenium.options.reuseSortOrder.tooltip": "Translucent entities such as player bodies, and see-through name tags, start sorting their faces from the order they had in the previous frame, which is usually already right, instead of sorting them from scratch every frame. Same order as before.",
   "ruthenium.options.playerPoseDraws": "GPU Player Poses",
   "ruthenium.options.playerPoseDraws.tooltip": "Player bodies are kept on the GPU in the pose they were modelled in, and each frame only the position and rotation of each body part is sent, instead of every corner of every face. Same image and same drawing order.",
+  "ruthenium.options.retainedLabels": "Retained Labels",
+  "ruthenium.options.retainedLabels.tooltip": "Name tags, hologram lines and other kept text are stored on the GPU once, and each frame only where each label is and how bright it is gets sent, instead of every corner of every letter. Same image and same drawing order. Mods that change how text is drawn may want it off.",
   "ruthenium.options.emptyArmorStandLayers": "Skip Empty Armor Stand Layers",
   "ruthenium.options.emptyArmorStandLayers.tooltip": "Armor stands without armor or items (such as the invisible ones hologram plugins use for each line of text) skip the armor, item and head layers, which would draw nothing. Mods that add something to those layers for empty armor stands may want it off.",
   "ruthenium.options.reuseEntityStates": "Reuse Entity Render States",

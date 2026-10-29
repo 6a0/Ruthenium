@@ -5,14 +5,16 @@ import com.mojang.renderpearl.api.commands.RenderPass;
 import net.minecraft.client.renderer.StagedVertexBuffer;
 import net.minecraft.client.renderer.feature.RenderTypeFeatureRenderer;
 import net.minecraft.client.renderer.oit.OitStage;
+import net.ruthenium.interfaces.LabelDrawHolder;
 import net.ruthenium.interfaces.PosedDrawHolder;
 import net.ruthenium.render.entity.PlayerPoseDraws;
+import net.ruthenium.render.text.RetainedLabels;
 import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
 
-/** A group's posed draws ({@link PlayerPoseDraws}) are drawn in the place of their (empty) staged draws */
+/** A group's posed draws ({@link PlayerPoseDraws}) and label draws ({@link RetainedLabels}) are drawn in the place of their (empty) staged draws */
 @Mixin(RenderTypeFeatureRenderer.class)
 public class RenderTypeFeatureRendererM {
     /** A redirect, so that every draw executed by any group pays no wrapper object */
@@ -23,6 +25,11 @@ public class RenderTypeFeatureRendererM {
         PlayerPoseDraws.PoseDraw posed = ((PosedDrawHolder) draw).ruthenium$poseDraw();
         if (posed != null && stage == null) {
             PlayerPoseDraws.draw(renderPass, posed);
+            return null;
+        }
+        RetainedLabels.LabelDraw labels = ((LabelDrawHolder) draw).ruthenium$labelDraw();
+        if (labels != null && stage == null) {
+            RetainedLabels.draw(renderPass, labels);
             return null;
         }
         return buffer.getExecuteInfo(draw);

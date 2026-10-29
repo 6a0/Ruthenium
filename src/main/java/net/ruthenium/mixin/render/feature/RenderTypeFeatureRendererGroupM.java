@@ -7,10 +7,13 @@ import net.minecraft.client.renderer.StagedVertexBuffer;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.ruthenium.Initializer;
+import net.ruthenium.interfaces.LabelDrawHolder;
 import net.ruthenium.interfaces.PosedDrawGroup;
 import net.ruthenium.interfaces.PosedDrawHolder;
 import net.ruthenium.render.entity.PlayerPoseDraws;
+import net.ruthenium.mixin.render.vertex.StagedVertexBufferAccessor;
 import net.ruthenium.render.feature.DrawKey;
+import net.ruthenium.render.text.RetainedLabels;
 import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -47,8 +50,15 @@ public class RenderTypeFeatureRendererGroupM implements PosedDrawGroup {
     @Shadow private @Nullable RenderType lastRenderType;
     @Shadow private StagedVertexBuffer.@Nullable Draw lastDraw;
 
+    @Shadow @Final private List<StagedVertexBuffer.Draw> draws;
+
     @Shadow
     private StagedVertexBuffer.Draw getOrAddDraw(RenderType renderType) {
+        throw new AssertionError();
+    }
+
+    @Shadow
+    public VertexConsumer getVertexBuilder(RenderType renderType) {
         throw new AssertionError();
     }
 
@@ -82,6 +92,7 @@ public class RenderTypeFeatureRendererGroupM implements PosedDrawGroup {
     @Inject(method = "<init>", at = @At("RETURN"))
     private void beginPoseGroup(CallbackInfo ci) {
         PlayerPoseDraws.beginGroup(this);
+        RetainedLabels.beginGroup(this);
     }
 
     /**
@@ -95,6 +106,10 @@ public class RenderTypeFeatureRendererGroupM implements PosedDrawGroup {
         PlayerPoseDraws.PoseDraw posed = ((PosedDrawHolder) draw).ruthenium$poseDraw();
         if (posed != null) {
             PlayerPoseDraws.materialize(posed, builder);
+        }
+        RetainedLabels.LabelDraw labels = ((LabelDrawHolder) draw).ruthenium$labelDraw();
+        if (labels != null) {
+            RetainedLabels.materialize(labels, builder);
         }
         return builder;
     }
@@ -121,5 +136,21 @@ public class RenderTypeFeatureRendererGroupM implements PosedDrawGroup {
     @Override
     public PreparedRenderType ruthenium$lastPreparedType() {
         return this.drawRenderTypes.getLast();
+    }
+
+    @Override
+    public PreparedRenderType ruthenium$preparedTypeOf(StagedVertexBuffer.Draw draw) {
+        int last = this.draws.size() - 1;
+        return this.drawRenderTypes.get(this.draws.get(last) == draw ? last : this.draws.indexOf(draw));
+    }
+
+    @Override
+    public boolean ruthenium$hasVertices(StagedVertexBuffer.Draw draw) {
+        return !draw.isEmpty() || ((StagedVertexBufferAccessor) this.stagedBuffer).ruthenium$lastBuildingDraw() == draw;
+    }
+
+    @Override
+    public VertexConsumer ruthenium$vertexBuilder(RenderType renderType) {
+        return this.getVertexBuilder(renderType);
     }
 }

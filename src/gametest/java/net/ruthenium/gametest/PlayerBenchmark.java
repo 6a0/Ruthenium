@@ -92,6 +92,13 @@ final class PlayerBenchmark {
     private static final boolean PLAYERS_HURT = Boolean.parseBoolean(BenchmarkClientGameTest.prop("playersHurt", "false"));
     /** Close-ups with stained glass through and water around some players of the first row */
     private static final boolean PLAYERS_GLASS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("playersGlass", "false"));
+    /**
+     * {@code bench.labelVariety=true}: a wall of special labels at x 40 (shadowed, see-through, translucent, custom and no
+     * background, underlined, struck through, italic, obfuscated, other glyph pages, wrapped and aligned lines, fixed
+     * billboards, scaled, labels stacked at one spot and overlapping name tags, a sneaking-like named mob, stained glass in
+     * front of some), with a third close-up ({@code close2}) of it. Changes the scene's numbers
+     */
+    private static final boolean LABEL_VARIETY = Boolean.parseBoolean(BenchmarkClientGameTest.prop("labelVariety", "false"));
     private static volatile boolean moving;
     private static final Map<Integer, double[]> SPOTS = new HashMap<>();
 
@@ -109,7 +116,11 @@ final class PlayerBenchmark {
     private static final double HOLOGRAM_BASE = 3.0, LINE_SPACING = 0.25;
 
     /** Close-up camera positions (x, height above the floor, z, pitch), looking along +z */
-    private static final float[][] CLOSE_UPS = {
+    private static final float[][] CLOSE_UPS = LABEL_VARIETY ? new float[][]{
+            {0.5F, 1.6F, -1.5F, 5.0F},   // the first rows of players
+            {0.5F, 3.2F, 0.0F, 0.0F},    // the first rows of holograms
+            {40.5F, 2.2F, -1.0F, 0.0F},  // the label variety wall
+    } : new float[][]{
             {0.5F, 1.6F, -1.5F, 5.0F},   // the first rows of players
             {0.5F, 3.2F, 0.0F, 0.0F},    // the first rows of holograms
     };
@@ -155,6 +166,9 @@ final class PlayerBenchmark {
             server.runCommand("gamemode creative @a");
             int players = PLAYERS ? buildPlayers(server) : 0;
             int lines = HOLOGRAMS ? buildHolograms(server) : 0;
+            if (LABEL_VARIETY) {
+                buildLabelVariety(server);
+            }
             moveCamera(context, server, (float) CAMERA_X, (float) (CAMERA_Y - FLOOR), (float) CAMERA_Z, PITCH);
             context.waitTicks(TICKS_PER_SECOND);
             TerrainBenchmark.waitForVisibleCompiled(context);
@@ -568,6 +582,42 @@ final class PlayerBenchmark {
             lines += HOLOGRAM_LINES;
         }
         return lines;
+    }
+
+    /** The label variety wall ({@link #LABEL_VARIETY}), at x 34 to 47, z 3 to 8 */
+    private static void buildLabelVariety(TestServerContext server) {
+        double y = FLOOR + 1.5;
+        String[] specs = {
+                // x, y offset, z, extra NBT
+                "34.5|0.0|4.5|text:{text:\"Shadowed bold\",color:\"gold\",bold:1b},shadow:1b,billboard:\"center\"",
+                "34.5|0.6|4.5|text:{text:\"See-through\",color:\"aqua\"},see_through:1b,billboard:\"center\"",
+                "34.5|1.2|4.5|text:{text:\"Half opacity\",color:\"white\"},text_opacity:-128b,billboard:\"center\"",
+                "34.5|1.8|4.5|text:{text:\"Red background\"},background:-2130771968,billboard:\"center\"",
+                "37.5|0.0|4.5|text:{text:\"No background\",color:\"green\"},background:0,billboard:\"center\"",
+                "37.5|0.6|4.5|text:[{text:\"Under\",underlined:1b},{text:\"strike\",strikethrough:1b},{text:\"italic\",italic:1b,color:\"red\"}],billboard:\"center\"",
+                "37.5|1.2|4.5|text:[{text:\"Obf \"},{text:\"secret\",obfuscated:1b,color:\"yellow\"}],billboard:\"center\"",
+                "37.5|1.8|4.5|text:{text:\"\u65e5\u672c\u8a9e \u2714 \u2764 \u00e9\u00e8\u00ea \u0416\u0418\u0412\"},billboard:\"center\"",
+                "40.5|0.0|5.5|text:{text:\"A wrapped line of text that is long enough to wrap several times\"},line_width:60,alignment:\"left\",billboard:\"center\"",
+                "40.5|1.2|5.5|text:{text:\"Right aligned and wrapped text here\",color:\"light_purple\"},line_width:50,alignment:\"right\",shadow:1b,billboard:\"center\"",
+                "43.5|0.0|4.5|text:{text:\"Fixed billboard\",color:\"blue\"},billboard:\"fixed\",Rotation:[25.0f,0.0f]",
+                "43.5|0.6|4.5|text:{text:\"Scaled up\"},transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],translation:[0f,0f,0f],scale:[2f,2f,2f]},billboard:\"vertical\"",
+                "46.5|0.4|4.5|text:{text:\"Stacked one\",color:\"red\"},billboard:\"center\"",
+                "46.5|0.4|4.5|text:{text:\"Stacked two!\",color:\"green\"},billboard:\"center\"",
+                "46.5|1.0|4.6|text:{text:\"Overlapping\",color:\"yellow\"},see_through:1b,billboard:\"center\"",
+                "46.5|1.05|4.4|text:{text:\"Overlapped\",color:\"aqua\"},billboard:\"center\"",
+        };
+        for (String spec : specs) {
+            String[] parts = spec.split("\\|", 4);
+            summon(server, "text_display", Double.parseDouble(parts[0]), y + Double.parseDouble(parts[1]), Double.parseDouble(parts[2]), parts[3]);
+        }
+        // Name tags stacked with text displays and each other: hologram stands at the text displays' spots, a named mob
+        summon(server, "armor_stand", 46.5, y + 0.6, 4.5, "Invisible:1b,Marker:1b,NoGravity:1b,CustomNameVisible:1b,CustomName:{text:\"Stand over stack\",color:\"gold\"}");
+        summon(server, "armor_stand", 46.5, y + 0.65, 4.7, "Invisible:1b,Marker:1b,NoGravity:1b,CustomNameVisible:1b,CustomName:{text:\"Stand behind\",color:\"white\",bold:1b}");
+        summon(server, "pig", 40.5, FLOOR, 7.5, "NoAI:1b,CustomNameVisible:1b,CustomName:{text:\"Named pig\",color:\"light_purple\"}");
+        summon(server, "armor_stand", 41.0, y + 1.9, 5.0, "Invisible:1b,Marker:1b,NoGravity:1b,CustomNameVisible:1b,CustomName:{text:\"\u65e5\u672c Mixed pages\",italic:1b}");
+        // Stained glass in front of part of the wall
+        server.runCommand("fill 33 %d 2 38 %d 2 minecraft:light_blue_stained_glass".formatted(FLOOR, FLOOR + 1));
+        server.runCommand("fill 45 %d 3 47 %d 3 minecraft:red_stained_glass".formatted(FLOOR + 1, FLOOR + 2));
     }
 
     /** Line l of hologram h as an SNBT text component */

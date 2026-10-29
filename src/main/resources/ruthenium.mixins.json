@@ -64,6 +64,7 @@
     "render.vertex.BufferBuilderAccessor",
     "render.vertex.BufferBuilderM",
     "render.vertex.MeshDataSortStateM",
+    "render.vertex.StagedVertexBufferAccessor",
     "render.vertex.StagedVertexBufferM",
     "render.vertex.StagedVertexBufferSortM",
     "render.vertex.StagedVertexBufferDrawM",

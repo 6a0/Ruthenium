@@ -14,3 +14,9 @@ accessible field net/minecraft/client/renderer/rendertype/RenderSetup textureTra
 accessible field net/minecraft/client/renderer/rendertype/RenderSetup textures Ljava/util/Map;
 accessible class net/minecraft/client/renderer/rendertype/RenderSetup$TextureBinding
 accessible method net/minecraft/client/renderer/rendertype/RenderSetup$TextureBinding location ()Lnet/minecraft/resources/Identifier;
+
+# Retained labels: the text feature renderer's glyph renderer (pose, light and display mode of the submit being written)
+accessible class net/minecraft/client/renderer/feature/TextFeatureRenderer$GlyphRenderer
+accessible field net/minecraft/client/renderer/feature/TextFeatureRenderer$GlyphRenderer pose Lorg/joml/Matrix4f;
+accessible field net/minecraft/client/renderer/feature/TextFeatureRenderer$GlyphRenderer lightCoords I
+accessible field net/minecraft/client/renderer/feature/TextFeatureRenderer$GlyphRenderer displayMode Lnet/minecraft/client/gui/Font$DisplayMode;
