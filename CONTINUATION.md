@@ -1971,13 +1971,13 @@ unchanged (it has none of the new types). Results in `results/blockentities-dev/
 ### Decisions and verification notes
 On 2026-10-28 the user reviewed the items below and **kept all of them** (transparent face culling, supporting
 blocks, plane culling and the mod compatibility trade-offs). On 2026-10-29 the user accepted the mod compatibility
-trade-offs of the nineteenth (both parts) and twenty-first sessions as well; only the twenty-second session's (below) is pending. The notes stay as reference; the
+trade-offs of the nineteenth (both parts), twenty-first and twenty-second sessions as well. The notes stay as reference; the
 `TransparentFaces` cache miss with instanced parts off was fixed in the nineteenth session (section 7).
 Twenty-first session, mod compatibility only (exact for vanilla, switch "Reuse Sort Order"): staged draws whose sorting is
 vanilla's distance sort no longer call `MeshData.SortState.writeSortedIndexBuffer` (already an `@Overwrite` since the first
 sessions), so a mod injecting there or into `VertexSorting.sort` is bypassed for them; a mod handing the group its own
 `VertexSorting` keeps vanilla's call.
-Twenty-second session, **mod compatibility, to be decided by the user** (exact for vanilla, switch "GPU Player Poses"): player
+Twenty-second session, mod compatibility only (accepted by the user on 2026-10-29; exact for vanilla, switch "GPU Player Poses"): player
 body submits of the exact `PlayerModel` class with vanilla's `entity_translucent` pipeline are no longer written into the group's
 vertex builder, so mods that act on those vertices (a `VertexConsumer` wrapper, mixins into `Cube.compile`, `ModelPartCubeM` or
 `BufferBuilder`) or on the draw (`PreparedRenderType.drawFromBuffer`, `RenderTypeFeatureRenderer.executeGroup`) don't see them;
