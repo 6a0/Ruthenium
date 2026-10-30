@@ -15,20 +15,6 @@
 > [!NOTE]
 > AI was used heavily for this project.
 
-## Recommended JVM arguments
-
-Minecraft 26.3 runs on Java 25, which has two options that save memory. A mod can't set them, so add them to your
-launcher's JVM arguments:
-
-```
--XX:+UseCompactObjectHeaders -XX:+UseStringDeduplication
-```
-
-- `-XX:+UseCompactObjectHeaders` shrinks every Java object's header from 12 to 8 bytes. In world at render distance 12
-  this measured about 25 MB less live heap.
-- `-XX:+UseStringDeduplication` lets the G1 garbage collector (the default) share the contents of identical strings.
-  This measured about 12 MB less in world.
-
 ## Credits
 
 - [xCollateral](https://github.com/xCollateral/) – for the base of the mod ([VulkanMod](https://github.com/xCollateral/VulkanMod)) and extensive existing work on Vulkan

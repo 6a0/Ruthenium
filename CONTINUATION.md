@@ -1020,7 +1020,8 @@ as is, benchmarking only) and G1 `FillerElement[]` (~5 MB).
 - Metaspace 157.9 MiB (vanilla 156.9): Knot 126.7 (31k classes, ~16.5k of them lambda proxies, ~33 MB estimated), boot 20 + 3.6
   hidden, app loader 6.75. Ruthenium's own classes ~0.5 MB. Knot's classes can't use CDS/AOT archives. The "~3 MB Mixin data" above
   is heap (`ClassNode`s of Ruthenium's 110 mixins 2.4 MB + `ClassInfo` 1.55); Mixin keeps 21.5 MB of heap in all.
-- Launcher JVM flags a mod can't set (one launch each, now in the README): `-XX:+UseCompactObjectHeaders` world 441 -> 416 MB,
+- Launcher JVM flags a mod can't set (one launch each, on the benchmark's G1; not in the README: 26.x launches default to ZGC and
+  guides already recommend compact headers): `-XX:+UseCompactObjectHeaders` world 441 -> 416 MB,
   `-XX:+UseStringDeduplication` -12 MB.
 - Possible upstream issues: Fabric Loader keeps Mojang's signed manifest through `URLJarFile.superEntries` (13.6 MB, in `java.base`
   reach only); Mixin could drop `MixinInfo$State.classNode` once its targets are all applied (up to 11.5 MB).
