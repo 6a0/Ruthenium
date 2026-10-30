@@ -399,6 +399,11 @@ public abstract class Options {
                                 () -> config.emptyArmorStandLayers)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.emptyArmorStandLayers.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.renderTypeCache"),
+                                value -> config.renderTypeCache = value,
+                                () -> config.renderTypeCache)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.renderTypeCache.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)

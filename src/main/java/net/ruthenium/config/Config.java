@@ -71,6 +71,8 @@ public class Config {
     public boolean retainedLabels = true;
     /** Armor stands with empty equipment skip their (vanilla) layers and the model pose for them */
     public boolean emptyArmorStandLayers = true;
+    /** Two-argument render type lookups (entityCutout, ...) check a small cache of vanilla's answers before vanilla's memo */
+    public boolean renderTypeCache = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */
