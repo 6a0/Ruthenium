@@ -237,6 +237,11 @@ public abstract class Options {
                                 value -> config.freeUnusedChunkData = value,
                                 () -> config.freeUnusedChunkData)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.freeUnusedChunkData.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.compactSkyLight"),
+                                value -> config.compactSkyLight = value,
+                                () -> config.compactSkyLight)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.compactSkyLight.tooltip"))
                                 .setImpact(PerformanceImpact.LOW)
                 }),
                 new OptionBlock("", new Option<?>[]{

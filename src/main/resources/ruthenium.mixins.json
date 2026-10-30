@@ -109,6 +109,8 @@
     "world.EntitySupportingBlockM",
     "world.LevelEntityCollisionsM",
     "world.LegacyRandomSourceAccessor",
+    "world.DataLayerAccessor",
+    "world.LevelLightEngineM",
     "world.LevelChunkSectionM",
     "world.LevelEntityGetterAdapterAccessor",
     "world.LevelM",

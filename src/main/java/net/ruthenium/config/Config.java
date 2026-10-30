@@ -116,6 +116,8 @@ public class Config {
     public boolean sectionStateCache = true;
     /** Compiled sections drop their compile region, and leaving a world frees its render data right away */
     public boolean freeUnusedChunkData = true;
+    /** Light data that arrives with full sky light everywhere is stored as one value instead of a 2 KB array */
+    public boolean compactSkyLight = true;
 
     /** The vignette is skipped while its color is black (its blend then leaves every pixel as it is) */
     public boolean skipBlackVignette = true;
