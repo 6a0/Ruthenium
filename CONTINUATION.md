@@ -965,8 +965,9 @@ jars are rebuilt starts ~3 s slower** (cold file cache; 13.8 vs 11.1 s): discard
 | GPU dedicated title / world / left | 309 / 663 (727 once) / 663 MB | 309 / 727 / 663 MB |
 
 - Load times: Ruthenium changes none of them; joining is server bound.
-- Ruthenium in world: **+12 MB live heap** (`int[]` +4.9 MB: packed draws, face groups and the other per-mesh arrays; ~3 MB of
-  Mixin/ASM class data kept after transformation). The GPU difference is **not** real: vanilla's in-world GPU memory was 663, 663
+- Ruthenium in world: **+12 MB live heap** (`int[]` +4.9 MB; ~3 MB of Mixin/ASM class data kept after transformation). The
+  thirtieth session found the `int[]` was **not** the per-mesh arrays (~0.2 MB at 418 meshes) but per-thread compile scratch, now
+  pooled (below). The GPU difference is **not** real: vanilla's in-world GPU memory was 663, 663
   and 727 MB in three launches, so a 64 MB block comes and goes run to run.
 - `-Pbench.footprintHeapDump=<snapshot>` writes a live heap dump at that snapshot (~500 MB; delete it afterwards), and
   `java -Xmx4g scripts/HprofPath.java <dump> <class> [paths|holders] [skip,fields]` prints the shortest strong paths from GC roots to
@@ -1004,6 +1005,43 @@ The in-world saving scales with the compiled sections (render distance squared),
 
 - Not measured yet: a scene with block entities and entities (the mixed scene's retained geometry lives there), GPU memory below
   the 64 MB block size (needs counters inside the Vulkan backend), and the OpenGL backend.
+
+**Where the rest goes (thirtieth session, `cdc77e1`, RD 12, Vulkan; one launch each, jcmd + heap dumps).** Live heap in world 441
+MB (vanilla 441.5), 407 MB of it reachable from GC roots: integrated server 108, client 170, shared/loader/JDK 129. Two things inflate
+every footprint number for both labels: the harness's `FrameRecorder` (25 MB of static 1M-frame arrays, allocated in every scene; left
+as is, benchmarking only) and G1 `FillerElement[]` (~5 MB).
+- `byte[]` 81.5 MB: String contents 27.3 (Fabric Loader manifest strings 7.8, Mixin `ClassInfo` 2.6, en_us loaded twice 1.5),
+  light `DataLayer`s server 13.8 / client 8.7, vanilla's `MemoryReserve` 10.0 (keep: out-of-memory screen), JDK jar central
+  directories 7.9, zipfs over the MC jar 6.0, Netty 3.1.
+- `long[]` 51.6 MB (vanilla 62.5: it keeps the compile regions): block states server 20.6 (1,922 chunks) / client 13.4. Every
+  palette was decoded: no stale entries, so repacking saves nothing; 1-3 bit palettes would save ~3 MB with protocol risk. Not worth it.
+- `int[]` 26.95 MB (vanilla 21.89): `FrameRecorder` 12.0, Ruthenium's per-thread compile scratch ~7.7 (pooled below), vanilla's
+  `BlockTintCache` 3.3 (Ruthenium doesn't fill it), `FontSet.glyphsByWidth` 1.6 (lazy below).
+- Metaspace 157.9 MiB (vanilla 156.9): Knot 126.7 (31k classes, ~16.5k of them lambda proxies, ~33 MB estimated), boot 20 + 3.6
+  hidden, app loader 6.75. Ruthenium's own classes ~0.5 MB. Knot's classes can't use CDS/AOT archives. The "~3 MB Mixin data" above
+  is heap (`ClassNode`s of Ruthenium's 110 mixins 2.4 MB + `ClassInfo` 1.55); Mixin keeps 21.5 MB of heap in all.
+- Launcher JVM flags a mod can't set (one launch each, now in the README): `-XX:+UseCompactObjectHeaders` world 441 -> 416 MB,
+  `-XX:+UseStringDeduplication` -12 MB.
+- Possible upstream issues: Fabric Loader keeps Mojang's signed manifest through `URLJarFile.superEntries` (13.6 MB, in `java.base`
+  reach only); Mixin could drop `MixinInfo$State.classNode` once its targets are all applied (up to 11.5 MB).
+- `scripts/HprofPath.java` gained the modes `sizes`, `dups`, `example`, `light`, `lightdups`, `palettes`, `subtree`, `fields`,
+  `classnodes`, `overview`, `unreached` (and `-Dreferent=true`); `scripts/metaspace_breakdown.py <VM.metaspace show-loaders
+  show-classes output> <VM.classes output> <jars...>` splits Knot's metaspace by package group.
+
+**Loader manifests** (thirtieth session, no switch, `LoaderManifests`): Fabric Loader's Knot keeps a parsed copy of each code source's manifest in `KnotClassDelegate.metadataCache`. The unremapped 26.3 client jar is signed, so it has 32,875 per-entry SHA-384 sections, plus 809 from a second signed jar: 6.00 MB of `Attributes`, `LinkedHashMap`s and nodes; the strings are shared with the JDK's copy. In loader 0.20.1, Knot uses only the cached `CodeSource` and defines packages with null attributes. The cached manifest is only returned by `FabricLauncher.getManifest(Path)`, which neither the loader nor Fabric API, Mixin or MixinExtras call. `URLJarFile.getManifest` deep-copies, so the verifier and `URLJarFile.superEntries` (13.56 MB, out of reach: Knot reads classes through `url.openStream()` and the verifier asks for the manifest again) keep their own. At client init, each cached `Metadata` with entries is replaced by reflection with one that keeps only the main attributes and the same `CodeSource`. If the loader's internals differ, it warns once and does nothing. It needs no switch: the trim happens once inside the loader and changes nothing visible. After (one cold and one warm launch each): live heap title 272.1 -> **266.0 MB**, world 441.0 -> **434.3**, left 306.5 -> **300.6**; `metadataCache` 6.00 -> 0.09 MB in the title dump. Startup, reloads and joins unchanged within noise. Recheck the reflection, `Metadata(Manifest, CodeSource)` and the `getManifest` callers when the loader version changes.
+
+**Lazy Obfuscated Text Table** (thirtieth session, switch `lazyGlyphWidths`, `FontSetM`, `LazyGlyphWidths`): `FontSet.selectProviders` filled `glyphsByWidth` (the code points of each glyph advance) on every font reload, although only obfuscated text reads it. Its only reader is `FontSet.getRandomGlyph`, reached through `GlyphSource.getRandomGlyph` from `Font.getGlyph` when the style is obfuscated; Fabric API never touches `FontSet`. 26.3's `FontSet` keeps `Conditional` providers, bakes glyphs lazily (`DelayedBake`) and serves them through two `GlyphSource`s (any and non-fishy). `FontManager` recreates every font set on a resource reload, and a font option change calls `reload(options)`; both paths go through `selectProviders`. The reload now only finds the providers in use: the forEach lambda is cancelled before `glyph.info()`. The table is built on the first random glyph request from the same providers in the same `IntOpenHashSet` order, so obfuscated text picks the same glyphs. It is double-checked under a lock, published through a volatile field, and lives in one object per reload, so a build that races a reload only fills the old one. Footprint scene (off/on interleaved, one launch each): `int[]` at the title screen −1.63 MB in every pair. A heap dump shows 64 `IntArrayList` arrays under `FontSet.glyphsByWidth` off, none on. Live heap title 271.7/271.8 → 269.8/270.8 MB. Reloads 1.04–1.05 s either way, no measurable change. The first lazy build of the default font takes ~17 ms. `-Pbench.glyphWidthCheck=true` (footprint scene, `ObfuscatedGlyphCheck`) takes an obfuscated title in the world (`obfuscated1`/`obfuscated2` screenshots). At the title screen it checks that vanilla's and the lazy tables are equal for all 8 font sets (357,522 code points), that a reload builds nothing, that 8 racing threads get one table, and that random glyphs have the replaced glyph's width.
+
+**Compact Sky Light** (thirtieth session, switch `compactSkyLight`, `LevelLightEngineM`, `UniformLight`): the light dumps (`HprofPath light`/`lightdups`) found 2,415 identical all-15 sky light arrays at RD 12. That is 1,450 on the integrated server (light loaded from disk) and 965 on the client (chunk and light packets), 4.7 MB in all. `LevelLightEngine.queueSectionData`, which every light array entering an engine passes through on both sides, now turns an array that is 15 everywhere into `new DataLayer(15)`. That layer keeps no array until it is written; vanilla makes such layers itself, and `getData()` creates the filled array for network, saving and mods. Only 15 is converted: an all-zero layer would become `isEmpty()`, which the sky engine fills with 15 when a chunk's light is enabled and the server neither saves nor sends; uniform-0 arrays are rare anyway (8 at RD 12). The check (`Arrays.mismatch` against a constant) costs 86-109 ns per all-15 array and ~5 ns per mixed one, against the 260-310 ns clone vanilla already makes of each array. Live heap in world (one launch each, `-Pvm.compactSkyLight=false` for off): RD 12 439.7 -> **434.8 MB**, RD 32 1005.4 -> **977.9 MB** (`byte[]` -26.9 MB; the server's arrays count as well, hence more than the client-only estimate). The terrain mesh check now also writes per-section mesh digests (`results/meshcheck/`). Between launches they differ in 4-6 of 486 sections even with the same settings (blocks change during the load), so they can't compare a load-time switch; on vs off screenshots differ only in clouds. Not yet looked at: at RD 32, ~520 MB stays live after leaving (105k `DataLayer`s, 179k `PalettedContainer`s, with or without the switch), against 305 MB at RD 12.
+
+**Pooled section compile scratch** (thirtieth session, switch `freeUnusedChunkData`, `SectionScratch`, `SectionCompilerM`): `BiomeTintBlend`'s grid, `BlockModelLighterCacheM`'s light window and `RenderSectionRegionM`'s state array were per thread, so every worker that ever compiled kept ~0.5 MB (~20 threads, ~10 MB). A compile now borrows one `SectionScratch` at `compile` HEAD, binds the region to it (thread plus binding number) and returns it at RETURN; not after an exception, because the region and the light cache may still point at it. Pooled scratch idle for 2 s is dropped every frame (`MinecraftFrameM`), and all of it on leaving (`LevelExtractorResetM`). `ClientLevel` tint lookups outside compiles borrow per call. Stamps are bytes with a clear on wrap (every 255 sections), ~37% less per scratch. The grid keeps its weak level. Live heap in world 440.7 -> **430.6 MB**, after leaving 304.6 -> **294.6 MB** (`int[]` −7.8 MB, `float[]` −0.4, `double[]` −0.2); one pooled scratch remains at `world`. Compile speed unchanged: `-Pbench.compileBenchScratchAb=true` alternates pooled and per-thread scratch 6 times per parallel thread count, equal within 2% at 1–19 threads. Single-thread all-on/all-off median 0.620 -> 0.608; 19-thread runs across builds stay within their ±3% spread. Mesh and tint checks: 0 mismatches. While compiles run, memory follows the compiles running at once in the last 2 s, up to ~0.34 MB each; not measured beyond the footprint scene.
+
+**All of them together** (merge `f3eeb65`, one launch, machine busy with another agent's runs): live heap title 272 -> **264.1 MB**,
+world 440.7 -> **418.4 MB** (vanilla 442), left 304.6 -> **289.8 MB**; reload 1.04 s, join 14.4 / 1.6 s (cold / warm), unchanged.
+
+- Open: at RD 32 ~520 MB stays live after leaving (105k `DataLayer`s, 179k `PalettedContainer`s, with or without Compact Sky
+  Light) against ~290-305 MB at RD 12; either a leak that only shows with more chunks or the integrated server still saving and
+  shutting down at the `left` snapshot.
 
 ---
 
@@ -3454,7 +3492,10 @@ most promising first:
 8. **Dynamic model baking** (ModernFix `dynamic_resources`): the biggest ceiling (`BakedQuad` 10.7 MB plus model arrays) but very
    invasive on the rewritten 26.x model system.
 FerriteCore's `FastMap` block state neighbour tables are worth only a few MB on vanilla's state count. Not covered by either:
-`byte[]` (83 MB), `long[]` (63 MB, chunk data), `int[]` and ~156 MB of metaspace.
+`byte[]` (83 MB), `long[]` (63 MB, chunk data), `int[]` and ~156 MB of metaspace. The thirtieth session broke those down
+(§6.11, "Where the rest goes") and did the cheap ones: loader manifests, compact sky light, lazy obfuscated text table, pooled compile
+scratch. What's left there is irreducible or not worth it (chunk block states, mixed light data, jar indexes, MC/lambda metaspace,
+`MemoryReserve`). Items 1-8 above are still open; a load time investigation (item 7, DFU) is running in a worktree.
 
 ### Bigger jobs: player bodies and billboard text (written up after the nineteenth session; job 1 done in the twenty-second, job 2 in the twenty-third)
 Both are the large items of item 1b. The numbers come from the players scene (section 6.10, section 7 "Players and
