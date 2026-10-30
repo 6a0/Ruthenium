@@ -105,6 +105,8 @@
   "ruthenium.options.noScratchMesh.tooltip": "With Cache Entity Block Models, item frames, block displays, minecarts and endermen no longer allocate an empty block mesh and a random generator every frame that the cached quads leave unused. Same image, less garbage. Mods that read the Fabric Renderer API's mesh of a block model render state may want it off.",
   "ruthenium.options.partChildArrays": "Model Part Child Arrays",
   "ruthenium.options.partChildArrays.tooltip": "Mob and player model parts go through their child parts from an array instead of creating an iterator for every part of every model each frame. Same image, less garbage. Mods that inject into the child loop of ModelPart.render may want it off.",
+  "ruthenium.options.pooledSubmitPoses": "Pooled Submit Poses",
+  "ruthenium.options.pooledSubmitPoses.tooltip": "Models, items and blocks drawn by entities copy their position into a pool reused every frame instead of creating new matrices for every submit. Same image, less garbage. Mods that keep the game's submits beyond the frame they were made in may want it off.",
   "ruthenium.options.hashedDrawLookup": "Fast Draw Lookup",
   "ruthenium.options.hashedDrawLookup.tooltip": "Finds the draw an entity's or item's geometry goes into with a hash lookup instead of searching all of the frame's draws.",
   "ruthenium.options.mergeDraws": "Merge Entity Draws",

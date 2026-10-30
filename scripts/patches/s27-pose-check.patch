@@ -1,0 +1,29 @@
+diff --git a/src/main/java/net/ruthenium/render/feature/SubmitPosePool.java b/src/main/java/net/ruthenium/render/feature/SubmitPosePool.java
+index 0584ad3..862a542 100644
+--- a/src/main/java/net/ruthenium/render/feature/SubmitPosePool.java
++++ b/src/main/java/net/ruthenium/render/feature/SubmitPosePool.java
+@@ -28,9 +28,24 @@ public final class SubmitPosePool {
+ 
+     /** A new frame: the poses handed out before are free again */
+     public static void beginFrame() {
++        if (CHECK) {
++            // Poison the last frame's poses: anything that reads one after its frame draws nothing
++            for (int i = 0; i < used; i++) {
++                poses[i].pose().scale(Float.NaN);
++                poses[i].normal().scale(Float.NaN);
++            }
++            maxUsed = Math.max(maxUsed, used);
++            if (++frames % 2000 == 0) {
++                org.slf4j.LoggerFactory.getLogger("Ruthenium pose pool check").info("pose pool: {} frames, {} poses last frame, {} at most", frames, used, maxUsed);
++            }
++        }
+         used = 0;
+     }
+ 
++    private static final boolean CHECK = Boolean.getBoolean("ruthenium.poseCheck");
++    private static int maxUsed;
++    private static long frames;
++
+     /** As {@code pose.copy()} */
+     public static PoseStack.Pose copy(PoseStack.Pose pose) {
+         if (!Initializer.CONFIG.pooledSubmitPoses || !RenderSystem.isOnRenderThread()) {

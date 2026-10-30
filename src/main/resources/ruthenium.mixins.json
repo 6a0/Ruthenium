@@ -51,6 +51,8 @@
     "render.feature.RenderTypeFeatureRendererM",
     "render.feature.LevelRendererM",
     "render.feature.ModelFeatureRendererM",
+    "render.feature.MinecraftFrameM",
+    "render.feature.SubmitNodeCollectionPoseM",
     "render.particle.ClientPacketListenerM",
     "render.particle.ParticleEngineM",
     "render.particle.QuadParticleRenderStateM",
