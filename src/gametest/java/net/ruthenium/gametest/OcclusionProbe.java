@@ -10,6 +10,7 @@ import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.minecraft.client.Minecraft;
+import net.ruthenium.interfaces.PackedSectionDraws;
 import net.minecraft.client.renderer.DynamicGpuData;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.core.BlockPos;
@@ -260,6 +261,15 @@ public final class OcclusionProbe {
         long[] under2 = new long[LAYERS.length];
         int cubeSections = 0, blockSections = 0, offSections = 0;
         double[] box = new double[6];
+        // TerrainOcclusion's last visibility of each section (its occluder flag), checked against this depth: a
+        // section it hid must be hidden behind the final depth too
+        Long2ObjectOpenHashMap<PackedSectionDraws> meshes = new Long2ObjectOpenHashMap<>();
+        for (var section : mc.levelRenderer.visibleSections()) {
+            if (section.getSectionMesh() instanceof PackedSectionDraws mesh) {
+                meshes.put(section.getRenderOrigin().asLong(), mesh);
+            }
+        }
+        int gpuHidden = 0, violations = 0;
 
         for (var entry : drawnQuads.long2ObjectEntrySet()) {
             long key = entry.getLongKey();
@@ -269,6 +279,17 @@ public final class OcclusionProbe {
 
             cube(box, ox, oy, oz);
             int cube = test(box, clip, a, b);
+            PackedSectionDraws mesh = meshes.get(key);
+            if (mesh != null && !mesh.ruthenium$isOccluder()) {
+                gpuHidden++;
+                if (cube == VISIBLE) {
+                    violations++;
+                    if (violations <= 20) {
+                        LOGGER.warn("Occlusion probe {}: GPU hid visible section {} {} {} at {} blocks, quads {}", view, ox, oy, oz,
+                                "%.0f".formatted(distance(box)), java.util.Arrays.toString(quads));
+                    }
+                }
+            }
             int blocks = blockBounds(mc, box, ox, oy, oz) ? test(box, clip, a, b) : cube;
             if (blocks == OFF_SCREEN) {
                 offSections++;
@@ -296,6 +317,7 @@ public final class OcclusionProbe {
         }
 
         LOGGER.info("Occlusion probe {}: {} sections drawn, quads {}", view, drawnQuads.size(), describe(all, null));
+        LOGGER.info("Occlusion probe {}: TerrainOcclusion hid {} sections, {} of them visible in the final depth", view, gpuHidden, violations);
         LOGGER.info("Occlusion probe {}: off screen {} sections, quads {}", view, offSections, describe(offQuads, all));
         LOGGER.info("Occlusion probe {}: hidden (section cube) {} sections, quads {}", view, cubeSections, describe(cubeHidden, all));
         LOGGER.info("Occlusion probe {}: hidden (block bounds) {} sections, quads {}", view, blockSections, describe(blocksHidden, all));

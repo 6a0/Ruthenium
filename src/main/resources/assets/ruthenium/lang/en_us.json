@@ -48,6 +48,8 @@
 
   "ruthenium.options.terrainFaceCulling": "Terrain Face Culling",
   "ruthenium.options.terrainFaceCulling.tooltip": "Skips the block faces of a chunk section that all point away from the camera, which the GPU would discard anyway. Changing it reloads the chunks.",
+  "ruthenium.options.terrainOcclusionCulling": "Terrain Occlusion Culling",
+  "ruthenium.options.terrainOcclusionCulling.tooltip": "Draws the chunk sections that were visible a moment ago first, then lets the GPU skip every other section hidden behind them.",
   "ruthenium.options.compressedTerrain": "Compressed Terrain Vertices",
   "ruthenium.options.compressedTerrain.tooltip": "Stores solid and cutout block vertices in 20 instead of 28 bytes, so the GPU reads less memory per frame. Changing it reloads the chunks.",
   "ruthenium.options.biomeBlendCache": "Fast Biome Blending",

@@ -20,4 +20,9 @@ public interface PackedSectionDraws {
     DynamicGpuData.@Nullable ChunkSectionInfo ruthenium$getSectionInfo();
 
     void ruthenium$setSectionInfo(DynamicGpuData.ChunkSectionInfo info);
+
+    /** Whether {@code TerrainOcclusion} last saw the mesh's section visible: its solid and cutout layers are occluders */
+    boolean ruthenium$isOccluder();
+
+    void ruthenium$setOccluder(boolean occluder);
 }

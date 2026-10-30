@@ -228,6 +228,11 @@ public abstract class Options {
                                 () -> config.terrainFaceCulling)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.terrainFaceCulling.tooltip"))
                                 .setImpact(PerformanceImpact.HIGH),
+                        new SwitchOption(Component.translatable("ruthenium.options.terrainOcclusionCulling"),
+                                value -> config.terrainOcclusionCulling = value,
+                                () -> config.terrainOcclusionCulling)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.terrainOcclusionCulling.tooltip"))
+                                .setImpact(PerformanceImpact.HIGH),
                         new SwitchOption(Component.translatable("ruthenium.options.compressedTerrain"),
                                 value -> {
                                     config.compressedTerrain = value;

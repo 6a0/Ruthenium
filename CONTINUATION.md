@@ -184,6 +184,11 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   Terrain static view 477 -> 670 fps, pan 658 -> 873 (vanilla Vulkan 474 / 651). Each has a switch on the
   Optimizations page. The old VulkanMod terrain renderer was **not** ported: vanilla's section compiler, uber
   buffers, occlusion graph and multi-draw-indirect are kept.
+- **Terrain occlusion culling on the GPU (thirty-second session, `TerrainOcclusion`, switch "Terrain Occlusion Culling").**
+  Two-phase, through renderpearl only (decision B kept): the sections seen visible a few frames ago are drawn first,
+  and every other terrain command gets its instance count from a GPU test against their depth. Terrain static view
+  706.5 -> 977.6 fps (+38%), pan 931 -> 1032; OpenGL static 638 -> 801; mixed scene neutral (it turns itself off
+  where it hides little). Screenshots identical within noise (section 7, thirty-second session).
 - **Section compiles (sixth session).** Exact caches in vanilla's section compile (meshes byte-identical, checked by
   `-Pbench.meshCheck=true`): biome tint blending (`BiomeTintBlend`), AO light/shade (`BlockModelLighterCacheM`) and
   block states (`RenderSectionRegionM`). Single-thread compile 681 -> ~400 us per section, terrain rebuild
@@ -356,6 +361,7 @@ bb25d7a Port build to Minecraft 26.3 and strip the 1.21.11 renderer
 | `config/**` (settings screen) + `mixin/screen/{OptionsScreenM,OptionInstanceAccessor,TooltipAccessor}.java` | Port of the old screen (`VOptionScreen`, `VOptionList`, widgets, search, Apply/Undo, the `ruthenium:mod_settings_registry` entrypoint API for other mods). `OptionsScreenM` swaps the supplier of the video button (`@ModifyArg` on `openScreenButton` when the message is `VIDEO`); Shift+P in the screen opens vanilla's. Pages: **Video** (window mode = vanilla `fullscreen` + `exclusiveFullscreen`, exclusive fullscreen mode of `window.findBestMonitor()`, framerate, vsync, inactivity limit, GUI scale, brightness, graphics API (only Vulkan and OpenGL; `OptionsGraphicsApiM` turns a Default API into Vulkan once, flagged by `Config.vulkanByDefault`, so vanilla's fallback to OpenGL after a failed start stays), attack/autosave indicators), **Graphics** (preset first, distances, chunk updates, filtering/anisotropy, particles, clouds, leaves, improved transparency, chunk fade, AO, biome blend, shadows, entity distance, mipmaps, weather radius, menu blur, vignette), **Optimizations** (the `Config` switches). `VanillaOptions` wraps a vanilla `OptionInstance`: `set` runs vanilla's listener (preset, `allChanged`, sampler reset, ...), and caption, value label (with the leading `options.generic_value` caption stripped) and tooltip come from the instance through accessors. After Apply every option re-reads its value (the preset changes the others); texture reloads (mipmaps/filtering/anisotropy) happen when the screen closes, like vanilla's video screen. Drawing goes through `GuiRenderer` → `GuiGraphicsExtractor`; the cycling arrows are `PolygonRenderState` triangles (a quad of `RenderPipelines.GUI` with the last vertex repeated; `guiRenderState`/`scissorStack` opened by the access widener). Text input uses `charTyped`; shortcut letters compare `KeyEvent.shortcutKey()` (SDL keycodes, lowercase ASCII for letters). Dropped from the old screen: device/frame queue/builder threads/wayland/texture animation options, advanced chunk culling, indirect draw, unique opaque layer, backface culling (terrain options come back with the terrain renderer), the update checker button |
 | `render/chunk/SectionFaceGroups.java` + `mixin/render/chunk/{SectionCompilerM,SectionCompilerResultsM}.java` + `CompiledSectionMeshM` (`interfaces/FaceGroupsHolder`) | Solid and cutout layer meshes (sequential quads) are reordered at compile time (stably, after `BufferBuilder.build`, through a wrap of the results' `Map.put`) into 7 groups: one per axis-aligned facing (by the quad's winding normal from its diagonals; all 4 vertices must share the plane coordinate) plus the rest. Each group keeps its lowest `normal . vertex`. When the draw list is built, a layer's draw is replaced by draws of the groups the eye can be in front of (margin 1e-3), merging adjacent ones. Exact: terrain pipelines cull back faces, and a quad is back facing iff the eye is behind its plane. Switch `terrainFaceCulling` (toggling calls `allChanged`). The non-MDI path (`extractSectionDrawGroups`) gets the same through a `List.add` wrap. **Mixin pitfall seen here:** array field initializers in a mixin were not merged before a constructor `@Inject` ran once a second such field existed; the NPE happened in a compile worker, where vanilla's `runTask` catches it and requeues the task silently (symptom: a compile queue that never drains). The arrays are now allocated in code |
 | `render/chunk/TerrainDrawList.java` + `mixin/render/chunk/LevelRendererM.java` (`@Overwrite prepareChunkRendersIndirect`) + `interfaces/PackedSectionDraws` | Builds vanilla's multi-draw-indirect commands: the same draw groups (per vertex/index buffer heap; translucent ones consecutive-only and back to front) and commands, without the 2 hash lookups per section and layer in `UberGpuBuffer.getAllocation` and without a record per command. Since the twelfth session a compiled mesh's solid and cutout draws are packed on first use into one int array (drawn flag, index count, base vertex, the face groups' starts, planes with the margin applied and always-drawn mask) and a `GpuBuffer[]` on the mesh (`CompiledSectionMeshM`): their vertex allocation never moves until the mesh is released. Translucent layers (index buffers re-uploaded under the same mesh when resorted) and meshes with custom index buffers in those layers take the lookups every frame. Face group runs come from a mask of drawn groups and a table of runs per mask (`SectionFaceGroups.addVisibleCommands(int[], ...)`). Verified: old and new collect side by side every frame, identical groups/commands/section infos over 22k server and 76k terrain frames (incl. rebuilds); the mask path on 16M random cases. Commands go into reused int arrays and one bulk copy per group into a VulkanMod `MappableRingBuffer` of indirect parameters, rotated each frame. Vertex sizes per layer are read per frame (they change with `CompressedTerrain`) |
+| `render/chunk/TerrainOcclusion.java` + `TerrainDrawList` (occluders / culled groups) + `LevelRendererM.cullTerrain` (`prepareTranslucents` TAIL) + shaders `core/occlusion_{hiz,visibility,commands}` | Two-phase GPU occlusion culling with render passes and copies only. `TerrainDrawList` writes the solid/cutout commands of sections whose mesh was last read back visible (`PackedSectionDraws.ruthenium$isOccluder`) as before (the occluders), and all other commands (other sections' solid/cutout, every translucent one) as templates in a vertex ring buffer. Before vanilla's main pass: the occluders are drawn into the main target in their own pass; their depth is reduced 4x4 into the even mips 0/2/4 of an R32_FLOAT pyramid (farthest = smallest depth, reversed-Z); 16 instanced points per section info test parts of its box's (16^3 + 1 block) screen rectangle against the depth (rectangles up to 16 px) or the pyramid (up to 16x16 texels) and write to an R8_UNORM target with MAX blending; 5 points per template write its ints, instance count = visibility, into an R32_UINT target, copied (`copyTextureToBuffer`) into the GPU buffer the main pass's indirect draws read. The visibility is read back (2-3 frames late) for the occluder choice and for the switch: culling runs while at least 10% of the tested solid/cutout quads are hidden (starts at 15%), else one frame every 250 ms checks. Off for wireframe terrain |
 | `render/chunk/CompressedTerrain.java` + `CompressedTerrainBuilder.java` + `mixin/render/chunk/{ChunkSectionLayerM,ChunkSectionsToRenderM}.java` + `assets/ruthenium/shaders/core/terrain_compressed.vsh` + `interfaces/SectionDispatcherReset` | Solid/cutout vertices in 20 bytes: `Position` RG32_UINT = 3x21 bit fixed point (1/65536 block, offset -8, range [-8, 24)), `Color` RGBA8, `UV0` RG16_UINT (/65536), `UV2` as vanilla. `ChunkSectionLayer.pipeline()`/`vertexFormat()` return copies of vanilla's terrain pipelines (built through a `RenderPipeline.Snippet` of the vanilla pipeline's properties, with the vertex shader and binding 0 replaced; also for the wireframe override). The section compiler gets `CompressedTerrainBuilder` (a `BufferBuilder` subclass handling the 11-arg `addVertex`, chained `addVertex(x,y,z)` and `setUv`) through a `NEW` wrap in `getOrBeginLayer`. The format is chosen when vanilla creates the section dispatcher (`invalidateCompiledGeometry` with a null dispatcher), because the uber buffers are sized per vertex. The switch `compressedTerrain` calls `LevelRenderer.ruthenium$recreateSectionDispatcher` (like `resetLevelRenderData`, but keeping the occlusion graph's loaded chunks and empty sections, which only fill as chunks load) and then `allChanged`. Translucent layers keep vanilla's format (their quad sorting reads float positions). Little-endian hosts only |
 | `render/chunk/BiomeTintBlend.java` + `mixin/render/chunk/{ClientLevelTintM,BiomeManagerAccessor}.java` | `ClientLevel.calculateBlockTint` (and, through `RenderSectionRegionM`, every tint a section compile asks for) from per-thread grids: the biomes of the section plus the blend radius around it (shared by all resolvers), each resolver's sample colours and its blended tints per block. Vanilla's per-block `BlockTintCache` (256 chunk columns, so it thrashed at render distance 32; a read lock and a linear search of the column's heights per lookup) is bypassed for compiles. The biomes are `BiomeManager.getBiome`'s fuzzy zoom with each quart corner's offsets (8 LCG steps) and noise biome cached; the distances use the same double arithmetic, and the sums vanilla's integer arithmetic, so results are identical (`-Pbench.tintCheck=true`: 14.2M blends, 0 mismatches). Grids are dropped through a generation counter on chunk load/unload and `clearTintCaches`. Only for vanilla's `BiomeManager` class and blend radius 1..16; otherwise vanilla's path. Switch `biomeBlendCache` |
 | `mixin/render/chunk/{BlockModelLighterCacheM,BlockModelLighterAccessor}.java` + `interfaces/SectionLightWindow` + `SectionCompilerM.beginLightWindow` | While a section compiles (from vanilla's `enableCaching` in `SectionCompiler.compile`), the AO light (packed brightness) and shade brightness of the section and its 1 block border (18^3) are kept in per-thread arrays instead of vanilla's 100 entry FIFO maps (`@Overwrite` of `Cache.getLightCoords`/`getShadeBrightness`; positions outside the window and other callers use vanilla's maps). Indigo's `AoCalculator` goes through this cache. Switch `sectionLightCache` |
@@ -812,6 +818,9 @@ screenshots both.
   - `-Pbench.gpuProfile=true` (`GpuProbe`): GPU timestamps around each terrain layer's draws
     (`ChunkSectionsToRender.DrawIndirect.render`), quads and draws per layer, and how much of the visible geometry
     is in fully underground sections. Logged as `GPU static: ...` / `GPU pan: ...`.
+  - `-Pbench.occlusionProbe=true` (`OcclusionProbe`, thirty-second session): what occlusion culling could hide at the static
+    view and the screenshot yaws, an oracle-culled static measurement, and the check that `TerrainOcclusion` hid nothing
+    the final depth shows (section 7, thirty-second session).
   - `-Pbench.meshCheck=true` (`MeshCompareCheck`): compiles 486 sections around the player with the mesher switches
     on and off (tint caches cleared before each) and fails on any differing vertex byte.
   - `-Pbench.tintCheck=true` (`BiomeTintCheck`): `BiomeTintBlend` vs vanilla's blending for 288 sections, 4
@@ -3045,6 +3054,77 @@ Busy gap after: ~0.19 ms (OpenGL 0.606 vs Vulkan 0.416). Settings screen check p
 in 4 chest cube views, but OpenGL static off/on 1.0006 (4 of 8), −2.7 us: the 23 retained draws are mostly single runs.
 
 **After the merge** (`943c1cf`, both agents' switches together): frozen close-ups close0-6 (4 shots, `closeToggle=skipFrameClear`, vignette skip, closed model culling and retained cell culling on) are 0 stable px at `StableDiff` threshold 1 on Vulkan and OpenGL (`s28-merge-close`, logs 2516, 2517). With the vignette skipped and nothing else in the HUD, the GUI-before-blur pass is gone, and the deferred `render3dHud` depth clear is dropped by `GameRenderer.render`'s GUI depth clear, which still runs. The settings screen check passed with all of the session's switches (log 2518).
+
+### Thirty-second session (2026-10-30): GPU occlusion culling through renderpearl
+The user asked what Nvidium does and whether its ideas fit (a subagent read it: mesh shaders, two-phase GPU occlusion with the
+last frame's visible sections, the representative fragment test; NVIDIA GL only, LGPL-3.0), then for a measurement first, then:
+*if the renderpearl-only route is physically possible without major performance loss, do it; bypass decision B only if that
+gains 15-25% over it.*
+
+**Measurement (`OcclusionProbe`, `-Pbench.occlusionProbe=true`, gametest only).** At the static view it captures a frame without
+its translucent pass, reads the depth back after the opaque pass, tests every drawn section's box (cube or non-air block bounds,
++1 block) against it at full resolution, then measures the static view with the hidden (and off-screen) sections left out on the
+CPU, and screenshots it (`culled`). It also surveys the screenshot yaws (counts only). Terrain scene, RD 32: 55% of the solid and
+46% of the cutout quads hidden at the static view (yaw 90/180/270: 24/22/47% solid), no visible block face under 1 px (so no
+small-triangle work to save), and static 697 -> 1095 fps (oracle: perfect, free culling), pixel-identical. The seventh session's
+CPU culling found ~10% because it only used whole solid faces as occluders; the depth buffer also has leaves, grass and partial
+blocks. Results: `results/terrain-dev/occlusion-probe/`, logs `build/bench-logs/occprobe-{1,2}.log`.
+
+**Feasibility (renderpearl 26.3, read in the decompiled sources).** No compute, storage buffers or occlusion queries, but:
+`copyTextureToBuffer` is a GPU copy on both backends (GL `glReadPixels` into a pixel pack buffer, Vulkan `vkCmdCopyImageToBuffer`)
+and Vulkan puts a full memory barrier after every copy and render pass; indirect draws are real `glMultiDrawElementsIndirect` /
+`vkCmdDrawIndexedIndirect` from the buffer; integer render targets (R32_UINT, R8_UINT), MAX blending, instanced vertex formats with
+integer attributes, POINTS, texture views of single mips (GL sets BASE/MAX_LEVEL at bind) and sampling the D32 depth (vanilla's
+`blit_depth`) all work. GL and Vulkan both put NDC y = -1 at memory row 0, so the passes address rows the same way on both. Texel
+buffers were avoided (`CloudFaceTexture`: ~20 us per submit on the NVIDIA Vulkan driver).
+
+**Implementation:** see the `TerrainOcclusion` row in section 4. Tuning, terrain static view (single runs, `gpuProfile`):
+
+| version | sections drawn | culling GPU ms | fps |
+|---|---|---|---|
+| 2x2 pyramid texels at a full mip chain | 76.9% | 0.096 | 780 |
+| up to 8x8 texels | 56.2% | 0.104 | 929 |
+| even mips only, 4x4 per pass, depth read directly for small boxes | 58.6% | 0.082 | 926 |
+| up to 16x16 | 54.6% | 0.098 | 947 |
+| 16 points per section (MAX blending) | 54.4% | 0.089 | 958 |
+| mip 0 at 1/4 resolution, pyramid capped at mip 4, adaptive | 54.3% | 0.082 | 966 |
+
+The culling's 0.08 ms is Hi-Z 0.044 (one read of the 1920x1080 depth, which any implementation needs), visibility 0.021, commands
+0.017. The probe's oracle hid ~49-51% of the sections; the rest of the gap is the pyramid's coarser footprints. `GpuProbe` now times
+a layer drawn twice per frame (occluder pass and main pass), the occluder pass and each culling step, and reports the share of
+sections read back visible. Its quad counts are from before the GPU's culling.
+
+**Result** (interleaved A/B, 3 pairs, `-Pvm.terrainOcclusionCulling=false` vs on, Vulkan):
+
+| scene / phase | off | on |
+|---|---|---|
+| terrain static | 706.5 (p99 483) | **977.6 (p99 630), +38%**, every pair |
+| terrain pan | 931.2 | 1031.6 (+11%) |
+| terrain rebuild | 831.4 | 960.6 (+16%) |
+| mixed initial / pan / static / particles | 1340 / 2395 / 2398 / 1756 | 1337 / 2362 / 2429 / 1789 (noise) |
+
+`results/terrain-dev/occlusion-gpu-final`, `results/mixed-dev/occlusion-gpu-adaptive`. Single runs: OpenGL static 638 -> 801, pan
+801 -> 824 (`occlusion-gpu-dev`); Fabulous (OIT) static 542 -> 724, pan 715 -> 783 (`occlusion-gpu-check`). Before the adaptive
+switch, the mixed scene lost 6-16% (`mixed-dev/occlusion-gpu`): at ~2400 fps a fixed 0.04-0.08 ms is a lot and a flat world hides
+almost nothing. Render-thread allocation on the terrain scene rose 19 -> 33 MB/s (about 14 KB per frame): JFR puts it in
+renderpearl's per-pass objects (`FrontendRenderPass`, `VulkanRenderPass`, uniform maps) of the 6 extra passes; render thread
++0.03 ms per frame.
+
+**Exactness.** Screenshots (static and yaws 90/180/270, rows >= 400, threshold 40) of every culled run against culled-off runs:
+0 px except falling-leaf particles (off-runs differ among themselves by up to ~120 px), on Vulkan, OpenGL and Fabulous. The probe
+also checks the invariant directly: every section the GPU hid must be hidden behind the final depth too (`TerrainOcclusion hid N
+sections, 0 of them visible in the final depth`): 0 violations in 16 views of 4 runs. **One unexplained artifact:** in 1 of 7
+culled runs (A/B run 20261030-205307, yaw 270) a ~10x15 px patch of exactly `#c0d8ff` showed through a gap in leaves where the
+off-runs show a distant hillside. It never came back (probe runs, final A/B). `#c0d8ff` fits vanilla's chunk fade-in (`mix(FogColor,
+color, chunkVisibility)`, restarted when a section first gets a mesh), e.g. a section first found and compiled at that yaw, but
+that is not proven.
+
+**Decision B stays.** A raw Vulkan compute version would use the same test, so it could at most save part of the 0.08 ms (single
+pass downsample, no copy): ~5%. Even the oracle (no cost, exact) is only ~15% above this, under the user's 15-25% threshold.
+
+**Ideas left:** tighter section boxes (non-air bounds at compile time: the probe saw +1.6% hidden quads), fewer passes for the
+allocation (the visibility and command targets could share one texture), and culling entities/block entities with the same
+visibility.
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |

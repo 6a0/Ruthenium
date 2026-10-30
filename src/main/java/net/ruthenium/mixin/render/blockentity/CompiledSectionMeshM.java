@@ -39,6 +39,7 @@ public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHol
     @Unique private int @Nullable [] packedDraws;
     @Unique private GpuBuffer @Nullable [] packedBuffers;
     @Unique private DynamicGpuData.@Nullable ChunkSectionInfo sectionInfo;
+    @Unique private boolean occluder;
 
     @Inject(method = "<init>", at = @At("RETURN"))
     private void copyFaceGroups(TranslucencyPointOfView pointOfView, SectionCompiler.Results results, long compileTaskStartTimeNs,
@@ -82,6 +83,16 @@ public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHol
     @Override
     public void ruthenium$setSectionInfo(DynamicGpuData.ChunkSectionInfo info) {
         this.sectionInfo = info;
+    }
+
+    @Override
+    public boolean ruthenium$isOccluder() {
+        return this.occluder;
+    }
+
+    @Override
+    public void ruthenium$setOccluder(boolean occluder) {
+        this.occluder = occluder;
     }
 
     @Override

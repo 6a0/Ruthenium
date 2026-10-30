@@ -21,12 +21,13 @@ import java.util.List;
 @Mixin(value = TerrainDrawList.class, remap = false)
 public class TerrainDrawListMixin {
     @Shadow @Final private static List[] GROUPS;
+    @Shadow @Final private static List[] CULLED_GROUPS;
     @Shadow @Final private static List<DynamicGpuData.ChunkSectionInfo> SECTION_INFOS;
 
     @Inject(method = "prepare", at = @At("HEAD"))
     private static void beginOcclusionProbe(SectionRenderDispatcher dispatcher, ObjectArrayList<SectionRenderDispatcher.RenderSection> visibleSections,
                                             Vec3 eye, double fadeInSeconds, Matrix4fc modelView, int atlasWidth, int atlasHeight,
-                                            boolean respectTranslucentOrder, CallbackInfoReturnable<?> cir) {
+                                            boolean respectTranslucentOrder, boolean wireframe, CallbackInfoReturnable<?> cir) {
         if (OcclusionProbe.ENABLED) {
             OcclusionProbe.beginFrame(eye, modelView);
         }
@@ -38,10 +39,12 @@ public class TerrainDrawListMixin {
         if (OcclusionProbe.ENABLED) {
             for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
                 OcclusionProbe.onCommands(layer, GROUPS[layer.ordinal()], SECTION_INFOS);
+                OcclusionProbe.onCommands(layer, CULLED_GROUPS[layer.ordinal()], SECTION_INFOS);
             }
         }
     }
 
+    /** With TerrainOcclusion on, the culled commands are counted too: the counts are from before the GPU's culling */
     @Inject(method = "writeCommands", at = @At("HEAD"))
     private static void countDraws(boolean respectTranslucentOrder, CallbackInfoReturnable<?> cir) {
         if (!GpuProbe.ENABLED) {
@@ -49,9 +52,11 @@ public class TerrainDrawListMixin {
         }
         GpuProbe.countFrame();
         for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
-            for (Object group : GROUPS[layer.ordinal()]) {
-                TerrainDrawListGroupAccessor accessor = (TerrainDrawListGroupAccessor) group;
-                GpuProbe.countDraws(layer, accessor.getCommands(), accessor.getCount());
+            for (List<?> groups : new List[]{GROUPS[layer.ordinal()], CULLED_GROUPS[layer.ordinal()]}) {
+                for (Object group : groups) {
+                    TerrainDrawListGroupAccessor accessor = (TerrainDrawListGroupAccessor) group;
+                    GpuProbe.countDraws(layer, accessor.getCommands(), accessor.getCount());
+                }
             }
         }
     }

@@ -20,13 +20,13 @@ import java.util.List;
 @Mixin(value = TerrainDrawList.class, remap = false)
 public class TerrainDrawListProfileMixin {
     @WrapOperation(method = "prepare", at = @At(value = "INVOKE",
-            target = "Lnet/ruthenium/render/chunk/TerrainDrawList;collect(Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher;Lit/unimi/dsi/fastutil/objects/ObjectArrayList;Lnet/minecraft/world/phys/Vec3;DZ)I"))
+            target = "Lnet/ruthenium/render/chunk/TerrainDrawList;collect(Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher;Lit/unimi/dsi/fastutil/objects/ObjectArrayList;Lnet/minecraft/world/phys/Vec3;DZZ)I"))
     private static int profileCollect(SectionRenderDispatcher dispatcher, ObjectArrayList<?> sections, Vec3 eye, double fade,
-                                      boolean order, Operation<Integer> original) {
+                                      boolean order, boolean occlusion, Operation<Integer> original) {
         ProfilerFiller profiler = Profiler.get();
         profiler.push("collect");
         profiler.incrementCounter("visibleSections", sections.size());
-        int result = original.call(dispatcher, sections, eye, fade, order);
+        int result = original.call(dispatcher, sections, eye, fade, order, occlusion);
         profiler.pop();
         return result;
     }

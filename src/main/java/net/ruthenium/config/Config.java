@@ -106,6 +106,8 @@ public class Config {
     public boolean directBakedQuads = true;
     /** Skips the terrain faces of a section that all face away from the camera */
     public boolean terrainFaceCulling = true;
+    /** Terrain sections hidden behind the terrain drawn first are culled on the GPU */
+    public boolean terrainOcclusionCulling = true;
     /** Solid and cutout terrain vertices in 20 instead of 28 bytes */
     public boolean compressedTerrain = true;
     /** Biome tint blending computes each column's sample once per section instead of once per block */

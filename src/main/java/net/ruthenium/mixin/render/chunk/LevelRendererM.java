@@ -3,10 +3,12 @@ package net.ruthenium.mixin.render.chunk;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import com.llamalad7.mixinextras.sugar.Local;
+import com.mojang.renderpearl.api.textures.GpuSampler;
 import com.mojang.renderpearl.api.textures.GpuTextureView;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import net.minecraft.client.renderer.DynamicGpuData;
 import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.client.renderer.LevelTargetBundle;
 import net.minecraft.client.renderer.ViewArea;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
@@ -24,6 +26,9 @@ import net.ruthenium.interfaces.SectionDispatcherReset;
 import net.ruthenium.render.chunk.CompressedTerrain;
 import net.ruthenium.render.chunk.SectionFaceGroups;
 import net.ruthenium.render.chunk.TerrainDrawList;
+import net.ruthenium.render.chunk.TerrainOcclusion;
+import net.minecraft.util.profiling.Profiler;
+import net.minecraft.util.profiling.ProfilerFiller;
 import org.joml.Matrix4fc;
 import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
@@ -44,6 +49,8 @@ public abstract class LevelRendererM implements SectionDispatcherReset {
     @Shadow @Final private ObjectArrayList<SectionRenderDispatcher.RenderSection> visibleSections;
     @Shadow private @Nullable SectionRenderDispatcher sectionRenderDispatcher;
     @Shadow private @Nullable ViewArea viewArea;
+    @Shadow @Final private LevelTargetBundle targets;
+    @Shadow private @Nullable GpuSampler chunkLayerSampler;
 
     @Shadow public abstract void clearVisibleSections();
 
@@ -80,7 +87,20 @@ public abstract class LevelRendererM implements SectionDispatcherReset {
         GpuTextureView blockAtlas = this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
         return TerrainDrawList.prepare(this.sectionRenderDispatcher, this.visibleSections, this.levelRenderState.cameraRenderState.pos,
                 this.optionsRenderState.chunkSectionFadeInTime, modelViewMatrix, blockAtlas.getWidth(0), blockAtlas.getHeight(0),
-                respectTranslucentOrder);
+                respectTranslucentOrder, this.levelRenderState.renderWireframeTerrain);
+    }
+
+    /**
+     * Right before the main pass (after the terrain's fog and sampler are set): draws the occluding terrain and
+     * writes the culled terrain commands the main pass draws ({@link TerrainOcclusion})
+     */
+    @Inject(method = "prepareTranslucents", at = @At("TAIL"))
+    private void cullTerrain(CallbackInfo ci) {
+        ProfilerFiller profiler = Profiler.get();
+        profiler.push("terrainOcclusion");
+        GpuTextureView blockAtlas = this.textureManager.getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
+        TerrainOcclusion.execute(this.targets.main.get(), this.chunkLayerSampler, blockAtlas, this.levelRenderState.renderWireframeTerrain);
+        profiler.pop();
     }
 
     /**

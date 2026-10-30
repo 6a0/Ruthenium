@@ -26,6 +26,7 @@
     "TerrainDrawListGroupAccessor",
     "TerrainDrawListMixin",
     "TerrainDrawListProfileMixin",
+    "TerrainOcclusionMixin",
     "TickProbeMixin",
     "VulkanCommandEncoderProfileMixin"
   ],
