@@ -201,6 +201,13 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 			def eula = runDir.get().file("eula.txt").asFile
 			eula.parentFile.mkdirs()
 			eula.text = "eula=true\n"
+			// Start with vsync off: once the window has had a FIFO swapchain, Vulkan keeps a slower present path after vsync is
+			// turned off (twenty-eighth session, mixed static -13 to -24%). -PbenchStartVsync starts with it on, as before
+			// 2026-10-30, for comparisons with older results
+			def options = runDir.get().file("options.txt").asFile
+			def vsyncLine = "enableVsync:${project.hasProperty("benchStartVsync")}"
+			def lines = options.exists() ? options.readLines().findAll { !it.startsWith("enableVsync:") } : []
+			options.text = ([vsyncLine] + lines).join("\n") + "\n"
 		}
 	}
 }

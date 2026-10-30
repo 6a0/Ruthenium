@@ -254,7 +254,7 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
     (instanced armor stands drawn with back face culling), "Retained Cell Culling" (retained chests drawn per 8³ cell, cells outside the
     view skipped). The block entity scene's static view lost 2.1% (dense sections fully in view).
   - **The frame gap** is GPU-side present work plus submit latency (vanilla queues one frame). The bench starts each launch in a slower
-    present path because `options.txt` starts with vsync on; see section 8 item 2.
+    present path because `options.txt` started with vsync on; since 2026-10-30 they start with vsync off, so Vulkan numbers are 13-24% higher than earlier ones (section 6.4).
   - **OpenGL gap:** ~85% of its extra ~0.2 ms is vanilla's GL backend and the driver. "Skip Redundant Frame Clear" skips two clears
     that a later clear overwrites: OpenGL static +2.5%, pan +4.8%; Vulkan +1.6%, +1.4%. `7193e1d` gains +17.9% on OpenGL with plates off.
   - The mixed `initial` phase's ~2% drop was noise.
@@ -557,6 +557,10 @@ run 3×, summarize, diff the static and yaw 270 screenshots, then commit with th
 `staticYaw=270`, `sectionProfile` or temporary instrumentation go to `results/heavy270/` or `results/sectprof/`.
 
 ### 6.4 Gotchas
+- **Vulkan results before the vsync change (the commit after `9d389c5`, 2026-10-30) are 13-24% low, so don't compare across it.** Bench tasks now write
+  `enableVsync:false` into the run directory's `options.txt` before launch. Before that, the first swapchain was FIFO and Vulkan stayed in a
+  slower present path for the whole run (twenty-eighth session). `-PbenchStartVsync` starts with vsync on as before, for comparisons with
+  older results. OpenGL is unaffected.
 - **Run everything through `scripts/gpulock.py`** (section 6.3). A second game instance (another worktree, another agent, a leftover
   `KnotClient`) changes GPU bound numbers and can collide on the world's `session.lock`; the lock also waits for leftover game JVMs.
 - **Move the results of plain runs out of `results/` before `run-ab.sh`**: it moves every `ruthenium-*` result it finds into the side it
@@ -2799,7 +2803,7 @@ against ~76 and ~120. Diagnostics `-Pbench.presentMode=` and `-Pbench.extraRecon
 IMMEDIATE -> FIFO -> IMMEDIATE is slow, IMMEDIATE from the start is fast (logs 2420-2423). Mixed static, default vs IMMEDIATE from the
 start: 1832 vs 2024/2143 (2 pairs, `s28-gpu-dev/presentab`); on the final build 2065 -> 2338 static and 1820 -> 2263 pan (logs 2448/2449).
 OpenGL shows no effect (log 2447 vs 2446). **Not changed:** starting the bench with vsync off would raise every Vulkan baseline by 13-24%
-and break comparability with history (decision for the user, section 8 item 2). Players who start with vsync off are in the fast path;
+and break comparability with history. **Changed at the user's request:** bench tasks start with vsync off since the commit after `9d389c5` (section 6.4). Players who start with vsync off are in the fast path;
 those who turn it off in game stay slow until they restart. In the fast path the deep queue read +7.0% (7 of 8, drifting rounds, log 2441),
 unconfirmed by interleaved launches; it adds a frame of latency when GPU bound.
 
@@ -3264,9 +3268,9 @@ leaves stale masks (faces missing until the next upload or reload).
      "Skip Redundant Frame Clear"). Left:
      - **Block entity scene static -2.1%** from retained cell culling where every cell of a dense section is in view. Untested fix: one
        merged buffer per part, laid out group-major across cells, so fully visible cells merge into the original few runs.
-     - **The bench's present path** (decision for the user, section 7): `options.txt` starts with vsync on, so the window's first swapchain
-       is FIFO and every later one stays in a slower present path. Starting with vsync off raises every Vulkan baseline by 13-24% and
-       breaks comparability with history. Players who turn vsync off in game stay slow until they restart.
+     - ~~The bench's present path~~: changed on 2026-10-30 at the user's request. Bench tasks start with vsync off (section 6.4), and
+       the VSync toggle's tooltip tells players to restart after turning it off on Vulkan. Making the fast path reachable without a
+       restart (it isn't a new `VkSurfaceKHR`, section 7) is still open.
      - **Remaining GPU at the mixed static view (Vulkan, us):** opaque terrain 88, instanced models 38, retained 28, blit + acquire 35-50
        (vanilla's), sky 14, the GUI depth clear ~10.
      - **Closed box culling for `InstancedParts`** (mob `entity_cutout`, `armor_cutout_no_cull`): the entity and players scenes are CPU

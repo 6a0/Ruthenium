@@ -97,6 +97,7 @@
   "ruthenium.options.cloudFaceTexture.tooltip": "Clouds read their faces from a small texture instead of a texel buffer, which on some graphics drivers (NVIDIA on Vulkan) makes every frame's submit slower while clouds are on. Same image. Shader packs and mods that change cloud rendering may want it off.",
   "ruthenium.options.fastScreenshots": "Fast Screenshots",
   "ruthenium.options.fastScreenshots.tooltip": "Screenshots (F2, and the icon of a new world on its first frame) copy the frame a row at a time instead of a pixel at a time, which shortens the hitch they cause. Same image. Mods that change how screenshots are taken may want it off.",
+  "ruthenium.options.vsync.restartNote": "On Vulkan, after turning VSync off, restart the game for the highest frame rate: until then the screen keeps a slower way of showing frames.",
   "ruthenium.options.skipFrameClear": "Skip Redundant Frame Clear",
   "ruthenium.options.skipFrameClear.tooltip": "Skips clears of the screen that another clear overwrites before anything uses them: the one before the world (which clears it again), and, when no hand is drawn (spectators, third person), the depth clear before the hand. Saves a little GPU time, and on OpenGL some CPU time too. Same image. Mods that read or draw into the screen before the world clears it may want it off.",
   "ruthenium.options.emptyArmorStandLayers": "Skip Empty Armor Stand Layers",

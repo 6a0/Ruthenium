@@ -23,6 +23,7 @@ import net.ruthenium.render.entity.BlockModelMeshCache;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Function;
 
 public abstract class Options {
 
@@ -112,7 +113,7 @@ public abstract class Options {
                         windowModeOption,
                         videoModeOption,
                         VanillaOptions.range(mcOptions.framerateLimit(), 10, 260, 10),
-                        VanillaOptions.toggle(mcOptions.enableVsync()),
+                        vsyncOption(),
                         VanillaOptions.cycling(mcOptions.inactivityFpsLimit(), InactivityFpsLimit.values())
                 }),
                 new OptionBlock("", new Option<?>[]{
@@ -126,6 +127,21 @@ public abstract class Options {
                         VanillaOptions.toggle(mcOptions.showAutosaveIndicator())
                 })
         };
+    }
+
+    /**
+     * Vanilla's VSync toggle with a note: on Vulkan, once the window has had a vsync (FIFO) swapchain, swapchains made after
+     * turning VSync off present more slowly until the game restarts (twenty-eighth session, mixed static -13 to -24%).
+     */
+    private static SwitchOption vsyncOption() {
+        var option = VanillaOptions.toggle(mcOptions.enableVsync());
+        Function<Boolean, Component> vanilla = VanillaOptions.tooltip(mcOptions.enableVsync());
+        option.setTooltip(value -> {
+            Component note = Component.translatable("ruthenium.options.vsync.restartNote");
+            Component tooltip = vanilla.apply(value);
+            return tooltip == null ? note : Component.empty().append(tooltip).append("\n\n").append(note);
+        });
+        return option;
     }
 
     public static OptionBlock[] getGraphicsOpts() {
