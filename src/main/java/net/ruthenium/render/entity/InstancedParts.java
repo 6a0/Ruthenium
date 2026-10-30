@@ -227,6 +227,8 @@ public final class InstancedParts {
         final int generation;
         final @Nullable PartBatch next;
         @Nullable GpuBuffer mesh;
+        /** {@code mesh.slice()}, kept */
+        @Nullable GpuBufferSlice meshSlice;
         int indexCount;
         ByteBuffer pending = MemoryUtil.memAlloc(16 * INSTANCE_SIZE);
         int count;
@@ -255,6 +257,24 @@ public final class InstancedParts {
         PreparedRenderType prepared;
         int offset;
         int count;
+        /** Slices of the instance ring's buffers this draw used, kept while its range stays the same (the ring rotates) */
+        final GpuBufferSlice[] instanceSlices = new GpuBufferSlice[4];
+        int nextSlice;
+
+        GpuBufferSlice instanceSlice(GpuBuffer instances) {
+            long offset = this.offset;
+            long length = (long) this.count * INSTANCE_SIZE;
+            GpuBufferSlice[] slices = this.instanceSlices;
+            for (GpuBufferSlice slice : slices) {
+                if (slice != null && slice.buffer() == instances && slice.offset() == offset && slice.length() == length) {
+                    return slice;
+                }
+            }
+            GpuBufferSlice slice = instances.slice(offset, length);
+            slices[this.nextSlice] = slice;
+            this.nextSlice = (this.nextSlice + 1) & (slices.length - 1);
+            return slice;
+        }
     }
 
     /** Drops every mesh at the start of the next frame (resource reload, switch toggled) */
@@ -735,8 +755,13 @@ public final class InstancedParts {
                 }
                 lastPrepared = cmd.prepared;
             }
-            renderPass.setVertexBuffer(0, batch.mesh.slice());
-            renderPass.setVertexBuffer(1, instances.slice(cmd.offset, (long) cmd.count * INSTANCE_SIZE));
+            // The same slices as vanilla's slice() calls, kept across frames
+            GpuBufferSlice meshSlice = batch.meshSlice;
+            if (meshSlice == null || meshSlice.buffer() != batch.mesh) {
+                meshSlice = batch.meshSlice = batch.mesh.slice();
+            }
+            renderPass.setVertexBuffer(0, meshSlice);
+            renderPass.setVertexBuffer(1, cmd.instanceSlice(instances));
             renderPass.drawIndexed(batch.indexCount, cmd.count, 0, 0, 0);
         }
         renderPass.popDebugGroup();
