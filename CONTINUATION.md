@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-30 (twenty-eighth session; twenty-seventh; twenty-sixth; twenty-fifth; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-30 (twenty-eighth session: GPU time, the OpenGL gap, the initial phase; twenty-seventh; twenty-sixth; twenty-fifth; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -248,6 +248,16 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   KB/frame: entities 2156 -> 1045, players 1296 -> 747, mixed 105 -> 63. Players +7.6% fps on Vulkan and +7.4% on OpenGL; entities +2%.
   The changes: pooled submit poses, no Fabric scratch mesh for cached block models, model part children from an array, kept display
   names, and more. Render states are now the largest source left.
+- **Twenty-eighth session** (section 7):
+  - **Mixed scene GPU time:** session start vs end, Vulkan static 1857 -> 2290 fps (+23.4%), pan +11.1%, particles +18.9%; OpenGL static
+    +4.7%, pan +6.2%. Three new switches: "Skip Black Vignette" (the GUI pass goes when the vignette is black), "Cull Closed Model Insides"
+    (instanced armor stands drawn with back face culling), "Retained Cell Culling" (retained chests drawn per 8³ cell, cells outside the
+    view skipped). The block entity scene's static view lost 2.1% (dense sections fully in view).
+  - **The frame gap** is GPU-side present work plus submit latency (vanilla queues one frame). The bench starts each launch in a slower
+    present path because `options.txt` starts with vsync on; see section 8 item 2.
+  - **OpenGL gap:** ~85% of its extra ~0.2 ms is vanilla's GL backend and the driver. "Skip Redundant Frame Clear" skips two clears
+    that a later clear overwrites: OpenGL static +2.5%, pan +4.8%; Vulkan +1.6%, +1.4%. `7193e1d` gains +17.9% on OpenGL with plates off.
+  - The mixed `initial` phase's ~2% drop was noise.
 - **Next:** see section 8.
 
 ---
@@ -2733,6 +2743,162 @@ pairs. Scripts:
 - `scripts/ab_pool.py`: pooled pair ratios across A/B dirs
 - `scripts/lp_ab.py`: light-profile tree and no-tick-frame diff per side
 
+### Twenty-eighth session (2026-10-30): the mixed static view's GPU time and the frame gap
+Main tree, Vulkan and OpenGL, every run under the GPU lock. Results in `build/run/bench/results/s28-gpu-*` (dev runs in `s28-gpu-dev/*`),
+logs `2409-2515` (2439, 2440 and 2491 are failed starts, renamed `*-FAILED-*`). Commits `651076a`, `c7490aa`, `7dd8dbf`, `eff5a2c`,
+`2603947`, `6e3c05a`, `5a8a0f4`, `1213c12`, `7ab33ac`.
+
+**Session start `6d556a5` vs end `7ab33ac`,** interleaved commit A/B:
+
+| scene | static | pan | particles | initial |
+|---|---|---|---|---|
+| mixed, Vulkan, 3 pairs (`s28-gpu-final3-vk`) | 1856.5 -> 2290.1 (+23.4%, every pair), p99 822.5 -> 960.5 | 1733.2 -> 1926.4 (+11.1%, every pair) | 1493.5 -> 1775.8 (+18.9%, every pair) | 1382.2 -> 1407.7 (2 of 3) |
+| mixed, OpenGL, 2 pairs (`s28-gpu-final3-gl`) | 1643.2 -> 1720.2 (+4.7%, both) | 1649.1 -> 1750.6 (+6.2%, both) | 1279.4 -> 1338.6 | 1050.4 vs 1044.4 |
+| block entities, Vulkan, 2 pairs (`s28-gpu-final3-be`) | 1361.6 -> 1333.1 (**-2.1%, both**) | 1851.3 -> 1951.0 (+5.4%, both) | | |
+
+**Where the GPU frame goes.** New probe `-Pbench.gpuTimeline=frame|passes` (`GpuTimelineProbe`, `651076a`): GPU timestamps around every
+render pass and inside the main pass, CPU events, and calibrated timestamps that place the GPU marks on `System.nanoTime`. Static view,
+Vulkan, before any change (log 2410), us per frame:
+
+| segment | us |
+|---|---|
+| frame start -> Sky pass (frame clear and writes) | 17.8 |
+| Sky | 14.4 |
+| opaque terrain (solid + cutout) | 87.8 |
+| retained block entities (chests 51k quads; sign text 30k quads) | 71.8 |
+| instanced models (armor stands 12.6k quads in 484 instances; books 864 quads) | 67.3 |
+| translucent terrain | 1.7 |
+| clouds | 7.1 |
+| main pass end | 3.3 |
+| main pass -> GUI (the GUI depth clear) | 11.7 |
+| "GUI before blur" pass (only the vignette at this view) | 27.7 |
+| swapchain blit + acquire wait | 50.1 |
+| **GPU busy (frame mark -> submit mark)** | **360.9** |
+
+Eliminations (`ToggleAb`, 8 rounds, `scripts/patches/s28-gpu-elimination.patch`, logs 2426-2429): instanced armor stands with culling
++7.3%; retained models skipped +15.2%; vignette skipped +6.8%; retained sign text skipped +0.1% (it costs nothing); retained chests without
+the cutout's discard ±0 (log 2443); retained overlay / lightmap fetch removed -4.7 / -3.6 us (logs 2451-2453; not built, the exactness of
+`mix` with alpha 1.0 is unproven).
+
+**The frame gap: why 0.52-0.56 ms when the GPU is busy 0.36 and the render thread 0.39.** Static view, log 2410: GPU period 561 us, busy
+361, gap between frames 200. The GPU was idle at `vkQueueSubmit2` in 49% of frames; submit to GPU start median 96 us; GPU end to the await
+returning median 37 us. `awaitGpu` averages 131 us but is bimodal (median 6, p90 295). Vanilla's `VulkanCommandEncoder.submit` waits for
+submit k-1 right after submitting k, so only one frame is ever queued; there is no readback or mapping stall. Binned
+(`scripts/patches/s28-frame-pacing.patch`):
+- **Three frames in flight** (logs 2411, 2441): removed the wait and the gap, but the frame's own GPU segments grew by as much (frame ->
+  blit 313 -> 408 us, blit -> submit 48 -> 118). Static on/off 0.9934, faster in 1 of 8.
+- **Busy-waiting on the semaphore** (log 2412): +0.3%. The 40 us stay, so they are on the GPU side.
+- **A new `VkSurfaceKHR` after FIFO** (log 2424): no change.
+
+So the gap is GPU-side presentation work plus submit latency. Cutting GPU busy time is the lever, and it converts into fps.
+
+**Harness finding: the present path depends on whether the window's first swapchain was FIFO.** `options.txt` in the run directory starts
+with `enableVsync:true`, and the harness turns vsync off only after start: the swapchain goes FIFO, then IMMEDIATE. Once a FIFO swapchain
+has existed on the window, every later swapchain stays in a slower present path for the session: CPU `present` ~24 us and GPU gap ~200 us,
+against ~76 and ~120. Diagnostics `-Pbench.presentMode=` and `-Pbench.extraReconfigures=`: FIFO -> IMMEDIATE -> IMMEDIATE is slow,
+IMMEDIATE -> FIFO -> IMMEDIATE is slow, IMMEDIATE from the start is fast (logs 2420-2423). Mixed static, default vs IMMEDIATE from the
+start: 1832 vs 2024/2143 (2 pairs, `s28-gpu-dev/presentab`); on the final build 2065 -> 2338 static and 1820 -> 2263 pan (logs 2448/2449).
+OpenGL shows no effect (log 2447 vs 2446). **Not changed:** starting the bench with vsync off would raise every Vulkan baseline by 13-24%
+and break comparability with history (decision for the user, section 8 item 2). Players who start with vsync off are in the fast path;
+those who turn it off in game stay slow until they restart. In the fast path the deep queue read +7.0% (7 of 8, drifting rounds, log 2441),
+unconfirmed by interleaved launches; it adds a frame of latency when GPU bound.
+
+**`c7490aa` Skip the vignette while it is black** (switch "Skip Black Vignette", `skipBlackVignette`, impact MEDIUM). `HudVignetteM` wraps
+the blit in `Hud.extractVignette` and skips the quad when the pipeline is vanilla's `VIGNETTE` and the color's RGB is 0: that blend (ZERO,
+ONE_MINUS_SRC_COLOR / ZERO, ONE) leaves every pixel unchanged. The color is black in daylight about 30 s after the eye reaches full light.
+At the static view the whole GUI pass goes: GPU busy 363.6 -> 329.4 us. Exact: close-ups 0 px at threshold 1 (logs 2430, 2434); a temporary
+log confirmed color `ff000000` and the skip alternating. In-launch 8 rounds: Vulkan static 1952.9 -> 2096.8 (+7.4%, 8 of 8), pan 1787.2 ->
+1897.8 (+6.2%, 8 of 8) (log 2435); OpenGL static 1637.4 -> 1701.7 (+3.9%, 8 of 8), pan 1667.0 -> 1807.3 (+8.4%, 8 of 8) (log 2437).
+
+**`7dd8dbf` Cull the inside faces of instanced models made of closed opaque boxes** (switch "Cull Closed Model Insides",
+`closedModelCulling`, MEDIUM). When a group's mesh is built, `ClosedBoxes` checks that every quad belongs to a closed, convex box wound
+outward (6 consecutive quads over 8 exactly shared corners, both triangles wound alike, no corner in front of a face's plane), and that every
+texel a face samples with nearest filtering passes the cutout (`TransparentFaces.TextureAlpha.isOpaqueNearest`, for plain textures with
+their own NEAREST sampler). Each frame such a group is drawn with the new `CUTOUT_CLOSED` pipeline only if every instance has a positive
+determinant and its bounding sphere (times the Frobenius norm, plus 1 block) is clear of the eye. Exact: close-ups 0 px (logs 2433, 2434);
+6 of 6 and 13 of 14 groups culled (the 14th not closed). Vulkan static 1977.0 -> 2099.8 (+6.2%, 8 of 8; instanced 68.5 -> 37.9 us), pan
+1855.9 -> 1896.5 (+2.2%, 8 of 8) (log 2436); OpenGL static 1762.6 vs 1757.5 (4 of 8; CPU bound), pan 1792.0 -> 1802.2 (6 of 8) (log 2438).
+
+**`6e3c05a` + `7ab33ac` Retained cell culling** (switch "Retained Cell Culling", `retainedCellCulling`, MEDIUM). Opaque entity-pipeline
+parts get one builder per 8³-block cell of the section, one draw per cell with its vertex bounds; a cell whose bounds plus 0.5 block lie
+outside the frame's cull frustum is skipped (`beginFrame` now gets the frustum). Text and outline sign draws stay one per render type, so
+render type order is unchanged. Batches rebuild when the switch flips. `7ab33ac` draws a part's cells facing group by facing group, nearest
+cell first, with shared transforms and bindings (cell-index order had cost the block entity scene 448 vs 287 us of retained GPU). Exact: 3
+new chest cube close-ups (`2603947`, close4-6, plus a 10-tick wait after close-up toggles); 0 px in close0-6 on Vulkan (logs 2467, 2471,
+2494) and OpenGL (logs 2470, 2497). Retained GPU at the mixed static view 71.8 -> 27.7 us.
+
+| in-launch 8 rounds, off -> on | static | pan |
+|---|---|---|
+| mixed, Vulkan (log 2495) | 2100.2 -> 2329.5 (+10.9%, 8 of 8) | 1901.3 -> 2020.6 (+6.3%, 8 of 8) |
+| mixed, OpenGL (log 2498) | 1732.9 -> 1766.3 (+1.9%, 7 of 8) | 1809.8 -> 1861.0 (+2.8%, 8 of 8) |
+| block entities, Vulkan (log 2496) | **1459.5 -> 1417.8 (-2.9%, lower in 7 of 8)** | 1962.8 -> 2076.0 (+5.8%, 8 of 8) |
+| facing the cube (log 2466) | neutral | |
+
+The block entity scene's static loss comes from dense sections whose cells are all in view: retained ~308 vs ~288 us, render thread +13 us.
+Ruled out: draw count, descriptor pushes, nearest-first vs plane order (log 2513). Splitting draws into 16 pieces (logs 2514/2515) made no
+difference. `1213c12` adds `bench.toggleField` to the block entity scene; `eff5a2c` / `5a8a0f4` add the patches and README rows. The
+settings screen check passed (log 2473).
+
+### Twenty-eighth session (2026-10-30): OpenGL's slower render thread (worktree)
+Branch `worktree-agent-a97bddc0c248f6591` on `778932f`, merged in `943c1cf`. Results and logs `0-46` are in that worktree's `build/` (another
+agent's matrices ran at the same time, serialised by the lock). Commits `9091a82` (skip the frame's first clear of the main target when the
+level clears it), `3bfb9a8` (skip the hand's depth clear when the GUI's depth clear comes first; same switch), `0bd5fbf` (harness:
+`GlCommandEncoderProfileMixin` splits OpenGL's submit into `fenceSync`, `awaitGpu`, `transientRotate`, as on Vulkan), `0669364` (patches
+`s28-gl-diagnostics.patch` and the binned `s28-retained-multidraw.patch`).
+
+**The gap, ranked.** Light profiler depth 8, static, plates on, mean of 2 runs per backend (`s28-gl-profile`). Vulkan 0.5425 ms/frame,
+`awaitGpu` 0.122, so ~0.42 busy; OpenGL 0.6345, `awaitGpu` 0.005. Busy gap ~0.214 ms. OpenGL isn't GPU bound (GPU frame <= 0.444 ms vs
+Vulkan 0.360, `-Pbench.gpuFrame`); its render thread is busy for the whole frame. `gl:*` sections at depth 16 (`s28-gl-diagnostics.patch`)
+agree.
+
+| OpenGL − Vulkan | us/frame | owner |
+|---|---|---|
+| present (`SDL_GL_SwapWindow`) 0.106 vs 0.025 ms, all inside SwapBuffers | +81 | driver |
+| clears: 4 per frame (frame start color+depth, level clear pass, hand depth, GUI depth), ~13-16 us each vs ~1 us; the first framebuffer bind of a frame costs ~12 us wherever it lands | ~+50 | vanilla's GL backend |
+| frame graph passes other than clears: sky +21, main pass begin/end +11, terrain +9 (vanilla); retained block entities +19 (23 draws, 7 pipeline binds, 115 `setUniform`), instanced models +6.5 (7 draws) (the mod) | ~+66 | |
+| swapchain blit (`glBlitFramebuffer` 24.9 us) | +16 | driver / vanilla |
+| `glFenceSync` | +14 | vanilla |
+| GUI draw, tick textures, extract, sound, fog, ... | ~+13 | vanilla |
+| Vulkan-only submit work (queueSubmit 26, pool reset 4, transient 2, destroy queue 1) | −34 | |
+
+GL call costs: `glDrawElements` ~0.6 us, pipeline bind ~0.7, per-draw setup ~0.5-1, pass begin ~5-6, pass end ~3-5; ~40 draws and ~20
+`setPipeline` per frame on both backends (`-Pbench.s28Count`). GL debug output ruled out: vanilla's `glDebugVerbosity:1` forced to 0 gave
+−11 us, +1.7% static (2 pairs, `s28-gl-debug`); it's vanilla's option, not worth a switch.
+
+**`7193e1d` on OpenGL** (plates off, 65 groups, in-launch 8 rounds, each part off with the others on; temporary switches now in
+`s28-gl-diagnostics.patch`; `s28-gl-7193-toggle`): all three parts 1228.4 -> 1448.1 (**+17.9%**, 8 of 8), render thread 0.795 -> 0.668 ms;
+bindings kept +7.5%; one prepare per render type +4.7%; one instance ring +11.5% (prepare −35 us, `awaitGpu` −34). On Vulkan the ring is
+within noise and all three ~+2%. On OpenGL, 65 per-group mapped rings cost CPU and GPU.
+
+**Kept: "Skip Redundant Frame Clear"** (`skipFrameClear`, impact LOW; `render/FrameClear`, `GameRendererM`, `FrontendCommandEncoderM`,
+`FrontendGpuSurfaceM`). `GameRenderer.render`'s start-of-frame color+depth clear of the main target is only remembered when the level is
+drawn, and so is `render3dHud`'s depth clear of the main target (the hud target's depth, read by post effects, is left alone). A full clear
+of the same textures drops the remembered clear (the level's clear pass, or the GUI's depth clear). Any other use performs it first (a render
+pass with them attached, another clear, an upload or copy, the swapchain blit), as does the end of `GameRenderer.render`. Temporary
+counters: 69632 dropped and 0 performed on OpenGL, 49152 / 0 on Vulkan; with the hand drawn (creative) the deferred depth clear was
+performed 6145 times. The hand clear only saves when no hand is drawn (spectators, third person, hidden HUD, sleeping).
+Exact: `StableDiff` threshold 1, frozen close-ups close0-3, 0 stable px on OpenGL and Vulkan for each clear (`s28-frameclear-close`,
+`s28-handclear-close`), and in creative with the hand drawn with the whole switch toggled (`s28-frameclear-creative`).
+
+| in-launch 8 rounds, static, off -> on | OpenGL | Vulkan |
+|---|---|---|
+| first clear (`9091a82`, `s28-frameclear-toggle`) | 1573.6 -> 1611.6 (+2.4%, 7 of 8), −19.7 us | 1844.7 -> 1859.3 (+0.8%, 7 of 8), `awaitGpu` −4.4 us |
+| hand depth clear (`3bfb9a8`, `s28-handclear-toggle`) | 1599.9 -> 1651.0 (+3.2%, 7 of 8), hand 13.5 -> 0.2 us | 1854.3 -> 1872.4 (+1.0%, 8 of 8) |
+
+Session start `778932f` vs end `0669364`, 3 interleaved pairs (`s28-final-gl`, `s28-final-vk`):
+
+| | static | pan | initial | particles |
+|---|---|---|---|---|
+| OpenGL | 1603.1 -> 1643.6 (+2.5%, 3 of 3), cpu 0.61 -> 0.60 | 1605.2 -> 1682.0 (+4.8%, every pair), cpu 0.61 -> 0.57 | 1026.0 -> 1052.8 (2 of 3) | 1233.5 -> 1286.8 (+4.3%, every pair) |
+| Vulkan | 1838.8 -> 1869.1 (+1.6%, every pair) | 1724.6 -> 1748.3 (+1.4%, every pair) | 1345.5 vs 1320.7 (noisy join) | 1489.0 vs 1491.3 |
+
+Busy gap after: ~0.19 ms (OpenGL 0.606 vs Vulkan 0.416). Settings screen check passed (`s28-settings`).
+
+**Binned:** retained multi-draw (`s28-retained-multidraw.patch`): a draw's plane and sign runs as one `glMultiDrawElementsBaseVertex`. 0 px
+in 4 chest cube views, but OpenGL static off/on 1.0006 (4 of 8), −2.7 us: the 23 retained draws are mostly single runs.
+
+**After the merge** (`943c1cf`, both agents' switches together): frozen close-ups close0-6 (4 shots, `closeToggle=skipFrameClear`, vignette skip, closed model culling and retained cell culling on) are 0 stable px at `StableDiff` threshold 1 on Vulkan and OpenGL (`s28-merge-close`, logs 2516, 2517). With the vignette skipped and nothing else in the HUD, the GUI-before-blur pass is gone, and the deferred `render3dHud` depth clear is dropped by `GameRenderer.render`'s GUI depth clear, which still runs. The settings screen check passed with all of the session's switches (log 2518).
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -2902,6 +3068,17 @@ Twenty-seventh session, mod compatibility only (each exact for vanilla, each swi
   names through mixins into those methods, keeps showing the old name tag.
 The no-switch commits (`faa4045`, `d2c512e`, `c71567f`, `a121d7c`, `fbc5245`) are exact. They change only the mod's own code, or vanilla
 calls whose results stay the same.
+Twenty-eighth session, mod compatibility only (each exact for vanilla, each switch on by default, **not yet reviewed by the user**):
+- **"Skip Redundant Frame Clear"** (`skipFrameClear`): vanilla's two clear calls in `GameRenderer.render` and `render3dHud` are
+  `@WrapOperation`-wrapped and may be skipped. A mod that wraps or injects at those calls sees them skipped, or performed later at the
+  target's first use. A mod that samples the main color or depth texture in a pass drawing into other textures, before the level's clear
+  pass or between the hand's depth clear and the GUI's, sees the previous contents instead of cleared values. Drawing into, copying or
+  clearing those textures is covered.
+- **"Skip Black Vignette"** (`skipBlackVignette`): a resource pack or shader pack that changes `core/position_tex_color` or the vignette's
+  blending, so that a black vignette changes pixels, loses that effect.
+- **"Cull Closed Model Insides"** (`closedModelCulling`): only the mod's own instanced `CUTOUT` groups are affected. See-through resource
+  pack texels fail the check and keep the old drawing. A mod that relies on seeing an armor stand's inside from outside would differ.
+- **"Retained Cell Culling"** (`retainedCellCulling`): the mod's own path only; bounds come from the actual vertices.
 The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
 been kept, its trade-off would have been: a mod that writes a downloaded skin's GPU texture without `DynamicTexture.upload`
 leaves stale masks (faces missing until the next upload or reload).
@@ -3081,11 +3258,22 @@ leaves stale masks (faces missing until the next upload or reload).
      - the OpenGL numbers for the plate change and the radix sort.
 
      **The mixed static view is now effectively GPU bound** (`awaitGpu` ~0.13 ms of a ~0.52 ms frame). CPU savings there show in the
-     render thread time and allocation, not in fps. Left:
-     - **GPU time of the mixed static view,** or the gap between its ~0.36 ms of GPU and the ~0.52 ms frame. This is the next lead for
-       fps there.
-     - **OpenGL's mixed static render thread is ~0.2 ms slower than Vulkan's** (0.61 vs 0.42 ms). Profile it with the light profiler at
-       depth 8. `7193e1d` hasn't been timed on OpenGL.
+     render thread time and allocation, not in fps.
+     Done in the twenty-eighth session (section 7): the GPU time (vignette skip, closed model culling, retained cell culling: Vulkan static
+     +23.4%) and the frame gap (GPU-side present work and the one-frame queue); the OpenGL gap (~85% vanilla's GL backend and the driver;
+     "Skip Redundant Frame Clear"). Left:
+     - **Block entity scene static -2.1%** from retained cell culling where every cell of a dense section is in view. Untested fix: one
+       merged buffer per part, laid out group-major across cells, so fully visible cells merge into the original few runs.
+     - **The bench's present path** (decision for the user, section 7): `options.txt` starts with vsync on, so the window's first swapchain
+       is FIFO and every later one stays in a slower present path. Starting with vsync off raises every Vulkan baseline by 13-24% and
+       breaks comparability with history. Players who turn vsync off in game stay slow until they restart.
+     - **Remaining GPU at the mixed static view (Vulkan, us):** opaque terrain 88, instanced models 38, retained 28, blit + acquire 35-50
+       (vanilla's), sky 14, the GUI depth clear ~10.
+     - **Closed box culling for `InstancedParts`** (mob `entity_cutout`, `armor_cutout_no_cull`): the entity and players scenes are CPU
+       bound, so it wouldn't show yet.
+     - **OpenGL leads:** a binding cache in vanilla's GL `setupDraw` (~10 us redundant UBO and sampler binds per frame; needs a switch,
+       raw GL mods could break it); the mod's retained draws (+19 us on GL, 7 pipeline switches) and instanced draws (+6.5 us, a mesh per
+       draw). Present (+81 us), `glBlitFramebuffer`, `glFenceSync` and the first framebuffer bind are out of reach.
      - **Candidate 7 (a trade-off idea only):** skip extraction and submission of armor stands whose inputs didn't change. It needs dirty
        tracking and is not exact for mods. What it could save is below.
      - **Plates off:** 37 grid keys per model against a cap of 32 still send ~20 stands to vanilla's path. Raising the cap was not
