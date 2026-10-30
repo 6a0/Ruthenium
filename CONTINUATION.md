@@ -531,11 +531,17 @@ and don't run Gradle in the background while running another; the idle Gradle da
 the wrapper for brevity.
 ```bash
 ./gradlew benchRuthenium          # this mod on vanilla's Vulkan backend (label ruthenium)
-./gradlew benchVanillaVulkan      # baselines: benchVanillaGl, benchVanillaVulkan, benchSodium (default backend = GL)
+./gradlew benchVanillaVulkan      # baselines: benchVanillaGl, benchVanillaVulkan, benchSodium (default backend = GL), benchSodiumVulkan
 scripts/run-matrix.sh 3 benchRuthenium   # N runs each, logs in build/bench-logs, prints BUILD/NTSTATUS per run
 python scripts/bench_summary.py build/run/bench/results   # medians per label and phase
 ```
 `./gradlew benchRutheniumGl` runs this mod on vanilla's OpenGL backend (label `ruthenium-gl`).
+`./gradlew benchSodiumVulkan` runs Sodium on vanilla's Vulkan backend (label `sodium-vulkan`): Sodium 0.9.3 picks its own Vulkan
+draw backends (`VK_MULTIDRAW` / `VK_INDIRECT`) when vanilla's device is Vulkan. Its Vulkan support is **experimental and has known
+bugs**, so treat its numbers as indicative. `benchSodium` passes no backend and gets the game's default (OpenGL). With Sodium the
+terrain scene fails after the pan, in the rebuild phase: that phase waits on vanilla's section compiler, which Sodium replaces, so its
+static and pan numbers are valid but the run reports BUILD FAILED. Thirty-second session, terrain RD 32, one run each, static / pan:
+vanilla Vulkan 480.0 / 671.0, Sodium OpenGL 500.5 / 540.2, Sodium Vulkan 710.3 / 836.0, Ruthenium 0.8.0 975.9 / 1029.3 fps.
 Options: `-PbenchJfr` (JFR profile to `results/<label>.jfr`), `-PbenchWindow=WxH` (default 1920x1080),
 `-PbenchJavaVendor=microsoft -Porg.gradle.java.installations.paths=<jdk>` (run on another JDK), and
 `-Pbench.<name>=value` → `-Druthenium.bench.<name>` (`renderDistance`, `preset`, `panSeconds`, `initialSeconds`,

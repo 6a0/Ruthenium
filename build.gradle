@@ -102,7 +102,7 @@ jar {
 }
 
 // Benchmarks: production-like client runs driven by the client gametest in src/gametest, in singleplayer worlds.
-// Usage: ./gradlew benchRuthenium (or benchVanillaGl / benchVanillaVulkan / benchSodium), -Pbench.scene=<scene>
+// Usage: ./gradlew benchRuthenium (or benchVanillaGl / benchVanillaVulkan / benchSodium / benchSodiumVulkan), -Pbench.scene=<scene>
 // Results are written to build/run/bench/results/
 def gametestJar = tasks.register("gametestJar", Jar) {
 	archiveClassifier = "gametest"
@@ -233,6 +233,7 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 registerBenchmark("benchVanillaGl", "vanilla-gl", "opengl", false, false)
 registerBenchmark("benchVanillaVulkan", "vanilla-vulkan", "vulkan", false, false)
 registerBenchmark("benchSodium", "sodium", null, false, true)
+registerBenchmark("benchSodiumVulkan", "sodium-vulkan", "vulkan", false, true)
 registerBenchmark("benchRuthenium", "ruthenium", "vulkan", true, false)
 registerBenchmark("benchRutheniumGl", "ruthenium-gl", "opengl", true, false)
 
