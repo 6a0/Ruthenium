@@ -212,7 +212,10 @@ public final class InstancedModels {
         @Nullable GpuBuffer mesh;
         int indexCount;
         boolean failed;
-        /** The last {@link #frame} that looked this group up or added an instance to it */
+        /**
+         * The last {@link #frame} that looked this group up or drew it (closed books after the first add instances without a
+         * lookup; {@link #prepareDraws} stamps every group with instances)
+         */
         int lastUsedFrame;
 
         ByteBuffer instances = MemoryUtil.memAlloc(64 * 52);
@@ -517,7 +520,6 @@ public final class InstancedModels {
         putRow(ptr + 32, m.m02(), m.m12(), m.m22(), m.m32());
         MemoryUtil.memPutInt(ptr + 48, lightCoords);
         group.count++;
-        group.lastUsedFrame = frame;
     }
 
     private static void putRow(long ptr, float x, float y, float z, float w) {
@@ -550,12 +552,14 @@ public final class InstancedModels {
         Group evictable = null;
         for (Group group : GROUPS) {
             if (group.matches(model, key, renderType, uvMapping, overlay, color)) {
+                // Also keeps the stand's body group from being evicted by its plate's lookup
                 group.lastUsedFrame = frame;
                 return group.failed ? null : group;
             }
             if (group.model == model) {
                 modelGroups++;
-                if (frame - group.lastUsedFrame > EVICT_AFTER_FRAMES
+                // Never a group with instances this frame (closed books add theirs without a lookup)
+                if (frame - group.lastUsedFrame > EVICT_AFTER_FRAMES && group.count == 0
                         && (evictable == null || group.lastUsedFrame - evictable.lastUsedFrame < 0)) {
                     evictable = group;
                 }
@@ -665,6 +669,7 @@ public final class InstancedModels {
             if (group.count == 0 || group.mesh == null) {
                 continue;
             }
+            group.lastUsedFrame = frame;
             group.instanceOffset = total;
             total += group.count * INSTANCE_SIZE;
             // The same textures for every group of a render type (the draws then keep their bindings)
