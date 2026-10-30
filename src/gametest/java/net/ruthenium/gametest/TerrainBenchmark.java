@@ -102,6 +102,9 @@ final class TerrainBenchmark {
             for (String yaw : TERRAIN_SHOT_YAWS) {
                 setView(context, Float.parseFloat(yaw.trim()));
                 context.takeScreenshot(label + "-terrain-yaw" + yaw.trim() + "-" + runId);
+                if (OcclusionProbe.ENABLED) {
+                    OcclusionProbe.survey(context, "yaw" + yaw.trim());
+                }
             }
 
             setView(context, BenchmarkClientGameTest.STATIC_YAW);
@@ -120,6 +123,9 @@ final class TerrainBenchmark {
                 context.runOnClient(_ -> GpuProbe.report("static"));
             }
             LOGGER.info(results.getLast().summaryLine());
+            if (OcclusionProbe.ENABLED) {
+                OcclusionProbe.run(context, label, runId, results);
+            }
 
             context.runOnClient(_ -> {
                 FrameRecorder.startPhase();

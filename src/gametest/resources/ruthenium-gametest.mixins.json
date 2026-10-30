@@ -17,6 +17,8 @@
     "LevelTickProfileMixin",
     "MinecraftMixin",
     "MinecraftProfilerMixin",
+    "OcclusionProbeLevelMixin",
+    "OcclusionProbeProjectionMixin",
     "ParticleEngineAccessor",
     "PresentModeMixin",
     "RetainedDrawProbeMixin",

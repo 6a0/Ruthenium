@@ -10,4 +10,7 @@ public interface TerrainDrawListGroupAccessor {
 
     @Accessor("count")
     int getCount();
+
+    @Accessor("count")
+    void setCount(int count);
 }
