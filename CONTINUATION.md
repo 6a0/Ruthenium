@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-29 (twenty-fifth session; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-30 (twenty-sixth session; twenty-fifth; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -236,6 +236,14 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   Texture", `cloudFaceTexture`): `vkQueueSubmit2` -21.7 us per frame, mixed static 1786.7 -> 1847.6 fps (+3.4%, every pair), OpenGL +1.8%;
   instanced groups share one instance ring, one prepare per render type and their bindings (exact): ~0.8 us per group, -4 us at the default 7
   groups; full size screenshots copy rows ("Fast Screenshots", `fastScreenshots`): the new world's icon readback 24-33 -> 11-15 ms.
+- **Twenty-sixth session** (section 7):
+  - **OpenGL:** the plate change gains +30.7% mixed static there (Vulkan +12.5%), and the radix sort cuts warm builds by 24%. Neither
+    regresses.
+  - **Stale instanced groups are evicted** (`InstancedModels`, no switch). With plates off, after the yaw sync, static goes 1526 -> 1804
+    fps; plates on is unchanged. This also explains the plate change's "seven unexplained pixels": those stands weren't instanced.
+  - **Candidate 6:** a front cache before the two-argument render type memos ("Render Type Lookup Cache") and empty hands skipping the
+    crossbow charge time's enchantment iteration ("Skip Empty Crossbow Charge Time"). Both are exact. Each saves ~3 us of render thread and
+    9-12% of its allocation. The mixed static fps doesn't move, because that view now waits on the GPU.
 - **Next:** see section 8.
 
 ---
@@ -2370,7 +2378,188 @@ later ones 2.5-3.2 vs 0.7-2.8 ms (the fresh 8 MB image's page faults dominate bo
 
 Still open: the stale groups with plates off (above); candidates 6 (small per-entity items) and 7 (trade-off idea) of the list above; the
 seven close-up pixels of the plate change; the plate change and the radix sort on the OpenGL backend (not measured). All are listed in
-section 8 item 2.
+section 8 item 2. All but candidate 7 were done in the twenty-sixth session (below).
+
+### Twenty-sixth session (2026-10-29/30)
+Three subagents worked on the three open items of section 8 item 2, at most two at a time. Every Gradle command ran under the GPU lock.
+- **OpenGL measurements:** in the main tree, measurement only.
+- **The eviction fix:** in a worktree, branch `worktree-agent-a7e3cdc31ceddcbd0`, merged as `d86fbab`; its results and logs are in that
+  worktree's `build/`.
+- **Candidate 6:** in the main tree after the OpenGL agent finished.
+Commits: `36bb953`, `b6260b7` (eviction), `30f72b6`, `a9c1d7f` (candidate 6). Main tree logs `build/bench-logs/2167-2216`; worktree logs 1-63.
+
+#### OpenGL: the plate change (`46a7390`) and the radix sort (`cea8b4b`)
+**Neither regresses on OpenGL. The plate split gains much more there than on Vulkan.**
+
+*Plates.* Same method as on Vulkan: the tree at `46a7390`, `run-ab.sh` with `-Pvm.armorStandPlates=false` against `=true`.
+
+| switch off -> on | static | pan | initial | particles |
+|---|---|---|---|---|
+| OpenGL, 4 interleaved pairs (`s26-gl-plate-mixed`, logs 2167-2174) | 1202.0 -> 1571.3 (+30.7%, every pair), p99 566.5 -> 664.4, 0.80 -> 0.61 ms | 1440.7 -> 1591.1 (+10.4%, every pair), 0.67 -> 0.61 | 825.6 -> 1011.8 (every pair), 1.18 -> 0.96 | 890.9 -> 1226.3 (+37.6%, every pair), 1.08 -> 0.79 |
+| Vulkan, 3 pairs (`s25-plate-mixed`) | 1599.2 -> 1799.5 (+12.5%), 0.54 -> 0.42 | 1651.6 -> 1715.4, 0.44 -> 0.37 | 1114.1 -> 1270.8 | 1281.3 -> 1432.2 |
+| OpenGL, in-launch, 8 rounds (`s26-gl-plate-toggle-mixed`, log 2176) | 1228.1 -> 1587.0 (8 of 8), 0.794 -> 0.615 | 1471.1 -> 1619.3 (8 of 8), 0.661 -> 0.594 | | |
+
+- **Why the gain is larger:** the 58 extra groups with plates off cost 0.19 ms of render thread on OpenGL, about 3.3 us per group. On
+  Vulkan they cost 0.12 ms, about 2 us per group. Both were measured at `46a7390`, before `7193e1d`.
+- **The stale-group bug didn't touch the interleaved runs.** Every phase ended within the ~60 s window after spawn: pan ~33 s, static ~41
+  s, particles ~51 s, checked per log.
+- **The in-launch toggle dipped once.** Static round 4 ran 60-64 s after spawn, so the sync landed in it.
+- **Parity** (`s26-gl-plate-parity`): every close-up count matches Vulkan's table within 1 px. Across the switch, 0 px differ by 2 levels
+  or more.
+
+*Radix sort with direct gather.* Each build was timed by a temporary timer, applied after each checkout and reverted after the run.
+`-Pjvm.ruthenium.s26.rebuildEvery=40` marked every batch dirty every 40 frames. 2 ABBA pairs; the tools are in
+`s26-gl-radix-time/tools/`.
+
+| warm builds, `46a7390` -> `cea8b4b` | 2048 block entities | 1536 | 520 |
+|---|---|---|---|
+| OpenGL build | 5.78 / 5.74 -> 4.46 / 4.33 ms | 4.31 / 4.30 -> 3.32 / 3.35 | 1.49 / 1.49 -> 1.12 / 1.15 |
+| OpenGL `sortByPlanes` call (keys, sort, planes, gather) | 3.33 / 3.34 -> 1.76 / 1.76 | 2.40 / 2.42 -> 1.30 / 1.30 | 0.76 / 0.77 -> 0.42 / 0.42 |
+| Vulkan build (twenty-fifth session) | 6.27 / 6.20 -> ~4.65 | 4.67 / 4.66 -> ~3.5 | 1.55 -> ~1.2 |
+
+- **The gain:** -1.37 ms (-24%) per warm 2048 build on OpenGL, against -1.55 ms on Vulkan.
+- **With rebuilds every 40 frames:** static 833.9 / 831.1 -> 920.3 / 937.6 fps, both pairs.
+- **The commit A/B in fps** (3 pairs, `s26-gl-radix-mixed`, logs 2181-2186): 1542.4 vs 1554.9 static, 1574.1 vs 1594.6 pan, render thread
+  equal (0.63 ms). No regression; the scene's own builds are cold.
+
+*Still open on OpenGL:*
+- The mixed static view's render thread is ~0.2 ms slower than on Vulkan (0.61 vs 0.42 ms, plates on). It hasn't been profiled.
+- `7193e1d` was only checked for exactness on OpenGL, not timed.
+
+*Script quirk:* `run-ab-commits.sh` started from a detached HEAD fails its final `git checkout -q ""`. It's harmless.
+
+#### Stale `InstancedModels` groups evicted (`36bb953`, `b6260b7`; no switch)
+**The design** (`InstancedModels.findGroup`):
+- Eviction happens only when a model is at its cap (still 32) and needs a new group, and at most once per frame. The model's least recently
+  used group goes, if it has been unused for more than `EVICT_AFTER_FRAMES = 1024` frames and has no instances this frame. Below the cap
+  nothing is evicted, so models out of view keep their groups.
+- **Why one eviction per frame:** a model whose groups all went idle could come back with more keys than its cap. Without the limit it
+  would evict and rebuild a group for every key past the cap, in turn, in one frame.
+- **What counts as used:** a matching lookup stamps the group, and `prepareDraws` stamps every group with instances once per frame
+  (`b6260b7`; `36bb953` stamped per instance). The match stamp also stops a plate lookup from evicting the same stand's body group, which
+  was found just before it.
+- **Why 1024 frames:**
+  - Rebuilds are bounded to 32 per model per 1024 frames, about 1 us per frame at most.
+  - That is far more than the frames in flight, so the GPU can't still be reading a closed mesh.
+  - Recovery after the sync takes about 0.6 s.
+- An evicted group is closed at once. If it is the closed book group, `closedBookGroup` and `closedBookRenderer` are reset.
+- **The books can't thrash.** They have one key (`BOOK_CLOSED`), so one group, and the cap is per model. 0 book evictions in every run.
+- **No switch.** It's a fix on the mod's own path that only changes which stands get a group.
+
+**Builds in a plates-off run:**
+- 195 in all: 65 at the start, 64 at the sync, and about 66 during the 360° pan.
+- The pan builds are overflow keys (37 per model against the cap of 32) taking the slots of stands out of view. That is at most 1 per frame,
+  20-110 us each, and pan fps doesn't drop.
+- With plates on: 0 evictions in every run.
+
+**Numbers** (mixed scene, Vulkan, worktree):
+- In the property A/B, the off side was the new code with eviction disabled by a temporary property, removed before the commit.
+- The commit A/Bs checked out each commit in turn in the worktree.
+- `-Pbench.initialSeconds=75` puts every phase after the sync, which lands ~63 s after spawn. The standard phases all run before it.
+
+| | static | pan | initial | particles |
+|---|---|---|---|---|
+| plates off, after the sync, property A/B, 3 pairs (`s26-platesoff-late`) | 1526.1 -> 1804.2 (every pair), 0.62 -> 0.45 ms | 1651.3 -> 1713.9 | 1708.5 -> 1765.7 | 1200.9 -> 1442.5 |
+| plates off, after the sync, `1a43c7d` vs `36bb953`, 2 pairs | 1520.1 -> 1811.4 (every pair) | 1653.2 -> 1704.1 | 1693.8 -> 1773.9 | 1197.0 -> 1440.4 |
+| plates on, `1a43c7d` vs `b6260b7`, 4 pairs (`s26-final-plateson`) | 1837.2 vs 1842.1 | 1721.6 vs 1731.3 (every pair) | 1359.5 vs 1345.6 (noisy join) | 1478.0 vs 1492.2 (every pair) |
+| plates on, yaw 270 (closed books), 3 pairs (`s26-final-yaw270`) | 1607.2 vs 1607.4 | | | 1520.3 vs 1518.5 |
+
+- **Group counters after the sync** (temporary probe):
+
+  | | groups drawn | instances | stands on vanilla's path |
+  |---|---|---|---|
+  | without eviction | 2 | 25 | 241 |
+  | with eviction | 65 | 246 | 20 (37 grid keys per model, as before the sync) |
+  | cap 64, no eviction | | | 238 (the client's yaw interpolation makes transient keys) |
+
+- **Why the stale state was slower than instancing off:** each fallback stand scanned 65 groups with `Arrays.equals` before taking
+  vanilla's path. `ToggleAb` with plates off (`toggleField=instancedModels`): without eviction, off/on was 1.09 from round 1 on; with
+  eviction it is 0.92 in all 8 rounds. **`ToggleAb` with plates off is valid past round 3 now.**
+- **`b6260b7` exists because `36bb953` measured -0.5% static with plates on** (1849.3 vs 1840.0, old faster in 4 of 5 pairs, two of them
+  by under 1 fps): a per-instance store for thousands of books. With `b6260b7`, static, pan and yaw 270 are even or better.
+
+**Exactness** (frozen close-ups after the sync, `s26-close/*`). The harness's plate toggles clear the groups, so only close0's shot 0 shows
+the groups the benchmark left.
+- **Plates on, across launches with and without eviction:** 0 px in 16 of 16 shots.
+- **Plates off:** 0 px in 15 of 16. The exception is close0 shot 0, where the no-eviction run draws the stale stands through vanilla's
+  path.
+- **Groups rebuilt after eviction against fresh groups,** with the cap raised to 64 for the check so the overflow choice can't differ:
+  0 px in all four close-ups.
+
+**The "seven unexplained pixels" are explained** (subagent's analysis, consistent with every log):
+- The variety stands in close2 took vanilla's path in the first shot because their model was at its cap, filled with stale or grid keys,
+  until a plate toggle cleared the groups. After that they were instanced.
+- The 8-55 level differences are the known instanced-vs-vanilla rounding on a texel edge, visible only where those stands are instanced.
+- That gives 2133's pattern: pixel 902,543 has vanilla's `7e6642` in shot 0 and `473820` in shots 1-3. It also gives 2134's: no clearing
+  toggle, so vanilla's values in every shot.
+- The OpenGL run shows the same.
+
+**Left:**
+- With plates off, ~20 stands still overflow the 37-key grid. Raising the cap was not measured.
+- The close-up harness can't check the groups the benchmark left beyond close0's first shot, because its toggles clear the groups.
+- The eviction fix was not measured on OpenGL.
+
+#### Candidate 6: render type front cache (`30f72b6`) and empty crossbow charge time (`a9c1d7f`)
+**Both are exact for vanilla and each has a switch. Neither moves the mixed static fps:** that view now waits on the GPU (`awaitGpu` ~0.13
+ms of a 0.52 ms frame), and the wait absorbed every microsecond saved. The investigation's +2-4% estimate was wrong. The real gains are
+about 3 us of render thread per frame each, plus 9-12% less render-thread allocation.
+
+*The probe* (`scripts/patches/s26-memo-probe.patch`, `s26-c6-probe`) counted `Util.memoize` lookups on the render thread:
+- **Mixed scene:** `RenderTypes.ENTITY_CUTOUT` 207 per frame, 1 key. Everything else is below 0.1 per frame.
+- **Entity scene:** `ENTITY_CUTOUT` 455 per frame. That is 87 equal keys, but more than 4096 distinct `Identifier` objects, because
+  villager clothing and other textures build them every frame.
+- **One-argument memos** (`ENTITY_SOLID_Z_OFFSET_FORWARD` 151 per frame, `ARMOR_CUTOUT_NO_CULL` 99, `EquipmentLayerRenderer`'s ~110) don't
+  allocate: they hit `ConcurrentHashMap.computeIfAbsent`'s first-node fast path. They were left alone.
+- **Two-argument memos allocate on every call.** `Util$11.apply` builds a `Pair`, a lambda and the `Object[]` for its hash. That was 6.6%
+  of render-thread allocation in the twenty-fifth session's JFR.
+- **The crossbow:** `CrossbowItem.getChargeDuration`'s enchantment iterator was 6.8%, called from
+  `HumanoidMobRenderer.extractHumanoidRenderState` for armor stands, humanoid mobs and players.
+
+*Design:*
+- **"Render Type Lookup Cache", `renderTypeCache`.**
+  - A `@ModifyExpressionValue` wraps every `Util.memoize(BiFunction)` in `RenderTypes.<clinit>` in a `RenderTypeFrontCache`:
+    `ENTITY_CUTOUT`, `_Z_OFFSET`, `_DISSOLVE`, `ENTITY_TRANSLUCENT`, `_EMISSIVE`, `BEACON_BEAM` and `OUTLINE`.
+  - The cache is two-way set associative: 512 sets of immutable `(first, second, result)` records.
+  - A hit needs `==` or `equals` on both arguments, `Pair.equals`' test. `null` arguments and misses go to vanilla's memo.
+  - Each entry is written with one reference store, so it is thread safe.
+  - A direct-mapped first version missed 11% of lookups in the players scene. The two-way version misses 76 of ~1M there.
+- **"Skip Empty Crossbow Charge Time", `emptyCrossbowCharge`** (on by default; the user's decision, 2026-10-29).
+  - A `@WrapOperation` on the `getChargeDuration` call in `extractHumanoidRenderState` returns 25 (`Mth.floor(1.25F * 20F)`) when
+    `stack.isEmpty()`. Otherwise it calls vanilla.
+  - This is exact for every empty stack: their `getComponents()` is `DataComponentMap.EMPTY`, so even a count-0 enchanted crossbow
+    iterates nothing.
+
+*Exactness* (`scripts/patches/s26-c6-check.patch`): every cache hit also asked vanilla's memo, and every skip also called vanilla.
+
+| run | render type hits | of them with an equal but not identical key | crossbow calls | mismatches |
+|---|---|---|---|---|
+| mixed | 14.9M | 1 | 15.0M | 0 |
+| entities | 6.0M | 1.54M | 1.01M | 0 |
+| players | 0.97M | 71k | 2.0M | 0 |
+| entities with AI (first version) | 4.0M | 0.57M | 0.38M (9784 non-empty went to vanilla) | 0 |
+
+Synthetic stacks check the result itself: vanilla returns 25 for `EMPTY`, for air and for a count-0 Quick Charge III crossbow, and 10 for
+the count-1 control.
+
+*Numbers* (switch off -> on, in-launch, 8 rounds; KB/frame is render-thread allocation, lower in 8 of 8 everywhere):
+
+| | static fps | KB/frame | light profiler |
+|---|---|---|---|
+| `renderTypeCache`, mixed | 1854.4 vs 1853.3 (4 of 8) | 126.2 -> 111.4 | `submitFeatures` -3.2 us, `awaitGpu` +3.8 us |
+| `renderTypeCache`, entities | 356.4 -> 361.5 (+0.9%, 7 of 8) | 2085 -> 2027 | |
+| `renderTypeCache`, OpenGL mixed | 1616.0 -> 1638.1 (+0.9%, 6 of 8) | 132.8 -> 117.6 | |
+| `emptyCrossbowCharge`, mixed | 1852.0 vs 1853.4 (4 of 8) | 111.7 -> 100.9 | `extract/level/entities` -2.8 us, `awaitGpu` +3.2 us |
+| `emptyCrossbowCharge`, entities | 363.9 vs 363.5 (noise) | 2034 -> 2015 | `extract/level/entities` -4.8 us |
+| `emptyCrossbowCharge`, OpenGL mixed | 1624.2 -> 1671.0 (6 of 8; the off rounds drifted, so read it as no loss) | 112.5 -> 101.1 | |
+
+**Both switches together, mixed, 3 interleaved pairs** (`s26-c6-ab-mixed`, logs 2210-2215):
+- static 1843.9 -> 1864.7 (one pair equal, two higher)
+- initial 1376.3 -> 1405.5 (every pair)
+- particles 1496.2 -> 1508.8
+- pan 1738.8 vs 1736.1
+- static allocation ~235 -> ~205 MB/s; static GCs 6/9/8 -> 5/6/5
+
+Mod compatibility notes are in section 8.
 
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
@@ -2521,6 +2710,12 @@ vertex shader, so shader packs and cloud mods that swap vanilla's cloud pipeline
 texel buffer is still written, so mods that read it keep working). Switch "Fast Screenshots" (**accepted by the user on 2026-10-29**): full size
 screenshots no longer run vanilla's copy lambda in `Screenshot.takeScreenshot` (a cancelling `@Inject` at its head), so a mod injecting into
 that lambda is bypassed; downscaled shots keep it. The `InstancedModels` change touches no vanilla code.
+Twenty-sixth session, mod compatibility only (both exact for vanilla). Switch "Skip Empty Crossbow Charge Time" (`emptyCrossbowCharge`,
+**on by default, the user's decision of 2026-10-29**): a mod that hooks `EnchantmentHelper.modifyCrossbowChargingTime`,
+`runIterationOnItem` or `CrossbowItem.getChargeDuration` to change the charge time of empty stacks is bypassed during humanoid extraction.
+Non-empty stacks keep vanilla's call. Switch "Render Type Lookup Cache" (`renderTypeCache`, not yet reviewed by the user): vanilla's
+`RenderTypes` methods are untouched. A mod reading the memo fields through an accessor gets the wrapper, which gives the same answers. A mod
+injecting into `Util`'s memoizing `BiFunction` misses the hits of these memos. The group eviction touches no vanilla code.
 The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
 been kept, its trade-off would have been: a mod that writes a downloaded skin's GPU texture without `DynamicTexture.upload`
 leaves stale masks (faces missing until the next upload or reload).
@@ -2692,20 +2887,23 @@ leaves stale masks (faces missing until the next upload or reload).
      client tick is ~0.53 ms (not 0.93). Done: armor stand base plates as their own instances (static +12.5%), radix-sorted retained
      builds gathered into the upload; in part 2 clouds without a texel buffer (mixed static +3.4%, `queueSubmit` -21.7 us), instanced groups
      sharing ring, prepares and bindings (~0.8 us per group before; -4 us at 7 groups), row-wise screenshot readback (icon callback 24-33 ->
-     11-15 ms). Left (all from the twenty-fifth session, section 7):
-     - **Bug, plates off:** evict unused `InstancedModels` groups. With `armorStandPlates=false` the server's byte-quantized yaw sync
-       fills the 32 groups per model with stale angles after ~60 s, so most stands fall back to vanilla's path (static ~1720 -> ~1460 fps;
-       the default, plates on, is unaffected). Groups are never evicted today. It also limits `ToggleAb` with plates off to ~3 static rounds.
-     - **The plate change's 7 close-up pixels** (8-55 levels against vanilla's path, depending on when the instance groups were built, not
-       on the switch's state; mechanism unknown; repro in the twenty-fifth session's entry: pixel 902,543 in `close2`, logs `2133`/`2134`).
-     - **Candidate 6:** small per-entity items, to probe before building: a front cache for `RenderTypes.entityCutout` and similar
-       `Util.memoize` lookups with `Pair` keys (exact), and skipping `CrossbowItem.getChargeDuration`'s enchantment iteration for empty stacks
-       during humanoid extraction (6.3% of render thread allocation; a trade-off: mods hooking `EnchantmentHelper.modifyCrossbowChargingTime`
-       are bypassed for empty stacks; needs the user's decision). Estimated +2-4% together.
-     - **Candidate 7 (trade-off idea only):** skip extraction and submission of armor stands whose inputs didn't change (dirty tracking;
-       not exact for mods). What it could save is below.
-     - **OpenGL not measured** for the plate change (`46a7390`) and the radix sort with direct gather (`cea8b4b`); both were measured on
-       Vulkan only (clouds, instanced groups and screenshots were checked on both).
+     11-15 ms).
+     Done in the twenty-sixth session (section 7):
+     - the stale-group eviction;
+     - the explanation of the seven pixels;
+     - candidate 6 (render type front cache, empty crossbow charge);
+     - the OpenGL numbers for the plate change and the radix sort.
+
+     **The mixed static view is now effectively GPU bound** (`awaitGpu` ~0.13 ms of a ~0.52 ms frame). CPU savings there show in the
+     render thread time and allocation, not in fps. Left:
+     - **GPU time of the mixed static view,** or the gap between its ~0.36 ms of GPU and the ~0.52 ms frame. This is the next lead for
+       fps there.
+     - **OpenGL's mixed static render thread is ~0.2 ms slower than Vulkan's** (0.61 vs 0.42 ms). Profile it with the light profiler at
+       depth 8. `7193e1d` hasn't been timed on OpenGL.
+     - **Candidate 7 (a trade-off idea only):** skip extraction and submission of armor stands whose inputs didn't change. It needs dirty
+       tracking and is not exact for mods. What it could save is below.
+     - **Plates off:** 37 grid keys per model against a cap of 32 still send ~20 stands to vanilla's path. Raising the cap was not
+       measured. This matters only with the switch off.
      After the plate change the armor stands still cost ~63 us
      extraction, ~38 us submission and ~60 us model prepare per frame; the static render thread is now ~0.39 ms per frame.
    - **Retained builds after joining or teleporting**: a section is built in one go; in the mixed scene's initial phase
