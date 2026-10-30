@@ -60,7 +60,7 @@ public class FrontendCommandEncoderM {
 
     @Inject(method = "clearDepthTexture", at = @At("HEAD"))
     private void ruthenium$beforeDepthClear(GpuTexture depth, double clearDepth, CallbackInfo ci) {
-        FrameClear.beforeUse(depth);
+        FrameClear.beforeDepthClear(depth);
     }
 
     @Inject(method = "writeToTexture(Lcom/mojang/renderpearl/api/textures/GpuTexture;Lcom/mojang/blaze3d/platform/NativeImage;IIII)V", at = @At("HEAD"))

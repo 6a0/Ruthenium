@@ -67,7 +67,7 @@ public class Config {
     public boolean cloudFaceTexture = true;
     /** Full size screenshots (F2, a new world's icon) copy the read back frame a row at a time instead of a pixel at a time */
     public boolean fastScreenshots = true;
-    /** The frame's first clear of the main target is skipped when the level's own clear pass clears it again before any use */
+    /** Clears of the main target that another clear overwrites before any use are skipped (the frame's first, the hand's depth) */
     public boolean skipFrameClear = true;
     /** Name tags and text display lines are drawn from a label-space mesh of their glyphs and a per-frame pose */
     public boolean retainedLabels = true;

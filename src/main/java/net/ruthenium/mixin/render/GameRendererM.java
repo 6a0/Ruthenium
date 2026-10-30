@@ -24,6 +24,15 @@ public class GameRendererM {
         }
     }
 
+    @WrapOperation(method = "render3dHud", at = @At(value = "INVOKE",
+            target = "Lcom/mojang/renderpearl/api/commands/CommandEncoder;clearDepthTexture(Lcom/mojang/renderpearl/api/textures/GpuTexture;D)V"))
+    private void ruthenium$deferHandDepthClear(CommandEncoder encoder, GpuTexture depth, double clearDepth, Operation<Void> original) {
+        // Only the main target's depth: the GUI clears that one again (the hud target's depth is read by post effects)
+        if (depth != ((GameRenderer) (Object) this).mainRenderTarget().getDepthTexture() || !FrameClear.deferDepth(depth, clearDepth)) {
+            original.call(encoder, depth, clearDepth);
+        }
+    }
+
     /** Nothing used the target this frame (it can't happen in vanilla): clear it as vanilla would have */
     @Inject(method = "render", at = @At("RETURN"))
     private void ruthenium$flushFrameClear(CallbackInfo ci) {
