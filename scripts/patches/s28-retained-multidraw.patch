@@ -1,0 +1,146 @@
+diff --git a/src/main/java/net/ruthenium/config/Config.java b/src/main/java/net/ruthenium/config/Config.java
+index f51bdd2..bfa9238 100644
+--- a/src/main/java/net/ruthenium/config/Config.java
++++ b/src/main/java/net/ruthenium/config/Config.java
+@@ -91,6 +91,8 @@ public class Config {
+     public boolean noAllocLightProbe = true;
+     /** Name tags of entities whose display name is built from the same objects as last frame are not built again */
+     public boolean keepDisplayNames = true;
++    // S28 TEMP: retained runs of one draw in one multi-draw where the device takes separate arrays (OpenGL)
++    public boolean s28RetainedMultiDraw = true;
+     /** Finds the draw of a render type with a hash lookup instead of a linear search */
+     public boolean hashedDrawLookup = true;
+     /** Geometry of equal render types joins one draw in groups that may be reordered */
+diff --git a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+index 9121695..8453ff9 100644
+--- a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
++++ b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+@@ -88,9 +88,11 @@ import org.joml.Matrix4f;
+ import org.joml.Vector3f;
+ import org.joml.Vector4f;
+ import org.jspecify.annotations.Nullable;
++import org.lwjgl.PointerBuffer;
+ import org.lwjgl.system.MemoryUtil;
+ 
+ import java.nio.ByteBuffer;
++import java.nio.IntBuffer;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.IdentityHashMap;
+@@ -168,6 +170,12 @@ public final class RetainedBlockEntities {
+     /** AbstractSignRenderer.OUTLINE_RENDER_DISTANCE plus a block of margin, for skipping batches without a sign in reach */
+     private static final double OUTLINE_REACH_SQ = 17.0 * 17.0;
+     private static final int[] RUNS = new int[SectionFaceGroups.MAX_PLANE_RUNS * 2];
++    /** The runs of signs that stay retained, as (first quad, quads) pairs */
++    private static int[] signRuns = new int[64];
++    /** A draw's runs for one multi-draw: byte offsets of the first index (all 0), index counts and base vertices */
++    private static PointerBuffer multiOffsets = MemoryUtil.memAllocPointer(64);
++    private static IntBuffer multiCounts = MemoryUtil.memAllocInt(64);
++    private static IntBuffer multiBases = MemoryUtil.memAllocInt(64);
+ 
+     private static final int NOT_CANDIDATE = 0;
+     private static final int CANDIDATE = 1;
+@@ -1071,6 +1079,8 @@ public final class RetainedBlockEntities {
+         RenderPipeline boundPipeline = null;
+         RenderType boundType = null;
+         boolean faceCulling = Initializer.CONFIG.modelBackFaceCulling;
++        // A draw's runs in one call where the device takes separate multi-draw arrays (OpenGL: a call per run costs more there)
++        boolean multi = Initializer.CONFIG.s28RetainedMultiDraw && RenderSystem.getDevice().getDeviceInfo().features().multiDrawDirectSeparate();
+         int i = 0;
+         for (Batch batch : VISIBLE) {
+             float eyeX = (float) (camX - batch.originX), eyeY = (float) (camY - batch.originY), eyeZ = (float) (camZ - batch.originZ);
+@@ -1097,13 +1107,10 @@ public final class RetainedBlockEntities {
+                     renderPass.setUniform("DynamicTransforms", transform);
+                     renderPass.setVertexBuffer(0, draw.buffer.slice());
+                     if (draw.signEnds != null && batch.anyNear) {
+-                        drawSignsNotNear(renderPass, draw.signEnds, batch.signsNear);
++                        drawRuns(renderPass, signRuns, signRunsNotNear(draw.signEnds, batch.signsNear), multi);
+                     } else if (faceCulling && draw.faces != null) {
+                         // Quads that face away from the eye would be culled by the pipeline
+-                        int runs = draw.faces.visiblePlaneRuns(eyeX, eyeY, eyeZ, RUNS);
+-                        for (int r = 0; r < runs; r++) {
+-                            renderPass.drawIndexed(RUNS[r * 2 + 1] * 6, 1, 0, RUNS[r * 2] * 4, 0);
+-                        }
++                        drawRuns(renderPass, RUNS, draw.faces.visiblePlaneRuns(eyeX, eyeY, eyeZ, RUNS), multi);
+                     } else {
+                         renderPass.drawIndexed(draw.indexCount, 1, 0, 0, 0);
+                     }
+@@ -1113,8 +1120,13 @@ public final class RetainedBlockEntities {
+         renderPass.popDebugGroup();
+     }
+ 
+-    /** Draws the quads of the signs that stay retained this frame, in runs of consecutive signs */
+-    private static void drawSignsNotNear(RenderPass renderPass, int[] signEnds, boolean[] near) {
++    /**
++     * The quads of the signs that stay retained this frame, in runs of consecutive signs, into {@link #signRuns}
++     *
++     * @return the number of runs (empty ones left out)
++     */
++    private static int signRunsNotNear(int[] signEnds, boolean[] near) {
++        int runs = 0;
+         int start = 0;
+         int runStart = -1;
+         for (int k = 0; k < signEnds.length; k++) {
+@@ -1123,19 +1135,57 @@ public final class RetainedBlockEntities {
+                     runStart = start;
+                 }
+             } else if (runStart >= 0) {
+-                drawQuads(renderPass, runStart, start - runStart);
++                runs = addRun(runs, runStart, start - runStart);
+                 runStart = -1;
+             }
+             start = signEnds[k];
+         }
+         if (runStart >= 0) {
+-            drawQuads(renderPass, runStart, start - runStart);
++            runs = addRun(runs, runStart, start - runStart);
++        }
++        return runs;
++    }
++
++    private static int addRun(int runs, int first, int count) {
++        if (count <= 0) {
++            return runs;
+         }
++        if (signRuns.length < (runs + 1) * 2) {
++            signRuns = Arrays.copyOf(signRuns, signRuns.length * 2);
++        }
++        signRuns[runs * 2] = first;
++        signRuns[runs * 2 + 1] = count;
++        return runs + 1;
+     }
+ 
+-    private static void drawQuads(RenderPass renderPass, int first, int count) {
+-        if (count > 0) {
+-            renderPass.drawIndexed(count * 6, 1, 0, first * 4, 0);
++    /**
++     * Draws runs of quads (first quad, quads), in order: one {@code drawIndexed} each, or with {@code multi} one multi-draw,
++     * which draws the same ranges in the same order
++     */
++    private static void drawRuns(RenderPass renderPass, int[] runs, int count, boolean multi) {
++        if (multi && count > 1) {
++            if (multiCounts.capacity() < count) {
++                int capacity = Math.max(count, multiCounts.capacity() * 2);
++                MemoryUtil.memFree(multiOffsets);
++                MemoryUtil.memFree(multiCounts);
++                MemoryUtil.memFree(multiBases);
++                multiOffsets = MemoryUtil.memAllocPointer(capacity);
++                multiCounts = MemoryUtil.memAllocInt(capacity);
++                multiBases = MemoryUtil.memAllocInt(capacity);
++            }
++            for (int r = 0; r < count; r++) {
++                multiOffsets.put(r, 0L);
++                multiCounts.put(r, runs[r * 2 + 1] * 6);
++                multiBases.put(r, runs[r * 2] * 4);
++            }
++            multiOffsets.clear();
++            multiCounts.clear();
++            multiBases.clear();
++            renderPass.multiDrawIndexed(multiOffsets, multiCounts, multiBases, count);
++            return;
++        }
++        for (int r = 0; r < count; r++) {
++            renderPass.drawIndexed(runs[r * 2 + 1] * 6, 1, 0, runs[r * 2] * 4, 0);
+         }
+     }
+ }
