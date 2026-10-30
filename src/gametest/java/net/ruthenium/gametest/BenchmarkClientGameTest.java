@@ -34,7 +34,8 @@ import java.util.Map;
  * The client benchmark: sets the options every scene shares (graphics preset, render distance, unlimited fps, no
  * vsync), then runs one singleplayer scene, chosen with {@code bench.scene}: "mixed" (the default,
  * {@link MixedBenchmark}), "terrain" ({@link TerrainBenchmark}), "blockentities" ({@link BlockEntityBenchmark}) or
- * "entities" ({@link EntityBenchmark}). All settings can be overridden with -Pbench.&lt;name&gt;=value on the Gradle
+ * "entities" ({@link EntityBenchmark}), "players" ({@link PlayerBenchmark}) or "footprint" (memory and load times,
+ * {@link FootprintBenchmark}). All settings can be overridden with -Pbench.&lt;name&gt;=value on the Gradle
  * bench* tasks.
  */
 public class BenchmarkClientGameTest implements FabricClientGameTest {
@@ -73,7 +74,8 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
             case "blockentities" -> BlockEntityBenchmark.run(context, LABEL, RUN_ID);
             case "entities" -> EntityBenchmark.run(context, LABEL, RUN_ID);
             case "players" -> PlayerBenchmark.run(context, LABEL, RUN_ID);
-            default -> throw new AssertionError("Unknown scene '" + SCENE + "' (mixed, terrain, blockentities, entities or players)");
+            case "footprint" -> FootprintBenchmark.run(context, LABEL, RUN_ID);
+            default -> throw new AssertionError("Unknown scene '" + SCENE + "' (mixed, terrain, blockentities, entities, players or footprint)");
         }
     }
 

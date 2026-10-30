@@ -174,6 +174,10 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 			def period = project.findProperty("benchJfrPeriod")?.with { ",jdk.ExecutionSample#period=${it}" } ?: ""
 			jvmArgs.add("-XX:StartFlightRecording=settings=profile${period},filename=../results/${label}.jfr,dumponexit=true")
 		}
+		// -PbenchNmt: native memory tracking, so the footprint scene also writes the JVM's native memory summary
+		if (project.hasProperty("benchNmt")) {
+			jvmArgs.add("-XX:NativeMemoryTracking=summary")
+		}
 		// Forward -Pbench.* project properties as system properties (e.g. -Pbench.renderDistance=16)
 		project.properties.findAll { it.key.startsWith("bench.") }.each { k, v ->
 			jvmArgs.add("-Druthenium.${k}=${v}")

@@ -930,6 +930,50 @@ are in every frame. `bench.playersKind`: `lobby` (default, both of the following
   (`close2`) of it; it changes the scene's numbers. Obfuscated text differs stably between the two settings of any `closeToggle`
   (its random glyphs depend on the frames drawn between shots): ignore the "Obf" label's pixels.
 
+### 6.11 Footprint benchmark: memory and load times (twenty-ninth session)
+`-Pbench.scene=footprint` (`FootprintBenchmark`), ~1 minute per launch. The user asked for memory and load time numbers that
+**don't need interleaved A/B matrices**: everything here is either close to deterministic or repeated within the launch, so
+**one launch per configuration** answers memory and reload questions; use a second launch only for the startup time.
+1. Startup: JVM uptime when the test first sees the title screen without a loading overlay.
+2. Snapshot `title`, then `bench.footprintReloads` (3) resource reloads, each timed from `reloadResourcePacks()` to its future
+   completing, then snapshot `reloaded`.
+3. `bench.footprintJoins` (2) joins of a fresh copy of the terrain scene's world (`build/run/bench/worlds/terrain-<seed>`; run the
+   terrain scene once if it is missing) at `bench.footprintRenderDistance` (12, ~637 chunks): seconds until the world is open and
+   until the chunks stop arriving with every section compiled. Snapshot `world` 3 s after the first join, `left` after the last.
+4. A snapshot runs a full GC through the `gcClassHistogram` diagnostic command (top 80 rows to
+   `results/footprint/<label>-footprint-<run>-histo-<snapshot>.txt`) and records live heap, committed heap (before the GC),
+   metaspace, code cache, direct buffers, loaded classes, working set and private bytes (`K32GetProcessMemoryInfo`), and dedicated and
+   shared GPU memory (`typeperf` on `\GPU Process Memory(pid_<pid>_*)`, summed over adapters). `-PbenchNmt` adds
+   `-XX:NativeMemoryTracking=summary` and writes the JVM's native summary next to the histograms.
+5. `python scripts/histo_diff.py A.txt B.txt [rows]` lists the classes whose live bytes changed most between two histograms.
+
+**Noise (measured, two launches each):** live heap repeats within ~1 MB and GPU dedicated exactly (it moves in 64 MB driver
+blocks, so it can't resolve less); reloads within ~2% inside a launch. **Committed heap, working set and private bytes are G1
+sizing noise** (vanilla's in-world committed heap 914 vs 1394 MB in two launches): don't compare them. The **first launch after the
+jars are rebuilt starts ~3 s slower** (cold file cache; 13.8 vs 11.1 s): discard it or launch twice. The **first join is cold**
+(~15 s, the integrated server's chunk loading not yet compiled), the second warm (~1.5 s); they are reported separately.
+
+**First results (2026-10-30, `d4aae52` + the scene, Vulkan, two launches each):**
+
+| | vanilla Vulkan | Ruthenium |
+|---|---|---|
+| startup to title (warm) | 10.86 / 11.04 s | 11.08 s (13.83 cold) |
+| resource reload | 1.05 s | 1.05 s |
+| join cold / warm (to all compiled) | 14.6-15.6 / 1.5 s | 14.8 / 1.6 s |
+| live heap title / world / left | 267 / 442 / 349 MB | 272 / 454 / 364 MB |
+| metaspace + code in world | 156 + 37 MB | 157 + 43 MB |
+| GPU dedicated title / world / left | 309 / 663 / 663 MB | 309 / 727 / 663 MB |
+
+- Load times: Ruthenium changes none of them; joining is server bound.
+- Ruthenium in world: **+12 MB live heap** (`int[]` +4.9 MB: packed draws, face groups and the other per-mesh arrays; ~3 MB of
+  Mixin/ASM class data kept after transformation) and **+64 MB GPU** (one more driver block; not yet attributed: the ring buffers,
+  label arena, pose texture or retained batches; released on leaving).
+- **Vanilla keeps the last world after leaving it**: at the title screen, ~82 MB more live heap than before joining (36k
+  `PalettedContainer`s and 15k `SectionRenderDispatcher$RenderSection`s of the old world, i.e. its chunks and section grid are still
+  reachable) and 354 MB of GPU memory. Candidate for a fix (find the GC root; likely held until the next join replaces it).
+- Not measured yet: a scene with block entities and entities (the mixed scene's retained geometry lives there), GPU memory below
+  the 64 MB block size (needs counters inside the Vulkan backend), and the OpenGL backend.
+
 ---
 
 ## 7. Results so far
