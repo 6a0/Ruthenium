@@ -85,6 +85,9 @@ final class MixedBenchmark {
             {0.5F, 4.5F, 3.5F, 0.0F, 55.0F},     // the grid from above, small stands in rows 3 and 7
             {0.0F, 1.5F, -3.5F, 180.0F, 20.0F},  // the summoned variety rows
             {0.0F, 4.0F, -5.0F, 180.0F, 60.0F},  // the same from above
+            {0.5F, 2.0F, 0.5F, 0.0F, 0.0F},      // the static view: the chest cube's corner at the right edge
+            {0.5F, 2.0F, 0.5F, 270.0F, 0.0F},    // the chest cube
+            {6.0F, 3.0F, 20.0F, 240.0F, 10.0F},  // the cube's corner, its sections across the screen edge
     };
     /** Stands summoned for the close-ups behind the camera: x, z, NBT (plates 1.25 blocks apart, so they don't overlap) */
     private static final String[][] VARIETY_STANDS = {
@@ -396,6 +399,8 @@ final class MixedBenchmark {
                 throw new AssertionError("Can't toggle " + CLOSE_TOGGLE, e);
             }
         });
+        // Switches that drop kept geometry (retainedCellCulling) rebuild it over a few frames
+        context.waitTicks(10);
     }
 
     private static String signText(String first, String color, boolean glowing) {
