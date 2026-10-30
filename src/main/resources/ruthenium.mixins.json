@@ -53,6 +53,7 @@
     "render.feature.ModelFeatureRendererM",
     "render.feature.MinecraftFrameM",
     "render.feature.SubmitNodeCollectionPoseM",
+    "render.feature.SubmitNodeStorageOrderM",
     "render.particle.ClientPacketListenerM",
     "render.particle.ParticleEngineM",
     "render.particle.QuadParticleRenderStateM",
