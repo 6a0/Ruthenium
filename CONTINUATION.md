@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-30 (twenty-seventh session; twenty-sixth; twenty-fifth; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-30 (twenty-eighth session; twenty-seventh; twenty-sixth; twenty-fifth; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -2697,6 +2697,42 @@ settings screen check passed (log 2284).
 - Fabric's merged mesh submits: `WrapOperation` can't reach their copies, so only the block model case got the copy marker.
 - The `fastCulling` / `keepBelowName` `original.call` boxing, about 1.5% in JFR: fixing it would bypass other mods' wrappers.
 
+### Twenty-eighth session (2026-10-30): the mixed `initial` phase over the twenty-seventh session
+A short measurement task in the main tree. Two other subagents worked alongside it: the OpenGL render thread gap in a worktree, then the
+mixed scene's GPU time. Every run was Vulkan, mixed scene, interleaved ABBA, under the GPU lock. Results are in
+`build/run/bench/results/s28-initial-*`, logs `2317-2408`. Nothing was committed.
+
+**Verdict: noise.** Any phase-level effect is at most ~1%, below what these A/Bs can resolve. It doesn't localise to a commit range or a
+profiler section.
+
+| A/B (initial phase) | dir | pairs | A | B | B/A | B lower in |
+|---|---|---|---|---|---|---|
+| `a3619a4` vs `fbc5245` (twenty-seventh session final) | `s27-alloc-final-mixed` | 3 | 1386.0 | 1348.9 | -2.7% | 3 of 3 |
+| `a3619a4` vs `fbc5245` | `s28-initial-ab` | 8 | 1392.9 | 1373.7 | -1.4% | 6 of 8 |
+| `a3619a4` vs `fbc5245`, repeat | `s28-initial-ab2` | 8 | 1381.0 | 1383.7 | +0.2% | 3 of 8 |
+| all direct pairs pooled | | 19 | | | pair median -0.96%, sd 1.99% | 12 of 19 |
+| `a3619a4` vs `fe0ac8d` (commits 1-4) | `s28-initial-bisect-fe0` | 8 | 1382.8 | 1401.0 | +1.3% | 2 of 8 |
+| `fe0ac8d` vs `fbc5245` (commits 5-12) | `s28-initial-bisect-5to12` | 8 | 1386.7 | 1384.4 | -0.2% | 5 of 8 |
+| HEAD, the five switches off vs on | `s28-initial-switches` | 8 | 1386.4 | 1386.1 | -0.0% | 5 of 8 |
+
+- **Each A/B carries its own bias of about ±1.5%.** The same `a3619a4` vs `fe0ac8d` comparison read -1.5% (3 pairs) and then +1.3% (8
+  pairs). Single pairs spread -6.2% to +4.5%.
+- **Static and pan are flat or better in the same runs.**
+- **The only consistent signal is in the first second after the join frames.** In the 0.5-1.0 s window, B has 6.8% fewer frames (15 of 19
+  pairs). That is ~20 frames of ~6900, about 0.3% of the phase.
+  - It is the JIT warm-up window, where frames average ~1.6 ms against ~0.55 ms later.
+  - It shows up in every split, including switches on vs off on one build, so it can't be tied to a commit.
+  - A light profile of just that window (`s28-initial-light`, 6 pairs) showed no section moving consistently.
+  - It's probably warm-up of the new code paths; that is inferred, not measured. Not worth a fix.
+- **Join frames, GCs and tick frames show no side bias.**
+
+**Method for future initial-phase questions:** compare per-frame CSV time windows, not the phase median. Resolving 1% needs about 20
+pairs. Scripts:
+- `scripts/init_windows.py`: frames per time window per pair
+- `scripts/init_window_split.py`: GC, tick and plain-frame split of a window
+- `scripts/ab_pool.py`: pooled pair ratios across A/B dirs
+- `scripts/lp_ab.py`: light-profile tree and no-tick-frame diff per side
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -3075,8 +3111,7 @@ leaves stale masks (faces missing until the next upload or reload).
      samplers and texture transforms, so it was skipped as too invasive.
    - **Immutable submit records:** `ModelFeatureRenderer$Submit`, `TextFeatureRenderer$Submit`, `Content$Text`.
    - **Fabric API's `permitArmorWithCustomRenderers` `Object[]`:** 9.5% of mixed.
-   - **The mixed `initial` phase** read ~2% lower over the twenty-seventh session (3 of 3 pairs, then 2 of 3). Not resolved; that phase
-     spreads ±3%.
+   - ~~The mixed `initial` phase reading ~2% lower~~: noise, settled in the twenty-eighth session (section 7).
 4. **Settings screen follow-ups** (the port itself is done, section 4).
    - Give every new optimisation that changes output or could misbehave a `Config` switch and an entry on the
      Optimizations page (with a tooltip and impact), instead of a system property.
