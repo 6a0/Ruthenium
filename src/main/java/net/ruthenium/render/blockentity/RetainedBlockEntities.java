@@ -451,6 +451,22 @@ public final class RetainedBlockEntities {
         clearPending = true;
     }
 
+    /**
+     * Drops every batch now (render thread, leaving a world). {@link #clear} only drops them on the next frame that
+     * extracts block entities, i.e. the next world's first: until then a batch's members kept their {@code ClientLevel}
+     * and with it the whole old world reachable (~3.7k chunks, ~230 MB live heap at render distance 32).
+     */
+    public static void release() {
+        clearPending = true;
+        BATCHES.values().forEach(Batch::close);
+        BATCHES.clear();
+        VISIBLE.clear();
+        synchronized (PENDING_DIRTY) {
+            PENDING_DIRTY.clear();
+            PENDING_CHANGED.clear();
+        }
+    }
+
     /** Called before the visible block entities are extracted */
     public static void beginFrame(Vec3 cameraPos, @Nullable Frustum frustum) {
         cullFrustum = frustum;

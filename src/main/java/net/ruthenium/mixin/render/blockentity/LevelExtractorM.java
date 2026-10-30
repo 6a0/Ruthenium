@@ -186,6 +186,14 @@ public class LevelExtractorM {
         InstancedModels.clear();
     }
 
+    /** Leaving a world: the retained batches keep their block entities and through them the old level reachable */
+    @Inject(method = "setLevel", at = @At("TAIL"))
+    private void releaseRetained(@Nullable ClientLevel level, CallbackInfo ci) {
+        if (level == null) {
+            RetainedBlockEntities.release();
+        }
+    }
+
     @Unique
     private boolean isCulledInPartialSection(Frustum frustum, long packed) {
         int x = BlockPos.getX(packed), y = BlockPos.getY(packed), z = BlockPos.getZ(packed);
