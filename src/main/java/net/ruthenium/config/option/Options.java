@@ -394,6 +394,11 @@ public abstract class Options {
                                 () -> config.fastScreenshots)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.fastScreenshots.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.skipFrameClear"),
+                                value -> config.skipFrameClear = value,
+                                () -> config.skipFrameClear)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.skipFrameClear.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.emptyArmorStandLayers"),
                                 value -> config.emptyArmorStandLayers = value,
                                 () -> config.emptyArmorStandLayers)
