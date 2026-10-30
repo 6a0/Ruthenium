@@ -237,6 +237,11 @@ public abstract class Options {
                                 () -> config.retainedChangeChecks)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.retainedChangeChecks.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.retainedCellCulling"),
+                                value -> config.retainedCellCulling = value,
+                                () -> config.retainedCellCulling)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.retainedCellCulling.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM),
                         new SwitchOption(Component.translatable("ruthenium.options.retainedGlowingText"),
                                 value -> {
                                     config.retainedGlowingText = value;

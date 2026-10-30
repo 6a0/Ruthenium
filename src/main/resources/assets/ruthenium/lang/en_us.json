@@ -29,6 +29,8 @@
   "ruthenium.options.retainedGlowingText": "Retained Glowing Sign Text",
   "ruthenium.options.retainedGlowingText.tooltip": "Signs with glowing text are kept on the GPU too. Coloured glowing text gets its outline only within 16 blocks of the camera, so those signs are drawn the normal way while you are close. Needs Retained Block Entities.",
   "ruthenium.options.retainedChangeChecks.tooltip": "When blocks or light change near retained block entities (crops, grass, redstone), their geometry is only rebuilt if their blocks or light changed. Needs Retained Block Entities.",
+  "ruthenium.options.retainedCellCulling": "Retained Cell Culling",
+  "ruthenium.options.retainedCellCulling.tooltip": "Retained chests and other kept block entity models are stored in eight parts per 16 block section, and the parts entirely outside the view are skipped, instead of drawing the whole section whenever any of it is in view. Same image. Needs Retained Block Entities. Mods that change how retained block entities are drawn may want it off.",
 
   "ruthenium.options.instancedModels": "Instanced Models",
   "ruthenium.options.instancedModels.tooltip": "Draws closed enchanting table books and armor stands posed alike as GPU instances.",

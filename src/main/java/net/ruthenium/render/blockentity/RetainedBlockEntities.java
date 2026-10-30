@@ -43,6 +43,7 @@ import net.minecraft.client.renderer.blockentity.StandingSignRenderer;
 import net.minecraft.client.renderer.blockentity.state.BlockEntityRenderState;
 import net.minecraft.client.renderer.blockentity.state.SignRenderState;
 import net.minecraft.client.renderer.chunk.SectionMesh;
+import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
 import net.minecraft.client.renderer.rendertype.RenderType;
@@ -78,6 +79,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.ChestType;
 import net.minecraft.world.phys.Vec3;
 import net.ruthenium.Initializer;
+import net.ruthenium.mixin.render.blockentity.FrustumAccessor;
 import net.ruthenium.render.chunk.SectionFaceGroups;
 import net.ruthenium.interfaces.IdleTicker;
 import net.ruthenium.mixin.render.text.AbstractSignRendererAccessor;
@@ -131,6 +133,12 @@ import java.util.function.Consumer;
  * filtering setting changes. Batches of sections only partly within the view distance aren't drawn; their
  * block entities take the vanilla path that frame.
  * <p>
+ * With {@code retainedCellCulling} the draws of the opaque entity pipelines are split by the 8x8x8 block cell of their
+ * block entity, each with the bounds of its vertices, and a cell whose bounds (plus half a block) lie outside the frame's
+ * cull frustum isn't drawn: a section is drawn whenever any of it is in view, and its block entities outside the view
+ * only cost vertex work. The cells keep the render type order; only the order across block entities of one render type
+ * changes, which shows only where two of them draw the same depth.
+ * <p>
  * Only used from the render thread, except {@link #markDirty} and {@link #clear}.
  */
 public final class RetainedBlockEntities {
@@ -181,6 +189,12 @@ public final class RetainedBlockEntities {
     private static volatile boolean clearPending;
 
     private static final List<Batch> VISIBLE = new ArrayList<>();
+    /** This frame's cull frustum, for {@link #isCulled} */
+    private static @Nullable Frustum cullFrustum;
+    /** {@code retainedCellCulling} when the batches were built */
+    private static boolean builtWithCells = true;
+    /** Per draw of {@link #prepareDraws}, in its order: culled this frame */
+    private static boolean[] culled = new boolean[0];
     private static final Map<RenderType, PreparedRenderType> PREPARED = new IdentityHashMap<>();
     private static final Map<RenderType, Matrix4f> MODEL_VIEWS = new IdentityHashMap<>();
     private static GpuBufferSlice[] transforms = new GpuBufferSlice[0];
@@ -299,8 +313,15 @@ public final class RetainedBlockEntities {
      * @param signEnds for draws of {@link Batch#signDraws}: the quad count after each of {@link Batch#signs}
      */
     private record Draw(RenderPipeline pipeline, RenderType renderType, GpuBuffer buffer, int indexCount,
-                        @Nullable SectionFaceGroups faces, int @Nullable [] signEnds) {
+                        @Nullable SectionFaceGroups faces, int @Nullable [] signEnds, float[] bounds) {
     }
+
+    /** {@code retainedCellCulling}: entity model geometry is split into the 8 cells of 8x8x8 blocks of its section */
+    private static final int CELLS = 8;
+    /** Bounds that are never culled (geometry whose format doesn't start with the position) */
+    private static final float[] NO_BOUNDS = new float[0];
+    /** Added on every side of a draw's vertex bounds before the frustum test */
+    private static final float CELL_CULL_MARGIN = 0.5f;
 
     private static final class Part {
         final ByteBufferBuilder bytes = new ByteBufferBuilder(1 << 16);
@@ -309,6 +330,25 @@ public final class RetainedBlockEntities {
         @Nullable BufferBuilder builder;
         /** In {@link #SIGN_PARTS}: the quad count after each sign written so far */
         final IntArrayList signEnds = new IntArrayList();
+        /** With {@code retainedCellCulling}, an entity pipeline's geometry by cell of its block entity ({@link #cellBuilder}) */
+        boolean split;
+        final ByteBufferBuilder[] cellBytes = new ByteBufferBuilder[CELLS];
+        final @Nullable BufferBuilder[] cellBuilders = new BufferBuilder[CELLS];
+    }
+
+    /** The builder of a part for a block entity in the given cell of the section */
+    private static BufferBuilder cellBuilder(Part part, int cell) {
+        if (!part.split) {
+            return part.builder;
+        }
+        BufferBuilder builder = part.cellBuilders[cell];
+        if (builder == null) {
+            if (part.cellBytes[cell] == null) {
+                part.cellBytes[cell] = new ByteBufferBuilder(1 << 14);
+            }
+            builder = part.cellBuilders[cell] = new BufferBuilder(part.cellBytes[cell], PrimitiveTopology.QUADS, part.renderType.format());
+        }
+        return builder;
     }
 
     /** One vertex builder per render type; the first {@link #count} are in use */
@@ -399,7 +439,8 @@ public final class RetainedBlockEntities {
     }
 
     /** Called before the visible block entities are extracted */
-    public static void beginFrame(Vec3 cameraPos) {
+    public static void beginFrame(Vec3 cameraPos, @Nullable Frustum frustum) {
+        cullFrustum = frustum;
         frame++;
         frameNanos = System.nanoTime();
         rebuiltThisFrame = 0;
@@ -415,6 +456,12 @@ public final class RetainedBlockEntities {
             clearPending = true;
         }
 
+        // Batches are built split by cell or not (retainedCellCulling): rebuilt when it changes, also by reflection
+        boolean cells = Initializer.CONFIG.retainedCellCulling;
+        if (cells != builtWithCells) {
+            builtWithCells = cells;
+            clearPending = true;
+        }
         if (clearPending) {
             clearPending = false;
             pipelineAvailable = null;
@@ -822,9 +869,11 @@ public final class RetainedBlockEntities {
                     continue;
                 }
                 PartSet parts = outlineDependent ? SIGN_PARTS : PARTS;
+                int cell = (pos.getX() - batch.originX) >> 3 & 1 | ((pos.getY() - batch.originY) >> 3 & 1) << 1
+                        | ((pos.getZ() - batch.originZ) >> 3 & 1) << 2;
                 for (int m = 0; m < CAPTURE.modelCount; m++) {
                     ModelSubmitCapture.ModelRecord model = CAPTURE.model(m);
-                    write(model, part(parts, model.renderType).builder);
+                    write(model, cellBuilder(part(parts, model.renderType), cell));
                 }
                 // TextFeatureRenderer's glyph renderer
                 for (int g = 0; g < GLYPHS.size(); g++) {
@@ -951,6 +1000,9 @@ public final class RetainedBlockEntities {
         part.pipeline = retainedPipeline(renderType);
         part.builder = new BufferBuilder(part.bytes, PrimitiveTopology.QUADS, renderType.format());
         part.signEnds.clear();
+        // Only the opaque entity pipelines are split: their order across block entities only matters where two draw the same depth
+        part.split = set == PARTS && Initializer.CONFIG.retainedCellCulling
+                && (part.pipeline == SOLID || part.pipeline == CUTOUT || part.pipeline == CUTOUT_CULL);
         if (set == SIGN_PARTS) {
             // No quads for the signs before this one
             part.signEnds.size(SIGN_INDICES.size());
@@ -968,29 +1020,28 @@ public final class RetainedBlockEntities {
         boolean signs = set == SIGN_PARTS;
         for (int i = 0; i < set.count; i++) {
             Part part = set.parts.get(i);
-            try (MeshData data = part.builder.build()) {
-                if (data != null) {
-                    if (draws.length == 0) {
-                        draws = new Draw[set.count];
-                    }
-                    // Reorders the vertices into the buffer that is uploaded
-                    SectionFaceGroups faces = null;
-                    ByteBuffer sorted = null;
-                    if (!signs && part.pipeline.isCull()) {
-                        sorted = MemoryUtil.memAlloc(data.vertexBuffer().remaining());
-                        faces = SectionFaceGroups.sortByPlanes(data, sorted);
-                    }
-                    GpuBuffer buffer;
-                    try {
-                        buffer = RenderSystem.getDevice().createBuffer(() -> "Ruthenium retained block entities",
-                                GpuBuffer.USAGE_VERTEX, faces != null ? sorted : data.vertexBuffer());
-                    } finally {
-                        if (sorted != null) {
-                            MemoryUtil.memFree(sorted);
+            if (part.split) {
+                // One draw per cell with geometry, in cell order; the part's own builder took nothing
+                for (int cell = 0; cell < CELLS; cell++) {
+                    BufferBuilder builder = part.cellBuilders[cell];
+                    part.cellBuilders[cell] = null;
+                    Draw draw = builder != null ? finishDraw(part, builder, false) : null;
+                    if (draw != null) {
+                        if (drawn == draws.length) {
+                            draws = Arrays.copyOf(draws, Math.max(set.count, drawn * 2));
                         }
+                        draws[drawn++] = draw;
                     }
-                    draws[drawn++] = new Draw(part.pipeline, part.renderType, buffer, data.drawState().vertexCount() / 4 * 6, faces,
-                            signs ? part.signEnds.toIntArray() : null);
+                }
+                try (MeshData unused = part.builder.build()) {
+                }
+            } else {
+                Draw draw = finishDraw(part, part.builder, signs);
+                if (draw != null) {
+                    if (drawn == draws.length) {
+                        draws = Arrays.copyOf(draws, Math.max(set.count, drawn * 2));
+                    }
+                    draws[drawn++] = draw;
                 }
             }
             part.builder = null;
@@ -1000,6 +1051,74 @@ public final class RetainedBlockEntities {
         }
         set.count = 0;
         return drawn == draws.length ? draws : Arrays.copyOf(draws, drawn);
+    }
+
+    /** Uploads one builder's vertices of a part as a draw, or null if it has none */
+    private static @Nullable Draw finishDraw(Part part, BufferBuilder builder, boolean signs) {
+        try (MeshData data = builder.build()) {
+            if (data == null) {
+                return null;
+            }
+            // Reorders the vertices into the buffer that is uploaded
+            SectionFaceGroups faces = null;
+            ByteBuffer sorted = null;
+            if (!signs && part.pipeline.isCull()) {
+                sorted = MemoryUtil.memAlloc(data.vertexBuffer().remaining());
+                faces = SectionFaceGroups.sortByPlanes(data, sorted);
+            }
+            GpuBuffer buffer;
+            try {
+                buffer = RenderSystem.getDevice().createBuffer(() -> "Ruthenium retained block entities",
+                        GpuBuffer.USAGE_VERTEX, faces != null ? sorted : data.vertexBuffer());
+            } finally {
+                if (sorted != null) {
+                    MemoryUtil.memFree(sorted);
+                }
+            }
+            return new Draw(part.pipeline, part.renderType, buffer, data.drawState().vertexCount() / 4 * 6, faces,
+                    signs ? part.signEnds.toIntArray() : null, part.split ? bounds(data, part.renderType.format()) : NO_BOUNDS);
+        }
+    }
+
+    /** The batch-relative bounds of a mesh's positions (min x, y, z, max x, y, z), or {@link #NO_BOUNDS} */
+    private static float[] bounds(MeshData data, VertexFormat format) {
+        var position = format.getElement("Position");
+        if (position == null || position.offset() != 0) {
+            return NO_BOUNDS;
+        }
+        ByteBuffer vertices = data.vertexBuffer();
+        long base = MemoryUtil.memAddress(vertices);
+        int stride = format.getVertexSize();
+        int count = data.drawState().vertexCount();
+        float minX = Float.POSITIVE_INFINITY, minY = Float.POSITIVE_INFINITY, minZ = Float.POSITIVE_INFINITY;
+        float maxX = Float.NEGATIVE_INFINITY, maxY = Float.NEGATIVE_INFINITY, maxZ = Float.NEGATIVE_INFINITY;
+        for (int v = 0; v < count; v++) {
+            long p = base + (long) v * stride;
+            float x = MemoryUtil.memGetFloat(p), y = MemoryUtil.memGetFloat(p + 4), z = MemoryUtil.memGetFloat(p + 8);
+            if (!Float.isFinite(x) || !Float.isFinite(y) || !Float.isFinite(z)) {
+                return NO_BOUNDS;
+            }
+            minX = Math.min(minX, x);
+            minY = Math.min(minY, y);
+            minZ = Math.min(minZ, z);
+            maxX = Math.max(maxX, x);
+            maxY = Math.max(maxY, y);
+            maxZ = Math.max(maxZ, z);
+        }
+        return new float[]{minX, minY, minZ, maxX, maxY, maxZ};
+    }
+
+    /** Whether a draw's geometry lies entirely outside the frame's cull frustum */
+    private static boolean isCulled(Batch batch, Draw draw) {
+        float[] b = draw.bounds;
+        Frustum frustum = cullFrustum;
+        if (b.length == 0 || frustum == null || !Initializer.CONFIG.retainedCellCulling) {
+            return false;
+        }
+        int result = ((FrustumAccessor) frustum).invokeCubeInFrustum(
+                batch.originX + b[0] - CELL_CULL_MARGIN, batch.originY + b[1] - CELL_CULL_MARGIN, batch.originZ + b[2] - CELL_CULL_MARGIN,
+                batch.originX + b[3] + CELL_CULL_MARGIN, batch.originY + b[4] + CELL_CULL_MARGIN, batch.originZ + b[5] + CELL_CULL_MARGIN);
+        return result != -2 && result != -1;
     }
 
     private static boolean isPipelineAvailable() {
@@ -1031,9 +1150,17 @@ public final class RetainedBlockEntities {
         DynamicGpuData.Transform[] data = new DynamicGpuData.Transform[count];
         int maxIndexCount = 0;
         int i = 0;
+        if (culled.length < count) {
+            culled = new boolean[Math.max(count, culled.length * 2)];
+        }
+        int d = 0;
         for (Batch batch : VISIBLE) {
             for (int set = 0; set < 2; set++) {
                 for (Draw draw : set == 0 ? batch.draws : batch.signDraws) {
+                    boolean skip = culled[d++] = isCulled(batch, draw);
+                    if (skip) {
+                        continue;
+                    }
                     // Fresh vectors: the uniform storage compares against the last record it wrote
                     Vector3f offset = new Vector3f((float) (batch.originX - camX), (float) (batch.originY - camY), (float) (batch.originZ - camZ));
                     data[i++] = new DynamicGpuData.Transform(modelView(draw.renderType, modelView), WHITE, offset, IDENTITY);
@@ -1042,7 +1169,8 @@ public final class RetainedBlockEntities {
                 }
             }
         }
-        transforms = RenderSystem.getDynamicUniforms().writeTransforms(data);
+        transforms = i == 0 ? new GpuBufferSlice[0]
+                : RenderSystem.getDynamicUniforms().writeTransforms(i == count ? data : Arrays.copyOf(data, i));
         RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS).getBuffer(maxIndexCount);
         drawCount = count;
     }
@@ -1072,10 +1200,14 @@ public final class RetainedBlockEntities {
         RenderType boundType = null;
         boolean faceCulling = Initializer.CONFIG.modelBackFaceCulling;
         int i = 0;
+        int d = 0;
         for (Batch batch : VISIBLE) {
             float eyeX = (float) (camX - batch.originX), eyeY = (float) (camY - batch.originY), eyeZ = (float) (camZ - batch.originZ);
             for (int set = 0; set < 2; set++) {
                 for (Draw draw : set == 0 ? batch.draws : batch.signDraws) {
+                    if (culled[d++]) {
+                        continue;
+                    }
                     GpuBufferSlice transform = transforms[i++];
                     if (draw.pipeline != boundPipeline) {
                         CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(draw.pipeline);

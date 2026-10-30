@@ -117,6 +117,8 @@ public class Config {
     public boolean skipBlackVignette = true;
     /** Instanced models of closed opaque boxes (armor stands) are drawn with back faces culled while the eye is outside them */
     public boolean closedModelCulling = true;
+    /** Retained block entity models are drawn per 8x8x8 block cell of their section, and cells outside the view are skipped */
+    public boolean retainedCellCulling = true;
 
     private static Path CONFIG_PATH;
 

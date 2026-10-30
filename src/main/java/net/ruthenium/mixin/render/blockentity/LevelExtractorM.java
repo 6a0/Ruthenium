@@ -80,7 +80,7 @@ public class LevelExtractorM {
         BlockEntityRenderDispatcher dispatcher = this.levelRenderer.blockEntityRenderDispatcher();
         List<BlockEntityRenderState> output = levelRenderState.blockEntityRenderStates;
         ObjectArrayList<SectionRenderDispatcher.RenderSection> sections = this.levelRenderer.visibleSections();
-        RetainedBlockEntities.beginFrame(cameraPos);
+        RetainedBlockEntities.beginFrame(cameraPos, camera.getCullFrustum());
         InstancedModels.beginFrame();
 
         for (int s = 0, sectionCount = sections.size(); s < sectionCount; s++) {
