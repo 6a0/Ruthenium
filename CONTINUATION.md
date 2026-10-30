@@ -2847,12 +2847,12 @@ texel buffer is still written, so mods that read it keep working). Switch "Fast 
 screenshots no longer run vanilla's copy lambda in `Screenshot.takeScreenshot` (a cancelling `@Inject` at its head), so a mod injecting into
 that lambda is bypassed; downscaled shots keep it. The `InstancedModels` change touches no vanilla code.
 Twenty-sixth session, mod compatibility only (both exact for vanilla). Switch "Skip Empty Crossbow Charge Time" (`emptyCrossbowCharge`,
-**on by default, the user's decision of 2026-10-29**): a mod that hooks `EnchantmentHelper.modifyCrossbowChargingTime`,
+**on by default, the user's decision of 2026-10-29; kept on 2026-10-30 although it measured no fps gain, only less allocation**): a mod that hooks `EnchantmentHelper.modifyCrossbowChargingTime`,
 `runIterationOnItem` or `CrossbowItem.getChargeDuration` to change the charge time of empty stacks is bypassed during humanoid extraction.
-Non-empty stacks keep vanilla's call. Switch "Render Type Lookup Cache" (`renderTypeCache`, not yet reviewed by the user): vanilla's
+Non-empty stacks keep vanilla's call. Switch "Render Type Lookup Cache" (`renderTypeCache`, **accepted by the user on 2026-10-30**): vanilla's
 `RenderTypes` methods are untouched. A mod reading the memo fields through an accessor gets the wrapper, which gives the same answers. A mod
 injecting into `Util`'s memoizing `BiFunction` misses the hits of these memos. The group eviction touches no vanilla code.
-Twenty-seventh session, mod compatibility only (each exact for vanilla, each switch on by default, **not yet reviewed by the user**):
+Twenty-seventh session, mod compatibility only (each exact for vanilla, each switch on by default, **all accepted by the user on 2026-10-30**):
 - **"No Scratch Meshes for Cached Models"** (`noScratchMesh`): mods that hook Fabric's `setupMesh`, or read a state's own mesh, see none for
   models in `BlockModelMeshCache`. A model that keeps the random it is handed gets the shared one.
 - **"Model Part Child Arrays"** (`partChildArrays`): `ModelPart.render` is now an `@Overwrite` (as `compile` and `translateAndRotate`
