@@ -3,7 +3,7 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-30 (twenty-sixth session; twenty-fifth; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-30 (twenty-seventh session; twenty-sixth; twenty-fifth; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -244,6 +244,10 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   - **Candidate 6:** a front cache before the two-argument render type memos ("Render Type Lookup Cache") and empty hands skipping the
     crossbow charge time's enchantment iteration ("Skip Empty Crossbow Charge Time"). Both are exact. Each saves ~3 us of render thread and
     9-12% of its allocation. The mixed static fps doesn't move, because that view now waits on the GPU.
+- **Twenty-seventh session** (section 7): **render-thread allocation** cut by 12 commits, 6 of them with new switches. Static view
+  KB/frame: entities 2156 -> 1045, players 1296 -> 747, mixed 105 -> 63. Players +7.6% fps on Vulkan and +7.4% on OpenGL; entities +2%.
+  The changes: pooled submit poses, no Fabric scratch mesh for cached block models, model part children from an array, kept display
+  names, and more. Render states are now the largest source left.
 - **Next:** see section 8.
 
 ---
@@ -2561,6 +2565,138 @@ the count-1 control.
 
 Mod compatibility notes are in section 8.
 
+### Twenty-seventh session (2026-10-30): render-thread allocation
+A subagent in the main tree, alone on the machine, every Gradle command under the GPU lock. **12 commits, `57568aa`..`fbc5245`.** Results are
+in `build/run/bench/results/s27-alloc-*`, logs in `build/bench-logs/2217-2316`. The check patches are `scripts/patches/s27-*-check.patch`.
+
+**Method:**
+- **Ranking:** JFR allocation samples of the 20 s static phase, with the throttle raised:
+  `-PbenchJfrPeriod=20ms,jdk.ObjectAllocationSample#throttle=2000/s`.
+- **Confirmation:** each fix was confirmed with `ThreadMXBean` render-thread bytes in `ToggleAb`, 8 rounds (KB/frame = render-thread MB/s ×
+  1000 / fps).
+- **No-switch changes** were measured through a temporary `Config` field, removed before the commit.
+- **Exactness:** check-mode patches, and frozen close-ups (8 shots, `StableDiff` at threshold 2). The pools were also checked for lifetime:
+  last frame's poses poisoned with NaN.
+- **New trap:** JFR's allocation ranking also needs a second method. JFR showed a MixinExtras `LocalRefImpl` at 9-12% of mixed allocation,
+  but removing it changed nothing in 3 pairs: with JFR off it is scalar-replaced.
+
+**Session start `a3619a4` against `fbc5245`**, static view, interleaved commit A/B (Vulkan 3 pairs, OpenGL 2 pairs, `s27-alloc-final-*`,
+logs 2285-2310):
+
+| scene | KB/frame | GCs | fps | render thread ms |
+|---|---|---|---|---|
+| entities | 2156 -> 1045 (-52%) | 24 -> 13 | 332.7 -> 339.5 (every pair) | 2.91 -> 2.82 |
+| players | 1296 -> 747 (-42%) | 21 -> 12 | 476.9 -> 513.3 (+7.6%, every pair) | 2.02 -> 1.88 |
+| mixed | 105.2 -> 63.4 (-40%) | 5 -> 4 | 1850.7 vs 1852.1 (GPU bound) | 0.39 vs 0.40 (quantised) |
+| entities, OpenGL | 2096 -> 1057 | 20 -> 11.5 | 276.4 -> 279.5 (both pairs) | 3.54 -> 3.48 |
+| players, OpenGL | 1299 -> 737 | 16.5 -> 8 | 398.0 -> 427.5 (+7.4%, both pairs) | 2.46 -> 2.25 |
+
+- **Pan KB/frame:** entities 414 -> 227, players 222 -> 191, mixed 125 -> 103.
+- **Open: the mixed `initial` (join) phase** read 1386.0 -> 1348.9, lower in all 3 pairs. A follow-up of `a3619a4` against `fe0ac8d`
+  (`s27-alloc-initial-mixed`, logs 2311-2316) gave 1414.3 vs 1392.8, lower in 2 of 3. That phase spreads about ±3% run to run, so this is
+  unresolved, not a confirmed regression.
+
+**Where the allocation went** (JFR share of render-thread allocation; logs 2217-2219 before, 2273-2275 after):
+
+| site | entities before -> after | players before -> after | mixed before -> after |
+|---|---|---|---|
+| total KB/frame (JFR run) | 2320 -> 1140 | 1383 -> 772 | 111 -> 66 |
+| Indigo scratch mesh (`setupMesh`) | 20.2% -> 0 | – | – |
+| submit pose copies | 14.7% -> 4.4% (mostly the Fabric block model copy, then removed by `bcec9f5`) | 9.2% -> 0.2% | 32.6% -> 1.0% |
+| text/name tag `Matrix4f` | 0.5% -> 0.4% | 9.5% -> 8.0% (the submit records and `Content$Text` are left) | – |
+| `ModelPart` children iterator | 6.1% -> 0 | 9.9% -> 0 | – |
+| `getNameTag` (display names) | 0.5% -> 0 | 11.2% -> 0 | – |
+| light probe `Vec3`/`BlockPos` | 3.3% -> 0 | 1.8% -> 0.7% | 5.3% -> 8.5% (armor stands, vanilla path) |
+| `InstancedParts` slices | 2.9% -> 1.1% | 0.8% -> 0.3% | – |
+| `SubmitNodeStorage.order` lambda | 1.4% -> 0 | 1.9% -> 0.1% | 3.6% -> 0 |
+| `TerrainDrawList` section info | 0.3% -> 0 | 0.6% -> 0 | 9.9% -> 0 |
+| posed `addVertex` `Vector3f` | 1.9% -> 0 | 1.4% -> 0 | – |
+| render states (`createRenderState`) | 28.2% -> 52.0% | 21.4% -> 36.1% | 1.2% -> 1.9% |
+| `RenderType.prepare` | 3.5% -> 7.1% | 7.6% -> 13.2% | 1.4% -> 2.7% |
+| submit records (`submitModel`) | 3.2% -> 6.4% | 2.4% -> 4.3% | 10.1% -> 17.4% |
+| Fabric `permitArmorWithCustomRenderers` `Object[]` | – | – | 6.2% -> 9.5% |
+
+The old list in section 8 item 3:
+- the chest openness `Float` boxing no longer shows;
+- `PoseStack.Pose` copies are pooled;
+- the `CompactVectorArray` per sort is gone;
+- the submit records and glyph instances remain (immutable records).
+
+**Commits.** Numbers are in-launch `ToggleAb`, static view, 8 rounds, off -> on. Close-ups are 0 stable px unless noted. Every switch is on by
+default.
+
+1. **`57568aa` Skip the empty Fabric mesh of cached entity block models.** Switch "No Scratch Meshes for Cached Models" (`noScratchMesh`).
+   - **Design:** Fabric's `update` overwrite calls `setupMesh`, which allocates a `MutableMeshImpl` for every new render state, every
+     frame. For a model already in `BlockModelMeshCache`, the state is set up as `setupMesh` would, without a mesh. A merged-method inject
+     on `setupMesh` tracks the states that might hold a Fabric mesh. `isEmpty` counts the cached mesh, and the model gets a shared seeded
+     random.
+   - **Numbers:**
+     - Vulkan entities: 361.0 -> 372.3 fps (+3.1%, 8 of 8), 2.710 -> 2.615 ms, 2106 -> 1660 KB/frame, GCs 128 -> 99 (log 2220).
+     - OpenGL: 284.2 -> 293.9 (+3.4%, 8 of 8), 2203 -> 1767 KB (log 2223).
+2. **`a721c96` Render model part children from an array.** Switch "Model Part Child Arrays" (`partChildArrays`).
+   - **Design:** `@Overwrite` of `ModelPart.render` with vanilla's body. With the switch on, children come from an array taken at
+     construction, used while the map's size still matches.
+   - **Check:** `s27-child-check.patch` gave 0 mismatches and 0 fallbacks over 55M renders each in entities and players.
+   - **Numbers:**
+     - entities: 370.4 -> 378.4 (7 of 8), 1739 -> 1574 KB (log 2227)
+     - players: 478.5 -> 494.7 (+3.4%, 8 of 8), 1321 -> 1200 (log 2228)
+     - OpenGL players: 415.2 -> 425.6 (8 of 8), 1284 -> 1162 (log 2231)
+3. **`2343806` Take submit pose copies from a per-frame pool.** Switch "Pooled Submit Poses" (`pooledSubmitPoses`).
+   - **Design:** a `WrapOperation` on vanilla's `Pose.copy` calls in `SubmitNodeCollection` returns pooled poses, set with `Pose.set`. The
+     pool is freed at the head of `Minecraft.renderFrame`. It is render-thread only and capped at 65536.
+   - **Check:** `s27-pose-check.patch` poisons last frame's poses with NaN. Close-ups: 0 stable px in all three scenes.
+   - **Numbers:**
+     - entities: 375.1 -> 381.1 (7 of 8), 1575 -> 1304 KB (log 2232)
+     - mixed: 1857.5 vs 1867.0, 0.410 -> 0.385 ms, 100.4 -> 65.5 KB (-35%), GCs 22 -> 13 (log 2233)
+     - players: fps neutral, 1211 -> 1094 KB
+     - OpenGL entities: fps neutral, 1582 -> 1311 KB
+4. **`fe0ac8d` Pool the matrix copies of text, name tag and shadow submits too.** Same switch as `2343806`.
+   - **Design:** wraps `new Matrix4f(pose)` in the name tag, text, shadow, leash and moving block submits.
+   - **Limit found:** MixinExtras' `WrapOperation` doesn't reach methods that another mixin merged (Fabric's submits), named or wildcarded.
+     This was checked in the exported class.
+   - **Numbers:** players 498.9 -> 502.8 (6 of 8), 1165 -> 982 KB (log 2242); OpenGL players 1210 -> 1027 KB.
+   - **Check:** poison close-ups are 0 stable px apart from the obfuscated label.
+5. **`faa4045` Return a submit order's existing collection without a lambda.** No switch.
+   - **Design:** an inject at the head of `SubmitNodeStorage.order`. Its `CallbackInfoReturnable` is scalar-replaced.
+   - **Numbers:** mixed 61.0 -> 57.0 KB; entities 1300 -> 1266 KB, 375.3 -> 377.3 fps (6 of 8).
+6. **`d2c512e` Keep the vertex buffer slices of instanced part draws.** The mod's own code, no switch. Each batch keeps its mesh slice, and
+   instance slices are kept per draw command, 4 per ring buffer. Entities 1263 -> 1209 KB, fps neutral.
+7. **`c71567f` Keep each section mesh's terrain section info record.** The mod's own code, no switch. Mixed 61.9 -> 51.7 KB.
+8. **`a121d7c` Transform posed vertices and normals into a scratch vector.** No switch.
+   - **Design:** `BufferBuilderM` overrides the `addVertex(Matrix4fc, …)` and `setNormal(Pose, …)` defaults, and `LazyVertexBuilder`
+     delegates to them.
+   - **Numbers:** entities 378.4 -> 380.9 (8 of 8), 1206 -> 1163 KB; players 986 -> 967 KB.
+9. **`d99bd78` Find entity light without a new probe vector and block position.** Switch "Light Probe Without Garbage"
+   (`noAllocLightProbe`).
+   - **Design:** for classes that keep `Entity.getLightProbePosition`, the eye position is computed with the same double operations, and
+     `BlockPos.containing` returns a scratch `MutableBlockPos`.
+   - **Check:** `s27-probe-check.patch` gave 0 mismatches over 12M probes.
+   - **Numbers:** entities 1191 -> 1091 KB, players 981 -> 947 KB; fps within noise.
+10. **`e092159` Keep entity name tags while their display name's inputs are the same.** Switch "Keep Display Names" (`keepDisplayNames`).
+    - **Design:** the kept name tag is returned without calling `getNameTag` while all of these are the same objects: the team, its prefix,
+      suffix and color `Optional`, the custom name, the type and the UUID. This applies only to classes that keep vanilla's name and team
+      methods, checked per class.
+    - **Check:** `s27-name-check.patch` gave 0 mismatches over 3M kept name tags.
+    - **Numbers:**
+      - players: 508.8 -> 529.0 (+4.0%, 8 of 8), 1.910 -> 1.820 ms, 890 -> 736 KB (log 2269)
+      - OpenGL: 421.5 -> 436.8 (+3.6%, 8 of 8), 944 -> 790 KB (log 2272)
+11. **`bcec9f5` Pool the pose copy of cached entity block models' Fabric submits.** Same switch as `2343806`.
+    - **Design:** `BlockModelRenderStateM` marks the next copy, and an inject in `Pose.copy` (`PoseCopyM`) serves it from the pool.
+    - **Numbers:** entities 1079 -> 1037 KB, fps neutral. Poison close-ups 0 stable px, at up to 4334 poses per frame.
+12. **`fbc5245` Decode sorted draws' centroids into an array kept per size.** No switch. Entities 1048 -> 1028 KB.
+
+**OpenGL coverage:** `ToggleAb` for switches 1, 2, 3, 4 and 10. The other commits were covered on OpenGL only by the final combined A/B. The
+settings screen check passed (log 2284).
+
+**Binned** (`scripts/patches`, with README rows):
+- `s27-light-localref.patch`: the JFR-only `LocalRefImpl`. No change in 3 pairs.
+- `s27-shadow-scratch.patch`: a scratch vector in `ShadowFeatureRenderer.shadowVertex`. -15 KB per frame in players, but fps was not
+  resolvable: lower in 6 of 8 rounds in one launch, even in the other.
+
+**Not built:**
+- Fabric's merged mesh submits: `WrapOperation` can't reach their copies, so only the block model case got the copy marker.
+- The `fastCulling` / `keepBelowName` `original.call` boxing, about 1.5% in JFR: fixing it would bypass other mods' wrappers.
+
 ### Terrain (fifth session, `-Pbench.scene=terrain`, median of 3)
 | Phase (avg fps) | vanilla Vulkan | VulkanMod v0 (start) | v1 face groups | v2 draw list | v3 compressed |
 |---|---|---|---|---|---|
@@ -2716,6 +2852,20 @@ Twenty-sixth session, mod compatibility only (both exact for vanilla). Switch "S
 Non-empty stacks keep vanilla's call. Switch "Render Type Lookup Cache" (`renderTypeCache`, not yet reviewed by the user): vanilla's
 `RenderTypes` methods are untouched. A mod reading the memo fields through an accessor gets the wrapper, which gives the same answers. A mod
 injecting into `Util`'s memoizing `BiFunction` misses the hits of these memos. The group eviction touches no vanilla code.
+Twenty-seventh session, mod compatibility only (each exact for vanilla, each switch on by default, **not yet reviewed by the user**):
+- **"No Scratch Meshes for Cached Models"** (`noScratchMesh`): mods that hook Fabric's `setupMesh`, or read a state's own mesh, see none for
+  models in `BlockModelMeshCache`. A model that keeps the random it is handed gets the shared one.
+- **"Model Part Child Arrays"** (`partChildArrays`): `ModelPart.render` is now an `@Overwrite` (as `compile` and `translateAndRotate`
+  already were); injections into it still apply. A mod that replaces a child in the map without changing its size isn't seen while the
+  switch is on.
+- **"Pooled Submit Poses"** (`pooledSubmitPoses`, three commits): a mod that keeps submits or their poses past the frame they were made in
+  sees them change.
+- **"Light Probe Without Garbage"** (`noAllocLightProbe`): a mixin into `Entity.getLightProbePosition` itself is bypassed. Renderer
+  overrides of `getBlockLightLevel`/`getSkyLightLevel` get a mutable position.
+- **"Keep Display Names"** (`keepDisplayNames`): a mod that mutates a custom name or team prefix component in place, or changes display
+  names through mixins into those methods, keeps showing the old name tag.
+The no-switch commits (`faa4045`, `d2c512e`, `c71567f`, `a121d7c`, `fbc5245`) are exact. They change only the mod's own code, or vanilla
+calls whose results stay the same.
 The twentieth session changed no mod code (its downloaded skin culling was binned), so it adds nothing to decide. Had it
 been kept, its trade-off would have been: a mod that writes a downloaded skin's GPU texture without `DynamicTexture.upload`
 leaves stale masks (faces missing until the next upload or reload).
@@ -2915,8 +3065,18 @@ leaves stale masks (faces missing until the next upload or reload).
      prepare of the armor stands; the next tick's packets (44-54 ms) and frame 1's light updates (13.6 ms) are vanilla's; frames 3-6 are
      retained builds, ~85% JIT-cold (warm, the same 8192 block entities take ~25 ms).
    - Occlusion culling of block entities is **not** exact (chests are 14/16 wide; the ones behind show through).
-3. **Allocation** (~0.35 MB/frame at static since the eighth session; was ~2.3): `Float` boxing of chest openness per submit, submit records,
-   `PoseStack.Pose`, glyph instances of non-sign text, `CompactVectorArray` per sort.
+3. **Allocation.** Done in the twenty-seventh session (section 7). Static render-thread KB/frame is now entities ~1045, players ~747 and
+   mixed ~63. Left:
+   - **Per-frame entity render states:** 52% of entity scene and 36% of players allocation (`ItemStackRenderState`, `LayerRenderState` with
+     a `Matrix4f`, `AvatarRenderState`, ...). Reusing render states generally is a trade-off; only armor stands do it today
+     (`ReusedRenderStates`).
+   - **`RenderType.prepare` per draw:** 7% of entities, 13% of players. Much of it is our own `PlayerPoseDraws.capture` and
+     `RetainedLabels.submit`, one prepare per body or label. A per-frame cache would have to check the model view, scissor, texture views,
+     samplers and texture transforms, so it was skipped as too invasive.
+   - **Immutable submit records:** `ModelFeatureRenderer$Submit`, `TextFeatureRenderer$Submit`, `Content$Text`.
+   - **Fabric API's `permitArmorWithCustomRenderers` `Object[]`:** 9.5% of mixed.
+   - **The mixed `initial` phase** read ~2% lower over the twenty-seventh session (3 of 3 pairs, then 2 of 3). Not resolved; that phase
+     spreads ±3%.
 4. **Settings screen follow-ups** (the port itself is done, section 4).
    - Give every new optimisation that changes output or could misbehave a `Config` switch and an entry on the
      Optimizations page (with a tooltip and impact), instead of a system property.
