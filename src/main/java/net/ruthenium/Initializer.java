@@ -22,13 +22,20 @@ public class Initializer implements ClientModInitializer {
 
 		LOGGER.info("== Ruthenium ==");
 
-		var configPath = FabricLoader.getInstance()
-				.getConfigDir()
-				.resolve("ruthenium_settings.json");
-
-		CONFIG = Config.load(configPath);
+		config();
 
 		LoaderManifests.trim();
+	}
+
+	/**
+	 * The config, loaded on first use: startup mixins that run before the mod initializer (in the game's main method
+	 * and the bootstrap) read their switches through this.
+	 */
+	public static synchronized Config config() {
+		if (CONFIG == null) {
+			CONFIG = Config.load(FabricLoader.getInstance().getConfigDir().resolve("ruthenium_settings.json"));
+		}
+		return CONFIG;
 	}
 
 	public static String getVersion() {

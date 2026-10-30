@@ -123,6 +123,12 @@ public class Config {
     public boolean lazyGlyphWidths = true;
     /** Light data that arrives with full sky light everywhere is stored as one value instead of a 2 KB array */
     public boolean compactSkyLight = true;
+    /** The loading overlay (startup, F3+T, pack changes) and the first title screen fade 4x faster */
+    public boolean fastLoadingFade = true;
+    /** Startup builds the throwaway crash report that preloads its classes (a hardware scan) on a background thread */
+    public boolean backgroundSystemReport = true;
+    /** Startup builds the data fixers' schemas on a background thread, alongside the registries */
+    public boolean backgroundDataFixers = true;
 
     /** The vignette is skipped while its color is black (its blend then leaves every pixel as it is) */
     public boolean skipBlackVignette = true;

@@ -550,6 +550,20 @@ public abstract class Options {
                                 () -> config.directBakedQuads)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.directBakedQuads.tooltip"))
                                 .setImpact(PerformanceImpact.LOW)
+                }),
+                new OptionBlock("", new Option<?>[]{
+                        new SwitchOption(Component.translatable("ruthenium.options.fastLoadingFade"),
+                                value -> config.fastLoadingFade = value,
+                                () -> config.fastLoadingFade)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.fastLoadingFade.tooltip")),
+                        new SwitchOption(Component.translatable("ruthenium.options.backgroundSystemReport"),
+                                value -> config.backgroundSystemReport = value,
+                                () -> config.backgroundSystemReport)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.backgroundSystemReport.tooltip")),
+                        new SwitchOption(Component.translatable("ruthenium.options.backgroundDataFixers"),
+                                value -> config.backgroundDataFixers = value,
+                                () -> config.backgroundDataFixers)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.backgroundDataFixers.tooltip"))
                 })
         };
     }

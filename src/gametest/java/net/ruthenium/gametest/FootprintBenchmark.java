@@ -84,6 +84,13 @@ final class FootprintBenchmark {
             throw new RuntimeException(e);
         }
 
+        if (Boolean.getBoolean("ruthenium.bench.loadProbe")) {
+            logClassLoadingCounters("title");
+            // -Pbench.stateCacheDump=true also writes every state's line (~15 MB) for diffing two launches
+            Path dump = Boolean.getBoolean("ruthenium.bench.stateCacheDump") ? histoDir.resolve(prefix + "-statecaches.txt") : null;
+            String digest = context.computeOnClient(_ -> StateCacheDigest.digest(dump));
+            LOGGER.info("Block state cache digest: {}", digest);
+        }
         JsonObject snapshots = new JsonObject();
         snapshots.add("title", snapshot(context, "title", histoDir, prefix));
 
@@ -114,9 +121,11 @@ final class FootprintBenchmark {
                 throw new RuntimeException("Failed to copy the terrain world", e);
             }
             long start = System.nanoTime();
+            LOGGER.info("Join {} starts at uptime {} ms", i + 1, uptimeMs());
             try (TestSingleplayerContext ignored = new TestWorldSaveImpl(context, save).open()) {
                 context.waitFor(mc -> mc.level != null && mc.player != null && mc.gui.screen() == null, 120 * TICKS_PER_SECOND);
                 openSeconds[i] = (System.nanoTime() - start) / 1.0e9;
+                LOGGER.info("Join {} open at uptime {} ms", i + 1, uptimeMs());
                 chunks[i] = waitForChunks(context);
                 loadedSeconds[i] = (System.nanoTime() - start) / 1.0e9 - 1.0;
                 LOGGER.info("Join {}: open after {} s, {} chunks loaded and compiled after {} s", i + 1,
@@ -190,17 +199,58 @@ final class FootprintBenchmark {
         }
     }
 
-    /** Reloads resources as F3+T does; returns the seconds until the reload's future completes */
+    /**
+     * Reloads resources as F3+T does; returns the seconds until the reload's future completes. The future completes when
+     * the loading overlay's tick sees the reload done, and vanilla's overlay first shows for at least 1 s (its fade in),
+     * so with vanilla timings this reads ~1.05 s however fast the reload is: its work alone is ~0.45-0.7 s ("Resource
+     * reload finished after" in the log with {@code -Pbench.loadProbe=true}).
+     */
     static double reload(ClientGameTestContext context) {
-        long[] times = new long[2];
+        long[] times = new long[4];
         CompletableFuture<?> future = context.computeOnClient(mc -> {
             times[0] = System.nanoTime();
-            return mc.reloadResourcePacks().whenComplete((_, _) -> times[1] = System.nanoTime());
+            times[2] = uptimeMs();
+            return mc.reloadResourcePacks().whenComplete((_, _) -> {
+                times[1] = System.nanoTime();
+                times[3] = uptimeMs();
+            });
         });
         context.waitFor(mc -> future.isDone() && mc.gui.overlay() == null, 120 * TICKS_PER_SECOND);
         future.join();
+        // Uptime markers for matching JFR samples (-PbenchJfr) to the reload
+        LOGGER.info("Reload from uptime {} ms to {} ms", times[2], times[3]);
         context.waitTicks(TICKS_PER_SECOND);
         return (times[1] - times[0]) / 1.0e9;
+    }
+
+    /**
+     * Logs HotSpot's class loading counters ({@code sun.cls.*}: time spent loading, parsing, linking and verifying
+     * classes, and in the class loaders' Java code) through the JDK's jcmd ({@code -Pbench.loadProbe=true})
+     */
+    private static void logClassLoadingCounters(String when) {
+        try {
+            Path java = Path.of(ProcessHandle.current().info().command().orElseThrow());
+            Path jcmd = java.resolveSibling(java.getFileName().toString().replace("java", "jcmd"));
+            Process process = new ProcessBuilder(jcmd.toString(), Long.toString(ProcessHandle.current().pid()), "PerfCounter.print")
+                    .redirectErrorStream(true).start();
+            String out = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            process.waitFor();
+            StringBuilder lines = new StringBuilder();
+            for (String line : out.split("\\R")) {
+                if (line.startsWith("sun.cls.") || line.startsWith("sun.rt.safepoint") || line.startsWith("java.cls.")
+                        || line.startsWith("sun.os.hrt.frequency") || line.startsWith("sun.ci.totalTime") || line.startsWith("sun.classloader")) {
+                    lines.append('\n').append(line);
+                }
+            }
+            LOGGER.info("Class loading counters at {} (ticks of sun.os.hrt.frequency):{}", when, lines);
+        } catch (Exception e) {
+            LOGGER.warn("Couldn't read the perf counters", e);
+        }
+    }
+
+    /** JVM uptime in milliseconds (JFR's recording starts with the JVM, so its events can be matched to these) */
+    private static long uptimeMs() {
+        return ManagementFactory.getRuntimeMXBean().getUptime();
     }
 
     /** Waits until the chunks in range stop arriving and every section is compiled; returns the loaded chunks */
@@ -208,8 +258,14 @@ final class FootprintBenchmark {
         int expected = (int) (Math.PI * RENDER_DISTANCE * RENDER_DISTANCE * 0.9);
         int[] last = {-1};
         int[] stableTicks = {0};
+        int[] ticks = {0};
+        boolean probe = Boolean.getBoolean("ruthenium.bench.loadProbe");
         context.waitFor(mc -> {
             int loaded = mc.level.getChunkSource().getLoadedChunksCount();
+            if (probe && ticks[0]++ % 10 == 0) {
+                LoadProbe.mark("client: " + loaded + " chunks loaded, all sections compiled " + mc.levelRenderer.hasRenderedAllSections()
+                        + ", fps " + mc.getFps());
+            }
             boolean done = loaded == last[0] && loaded >= expected && mc.levelRenderer.hasRenderedAllSections();
             stableTicks[0] = done ? stableTicks[0] + 1 : 0;
             last[0] = loaded;

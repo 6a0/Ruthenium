@@ -14,7 +14,8 @@
   },
   "mixins": [
     "ruthenium-gametest.mixins.json",
-    "ruthenium-gametest-probe.mixins.json"
+    "ruthenium-gametest-probe.mixins.json",
+    "ruthenium-gametest-load.mixins.json"
   ],
   "depends": {
     "fabric-client-gametest-api-v1": "*"

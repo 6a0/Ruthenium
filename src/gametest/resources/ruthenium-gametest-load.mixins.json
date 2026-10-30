@@ -1,0 +1,18 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "net.ruthenium.gametest.loadprobe",
+  "plugin": "net.ruthenium.gametest.LoadProbePlugin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "BlocksLoadProbeMixin",
+    "LoadingOverlayLoadProbeMixin",
+    "MainLoadProbeMixin",
+    "MinecraftLoadProbeMixin",
+    "PlayerChunkSenderLoadProbeMixin",
+    "ReloadableResourceManagerLoadProbeMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
