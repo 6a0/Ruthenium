@@ -137,7 +137,10 @@ import java.util.function.Consumer;
  * block entity, each with the bounds of its vertices, and a cell whose bounds (plus half a block) lie outside the frame's
  * cull frustum isn't drawn: a section is drawn whenever any of it is in view, and its block entities outside the view
  * only cost vertex work. The cells keep the render type order; only the order across block entities of one render type
- * changes, which shows only where two of them draw the same depth.
+ * changes, which shows only where two of them draw the same depth. A part's cells are drawn facing group by facing group,
+ * as one section-wide buffer sorted by planes draws them, and within a group nearest cell first: drawn cell after cell in
+ * index order, occluded fragments of dense sections were shaded (the block entity scene's retained draws took 448 instead
+ * of 287 us of GPU per frame).
  * <p>
  * Only used from the render thread, except {@link #markDirty} and {@link #clear}.
  */
@@ -195,6 +198,16 @@ public final class RetainedBlockEntities {
     private static boolean builtWithCells = true;
     /** Per draw of {@link #prepareDraws}, in its order: culled this frame */
     private static boolean[] culled = new boolean[0];
+    /** Per draw of {@link #prepareDraws}: the index of its transform in {@link #transforms} */
+    private static int[] transformOf = new int[0];
+    /** {@link #draw}'s bindings, and its order of a part's cells */
+    private static @Nullable RenderPipeline boundPipeline;
+    private static @Nullable RenderType boundType;
+    private static @Nullable GpuBufferSlice boundTransform;
+    private static @Nullable GpuBuffer boundBuffer;
+    private static final int[] FIRST_QUAD = new int[1];
+    private static final int[] CELL_ORDER = new int[8];
+    private static final float[] CELL_DISTANCES = new float[8];
     private static final Map<RenderType, PreparedRenderType> PREPARED = new IdentityHashMap<>();
     private static final Map<RenderType, Matrix4f> MODEL_VIEWS = new IdentityHashMap<>();
     private static GpuBufferSlice[] transforms = new GpuBufferSlice[0];
@@ -1153,14 +1166,27 @@ public final class RetainedBlockEntities {
         if (culled.length < count) {
             culled = new boolean[Math.max(count, culled.length * 2)];
         }
+        if (transformOf.length < count) {
+            transformOf = new int[Math.max(count, transformOf.length * 2)];
+        }
         int d = 0;
         for (Batch batch : VISIBLE) {
+            RenderType lastType = null;
             for (int set = 0; set < 2; set++) {
                 for (Draw draw : set == 0 ? batch.draws : batch.signDraws) {
-                    boolean skip = culled[d++] = isCulled(batch, draw);
+                    boolean skip = culled[d] = isCulled(batch, draw);
                     if (skip) {
+                        d++;
                         continue;
                     }
+                    // The cells of a part share their batch's transform (and the draws then keep its binding)
+                    if (draw.renderType == lastType) {
+                        transformOf[d++] = i - 1;
+                        maxIndexCount = Math.max(maxIndexCount, draw.indexCount);
+                        continue;
+                    }
+                    lastType = draw.renderType;
+                    transformOf[d++] = i;
                     // Fresh vectors: the uniform storage compares against the last record it wrote
                     Vector3f offset = new Vector3f((float) (batch.originX - camX), (float) (batch.originY - camY), (float) (batch.originZ - camZ));
                     data[i++] = new DynamicGpuData.Transform(modelView(draw.renderType, modelView), WHITE, offset, IDENTITY);
@@ -1196,53 +1222,123 @@ public final class RetainedBlockEntities {
 
         renderPass.pushDebugGroup(() -> "Ruthenium retained block entities");
         RenderSystem.AutoStorageIndexBuffer indices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
-        RenderPipeline boundPipeline = null;
-        RenderType boundType = null;
+        boundPipeline = null;
+        boundType = null;
+        boundTransform = null;
+        boundBuffer = null;
         boolean faceCulling = Initializer.CONFIG.modelBackFaceCulling;
-        int i = 0;
         int d = 0;
         for (Batch batch : VISIBLE) {
             float eyeX = (float) (camX - batch.originX), eyeY = (float) (camY - batch.originY), eyeZ = (float) (camZ - batch.originZ);
             for (int set = 0; set < 2; set++) {
-                for (Draw draw : set == 0 ? batch.draws : batch.signDraws) {
-                    if (culled[d++]) {
-                        continue;
-                    }
-                    GpuBufferSlice transform = transforms[i++];
-                    if (draw.pipeline != boundPipeline) {
-                        CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(draw.pipeline);
-                        if (pipeline == null) {
-                            continue;
-                        }
-                        boundPipeline = draw.pipeline;
-                        boundType = null;
-                        renderPass.setPipeline(pipeline);
-                        RenderSystem.bindDefaultUniforms(renderPass);
-                        renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
-                    }
-                    if (draw.renderType != boundType) {
-                        boundType = draw.renderType;
-                        for (PreparedRenderType.Texture texture : PREPARED.get(boundType).textures()) {
-                            renderPass.setUniform(texture.name(), texture.textureView(), texture.sampler());
+                Draw[] draws = set == 0 ? batch.draws : batch.signDraws;
+                for (int k = 0; k < draws.length; ) {
+                    // A part's cells (consecutive draws of one render type with bounds) nearest to the eye first: the cells'
+                    // order otherwise breaks the near to far order the planes gave the whole section, and occluded fragments
+                    // are shaded
+                    int end = k + 1;
+                    if (draws[k].bounds.length != 0) {
+                        while (end < draws.length && draws[end].renderType == draws[k].renderType && draws[end].bounds.length != 0) {
+                            end++;
                         }
                     }
-                    renderPass.setUniform("DynamicTransforms", transform);
-                    renderPass.setVertexBuffer(0, draw.buffer.slice());
-                    if (draw.signEnds != null && batch.anyNear) {
-                        drawSignsNotNear(renderPass, draw.signEnds, batch.signsNear);
-                    } else if (faceCulling && draw.faces != null) {
-                        // Quads that face away from the eye would be culled by the pipeline
-                        int runs = draw.faces.visiblePlaneRuns(eyeX, eyeY, eyeZ, RUNS);
-                        for (int r = 0; r < runs; r++) {
-                            renderPass.drawIndexed(RUNS[r * 2 + 1] * 6, 1, 0, RUNS[r * 2] * 4, 0);
+                    int n = end - k;
+                    for (int j = 0; j < n; j++) {
+                        int index = k + j;
+                        float distance = n == 1 ? 0.0F : centerDistance(draws[index].bounds, eyeX, eyeY, eyeZ);
+                        int at = j;
+                        while (at > 0 && CELL_DISTANCES[at - 1] > distance) {
+                            CELL_ORDER[at] = CELL_ORDER[at - 1];
+                            CELL_DISTANCES[at] = CELL_DISTANCES[at - 1];
+                            at--;
+                        }
+                        CELL_ORDER[at] = index;
+                        CELL_DISTANCES[at] = distance;
+                    }
+                    if (n > 1 && faceCulling && draws[k].faces != null) {
+                        // Group by group, as one section-wide buffer sorted by planes draws them, each group's cells near to far
+                        for (int g = 0; g < SectionFaceGroups.GROUP_COUNT; g++) {
+                            for (int j = 0; j < n; j++) {
+                                int index = CELL_ORDER[j];
+                                Draw draw = draws[index];
+                                if (culled[d + index]) {
+                                    continue;
+                                }
+                                int quads = draw.faces.visibleGroupQuads(g, eyeX, eyeY, eyeZ, FIRST_QUAD);
+                                if (quads > 0 && bind(renderPass, indices, draw, transforms[transformOf[d + index]])) {
+                                    renderPass.drawIndexed(quads * 6, 1, 0, FIRST_QUAD[0] * 4, 0);
+                                }
+                            }
                         }
                     } else {
-                        renderPass.drawIndexed(draw.indexCount, 1, 0, 0, 0);
+                        for (int j = 0; j < n; j++) {
+                            int index = CELL_ORDER[j];
+                            if (!culled[d + index]) {
+                                drawOne(renderPass, indices, batch, draws[index], transforms[transformOf[d + index]], faceCulling, eyeX, eyeY, eyeZ);
+                            }
+                        }
                     }
+                    k = end;
                 }
+                d += draws.length;
             }
         }
         renderPass.popDebugGroup();
+    }
+
+    /** The squared distance from the eye to the center of a draw's bounds */
+    private static float centerDistance(float[] bounds, float eyeX, float eyeY, float eyeZ) {
+        float dx = (bounds[0] + bounds[3]) * 0.5F - eyeX, dy = (bounds[1] + bounds[4]) * 0.5F - eyeY, dz = (bounds[2] + bounds[5]) * 0.5F - eyeZ;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    private static void drawOne(RenderPass renderPass, RenderSystem.AutoStorageIndexBuffer indices, Batch batch, Draw draw,
+                                GpuBufferSlice transform, boolean faceCulling, float eyeX, float eyeY, float eyeZ) {
+        if (!bind(renderPass, indices, draw, transform)) {
+            return;
+        }
+        if (draw.signEnds != null && batch.anyNear) {
+            drawSignsNotNear(renderPass, draw.signEnds, batch.signsNear);
+        } else if (faceCulling && draw.faces != null) {
+            // Quads that face away from the eye would be culled by the pipeline
+            int runs = draw.faces.visiblePlaneRuns(eyeX, eyeY, eyeZ, RUNS);
+            for (int r = 0; r < runs; r++) {
+                renderPass.drawIndexed(RUNS[r * 2 + 1] * 6, 1, 0, RUNS[r * 2] * 4, 0);
+            }
+        } else {
+            renderPass.drawIndexed(draw.indexCount, 1, 0, 0, 0);
+        }
+    }
+
+    /** Binds what a draw needs (only what changed); false if its pipeline is not compiled */
+    private static boolean bind(RenderPass renderPass, RenderSystem.AutoStorageIndexBuffer indices, Draw draw, GpuBufferSlice transform) {
+        if (draw.pipeline != boundPipeline) {
+            CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(draw.pipeline);
+            if (pipeline == null) {
+                return false;
+            }
+            boundPipeline = draw.pipeline;
+            boundType = null;
+            boundTransform = null;
+            renderPass.setPipeline(pipeline);
+            RenderSystem.bindDefaultUniforms(renderPass);
+            renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
+        }
+        if (draw.renderType != boundType) {
+            boundType = draw.renderType;
+            for (PreparedRenderType.Texture texture : PREPARED.get(boundType).textures()) {
+                renderPass.setUniform(texture.name(), texture.textureView(), texture.sampler());
+            }
+        }
+        if (transform != boundTransform) {
+            boundTransform = transform;
+            renderPass.setUniform("DynamicTransforms", transform);
+        }
+        if (draw.buffer != boundBuffer) {
+            boundBuffer = draw.buffer;
+            renderPass.setVertexBuffer(0, draw.buffer.slice());
+        }
+        return true;
     }
 
     /** Draws the quads of the signs that stay retained this frame, in runs of consecutive signs */

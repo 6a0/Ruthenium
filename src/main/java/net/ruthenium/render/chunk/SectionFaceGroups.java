@@ -250,6 +250,36 @@ public final class SectionFaceGroups {
         return bits ^ (bits >> 31 & 0x7FFFFFFF);
     }
 
+    /** Facing groups, {@link #UNASSIGNED} and the six directions */
+    public static final int GROUP_COUNT = GROUPS;
+
+    /**
+     * The quads of one group that {@link #visiblePlaneRuns} draws for an eye position, as a first quad and a count
+     * (the whole {@link #UNASSIGNED} group)
+     *
+     * @return the count; {@code first[0]} receives the first quad
+     */
+    public int visibleGroupQuads(int g, float eyeX, float eyeY, float eyeZ, int[] first) {
+        int start = this.starts[g];
+        first[0] = start;
+        if (g == UNASSIGNED) {
+            return this.starts[1] - start;
+        }
+        int end = start;
+        int lastPlane = this.groupPlanes[g + 1];
+        float eye = g <= WEST ? eyeX : g <= DOWN ? eyeY : eyeZ;
+        if ((g & 1) == 1) {
+            for (int p = this.groupPlanes[g]; p < lastPlane && eye > this.planeTests[p]; p++) {
+                end = this.planeEnds[p];
+            }
+        } else {
+            for (int p = this.groupPlanes[g]; p < lastPlane && eye < this.planeTests[p]; p++) {
+                end = this.planeEnds[p];
+            }
+        }
+        return end - start;
+    }
+
     /**
      * The runs of quads to draw for an eye position, of groups sorted by {@link #sortByPlanes}: of each facing group
      * the quads whose plane the eye can be in front of, merging adjacent runs.
