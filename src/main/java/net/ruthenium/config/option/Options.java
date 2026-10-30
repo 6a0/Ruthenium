@@ -242,6 +242,11 @@ public abstract class Options {
                                 value -> config.lazyGlyphWidths = value,
                                 () -> config.lazyGlyphWidths)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.lazyGlyphWidths.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.compactSkyLight"),
+                                value -> config.compactSkyLight = value,
+                                () -> config.compactSkyLight)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.compactSkyLight.tooltip"))
                                 .setImpact(PerformanceImpact.LOW)
                 }),
                 new OptionBlock("", new Option<?>[]{

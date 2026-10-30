@@ -9,19 +9,34 @@ import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.chunk.RenderRegionCache;
 import net.minecraft.client.renderer.chunk.SectionCompiler;
 import net.minecraft.core.SectionPos;
+import net.minecraft.world.level.LightLayer;
+import net.minecraft.world.level.chunk.DataLayer;
 import net.ruthenium.Initializer;
 import net.ruthenium.gametest.mixin.SectionRenderDispatcherAccessor;
+import net.ruthenium.mixin.world.DataLayerAccessor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.EnumMap;
+import java.util.HexFormat;
 import java.util.Map;
 
 /**
  * {@code -Pbench.meshCheck=true}: compiles the sections around the player with the mesher optimisations
  * ({@code biomeBlendCache}, {@code sectionLightCache}, {@code sectionStateCache}) on and off and requires byte-identical meshes. Vanilla's
  * tint caches are cleared before each compile, so the "off" compile computes every tint itself.
+ * <p>
+ * It also writes a SHA-256 digest of every section's meshes (the "off" compile) to
+ * {@code results/meshcheck/<compactSkyLight>-<time>.txt} and logs one digest over all of them, for comparing launches
+ * whose difference is fixed when the world loads (switch {@code compactSkyLight}: how the client stores its light).
  */
 final class MeshCompareCheck {
     static final boolean ENABLED = Boolean.parseBoolean(BenchmarkClientGameTest.prop("meshCheck", "false"));
@@ -39,6 +54,9 @@ final class MeshCompareCheck {
             boolean light = Initializer.CONFIG.sectionLightCache;
             boolean states = Initializer.CONFIG.sectionStateCache;
             int sections = 0, quads = 0, mismatches = 0;
+            int skyNoArray = 0, skyArray = 0, skyMissing = 0;
+            MessageDigest all = sha256();
+            StringBuilder perSection = new StringBuilder();
             try (SectionBufferBuilderPack buffers = new SectionBufferBuilderPack()) {
                 for (int dx = -RADIUS; dx <= RADIUS; dx++) {
                     for (int dz = -RADIUS; dz <= RADIUS; dz++) {
@@ -47,6 +65,20 @@ final class MeshCompareCheck {
                             Map<ChunkSectionLayer, byte[]> fast = compile(mc, compiler, buffers, pos, true);
                             Map<ChunkSectionLayer, byte[]> vanilla = compile(mc, compiler, buffers, pos, false);
                             sections++;
+                            DataLayer sky = mc.level.getLightEngine().getLayerListener(LightLayer.SKY).getDataLayerData(pos);
+                            if (sky == null) skyMissing++;
+                            else if (((DataLayerAccessor) sky).ruthenium$data() == null) skyNoArray++;
+                            else skyArray++;
+                            MessageDigest one = sha256();
+                            for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
+                                byte[] b = vanilla.get(layer);
+                                one.update((byte) layer.ordinal());
+                                if (b != null) one.update(b);
+                            }
+                            byte[] sectionDigest = one.digest();
+                            all.update(sectionDigest);
+                            perSection.append(pos.x()).append(' ').append(pos.y()).append(' ').append(pos.z()).append(' ')
+                                    .append(HexFormat.of().formatHex(sectionDigest)).append('\n');
                             for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
                                 byte[] a = fast.get(layer), b = vanilla.get(layer);
                                 if (b != null) {
@@ -66,10 +98,30 @@ final class MeshCompareCheck {
                 Initializer.CONFIG.sectionStateCache = states;
             }
             LOGGER.info("Mesh check: {} sections ({} quads) compiled twice, {} mismatching layers", sections, quads, mismatches);
+            String digest = HexFormat.of().formatHex(all.digest());
+            LOGGER.info("Mesh check digest {} (compactSkyLight {}; sky layers of these sections: {} without array, {} with, {} none)",
+                    digest, Initializer.CONFIG.compactSkyLight, skyNoArray, skyArray, skyMissing);
+            try {
+                Path dir = Path.of(BenchmarkClientGameTest.prop("outDir", "../results")).resolve("meshcheck");
+                Files.createDirectories(dir);
+                String time = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+                Files.writeString(dir.resolve("compactSkyLight-" + Initializer.CONFIG.compactSkyLight + "-" + time + ".txt"),
+                        "digest " + digest + "\n" + perSection);
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to write mesh digests", e);
+            }
             if (mismatches > 0) {
                 throw new AssertionError(mismatches + " mismatching section layers");
             }
         });
+    }
+
+    private static MessageDigest sha256() {
+        try {
+            return MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     private static Map<ChunkSectionLayer, byte[]> compile(Minecraft mc, SectionCompiler compiler, SectionBufferBuilderPack buffers,
