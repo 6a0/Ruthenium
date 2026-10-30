@@ -68,6 +68,7 @@
     "render.text.MutableComponentM",
     "render.text.SignTextM",
     "render.text.SubmitNodeCollectionNameTagM",
+    "render.text.PlayerTeamAccessor",
     "render.text.TextDisplayRendererM",
     "render.text.TextFeatureRendererM",
     "render.vertex.BufferBuilderAccessor",

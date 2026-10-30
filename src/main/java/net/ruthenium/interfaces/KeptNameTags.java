@@ -8,4 +8,9 @@ public interface KeptNameTags {
     @Nullable Component ruthenium$keptNameTag(boolean belowName);
 
     void ruthenium$keepNameTag(boolean belowName, Component component);
+
+    /** What the kept name tag was built from ({@link net.ruthenium.render.text.DisplayNames}) */
+    net.ruthenium.render.text.DisplayNames.@Nullable Inputs ruthenium$displayNameInputs();
+
+    void ruthenium$setDisplayNameInputs(net.ruthenium.render.text.DisplayNames.@Nullable Inputs inputs);
 }

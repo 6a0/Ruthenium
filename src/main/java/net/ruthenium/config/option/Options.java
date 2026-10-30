@@ -442,6 +442,11 @@ public abstract class Options {
                                 () -> config.noAllocLightProbe)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.noAllocLightProbe.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.keepDisplayNames"),
+                                value -> config.keepDisplayNames = value,
+                                () -> config.keepDisplayNames)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.keepDisplayNames.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.hashedDrawLookup"),
                                 value -> config.hashedDrawLookup = value,
                                 () -> config.hashedDrawLookup)

@@ -1,0 +1,47 @@
+diff --git a/src/main/java/net/ruthenium/mixin/render/text/EntityRendererNameTagM.java b/src/main/java/net/ruthenium/mixin/render/text/EntityRendererNameTagM.java
+index 1eb528e..7569943 100644
+--- a/src/main/java/net/ruthenium/mixin/render/text/EntityRendererNameTagM.java
++++ b/src/main/java/net/ruthenium/mixin/render/text/EntityRendererNameTagM.java
+@@ -20,6 +20,10 @@ public class EntityRendererNameTagM {
+     private Component ruthenium$keepNameTag(EntityRenderer<?, ?> renderer, Entity entity, Operation<Component> original) {
+         Component kept = DisplayNames.kept(renderer, entity);
+         if (kept != null) {
++            if (Boolean.getBoolean("ruthenium.nameCheck")) {
++                Component vanilla = original.call(renderer, entity);
++                net.ruthenium.render.text.DisplayNameCheck.check(kept, vanilla);
++            }
+             return kept;
+         }
+         Component nameTag = EntityTextCache.keep(entity, original.call(renderer, entity), false);
+diff --git a/src/main/java/net/ruthenium/render/text/DisplayNameCheck.java b/src/main/java/net/ruthenium/render/text/DisplayNameCheck.java
+new file mode 100644
+index 0000000..c440286
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/text/DisplayNameCheck.java
+@@ -0,0 +1,26 @@
++package net.ruthenium.render.text;
++
++import net.minecraft.network.chat.Component;
++import org.slf4j.LoggerFactory;
++
++import java.util.Objects;
++
++/** Temporary check of keepDisplayNames: every kept name tag against vanilla's getNameTag (-Druthenium.nameCheck=true) */
++public final class DisplayNameCheck {
++    private static long hits, mismatches;
++
++    private DisplayNameCheck() {
++    }
++
++    public static void check(Component kept, Component vanilla) {
++        hits++;
++        if (!Objects.equals(kept, vanilla)) {
++            if (mismatches++ < 5) {
++                LoggerFactory.getLogger("Ruthenium name check").info("mismatch: kept {} vanilla {}", kept, vanilla);
++            }
++        }
++        if (hits % 1_000_000 == 0) {
++            LoggerFactory.getLogger("Ruthenium name check").info("display names: {} kept, {} mismatches", hits, mismatches);
++        }
++    }
++}

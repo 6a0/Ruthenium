@@ -87,6 +87,8 @@ public class Config {
     public boolean pooledSubmitPoses = true;
     /** Entities with the default light probe (their eye) find their light without a new vector and block position per frame */
     public boolean noAllocLightProbe = true;
+    /** Name tags of entities whose display name is built from the same objects as last frame are not built again */
+    public boolean keepDisplayNames = true;
     /** Finds the draw of a render type with a hash lookup instead of a linear search */
     public boolean hashedDrawLookup = true;
     /** Geometry of equal render types joins one draw in groups that may be reordered */
