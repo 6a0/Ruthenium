@@ -16,7 +16,8 @@ import java.util.HexFormat;
 /**
  * A digest of every block state's cached data (collision and occlusion shapes, sturdy faces, light, fluid, solid), to
  * check that building the caches differently (e.g. in parallel, a twenty-ninth session prototype) gives the same results:
- * the footprint scene logs it with {@code -Pbench.loadProbe=true} and writes each state's line next to the histograms,
+ * the footprint scene logs it with {@code -Pbench.loadProbe=true} (and with {@code -Pbench.stateCacheDump=true} writes each
+ * state's line next to the histograms),
  * and two launches with the change on and off must log the same digest.
  */
 final class StateCacheDigest {

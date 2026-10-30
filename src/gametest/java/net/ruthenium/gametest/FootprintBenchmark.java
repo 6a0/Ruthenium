@@ -84,7 +84,8 @@ final class FootprintBenchmark {
 
         if (Boolean.getBoolean("ruthenium.bench.loadProbe")) {
             logClassLoadingCounters("title");
-            Path dump = histoDir.resolve(prefix + "-statecaches.txt");
+            // -Pbench.stateCacheDump=true also writes every state's line (~15 MB) for diffing two launches
+            Path dump = Boolean.getBoolean("ruthenium.bench.stateCacheDump") ? histoDir.resolve(prefix + "-statecaches.txt") : null;
             String digest = context.computeOnClient(_ -> StateCacheDigest.digest(dump));
             LOGGER.info("Block state cache digest: {}", digest);
         }
