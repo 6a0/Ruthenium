@@ -1,7 +1,10 @@
 package net.ruthenium.render.entity;
 
 import com.mojang.blaze3d.systems.RenderSystem;
+import net.fabricmc.fabric.api.client.renderer.v1.Renderer;
 import net.fabricmc.fabric.api.client.renderer.v1.mesh.Mesh;
+import net.fabricmc.fabric.api.client.renderer.v1.mesh.MutableMesh;
+import net.fabricmc.fabric.api.client.renderer.v1.mesh.QuadEmitter;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.ModelBlockRenderer;
@@ -34,6 +37,11 @@ public final class BlockModelMeshCache {
 
     private static final Map<Object, Mesh> MESHES = new HashMap<>();
     private static @Nullable RandomSource keyRandom;
+    /** The render state's {@code setupMesh} is seen by {@code BlockModelRenderStateM}, so it knows which states hold a mesh */
+    private static boolean setupMeshHooked;
+    /** The random {@code update} hands the model instead of a new state's own ({@code noScratchMesh}) */
+    private static @Nullable RandomSource scratchRandom;
+    private static @Nullable MutableMesh scratchMesh;
 
     private BlockModelMeshCache() {
     }
@@ -63,6 +71,38 @@ public final class BlockModelMeshCache {
             return new OpaqueKey(key);
         }
         return key;
+    }
+
+    public static void setupMeshHooked() {
+        setupMeshHooked = true;
+    }
+
+    /** States of cached models may be set up without a mesh of their own ({@code noScratchMesh}) */
+    public static boolean skipScratchMesh() {
+        return setupMeshHooked && Initializer.CONFIG.noScratchMesh;
+    }
+
+    /**
+     * The random of a block model update, as {@code BlockModelRenderState.scratchRandomSource} returns it but shared
+     * instead of one per render state (render states are new every frame); render thread only
+     */
+    public static RandomSource scratchRandom(long seed) {
+        RandomSource random = scratchRandom;
+        if (random == null) {
+            random = scratchRandom = RandomSource.create(seed);
+        } else {
+            random.setSeed(seed);
+        }
+        return random;
+    }
+
+    /** An emitter nothing is written to, returned where a state set up without a mesh of its own must return one */
+    public static QuadEmitter scratchEmitter() {
+        MutableMesh mesh = scratchMesh;
+        if (mesh == null) {
+            mesh = scratchMesh = Renderer.get().mutableMesh();
+        }
+        return mesh.emitter();
     }
 
     public static @Nullable Mesh get(Object key) {

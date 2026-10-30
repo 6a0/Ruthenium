@@ -101,6 +101,8 @@
   "ruthenium.options.reuseEntityStates.tooltip": "Armor stands reuse their render state from the previous frame instead of creating a new one every frame.",
   "ruthenium.options.blockModelMeshCache": "Cache Entity Block Models",
   "ruthenium.options.blockModelMeshCache.tooltip": "Item frames, block displays, minecarts and endermen reuse the quads of their block models instead of building them again every frame.",
+  "ruthenium.options.noScratchMesh": "No Scratch Meshes for Cached Models",
+  "ruthenium.options.noScratchMesh.tooltip": "With Cache Entity Block Models, item frames, block displays, minecarts and endermen no longer allocate an empty block mesh and a random generator every frame that the cached quads leave unused. Same image, less garbage. Mods that read the Fabric Renderer API's mesh of a block model render state may want it off.",
   "ruthenium.options.hashedDrawLookup": "Fast Draw Lookup",
   "ruthenium.options.hashedDrawLookup.tooltip": "Finds the draw an entity's or item's geometry goes into with a hash lookup instead of searching all of the frame's draws.",
   "ruthenium.options.mergeDraws": "Merge Entity Draws",

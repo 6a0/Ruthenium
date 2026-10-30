@@ -1,9 +1,11 @@
 package net.ruthenium.mixin.render.entity;
 
+import com.llamalad7.mixinextras.injector.ModifyReturnValue;
 import com.mojang.blaze3d.vertex.PoseStack;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import net.fabricmc.fabric.api.client.renderer.v1.mesh.Mesh;
+import net.minecraft.client.renderer.Sheets;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.block.BlockModelRenderState;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
@@ -19,6 +21,7 @@ import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.Collections;
 import java.util.List;
@@ -28,6 +31,10 @@ import java.util.List;
  * model's quads into the render state's mesh while extracting and that mesh into a new immutable one while
  * submitting, for every entity and frame. The cached mesh is immutable and has the same quads. Applied after the
  * Fabric Renderer API's mixin (priority), whose submit does nothing while the render state's own mesh is empty.
+ * <p>
+ * With {@code noScratchMesh} a state whose model is cached doesn't get a mesh of its own at all
+ * ({@link #ruthenium$setupCachedMesh}): the Fabric Renderer API's {@code setupMesh} allocates one for every new or cleared
+ * state (render states are new every frame), only for it to stay empty.
  */
 @Mixin(value = BlockModelRenderState.class, priority = 1100)
 public class BlockModelRenderStateM implements CachedMeshRenderState {
@@ -35,17 +42,60 @@ public class BlockModelRenderStateM implements CachedMeshRenderState {
     @Shadow private @Nullable Matrix4fc transformation;
     @Shadow private @Nullable IntList tintLayers;
     @Shadow public int blockLightCoords;
+    @Shadow private @Nullable RenderType renderType;
+
+    @Shadow
+    private static @Nullable Matrix4fc identityToNull(Matrix4fc transformation) {
+        throw new AssertionError();
+    }
 
     @Unique private @Nullable Mesh cachedMesh;
+    /** The Fabric Renderer API's {@code setupMesh} ran since the state was created or last cleared, so it may hold a mesh */
+    @Unique private boolean fabricMesh;
 
     @Override
     public void ruthenium$setCachedMesh(@Nullable Mesh mesh) {
         this.cachedMesh = mesh;
     }
 
+    @Override
+    public boolean ruthenium$setupCachedMesh(Matrix4fc transformation, boolean hasTranslucency, Mesh mesh) {
+        if (this.fabricMesh) {
+            // Its mesh must be cleared, which setupMesh does without allocating
+            return false;
+        }
+        // What setupMesh does, without the mesh
+        this.transformation = identityToNull(transformation);
+        this.renderType = hasTranslucency ? Sheets.translucentBlockItemSheet() : Sheets.cutoutBlockItemSheet();
+        if (this.modelParts != null) {
+            this.modelParts.clear();
+        }
+        this.cachedMesh = mesh;
+        return true;
+    }
+
     @Inject(method = {"clear", "setupModel"}, at = @At("HEAD"))
     private void clearCachedMesh(CallbackInfo ci) {
         this.cachedMesh = null;
+    }
+
+    /** The Fabric Renderer API's mixin sets its mesh to null at the end of clear */
+    @Inject(method = "clear", at = @At("RETURN"))
+    private void clearFabricMesh(CallbackInfo ci) {
+        this.fabricMesh = false;
+    }
+
+    /** Merged by the Fabric Renderer API's mixin, which is applied first (priority) */
+    @Inject(method = "setupMesh", at = @At("HEAD"), require = 0)
+    private void markFabricMesh(CallbackInfoReturnable<?> cir) {
+        this.fabricMesh = true;
+        BlockModelMeshCache.setupMeshHooked();
+    }
+
+    /** A state set up without a mesh of its own is not empty while it has a cached one, as with its own (empty) mesh */
+    @ModifyReturnValue(method = "isEmpty", at = @At("RETURN"))
+    private boolean cachedMeshNotEmpty(boolean original) {
+        return original && this.cachedMesh == null;
     }
 
     @Inject(method = "submitModel", at = @At("HEAD"), cancellable = true)
