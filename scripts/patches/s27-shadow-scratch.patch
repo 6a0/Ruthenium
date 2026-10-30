@@ -1,0 +1,30 @@
+diff --git a/src/main/java/net/ruthenium/mixin/render/feature/ShadowFeatureRendererM.java b/src/main/java/net/ruthenium/mixin/render/feature/ShadowFeatureRendererM.java
+new file mode 100644
+index 0000000..2ce217c
+--- /dev/null
++++ b/src/main/java/net/ruthenium/mixin/render/feature/ShadowFeatureRendererM.java
+@@ -0,0 +1,24 @@
++package net.ruthenium.mixin.render.feature;
++
++import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
++import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
++import com.mojang.blaze3d.systems.RenderSystem;
++import net.minecraft.client.renderer.feature.ShadowFeatureRenderer;
++import org.joml.Vector3f;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Unique;
++import org.spongepowered.asm.mixin.injection.At;
++
++/**
++ * {@code shadowVertex} transforms each shadow vertex into a new vector, read right away; on the render thread it gets a
++ * scratch vector instead (the same transform)
++ */
++@Mixin(ShadowFeatureRenderer.class)
++public class ShadowFeatureRendererM {
++    @Unique private static final Vector3f SCRATCH = new Vector3f();
++
++    @WrapOperation(method = "shadowVertex", at = @At(value = "NEW", target = "()Lorg/joml/Vector3f;"))
++    private static Vector3f ruthenium$scratch(Operation<Vector3f> original) {
++        return RenderSystem.isOnRenderThread() ? SCRATCH : original.call();
++    }
++}

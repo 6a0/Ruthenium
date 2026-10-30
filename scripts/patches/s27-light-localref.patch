@@ -1,0 +1,59 @@
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/EntityRendererLightM.java b/src/main/java/net/ruthenium/mixin/render/entity/EntityRendererLightM.java
+index d00450a..2a8b0fc 100644
+--- a/src/main/java/net/ruthenium/mixin/render/entity/EntityRendererLightM.java
++++ b/src/main/java/net/ruthenium/mixin/render/entity/EntityRendererLightM.java
+@@ -2,7 +2,7 @@ package net.ruthenium.mixin.render.entity;
+ 
+ import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
+ import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
+-import com.llamalad7.mixinextras.sugar.Local;
++import com.llamalad7.mixinextras.injector.ModifyReceiver;
+ import com.mojang.blaze3d.systems.RenderSystem;
+ import net.minecraft.client.renderer.entity.EntityRenderer;
+ import net.minecraft.core.BlockPos;
+@@ -12,21 +12,44 @@ import net.minecraft.world.level.LightLayer;
+ import net.ruthenium.Initializer;
+ import net.ruthenium.interfaces.CachedEntityLight;
+ import net.ruthenium.render.entity.EntityLight;
++import org.jspecify.annotations.Nullable;
+ import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Unique;
+ import org.spongepowered.asm.mixin.injection.At;
+ 
+ /**
+  * The block and sky light that {@code EntityRenderer} reads at an entity's light probe position every frame come from
+  * the values kept on the entity ({@link EntityLight}).
++ * <p>
++ * The entity is taken from the {@code entity.level()} call right before the light lookup ({@code ModifyReceiver}), not
++ * with {@code @Local}: in a {@code WrapOperation} MixinExtras passes such a local by reference, a {@code LocalRef}
++ * allocated for every call (two per entity and frame).
+  */
+ @Mixin(EntityRenderer.class)
+ public class EntityRendererLightM {
++    /** The entity whose light is looked up next on the render thread */
++    @Unique private static @Nullable Entity lightEntity;
++
++    @ModifyReceiver(method = {"getSkyLightLevel", "getBlockLightLevel"}, at = @At(value = "INVOKE",
++            target = "Lnet/minecraft/world/entity/Entity;level()Lnet/minecraft/world/level/Level;"))
++    private Entity ruthenium$lightEntity(Entity entity) {
++        if (RenderSystem.isOnRenderThread()) {
++            lightEntity = entity;
++        }
++        return entity;
++    }
++
+     @WrapOperation(method = {"getSkyLightLevel", "getBlockLightLevel"}, at = @At(value = "INVOKE",
+             target = "Lnet/minecraft/world/level/Level;getBrightness(Lnet/minecraft/world/level/LightLayer;Lnet/minecraft/core/BlockPos;)I"))
+-    private int ruthenium$keptBrightness(Level level, LightLayer layer, BlockPos pos, Operation<Integer> original, @Local(argsOnly = true) Entity entity) {
++    private int ruthenium$keptBrightness(Level level, LightLayer layer, BlockPos pos, Operation<Integer> original) {
+         if (!Initializer.CONFIG.entityLightCache || !RenderSystem.isOnRenderThread()) {
+             return original.call(level, layer, pos);
+         }
++        Entity entity = lightEntity;
++        lightEntity = null;
++        if (entity == null) {
++            return original.call(level, layer, pos);
++        }
+ 
+         CachedEntityLight cache = (CachedEntityLight) entity;
+         int light = cache.ruthenium$light(level, layer, pos.asLong(), EntityLight.generation());

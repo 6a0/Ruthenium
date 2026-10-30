@@ -13,6 +13,7 @@ import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.util.LightCoordsUtil;
 import net.ruthenium.interfaces.CachedMeshRenderState;
 import net.ruthenium.render.entity.BlockModelMeshCache;
+import net.ruthenium.render.feature.SubmitPosePool;
 import org.joml.Matrix4fc;
 import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
@@ -111,15 +112,21 @@ public class BlockModelRenderStateM implements CachedMeshRenderState {
                 ? new ObjectArrayList<>(this.modelParts) : Collections.emptyList();
         int[] tints = this.tintLayers != null ? this.tintLayers.toArray(BlockModelRenderState.EMPTY_TINTS) : BlockModelRenderState.EMPTY_TINTS;
         int lightCoords = LightCoordsUtil.max(externalLightCoords, this.blockLightCoords);
-        if (this.transformation != null) {
-            poseStack.pushPose();
-            poseStack.mulPose(this.transformation);
-            submitNodeCollector.submitBlockModel(poseStack, _ -> renderType, renderType.hasBlending(), modelPartsCopy, mesh, tints, lightCoords,
-                    overlayCoords, outlineColor);
-            poseStack.popPose();
-        } else {
-            submitNodeCollector.submitBlockModel(poseStack, _ -> renderType, renderType.hasBlending(), modelPartsCopy, mesh, tints, lightCoords,
-                    overlayCoords, outlineColor);
+        // The Fabric Renderer API's submit copies the pose first thing; that copy comes from the submit pose pool
+        SubmitPosePool.poolNextCopy();
+        try {
+            if (this.transformation != null) {
+                poseStack.pushPose();
+                poseStack.mulPose(this.transformation);
+                submitNodeCollector.submitBlockModel(poseStack, _ -> renderType, renderType.hasBlending(), modelPartsCopy, mesh, tints, lightCoords,
+                        overlayCoords, outlineColor);
+                poseStack.popPose();
+            } else {
+                submitNodeCollector.submitBlockModel(poseStack, _ -> renderType, renderType.hasBlending(), modelPartsCopy, mesh, tints, lightCoords,
+                        overlayCoords, outlineColor);
+            }
+        } finally {
+            SubmitPosePool.clearNextCopy();
         }
         ci.cancel();
     }

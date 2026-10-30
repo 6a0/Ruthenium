@@ -1,8 +1,8 @@
 diff --git a/src/main/java/net/ruthenium/render/feature/SubmitPosePool.java b/src/main/java/net/ruthenium/render/feature/SubmitPosePool.java
-index b32ca5c..ad042bc 100644
+index 34deaac..baba600 100644
 --- a/src/main/java/net/ruthenium/render/feature/SubmitPosePool.java
 +++ b/src/main/java/net/ruthenium/render/feature/SubmitPosePool.java
-@@ -33,10 +33,30 @@ public final class SubmitPosePool {
+@@ -35,6 +35,22 @@ public final class SubmitPosePool {
  
      /** A new frame: the poses handed out before are free again */
      public static void beginFrame() {
@@ -24,6 +24,9 @@ index b32ca5c..ad042bc 100644
 +        }
          used = 0;
          usedMatrices = 0;
+     }
+@@ -61,6 +77,10 @@ public final class SubmitPosePool {
+         return false;
      }
  
 +    private static final boolean CHECK = Boolean.getBoolean("ruthenium.poseCheck");

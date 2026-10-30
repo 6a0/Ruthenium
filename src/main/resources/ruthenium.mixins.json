@@ -55,6 +55,7 @@
     "render.feature.MinecraftFrameM",
     "render.feature.SubmitNodeCollectionPoseM",
     "render.feature.SubmitNodeStorageOrderM",
+    "render.feature.PoseCopyM",
     "render.particle.ClientPacketListenerM",
     "render.particle.ParticleEngineM",
     "render.particle.QuadParticleRenderStateM",

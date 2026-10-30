@@ -25,6 +25,8 @@ public final class SubmitPosePool {
 
     private static PoseStack.Pose[] poses = new PoseStack.Pose[1024];
     private static int used;
+    /** The next {@code Pose.copy()} on the render thread is a submit's ({@link #poolNextCopy}) */
+    private static boolean poolNextCopy;
     private static Matrix4f[] matrices = new Matrix4f[256];
     private static int usedMatrices;
 
@@ -35,6 +37,28 @@ public final class SubmitPosePool {
     public static void beginFrame() {
         used = 0;
         usedMatrices = 0;
+    }
+
+    /**
+     * The next {@code Pose.copy()} is a submit's that {@code SubmitNodeCollectionPoseM} can't reach: the Fabric Renderer
+     * API's mesh submit of a cached entity block model ({@code BlockModelRenderStateM}), which copies the pose first thing
+     * (a method its mixin merges into the collection). {@code PoseCopyM} hands that copy out of the pool.
+     */
+    public static void poolNextCopy() {
+        poolNextCopy = Initializer.CONFIG.pooledSubmitPoses && RenderSystem.isOnRenderThread();
+    }
+
+    public static void clearNextCopy() {
+        poolNextCopy = false;
+    }
+
+    /** True once after {@link #poolNextCopy}, on the render thread */
+    public static boolean takeNextCopy() {
+        if (poolNextCopy && RenderSystem.isOnRenderThread()) {
+            poolNextCopy = false;
+            return true;
+        }
+        return false;
     }
 
     /** As {@code pose.copy()} */
