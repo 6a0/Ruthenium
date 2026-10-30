@@ -27,6 +27,8 @@ public class Initializer implements ClientModInitializer {
 				.resolve("ruthenium_settings.json");
 
 		CONFIG = Config.load(configPath);
+
+		LoaderManifests.trim();
 	}
 
 	public static String getVersion() {
