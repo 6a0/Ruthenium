@@ -124,9 +124,8 @@ Mentions of "VulkanMod" further down are history: the upstream mod, or this mod 
   only rendering speed.
 - **Icon:** `assets/ruthenium/rlogo.png` (960×960 RGBA, transparent background) is both the mod list icon
   (`fabric.mod.json`) and the settings screen icon (`ModSettingsRegistry`); VulkanMod's `vlogo*.png` were removed.
-- **Still to decide:** the issue templates in `.github/` and the
-  Ko-fi button on the settings screen (`VOptionScreen.KOFI_URI`) still point to upstream VulkanMod; `fabric.mod.json`
-  still lists `Collateral` as the author.
+- **Still to decide:** the issue templates in `.github/` still point to upstream VulkanMod; `fabric.mod.json` still
+  lists `Collateral` as the author. The Ko-fi "Support me" button on the settings screen was removed.
 - **Name history:** briefly Rubidium, then Thallium (both already used: Rubidium is a Forge Sodium port, Thallium a
   Modrinth modpack). Ruthenium was free when checked: no public Modrinth project (an old, deleted or private
   kel-cu "Ruthenium" mod may still hold the `ruthenium` slug), no CurseForge result found, and only two archived GitHub

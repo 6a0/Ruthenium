@@ -6,7 +6,6 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.TextureFilteringMethod;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.events.GuiEventListener;
-import net.minecraft.client.gui.screens.ConfirmLinkScreen;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.options.VideoSettingsScreen;
 import net.minecraft.client.input.KeyEvent;
@@ -21,13 +20,11 @@ import net.ruthenium.config.gui.widget.*;
 import net.ruthenium.config.option.*;
 import net.ruthenium.config.gui.util.ColorUtil;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 
 public class VOptionScreen extends Screen {
     public final static int MARGIN = 10;
-    private static final URI KOFI_URI = URI.create("https://ko-fi.com/xcollateral");
 
     private final Screen parent;
 
@@ -119,9 +116,7 @@ public class VOptionScreen extends Screen {
 
     private VTextInputWidget createSearchField() {
         int rightMargin = 10;
-        int padding = 10;
-        int kofiWidth = Minecraft.getInstance().font.width(Component.translatable("ruthenium.options.buttons.kofi")) + padding;
-        int topBarRight = this.width - kofiWidth - rightMargin;
+        int topBarRight = this.width - rightMargin;
 
         int leftMargin = VGuiConstants.PAGE_BUTTON_WIDTH + MARGIN + 6;
         int width = Math.min(topBarRight - leftMargin - 4, 413);
@@ -288,21 +283,12 @@ public class VOptionScreen extends Screen {
         this.undoButton = new VButtonWidget(x0, y0, buttonWidth, VGuiConstants.WIDGET_HEIGHT,
                 Component.translatable("ruthenium.options.buttons.undo"), button -> undo());
 
-        int kofiWidth = Minecraft.getInstance().font.width(Component.translatable("ruthenium.options.buttons.kofi")) + padding;
-
-        int kofiX = this.width - kofiWidth - rightMargin;
-        VButtonWidget supportButton = new VButtonWidget(kofiX, 4, kofiWidth, VGuiConstants.WIDGET_HEIGHT,
-                Component.translatable("ruthenium.options.buttons.kofi"),
-                button -> ConfirmLinkScreen.confirmLinkNow(this, KOFI_URI));
-
         this.buttons.add(this.applyButton);
         this.buttons.add(doneButton);
-        this.buttons.add(supportButton);
         this.buttons.add(this.undoButton);
 
         this.addWidget(this.applyButton);
         this.addWidget(doneButton);
-        this.addWidget(supportButton);
         this.addWidget(this.undoButton);
         this.addWidget(this.searchField);
     }
