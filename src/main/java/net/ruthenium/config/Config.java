@@ -113,6 +113,9 @@ public class Config {
     /** Section compiles read the block states around each block from an array */
     public boolean sectionStateCache = true;
 
+    /** The vignette is skipped while its color is black (its blend then leaves every pixel as it is) */
+    public boolean skipBlackVignette = true;
+
     private static Path CONFIG_PATH;
 
     private static final Gson GSON = new GsonBuilder()

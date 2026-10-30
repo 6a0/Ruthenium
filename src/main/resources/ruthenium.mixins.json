@@ -5,6 +5,7 @@
   "compatibilityLevel": "JAVA_25",
   "mixins": [],
   "client": [
+    "render.HudVignetteM",
     "render.RenderTypesM",
     "render.ScreenshotM",
     "render.blockentity.BlockEntityDataPacketM",

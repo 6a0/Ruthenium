@@ -389,6 +389,11 @@ public abstract class Options {
                                 () -> config.cloudFaceTexture)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.cloudFaceTexture.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.skipBlackVignette"),
+                                value -> config.skipBlackVignette = value,
+                                () -> config.skipBlackVignette)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.skipBlackVignette.tooltip"))
+                                .setImpact(PerformanceImpact.MEDIUM),
                         new SwitchOption(Component.translatable("ruthenium.options.fastScreenshots"),
                                 value -> config.fastScreenshots = value,
                                 () -> config.fastScreenshots)

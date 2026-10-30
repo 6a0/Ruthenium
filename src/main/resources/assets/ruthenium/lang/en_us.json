@@ -87,6 +87,8 @@
   "ruthenium.options.playerPoseDraws.tooltip": "Player bodies are kept on the GPU in the pose they were modelled in, and each frame only the position and rotation of each body part is sent, instead of every corner of every face. Same image and same drawing order.",
   "ruthenium.options.retainedLabels": "Retained Labels",
   "ruthenium.options.retainedLabels.tooltip": "Name tags, hologram lines and other kept text are stored on the GPU once, and each frame only where each label is and how bright it is gets sent, instead of every corner of every letter. Same image and same drawing order. Mods that change how text is drawn may want it off.",
+  "ruthenium.options.skipBlackVignette": "Skip Black Vignette",
+  "ruthenium.options.skipBlackVignette.tooltip": "The vignette (the darkening of the screen's edges in dim light) isn't drawn while it darkens nothing, as in daylight, where drawing it would only cost a full screen of GPU work. Same image. Resource packs or shader packs that change the vignette's shader may want it off.",
   "ruthenium.options.cloudFaceTexture": "Cloud Face Texture",
   "ruthenium.options.cloudFaceTexture.tooltip": "Clouds read their faces from a small texture instead of a texel buffer, which on some graphics drivers (NVIDIA on Vulkan) makes every frame's submit slower while clouds are on. Same image. Shader packs and mods that change cloud rendering may want it off.",
   "ruthenium.options.fastScreenshots": "Fast Screenshots",
