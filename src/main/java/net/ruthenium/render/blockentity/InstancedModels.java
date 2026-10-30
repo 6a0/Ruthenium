@@ -93,7 +93,14 @@ public final class InstancedModels {
     public static final RenderPipeline SOLID = instancedPipeline("entity_solid", false, false, true);
     public static final RenderPipeline CUTOUT = instancedPipeline("entity_cutout", true, true, false);
     public static final RenderPipeline CUTOUT_CULL = instancedPipeline("entity_cutout_cull", true, false, true);
-    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT, CUTOUT_CULL);
+    /** {@link #CUTOUT} with back faces culled, for groups of closed opaque boxes ({@link ClosedBoxes}) */
+    public static final RenderPipeline CUTOUT_CLOSED = instancedPipeline("entity_cutout_closed", true, true, true);
+    public static final List<RenderPipeline> PIPELINES = List.of(SOLID, CUTOUT, CUTOUT_CULL, CUTOUT_CLOSED);
+    /**
+     * How much farther than its mesh's bounding sphere an instance's center must be from the eye for back face culling: more
+     * than the near plane (0.05) and view bobbing's offset of the eye, so the eye is outside every box and no box is clipped
+     */
+    private static final float CLOSED_EYE_MARGIN = 1.0f;
 
     /** Models drawn from their prepared submits when their parts are posed like an existing group */
     private static final Set<Class<?>> POSED_MODELS = Set.of(ArmorStandModel.class);
@@ -226,6 +233,11 @@ public final class InstancedModels {
         @Nullable PreparedRenderType prepared;
         /** Of a {@link #PLATE_KEY} group: the plate's scale in its mesh */
         float plateXScale, plateYScale, plateZScale;
+        /** A {@link #CUTOUT} mesh of closed opaque boxes ({@link ClosedBoxes}) and its model-space bounding sphere */
+        boolean closed;
+        float boundX, boundY, boundZ, boundRadius;
+        /** This frame: drawn with {@link #CUTOUT_CLOSED} */
+        boolean cullBackFaces;
 
         Group(Model<?> model, Object key, RenderPipeline pipeline, RenderType renderType, @Nullable UvMapping uvMapping, int overlay, int color) {
             this.model = model;
@@ -522,6 +534,34 @@ public final class InstancedModels {
         group.count++;
     }
 
+    /**
+     * Whether every instance of a closed group keeps the winding (positive determinant) and has the eye (the origin of the
+     * camera-relative instance space) farther than {@link #CLOSED_EYE_MARGIN} outside its bounding sphere. The sphere's
+     * radius is scaled by the linear part's Frobenius norm, which bounds how far it moves a point of the mesh.
+     */
+    private static boolean eyeOutsideAll(Group group) {
+        long ptr = MemoryUtil.memAddress0(group.instances);
+        float cx = group.boundX, cy = group.boundY, cz = group.boundZ;
+        for (int i = 0; i < group.count; i++, ptr += INSTANCE_SIZE) {
+            float a = MemoryUtil.memGetFloat(ptr), b = MemoryUtil.memGetFloat(ptr + 4), c = MemoryUtil.memGetFloat(ptr + 8);
+            float d = MemoryUtil.memGetFloat(ptr + 16), e = MemoryUtil.memGetFloat(ptr + 20), f = MemoryUtil.memGetFloat(ptr + 24);
+            float g = MemoryUtil.memGetFloat(ptr + 32), h = MemoryUtil.memGetFloat(ptr + 36), k = MemoryUtil.memGetFloat(ptr + 40);
+            float det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+            if (!(det > 0.0f)) {
+                return false;
+            }
+            float x = a * cx + b * cy + c * cz + MemoryUtil.memGetFloat(ptr + 12);
+            float y = d * cx + e * cy + f * cz + MemoryUtil.memGetFloat(ptr + 28);
+            float z = g * cx + h * cy + k * cz + MemoryUtil.memGetFloat(ptr + 44);
+            float norm = (float) Math.sqrt(a * a + b * b + c * c + d * d + e * e + f * f + g * g + h * h + k * k);
+            float reach = group.boundRadius * norm + CLOSED_EYE_MARGIN;
+            if (!(x * x + y * y + z * z > reach * reach)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static void putRow(long ptr, float x, float y, float z, float w) {
         MemoryUtil.memPutFloat(ptr, x);
         MemoryUtil.memPutFloat(ptr + 4, y);
@@ -632,6 +672,14 @@ public final class InstancedModels {
                     group.failed = true;
                     return null;
                 }
+                if (pipeline == CUTOUT && uvMapping == null
+                        && ClosedBoxes.check(data.vertexBuffer(), data.drawState().vertexCount() / 4, DefaultVertexFormat.ENTITY.getVertexSize(), renderType)) {
+                    group.closed = true;
+                    group.boundX = ClosedBoxes.centerX;
+                    group.boundY = ClosedBoxes.centerY;
+                    group.boundZ = ClosedBoxes.centerZ;
+                    group.boundRadius = ClosedBoxes.radius;
+                }
                 group.mesh = RenderSystem.getDevice().createBuffer(() -> "Ruthenium instanced model", GpuBuffer.USAGE_VERTEX, data.vertexBuffer());
                 group.indexCount = data.drawState().vertexCount() / 4 * 6;
             }
@@ -670,6 +718,7 @@ public final class InstancedModels {
                 continue;
             }
             group.lastUsedFrame = frame;
+            group.cullBackFaces = group.closed && Initializer.CONFIG.closedModelCulling && eyeOutsideAll(group);
             group.instanceOffset = total;
             total += group.count * INSTANCE_SIZE;
             // The same textures for every group of a render type (the draws then keep their bindings)
@@ -724,8 +773,9 @@ public final class InstancedModels {
                 continue;
             }
             // Bindings are kept between draws of one pipeline (the same values vanilla's per draw binding would set)
-            if (group.pipeline != lastPipeline) {
-                CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(group.pipeline);
+            RenderPipeline groupPipeline = group.cullBackFaces ? CUTOUT_CLOSED : group.pipeline;
+            if (groupPipeline != lastPipeline) {
+                CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(groupPipeline);
                 if (pipeline == null) {
                     continue;
                 }
@@ -733,7 +783,7 @@ public final class InstancedModels {
                 RenderSystem.bindDefaultUniforms(renderPass);
                 renderPass.setUniform("DynamicTransforms", transform);
                 renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
-                lastPipeline = group.pipeline;
+                lastPipeline = groupPipeline;
                 lastPrepared = null;
             }
             if (group.prepared != lastPrepared) {

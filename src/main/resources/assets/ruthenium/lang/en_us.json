@@ -34,6 +34,8 @@
   "ruthenium.options.instancedModels.tooltip": "Draws closed enchanting table books and armor stands posed alike as GPU instances.",
   "ruthenium.options.armorStandPlates": "Separate Armor Stand Plates",
   "ruthenium.options.armorStandPlates.tooltip": "The base plate of an armor stand turns with the stand, so stands facing different ways used to need a GPU instance group each. The plate is now an instance of its own, and stands posed alike share one group whichever way they face. Same image. Needs Instanced Models. Mods that change the armor stand model may want it off.",
+  "ruthenium.options.closedModelCulling": "Cull Closed Model Insides",
+  "ruthenium.options.closedModelCulling.tooltip": "Armor stands drawn as GPU instances skip the inside faces of their boxes, which are drawn without face culling but always hidden behind the outside faces, as long as every box is closed, its texture fully opaque and the camera not near the stand. Same image. Needs Instanced Models. Resource packs with see-through armor stand textures are detected and drawn as before; mods that change how armor stands are drawn may want it off.",
 
   "ruthenium.options.modelBackFaceCulling": "Model Backface Culling",
   "ruthenium.options.modelBackFaceCulling.tooltip": "Leaves out entity and block entity faces, and sign text, that face away from the camera on the CPU. The GPU would discard them anyway.",

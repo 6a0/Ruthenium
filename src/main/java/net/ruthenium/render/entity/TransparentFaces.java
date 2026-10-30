@@ -6,6 +6,7 @@ import com.mojang.renderpearl.api.pipeline.ColorTargetState;
 import com.mojang.renderpearl.api.pipeline.DepthStencilState;
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import com.mojang.renderpearl.api.pipeline.ShaderType;
+import com.mojang.renderpearl.api.textures.FilterMode;
 import com.mojang.renderpearl.api.textures.GpuTexture;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.model.geom.ModelPart;
@@ -121,6 +122,33 @@ public final class TransparentFaces {
 
         private boolean isTransparent(int x, int y) {
             return (this.alpha[y * this.width + x] & 0xFF) < this.threshold;
+        }
+
+        /**
+         * Whether every texel a face with these UV bounds samples with nearest filtering keeps its fragments: texels
+         * {@code floor(u0 * width)} to {@code ceil(u1 * width) - 1} (and the same in v), repeated and clamped. The texel past
+         * an edge that lies on a texel boundary is only sampled at UVs exactly on that edge.
+         */
+        public boolean isOpaqueNearest(float u0, float u1, float v0, float v1) {
+            if (!Float.isFinite(u0) || !Float.isFinite(u1) || !Float.isFinite(v0) || !Float.isFinite(v1)
+                    || this.texture.getSampler().getMinFilter() != FilterMode.NEAREST
+                    || this.texture.getSampler().getMagFilter() != FilterMode.NEAREST) {
+                return false;
+            }
+            double x0 = Math.floor(u0 * (double) this.width), x1 = Math.ceil(u1 * (double) this.width) - 1;
+            double y0 = Math.floor(v0 * (double) this.height), y1 = Math.ceil(v1 * (double) this.height) - 1;
+            if (x1 < x0 || y1 < y0 || x1 - x0 > this.width || y1 - y0 > this.height) {
+                return false;
+            }
+            for (int y = (int) y0; y <= (int) y1; y++) {
+                for (int x = (int) x0; x <= (int) x1; x++) {
+                    if (this.isTransparent(Math.floorMod(x, this.width), Math.floorMod(y, this.height))
+                            || this.isTransparent(Math.clamp(x, 0, this.width - 1), Math.clamp(y, 0, this.height - 1))) {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
     }
 

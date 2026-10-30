@@ -115,6 +115,8 @@ public class Config {
 
     /** The vignette is skipped while its color is black (its blend then leaves every pixel as it is) */
     public boolean skipBlackVignette = true;
+    /** Instanced models of closed opaque boxes (armor stands) are drawn with back faces culled while the eye is outside them */
+    public boolean closedModelCulling = true;
 
     private static Path CONFIG_PATH;
 
