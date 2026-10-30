@@ -107,6 +107,23 @@ final class SettingsScreenCheck {
         context.waitTicks(3);
         context.takeScreenshot(label + "-settings-search");
 
+        // The graphics API (Vulkan / OpenGL) and VSync options with their tooltips: search each and hover its row
+        for (String term : new String[]{"api", "vsync"}) {
+            context.runOnClient(mc -> {
+                Screen screen = mc.gui.screen();
+                screen.keyPressed(new KeyEvent(InputConstants.KEY_ESCAPE, 0, 0));
+                screen.keyPressed(new KeyEvent(InputConstants.KEY_L, 'l', CTRL));
+                for (char c : term.toCharArray()) {
+                    screen.charTyped(new CharacterEvent(c));
+                }
+            });
+            context.waitTicks(3);
+            context.getInput().setCursorPos(250 * guiScale, (32 + 23 + 10) * guiScale);
+            context.waitTicks(10);
+            context.takeScreenshot(label + "-settings-" + term);
+            context.getInput().setCursorPos(0, 0);
+        }
+
         // Escape leaves the search, then Shift+P opens vanilla's screen
         context.runOnClient(mc -> {
             Screen screen = mc.gui.screen();

@@ -120,7 +120,7 @@ public abstract class Options {
                         VanillaOptions.range(mcOptions.guiScale(),
                                 0, Math.max(window.calculateScale(0, minecraft.isEnforceUnicode()), mcOptions.guiScale().get()), 1),
                         VanillaOptions.range(mcOptions.gamma(), 0, 100, 1, value -> value * 0.01, value -> (int) Math.round(value * 100.0)),
-                        VanillaOptions.cycling(mcOptions.preferredGraphicsBackend(), PreferredGraphicsApi.values())
+                        graphicsApiOption()
                 }),
                 new OptionBlock("", new Option<?>[]{
                         VanillaOptions.cycling(mcOptions.attackIndicator(), AttackIndicatorStatus.values()),
@@ -141,6 +141,29 @@ public abstract class Options {
             Component tooltip = vanilla.apply(value);
             return tooltip == null ? note : Component.empty().append(tooltip).append("\n\n").append(note);
         });
+        return option;
+    }
+
+    /**
+     * Vanilla's graphics API option with only Vulkan and OpenGL, without vanilla's "Prefer" and "Experimental" labels. Default
+     * (OpenGL first, what vanilla's fallback after a failed start leaves) shows as OpenGL.
+     */
+    private static CyclingOption<PreferredGraphicsApi> graphicsApiOption() {
+        var instance = mcOptions.preferredGraphicsBackend();
+        Function<PreferredGraphicsApi, Component> vanilla = VanillaOptions.tooltip(instance);
+        var option = new CyclingOption<>(VanillaOptions.caption(instance),
+                                         new PreferredGraphicsApi[]{PreferredGraphicsApi.VULKAN, PreferredGraphicsApi.OPENGL},
+                                         value -> {
+                                             if (value != PreferredGraphicsApi.OPENGL || instance.get() != PreferredGraphicsApi.DEFAULT) {
+                                                 instance.set(value);
+                                             }
+                                         },
+                                         () -> instance.get() == PreferredGraphicsApi.DEFAULT ? PreferredGraphicsApi.OPENGL : instance.get());
+        option.setTranslator(value -> Component.translatable(value == PreferredGraphicsApi.VULKAN
+                ? "ruthenium.options.graphicsApi.vulkan" : "ruthenium.options.graphicsApi.opengl"));
+        // Vanilla's tooltip, whose restart note compares with the API of this start
+        option.setTooltip(value -> vanilla.apply(value == PreferredGraphicsApi.OPENGL && instance.get() == PreferredGraphicsApi.DEFAULT
+                ? PreferredGraphicsApi.DEFAULT : value));
         return option;
     }
 

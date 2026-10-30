@@ -189,6 +189,9 @@ public class VTextInputWidget extends VAbstractWidget {
 
     public void setInput(String input) {
         this.text = input != null ? input : "";
+        // A shorter text (Escape clears the search) must not leave the cursor past its end
+        this.cursorPos = Math.min(this.cursorPos, this.text.length());
+        this.selectionEnd = Math.min(this.selectionEnd, this.text.length());
     }
 
     @SuppressWarnings("unused")

@@ -136,6 +136,8 @@ public class Config {
     public boolean closedModelCulling = true;
     /** Retained block entity models are drawn per 8x8x8 block cell of their section, and cells outside the view are skipped */
     public boolean retainedCellCulling = true;
+    /** Not a switch: set once a Default graphics API has been changed to Vulkan, so a fallback to OpenGL after a failed start stays */
+    public boolean vulkanByDefault = false;
 
     private static Path CONFIG_PATH;
 

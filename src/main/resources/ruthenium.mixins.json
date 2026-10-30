@@ -93,6 +93,7 @@
     "screen.TitleScreenFadeM",
     "screen.TooltipAccessor",
     "startup.MainStartupM",
+    "startup.OptionsGraphicsApiM",
     "world.BlockEntityM",
     "world.AbstractBoatM",
     "world.ArmorStandM",
