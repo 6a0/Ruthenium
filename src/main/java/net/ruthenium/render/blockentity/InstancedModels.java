@@ -70,7 +70,10 @@ import java.util.Set;
  * model rendered once with the identity pose. {@code ArmorStandModel.setupAnim} turns the base plate back by the
  * stand's yaw (it keeps its world orientation), so with {@code armorStandPlates} the plate is left out of the snapshot
  * and the mesh and drawn as an instance
- * of its own ({@link #PLATE_KEY}): stands posed alike share their groups whichever way they face. The instances are
+ * of its own ({@link #PLATE_KEY}): stands posed alike share their groups whichever way they face. A model has at most
+ * {@link #MAX_GROUPS_PER_MODEL} groups; when it needs another, a group unused for {@link #EVICT_AFTER_FRAMES} is evicted
+ * (poses and yaws change: with the plates in the snapshot, the server's byte-quantized rotation sync gave every stand a new
+ * key ~60 s after it spawned, and the groups full of the old keys sent most stands down vanilla's path). The instances are
  * drawn after the world's solid features with
  * instanced copies of vanilla's entity pipelines, whose vertex shader applies the instance's pose to the position
  * and normal. The only difference to vanilla is rounding: the normal is quantized before the transform instead of
@@ -95,6 +98,13 @@ public final class InstancedModels {
     /** Models drawn from their prepared submits when their parts are posed like an existing group */
     private static final Set<Class<?>> POSED_MODELS = Set.of(ArmorStandModel.class);
     private static final int MAX_GROUPS_PER_MODEL = 32;
+    /**
+     * A model's group that hasn't been used for this many frames may be evicted when the model is at its cap and needs a new
+     * group (least recently used first, at most one eviction per frame). Groups aren't evicted otherwise, so out-of-view models
+     * keep theirs; this bounds mesh rebuilds to {@link #MAX_GROUPS_PER_MODEL} per model per this many frames however fast the
+     * poses change, and is far more than the frames in flight that may still read an evicted group's mesh
+     */
+    private static final int EVICT_AFTER_FRAMES = 1024;
 
     private static final int INSTANCE_SIZE = INSTANCE_FORMAT.getVertexSize();
     /** Tolerance of the rotation test on the pose's linear part */
@@ -109,6 +119,13 @@ public final class InstancedModels {
     private static final PoseStack PLATE_POSE = new PoseStack();
     /** {@code armorStandPlates} when the groups were made; they are dropped when it changes (the groups' keys differ) */
     private static boolean groupsWithPlates;
+    /** Counts frames, for {@link Group#lastUsedFrame} */
+    private static int frame;
+    /**
+     * One eviction per frame: when a model's groups have all been idle (e.g. the models were out of view) and more keys than its
+     * cap come back, the first frame would otherwise evict and rebuild a group for every key past the cap in turn
+     */
+    private static boolean evictedThisFrame;
     private static float[] snapshotScratch = new float[0];
     private static final ModelSubmitCapture CAPTURE = new ModelSubmitCapture();
     private static final PoseStack POSE_STACK = new PoseStack();
@@ -195,6 +212,11 @@ public final class InstancedModels {
         @Nullable GpuBuffer mesh;
         int indexCount;
         boolean failed;
+        /**
+         * The last {@link #frame} that looked this group up or drew it (closed books after the first add instances without a
+         * lookup; {@link #prepareDraws} stamps every group with instances)
+         */
+        int lastUsedFrame;
 
         ByteBuffer instances = MemoryUtil.memAlloc(64 * 52);
         int count;
@@ -255,6 +277,8 @@ public final class InstancedModels {
         }
         frameTableRenderer = null;
         frameLightStamp = lightGeneration;
+        frame++;
+        evictedThisFrame = false;
         for (Group group : GROUPS) {
             group.count = 0;
         }
@@ -525,20 +549,39 @@ public final class InstancedModels {
     private static @Nullable Group findGroup(Model model, Object state, Object key, RenderPipeline pipeline, RenderType renderType,
                                              @Nullable UvMapping uvMapping, int overlay, int color) {
         int modelGroups = 0;
+        Group evictable = null;
         for (Group group : GROUPS) {
             if (group.matches(model, key, renderType, uvMapping, overlay, color)) {
+                // Also keeps the stand's body group from being evicted by its plate's lookup
+                group.lastUsedFrame = frame;
                 return group.failed ? null : group;
             }
             if (group.model == model) {
                 modelGroups++;
+                // Never a group with instances this frame (closed books add theirs without a lookup)
+                if (frame - group.lastUsedFrame > EVICT_AFTER_FRAMES && group.count == 0
+                        && (evictable == null || group.lastUsedFrame - evictable.lastUsedFrame < 0)) {
+                    evictable = group;
+                }
             }
         }
         if (modelGroups >= MAX_GROUPS_PER_MODEL) {
-            return null;
+            // Groups whose key is no longer seen (e.g. a stand's pose or yaw changed) would otherwise keep the model at its cap
+            if (evictable == null || evictedThisFrame) {
+                return null;
+            }
+            evictedThisFrame = true;
+            GROUPS.remove(evictable);
+            evictable.close();
+            if (evictable == closedBookGroup) {
+                closedBookGroup = null;
+                closedBookRenderer = null;
+            }
         }
 
         Object groupKey = key instanceof float[] snapshot ? snapshot.clone() : key;
         Group group = new Group(model, groupKey, pipeline, renderType, uvMapping, overlay, color);
+        group.lastUsedFrame = frame;
         GROUPS.add(group);
 
         try (ByteBufferBuilder bytes = new ByteBufferBuilder(1 << 12)) {
@@ -626,6 +669,7 @@ public final class InstancedModels {
             if (group.count == 0 || group.mesh == null) {
                 continue;
             }
+            group.lastUsedFrame = frame;
             group.instanceOffset = total;
             total += group.count * INSTANCE_SIZE;
             // The same textures for every group of a render type (the draws then keep their bindings)
