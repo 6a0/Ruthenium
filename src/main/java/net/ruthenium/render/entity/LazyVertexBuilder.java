@@ -1,8 +1,10 @@
 package net.ruthenium.render.entity;
 
+import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.texture.UvMapping;
+import org.joml.Matrix4fc;
 import org.jspecify.annotations.Nullable;
 
 import java.util.Objects;
@@ -47,6 +49,17 @@ public final class LazyVertexBuilder implements VertexConsumer {
     @Override
     public VertexConsumer addVertex(float x, float y, float z) {
         return this.resolve().addVertex(x, y, z);
+    }
+
+    /** The builder's own (a {@code BufferBuilder} transforms without a new vector), as the default method would end there */
+    @Override
+    public VertexConsumer addVertex(Matrix4fc pose, float x, float y, float z) {
+        return this.resolve().addVertex(pose, x, y, z);
+    }
+
+    @Override
+    public VertexConsumer setNormal(PoseStack.Pose pose, float x, float y, float z) {
+        return this.resolve().setNormal(pose, x, y, z);
     }
 
     @Override

@@ -14,6 +14,7 @@ import net.minecraft.util.Mth;
 import net.ruthenium.Initializer;
 import net.ruthenium.interfaces.ExtendedVertexBuilder;
 import org.joml.Matrix4f;
+import org.joml.Matrix4fc;
 import org.joml.Vector3f;
 import org.lwjgl.system.MemoryUtil;
 import org.spongepowered.asm.mixin.Final;
@@ -72,6 +73,31 @@ public abstract class BufferBuilderM implements ExtendedVertexBuilder, VertexCon
     @Override
     public long ruthenium$beginElement(int semanticId) {
         return this.beginElement(semanticId);
+    }
+
+    /**
+     * Vanilla's default method transforms the position into a new vector; this into a scratch vector, the same
+     * transform ({@code Matrix4fc.transformPosition}), then the same {@code addVertex(x, y, z)}
+     */
+    @Override
+    public VertexConsumer addVertex(Matrix4fc pose, float x, float y, float z) {
+        Vector3f scratch = this.scratch;
+        if (scratch == null) {
+            scratch = this.scratch = new Vector3f();
+        }
+        Vector3f position = pose.transformPosition(x, y, z, scratch);
+        return this.addVertex(position.x(), position.y(), position.z());
+    }
+
+    /** As {@link #addVertex(Matrix4fc, float, float, float)}: the default method's normal transform into a scratch vector */
+    @Override
+    public VertexConsumer setNormal(PoseStack.Pose pose, float x, float y, float z) {
+        Vector3f scratch = this.scratch;
+        if (scratch == null) {
+            scratch = this.scratch = new Vector3f();
+        }
+        Vector3f normal = pose.transformNormal(x, y, z, scratch);
+        return this.setNormal(normal.x(), normal.y(), normal.z());
     }
 
     /**
