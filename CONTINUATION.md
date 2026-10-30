@@ -988,6 +988,14 @@ dumps:
    region as `owner` (now a stamp comparison), `BiomeTintBlend`'s per-thread grids kept the level and its biome manager (now a
    `WeakReference` for identity, the strong fields only set during a `blend` call), and `AnimateTick.system` kept the last
    `EnvironmentAttributeSystem` (its biome layer captures the level's `BiomeManager`; now weak).
+4. *Intermittent (thirtieth session):* the last frame's `LevelRenderState` is also only reset by the next world's first
+   `extract`. Its `sectionUpdateRenderStates` hold the `RenderSectionRegion`s of the sections that frame found dirty, and a region
+   keeps the `ClientLevel`: when sections were being updated as the world was left, all ~637 chunks stayed reachable (`left`
+   352.7 MB instead of ~305, +30.7k `PalettedContainer`s; in about half of all leaves, 6 of 11 in a 12-join launch, none of the
+   options matters). `LevelExtractorResetM` now also runs `levelRenderState.reset()` and drops `playerCompiledSectionCallback`
+   (the level load tracker's, which keeps the connection) in `setLevel(null)`; 0 of 11 leaves kept a `ClientLevel` after.
+   To catch such races, run a full `gcClassHistogram` after every leave and count `ClientLevel` rows: one `left` snapshot
+   per launch hits them only sometimes.
 
 After (one launch each step; Ruthenium, RD 12): live heap in world 454 -> **439 MB** (vanilla 442), after leaving 364 -> **305 MB**
 (vanilla 345-349, title screen ~273; the remaining ~32 MB are strings, sounds, resource paths and Mixin ASM data of classes loaded
