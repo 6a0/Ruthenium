@@ -591,6 +591,16 @@ table books (red specks in the chest cube).
 
 ### 6.6 Profiling
 
+**Frame stats in a normal game (thirty-first session):** `-Druthenium.frameStats=true` (`FrameStats`, `MinecraftFrameStatsM`, in the
+mod itself, off by default) logs every 10 s the average fps, the 1% low (p99 frame time) and the worst 1% average, and for the slowest 1%
+of frames the mean acquire, client tick, submit (the wait on the previous frame's GPU work), present and other time, which part was
+largest, how many had a tick or a GC, their frame time bins, and the surface size and present mode. Use it in the user's Prism instance
+(JVM arguments) when a problem doesn't reproduce in the bench. **Overlays that report displayed frames don't measure the game:** the
+user's NVIDIA overlay read a 1% low pinned at 139 fps (Fast, ~1400 avg) and 72 (Fabulous) in a maximised window on the 143 Hz
+display, while the game's own frames had a 1% low of 465-645 fps (slowest frames 1.75-2.5 ms, acquire 0.00 ms, present ~0.2 ms).
+The window is composed by DWM, so the screen changes at most once per refresh (6.95 ms = 143, two refreshes = 72). In exclusive
+fullscreen the same overlay read 400-800 fps.
+
 **Seventeenth session tools and traps:**
 - Elimination runs through temporary system properties ranked the server scene's costs (retained draws skipped or doubled,
   enchanting table batch skipped); temporary counters in `RetainedBlockEntities.draw` counted batches, draws and quads (sign
