@@ -125,6 +125,9 @@ public final class FrameRecorder {
             GpuFrameProbe.reset();
             GpuPassProbe.reset();
         }
+        if (GpuTimelineProbe.ENABLED) {
+            GpuTimelineProbe.reset();
+        }
         TickProbe.reset();
         if (EntityCostProbe.ENABLED) {
             EntityCostProbe.reset();
@@ -137,6 +140,9 @@ public final class FrameRecorder {
         org.slf4j.LoggerFactory.getLogger("Ruthenium Benchmark").info("{}: {}", name, TickProbe.report());
         if (GpuFrameProbe.ENABLED) {
             org.slf4j.LoggerFactory.getLogger("Ruthenium Benchmark").info("{}: {}; {}", name, GpuFrameProbe.report(), GpuPassProbe.report());
+        }
+        if (GpuTimelineProbe.ENABLED) {
+            org.slf4j.LoggerFactory.getLogger("Ruthenium Benchmark").info("\n{}", GpuTimelineProbe.report(name));
         }
         if (LightProfiler.enabled()) {
             org.slf4j.LoggerFactory.getLogger("Ruthenium Benchmark").info("\n{}", LightProfiler.INSTANCE.stopRecording(name));

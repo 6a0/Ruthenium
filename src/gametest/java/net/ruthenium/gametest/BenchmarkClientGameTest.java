@@ -61,6 +61,12 @@ public class BenchmarkClientGameTest implements FabricClientGameTest {
             return;
         }
         context.runOnClient(BenchmarkClientGameTest::applyOptions);
+        // Diagnostic: extra swapchain reconfigurations after the options (bench.extraReconfigures, a second apart)
+        int extraReconfigures = Integer.parseInt(prop("extraReconfigures", "0"));
+        for (int i = 0; i < extraReconfigures; i++) {
+            context.waitTicks(20);
+            context.runOnClient(Minecraft::invalidateSurfaceConfiguration);
+        }
         switch (SCENE) {
             case "mixed" -> MixedBenchmark.run(context, LABEL, RUN_ID);
             case "terrain" -> TerrainBenchmark.run(context, LABEL, RUN_ID);

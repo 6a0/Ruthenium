@@ -23,7 +23,9 @@ public class VulkanCommandEncoderProfileMixin {
     private boolean profileAwait(VulkanCommandEncoder encoder, long submitIndex, long timeout, Operation<Boolean> original) {
         ProfilerFiller profiler = Profiler.get();
         profiler.push("awaitGpu");
+        net.ruthenium.gametest.GpuTimelineProbe.cpu(net.ruthenium.gametest.GpuTimelineProbe.C_AWAIT0);
         boolean result = original.call(encoder, submitIndex, timeout);
+        net.ruthenium.gametest.GpuTimelineProbe.cpu(net.ruthenium.gametest.GpuTimelineProbe.C_AWAIT1);
         profiler.pop();
         return result;
     }
@@ -40,7 +42,9 @@ public class VulkanCommandEncoderProfileMixin {
     @WrapOperation(method = "submit", at = @At(value = "INVOKE", target = "Lcom/mojang/renderpearl/backend/vulkan/VulkanQueue$Submission;close()V"))
     private void profileQueueSubmit(VulkanQueue.Submission s, Operation<Void> original) {
         Profiler.get().push("queueSubmit");
+        net.ruthenium.gametest.GpuTimelineProbe.cpu(net.ruthenium.gametest.GpuTimelineProbe.C_QS0);
         original.call(s);
+        net.ruthenium.gametest.GpuTimelineProbe.cpu(net.ruthenium.gametest.GpuTimelineProbe.C_QS1);
         Profiler.get().pop();
     }
 

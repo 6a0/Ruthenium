@@ -13,10 +13,12 @@ public class InstancedDrawProbeMixin {
     @Inject(method = "draw", at = @At("HEAD"))
     private static void stampStart(RenderPass pass, CallbackInfo ci) {
         GpuPassProbe.stamp(pass, 4);
+        net.ruthenium.gametest.GpuTimelineProbe.markPass(pass, "instanced");
     }
 
     @Inject(method = "draw", at = @At("RETURN"))
     private static void stampEnd(RenderPass pass, CallbackInfo ci) {
         GpuPassProbe.stamp(pass, 5);
+        net.ruthenium.gametest.GpuTimelineProbe.markPass(pass, "instancedEnd");
     }
 }
