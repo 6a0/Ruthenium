@@ -2,49 +2,36 @@ package net.ruthenium.mixin.render.vertex;
 
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
-import com.mojang.blaze3d.vertex.MeshData;
-import com.mojang.blaze3d.vertex.VertexSorting;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vertex.CompactVectorArray;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import net.minecraft.client.renderer.StagedVertexBuffer;
-import net.ruthenium.Initializer;
-import net.ruthenium.render.vertex.DistanceSorting;
-import net.ruthenium.render.vertex.SortOrderCache;
-import net.ruthenium.render.vertex.SortedQuadIndices;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-import java.nio.ByteBuffer;
-
-/** Sorted draws start their quad sort from their order in the previous upload ({@link SortOrderCache}) */
+/**
+ * The centroids of a sorted draw ({@code decodeSortingPoints}) go into an array kept per size instead of a new one per draw
+ * and frame. The upload decodes, sorts and writes each draw's indices before the next draw's centroids are decoded, and
+ * nothing keeps the array (the sort order cache keys on its values), so an array is free again for the next draw of its
+ * size. Every element is written by the decode. Render thread only; at most 256 sizes are kept.
+ */
 @Mixin(StagedVertexBuffer.class)
 public class StagedVertexBufferSortM {
-    private static final String UPLOAD = "uploadDrawsToBuffers";
+    @Unique private static final Int2ObjectOpenHashMap<CompactVectorArray> ARRAYS = new Int2ObjectOpenHashMap<>();
 
-    @Unique
-    private final SortOrderCache ruthenium$sortOrders = new SortOrderCache();
-    @Unique
-    private boolean ruthenium$sortOrdersUsed;
-
-    @Inject(method = UPLOAD, at = @At("HEAD"))
-    private void beginSortOrders(CallbackInfo ci) {
-        if (Initializer.CONFIG.reuseSortOrder) {
-            this.ruthenium$sortOrders.beginUpload();
-            this.ruthenium$sortOrdersUsed = true;
-        } else if (this.ruthenium$sortOrdersUsed) {
-            this.ruthenium$sortOrders.clear();
-            this.ruthenium$sortOrdersUsed = false;
+    @WrapOperation(method = "decodeSortingPoints", at = @At(value = "NEW", target = "(I)Lcom/mojang/blaze3d/vertex/CompactVectorArray;"))
+    private static CompactVectorArray ruthenium$keptArray(int count, Operation<CompactVectorArray> original) {
+        if (!RenderSystem.isOnRenderThread()) {
+            return original.call(count);
         }
-    }
-
-    @WrapOperation(method = UPLOAD, at = @At(value = "INVOKE",
-            target = "Lcom/mojang/blaze3d/vertex/MeshData$SortState;writeSortedIndexBuffer(Ljava/nio/ByteBuffer;Lcom/mojang/blaze3d/vertex/VertexSorting;)V"))
-    private void sortFromLastOrder(MeshData.SortState state, ByteBuffer buffer, VertexSorting sorting, Operation<Void> original) {
-        if (this.ruthenium$sortOrdersUsed && sorting instanceof DistanceSorting.Sorter sorter) {
-            SortedQuadIndices.write(buffer, this.ruthenium$sortOrders.sort(sorter, state.centroids()), state.indexType());
-        } else {
-            original.call(state, buffer, sorting);
+        CompactVectorArray array = ARRAYS.get(count);
+        if (array == null) {
+            array = new CompactVectorArray(count);
+            if (ARRAYS.size() < 256) {
+                ARRAYS.put(count, array);
+            }
         }
+        return array;
     }
 }
