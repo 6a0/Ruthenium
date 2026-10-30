@@ -1,0 +1,213 @@
+diff --git a/src/main/java/net/ruthenium/config/Config.java b/src/main/java/net/ruthenium/config/Config.java
+index 6b2b9fd..578418a 100644
+--- a/src/main/java/net/ruthenium/config/Config.java
++++ b/src/main/java/net/ruthenium/config/Config.java
+@@ -118,6 +118,13 @@ public class Config {
+     /** Instanced models of closed opaque boxes (armor stands) are drawn with back faces culled while the eye is outside them */
+     public boolean closedModelCulling = true;
+ 
++    /** TEMPORARY (s28): wait for the submit two back instead of the last one on Vulkan */
++    public boolean deepFrameQueue = false;
++    /** TEMPORARY (s28): busy wait for the GPU before vanilla's blocking wait */
++    public boolean spinGpuWait = false;
++    /** TEMPORARY (s28): a new VkSurfaceKHR when the swapchain leaves FIFO */
++    public boolean s28RecreateSurface = false;
++
+     private static Path CONFIG_PATH;
+ 
+     private static final Gson GSON = new GsonBuilder()
+diff --git a/src/main/java/net/ruthenium/mixin/render/device/VulkanCommandEncoderM.java b/src/main/java/net/ruthenium/mixin/render/device/VulkanCommandEncoderM.java
+new file mode 100644
+index 0000000..7f8ecc8
+--- /dev/null
++++ b/src/main/java/net/ruthenium/mixin/render/device/VulkanCommandEncoderM.java
+@@ -0,0 +1,50 @@
++package net.ruthenium.mixin.render.device;
++
++import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
++import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
++import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
++import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
++import net.ruthenium.render.FramePacing;
++import org.spongepowered.asm.mixin.Final;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Constant;
++import org.spongepowered.asm.mixin.injection.ModifyConstant;
++
++/** {@link FramePacing}: three command pools and destruction slots, the wait distance after a submit and the busy wait */
++@Mixin(value = VulkanCommandEncoder.class, remap = false)
++public class VulkanCommandEncoderM {
++    @Shadow @Final private VulkanDevice device;
++    @Shadow @Final private long submitSemaphore;
++    @Shadow private long completedSubmitIndex;
++
++    @ModifyConstant(method = "<init>", constant = @Constant(intValue = 2))
++    private int ruthenium$slots(int two) {
++        return FramePacing.SLOTS;
++    }
++
++    @ModifyConstant(method = "destroy", constant = @Constant(intValue = 2))
++    private int ruthenium$destroySlots(int two) {
++        return FramePacing.SLOTS;
++    }
++
++    @ModifyConstant(method = "currentCommandPool", constant = @Constant(longValue = 2L))
++    private long ruthenium$poolModulo(long two) {
++        return FramePacing.SLOTS;
++    }
++
++    @ModifyConstant(method = "submit", constant = @Constant(longValue = 2L))
++    private long ruthenium$waitDistance(long two) {
++        return FramePacing.waitDistance();
++    }
++
++    @WrapOperation(method = "submit", at = @At(value = "INVOKE",
++            target = "Lcom/mojang/renderpearl/backend/vulkan/VulkanCommandEncoder;awaitSubmitCompletion(JJ)Z"))
++    private boolean ruthenium$spin(VulkanCommandEncoder encoder, long submitIndex, long timeout, Operation<Boolean> original) {
++        if (this.completedSubmitIndex < submitIndex) {
++            FramePacing.spinUntil(this.device.vkDevice(), this.submitSemaphore, submitIndex);
++        }
++        return original.call(encoder, submitIndex, timeout);
++    }
++}
+diff --git a/src/main/java/net/ruthenium/mixin/render/device/VulkanGpuSurfaceM.java b/src/main/java/net/ruthenium/mixin/render/device/VulkanGpuSurfaceM.java
+new file mode 100644
+index 0000000..d892a09
+--- /dev/null
++++ b/src/main/java/net/ruthenium/mixin/render/device/VulkanGpuSurfaceM.java
+@@ -0,0 +1,69 @@
++package net.ruthenium.mixin.render.device;
++
++import com.mojang.renderpearl.api.device.GpuSurface;
++import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
++import com.mojang.renderpearl.backend.vulkan.VulkanGpuSurface;
++import net.ruthenium.Initializer;
++import net.ruthenium.render.FramePacing;
++import org.lwjgl.sdl.SDLError;
++import org.lwjgl.sdl.SDLVulkan;
++import org.lwjgl.system.MemoryStack;
++import org.lwjgl.vulkan.KHRSurface;
++import org.spongepowered.asm.mixin.Final;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.Mutable;
++import org.spongepowered.asm.mixin.Shadow;
++import org.spongepowered.asm.mixin.Unique;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Constant;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.ModifyConstant;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++import java.nio.LongBuffer;
++
++/**
++ * {@link FramePacing}: one acquire semaphore per submit in flight. TEMPORARY (s28): a new window surface when the
++ * swapchain leaves FIFO
++ */
++@Mixin(value = VulkanGpuSurface.class, remap = false)
++public class VulkanGpuSurfaceM {
++    @Shadow @Final private VulkanDevice device;
++    @Shadow @Final @Mutable private long surface;
++
++    @Unique private long ruthenium$window;
++    @Unique private GpuSurface.PresentMode ruthenium$lastMode;
++
++    @ModifyConstant(method = "<init>", constant = @Constant(intValue = 2))
++    private int ruthenium$acquireSemaphores(int two) {
++        return FramePacing.SLOTS;
++    }
++
++    @Inject(method = "<init>", at = @At("RETURN"))
++    private void ruthenium$keepWindow(VulkanDevice device, long windowHandle, CallbackInfo ci) {
++        this.ruthenium$window = windowHandle;
++    }
++
++    @Inject(method = "configure", at = @At(value = "INVOKE", shift = At.Shift.AFTER,
++            target = "Lcom/mojang/renderpearl/backend/vulkan/VulkanGpuSurface;destroySwapchain()V"))
++    private void ruthenium$freshSurface(GpuSurface.Configuration config, CallbackInfo ci) {
++        GpuSurface.PresentMode last = this.ruthenium$lastMode;
++        GpuSurface.PresentMode mode = config.presentMode();
++        this.ruthenium$lastMode = mode;
++        boolean leavesVsync = (last == GpuSurface.PresentMode.FIFO || last == GpuSurface.PresentMode.FIFO_RELAXED)
++                && (mode == GpuSurface.PresentMode.IMMEDIATE || mode == GpuSurface.PresentMode.MAILBOX);
++        if (!leavesVsync || !Initializer.CONFIG.s28RecreateSurface) {
++            return;
++        }
++        var instance = this.device.vkDevice().getPhysicalDevice().getInstance();
++        try (MemoryStack stack = MemoryStack.stackPush()) {
++            LongBuffer handle = stack.longs(0L);
++            KHRSurface.vkDestroySurfaceKHR(instance, this.surface, null);
++            if (!SDLVulkan.SDL_Vulkan_CreateSurface(this.ruthenium$window, instance, null, handle)) {
++                throw new IllegalStateException("Failed to create window surface: " + SDLError.SDL_GetError());
++            }
++            this.surface = handle.get(0);
++            Initializer.LOGGER.info("New window surface for {} after {}", mode, last);
++        }
++    }
++}
+diff --git a/src/main/java/net/ruthenium/render/FramePacing.java b/src/main/java/net/ruthenium/render/FramePacing.java
+new file mode 100644
+index 0000000..11bcc39
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/FramePacing.java
+@@ -0,0 +1,45 @@
++package net.ruthenium.render;
++
++import net.ruthenium.Initializer;
++import org.lwjgl.system.MemoryStack;
++import org.lwjgl.vulkan.VK12;
++import org.lwjgl.vulkan.VkDevice;
++
++import java.nio.LongBuffer;
++
++/**
++ * How far the render thread may run ahead of the GPU on vanilla's Vulkan backend. Vanilla waits, right after submitting
++ * frame k, for frame k-1 (two submits in flight), so the GPU only ever has one frame queued while the next is
++ * recorded, and every frame pays the driver's submit latency and the thread's wakeup on the GPU's timeline.
++ */
++public final class FramePacing {
++    /** Command pools, destruction queue slots and acquire semaphores the encoder keeps (vanilla: 2) */
++    public static final int SLOTS = 3;
++    /** Longest busy wait before the blocking wait */
++    private static final long SPIN_NANOS = 1_000_000L;
++
++    private FramePacing() {
++    }
++
++    /** Submits back the render thread waits for after a submit: vanilla's 2, or 3 with the deeper queue */
++    public static long waitDistance() {
++        return Initializer.CONFIG.deepFrameQueue ? 3L : 2L;
++    }
++
++    /** Polls the encoder's timeline semaphore until it reaches {@code value} or the spin budget runs out */
++    public static void spinUntil(VkDevice device, long semaphore, long value) {
++        if (!Initializer.CONFIG.spinGpuWait) {
++            return;
++        }
++        long deadline = System.nanoTime() + SPIN_NANOS;
++        try (MemoryStack stack = MemoryStack.stackPush()) {
++            LongBuffer counter = stack.mallocLong(1);
++            do {
++                if (VK12.vkGetSemaphoreCounterValue(device, semaphore, counter) != 0 || counter.get(0) >= value) {
++                    return;
++                }
++                Thread.onSpinWait();
++            } while (System.nanoTime() < deadline);
++        }
++    }
++}
+diff --git a/src/main/resources/ruthenium.mixins.json b/src/main/resources/ruthenium.mixins.json
+index 3b35aa5..9014671 100644
+--- a/src/main/resources/ruthenium.mixins.json
++++ b/src/main/resources/ruthenium.mixins.json
+@@ -25,6 +25,8 @@
+     "render.chunk.RenderSectionRegionM",
+     "render.chunk.SectionCompilerM",
+     "render.chunk.SectionCompilerResultsM",
++    "render.device.VulkanCommandEncoderM",
++    "render.device.VulkanGpuSurfaceM",
+     "render.entity.BlockModelRenderStateM",
+     "render.entity.BlockStateModelWrapperM",
+     "render.entity.EntityRenderDispatcherM",

@@ -1,0 +1,190 @@
+diff --git a/src/main/java/net/ruthenium/config/Config.java b/src/main/java/net/ruthenium/config/Config.java
+index 6b2b9fd..873ef16 100644
+--- a/src/main/java/net/ruthenium/config/Config.java
++++ b/src/main/java/net/ruthenium/config/Config.java
+@@ -117,6 +117,10 @@ public class Config {
+     public boolean skipBlackVignette = true;
+     /** Instanced models of closed opaque boxes (armor stands) are drawn with back faces culled while the eye is outside them */
+     public boolean closedModelCulling = true;
++    /** s28 eliminations: instanced cutout drawn with the cull pipeline, retained sign text or models skipped */
++    public boolean s28CullInstanced = false;
++    public boolean s28SkipSigns = false;
++    public boolean s28SkipRetainedModels = false;
+ 
+     private static Path CONFIG_PATH;
+ 
+diff --git a/src/main/java/net/ruthenium/mixin/render/HudVignetteM.java b/src/main/java/net/ruthenium/mixin/render/HudVignetteM.java
+index 6167a36..5a6c4da 100644
+--- a/src/main/java/net/ruthenium/mixin/render/HudVignetteM.java
++++ b/src/main/java/net/ruthenium/mixin/render/HudVignetteM.java
+@@ -19,11 +19,19 @@ import org.spongepowered.asm.mixin.injection.At;
+  */
+ @Mixin(Hud.class)
+ public class HudVignetteM {
++    private static int s28Last = -1;
+     @WrapOperation(method = "extractVignette", at = @At(value = "INVOKE",
+             target = "Lnet/minecraft/client/gui/GuiGraphicsExtractor;blit(Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;Lnet/minecraft/resources/Identifier;IIFFIIIII)V"))
+     private void ruthenium$skipBlackVignette(GuiGraphicsExtractor graphics, RenderPipeline pipeline, Identifier texture, int x, int y,
+                                              float u, float v, int width, int height, int textureWidth, int textureHeight, int color,
+                                              Operation<Void> original) {
++        if (Boolean.getBoolean("ruthenium.s28.logClosed")) {
++            int state = (Initializer.CONFIG.skipBlackVignette ? 1 << 24 : 0) | (color & 0xFFFFFF);
++            if (state != s28Last) {
++                s28Last = state;
++                Initializer.LOGGER.info("s28 vignette color {} skip {}", Integer.toHexString(color), Initializer.CONFIG.skipBlackVignette);
++            }
++        }
+         if (Initializer.CONFIG.skipBlackVignette && pipeline == RenderPipelines.VIGNETTE && (color & 0xFFFFFF) == 0) {
+             return;
+         }
+diff --git a/src/main/java/net/ruthenium/mixin/render/feature/MinecraftFrameM.java b/src/main/java/net/ruthenium/mixin/render/feature/MinecraftFrameM.java
+index da0550e..f77891e 100644
+--- a/src/main/java/net/ruthenium/mixin/render/feature/MinecraftFrameM.java
++++ b/src/main/java/net/ruthenium/mixin/render/feature/MinecraftFrameM.java
+@@ -13,5 +13,6 @@ public class MinecraftFrameM {
+     @Inject(method = "renderFrame", at = @At("HEAD"))
+     private void beginFrame(boolean advanceGameTime, CallbackInfo ci) {
+         SubmitPosePool.beginFrame();
++        net.ruthenium.render.S28Counters.endFrame();
+     }
+ }
+diff --git a/src/main/java/net/ruthenium/render/S28Counters.java b/src/main/java/net/ruthenium/render/S28Counters.java
+new file mode 100644
+index 0000000..8e6f92d
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/S28Counters.java
+@@ -0,0 +1,39 @@
++package net.ruthenium.render;
++
++import java.util.Map;
++import java.util.TreeMap;
++
++/** TEMPORARY (s28): quads and draws per category, logged every 8192 frames when -Druthenium.s28.counters=true */
++public final class S28Counters {
++    public static final boolean ENABLED = Boolean.getBoolean("ruthenium.s28.counters");
++    private static final Map<String, long[]> COUNTS = new TreeMap<>();
++    private static int frames;
++
++    private S28Counters() {
++    }
++
++    public static void add(String key, long quads, long instances) {
++        if (!ENABLED) {
++            return;
++        }
++        long[] c = COUNTS.computeIfAbsent(key, k -> new long[3]);
++        c[0] += quads;
++        c[1] += instances;
++        c[2]++;
++    }
++
++    public static void endFrame() {
++        if (!ENABLED || ++frames < 8192) {
++            return;
++        }
++        StringBuilder sb = new StringBuilder("s28 counters per frame:");
++        for (Map.Entry<String, long[]> e : COUNTS.entrySet()) {
++            long[] c = e.getValue();
++            sb.append("\n  ").append(e.getKey()).append(": quads ").append(c[0] / frames).append(", instances ")
++                    .append(c[1] / frames).append(", draws ").append(c[2] / frames);
++        }
++        net.ruthenium.Initializer.LOGGER.info(sb.toString());
++        COUNTS.clear();
++        frames = 0;
++    }
++}
+diff --git a/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java b/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java
+index 9d28b19..d62ad59 100644
+--- a/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java
++++ b/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java
+@@ -101,6 +101,8 @@ public final class InstancedModels {
+      * than the near plane (0.05) and view bobbing's offset of the eye, so the eye is outside every box and no box is clipped
+      */
+     private static final float CLOSED_EYE_MARGIN = 1.0f;
++    private static final boolean S28_LOG = Boolean.getBoolean("ruthenium.s28.logClosed");
++    private static int s28LastState = -1;
+ 
+     /** Models drawn from their prepared submits when their parts are posed like an existing group */
+     private static final Set<Class<?>> POSED_MODELS = Set.of(ArmorStandModel.class);
+@@ -731,6 +733,21 @@ public final class InstancedModels {
+             maxIndexCount = Math.max(maxIndexCount, group.indexCount);
+             drawPending = true;
+         }
++        if (S28_LOG) {
++            int culled = 0, closed = 0, all = 0;
++            for (Group g : GROUPS) {
++                if (g.count > 0 && g.mesh != null) {
++                    all++;
++                    closed += g.closed ? 1 : 0;
++                    culled += g.cullBackFaces ? 1 : 0;
++                }
++            }
++            int state = culled << 20 | closed << 10 | all;
++            if (state != s28LastState) {
++                s28LastState = state;
++                Initializer.LOGGER.info("s28 instanced groups drawn {}, closed {}, culled {}", all, closed, culled);
++            }
++        }
+         if (!drawPending) {
+             return;
+         }
+@@ -773,9 +790,10 @@ public final class InstancedModels {
+                 continue;
+             }
+             // Bindings are kept between draws of one pipeline (the same values vanilla's per draw binding would set)
+-            RenderPipeline groupPipeline = group.cullBackFaces ? CUTOUT_CLOSED : group.pipeline;
+-            if (groupPipeline != lastPipeline) {
+-                CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(groupPipeline);
++            RenderPipeline s28Pipeline = Initializer.CONFIG.s28CullInstanced && group.pipeline == CUTOUT ? CUTOUT_CULL
++                    : group.cullBackFaces ? CUTOUT_CLOSED : group.pipeline;
++            if (s28Pipeline != lastPipeline) {
++                CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(s28Pipeline);
+                 if (pipeline == null) {
+                     continue;
+                 }
+@@ -783,7 +801,7 @@ public final class InstancedModels {
+                 RenderSystem.bindDefaultUniforms(renderPass);
+                 renderPass.setUniform("DynamicTransforms", transform);
+                 renderPass.setIndexBuffer(indices.getBuffer(), indices.type());
+-                lastPipeline = groupPipeline;
++                lastPipeline = s28Pipeline;
+                 lastPrepared = null;
+             }
+             if (group.prepared != lastPrepared) {
+@@ -795,6 +813,7 @@ public final class InstancedModels {
+             renderPass.setVertexBuffer(0, group.mesh.slice());
+             renderPass.setVertexBuffer(1, group.instanceSlice);
+             renderPass.drawIndexed(group.indexCount, group.count, 0, 0, 0);
++            if (net.ruthenium.render.S28Counters.ENABLED) net.ruthenium.render.S28Counters.add(group.cullBackFaces ? "instanced closed" : group.pipeline == CUTOUT ? "instanced cutout" : "instanced other", (long) group.indexCount / 6 * group.count, group.count);
+         }
+         renderPass.popDebugGroup();
+     }
+diff --git a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+index 9121695..b9a9aba 100644
+--- a/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
++++ b/src/main/java/net/ruthenium/render/blockentity/RetainedBlockEntities.java
+@@ -1077,6 +1077,12 @@ public final class RetainedBlockEntities {
+             for (int set = 0; set < 2; set++) {
+                 for (Draw draw : set == 0 ? batch.draws : batch.signDraws) {
+                     GpuBufferSlice transform = transforms[i++];
++                    if (set == 1 && Initializer.CONFIG.s28SkipSigns) {
++                        continue;
++                    }
++                    if (set == 0 && Initializer.CONFIG.s28SkipRetainedModels) {
++                        continue;
++                    }
+                     if (draw.pipeline != boundPipeline) {
+                         CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(draw.pipeline);
+                         if (pipeline == null) {
+@@ -1103,9 +1109,11 @@ public final class RetainedBlockEntities {
+                         int runs = draw.faces.visiblePlaneRuns(eyeX, eyeY, eyeZ, RUNS);
+                         for (int r = 0; r < runs; r++) {
+                             renderPass.drawIndexed(RUNS[r * 2 + 1] * 6, 1, 0, RUNS[r * 2] * 4, 0);
++                            if (net.ruthenium.render.S28Counters.ENABLED) net.ruthenium.render.S28Counters.add("retained culled " + draw.pipeline.getLocation().getPath(), RUNS[r * 2 + 1], 1);
+                         }
+                     } else {
+                         renderPass.drawIndexed(draw.indexCount, 1, 0, 0, 0);
++                        if (net.ruthenium.render.S28Counters.ENABLED) net.ruthenium.render.S28Counters.add((set == 1 ? "retained signs " : "retained ") + draw.pipeline.getLocation().getPath(), draw.indexCount / 6, 1);
+                     }
+                 }
+             }
