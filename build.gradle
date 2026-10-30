@@ -168,6 +168,16 @@ def registerBenchmark = { String name, String label, String backend, boolean wit
 				"--enable-native-access=ALL-UNNAMED",
 				"-Xmx4G"
 		)
+		// -PbenchGc=zgc|g1: the garbage collector. The footprint scene defaults to ZGC, as 26.x launches use; the other
+		// scenes keep G1 so their numbers stay comparable with earlier sessions
+		def gc = project.findProperty("benchGc")?.toString() ?: (project.findProperty("bench.scene") == "footprint" ? "zgc" : "g1")
+		if (gc == "zgc") {
+			jvmArgs.add("-XX:+UseZGC")
+		} else if (gc == "g1") {
+			jvmArgs.add("-XX:+UseG1GC")
+		} else {
+			throw new GradleException("-PbenchGc must be zgc or g1, not ${gc}")
+		}
 		// -PbenchJfr records a Java Flight Recorder profile of the run into the results directory
 		if (project.hasProperty("benchJfr")) {
 			// -PbenchJfrPeriod=1ms samples more often than the profile setting's 10-20 ms (short phases, small costs)

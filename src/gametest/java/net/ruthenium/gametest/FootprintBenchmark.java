@@ -174,9 +174,10 @@ final class FootprintBenchmark {
         Arrays.stream(chunks).forEach(chunkArray::add);
         root.add("joinChunks", chunkArray);
         root.add("snapshots", snapshots);
+        root.addProperty("gc", collector());
 
         StringBuilder summary = new StringBuilder();
-        summary.append("== Footprint: ").append(label).append(" ==\n");
+        summary.append("== Footprint: ").append(label).append(" (").append(collector()).append(") ==\n");
         summary.append("startup %.2f s\n".formatted(startupSeconds));
         summary.append("reload median %.3f s %s\n".formatted(median(reloadSeconds), Arrays.toString(reloadSeconds)));
         // The first join is cold (the integrated server's chunk loading isn't compiled yet; ~10x slower), so no median
@@ -184,8 +185,8 @@ final class FootprintBenchmark {
                 Arrays.toString(openSeconds), Arrays.toString(loadedSeconds), Arrays.toString(chunks)));
         for (String name : snapshots.keySet()) {
             JsonObject s = snapshots.getAsJsonObject(name);
-            summary.append("%-8s live heap %7.1f MB, committed %7.1f MB, metaspace %6.1f MB, code %5.1f MB, direct %6.1f MB, working set %7.1f MB, private %7.1f MB, GPU dedicated %7.1f MB, shared %6.1f MB\n"
-                    .formatted(name, mb(s, "liveHeap"), mb(s, "committedHeapBeforeGc"), mb(s, "metaspace"), mb(s, "codeCache"),
+            summary.append("%-8s live heap %7.1f MB, objects %7.1f MB, committed %7.1f MB, metaspace %6.1f MB, code %5.1f MB, direct %6.1f MB, working set %7.1f MB, private %7.1f MB, GPU dedicated %7.1f MB, shared %6.1f MB\n"
+                    .formatted(name, mb(s, "liveHeap"), mb(s, "histogramBytes"), mb(s, "committedHeapBeforeGc"), mb(s, "metaspace"), mb(s, "codeCache"),
                             mb(s, "directBuffers"), mb(s, "workingSet"), mb(s, "privateBytes"), mb(s, "gpuDedicated"), mb(s, "gpuShared")));
         }
         LOGGER.info("\n{}", summary);
@@ -227,6 +228,15 @@ final class FootprintBenchmark {
      * Logs HotSpot's class loading counters ({@code sun.cls.*}: time spent loading, parsing, linking and verifying
      * classes, and in the class loaders' Java code) through the JDK's jcmd ({@code -Pbench.loadProbe=true})
      */
+    /** The garbage collector in use (-PbenchGc; ZGC by default in this scene, as 26.x launches use) */
+    private static String collector() {
+        var hotspot = ManagementFactory.getPlatformMXBean(com.sun.management.HotSpotDiagnosticMXBean.class);
+        if ("true".equals(hotspot.getVMOption("UseZGC").getValue())) {
+            return "ZGC";
+        }
+        return "true".equals(hotspot.getVMOption("UseG1GC").getValue()) ? "G1" : "other GC";
+    }
+
     private static void logClassLoadingCounters(String when) {
         try {
             Path java = Path.of(ProcessHandle.current().info().command().orElseThrow());
