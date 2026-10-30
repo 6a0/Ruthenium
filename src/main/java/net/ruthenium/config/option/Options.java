@@ -237,6 +237,11 @@ public abstract class Options {
                                 value -> config.freeUnusedChunkData = value,
                                 () -> config.freeUnusedChunkData)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.freeUnusedChunkData.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.lazyGlyphWidths"),
+                                value -> config.lazyGlyphWidths = value,
+                                () -> config.lazyGlyphWidths)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.lazyGlyphWidths.tooltip"))
                                 .setImpact(PerformanceImpact.LOW)
                 }),
                 new OptionBlock("", new Option<?>[]{

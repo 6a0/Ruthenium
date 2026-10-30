@@ -116,6 +116,8 @@ public class Config {
     public boolean sectionStateCache = true;
     /** Compiled sections drop their compile region, and leaving a world frees its render data right away */
     public boolean freeUnusedChunkData = true;
+    /** Font sets build their glyphs by width (only obfuscated text reads them) on the first request instead of on every reload */
+    public boolean lazyGlyphWidths = true;
 
     /** The vignette is skipped while its color is black (its blend then leaves every pixel as it is) */
     public boolean skipBlackVignette = true;

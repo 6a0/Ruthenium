@@ -64,6 +64,8 @@ final class FootprintBenchmark {
     private static final int HISTOGRAM_ROWS = 80;
     /** Snapshot to also write a heap dump of (live objects) for {@code scripts/HprofPath.java}; empty for none */
     private static final String HEAP_DUMP = BenchmarkClientGameTest.prop("footprintHeapDump", "");
+    /** Checks obfuscated text and the lazy glyphs by width after the measurements ({@link ObfuscatedGlyphCheck}) */
+    private static final boolean GLYPH_WIDTH_CHECK = Boolean.parseBoolean(BenchmarkClientGameTest.prop("glyphWidthCheck", "false"));
 
     private FootprintBenchmark() {
     }
@@ -123,6 +125,9 @@ final class FootprintBenchmark {
                     BenchmarkClientGameTest.waitSeconds(context, 3);
                     snapshots.add("world", snapshot(context, "world", histoDir, prefix));
                 }
+                if (GLYPH_WIDTH_CHECK && i == JOINS - 1) {
+                    ObfuscatedGlyphCheck.screenshots(context, label, runId);
+                }
             }
         }
         context.runOnClient(mc -> mc.options.renderDistance().set(previousDistance));
@@ -130,6 +135,9 @@ final class FootprintBenchmark {
             context.waitFor(mc -> mc.level == null && mc.gui.screen() instanceof TitleScreen, 60 * TICKS_PER_SECOND);
             context.waitTicks(TICKS_PER_SECOND);
             snapshots.add("left", snapshot(context, "left", histoDir, prefix));
+        }
+        if (GLYPH_WIDTH_CHECK) {
+            ObfuscatedGlyphCheck.run(context);
         }
 
         JsonObject environment = context.computeOnClient(mc -> {
@@ -183,7 +191,7 @@ final class FootprintBenchmark {
     }
 
     /** Reloads resources as F3+T does; returns the seconds until the reload's future completes */
-    private static double reload(ClientGameTestContext context) {
+    static double reload(ClientGameTestContext context) {
         long[] times = new long[2];
         CompletableFuture<?> future = context.computeOnClient(mc -> {
             times[0] = System.nanoTime();
