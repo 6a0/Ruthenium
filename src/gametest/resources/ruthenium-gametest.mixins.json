@@ -6,6 +6,7 @@
   "client": [
     "ClientMannequinMixin",
     "DrawIndirectMixin",
+    "GlCommandEncoderProfileMixin",
     "GpuPassProbeMixin",
     "InstancedDrawProbeMixin",
     "LevelExtractorMixin",
