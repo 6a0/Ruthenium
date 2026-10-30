@@ -136,6 +136,10 @@ final class BlockEntityBenchmark {
             frameSeries.put("pan", context.computeOnClient(_ -> FrameRecorder.framesCsv()));
             LOGGER.info(results.getLast().summaryLine());
 
+            if (ToggleAb.enabled()) {
+                ToggleAb.run(context, results, () -> setView(context, 0.0F), 0.0F, PITCH);
+            }
+
             var environment = context.computeOnClient(BenchmarkClientGameTest::describeEnvironment);
             environment.addProperty("label", label + "-blockentities");
             var blockEntities = new com.google.gson.JsonObject();
