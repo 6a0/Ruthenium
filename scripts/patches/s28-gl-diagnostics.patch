@@ -1,0 +1,531 @@
+diff --git a/src/gametest/java/net/ruthenium/gametest/MixedBenchmark.java b/src/gametest/java/net/ruthenium/gametest/MixedBenchmark.java
+index a120d57..14ff957 100644
+--- a/src/gametest/java/net/ruthenium/gametest/MixedBenchmark.java
++++ b/src/gametest/java/net/ruthenium/gametest/MixedBenchmark.java
+@@ -80,7 +80,13 @@ final class MixedBenchmark {
+             {200.0, -35.0F, false, true},
+     };
+     /** Close-up camera positions: x, height above the floor, z, yaw, pitch */
+-    private static final float[][] CLOSE_UPS = {
++    private static final float[][] CLOSE_UPS = Boolean.parseBoolean(BenchmarkClientGameTest.prop("s28CubeShots", "false")) ? new float[][] {
++            // S28 TEMP: the chest cube (retained chests and signs): face signs in reach, close, and out of reach, from above
++            {6.5F, 1.7F, 0.5F, 270.0F, 0.0F},
++            {0.5F, 1.7F, 0.5F, 270.0F, 10.0F},
++            {-8.0F, 1.7F, 0.5F, 270.0F, 0.0F},
++            {-4.0F, 12.0F, 0.5F, 270.0F, 30.0F},
++    } : new float[][] {
+             {0.5F, 1.7F, 1.5F, 0.0F, 20.0F},     // the grid's first rows: big stands, arms, many yaws
+             {0.5F, 4.5F, 3.5F, 0.0F, 55.0F},     // the grid from above, small stands in rows 3 and 7
+             {0.0F, 1.5F, -3.5F, 180.0F, 20.0F},  // the summoned variety rows
+@@ -305,6 +311,10 @@ final class MixedBenchmark {
+             server.runCommand("summon minecraft:armor_stand %s %d %s {NoGravity:1b,Invulnerable:1b,%s}".formatted(stand[0], FLOOR, stand[1], stand[2]));
+         }
+         context.runOnClient(mc -> mc.options.cloudStatus().set(net.minecraft.client.CloudStatus.OFF));
++        if (Boolean.parseBoolean(BenchmarkClientGameTest.prop("s28Creative", "false"))) {
++            // S28 TEMP: first person with a hand drawn
++            server.runCommand("gamemode creative @a");
++        }
+         context.waitTicks(10);
+         server.runCommand("tick freeze");
+         context.waitTicks(5);
+diff --git a/src/gametest/java/net/ruthenium/gametest/mixin/S28GlDebugMixin.java b/src/gametest/java/net/ruthenium/gametest/mixin/S28GlDebugMixin.java
+new file mode 100644
+index 0000000..d4f9a3b
+--- /dev/null
++++ b/src/gametest/java/net/ruthenium/gametest/mixin/S28GlDebugMixin.java
+@@ -0,0 +1,15 @@
++package net.ruthenium.gametest.mixin;
++
++import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
++import net.minecraft.client.Minecraft;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++
++/** S28 TEMP: {@code -Pbench.s28GlDebug=N} overrides the GL debug verbosity the device is created with */
++@Mixin(Minecraft.class)
++public class S28GlDebugMixin {
++    @ModifyExpressionValue(method = "<init>", at = @At(value = "FIELD", target = "Lnet/minecraft/client/Options;glDebugVerbosity:I"))
++    private int s28Verbosity(int original) {
++        return Integer.getInteger("ruthenium.bench.s28GlDebug", original);
++    }
++}
+diff --git a/src/gametest/java/net/ruthenium/gametest/mixin/S28GlProbe2Mixin.java b/src/gametest/java/net/ruthenium/gametest/mixin/S28GlProbe2Mixin.java
+new file mode 100644
+index 0000000..2f24752
+--- /dev/null
++++ b/src/gametest/java/net/ruthenium/gametest/mixin/S28GlProbe2Mixin.java
+@@ -0,0 +1,84 @@
++package net.ruthenium.gametest.mixin;
++
++import net.minecraft.util.profiling.Profiler;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/** S28 TEMP: profiler sections for the GL calls inside the swapchain blit and the clears ({@code -Pbench.s28Gl=true}) */
++@Mixin(targets = "com.mojang.renderpearl.backend.opengl.GlCommandEncoder")
++public class S28GlProbe2Mixin {
++    private static final boolean ON = Boolean.getBoolean("ruthenium.bench.s28Gl");
++    private static final String MAKE_CURRENT = "Lcom/mojang/renderpearl/backend/opengl/GlDevice;makeCurrent(J)V";
++    private static final String ATTACH = "Lcom/mojang/renderpearl/backend/opengl/DirectStateAccess;bindFrameBufferTextures(IIIII)V";
++    private static final String BLIT = "Lcom/mojang/renderpearl/backend/opengl/DirectStateAccess;blitFrameBuffers(IIIIIIIIIIII)V";
++    private static final String CLEAR = "Lcom/mojang/renderpearl/backend/opengl/GlStateManager;_clear(I)V";
++    private static final String BIND_FB = "Lcom/mojang/renderpearl/backend/opengl/GlStateManager;_glBindFramebuffer(II)V";
++    private static final String DETACH = "Lcom/mojang/renderpearl/backend/opengl/GlStateManager;_glFramebufferTexture2D(IIIII)V";
++
++    private static void push(String name) {
++        if (ON) {
++            Profiler.get().push(name);
++        }
++    }
++
++    private static void pop() {
++        if (ON) {
++            Profiler.get().pop();
++        }
++    }
++
++    @Inject(method = "presentTexture", at = @At(value = "INVOKE", target = MAKE_CURRENT))
++    private void p1(CallbackInfo ci) {
++        push("gl:makeCurrent");
++    }
++
++    @Inject(method = {"presentTexture", "clearDepthTexture", "clearColorTexture"}, at = @At(value = "INVOKE", target = ATTACH))
++    private void p2(CallbackInfo ci) {
++        push("gl:attach");
++    }
++
++    @Inject(method = "presentTexture", at = @At(value = "INVOKE", target = BLIT))
++    private void p3(CallbackInfo ci) {
++        push("gl:blitFb");
++    }
++
++    @Inject(method = {"clearDepthTexture", "clearColorTexture",
++            "clearColorAndDepthTextures(Lcom/mojang/renderpearl/api/textures/GpuTexture;Lorg/joml/Vector4fc;Lcom/mojang/renderpearl/api/textures/GpuTexture;D)V"},
++            at = @At(value = "INVOKE", target = CLEAR))
++    private void p4(CallbackInfo ci) {
++        push("gl:glClear");
++    }
++
++    @Inject(method = {"clearDepthTexture", "clearColorTexture",
++            "clearColorAndDepthTextures(Lcom/mojang/renderpearl/api/textures/GpuTexture;Lorg/joml/Vector4fc;Lcom/mojang/renderpearl/api/textures/GpuTexture;D)V"},
++            at = @At(value = "INVOKE", target = BIND_FB))
++    private void p5(CallbackInfo ci) {
++        push("gl:bindFb");
++    }
++
++    @Inject(method = {"clearDepthTexture", "clearColorTexture"}, at = @At(value = "INVOKE", target = DETACH))
++    private void p6(CallbackInfo ci) {
++        push("gl:detach");
++    }
++
++    @Inject(method = "presentTexture", at = {@At(value = "INVOKE", target = MAKE_CURRENT, shift = At.Shift.AFTER),
++            @At(value = "INVOKE", target = ATTACH, shift = At.Shift.AFTER), @At(value = "INVOKE", target = BLIT, shift = At.Shift.AFTER)})
++    private void q1(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = {"clearDepthTexture", "clearColorTexture"}, at = {@At(value = "INVOKE", target = ATTACH, shift = At.Shift.AFTER),
++            @At(value = "INVOKE", target = CLEAR, shift = At.Shift.AFTER), @At(value = "INVOKE", target = BIND_FB, shift = At.Shift.AFTER),
++            @At(value = "INVOKE", target = DETACH, shift = At.Shift.AFTER)})
++    private void q2(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = "clearColorAndDepthTextures(Lcom/mojang/renderpearl/api/textures/GpuTexture;Lorg/joml/Vector4fc;Lcom/mojang/renderpearl/api/textures/GpuTexture;D)V",
++            at = {@At(value = "INVOKE", target = CLEAR, shift = At.Shift.AFTER), @At(value = "INVOKE", target = BIND_FB, shift = At.Shift.AFTER)})
++    private void q3(CallbackInfo ci) {
++        pop();
++    }
++}
+diff --git a/src/gametest/java/net/ruthenium/gametest/mixin/S28GlProbeMixin.java b/src/gametest/java/net/ruthenium/gametest/mixin/S28GlProbeMixin.java
+new file mode 100644
+index 0000000..bfbe4b5
+--- /dev/null
++++ b/src/gametest/java/net/ruthenium/gametest/mixin/S28GlProbeMixin.java
+@@ -0,0 +1,130 @@
++package net.ruthenium.gametest.mixin;
++
++import net.minecraft.util.profiling.Profiler;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
++
++/** S28 TEMP: profiler sections inside the OpenGL backend's command encoder ({@code -Pbench.s28Gl=true}) */
++@Mixin(targets = "com.mojang.renderpearl.backend.opengl.GlCommandEncoder")
++public class S28GlProbeMixin {
++    private static final boolean ON = Boolean.getBoolean("ruthenium.bench.s28Gl");
++
++    private static void push(String name) {
++        if (ON) {
++            Profiler.get().push(name);
++        }
++    }
++
++    private static void pop() {
++        if (ON) {
++            Profiler.get().pop();
++        }
++    }
++
++    @Inject(method = "createRenderPass", at = @At("HEAD"))
++    private void a1(CallbackInfoReturnable<Object> ci) {
++        push("gl:beginPass");
++    }
++
++    @Inject(method = "createRenderPass", at = @At("RETURN"))
++    private void a2(CallbackInfoReturnable<Object> ci) {
++        pop();
++    }
++
++    @Inject(method = "submitRenderPass", at = @At("HEAD"))
++    private void b1(CallbackInfo ci) {
++        push("gl:endPass");
++    }
++
++    @Inject(method = "submitRenderPass", at = @At("RETURN"))
++    private void b2(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = {"clearColorAndDepthTextures(Lcom/mojang/renderpearl/api/textures/GpuTexture;Lorg/joml/Vector4fc;Lcom/mojang/renderpearl/api/textures/GpuTexture;D)V",
++            "clearColorAndDepthTextures(Lcom/mojang/renderpearl/api/textures/GpuTexture;Lorg/joml/Vector4fc;Lcom/mojang/renderpearl/api/textures/GpuTexture;DIIIII)V",
++            "clearDepthTexture", "clearColorTexture"}, at = @At("HEAD"))
++    private void c1(CallbackInfo ci) {
++        push("gl:clear");
++    }
++
++    @Inject(method = {"clearColorAndDepthTextures(Lcom/mojang/renderpearl/api/textures/GpuTexture;Lorg/joml/Vector4fc;Lcom/mojang/renderpearl/api/textures/GpuTexture;D)V",
++            "clearColorAndDepthTextures(Lcom/mojang/renderpearl/api/textures/GpuTexture;Lorg/joml/Vector4fc;Lcom/mojang/renderpearl/api/textures/GpuTexture;DIIIII)V",
++            "clearDepthTexture", "clearColorTexture"}, at = @At("RETURN"))
++    private void c2(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = {"writeToBuffer", "copyToBuffer"}, at = @At("HEAD"))
++    private void d1(CallbackInfo ci) {
++        push("gl:writeBuffer");
++    }
++
++    @Inject(method = {"writeToBuffer", "copyToBuffer"}, at = @At("RETURN"))
++    private void d2(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = {"writeToTexture", "copyBufferToTexture", "copyTextureToTexture"}, at = @At("HEAD"))
++    private void e1(CallbackInfo ci) {
++        push("gl:texture");
++    }
++
++    @Inject(method = {"writeToTexture", "copyBufferToTexture", "copyTextureToTexture"}, at = @At("RETURN"))
++    private void e2(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = {"executeDraw", "executeDraws", "executeDrawIndirect"}, at = @At("HEAD"))
++    private void f1(CallbackInfo ci) {
++        push("gl:draw");
++    }
++
++    @Inject(method = {"executeDraw", "executeDraws", "executeDrawIndirect"}, at = @At("RETURN"))
++    private void f2(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = "setupDraw", at = @At("HEAD"))
++    private void g1(CallbackInfo ci) {
++        push("gl:setup");
++    }
++
++    @Inject(method = "setupDraw", at = @At(value = "INVOKE", target = "Lcom/mojang/renderpearl/backend/opengl/GlRenderPipeline;bind()V"))
++    private void g2(CallbackInfo ci) {
++        push("gl:pipelineBind");
++    }
++
++    @Inject(method = "setupDraw", at = @At(value = "INVOKE", target = "Lcom/mojang/renderpearl/backend/opengl/GlRenderPipeline;bind()V", shift = At.Shift.AFTER))
++    private void g3(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = "setupDraw", at = @At(value = "INVOKE", target = "Lcom/mojang/renderpearl/backend/opengl/VertexArray;bind([Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;)V"))
++    private void g4(CallbackInfo ci) {
++        push("gl:vertexArray");
++    }
++
++    @Inject(method = "setupDraw", at = @At(value = "INVOKE", target = "Lcom/mojang/renderpearl/backend/opengl/VertexArray;bind([Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;)V", shift = At.Shift.AFTER))
++    private void g5(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = "setupDraw", at = @At("RETURN"))
++    private void g6(CallbackInfo ci) {
++        pop();
++    }
++
++    @Inject(method = "presentTexture", at = @At("HEAD"))
++    private void h1(CallbackInfo ci) {
++        push("gl:blit");
++    }
++
++    @Inject(method = "presentTexture", at = @At("RETURN"))
++    private void h2(CallbackInfo ci) {
++        pop();
++    }
++}
+diff --git a/src/gametest/java/net/ruthenium/gametest/mixin/S28RenderPassCountMixin.java b/src/gametest/java/net/ruthenium/gametest/mixin/S28RenderPassCountMixin.java
+new file mode 100644
+index 0000000..aa72e12
+--- /dev/null
++++ b/src/gametest/java/net/ruthenium/gametest/mixin/S28RenderPassCountMixin.java
+@@ -0,0 +1,50 @@
++package net.ruthenium.gametest.mixin;
++
++import com.mojang.renderpearl.frontend.FrontendRenderPass;
++import net.minecraft.util.profiling.Profiler;
++import org.spongepowered.asm.mixin.Mixin;
++import org.spongepowered.asm.mixin.injection.At;
++import org.spongepowered.asm.mixin.injection.Inject;
++import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
++
++/** S28 TEMP: counts render pass calls per profiler section ({@code -Pbench.s28Count=true}) */
++@Mixin(FrontendRenderPass.class)
++public class S28RenderPassCountMixin {
++    private static final boolean ON = Boolean.getBoolean("ruthenium.bench.s28Count");
++
++    @Inject(method = {"drawIndexed", "draw", "drawIndexedIndirect", "drawIndirect"}, at = @At("HEAD"))
++    private void s28Draw(CallbackInfo ci) {
++        if (ON) {
++            Profiler.get().incrementCounter("draw");
++        }
++    }
++
++    @Inject(method = {"multiDrawIndexed(Lorg/lwjgl/PointerBuffer;Ljava/nio/IntBuffer;Ljava/nio/IntBuffer;I)V",
++            "multiDraw(Ljava/nio/IntBuffer;Ljava/nio/IntBuffer;I)V"}, at = @At("HEAD"))
++    private void s28MultiDraw(CallbackInfo ci) {
++        if (ON) {
++            Profiler.get().incrementCounter("multiDraw");
++        }
++    }
++
++    @Inject(method = "setPipeline", at = @At("HEAD"))
++    private void s28Pipeline(CallbackInfo ci) {
++        if (ON) {
++            Profiler.get().incrementCounter("setPipeline");
++        }
++    }
++
++    @Inject(method = "setUniform(Ljava/lang/String;Ljava/lang/Object;)V", at = @At("HEAD"))
++    private void s28Uniform(CallbackInfo ci) {
++        if (ON) {
++            Profiler.get().incrementCounter("setUniform");
++        }
++    }
++
++    @Inject(method = "setVertexBuffer", at = @At("HEAD"))
++    private void s28Vertex(CallbackInfo ci) {
++        if (ON) {
++            Profiler.get().incrementCounter("setVertexBuffer");
++        }
++    }
++}
+diff --git a/src/gametest/resources/ruthenium-gametest.mixins.json b/src/gametest/resources/ruthenium-gametest.mixins.json
+index a70ce42..ce84788 100644
+--- a/src/gametest/resources/ruthenium-gametest.mixins.json
++++ b/src/gametest/resources/ruthenium-gametest.mixins.json
+@@ -16,6 +16,10 @@
+     "MinecraftProfilerMixin",
+     "ParticleEngineAccessor",
+     "RetainedDrawProbeMixin",
++    "S28GlDebugMixin",
++    "S28GlProbe2Mixin",
++    "S28GlProbeMixin",
++    "S28RenderPassCountMixin",
+     "SectionRenderDispatcherAccessor",
+     "TerrainDrawListGroupAccessor",
+     "TerrainDrawListMixin",
+diff --git a/src/main/java/net/ruthenium/config/Config.java b/src/main/java/net/ruthenium/config/Config.java
+index f51bdd2..2ae48ac 100644
+--- a/src/main/java/net/ruthenium/config/Config.java
++++ b/src/main/java/net/ruthenium/config/Config.java
+@@ -91,6 +91,11 @@ public class Config {
+     public boolean noAllocLightProbe = true;
+     /** Name tags of entities whose display name is built from the same objects as last frame are not built again */
+     public boolean keepDisplayNames = true;
++    // S28 TEMP: the three parts of 7193e1d (instanced groups share one ring, one prepare per render type, kept bindings)
++    public boolean s28SharedRing = true;
++    public boolean s28PreparePerType = true;
++    public boolean s28KeepBindings = true;
++    public boolean s28GroupsAll = true;
+     /** Finds the draw of a render type with a hash lookup instead of a linear search */
+     public boolean hashedDrawLookup = true;
+     /** Geometry of equal render types joins one draw in groups that may be reordered */
+diff --git a/src/main/java/net/ruthenium/mixin/render/feature/LevelRendererM.java b/src/main/java/net/ruthenium/mixin/render/feature/LevelRendererM.java
+index 35eaec7..fd98d03 100644
+--- a/src/main/java/net/ruthenium/mixin/render/feature/LevelRendererM.java
++++ b/src/main/java/net/ruthenium/mixin/render/feature/LevelRendererM.java
+@@ -36,19 +36,30 @@ public class LevelRendererM {
+     @Inject(method = "render", at = @At(value = "INVOKE", target = PREPARE_FRAME, shift = At.Shift.AFTER))
+     private void endWorldFeatures(CallbackInfo ci) {
+         ModelCulling.setWorldPass(false);
++        // S28 TEMP sections
++        net.minecraft.util.profiling.Profiler.get().push("s28:retainedPrepare");
+         RetainedBlockEntities.prepareDraws();
++        net.minecraft.util.profiling.Profiler.get().popPush("s28:instancedPrepare");
+         InstancedModels.prepareDraws();
++        net.minecraft.util.profiling.Profiler.get().popPush("s28:partsUpload");
+         InstancedParts.upload();
++        net.minecraft.util.profiling.Profiler.get().popPush("s28:posesUpload");
+         PlayerPoseDraws.upload();
++        net.minecraft.util.profiling.Profiler.get().popPush("s28:labelsUpload");
+         RetainedLabels.upload();
++        net.minecraft.util.profiling.Profiler.get().pop();
+     }
+ 
+     @Inject(method = "executeSolid", at = @At(value = "INVOKE", shift = At.Shift.AFTER,
+             target = "Lnet/minecraft/client/renderer/feature/FeatureRenderDispatcher$PreparedFrame;executeSolid(Lcom/mojang/renderpearl/api/commands/RenderPass;)V"))
+     private void drawRetainedBlockEntities(ChunkSectionsToRender chunkSectionsToRender, FeatureRenderDispatcher.PreparedFrame featureFrame,
+                                            RenderPass renderPass, CallbackInfo ci) {
++        // S28 TEMP sections
++        net.minecraft.util.profiling.Profiler.get().push("s28:retainedDraw");
+         RetainedBlockEntities.draw(renderPass);
++        net.minecraft.util.profiling.Profiler.get().popPush("s28:instancedDraw");
+         InstancedModels.draw(renderPass);
++        net.minecraft.util.profiling.Profiler.get().pop();
+     }
+ 
+     @Inject(method = "submitBlockEntities", at = @At("HEAD"))
+diff --git a/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java b/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java
+index 7993bfd..35d91e1 100644
+--- a/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java
++++ b/src/main/java/net/ruthenium/render/blockentity/InstancedModels.java
+@@ -224,6 +224,8 @@ public final class InstancedModels {
+         /** This frame's instances' offset in the shared instance buffer */
+         int instanceOffset;
+         @Nullable PreparedRenderType prepared;
++        // S28 TEMP: the per-group ring of before 7193e1d
++        @Nullable MappableRingBuffer s28Ring;
+         /** Of a {@link #PLATE_KEY} group: the plate's scale in its mesh */
+         float plateXScale, plateYScale, plateZScale;
+ 
+@@ -248,6 +250,10 @@ public final class InstancedModels {
+                 this.mesh.close();
+                 this.mesh = null;
+             }
++            if (this.s28Ring != null) {
++                this.s28Ring.close();
++                this.s28Ring = null;
++            }
+             MemoryUtil.memFree(this.instances);
+         }
+     }
+@@ -656,6 +662,12 @@ public final class InstancedModels {
+      * after the other in one buffer, each render type prepared once
+      */
+     public static void prepareDraws() {
++        // S28 TEMP
++        boolean all = Initializer.CONFIG.s28GroupsAll;
++        if (!(all && Initializer.CONFIG.s28SharedRing) || !(all && Initializer.CONFIG.s28PreparePerType)) {
++            s28PrepareDraws(all && Initializer.CONFIG.s28SharedRing, all && Initializer.CONFIG.s28PreparePerType);
++            return;
++        }
+         drawPending = false;
+         int maxIndexCount = 0;
+         PREPARED.clear();
+@@ -709,11 +721,85 @@ public final class InstancedModels {
+         RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS).getBuffer(maxIndexCount);
+     }
+ 
++    // S28 TEMP: prepareDraws with parts of 7193e1d undone
++    private static void s28PrepareDraws(boolean sharedRing, boolean preparePerType) {
++        drawPending = false;
++        int maxIndexCount = 0;
++        PREPARED.clear();
++        if (sharedRing && ring != null) {
++            ring.rotate();
++        }
++        int total = 0;
++        for (Group group : GROUPS) {
++            group.instanceSlice = null;
++            if (!sharedRing && group.s28Ring != null) {
++                group.s28Ring.rotate();
++            }
++            if (group.count == 0 || group.mesh == null) {
++                continue;
++            }
++            group.lastUsedFrame = frame;
++            group.instanceOffset = total;
++            total += group.count * INSTANCE_SIZE;
++            PreparedRenderType prepared = preparePerType ? PREPARED.get(group.renderType) : null;
++            if (prepared == null) {
++                prepared = group.renderType.prepare();
++                PREPARED.put(group.renderType, prepared);
++            }
++            group.prepared = prepared;
++            maxIndexCount = Math.max(maxIndexCount, group.indexCount);
++            drawPending = true;
++            if (!sharedRing) {
++                int size = group.count * INSTANCE_SIZE;
++                if (group.s28Ring == null || group.s28Ring.size() < size) {
++                    if (group.s28Ring != null) {
++                        group.s28Ring.close();
++                    }
++                    group.s28Ring = new MappableRingBuffer(() -> "Ruthenium model instances",
++                            GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_MAP_WRITE, Math.max(size * 2, 64 * INSTANCE_SIZE));
++                }
++                GpuBuffer buffer = group.s28Ring.currentBuffer();
++                try (GpuBufferSlice.MappedView view = buffer.slice(0, size).map(false, true)) {
++                    MemoryUtil.memCopy(MemoryUtil.memAddress0(group.instances), MemoryUtil.memAddress(view.data()), size);
++                }
++                group.instanceSlice = buffer.slice(0, size);
++            }
++        }
++        if (!drawPending) {
++            return;
++        }
++        if (sharedRing) {
++            if (ring == null || ring.size() < total) {
++                if (ring != null) {
++                    ring.close();
++                }
++                ring = new MappableRingBuffer(() -> "Ruthenium model instances", GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_MAP_WRITE,
++                        Math.max(total * 2, 256 * INSTANCE_SIZE));
++            }
++            GpuBuffer buffer = ring.currentBuffer();
++            try (GpuBufferSlice.MappedView view = buffer.slice(0, total).map(false, true)) {
++                long target = MemoryUtil.memAddress(view.data());
++                for (Group group : GROUPS) {
++                    if (group.count == 0 || group.mesh == null) {
++                        continue;
++                    }
++                    int size = group.count * INSTANCE_SIZE;
++                    MemoryUtil.memCopy(MemoryUtil.memAddress0(group.instances), target + group.instanceOffset, size);
++                    group.instanceSlice = buffer.slice(group.instanceOffset, size);
++                }
++            }
++        }
++        transform = RenderSystem.getDynamicUniforms().writeTransform(RenderSystem.getModelViewMatrixCopy());
++        RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS).getBuffer(maxIndexCount);
++    }
++
+     /** Draws the instances into the world's solid pass */
+     public static void draw(RenderPass renderPass) {
+         if (!drawPending) {
+             return;
+         }
++        // S28 TEMP
++        boolean s28Keep = Initializer.CONFIG.s28GroupsAll && Initializer.CONFIG.s28KeepBindings;
+ 
+         renderPass.pushDebugGroup(() -> "Ruthenium instanced models");
+         RenderSystem.AutoStorageIndexBuffer indices = RenderSystem.getSequentialBuffer(PrimitiveTopology.QUADS);
+@@ -724,7 +810,7 @@ public final class InstancedModels {
+                 continue;
+             }
+             // Bindings are kept between draws of one pipeline (the same values vanilla's per draw binding would set)
+-            if (group.pipeline != lastPipeline) {
++            if (group.pipeline != lastPipeline || !s28Keep) {
+                 CompiledRenderPipeline pipeline = RenderSystem.getCompiledPipelineNullable(group.pipeline);
+                 if (pipeline == null) {
+                     continue;
