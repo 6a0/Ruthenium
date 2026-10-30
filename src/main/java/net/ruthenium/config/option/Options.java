@@ -404,6 +404,11 @@ public abstract class Options {
                                 () -> config.renderTypeCache)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.renderTypeCache.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.emptyCrossbowCharge"),
+                                value -> config.emptyCrossbowCharge = value,
+                                () -> config.emptyCrossbowCharge)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.emptyCrossbowCharge.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.reuseEntityStates"),
                                 value -> config.reuseEntityStates = value,
                                 () -> config.reuseEntityStates)

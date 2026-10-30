@@ -73,6 +73,8 @@ public class Config {
     public boolean emptyArmorStandLayers = true;
     /** Two-argument render type lookups (entityCutout, ...) check a small cache of vanilla's answers before vanilla's memo */
     public boolean renderTypeCache = true;
+    /** Humanoids that aren't using an item skip the enchantment lookup of the crossbow charge time (vanilla's answer for an empty hand) */
+    public boolean emptyCrossbowCharge = true;
     /** Armor stands extracted into render states reused across frames */
     public boolean reuseEntityStates = true;
     /** Block models of entities (item frames, block displays, ...) keep their quads across frames */

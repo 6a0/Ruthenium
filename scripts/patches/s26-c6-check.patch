@@ -1,0 +1,136 @@
+diff --git a/src/main/java/net/ruthenium/render/RenderTypeFrontCache.java b/src/main/java/net/ruthenium/render/RenderTypeFrontCache.java
+--- a/src/main/java/net/ruthenium/render/RenderTypeFrontCache.java
++++ b/src/main/java/net/ruthenium/render/RenderTypeFrontCache.java
+@@ -53,7 +53,13 @@
+             }
+         }
+         if (entry != null) {
++            if (C6Check.ENABLED) {
++                C6Check.renderType(entry.result, this.memo.apply(first, second), entry.first == first && entry.second == second);
++            }
+             return (R) entry.result;
++        }
++        if (C6Check.ENABLED) {
++            C6Check.renderTypeMiss();
+         }
+         R result = this.memo.apply(first, second);
+         this.entries[index + 1] = newest;
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/HumanoidMobRendererM.java b/src/main/java/net/ruthenium/mixin/render/entity/HumanoidMobRendererM.java
+--- a/src/main/java/net/ruthenium/mixin/render/entity/HumanoidMobRendererM.java
++++ b/src/main/java/net/ruthenium/mixin/render/entity/HumanoidMobRendererM.java
+@@ -17,7 +17,14 @@
+             target = "Lnet/minecraft/world/item/CrossbowItem;getChargeDuration(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/entity/LivingEntity;)I"))
+     private static int ruthenium$emptyChargeDuration(ItemStack stack, LivingEntity entity, Operation<Integer> original) {
+         if (Initializer.CONFIG.emptyCrossbowCharge && stack.isEmpty()) {
++            if (net.ruthenium.render.C6Check.ENABLED) {
++                net.ruthenium.render.C6Check.syntheticStacks(entity, EmptyChargeDuration.VALUE);
++                net.ruthenium.render.C6Check.crossbow(EmptyChargeDuration.VALUE, original.call(stack, entity));
++            }
+             return EmptyChargeDuration.VALUE;
++        }
++        if (net.ruthenium.render.C6Check.ENABLED) {
++            net.ruthenium.render.C6Check.crossbowVanilla();
+         }
+         return original.call(stack, entity);
+     }
+diff --git a/src/main/java/net/ruthenium/render/C6Check.java b/src/main/java/net/ruthenium/render/C6Check.java
+new file mode 100644
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/C6Check.java
+@@ -0,0 +1,96 @@
++package net.ruthenium.render;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.concurrent.atomic.AtomicLong;
++
++/** Temporary check mode (s26 candidate 6, not committed): each fast answer compared with vanilla's computation */
++public final class C6Check {
++    public static final boolean ENABLED = Boolean.getBoolean("ruthenium.c6Check");
++    private static final Logger LOGGER = LoggerFactory.getLogger("Ruthenium c6 check");
++    private static final AtomicLong RT_HITS = new AtomicLong();
++    private static final AtomicLong RT_EQUAL_HITS = new AtomicLong();
++    private static final AtomicLong RT_MISSES = new AtomicLong();
++    private static final AtomicLong RT_MISMATCHES = new AtomicLong();
++    private static final AtomicLong CB_SKIPS = new AtomicLong();
++    private static final AtomicLong CB_VANILLA = new AtomicLong();
++    private static final AtomicLong CB_MISMATCHES = new AtomicLong();
++
++    private C6Check() {
++    }
++
++    public static void renderType(Object cached, Object vanilla, boolean identicalKey) {
++        if (cached != vanilla) {
++            long n = RT_MISMATCHES.incrementAndGet();
++            if (n <= 20) {
++                LOGGER.error("render type mismatch: cached {} vanilla {}", cached, vanilla);
++            }
++        }
++        if (!identicalKey) {
++            RT_EQUAL_HITS.incrementAndGet();
++        }
++        if (RT_HITS.incrementAndGet() % 2_000_000 == 0) {
++            log();
++        }
++    }
++
++    public static void renderTypeMiss() {
++        RT_MISSES.incrementAndGet();
++    }
++
++    private static boolean synthetic;
++
++    /**
++     * Once: vanilla's getChargeDuration on synthetic empty stacks (EMPTY, air, a count 0 crossbow with Quick Charge III)
++     * against the fast answer, and on a count 1 Quick Charge III crossbow as a control (vanilla must differ there)
++     */
++    public static void syntheticStacks(net.minecraft.world.entity.LivingEntity entity, int fast) {
++        if (synthetic) {
++            return;
++        }
++        synthetic = true;
++        try {
++            var enchantments = entity.level().registryAccess().lookupOrThrow(net.minecraft.core.registries.Registries.ENCHANTMENT);
++            var quickCharge = enchantments.getOrThrow(net.minecraft.world.item.enchantment.Enchantments.QUICK_CHARGE);
++            net.minecraft.world.item.ItemStack zero = new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.CROSSBOW, 1);
++            zero.enchant(quickCharge, 3);
++            net.minecraft.world.item.ItemStack one = zero.copy();
++            zero.setCount(0);
++            int empty = net.minecraft.world.item.CrossbowItem.getChargeDuration(net.minecraft.world.item.ItemStack.EMPTY, entity);
++            int air = net.minecraft.world.item.CrossbowItem.getChargeDuration(new net.minecraft.world.item.ItemStack(net.minecraft.world.item.Items.AIR), entity);
++            int zeroCount = net.minecraft.world.item.CrossbowItem.getChargeDuration(zero, entity);
++            int control = net.minecraft.world.item.CrossbowItem.getChargeDuration(one, entity);
++            LOGGER.info("synthetic stacks: fast {}, vanilla EMPTY {}, air {}, count 0 Quick Charge III crossbow {} (isEmpty {}); "
++                    + "control count 1 Quick Charge III crossbow {}", fast, empty, air, zeroCount, zero.isEmpty(), control);
++            crossbow(fast, empty);
++            crossbow(fast, air);
++            crossbow(fast, zeroCount);
++        } catch (Throwable t) {
++            LOGGER.error("synthetic stack check failed", t);
++        }
++    }
++
++    public static void crossbow(int fast, int vanilla) {
++        if (fast != vanilla) {
++            long n = CB_MISMATCHES.incrementAndGet();
++            if (n <= 20) {
++                LOGGER.error("charge duration mismatch: fast {} vanilla {}", fast, vanilla);
++            }
++        }
++        if (CB_SKIPS.incrementAndGet() % 1_000_000 == 0) {
++            log();
++        }
++    }
++
++    public static void crossbowVanilla() {
++        CB_VANILLA.incrementAndGet();
++    }
++
++    public static void log() {
++        LOGGER.info("render type cache: {} hits ({} by an equal, not identical key), {} misses, {} mismatches; "
++                        + "empty charge duration: {} skipped calls compared, {} non-empty calls to vanilla, {} mismatches",
++                RT_HITS.get(), RT_EQUAL_HITS.get(), RT_MISSES.get(), RT_MISMATCHES.get(),
++                CB_SKIPS.get(), CB_VANILLA.get(), CB_MISMATCHES.get());
++    }
++}

@@ -95,6 +95,8 @@
   "ruthenium.options.emptyArmorStandLayers.tooltip": "Armor stands without armor or items (such as the invisible ones hologram plugins use for each line of text) skip the armor, item and head layers, which would draw nothing. Mods that add something to those layers for empty armor stands may want it off.",
   "ruthenium.options.renderTypeCache": "Render Type Lookup Cache",
   "ruthenium.options.renderTypeCache.tooltip": "Entities look up how they are drawn (their render type) every frame, and vanilla builds a new lookup key each time. A small cache in front of vanilla's lookup answers repeated lookups with the very same render types. Same image.",
+  "ruthenium.options.emptyCrossbowCharge": "Skip Empty Crossbow Charge Time",
+  "ruthenium.options.emptyCrossbowCharge.tooltip": "Mobs, players and armor stands that aren't using an item skip looking up crossbow enchantments for their empty hand every frame; the answer for an empty hand is always the same. Same image. Mods that change the crossbow charge time through enchantment hooks even for empty hands may want it off.",
   "ruthenium.options.reuseEntityStates": "Reuse Entity Render States",
   "ruthenium.options.reuseEntityStates.tooltip": "Armor stands reuse their render state from the previous frame instead of creating a new one every frame.",
   "ruthenium.options.blockModelMeshCache": "Cache Entity Block Models",
