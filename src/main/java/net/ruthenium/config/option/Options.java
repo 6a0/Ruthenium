@@ -427,6 +427,11 @@ public abstract class Options {
                                 () -> config.noScratchMesh)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.noScratchMesh.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.partChildArrays"),
+                                value -> config.partChildArrays = value,
+                                () -> config.partChildArrays)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.partChildArrays.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.hashedDrawLookup"),
                                 value -> config.hashedDrawLookup = value,
                                 () -> config.hashedDrawLookup)

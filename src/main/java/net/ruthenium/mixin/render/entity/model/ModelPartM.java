@@ -4,6 +4,7 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.model.geom.ModelPart;
+import net.ruthenium.Initializer;
 import net.ruthenium.interfaces.InstancedPartHolder;
 import net.ruthenium.interfaces.PosedPart;
 import net.ruthenium.interfaces.ReplayablePart;
@@ -18,17 +19,25 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Overwrite;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * Adds the part as an instance ({@link InstancedParts}) or hands its pose to a posed player draw ({@link PlayerPoseDraws})
  * instead of writing its cubes when the model allows it, records its pose for layers ({@link ModelPoseReplay}), and
- * keeps the quaternion of its rotation while its angles stay the same.
+ * keeps the quaternion of its rotation while its angles stay the same. With {@code partChildArrays} its children are
+ * rendered from an array taken at construction instead of an iterator of the children map per render.
  */
 @Mixin(ModelPart.class)
 public class ModelPartM implements InstancedPartHolder, ReplayablePart, PosedPart {
     @Shadow @Final private List<ModelPart.Cube> cubes;
+    @Shadow @Final private Map<String, ModelPart> children;
+    @Shadow public boolean visible;
+    @Shadow public boolean skipDraw;
     @Shadow public float x;
     @Shadow public float y;
     @Shadow public float z;
@@ -48,6 +57,45 @@ public class ModelPartM implements InstancedPartHolder, ReplayablePart, PosedPar
     /** The part's {@link PlayerPoseDraws} layout and slot in it */
     @Unique private @Nullable Object poseLayout;
     @Unique private int poseSlot;
+    /** The children in the map's order, taken at construction (vanilla never changes the map of a part) */
+    @Unique private ModelPart @Nullable [] childArray;
+
+    @Inject(method = "<init>", at = @At("RETURN"))
+    private void keepChildArray(List<ModelPart.Cube> cubes, Map<String, ModelPart> children, CallbackInfo ci) {
+        this.childArray = children.values().toArray(new ModelPart[0]);
+    }
+
+    /**
+     * @author Ruthenium
+     * @reason Vanilla's body, except that the children come from an array taken at construction instead of an iterator
+     * of the children map (allocated for every part rendered, leaves included, as every baked part has a map) while the
+     * map's size still matches it
+     */
+    @Overwrite
+    public void render(final PoseStack poseStack, final VertexConsumer buffer, final int lightCoords, final int overlayCoords, final int color) {
+        if (this.visible) {
+            if (!this.cubes.isEmpty() || !this.children.isEmpty()) {
+                poseStack.pushPose();
+                ((ModelPart) (Object) this).translateAndRotate(poseStack);
+                if (!this.skipDraw) {
+                    this.compile(poseStack.last(), buffer, lightCoords, overlayCoords, color);
+                }
+
+                ModelPart[] childArray = this.childArray;
+                if (Initializer.CONFIG.partChildArrays && childArray != null && childArray.length == this.children.size()) {
+                    for (ModelPart child : childArray) {
+                        child.render(poseStack, buffer, lightCoords, overlayCoords, color);
+                    }
+                } else {
+                    for (ModelPart child : this.children.values()) {
+                        child.render(poseStack, buffer, lightCoords, overlayCoords, color);
+                    }
+                }
+
+                poseStack.popPose();
+            }
+        }
+    }
 
     /**
      * @author Ruthenium

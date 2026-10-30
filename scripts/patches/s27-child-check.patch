@@ -1,0 +1,73 @@
+diff --git a/src/main/java/net/ruthenium/mixin/render/entity/model/ModelPartM.java b/src/main/java/net/ruthenium/mixin/render/entity/model/ModelPartM.java
+index 7892d71..880d218 100644
+--- a/src/main/java/net/ruthenium/mixin/render/entity/model/ModelPartM.java
++++ b/src/main/java/net/ruthenium/mixin/render/entity/model/ModelPartM.java
+@@ -83,10 +83,16 @@ public class ModelPartM implements InstancedPartHolder, ReplayablePart, PosedPar
+ 
+                 ModelPart[] childArray = this.childArray;
+                 if (Initializer.CONFIG.partChildArrays && childArray != null && childArray.length == this.children.size()) {
++                    if (net.ruthenium.render.entity.ChildArrayCheck.ENABLED) {
++                        net.ruthenium.render.entity.ChildArrayCheck.check(childArray, this.children);
++                    }
+                     for (ModelPart child : childArray) {
+                         child.render(poseStack, buffer, lightCoords, overlayCoords, color);
+                     }
+                 } else {
++                    if (net.ruthenium.render.entity.ChildArrayCheck.ENABLED && Initializer.CONFIG.partChildArrays) {
++                        net.ruthenium.render.entity.ChildArrayCheck.fallback();
++                    }
+                     for (ModelPart child : this.children.values()) {
+                         child.render(poseStack, buffer, lightCoords, overlayCoords, color);
+                     }
+diff --git a/src/main/java/net/ruthenium/render/entity/ChildArrayCheck.java b/src/main/java/net/ruthenium/render/entity/ChildArrayCheck.java
+new file mode 100644
+index 0000000..1e91c9b
+--- /dev/null
++++ b/src/main/java/net/ruthenium/render/entity/ChildArrayCheck.java
+@@ -0,0 +1,46 @@
++package net.ruthenium.render.entity;
++
++import net.minecraft.client.model.geom.ModelPart;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.Map;
++
++/** Temporary check of partChildArrays: the array against the children map's iteration, per render (-Druthenium.childCheck=true) */
++public final class ChildArrayCheck {
++    public static final boolean ENABLED = Boolean.getBoolean("ruthenium.childCheck");
++    private static final Logger LOGGER = LoggerFactory.getLogger("Ruthenium child check");
++    private static long renders, children, mismatches, leaves;
++
++    private ChildArrayCheck() {
++    }
++
++    private static long fallbacks;
++
++    public static synchronized void fallback() {
++        if (++fallbacks % 1000 == 1) {
++            LOGGER.info("child arrays: {} fallbacks to the map", fallbacks);
++        }
++    }
++
++    public static synchronized void check(ModelPart[] array, Map<String, ModelPart> map) {
++        renders++;
++        if (array.length == 0) {
++            leaves++;
++        }
++        int i = 0;
++        for (ModelPart child : map.values()) {
++            if (i >= array.length || array[i] != child) {
++                mismatches++;
++            }
++            i++;
++            children++;
++        }
++        if (i != array.length) {
++            mismatches++;
++        }
++        if (renders % 5_000_000 == 0) {
++            LOGGER.info("child arrays: {} renders ({} leaves), {} children compared, {} mismatches, {} fallbacks", renders, leaves, children, mismatches, fallbacks);
++        }
++    }
++}

@@ -81,6 +81,8 @@ public class Config {
     public boolean blockModelMeshCache = true;
     /** Render states of cached block models get no mesh of their own (the Fabric Renderer API's, which stays empty) */
     public boolean noScratchMesh = true;
+    /** Model parts render their children from an array instead of an iterator of their children map per render */
+    public boolean partChildArrays = true;
     /** Finds the draw of a render type with a hash lookup instead of a linear search */
     public boolean hashedDrawLookup = true;
     /** Geometry of equal render types joins one draw in groups that may be reordered */
