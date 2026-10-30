@@ -5,6 +5,7 @@ import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.extract.LevelExtractor;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.ruthenium.Initializer;
+import net.ruthenium.render.chunk.SectionScratch;
 import org.jspecify.annotations.Nullable;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -26,6 +27,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * {@code ClientLevel}), so whenever sections were still being updated as the world was left, the whole world stayed
  * reachable (~640 chunks, +35-48 MB live heap after leaving, in some launches only). It is reset here too, as
  * {@code extract} would, along with the level load tracker's callback (it keeps the connection and its level).
+ * The pooled section compile scratch ({@link SectionScratch}) is dropped too: it keeps no level, only arrays.
  */
 @Mixin(LevelExtractor.class)
 public class LevelExtractorResetM {
@@ -38,6 +40,7 @@ public class LevelExtractorResetM {
             this.levelRenderer.resetLevelRenderData();
             this.levelRenderState.reset();
             this.levelRenderState.playerCompiledSectionCallback = null;
+            SectionScratch.clear();
         }
     }
 }

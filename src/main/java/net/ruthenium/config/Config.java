@@ -114,7 +114,10 @@ public class Config {
     public boolean sectionLightCache = true;
     /** Section compiles read the block states around each block from an array */
     public boolean sectionStateCache = true;
-    /** Compiled sections drop their compile region, and leaving a world frees its render data right away */
+    /**
+     * Compiled sections drop their compile region, leaving a world frees its render data right away, and section
+     * compiles borrow their scratch from a pool that is trimmed while idle instead of keeping it per thread
+     */
     public boolean freeUnusedChunkData = true;
     /** Font sets build their glyphs by width (only obfuscated text reads them) on the first request instead of on every reload */
     public boolean lazyGlyphWidths = true;

@@ -10,7 +10,9 @@ import net.minecraft.world.level.ColorResolver;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.ruthenium.Initializer;
+import net.ruthenium.interfaces.SectionScratchHolder;
 import net.ruthenium.render.chunk.BiomeTintBlend;
+import net.ruthenium.render.chunk.SectionScratch;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Overwrite;
@@ -20,18 +22,18 @@ import org.spongepowered.asm.mixin.Unique;
 /**
  * The block states of the region's center section and the blocks around it (18^3) are read from the section copies
  * once and then from an array: culling and smooth lighting look up each block's neighbours many times. The region is
- * an immutable snapshot, so the states are the same. The array is per thread and owned by one region at a time
- * (vanilla uses a region on one thread; another thread takes its own array).
+ * an immutable snapshot, so the states are the same. The array is the compile's scratch ({@link SectionScratch}),
+ * which {@code SectionCompilerM} binds to the region for the compile on the compiling thread; lookups on another
+ * thread, outside the compile or after the scratch was bound to another region read the section copies directly.
  * <p>
- * Block tints go straight to {@link BiomeTintBlend}, which keeps the section's blended tints itself, instead of
- * through vanilla's per-block tint cache (a read lock and a linear search of the column's heights per lookup).
+ * Block tints go straight to {@link BiomeTintBlend}, which keeps the section's blended tints itself in the same
+ * scratch, instead of through vanilla's per-block tint cache (a read lock and a linear search of the column's heights
+ * per lookup).
  */
 @Mixin(RenderSectionRegion.class)
-public class RenderSectionRegionM {
+public class RenderSectionRegionM implements SectionScratchHolder {
     @Unique
-    private static final int SIZE = 18;
-    @Unique
-    private static final ThreadLocal<States> STATES = ThreadLocal.withInitial(States::new);
+    private static final int SIZE = SectionScratch.WINDOW;
 
     @Shadow @Final private int minSectionX;
     @Shadow @Final private int minSectionY;
@@ -43,20 +45,39 @@ public class RenderSectionRegionM {
         throw new AssertionError();
     }
 
+    /** The scratch of the compile this region is in, on {@link #ruthenium$thread}, or null */
     @Unique
-    private States ruthenium$states;
-    /** The array's stamp when this region took it: it is still this region's while the stamp is unchanged */
+    private SectionScratch ruthenium$scratch;
+    /** Its block state window, or null while switch {@code sectionStateCache} was off when it was bound */
     @Unique
-    private int ruthenium$stamp;
+    private SectionScratch.States ruthenium$states;
+    @Unique
+    private Thread ruthenium$thread;
+    /** The scratch's binding number when this region was bound: it is still bound while that is unchanged */
+    @Unique
+    private int ruthenium$bind;
 
+    @Override
+    public void ruthenium$bindScratch(SectionScratch scratch) {
+        this.ruthenium$bind = scratch.bind();
+        this.ruthenium$states = scratch.newStates();
+        this.ruthenium$thread = Thread.currentThread();
+        this.ruthenium$scratch = scratch;
+    }
+
+    @Override
+    public void ruthenium$unbindScratch() {
+        this.ruthenium$scratch = null;
+        this.ruthenium$states = null;
+        this.ruthenium$thread = null;
+    }
+
+    /** The bound scratch if this thread may use it, else null */
     @Unique
-    private static final class States {
-        final BlockState[] states = new BlockState[SIZE * SIZE * SIZE];
-        final int[] stamps = new int[SIZE * SIZE * SIZE];
-        final Thread thread = Thread.currentThread();
-        // Stamps instead of a reference to the owning region: a worker's array outlives its last region, which
-        // would keep that region's chunks (and after leaving a world, the whole world) reachable
-        int stamp;
+    private SectionScratch ruthenium$boundScratch() {
+        SectionScratch scratch = this.ruthenium$scratch;
+        return scratch != null && this.ruthenium$thread == Thread.currentThread() && scratch.binds() == this.ruthenium$bind
+                ? scratch : null;
     }
 
     /**
@@ -68,20 +89,12 @@ public class RenderSectionRegionM {
         int x = pos.getX() - (this.minSectionX << 4) - 15;
         int y = pos.getY() - (this.minSectionY << 4) - 15;
         int z = pos.getZ() - (this.minSectionZ << 4) - 15;
-        if ((x | y | z) < 0 || x >= SIZE || y >= SIZE || z >= SIZE || !Initializer.CONFIG.sectionStateCache) {
+        SectionScratch.States states = this.ruthenium$states;
+        if ((x | y | z) < 0 || x >= SIZE || y >= SIZE || z >= SIZE || states == null || !Initializer.CONFIG.sectionStateCache
+                || this.ruthenium$boundScratch() == null) {
             return this.ruthenium$lookUp(pos);
         }
 
-        States states = this.ruthenium$states;
-        if (states == null || states.stamp != this.ruthenium$stamp || states.thread != Thread.currentThread()) {
-            states = STATES.get();
-            if (++states.stamp == 0) {
-                java.util.Arrays.fill(states.stamps, 0);
-                states.stamp = 1;
-            }
-            this.ruthenium$states = states;
-            this.ruthenium$stamp = states.stamp;
-        }
         int index = (y * SIZE + z) * SIZE + x;
         if (states.stamps[index] == states.stamp) {
             return states.states[index];
@@ -110,7 +123,9 @@ public class RenderSectionRegionM {
         if (Initializer.CONFIG.biomeBlendCache) {
             int radius = Minecraft.getInstance().options.biomeBlendRadius().get();
             if (BiomeTintBlend.supports(radius)) {
-                return BiomeTintBlend.blend(this.level, pos, resolver, radius);
+                SectionScratch scratch = this.ruthenium$boundScratch();
+                return scratch != null ? BiomeTintBlend.blend(scratch, this.level, pos, resolver, radius)
+                        : BiomeTintBlend.blend(this.level, pos, resolver, radius);
             }
         }
         return this.level.getBlockTint(pos, resolver);

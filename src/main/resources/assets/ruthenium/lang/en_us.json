@@ -57,7 +57,7 @@
   "ruthenium.options.sectionStateCache": "Fast Block Lookups",
   "ruthenium.options.sectionStateCache.tooltip": "Builds chunks faster: the blocks around each block (for hidden faces and smooth lighting) are read from a flat array instead of the chunk's compressed storage. The chunks look identical.",
   "ruthenium.options.freeUnusedChunkData": "Free Unused Chunk Data",
-  "ruthenium.options.freeUnusedChunkData.tooltip": "Saves memory: built chunks let go of the copies of the blocks around them that building needed (vanilla keeps them until the chunk is rebuilt), and leaving a world frees its chunks and their GPU buffers right away instead of when the next world loads. The world looks and plays the same.",
+  "ruthenium.options.freeUnusedChunkData.tooltip": "Saves memory: built chunks let go of the copies of the blocks around them that building needed (vanilla keeps them until the chunk is rebuilt), and leaving a world frees its chunks and their GPU buffers right away instead of when the next world loads. The threads that build chunks also share their working memory and free it while no chunks are being built. The world looks and plays the same.",
   "ruthenium.options.lazyGlyphWidths": "Lazy Obfuscated Text Table",
   "ruthenium.options.lazyGlyphWidths.tooltip": "Saves memory and a little resource reload time: the table of glyphs sorted by width, which only obfuscated (scrambled) text uses, is built the first time such text is drawn instead of on every resource reload. Text looks the same. Takes effect on the next resource reload.",
   "ruthenium.options.compactSkyLight": "Compact Sky Light",

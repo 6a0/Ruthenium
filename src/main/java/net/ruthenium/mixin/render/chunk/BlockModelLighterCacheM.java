@@ -7,6 +7,7 @@ import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.world.level.block.state.BlockState;
 import net.ruthenium.Initializer;
 import net.ruthenium.interfaces.SectionLightWindow;
+import net.ruthenium.render.chunk.SectionScratch;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Overwrite;
@@ -16,53 +17,48 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
-import java.util.Arrays;
-
 /**
  * While a section compiles, the smooth lighting's light and shade values of the section and the blocks around it
  * are kept in arrays (18^3 entries) instead of vanilla's 100 entry FIFO maps, which a section's block order keeps
  * evicting. Each value is computed the same way, so the lighting is identical. Positions outside the section and
- * compiles without {@link #ruthenium$beginSection} use vanilla's maps. One cache per thread, like vanilla's.
+ * compiles without {@link #ruthenium$beginSection} use vanilla's maps. One cache per thread, like vanilla's; the
+ * arrays belong to the compile's scratch ({@link SectionScratch}) and are only referenced here while it compiles.
  */
 @Mixin(BlockModelLighter.Cache.class)
 public class BlockModelLighterCacheM implements SectionLightWindow {
     @Unique
-    private static final int SIZE = 18;
+    private static final int SIZE = SectionScratch.WINDOW;
 
     @Shadow private boolean enabled;
     @Shadow @Final private LightCoordsUtil.BrightnessGetter cachedBrightnessGetter;
     @Shadow @Final private it.unimi.dsi.fastutil.longs.Long2FloatLinkedOpenHashMap brightnessCache;
 
-    // Allocated in code: array field initializers in mixins are not reliably merged (see CompiledSectionMeshM)
+    // The window of the compile's scratch, set from beginSection to disable (the end of the compile)
     @Unique private int[] ruthenium$light;
-    @Unique private int[] ruthenium$lightStamps;
+    @Unique private byte[] ruthenium$lightStamps;
     @Unique private float[] ruthenium$shade;
-    @Unique private int[] ruthenium$shadeStamps;
+    @Unique private byte[] ruthenium$shadeStamps;
     /** An entry is valid when its stamp is this one, so a new section needs no clearing */
-    @Unique private int ruthenium$stamp;
+    @Unique private byte ruthenium$stamp;
     @Unique private boolean ruthenium$active;
     @Unique private int ruthenium$minX, ruthenium$minY, ruthenium$minZ;
     @Unique private LightCoordsUtil.BrightnessGetter ruthenium$windowGetter;
 
     @Override
-    public void ruthenium$beginSection(BlockPos sectionOrigin) {
+    public void ruthenium$beginSection(BlockPos sectionOrigin, SectionScratch scratch) {
         if (!Initializer.CONFIG.sectionLightCache) {
             this.ruthenium$active = false;
             return;
         }
-        if (this.ruthenium$light == null) {
-            int entries = SIZE * SIZE * SIZE;
-            this.ruthenium$light = new int[entries];
-            this.ruthenium$lightStamps = new int[entries];
-            this.ruthenium$shade = new float[entries];
-            this.ruthenium$shadeStamps = new int[entries];
+        if (this.ruthenium$windowGetter == null) {
             this.ruthenium$windowGetter = this::ruthenium$packedBrightness;
         }
-        if (++this.ruthenium$stamp == 0) {
-            Arrays.fill(this.ruthenium$lightStamps, 0);
-            Arrays.fill(this.ruthenium$shadeStamps, 0);
-            this.ruthenium$stamp = 1;
-        }
+        SectionScratch.Light window = scratch.newLight();
+        this.ruthenium$light = window.light;
+        this.ruthenium$lightStamps = window.lightStamps;
+        this.ruthenium$shade = window.shade;
+        this.ruthenium$shadeStamps = window.shadeStamps;
+        this.ruthenium$stamp = window.stamp;
         this.ruthenium$minX = sectionOrigin.getX() - 1;
         this.ruthenium$minY = sectionOrigin.getY() - 1;
         this.ruthenium$minZ = sectionOrigin.getZ() - 1;
@@ -72,6 +68,11 @@ public class BlockModelLighterCacheM implements SectionLightWindow {
     @Inject(method = "disable", at = @At("HEAD"))
     private void ruthenium$endSection(CallbackInfo ci) {
         this.ruthenium$active = false;
+        // The scratch goes back to the pool after this: keep no reference to its arrays
+        this.ruthenium$light = null;
+        this.ruthenium$lightStamps = null;
+        this.ruthenium$shade = null;
+        this.ruthenium$shadeStamps = null;
     }
 
     @Unique
