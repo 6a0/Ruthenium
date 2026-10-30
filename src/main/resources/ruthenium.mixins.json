@@ -30,6 +30,7 @@
     "render.entity.EntityRendererAccessor",
     "render.entity.EntityLightHolderM",
     "render.entity.EntityRendererLightM",
+    "render.entity.EntityRendererProbeM",
     "render.entity.EntityTypeM",
     "render.entity.HumanoidMobRendererM",
     "render.entity.LayerLightSectionStorageM",

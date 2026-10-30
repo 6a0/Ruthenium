@@ -437,6 +437,11 @@ public abstract class Options {
                                 () -> config.pooledSubmitPoses)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.pooledSubmitPoses.tooltip"))
                                 .setImpact(PerformanceImpact.LOW),
+                        new SwitchOption(Component.translatable("ruthenium.options.noAllocLightProbe"),
+                                value -> config.noAllocLightProbe = value,
+                                () -> config.noAllocLightProbe)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.noAllocLightProbe.tooltip"))
+                                .setImpact(PerformanceImpact.LOW),
                         new SwitchOption(Component.translatable("ruthenium.options.hashedDrawLookup"),
                                 value -> config.hashedDrawLookup = value,
                                 () -> config.hashedDrawLookup)

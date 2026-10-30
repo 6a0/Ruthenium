@@ -1,0 +1,31 @@
+diff --git a/src/main/java/net/ruthenium/render/entity/EntityLightProbe.java b/src/main/java/net/ruthenium/render/entity/EntityLightProbe.java
+index cfe2599..698db2b 100644
+--- a/src/main/java/net/ruthenium/render/entity/EntityLightProbe.java
++++ b/src/main/java/net/ruthenium/render/entity/EntityLightProbe.java
+@@ -33,6 +33,8 @@ public final class EntityLightProbe {
+     private static final BlockPos.MutableBlockPos BLOCK = new BlockPos.MutableBlockPos();
+     private static double x, y, z;
+     private static boolean pending;
++    private static final boolean CHECK = Boolean.getBoolean("ruthenium.probeCheck");
++    private static long checks, mismatches;
+ 
+     private EntityLightProbe() {
+     }
+@@ -47,6 +49,17 @@ public final class EntityLightProbe {
+         y = Mth.lerp((double) partialTick, entity.yo, entity.getY()) + (double) entity.getEyeHeight();
+         z = Mth.lerp((double) partialTick, entity.zo, entity.getZ());
+         pending = true;
++        if (CHECK) {
++            Vec3 vanilla = entity.getLightProbePosition(partialTick);
++            checks++;
++            if (Double.doubleToRawLongBits(vanilla.x) != Double.doubleToRawLongBits(x) || Double.doubleToRawLongBits(vanilla.y) != Double.doubleToRawLongBits(y)
++                    || Double.doubleToRawLongBits(vanilla.z) != Double.doubleToRawLongBits(z) || !BlockPos.containing(vanilla).equals(new BlockPos(Mth.floor(x), Mth.floor(y), Mth.floor(z)))) {
++                mismatches++;
++            }
++            if (checks % 1_000_000 == 0) {
++                org.slf4j.LoggerFactory.getLogger("Ruthenium probe check").info("light probes: {} checked, {} mismatches", checks, mismatches);
++            }
++        }
+         return MARKER;
+     }
+ 

@@ -85,6 +85,8 @@ public class Config {
     public boolean partChildArrays = true;
     /** Submits take their pose copies from a pool reused from the next frame on instead of new ones per submit */
     public boolean pooledSubmitPoses = true;
+    /** Entities with the default light probe (their eye) find their light without a new vector and block position per frame */
+    public boolean noAllocLightProbe = true;
     /** Finds the draw of a render type with a hash lookup instead of a linear search */
     public boolean hashedDrawLookup = true;
     /** Geometry of equal render types joins one draw in groups that may be reordered */
