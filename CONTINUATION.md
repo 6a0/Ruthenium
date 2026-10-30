@@ -1043,6 +1043,12 @@ world 440.7 -> **418.4 MB** (vanilla 442), left 304.6 -> **289.8 MB**; reload 1.
   Light) against ~290-305 MB at RD 12; either a leak that only shows with more chunks or the integrated server still saving and
   shutting down at the `left` snapshot.
 
+**Load times (thirtieth session, merged `f9d5c6b`).** `-Pbench.loadProbe=true` prints uptime milestones (main method, data fixers, crash report preload, bootstrap and block state caches, the Minecraft constructor's device/window/initial reload, overlay done), turns on vanilla's profiled reload instance (per listener prepare/apply ms), logs the server's chunk send rate and the client's loaded chunks during joins, HotSpot's `sun.cls.*` counters and a digest of all 35,723 block states' cached data at the title. `scripts/LoadJfr.java <jfr> threads|phases|timeline|parks|top|tree` breaks a recording down by uptime window (use `-PbenchJfrPeriod=1ms`; JFR misses VM time such as class define and verify), and `scripts/load_ab.py <dir>` tabulates probe launches. **The footprint scene's cold join (~15 s) is mostly the harness:** the client gametest's thread phases park the integrated server between ticks instead of letting it run chunk tasks. `-PbenchProbe=150 -Pbench.probeJoins=2` measures joins without gametest mode: about 4.3 s cold (open 2.5–2.9 s) and 1.5–1.8 s warm, Ruthenium the same as vanilla. **The scene's reload time (1.05 s) is the loading overlay's minimum 1 s**; the work is 0.45–0.7 s. Vanilla startup (13.46 s to a usable title): Fabric Loader 1.67, native libraries 0.55, data fixer schemas 0.5 and crash report preload (an OSHI hardware scan) 0.65–0.9 on the main thread before `Bootstrap` 3.96 (block state caches 1.49, including Items' static init), `Minecraft.<init>` 2.37, initial reload 1.52 (CPU-bound on the workers, then ~0.45 s apply on main), fade 2.12. New switches: `fastLoadingFade` (overlay and first title screen fade 4x faster: startup −1.5 s, F3+T to input ~3.1 → ~1.0 s), `backgroundSystemReport` and `backgroundDataFixers` (bootstrap starts 1.1 s earlier, ends 0.75 s earlier). Ruthenium now reaches the title in 11.42 vs 13.46 s for vanilla. Not worth it: parallel block state caches (the first state of each block and Items' static init dominate; 0.2 s left to parallelise), stronghold search off the shared pool (no gain, and a 135 s stall when its low-priority threads starved), pack listing cache (1.1% of samples), lazy recipe search trees (26.3 already builds them asynchronously, 0 samples). Next candidates: native libraries in the background (~0.4 s), a SPIR-V cache for the 463 shaderc compiles per reload (~0.1–0.3 s), and lazy data fixers for ~12 MB of heap (the entity and block entity schema check at bootstrap must be skipped too).
+
+Fully merged (`9571ba1`, one launch, cold after the rebuild, another agent benchmarking): startup 12.12 s, reloads 0.54-0.72 s
+(was 1.05: the overlay's fade), live heap title 263.9 / world 417.9 / left 287.5 MB. The unused `shaders/basic/terrain_earlyZ`
+(its uppercase path logged two "Invalid path" errors every reload) is deleted.
+
 ---
 
 ## 7. Results so far
@@ -3495,7 +3501,9 @@ FerriteCore's `FastMap` block state neighbour tables are worth only a few MB on 
 `byte[]` (83 MB), `long[]` (63 MB, chunk data), `int[]` and ~156 MB of metaspace. The thirtieth session broke those down
 (§6.11, "Where the rest goes") and did the cheap ones: loader manifests, compact sky light, lazy obfuscated text table, pooled compile
 scratch. What's left there is irreducible or not worth it (chunk block states, mixed light data, jar indexes, MC/lambda metaspace,
-`MemoryReserve`). Items 1-8 above are still open; a load time investigation (item 7, DFU) is running in a worktree.
+`MemoryReserve`). Items 1-6 and 8 above are still open. Item 7 and the DFU's startup cost were measured in the thirtieth
+session (§6.11, "Load times"): the pack listing cache and lazy recipe search trees are not worth it on 26.3, and the data fixers
+now build in the background (switch `backgroundDataFixers`); lazy data fixers would still save ~12 MB of heap.
 
 ### Bigger jobs: player bodies and billboard text (written up after the nineteenth session; job 1 done in the twenty-second, job 2 in the twenty-third)
 Both are the large items of item 1b. The numbers come from the players scene (section 6.10, section 7 "Players and
