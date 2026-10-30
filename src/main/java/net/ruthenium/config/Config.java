@@ -116,6 +116,8 @@ public class Config {
     public boolean sectionStateCache = true;
     /** Compiled sections drop their compile region, and leaving a world frees its render data right away */
     public boolean freeUnusedChunkData = true;
+    /** The loading overlay (startup, F3+T, pack changes) and the first title screen fade 4x faster */
+    public boolean fastLoadingFade = true;
 
     /** The vignette is skipped while its color is black (its blend then leaves every pixel as it is) */
     public boolean skipBlackVignette = true;

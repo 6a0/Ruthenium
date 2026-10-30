@@ -540,6 +540,12 @@ public abstract class Options {
                                 () -> config.directBakedQuads)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.directBakedQuads.tooltip"))
                                 .setImpact(PerformanceImpact.LOW)
+                }),
+                new OptionBlock("", new Option<?>[]{
+                        new SwitchOption(Component.translatable("ruthenium.options.fastLoadingFade"),
+                                value -> config.fastLoadingFade = value,
+                                () -> config.fastLoadingFade)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.fastLoadingFade.tooltip"))
                 })
         };
     }

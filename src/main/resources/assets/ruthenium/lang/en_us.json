@@ -58,6 +58,8 @@
   "ruthenium.options.sectionStateCache.tooltip": "Builds chunks faster: the blocks around each block (for hidden faces and smooth lighting) are read from a flat array instead of the chunk's compressed storage. The chunks look identical.",
   "ruthenium.options.freeUnusedChunkData": "Free Unused Chunk Data",
   "ruthenium.options.freeUnusedChunkData.tooltip": "Saves memory: built chunks let go of the copies of the blocks around them that building needed (vanilla keeps them until the chunk is rebuilt), and leaving a world frees its chunks and their GPU buffers right away instead of when the next world loads. The world looks and plays the same.",
+  "ruthenium.options.fastLoadingFade": "Fast Loading Fade",
+  "ruthenium.options.fastLoadingFade.tooltip": "Loads feel faster: the loading screen fades out in half a second instead of two once loading is done (at startup, F3+T and resource pack changes), and the title screen's buttons fade in four times faster. Vanilla takes no input until the fade is over. Nothing loads differently.",
   "ruthenium.options.biomeBlendCache.tooltip": "Builds chunks faster: biome colour blending (grass, leaves, water) looks up each column's biome once per chunk section instead of once for every block around it. The colours are identical.",
   "ruthenium.options.skipIdleTicks": "Skip Idle Block Entity Ticks",
   "ruthenium.options.skipIdleTicks.tooltip": "Skips ticking closed chests and signs nobody is editing, whose ticks do nothing.",
