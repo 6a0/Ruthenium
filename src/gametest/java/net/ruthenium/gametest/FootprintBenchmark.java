@@ -62,6 +62,8 @@ final class FootprintBenchmark {
     private static final String WORLD_NAME = "terrain-" + BenchmarkClientGameTest.prop("terrainSeed", "8279265");
     /** Rows of each class histogram kept in the files (the full one is thousands of classes) */
     private static final int HISTOGRAM_ROWS = 80;
+    /** Snapshot to also write a heap dump of (live objects) for {@code scripts/HprofPath.java}; empty for none */
+    private static final String HEAP_DUMP = BenchmarkClientGameTest.prop("footprintHeapDump", "");
 
     private FootprintBenchmark() {
     }
@@ -214,6 +216,16 @@ final class FootprintBenchmark {
         // Two full GCs (the histogram's own is one) so soft and finalizable leftovers are gone too
         System.gc();
         String histogram = diagnosticCommand("gcClassHistogram");
+        if (name.equals(HEAP_DUMP)) {
+            Path dump = histoDir.resolve(prefix + "-" + name + ".hprof").toAbsolutePath();
+            try {
+                Files.deleteIfExists(dump);
+                ManagementFactory.getPlatformMXBean(com.sun.management.HotSpotDiagnosticMXBean.class).dumpHeap(dump.toString(), true);
+            } catch (IOException e) {
+                throw new RuntimeException("Heap dump failed", e);
+            }
+            LOGGER.info("Heap dump of snapshot {}: {}", name, dump);
+        }
         JsonObject s = new JsonObject();
         s.addProperty("committedHeapBeforeGc", committedBefore);
         var heap = ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();

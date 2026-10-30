@@ -232,7 +232,12 @@ public abstract class Options {
                                 value -> config.sectionStateCache = value,
                                 () -> config.sectionStateCache)
                                 .setTooltip(value -> Component.translatable("ruthenium.options.sectionStateCache.tooltip"))
-                                .setImpact(PerformanceImpact.MEDIUM)
+                                .setImpact(PerformanceImpact.MEDIUM),
+                        new SwitchOption(Component.translatable("ruthenium.options.freeUnusedChunkData"),
+                                value -> config.freeUnusedChunkData = value,
+                                () -> config.freeUnusedChunkData)
+                                .setTooltip(value -> Component.translatable("ruthenium.options.freeUnusedChunkData.tooltip"))
+                                .setImpact(PerformanceImpact.LOW)
                 }),
                 new OptionBlock("", new Option<?>[]{
                         new SwitchOption(Component.translatable("ruthenium.options.blockEntityCulling"),

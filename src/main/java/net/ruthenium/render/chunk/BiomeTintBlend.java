@@ -10,6 +10,7 @@ import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.BiomeManager;
 import net.ruthenium.mixin.render.chunk.BiomeManagerAccessor;
 
+import java.lang.ref.WeakReference;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -53,6 +54,16 @@ public final class BiomeTintBlend {
         int z = pos.getZ();
         Grid grid = GRID.get();
         grid.prepare(level, x >> 4, y >> 4, z >> 4, radius);
+        try {
+            return blend(grid, x, y, z, resolver, radius);
+        } finally {
+            // A worker's grid outlives the level: no strong reference to it between calls (see Grid.levelRef)
+            grid.level = null;
+            grid.biomeManager = null;
+        }
+    }
+
+    private static int blend(Grid grid, int x, int y, int z, ColorResolver resolver, int radius) {
         Colors colors = grid.colors(resolver);
 
         int block = ((y & 15) << 8) | ((z & 15) << 4) | (x & 15);
@@ -97,6 +108,12 @@ public final class BiomeTintBlend {
     private static final class Grid {
         final BlockPos.MutableBlockPos samplePos = new BlockPos.MutableBlockPos();
         final Colors[] slots = new Colors[RESOLVER_SLOTS];
+        /**
+         * The level the grid's entries belong to. Weak: the grids are per worker thread and outlive the level, which
+         * with a strong reference stayed reachable after leaving the world (its chunks and all). {@link #level} and
+         * {@link #biomeManager} are only set during a {@code blend} call.
+         */
+        WeakReference<ClientLevel> levelRef = new WeakReference<>(null);
         ClientLevel level;
         int sectionX, sectionY, sectionZ, radius = -1, generation;
         int size;
@@ -117,17 +134,20 @@ public final class BiomeTintBlend {
 
         void prepare(ClientLevel level, int sectionX, int sectionY, int sectionZ, int radius) {
             int generation = GENERATION.get();
-            if (this.level == level && this.sectionX == sectionX && this.sectionY == sectionY && this.sectionZ == sectionZ
+            this.level = level;
+            BiomeManager manager = level.getBiomeManager();
+            this.biomeManager = manager.getClass() == BiomeManager.class ? manager : null;
+            if (this.levelRef.get() == level && this.sectionX == sectionX && this.sectionY == sectionY && this.sectionZ == sectionZ
                     && this.radius == radius && this.generation == generation) {
                 return;
             }
-            this.level = level;
+            if (this.levelRef.get() != level) {
+                this.levelRef = new WeakReference<>(level);
+            }
             this.sectionX = sectionX;
             this.sectionY = sectionY;
             this.sectionZ = sectionZ;
             this.generation = generation;
-            BiomeManager manager = level.getBiomeManager();
-            this.biomeManager = manager.getClass() == BiomeManager.class ? manager : null;
             if (this.biomeManager != null) {
                 this.zoomSeed = ((BiomeManagerAccessor) manager).ruthenium$getBiomeZoomSeed();
             }

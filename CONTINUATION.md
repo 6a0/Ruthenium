@@ -962,15 +962,38 @@ jars are rebuilt starts ~3 s slower** (cold file cache; 13.8 vs 11.1 s): discard
 | join cold / warm (to all compiled) | 14.6-15.6 / 1.5 s | 14.8 / 1.6 s |
 | live heap title / world / left | 267 / 442 / 349 MB | 272 / 454 / 364 MB |
 | metaspace + code in world | 156 + 37 MB | 157 + 43 MB |
-| GPU dedicated title / world / left | 309 / 663 / 663 MB | 309 / 727 / 663 MB |
+| GPU dedicated title / world / left | 309 / 663 (727 once) / 663 MB | 309 / 727 / 663 MB |
 
 - Load times: Ruthenium changes none of them; joining is server bound.
 - Ruthenium in world: **+12 MB live heap** (`int[]` +4.9 MB: packed draws, face groups and the other per-mesh arrays; ~3 MB of
-  Mixin/ASM class data kept after transformation) and **+64 MB GPU** (one more driver block; not yet attributed: the ring buffers,
-  label arena, pose texture or retained batches; released on leaving).
-- **Vanilla keeps the last world after leaving it**: at the title screen, ~82 MB more live heap than before joining (36k
-  `PalettedContainer`s and 15k `SectionRenderDispatcher$RenderSection`s of the old world, i.e. its chunks and section grid are still
-  reachable) and 354 MB of GPU memory. Candidate for a fix (find the GC root; likely held until the next join replaces it).
+  Mixin/ASM class data kept after transformation). The GPU difference is **not** real: vanilla's in-world GPU memory was 663, 663
+  and 727 MB in three launches, so a 64 MB block comes and goes run to run.
+- `-Pbench.footprintHeapDump=<snapshot>` writes a live heap dump at that snapshot (~500 MB; delete it afterwards), and
+  `java -Xmx4g scripts/HprofPath.java <dump> <class> [paths|holders] [skip,fields]` prints the shortest strong paths from GC roots to
+  the first instances of a class (`[B`, `[I`, ... for primitive arrays), or groups all of them by the last 4 steps of their path.
+  It parses a 500 MB dump in ~1 s.
+
+**Free Unused Chunk Data** (same session, switch `freeUnusedChunkData`, `CompileTaskM`, `LevelExtractorResetM`), found with the
+dumps:
+1. *In world:* each `RenderSection` keeps its finished compile task (`lastCompileTask`, for cancelling), and the task its
+   `RenderSectionRegion`: `SectionCopy`s of the 27 sections around it, each a `PalettedContainer.copy()` of their states (with a
+   `ThreadingDetector`, lock and semaphore each) and an `ImmutableMap` copy of the chunk's block entities, plus the `LevelChunk`
+   itself as `levelHeightAccessor`. Only `doTask` reads `region`, so it is set to null when `doTask` returns (not on an exception:
+   `runTask` queues the task again after a `NullPointerException`).
+2. *Leaving a world:* `LevelExtractor.setLevel(null)` only sets `shouldResetLevelRenderData`; `extract` runs the reset, i.e. on the
+   next world's first frame. Until then `LevelRenderer.visibleSections`, `nearbyVisibleSections` and `viewArea` (all 15k sections),
+   the dispatcher and its buffers keep the old world reachable through (1). The reset now runs in `setLevel` (TAIL) when the level
+   is null; the flag stays set, so the next frame's reset is a no-op as before.
+3. Ruthenium's own holders of the old world (fixed without a switch): `RenderSectionRegionM`'s per-thread state array kept its last
+   region as `owner` (now a stamp comparison), `BiomeTintBlend`'s per-thread grids kept the level and its biome manager (now a
+   `WeakReference` for identity, the strong fields only set during a `blend` call), and `AnimateTick.system` kept the last
+   `EnvironmentAttributeSystem` (its biome layer captures the level's `BiomeManager`; now weak).
+
+After (one launch each step; Ruthenium, RD 12): live heap in world 454 -> **439 MB** (vanilla 442), after leaving 364 -> **305 MB**
+(vanilla 345-349, title screen ~273; the remaining ~32 MB are strings, sounds, resource paths and Mixin ASM data of classes loaded
+in the world, no world objects: `HprofPath` finds no `ClientLevel` or `LevelChunk`), GPU after leaving 663 -> **247 MB** (vanilla 663).
+The in-world saving scales with the compiled sections (render distance squared), not measured beyond RD 12.
+
 - Not measured yet: a scene with block entities and entities (the mixed scene's retained geometry lives there), GPU memory below
   the 64 MB block size (needs counters inside the Vulkan backend), and the OpenGL backend.
 
@@ -3401,6 +3424,29 @@ leaves stale masks (faces missing until the next upload or reload).
 8. **Smaller ports.** Clouds (mixin vanilla `CloudRenderer` `prepare`/`render`; there is no separate clouds pass
    any more), the debug overlay and profiler HUD (`Gui` → `Hud`, `extractRenderState`), and
    `DebugEntryMemory` (`bytesToMebibytes`).
+
+### Memory and load time ideas from FerriteCore and ModernFix (twenty-ninth session, read only, no code copied)
+FerriteCore (MIT; 9.0.0 for 26.1-26.3, Fabric and NeoForge; its model optimisations were all deleted in the 1.21.5 port) and
+ModernFix (LGPL-3.0; the 26.1 branch is NeoForge only, the last Fabric build is for 1.20.1). Their published savings come from 2020
+1.16 modpacks and overstate what vanilla 26.3 has. Mapped onto the footprint scene's in-world histogram (vanilla, RD 12, 442 MB live),
+most promising first:
+1. **`ThreadingDetector` per `PalettedContainer`** (FerriteCore `threaddetec`, opt-in there after rare unreproduced races): one
+   detector + `ReentrantLock` + `Semaphore` per container, 128k of them (~12 MB, ~40k after Free Unused Chunk Data). A byte of state
+   on the container instead; get the memory ordering right.
+2. **Lazy DataFixer bootstrap** (ModernFix `dynamic_dfu`): DFU schemas and types (~12 MB of `Sum`/`Product`/`Tag` types) built only
+   when something needs upgrading; must still trigger for old worlds and structures. Also startup time.
+3. **Unifont glyphs** (ModernFix `compress_unihex_font`): 136k `UnihexProvider$Glyph` with a `byte[16]`/`short[16]` each, stored
+   as 2-4 longs instead; optionally loaded lazily. Likely 5-8 MB, low risk.
+4. **Entity model cubes** (ModernFix `compact_entity_models`): identical baked `ModelPart.Cube`s interned; `ModelPart$Vertex` is
+   7.2 MB (224k). Packing vertices into float arrays would be our own extension.
+5. **Canonical `VoxelShape`s** (FerriteCore shape cache dedup, ModernFix wall shapes): `SubShape` and shape arrays, a few MB.
+6. **Language strings and `Identifier` interning** (ModernFix `dynamic_languages`, `deduplicate_location`): part of `String` and
+   `HashMap$Node`; interning slows loading, measure.
+7. Load time only: pack listing cache, lazy recipe search tree (ModernFix); benchmark first, vanilla's pack code changed since.
+8. **Dynamic model baking** (ModernFix `dynamic_resources`): the biggest ceiling (`BakedQuad` 10.7 MB plus model arrays) but very
+   invasive on the rewritten 26.x model system.
+FerriteCore's `FastMap` block state neighbour tables are worth only a few MB on vanilla's state count. Not covered by either:
+`byte[]` (83 MB), `long[]` (63 MB, chunk data), `int[]` and ~156 MB of metaspace.
 
 ### Bigger jobs: player bodies and billboard text (written up after the nineteenth session; job 1 done in the twenty-second, job 2 in the twenty-third)
 Both are the large items of item 1b. The numbers come from the players scene (section 6.10, section 7 "Players and

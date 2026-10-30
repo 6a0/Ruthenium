@@ -114,6 +114,8 @@ public class Config {
     public boolean sectionLightCache = true;
     /** Section compiles read the block states around each block from an array */
     public boolean sectionStateCache = true;
+    /** Compiled sections drop their compile region, and leaving a world frees its render data right away */
+    public boolean freeUnusedChunkData = true;
 
     /** The vignette is skipped while its color is black (its blend then leaves every pixel as it is) */
     public boolean skipBlackVignette = true;

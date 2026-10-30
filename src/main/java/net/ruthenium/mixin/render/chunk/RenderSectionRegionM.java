@@ -45,14 +45,18 @@ public class RenderSectionRegionM {
 
     @Unique
     private States ruthenium$states;
+    /** The array's stamp when this region took it: it is still this region's while the stamp is unchanged */
+    @Unique
+    private int ruthenium$stamp;
 
     @Unique
     private static final class States {
         final BlockState[] states = new BlockState[SIZE * SIZE * SIZE];
         final int[] stamps = new int[SIZE * SIZE * SIZE];
         final Thread thread = Thread.currentThread();
+        // Stamps instead of a reference to the owning region: a worker's array outlives its last region, which
+        // would keep that region's chunks (and after leaving a world, the whole world) reachable
         int stamp;
-        Object owner;
     }
 
     /**
@@ -69,14 +73,14 @@ public class RenderSectionRegionM {
         }
 
         States states = this.ruthenium$states;
-        if (states == null || states.owner != this || states.thread != Thread.currentThread()) {
+        if (states == null || states.stamp != this.ruthenium$stamp || states.thread != Thread.currentThread()) {
             states = STATES.get();
             if (++states.stamp == 0) {
                 java.util.Arrays.fill(states.stamps, 0);
                 states.stamp = 1;
             }
-            states.owner = this;
             this.ruthenium$states = states;
+            this.ruthenium$stamp = states.stamp;
         }
         int index = (y * SIZE + z) * SIZE + x;
         if (states.stamps[index] == states.stamp) {

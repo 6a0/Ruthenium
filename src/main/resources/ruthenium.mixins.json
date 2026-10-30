@@ -24,6 +24,8 @@
     "render.chunk.ChunkSectionLayerM",
     "render.chunk.ChunkSectionsToRenderM",
     "render.chunk.ClientLevelTintM",
+    "render.chunk.CompileTaskM",
+    "render.chunk.LevelExtractorResetM",
     "render.chunk.LevelRendererM",
     "render.chunk.RenderSectionRegionM",
     "render.chunk.SectionCompilerM",

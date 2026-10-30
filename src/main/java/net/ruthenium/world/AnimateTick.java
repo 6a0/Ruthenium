@@ -19,6 +19,7 @@ import net.ruthenium.mixin.world.EnvironmentAttributeSystemAccessor;
 import net.ruthenium.mixin.world.EnvironmentValueSamplerAccessor;
 import net.ruthenium.mixin.world.LegacyRandomSourceAccessor;
 
+import java.lang.ref.WeakReference;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
@@ -43,7 +44,8 @@ public final class AnimateTick {
     private static final int SECTION_RANGE = 8;
     private static final int SECTION_SLOTS = SECTION_RANGE * SECTION_RANGE * SECTION_RANGE;
 
-    private static EnvironmentAttributeSystem system;
+    /** Weak: a strong one kept the last level reachable after leaving it (its attribute layers capture its biome manager) */
+    private static WeakReference<EnvironmentAttributeSystem> system = new WeakReference<>(null);
     private static boolean systemEligible;
     private static final Map<Biome, Boolean> AMBIENT_BIOMES = new IdentityHashMap<>();
 
@@ -71,8 +73,8 @@ public final class AnimateTick {
         baseZ = (z >> 4) - 3;
 
         EnvironmentAttributeSystem current = clientLevel.environmentAttributes();
-        if (current != system) {
-            system = current;
+        if (current != system.get()) {
+            system = new WeakReference<>(current);
             systemEligible = onlyBiomeLayerIsPositional(current, EnvironmentAttributes.AMBIENT_PARTICLES);
             AMBIENT_BIOMES.clear();
         }
@@ -103,7 +105,7 @@ public final class AnimateTick {
 
     @SuppressWarnings("unchecked")
     public static <V> V getValue(ClientLevel level, EnvironmentAttributeSystem attributes, EnvironmentAttribute<V> attribute, BlockPos pos) {
-        if (!eligible || attribute != EnvironmentAttributes.AMBIENT_PARTICLES || attributes != system || !noAmbientBiomesAround(level, pos)) {
+        if (!eligible || attribute != EnvironmentAttributes.AMBIENT_PARTICLES || attributes != system.get() || !noAmbientBiomesAround(level, pos)) {
             return attributes.getValue(attribute, pos);
         }
         if (noBiomeValue == null) {
