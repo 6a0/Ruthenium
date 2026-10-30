@@ -1,5 +1,6 @@
 package net.ruthenium.interfaces;
 
+import net.minecraft.client.renderer.DynamicGpuData;
 import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import org.jspecify.annotations.Nullable;
 
@@ -14,4 +15,9 @@ public interface PackedSectionDraws {
     GpuBuffer @Nullable [] ruthenium$getPackedBuffers();
 
     void ruthenium$setPackedDraws(int[] draws, GpuBuffer[] buffers);
+
+    /** The section info {@code TerrainDrawList} last wrote for the mesh's section, kept while its values stay the same */
+    DynamicGpuData.@Nullable ChunkSectionInfo ruthenium$getSectionInfo();
+
+    void ruthenium$setSectionInfo(DynamicGpuData.ChunkSectionInfo info);
 }

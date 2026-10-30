@@ -172,7 +172,7 @@ public final class TerrainDrawList {
                         continue;
                     }
                     if (sectionInfo == -1) {
-                        sectionInfo = addSectionInfo(section, origin, now, fadeDuration);
+                        sectionInfo = addSectionInfo(section, mesh, origin, now, fadeDuration);
                     }
                     int indexCount = packed[o + 1];
                     largestIndexCount = Math.max(largestIndexCount, indexCount);
@@ -197,7 +197,7 @@ public final class TerrainDrawList {
                 }
 
                 if (sectionInfo == -1) {
-                    sectionInfo = addSectionInfo(section, origin, now, fadeDuration);
+                    sectionInfo = addSectionInfo(section, mesh, origin, now, fadeDuration);
                 }
 
                 GpuBuffer vertexBuffer = slice.vertexBuffer();
@@ -240,10 +240,24 @@ public final class TerrainDrawList {
         return largestIndexCount;
     }
 
-    private static int addSectionInfo(SectionRenderDispatcher.RenderSection section, BlockPos origin, long now, long fadeDuration) {
+    private static int addSectionInfo(SectionRenderDispatcher.RenderSection section, SectionMesh mesh, BlockPos origin, long now,
+                                      long fadeDuration) {
         int index = SECTION_INFOS.size();
-        SECTION_INFOS.add(new DynamicGpuData.ChunkSectionInfo(origin.getX(), origin.getY(), origin.getZ(),
-                section.getVisibility(now, fadeDuration)));
+        int x = origin.getX(), y = origin.getY(), z = origin.getZ();
+        float visibility = section.getVisibility(now, fadeDuration);
+        DynamicGpuData.ChunkSectionInfo info;
+        if (mesh instanceof PackedSectionDraws holder) {
+            // The mesh's last info while its values are the same (a record: the same writes)
+            info = holder.ruthenium$getSectionInfo();
+            if (info == null || info.x() != x || info.y() != y || info.z() != z
+                    || Float.floatToRawIntBits(info.visibility()) != Float.floatToRawIntBits(visibility)) {
+                info = new DynamicGpuData.ChunkSectionInfo(x, y, z, visibility);
+                holder.ruthenium$setSectionInfo(info);
+            }
+        } else {
+            info = new DynamicGpuData.ChunkSectionInfo(x, y, z, visibility);
+        }
+        SECTION_INFOS.add(info);
         return index;
     }
 

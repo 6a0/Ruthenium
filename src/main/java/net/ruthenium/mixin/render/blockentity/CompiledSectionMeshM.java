@@ -1,5 +1,6 @@
 package net.ruthenium.mixin.render.blockentity;
 
+import net.minecraft.client.renderer.DynamicGpuData;
 import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.chunk.CompiledSectionMesh;
@@ -37,6 +38,7 @@ public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHol
     @Unique private SectionFaceGroups @Nullable [] faceGroups;
     @Unique private int @Nullable [] packedDraws;
     @Unique private GpuBuffer @Nullable [] packedBuffers;
+    @Unique private DynamicGpuData.@Nullable ChunkSectionInfo sectionInfo;
 
     @Inject(method = "<init>", at = @At("RETURN"))
     private void copyFaceGroups(TranslucencyPointOfView pointOfView, SectionCompiler.Results results, long compileTaskStartTimeNs,
@@ -70,6 +72,16 @@ public class CompiledSectionMeshM implements BlockEntityPositions, FaceGroupsHol
     @Override
     public GpuBuffer @Nullable [] ruthenium$getPackedBuffers() {
         return this.packedBuffers;
+    }
+
+    @Override
+    public DynamicGpuData.@Nullable ChunkSectionInfo ruthenium$getSectionInfo() {
+        return this.sectionInfo;
+    }
+
+    @Override
+    public void ruthenium$setSectionInfo(DynamicGpuData.ChunkSectionInfo info) {
+        this.sectionInfo = info;
     }
 
     @Override
