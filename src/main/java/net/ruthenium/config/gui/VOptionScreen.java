@@ -1,5 +1,6 @@
 package net.ruthenium.config.gui;
 
+import com.mojang.blaze3d.platform.InputConstants;
 import com.google.common.collect.Lists;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.TextureFilteringMethod;
@@ -311,7 +312,7 @@ public class VOptionScreen extends Screen {
         for (GuiEventListener element : this.children()) {
             if (element.mouseClicked(event, bl)) {
                 this.setFocused(element);
-                if (event.button() == 0) {
+                if (event.button() == InputConstants.MOUSE_BUTTON_LEFT) {
                     this.setDragging(true);
                 }
 

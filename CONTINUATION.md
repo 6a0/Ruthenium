@@ -3621,6 +3621,9 @@ and with job 2 for hologram-heavy hubs. Answer both "find out first" questions b
   commit messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Git user `6a0`. Remote
   `origin` = `6a0/Ruthenium` (renamed from `6a0/VulkanMod` on 2026-10-28), `upstream` = `xCollateral/VulkanMod`. Branch `26.3` is pushed to `origin` (since 2026-10-28) and tracks `origin/26.3`; nothing goes to `upstream`.
 - **No Sodium code.** It is PolyForm Shield licensed.
+- **Mouse buttons are SDL-numbered in 26.x:** left is `InputConstants.MOUSE_BUTTON_LEFT` (1), not GLFW's 0. The settings screen
+  compared with 0 until the thirtieth session, so real clicks did nothing while the settings check (which clicked with 0 too)
+  passed; it now also clicks once through `TestInput.pressMouse` (i.e. `MouseHandler`). Never hard-code button numbers.
 - **Safety of the culling:** `BlockEntityCulling` only handles `minecraft:` block entity types. If more types
   render outside block ±1 (+2 up), widen the box rather than special-casing.
 - **Thread-safety assumptions:** `ModelPartCubeM`, `BakedSheetGlyphM` and `QuadParticleRenderStateM` keep

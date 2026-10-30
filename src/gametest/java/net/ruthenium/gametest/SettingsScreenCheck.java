@@ -42,6 +42,20 @@ final class SettingsScreenCheck {
         context.waitTicks(5);
         context.takeScreenshot(label + "-settings-video");
 
+        // A real click (through MouseHandler, as a player's) on the second page button must switch the page
+        double scale = context.computeOnClient(mc -> (double) mc.getWindow().getGuiScale());
+        int pageY = 4 + 28 + VGuiConstants.WIDGET_HEIGHT + VGuiConstants.WIDGET_HEIGHT / 2;
+        context.getInput().setCursorPos((VOptionScreen.MARGIN + 20) * scale, pageY * scale);
+        context.waitTicks(2);
+        context.getInput().pressMouse(InputConstants.MOUSE_BUTTON_LEFT);
+        context.waitTicks(3);
+        int realPage = context.computeOnClient(mc -> currentPage(mc.gui.screen()));
+        LOGGER.info("Real click on page 1's button at gui ({}, {}), scale {}: page now {}", VOptionScreen.MARGIN + 20, pageY, scale, realPage);
+        context.takeScreenshot(label + "-settings-realclick");
+        check(realPage == 1, "a real mouse click switches the page");
+        context.runOnClient(mc -> click(mc.gui.screen(), VOptionScreen.MARGIN + 20, 4 + 28 + VGuiConstants.WIDGET_HEIGHT / 2));
+        context.waitTicks(3);
+
         // Page buttons are below the mod icon (28 high), one widget height apart
         for (int page = 1; page <= 2; page++) {
             int y = 4 + 28 + page * VGuiConstants.WIDGET_HEIGHT + VGuiConstants.WIDGET_HEIGHT / 2;
@@ -106,8 +120,18 @@ final class SettingsScreenCheck {
         LOGGER.info("Settings screen check passed");
     }
 
+    private static int currentPage(Screen screen) {
+        try {
+            var field = VOptionScreen.class.getDeclaredField("currentListIdx");
+            field.setAccessible(true);
+            return field.getInt(screen);
+        } catch (ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     private static void click(Screen screen, double x, double y) {
-        var event = new MouseButtonEvent(x, y, new MouseButtonInfo(0, 0));
+        var event = new MouseButtonEvent(x, y, new MouseButtonInfo(InputConstants.MOUSE_BUTTON_LEFT, 0));
         screen.mouseClicked(event, false);
         screen.mouseReleased(event);
     }

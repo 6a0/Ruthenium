@@ -1,5 +1,6 @@
 package net.ruthenium.config.gui;
 
+import com.mojang.blaze3d.platform.InputConstants;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.events.GuiEventListener;
@@ -80,7 +81,7 @@ public class VOptionList extends GuiElement {
     }
 
     protected void updateScrollingState(double mouseX, int button) {
-        this.scrolling = button == 0 && mouseX >= (double) this.getScrollbarPosition() && mouseX < (double) (this.getScrollbarPosition() + 6);
+        this.scrolling = button == InputConstants.MOUSE_BUTTON_LEFT && mouseX >= (double) this.getScrollbarPosition() && mouseX < (double) (this.getScrollbarPosition() + 6);
     }
 
     protected float getScrollAmount() {
@@ -114,7 +115,7 @@ public class VOptionList extends GuiElement {
                 return true;
             }
 
-            return event.button() == 0;
+            return event.button() == InputConstants.MOUSE_BUTTON_LEFT;
         }
 
         return false;
@@ -137,7 +138,7 @@ public class VOptionList extends GuiElement {
 
     @Override
     public boolean mouseDragged(MouseButtonEvent event, double deltaX, double deltaY) {
-        if (event.button() != 0) {
+        if (event.button() != InputConstants.MOUSE_BUTTON_LEFT) {
             return false;
         }
 
@@ -275,7 +276,7 @@ public class VOptionList extends GuiElement {
     }
 
     protected boolean isValidClickButton(int i) {
-        return i == 0;
+        return i == InputConstants.MOUSE_BUTTON_LEFT;
     }
 
     protected static class Entry implements GuiEventListener {
