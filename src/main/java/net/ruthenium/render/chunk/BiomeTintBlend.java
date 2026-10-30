@@ -17,9 +17,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Vanilla's {@code ClientLevel.calculateBlockTint} with the per-column samples cached: a block's tint is the average
  * of {@code resolver.getColor(biome, x, z)} over the (2r+1)^2 columns around it at its height, and each sample needs a
- * fuzzy-zoomed biome lookup. Neighbouring blocks share almost all of their samples, so each thread keeps the biomes
- * of the section it last asked about (shared by all resolvers), each resolver's sample colours and its blended
- * results, and computes each of them once. The sum and the division are the same integer arithmetic as vanilla's,
+ * fuzzy-zoomed biome lookup. Neighbouring blocks share almost all of their samples, so a grid keeps the biomes of
+ * the section it last served (shared by all resolvers), each resolver's sample colours and its blended results, and
+ * computes each of them once. Grids live in the compile scratch ({@link SectionScratch}): a compile uses the one it
+ * borrowed, other lookups borrow one per call. The sum and the division are the same integer arithmetic as vanilla's,
  * so the result is identical.
  * <p>
  * The biomes themselves are {@code BiomeManager.getBiome}'s fuzzy zoom with its per-corner work cached: the 8 quart
@@ -34,7 +35,6 @@ public final class BiomeTintBlend {
     private static final int RESOLVER_SLOTS = 8;
 
     private static final AtomicInteger GENERATION = new AtomicInteger();
-    private static final ThreadLocal<Grid> GRID = ThreadLocal.withInitial(Grid::new);
 
     private BiomeTintBlend() {
     }
@@ -47,17 +47,30 @@ public final class BiomeTintBlend {
         return radius >= 1 && radius <= MAX_RADIUS;
     }
 
-    /** Returns vanilla's blended tint at {@code pos}, for a blend radius in [1, {@value MAX_RADIUS}] */
+    /**
+     * Returns vanilla's blended tint at {@code pos}, for a blend radius in [1, {@value MAX_RADIUS}], with a grid
+     * borrowed for this call (lookups outside section compiles)
+     */
     public static int blend(ClientLevel level, BlockPos pos, ColorResolver resolver, int radius) {
+        SectionScratch scratch = SectionScratch.borrow();
+        try {
+            return blend(scratch, level, pos, resolver, radius);
+        } finally {
+            scratch.release();
+        }
+    }
+
+    /** {@link #blend(ClientLevel, BlockPos, ColorResolver, int)} with the grid of a scratch this thread holds */
+    public static int blend(SectionScratch scratch, ClientLevel level, BlockPos pos, ColorResolver resolver, int radius) {
         int x = pos.getX();
         int y = pos.getY();
         int z = pos.getZ();
-        Grid grid = GRID.get();
+        Grid grid = scratch.tintGrid();
         grid.prepare(level, x >> 4, y >> 4, z >> 4, radius);
         try {
             return blend(grid, x, y, z, resolver, radius);
         } finally {
-            // A worker's grid outlives the level: no strong reference to it between calls (see Grid.levelRef)
+            // A pooled grid outlives the level: no strong reference to it between calls (see Grid.levelRef)
             grid.level = null;
             grid.biomeManager = null;
         }
@@ -103,14 +116,14 @@ public final class BiomeTintBlend {
 
     /**
      * A section and the columns within the blend radius around it, 16 heights. An entry is valid when its stamp is
-     * the grid's, so starting over needs no clearing.
+     * the grid's, so starting over needs no clearing (only when the byte stamp wraps, every 255 sections).
      */
-    private static final class Grid {
+    static final class Grid {
         final BlockPos.MutableBlockPos samplePos = new BlockPos.MutableBlockPos();
         final Colors[] slots = new Colors[RESOLVER_SLOTS];
         /**
-         * The level the grid's entries belong to. Weak: the grids are per worker thread and outlive the level, which
-         * with a strong reference stayed reachable after leaving the world (its chunks and all). {@link #level} and
+         * The level the grid's entries belong to. Weak: the grids are pooled ({@link SectionScratch}) and outlive the
+         * level, which with a strong reference stayed reachable after leaving the world (its chunks and all). {@link #level} and
          * {@link #biomeManager} are only set during a {@code blend} call.
          */
         WeakReference<ClientLevel> levelRef = new WeakReference<>(null);
@@ -119,8 +132,8 @@ public final class BiomeTintBlend {
         int size;
         int entries;
         Biome[] biomes = new Biome[0];
-        int[] biomeStamps = new int[0];
-        int stamp;
+        byte[] biomeStamps = new byte[0];
+        byte stamp;
 
         /** The level's biome manager, if it is vanilla's (its fuzzy zoom is reproduced here), else null */
         BiomeManager biomeManager;
@@ -128,9 +141,9 @@ public final class BiomeTintBlend {
         /** Quart corners around the grid's blocks: x, y, z offsets per corner and its noise biome */
         int cornerMinX, cornerMinY, cornerMinZ, cornersX, cornersY, cornersZ;
         double[] fiddles = new double[0];
-        int[] fiddleStamps = new int[0];
+        byte[] fiddleStamps = new byte[0];
         Biome[] cornerBiomes = new Biome[0];
-        int[] cornerBiomeStamps = new int[0];
+        byte[] cornerBiomeStamps = new byte[0];
 
         void prepare(ClientLevel level, int sectionX, int sectionY, int sectionZ, int radius) {
             int generation = GENERATION.get();
@@ -161,13 +174,13 @@ public final class BiomeTintBlend {
                 int corners = this.cornersX * this.cornersY * this.cornersZ;
                 if (this.cornerBiomes.length < corners) {
                     this.fiddles = new double[corners * 3];
-                    this.fiddleStamps = new int[corners];
+                    this.fiddleStamps = new byte[corners];
                     this.cornerBiomes = new Biome[corners];
-                    this.cornerBiomeStamps = new int[corners];
+                    this.cornerBiomeStamps = new byte[corners];
                 }
                 if (this.biomes.length < this.entries) {
                     this.biomes = new Biome[this.entries];
-                    this.biomeStamps = new int[this.entries];
+                    this.biomeStamps = new byte[this.entries];
                     for (Colors colors : this.slots) {
                         if (colors != null) {
                             colors.resize(this.entries);
@@ -179,9 +192,9 @@ public final class BiomeTintBlend {
             this.cornerMinY = ((sectionY << 4) - 2) >> 2;
             this.cornerMinZ = ((sectionZ << 4) - radius - 2) >> 2;
             if (++this.stamp == 0) {
-                Arrays.fill(this.biomeStamps, 0);
-                Arrays.fill(this.fiddleStamps, 0);
-                Arrays.fill(this.cornerBiomeStamps, 0);
+                Arrays.fill(this.biomeStamps, (byte) 0);
+                Arrays.fill(this.fiddleStamps, (byte) 0);
+                Arrays.fill(this.cornerBiomeStamps, (byte) 0);
                 for (Colors colors : this.slots) {
                     if (colors != null) {
                         colors.clearStamps();
@@ -297,9 +310,9 @@ public final class BiomeTintBlend {
     private static final class Colors {
         final ColorResolver resolver;
         int[] samples;
-        int[] sampleStamps;
+        byte[] sampleStamps;
         final int[] blends = new int[16 * 16 * 16];
-        final int[] blendStamps = new int[16 * 16 * 16];
+        final byte[] blendStamps = new byte[16 * 16 * 16];
 
         Colors(ColorResolver resolver, int entries) {
             this.resolver = resolver;
@@ -308,13 +321,13 @@ public final class BiomeTintBlend {
 
         void resize(int entries) {
             this.samples = new int[entries];
-            this.sampleStamps = new int[entries];
-            Arrays.fill(this.blendStamps, 0);
+            this.sampleStamps = new byte[entries];
+            Arrays.fill(this.blendStamps, (byte) 0);
         }
 
         void clearStamps() {
-            Arrays.fill(this.sampleStamps, 0);
-            Arrays.fill(this.blendStamps, 0);
+            Arrays.fill(this.sampleStamps, (byte) 0);
+            Arrays.fill(this.blendStamps, (byte) 0);
         }
     }
 }
