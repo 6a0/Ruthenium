@@ -3,7 +3,9 @@
 This is a hand-off document for a new session. It covers what was decided, what has been built, how to test it,
 what the numbers are, and what to do next. Read it all before changing code.
 
-Last updated: 2026-10-30 (twenty-eighth session: GPU time, the OpenGL gap, the initial phase; twenty-seventh; twenty-sixth; twenty-fifth; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
+Last updated: 2026-10-30 (thirty-second session: GPU terrain occlusion culling through renderpearl, version 0.8.0; thirty-first: frame
+stats, Vulkan by default; thirtieth: memory, load times, settings clicks; twenty-ninth: the footprint benchmark; twenty-eighth
+session: GPU time, the OpenGL gap, the initial phase; twenty-seventh; twenty-sixth; twenty-fifth; twenty-fourth; twenty-third; twenty-second; twenty-first; twentieth; before that 2026-10-28, seventeenth session; earlier: 2026-10-27, sixth session), with the GPU probe findings and the faster section compiles (biome blend,
 light, block state and tint caches). Seventh session: exact software occlusion culling of terrain sections on the CPU
 was built, measured and rejected (section 7, "Rejected: CPU occlusion culling"); the retained chests were generalised
 to shulker boxes, decorated pots and skulls (`RetainedBlockEntities`), with a block entity scene to measure them
@@ -3548,9 +3550,12 @@ leaves stale masks (faces missing until the next upload or reload).
 6. **Terrain**, after the sixth session (section 7, "Terrain"). The view is GPU bound on per-vertex work (see
    "Where the terrain's GPU time goes"); 16 bit indices, translucent compression and draw counts were measured and
    don't matter. Ideas:
-   - Fewer vertices: anything exact must skip whole invisible faces/sections (occlusion), which renderpearl can't
-     do on the GPU. An exact CPU occlusion test was built and rejected in the seventh session (section 7): in this
-     scene occlusion hides only ~10% of the quads, and only with ~168k occluder faces per frame.
+   - Fewer vertices: **done in the thirty-second session** (`TerrainOcclusion`, two-phase GPU occlusion culling through
+     renderpearl; terrain static +38%, section 7). The seventh session's exact CPU test stays rejected (~10% of the quads,
+     ~168k occluder faces per frame). Left there: tighter section boxes (non-air bounds at compile time, +1.6% hidden
+     quads), fewer passes (the visibility and command targets could share a texture; the 6 extra passes allocate ~14 KB
+     per frame), culling entities and block entities with the same visibility, and the one unexplained `#c0d8ff` patch
+     (1 of 7 culled runs, never reproduced; section 7).
    - Section compiles (now ~400 us per section single-threaded): Indigo's `AoCalculator` (~22% before the caches,
      Fabric internals, so mixins there are fragile), fluids (~8%), Indigo's quad transform/emit overhead.
    - The vanilla occlusion graph bug after `allChanged` (section 6.7), which also leaves holes for players who
@@ -3713,7 +3718,7 @@ and with job 2 for hologram-heavy hubs. Answer both "find out first" questions b
 ## 9. Important notes
 
 - **Commits:** the user wants a commit after each change is benchmarked, with the numbers in the message. End
-  commit messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Git user `6a0`. Remote
+  commit messages with the `Co-Authored-By` trailer the current session is given (don't copy one from older commits). Git user `6a0`. Remote
   `origin` = `6a0/Ruthenium` (renamed from `6a0/VulkanMod` on 2026-10-28), `upstream` = `xCollateral/VulkanMod`. Branch `26.3` is pushed to `origin` (since 2026-10-28) and tracks `origin/26.3`; nothing goes to `upstream`.
 - **No Sodium code.** It is PolyForm Shield licensed.
 - **Mouse buttons are SDL-numbered in 26.x:** left is `InputConstants.MOUSE_BUTTON_LEFT` (1), not GLFW's 0. The settings screen
@@ -3732,6 +3737,10 @@ and with job 2 for hologram-heavy hubs. Answer both "find out first" questions b
 - **Assumptions of the model caches/culling:** world features are camera-relative (eye at the origin) and
   drawn with a perspective projection; `Float`-state models are pure functions of that state in `setupAnim`;
   atlas sprites are replaced (not mutated) on resource reload, so identity keys stay valid.
+- **Paths in this document are the user's Windows machine** (`D:\dev\VulkanMod`, `%TEMP%`, `C:\Program Files\Java`). The
+  benchmarks need its GPU. A cloud or Linux session has none of them: it can build (`./gradlew build`, JDK 25) and edit, but
+  not benchmark, and must regenerate decompiled sources as in section 5.
+- **CI** (`.github/workflows/build.yml`) builds on JDK 25, which the mod requires (`release = 25`, `"java": ">=25"`).
 - **Decompiled sources** from the first session are still at
   `%TEMP%/claude/D--dev-VulkanMod/28854e05-c88c-445a-b4b2-c27fb65a3ca3/scratchpad/src-26.3` (client and
   `com/mojang` only), and the third session decompiled `net/minecraft/{world,core,util}` to
@@ -3739,5 +3748,5 @@ and with job 2 for hologram-heavy hubs. Answer both "find out first" questions b
   `.../28854e05-.../scratchpad/tools/vineflower.jar`; ~20 s per package set).
 - **26.4 snapshots** already change renderpearl further (Vulkan is the default there). Expect API churn when moving
   past 26.3.
-- **Memory files** for future sessions: `~/.claude/projects/D--dev-VulkanMod/memory/` (`port-26-3-strategy.md`,
+- **Memory files** for future sessions (on the Windows machine only): `~/.claude/projects/D--dev-VulkanMod/memory/` (`port-26-3-strategy.md`,
   `benchmark-protocol.md`).
