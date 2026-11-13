@@ -24,6 +24,7 @@ public class Initializer implements ClientModInitializer {
 
 		config();
 
+		HeapCheck.run();
 		LoaderManifests.trim();
 	}
 
