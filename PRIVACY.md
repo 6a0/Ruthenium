@@ -22,6 +22,10 @@ Ruthenium is pre-alpha. This document describes how the client is designed to wo
 - Microsoft and Minecraft tokens, in your operating system's credential store (Windows DPAPI, or Secret Service on Linux).
 - Settings, the server list and caches built from your installed game, in Ruthenium's data folder.
 
+## What Ruthenium reads on your device
+
+To find your installed game, Ruthenium looks in your launchers' folders for the 26.3 client jar, its libraries, its asset index and asset files, and Java runtimes the launcher downloaded. It does not read launcher account files, instance worlds, screenshots or settings.
+
 Delete Ruthenium's data folder and its credential-store entries to remove everything.
 
 ## Crash reports (future)

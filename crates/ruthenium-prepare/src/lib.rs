@@ -2,10 +2,47 @@
 //!
 //! Ruthenium ships no Mojang files and downloads none. This crate finds a
 //! 26.3 install the player already has (official launcher, Prism, MultiMC,
-//! Modrinth App, ATLauncher, GDLauncher), verifies the client jar against a
-//! pinned SHA-1, and builds per-version caches from it on the player's machine.
+//! Modrinth App, ATLauncher, GDLauncher), verifies it against pinned SHA-1s,
+//! imports it into Ruthenium's cache, and builds per-version data from it on
+//! the player's machine.
+//!
+//! 1. [`discover`]: search launcher folders; accept only pinned files.
+//! 2. [`import`]: hard-link or copy the jar, libraries and assets into the
+//!    cache, checking every hash.
+//! 3. [`java`] + [`datagen`]: run Mojang's data generator from the imported
+//!    jar. Steps are keyed by their inputs ([`step`]), so they run once.
 
 #![forbid(unsafe_code)]
 
-/// SHA-1 of the 26.3 client jar, as published in Mojang's version manifest.
-pub const CLIENT_JAR_SHA1_26_3: &str = "e877b6a07acd633fb3bb475002175cec036e7b87";
+pub mod datagen;
+pub mod discover;
+mod hash;
+pub mod import;
+pub mod java;
+mod pins;
+pub mod step;
+pub mod version;
+
+use std::path::PathBuf;
+
+pub use version::GameVersion;
+
+/// The game version this build of Ruthenium plays.
+pub fn supported_version() -> &'static GameVersion {
+    &pins::V26_3
+}
+
+/// Ruthenium's per-user data folder: `$XDG_DATA_HOME/ruthenium` (default
+/// `~/.local/share/ruthenium`) or `%LOCALAPPDATA%\Ruthenium`.
+pub fn default_data_dir(env: &discover::Env) -> Option<PathBuf> {
+    if cfg!(windows) {
+        Some(env.local_appdata.as_ref()?.join("Ruthenium"))
+    } else {
+        Some(
+            env.xdg_data_home
+                .clone()
+                .or_else(|| Some(env.home.as_ref()?.join(".local/share")))?
+                .join("ruthenium"),
+        )
+    }
+}

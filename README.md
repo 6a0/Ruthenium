@@ -29,6 +29,17 @@ cargo test --workspace
 cargo xtask check-content   # make sure no Mojang content is in the tree
 ```
 
+## Game files
+
+Install and play Minecraft 26.3 once in your usual launcher, then run:
+
+```sh
+cargo run -p ruthenium -- locate    # list the launcher folders searched
+cargo run -p ruthenium -- prepare   # import the game files and run Mojang's data generator
+```
+
+`prepare` accepts a client jar only if its SHA-1 matches the official 26.3 release. It checks the asset index and every library and asset file the same way. Verified files are hard-linked (or copied) into Ruthenium's data folder. Pass `--from <folder>` for a launcher folder that isn't found automatically.
+
 ## Publisher and contact
 
 Ruthenium is published by **6a0**. Contact: **[sixazero@outlook.com](mailto:sixazero@outlook.com)**. Report security issues as described in [SECURITY.md](SECURITY.md).
