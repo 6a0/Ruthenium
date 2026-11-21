@@ -106,10 +106,10 @@ fn check(root: &Path, jars: &[PathBuf], indexes: &[PathBuf]) -> Result<Vec<Strin
         // Deleted-but-tracked files show up in ls-files; nothing to check.
         let Ok(bytes) = fs::read(&path) else { continue };
         problems.extend(rule_problems(rel, &bytes));
-        if bytes.len() >= MIN_HASHED_LEN {
-            if let Some(origin) = known.get(&sha1_hex(&bytes)) {
-                problems.push(format!("{rel}: byte-identical to {origin}"));
-            }
+        if bytes.len() >= MIN_HASHED_LEN
+            && let Some(origin) = known.get(&sha1_hex(&bytes))
+        {
+            problems.push(format!("{rel}: byte-identical to {origin}"));
         }
     }
 
@@ -139,7 +139,9 @@ fn rule_problems(rel: &str, bytes: &[u8]) -> Vec<String> {
         }
     }
     if ext == "java" && !lower.starts_with(JAVA_DIR) {
-        out.push(format!("{rel}: Java sources are only allowed under {JAVA_DIR}"));
+        out.push(format!(
+            "{rel}: Java sources are only allowed under {JAVA_DIR}"
+        ));
     }
     if ext == "png" && !lower.starts_with(PNG_DIR) {
         out.push(format!("{rel}: images are only allowed under {PNG_DIR}"));
@@ -147,7 +149,9 @@ fn rule_problems(rel: &str, bytes: &[u8]) -> Vec<String> {
     if let Ok(text) = std::str::from_utf8(bytes) {
         for marker in DENIED_TEXT {
             if text.contains(marker) {
-                out.push(format!("{rel}: contains {marker:?} (decompiled Mojang source?)"));
+                out.push(format!(
+                    "{rel}: contains {marker:?} (decompiled Mojang source?)"
+                ));
             }
         }
     }
@@ -157,7 +161,13 @@ fn rule_problems(rel: &str, bytes: &[u8]) -> Vec<String> {
 /// Every file git would commit: tracked files plus untracked, non-ignored ones.
 fn candidate_files(root: &Path) -> Result<Vec<String>, String> {
     let out = Command::new("git")
-        .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
         .current_dir(root)
         .output()
         .map_err(|e| format!("could not run git: {e}"))?;
@@ -180,10 +190,14 @@ fn candidate_files(root: &Path) -> Result<Vec<String>, String> {
 fn hash_jar(jar: &Path, known: &mut HashMap<String, String>) -> Result<(), String> {
     let file = File::open(jar).map_err(|e| format!("{}: {e}", jar.display()))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("{}: {e}", jar.display()))?;
-    let jar_name = jar.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let jar_name = jar
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
     let mut buf = Vec::new();
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).map_err(|e| format!("{}: {e}", jar.display()))?;
+        let mut entry = zip
+            .by_index(i)
+            .map_err(|e| format!("{}: {e}", jar.display()))?;
         if entry.is_dir() {
             continue;
         }
@@ -217,7 +231,10 @@ fn hash_asset_index(index: &Path, known: &mut HashMap<String, String>) -> Result
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
-    Sha1::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha1::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -237,7 +254,8 @@ mod tests {
     fn accepts_own_files() {
         assert!(rule_problems("crates/ruthenium/src/main.rs", b"fn main() {}").is_empty());
         assert!(rule_problems("branding/logo.png", b"").is_empty());
-        let exporter = "package dev.ruthenium.exporter;\nimport net.minecraft.world.level.block.Block;\n";
+        let exporter =
+            "package dev.ruthenium.exporter;\nimport net.minecraft.world.level.block.Block;\n";
         assert!(rule_problems("tools/java/Exporter.java", exporter.as_bytes()).is_empty());
     }
 }
