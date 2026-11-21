@@ -1,0 +1,10 @@
+# Mojang code/assets: never commit or redistribute
+/reference/
+/target/
+
+# Private planning: research notes quote decompiled 26.3 source; the plan is internal
+/research/
+/PLAN.md
+
+# Local caches written by ruthenium-prepare during development
+/cache/

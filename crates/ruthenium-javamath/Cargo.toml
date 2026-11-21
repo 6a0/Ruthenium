@@ -1,0 +1,11 @@
+[package]
+name = "ruthenium-javamath"
+description = "Java-exact math (Mth sin table, Java float/rounding semantics) for bit-identical simulation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[lints]
+workspace = true

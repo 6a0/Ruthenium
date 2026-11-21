@@ -1,0 +1,11 @@
+[package]
+name = "ruthenium-prepare"
+description = "Finds the player's installed 26.3 client, verifies it by hash, and prepares per-version caches"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
