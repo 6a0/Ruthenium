@@ -433,6 +433,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruthenium-shaders"
+version = "0.0.0"
+
+[[package]]
 name = "ruthenium-trace"
 version = "0.0.0"
 dependencies = [
@@ -871,6 +875,7 @@ dependencies = [
  "ruthenium-prepare",
  "serde_json",
  "sha1",
+ "sha2",
  "zip",
 ]
 

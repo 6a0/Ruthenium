@@ -37,6 +37,8 @@ cargo run -p ruthenium -- --no-vsync --stats  # uncapped; --fps-cap 240 adds the
 cargo run -p ruthenium -- --help
 ```
 
+Shaders are GLSL in `crates/ruthenium-shaders/glsl`, compiled to SPIR-V that is committed, so building needs no shader compiler. After editing a shader, run `cargo xtask shaders`. It uses the `glslc` of a pinned Vulkan SDK release: on Linux x86-64 it is downloaded once into the git-ignored `cache/`; elsewhere, install that SDK and pass `--glslc <path>`. CI fails if the committed SPIR-V differs from what that compiler produces.
+
 Debug builds turn on the Vulkan validation layer if it is installed (Fedora `vulkan-validation-layers`, Debian/Ubuntu `vulkan-validationlayers`). Set `RUTHENIUM_VALIDATION=1` to make it required.
 
 The per-version tables in `crates/ruthenium-data` (packet ids, registries, block states, entity-data serializer ids) are generated and committed, so building needs no game files. To regenerate them, run `cargo xtask codegen`. It needs JDK 25 and the official client jar (see below), and runs Mojang's data generator from that jar.

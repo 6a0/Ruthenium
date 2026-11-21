@@ -77,6 +77,20 @@ jobs:
           path: target/java/ruthenium-exporters.jar
           if-no-files-found: error
 
+  shaders:
+    name: Shaders (pinned glslc)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Only the glslc binary from the pinned Vulkan SDK (Apache-2.0), not the SDK.
+      - uses: actions/cache@v4
+        with:
+          path: cache/glslc
+          key: glslc-${{ hashFiles('xtask/src/shaders.rs') }}
+      # Recompiles every shader and fails if the committed SPIR-V differs.
+      - run: cargo xtask shaders --check
+
   javamath-jvm:
     # Vanilla builds its sine table with Math.sin, which HotSpot implements
     # with per-architecture intrinsics. Dump the table and ~460k Mth.sin/cos

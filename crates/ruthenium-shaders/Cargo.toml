@@ -1,0 +1,11 @@
+[package]
+name = "ruthenium-shaders"
+description = "Ruthenium's shaders: GLSL sources and the committed SPIR-V built from them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

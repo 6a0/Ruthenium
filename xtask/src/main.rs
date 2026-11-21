@@ -15,6 +15,7 @@ mod jvm;
 mod launch_pins;
 mod mods;
 mod pin_version;
+mod shaders;
 mod trace;
 
 use std::process::ExitCode;
@@ -66,7 +67,12 @@ tasks:
       block states, entity-data serializer ids) from the pinned client jar.
       Runs Mojang's data generator from the jar (cached in cache/codegen) unless
       --reports names a folder of its reports. The jar is found like for
-      exporters. With --check, write nothing and fail if any file is stale.";
+      exporters. With --check, write nothing and fail if any file is stale.
+  shaders [--glslc <glslc>] [--check]
+      Compile crates/ruthenium-shaders/glsl to the committed SPIR-V with the
+      glslc of the pinned Vulkan SDK (downloaded once into cache/glslc on Linux
+      x86-64; elsewhere pass that SDK's glslc). With --check, write nothing and
+      fail if any committed file differs from glslc's output.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -103,6 +109,7 @@ fn main() -> ExitCode {
             }
         }
         Some("codegen") => codegen::run(workspace_root(), &args[1..]),
+        Some("shaders") => shaders::run(workspace_root(), &args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::FAILURE
