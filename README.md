@@ -10,7 +10,7 @@ Ruthenium is an open-source client for **Minecraft: Java Edition** (currently ta
 
 ## Status
 
-**Pre-alpha. Nothing is playable yet.** Work is at Stage 0: workspace, CI, game-file import and code generation.
+**Pre-alpha. Nothing is playable yet.** Work is at Stage 0: workspace, CI, game-file import, code generation, golden traces of the vanilla client and its baseline measurements ([docs/baseline.md](docs/baseline.md)).
 
 ## How Ruthenium treats Mojang's content and accounts
 
@@ -43,6 +43,18 @@ cargo run -p ruthenium -- prepare   # import the game files and run Mojang's dat
 To also run Ruthenium's exporters (original Java code that reads data such as entity sizes from your installed game), build them first with `cargo xtask exporters`. This needs JDK 25 and a client jar to compile against: either the local reference copy, or the official jar fetched by `cargo xtask fetch-compile-deps` (compile-time only, kept in the git-ignored `cache/`).
 
 `prepare` accepts a client jar only if its SHA-1 matches the official 26.3 release. It checks the asset index and every library and asset file the same way. Verified files are hard-linked (or copied) into Ruthenium's data folder. Pass `--from <folder>` for a launcher folder that isn't found automatically.
+
+## Measuring vanilla
+
+Two development tools run the vanilla 26.3 client from your own install (offline developer mode, singleplayer only; your account is never used):
+
+```sh
+cargo xtask trace          # record golden traces of scripted scenarios (docs/golden-traces.md)
+cargo xtask bench setup    # create the benchmark world, then:
+cargo xtask bench run      # frame times, memory and launch time on OpenGL and Vulkan (docs/baseline.md)
+```
+
+They load Fabric Loader and Ruthenium's own small development mods (`tools/java/`). They need JDK 25 to compile the mods and a desktop session, since a game window opens.
 
 ## Publisher and contact
 

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "ruthenium-bench",
+  "version": "0.0.0",
+  "name": "Ruthenium benchmark driver",
+  "description": "Development tool: drives repeatable scenes in the vanilla client and records frame times. Does nothing unless started by cargo xtask bench.",
+  "license": "GPL-3.0-or-later",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.ruthenium.bench.BenchClient"
+    ]
+  },
+  "mixins": [
+    "ruthenium-bench.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.20.1",
+    "minecraft": "26.3"
+  }
+}

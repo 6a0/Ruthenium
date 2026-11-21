@@ -2,13 +2,19 @@
 
 #![forbid(unsafe_code)]
 
+mod bench;
 mod check_content;
 mod codegen;
 mod exporters;
+mod fabric;
 mod fetch_compile_deps;
+mod game;
 mod javamath_dump;
 mod jvm;
+mod launch_pins;
+mod mods;
 mod pin_version;
+mod trace;
 
 use std::process::ExitCode;
 
@@ -40,6 +46,20 @@ tasks:
       reference/26.3 or cache/compile-deps by default.
   check-bundle <jar>
       Fail if the jar holds anything but dev/ruthenium/ classes and a manifest.
+  bench <setup|run|report> [--backend opengl,vulkan] [--scene menu,idle,spin,fly]
+        [--reps N] [--warmup S] [--duration S] [--render-distance N] [--seed N]
+        [--java <java>] [--screenshot] [--results <folder>]
+      Baseline measurements of vanilla 26.3, run from the player's own install
+      with Fabric Loader and tools/java/bench (needs a display; see
+      docs/baseline.md). setup creates the benchmark world, run measures every
+      scene on every backend, report prints Markdown tables for a results folder.
+  trace [--only <scenario,...>] [--out <folder>] [--java <java>]
+      Record golden traces from vanilla 26.3 (Fabric Loader, Fabric API's client
+      gametest module and tools/java/trace; see docs/golden-traces.md) into
+      cache/traces/26.3. Copy them to tests/golden/26.3 to update the committed
+      ones.
+  build-mod <bench|trace>
+      Compile a development mod into target/java/ruthenium-<name>.jar.
   codegen [--deps <folder>] [--java <java>] [--reports <folder>] [--check]
       Regenerate crates/ruthenium-data/src/v26_3 (packet ids, registries,
       block states, entity-data serializer ids) from the pinned client jar.
@@ -56,6 +76,31 @@ fn main() -> ExitCode {
         Some("fetch-compile-deps") => fetch_compile_deps::run(workspace_root(), &args[1..]),
         Some("exporters") => exporters::run(workspace_root(), &args[1..]),
         Some("check-bundle") => exporters::run_check(&args[1..]),
+        Some("bench") => bench::run(workspace_root(), &args[1..]),
+        Some("trace") => trace::run(workspace_root(), &args[1..]),
+        Some("build-mod") if args.len() == 2 => {
+            let extra = if args[1] == "trace" {
+                match fabric::fetch_all(workspace_root(), fabric::GAMETEST_MODS) {
+                    Ok(jars) => jars,
+                    Err(e) => {
+                        eprintln!("build-mod: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            match mods::build(workspace_root(), &args[1], &extra) {
+                Ok(p) => {
+                    println!("{}", p.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("build-mod: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("codegen") => codegen::run(workspace_root(), &args[1..]),
         _ => {
             eprintln!("{USAGE}");

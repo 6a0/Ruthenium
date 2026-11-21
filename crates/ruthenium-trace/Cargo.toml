@@ -1,0 +1,17 @@
+[package]
+name = "ruthenium-trace"
+description = "Reader for golden traces recorded from the vanilla client (format ruthenium-trace/1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
+
+[dev-dependencies]
+ruthenium-data = { path = "../ruthenium-data" }

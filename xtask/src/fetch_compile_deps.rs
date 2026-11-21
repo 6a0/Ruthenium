@@ -57,7 +57,7 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn sha1_of(path: &Path) -> Option<String> {
+pub(crate) fn sha1_of(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     Some(
         Sha1::digest(&bytes)
@@ -67,7 +67,7 @@ fn sha1_of(path: &Path) -> Option<String> {
     )
 }
 
-fn fetch(url: &str, dest: &Path, sha1: &str) -> Result<(), String> {
+pub(crate) fn fetch(url: &str, dest: &Path, sha1: &str) -> Result<(), String> {
     let parent = dest.parent().expect("file has a parent");
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let partial = dest.with_extension("partial");

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "ruthenium-trace",
+  "version": "0.0.0",
+  "name": "Ruthenium golden-trace recorder",
+  "description": "Development tool: records per-tick input, player state and the packet stream of the vanilla client while client gametests drive scripted scenarios. Only active when started by cargo xtask trace.",
+  "license": "GPL-3.0-or-later",
+  "environment": "client",
+  "entrypoints": {
+    "fabric-client-gametest": [
+      "dev.ruthenium.trace.TraceGameTests"
+    ]
+  },
+  "mixins": [
+    "ruthenium-trace.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.20.1",
+    "minecraft": "26.3",
+    "fabric-client-gametest-api-v1": "*"
+  }
+}
