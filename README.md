@@ -29,6 +29,8 @@ cargo test --workspace
 cargo xtask check-content   # make sure no Mojang content is in the tree
 ```
 
+The per-version tables in `crates/ruthenium-data` (packet ids, registries, block states, entity-data serializer ids) are generated and committed, so building needs no game files. To regenerate them, run `cargo xtask codegen`. It needs JDK 25 and the official client jar (see below), and runs Mojang's data generator from that jar.
+
 ## Game files
 
 Install and play Minecraft 26.3 once in your usual launcher, then run:

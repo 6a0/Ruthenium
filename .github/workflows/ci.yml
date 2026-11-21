@@ -48,18 +48,23 @@ jobs:
       - run: cargo fmt --all --check
 
   exporters:
-    name: Exporter bundle
+    name: Exporter bundle and generated tables
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '25'
-      # Official jars, pinned by SHA-1, as compile-time input only: they stay in
+      # Official jars, pinned by SHA-1, as build-time input only: they stay in
       # git-ignored cache/ and are never cached or uploaded.
       - run: cargo xtask fetch-compile-deps
+      # Reruns Mojang's data generator from the fetched jar and fails if the
+      # committed ruthenium-data tables differ from what it produces.
+      - run: cargo xtask codegen --deps cache/compile-deps --check
       # Fails if the bundle holds any class outside dev/ruthenium/.
       - run: cargo xtask exporters --deps cache/compile-deps
       - uses: actions/upload-artifact@v4

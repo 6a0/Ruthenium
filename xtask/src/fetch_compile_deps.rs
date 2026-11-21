@@ -1,7 +1,8 @@
 //! `cargo xtask fetch-compile-deps`: download the official client jar and
-//! its class-path libraries, pinned by SHA-1, so CI can compile the exporters.
+//! its class-path libraries, pinned by SHA-1, so CI can compile the exporters
+//! and check the generated tables (`cargo xtask codegen --check`).
 //!
-//! These files are compile-time inputs only. They go to `cache/` (git-ignored)
+//! These files are build-time inputs only. They go to `cache/` (git-ignored)
 //! and are never committed, cached by CI or put in a build artifact. Ruthenium
 //! itself downloads nothing: players' copies come from their own launcher.
 

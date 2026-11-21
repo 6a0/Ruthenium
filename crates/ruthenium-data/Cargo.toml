@@ -1,6 +1,6 @@
 [package]
 name = "ruthenium-data"
-description = "Generated per-version tables: registries, block states, packet IDs"
+description = "Generated per-version tables: packet IDs, registries, block states, entity-data serializer IDs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

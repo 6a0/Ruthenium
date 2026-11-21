@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod check_content;
+mod codegen;
 mod exporters;
 mod fetch_compile_deps;
 mod javamath_dump;
@@ -31,7 +32,7 @@ tasks:
       JSON. Defaults to reference/26.3/jars/26.3.json.
   fetch-compile-deps [--out <folder>]
       Download the official client jar and its class-path libraries, pinned by
-      SHA-1, into cache/compile-deps. Compile-time input for CI only: never
+      SHA-1, into cache/compile-deps. Build-time input for CI only: never
       commit, cache or ship these files.
   exporters [--deps <folder> | --classpath <cp>] [--javac <javac>] [--out <jar>]
       Compile tools/java/exporters into target/java/ruthenium-exporters.jar and
@@ -39,8 +40,12 @@ tasks:
       reference/26.3 or cache/compile-deps by default.
   check-bundle <jar>
       Fail if the jar holds anything but dev/ruthenium/ classes and a manifest.
-  codegen
-      Generate ruthenium-data tables (not implemented yet).";
+  codegen [--deps <folder>] [--java <java>] [--reports <folder>] [--check]
+      Regenerate crates/ruthenium-data/src/v26_3 (packet ids, registries,
+      block states, entity-data serializer ids) from the pinned client jar.
+      Runs Mojang's data generator from the jar (cached in cache/codegen) unless
+      --reports names a folder of its reports. The jar is found like for
+      exporters. With --check, write nothing and fail if any file is stale.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -51,10 +56,7 @@ fn main() -> ExitCode {
         Some("fetch-compile-deps") => fetch_compile_deps::run(workspace_root(), &args[1..]),
         Some("exporters") => exporters::run(workspace_root(), &args[1..]),
         Some("check-bundle") => exporters::run_check(&args[1..]),
-        Some("codegen") => {
-            eprintln!("codegen: not implemented yet");
-            ExitCode::FAILURE
-        }
+        Some("codegen") => codegen::run(workspace_root(), &args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::FAILURE
