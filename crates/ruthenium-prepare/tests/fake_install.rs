@@ -256,7 +256,30 @@ fn steps_run_once_per_key() {
     assert_eq!(std::fs::read_to_string(dir.join("result")).unwrap(), "b");
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+#[test]
+fn default_roots_use_application_support() {
+    let env = discover::Env {
+        home: Some("/h".into()),
+        ..Default::default()
+    };
+    let roots = discover::default_roots(&env);
+    let has = |l: Launcher, p: &str| roots.iter().any(|(rl, rp)| *rl == l && rp == Path::new(p));
+    assert!(has(
+        Launcher::Official,
+        "/h/Library/Application Support/minecraft"
+    ));
+    assert!(has(
+        Launcher::Prism,
+        "/h/Library/Application Support/PrismLauncher"
+    ));
+    assert!(has(
+        Launcher::Modrinth,
+        "/h/Library/Application Support/ModrinthApp"
+    ));
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn default_roots_follow_xdg_and_flatpak() {
     let env = discover::Env {

@@ -5,13 +5,14 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use ruthenium_prepare::discover::{self, Candidate, Env, Launcher};
-use ruthenium_prepare::{datagen, import, java, supported_version};
+use ruthenium_prepare::{datagen, exporters, import, java, supported_version};
 
 #[derive(Debug, Default)]
 struct Options {
     from: Option<PathBuf>,
     data_dir: Option<PathBuf>,
     java: Option<PathBuf>,
+    exporters: Option<PathBuf>,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -27,6 +28,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--from" => opts.from = Some(value()?),
             "--data-dir" => opts.data_dir = Some(value()?),
             "--java" => opts.java = Some(value()?),
+            "--exporters" => opts.exporters = Some(value()?),
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -149,37 +151,77 @@ pub fn prepare(args: &[String]) -> ExitCode {
         },
     };
 
-    if datagen::is_current(&imported) {
-        println!("Data generator: up to date");
-        println!("Reports: {}", datagen::reports_dir(&imported).display());
-        return ExitCode::SUCCESS;
-    }
+    let bundle = exporters::find_bundle(opts.exporters.as_deref());
+    let need_datagen = !datagen::is_current(&imported);
+    let need_exports = bundle
+        .as_deref()
+        .is_some_and(|b| !exporters::is_current(&imported, b));
 
-    let java = match java::find_java(Some(install), &version.java, opts.java.as_deref()) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!(
-                "{e}\nInstall a Java {}+ runtime or pass --java <path>.",
-                version.java.major
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    println!("Java: {} ({})", java.description, java.path.display());
-
-    let start = Instant::now();
-    match datagen::run_reports(&java, &imported) {
-        Ok((reports, ran)) => {
-            if ran {
-                println!("Data generator: done ({:.1?})", start.elapsed());
-            } else {
-                println!("Data generator: up to date");
+    // Only start a JVM when a step is out of date.
+    let java = if need_datagen || need_exports {
+        match java::find_java(Some(install), &version.java, opts.java.as_deref()) {
+            Ok(j) => {
+                println!("Java: {} ({})", j.description, j.path.display());
+                Some(j)
             }
-            println!("Reports: {}", reports.display());
+            Err(e) => {
+                eprintln!(
+                    "{e}\nInstall a Java {}+ runtime or pass --java <path>.",
+                    version.java.major
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    match java.as_ref().filter(|_| need_datagen) {
+        Some(java) => {
+            let start = Instant::now();
+            if let Err(e) = datagen::run_reports(java, &imported) {
+                eprintln!("Data generator failed: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("Data generator: done ({:.1?})", start.elapsed());
+        }
+        None => println!("Data generator: up to date"),
+    }
+    println!("Reports: {}", datagen::reports_dir(&imported).display());
+
+    let Some(bundle) = bundle else {
+        println!(
+            "Exporters: no {} found; build it with `cargo xtask exporters` or pass --exporters <jar>. Skipped.",
+            exporters::BUNDLE_NAME
+        );
+        return ExitCode::SUCCESS;
+    };
+    match java.as_ref().filter(|_| need_exports) {
+        Some(java) => {
+            let start = Instant::now();
+            if let Err(e) = exporters::run(java, &imported, &bundle) {
+                eprintln!("Exporters failed: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("Exporters: done ({:.1?})", start.elapsed());
+        }
+        None => println!("Exporters: up to date"),
+    }
+    let exports = exporters::exports_dir(&imported);
+    let dims = std::fs::read(exports.join(exporters::ENTITY_DIMENSIONS))
+        .map_err(|e| e.to_string())
+        .and_then(|b| exporters::read_entity_dimensions(&b));
+    match dims {
+        Ok(dims) => {
+            println!(
+                "Exports: {} ({} entity types)",
+                exports.display(),
+                dims.len()
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("Data generator failed: {e}");
+            eprintln!("Exports are unreadable: {e}");
             ExitCode::FAILURE
         }
     }

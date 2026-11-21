@@ -30,6 +30,11 @@ pub fn sha1_file(path: &Path) -> io::Result<String> {
     digest_file::<Sha1>(path)
 }
 
+/// Lowercase hex SHA-256 of a file's contents.
+pub fn sha256_file(path: &Path) -> io::Result<String> {
+    digest_file::<Sha256>(path)
+}
+
 /// Lowercase hex SHA-256 of a byte string, used to key preparation steps.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))

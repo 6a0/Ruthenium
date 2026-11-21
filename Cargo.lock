@@ -412,6 +412,7 @@ dependencies = [
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "ruthenium-prepare",
  "serde_json",
  "sha1",
  "zip",

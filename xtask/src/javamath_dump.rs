@@ -5,19 +5,14 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use crate::jvm;
+
 const SOURCE: &str = "tools/java/javamath/dev/ruthenium/tools/DumpMth.java";
 const MAIN_CLASS: &str = "dev.ruthenium.tools.DumpMth";
 
 pub fn run(root: &Path, args: &[String]) -> ExitCode {
-    let java_home = std::env::var_os("JAVA_HOME").map(PathBuf::from);
-    let tool = |name: &str| {
-        java_home
-            .as_ref()
-            .map(|h| h.join("bin").join(name))
-            .unwrap_or_else(|| PathBuf::from(name))
-    };
-    let mut java = tool("java");
-    let mut javac = tool("javac");
+    let mut java = jvm::tool("java");
+    let mut javac = jvm::tool("javac");
     let mut classpath: Option<OsString> = None;
     let mut out = root.join("cache/javamath/mth.bin");
 
@@ -39,19 +34,11 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
         }
     }
 
-    let game_cp = match classpath {
-        Some(cp) => cp,
-        None => {
-            let jar = root.join("reference/26.3/jars/client.jar");
-            if !jar.is_file() {
-                eprintln!(
-                    "javamath-dump: {} not found; pass --classpath <client.jar and its libraries>",
-                    jar.display()
-                );
-                return ExitCode::FAILURE;
-            }
-            // Java expands a trailing "*" classpath entry to every jar in that folder.
-            join(&[jar, root.join("reference/26.3/libs/*")])
+    let game_cp = match classpath.map_or_else(|| jvm::game_classpath(root, None), Ok) {
+        Ok(cp) => cp,
+        Err(e) => {
+            eprintln!("javamath-dump: {e}");
+            return ExitCode::FAILURE;
         }
     };
 
@@ -79,8 +66,7 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
         }
     };
     let mut run_cp = game_cp;
-    run_cp.push(if cfg!(windows) { ";" } else { ":" });
-    run_cp.push(&classes);
+    jvm::push(&mut run_cp, &classes);
     let ran = Command::new(&java)
         .arg("-cp")
         .arg(&run_cp)
@@ -94,8 +80,4 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
         eprintln!("javamath-dump: running with {} failed", java.display());
         ExitCode::FAILURE
     }
-}
-
-fn join(parts: &[PathBuf]) -> OsString {
-    std::env::join_paths(parts).expect("classpath entries contain no separator")
 }

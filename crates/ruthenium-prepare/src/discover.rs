@@ -112,6 +112,23 @@ pub fn default_roots(env: &Env) -> Vec<(Launcher, PathBuf)> {
         add(GdLauncher, appdata("gdlauncher_carbon/data"));
         add(GdLauncher, appdata("gdlauncher_next/datastore"));
         // MultiMC on Windows is portable only; use --from.
+    } else if cfg!(target_os = "macos") {
+        let support = |rel: &str| {
+            Some(
+                env.home
+                    .as_ref()?
+                    .join("Library/Application Support")
+                    .join(rel),
+            )
+        };
+        add(Official, support("minecraft"));
+        add(Prism, support("PrismLauncher"));
+        add(Modrinth, support("ModrinthApp"));
+        add(Modrinth, support("com.modrinth.theseus"));
+        add(AtLauncher, support("ATLauncher"));
+        add(GdLauncher, support("gdlauncher_carbon/data"));
+        add(GdLauncher, support("gdlauncher_next/datastore"));
+        // MultiMC on macOS is portable only; use --from.
     } else {
         let home = |rel: &str| Some(env.home.as_ref()?.join(rel));
         let data = |rel: &str| Some(env.data_home()?.join(rel));

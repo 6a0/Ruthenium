@@ -3,7 +3,10 @@
 #![forbid(unsafe_code)]
 
 mod check_content;
+mod exporters;
+mod fetch_compile_deps;
 mod javamath_dump;
+mod jvm;
 mod pin_version;
 
 use std::process::ExitCode;
@@ -26,6 +29,16 @@ tasks:
       Regenerate crates/ruthenium-prepare/src/pins.rs (hashes, sizes and paths of
       the client jar, asset index and class-path libraries) from Mojang's version
       JSON. Defaults to reference/26.3/jars/26.3.json.
+  fetch-compile-deps [--out <folder>]
+      Download the official client jar and its class-path libraries, pinned by
+      SHA-1, into cache/compile-deps. Compile-time input for CI only: never
+      commit, cache or ship these files.
+  exporters [--deps <folder> | --classpath <cp>] [--javac <javac>] [--out <jar>]
+      Compile tools/java/exporters into target/java/ruthenium-exporters.jar and
+      fail if the bundle holds any class outside dev/ruthenium/. Compiles against
+      reference/26.3 or cache/compile-deps by default.
+  check-bundle <jar>
+      Fail if the jar holds anything but dev/ruthenium/ classes and a manifest.
   codegen
       Generate ruthenium-data tables (not implemented yet).";
 
@@ -35,6 +48,9 @@ fn main() -> ExitCode {
         Some("check-content") => check_content::run(&args[1..]),
         Some("javamath-dump") => javamath_dump::run(workspace_root(), &args[1..]),
         Some("pin-version") => pin_version::run(workspace_root(), &args[1..]),
+        Some("fetch-compile-deps") => fetch_compile_deps::run(workspace_root(), &args[1..]),
+        Some("exporters") => exporters::run(workspace_root(), &args[1..]),
+        Some("check-bundle") => exporters::run_check(&args[1..]),
         Some("codegen") => {
             eprintln!("codegen: not implemented yet");
             ExitCode::FAILURE

@@ -11,6 +11,11 @@ use std::process::Command;
 use crate::discover::Install;
 use crate::version::JavaRequirement;
 
+/// How far below a launcher's Java folder to look for `bin/java`. The deepest
+/// known layout is Mojang's macOS runtime:
+/// `runtime/<component>/mac-os-arm64/<component>/jre.bundle/Contents/Home/bin/java`.
+const SEARCH_DEPTH: u32 = 6;
+
 const JAVA_EXE: &str = if cfg!(windows) { "java.exe" } else { "java" };
 
 /// Where a Java candidate came from.
@@ -65,7 +70,7 @@ pub fn find_java(
         if let Some(install) = install {
             let mut found = Vec::new();
             for root in &install.java_roots {
-                find_java_exes(root, 4, &mut found);
+                find_java_exes(root, SEARCH_DEPTH, &mut found);
             }
             // Mojang's runtime for this version first, then anything newer.
             found.sort_by_key(|p| !p.components().any(|c| c.as_os_str() == req.component));
@@ -161,6 +166,22 @@ fn parse_properties(text: &str) -> Option<(u32, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_mojang_macos_runtime_layout() {
+        let root =
+            std::env::temp_dir().join(format!("ruthenium-java-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join(
+            "runtime/java-runtime-epsilon/mac-os-arm64/java-runtime-epsilon/jre.bundle/Contents/Home",
+        );
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join("bin").join(JAVA_EXE), b"").unwrap();
+        let mut found = Vec::new();
+        find_java_exes(&root.join("runtime"), SEARCH_DEPTH, &mut found);
+        assert_eq!(found, [home.join("bin").join(JAVA_EXE)]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn reads_version_properties() {

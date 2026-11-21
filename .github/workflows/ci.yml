@@ -47,12 +47,33 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  exporters:
+    name: Exporter bundle
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      # Official jars, pinned by SHA-1, as compile-time input only: they stay in
+      # git-ignored cache/ and are never cached or uploaded.
+      - run: cargo xtask fetch-compile-deps
+      # Fails if the bundle holds any class outside dev/ruthenium/.
+      - run: cargo xtask exporters --deps cache/compile-deps
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ruthenium-exporters
+          path: target/java/ruthenium-exporters.jar
+          if-no-files-found: error
+
   test:
     name: Test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025, windows-11-arm]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025, windows-11-arm, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

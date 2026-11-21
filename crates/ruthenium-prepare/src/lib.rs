@@ -9,13 +9,15 @@
 //! 1. [`discover`]: search launcher folders; accept only pinned files.
 //! 2. [`import`]: hard-link or copy the jar, libraries and assets into the
 //!    cache, checking every hash.
-//! 3. [`java`] + [`datagen`]: run Mojang's data generator from the imported
-//!    jar. Steps are keyed by their inputs ([`step`]), so they run once.
+//! 3. [`java`] + [`datagen`] + [`exporters`]: run Mojang's data generator and
+//!    Ruthenium's own exporters against the imported jar. Steps are keyed by
+//!    their inputs ([`step`]), so they run once.
 
 #![forbid(unsafe_code)]
 
 pub mod datagen;
 pub mod discover;
+pub mod exporters;
 mod hash;
 pub mod import;
 pub mod java;
@@ -33,10 +35,17 @@ pub fn supported_version() -> &'static GameVersion {
 }
 
 /// Ruthenium's per-user data folder: `$XDG_DATA_HOME/ruthenium` (default
-/// `~/.local/share/ruthenium`) or `%LOCALAPPDATA%\Ruthenium`.
+/// `~/.local/share/ruthenium`), `~/Library/Application Support/Ruthenium`
+/// on macOS, or `%LOCALAPPDATA%\Ruthenium`.
 pub fn default_data_dir(env: &discover::Env) -> Option<PathBuf> {
     if cfg!(windows) {
         Some(env.local_appdata.as_ref()?.join("Ruthenium"))
+    } else if cfg!(target_os = "macos") {
+        Some(
+            env.home
+                .as_ref()?
+                .join("Library/Application Support/Ruthenium"),
+        )
     } else {
         Some(
             env.xdg_data_home

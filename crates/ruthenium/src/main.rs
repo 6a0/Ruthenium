@@ -16,9 +16,10 @@ usage: ruthenium [command]
 commands:
   locate  [--from <folder>]
       List the launcher folders searched for a verified game install.
-  prepare [--from <folder>] [--data-dir <folder>] [--java <java>]
-      Import the game files from your launcher into Ruthenium's data folder and
-      run Mojang's data generator on them. Runs only what is out of date.";
+  prepare [--from <folder>] [--data-dir <folder>] [--java <java>] [--exporters <jar>]
+      Import the game files from your launcher into Ruthenium's data folder,
+      then run Mojang's data generator and Ruthenium's exporters on them. Runs
+      only what is out of date.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
