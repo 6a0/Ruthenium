@@ -77,6 +77,38 @@ jobs:
           path: target/java/ruthenium-exporters.jar
           if-no-files-found: error
 
+  javamath-jvm:
+    # Vanilla builds its sine table with Math.sin, which HotSpot implements
+    # with per-architecture intrinsics. Dump the table and ~460k Mth.sin/cos
+    # results from a real JVM on x64 and on each ARM64 platform, and compare
+    # them bit for bit with ruthenium-javamath on the same machine.
+    name: Trig table vs JVM (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, arch: amd64 }
+          - { os: ubuntu-24.04-arm, arch: aarch64 }
+          - { os: macos-15, arch: aarch64 }
+          - { os: windows-11-arm, arch: aarch64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Microsoft's OpenJDK build, as in Mojang's own Java runtime.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: '25'
+      # Official jars, pinned by SHA-1, as build-time input only (git-ignored
+      # cache/, never cached or uploaded).
+      - run: cargo xtask fetch-compile-deps
+      - run: cargo xtask javamath-dump
+      - run: cargo test -p ruthenium-javamath --test vanilla
+        env:
+          RUTHENIUM_JAVAMATH_REQUIRE_DUMP: '1'
+          RUTHENIUM_JAVAMATH_EXPECT_ARCH: ${{ matrix.arch }}
+
   test:
     name: Test (${{ matrix.os }})
     strategy:

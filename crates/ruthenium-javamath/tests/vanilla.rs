@@ -6,6 +6,11 @@
 //! * When a dump is available (`cargo xtask javamath-dump`, or the
 //!   `RUTHENIUM_JAVAMATH_DUMP` environment variable): every table entry and the
 //!   sin/cos results for ~460k probe inputs, compared bit for bit.
+//!
+//! CI's `javamath-jvm` job dumps from a JVM on each architecture (x64 and
+//! ARM64) and sets `RUTHENIUM_JAVAMATH_REQUIRE_DUMP=1`, so a missing dump fails
+//! instead of skipping, and `RUTHENIUM_JAVAMATH_EXPECT_ARCH` (the JVM's
+//! `os.arch`, e.g. `aarch64`), so a dump from the wrong JVM can't pass.
 
 use std::path::PathBuf;
 
@@ -72,12 +77,23 @@ fn load_dump() -> Option<(PathBuf, Dump)> {
 #[test]
 fn matches_jvm_dump() {
     let Some((path, dump)) = load_dump() else {
+        assert!(
+            std::env::var_os("RUTHENIUM_JAVAMATH_REQUIRE_DUMP").is_none(),
+            "RUTHENIUM_JAVAMATH_REQUIRE_DUMP is set, but there is no javamath dump"
+        );
         eprintln!(
             "no javamath dump found; run `cargo xtask javamath-dump` for the full comparison"
         );
         return;
     };
     eprintln!("comparing against {} ({})", path.display(), dump.jvm);
+    if let Ok(arch) = std::env::var("RUTHENIUM_JAVAMATH_EXPECT_ARCH") {
+        assert!(
+            dump.jvm.ends_with(&format!(" {arch}")),
+            "expected a dump from an {arch} JVM, got one from {}",
+            dump.jvm
+        );
+    }
 
     let ours = mth::sin_table();
     assert_eq!(dump.table.len(), ours.len());
