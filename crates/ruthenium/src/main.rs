@@ -2,9 +2,11 @@
 
 #![forbid(unsafe_code)]
 
+mod client;
 mod prepare_cmd;
 
 use std::process::ExitCode;
+use std::time::Instant;
 
 /// Shown on every first-run, About and title screen (Minecraft Usage Guidelines).
 pub const DISCLAIMER: &str =
@@ -13,7 +15,21 @@ pub const DISCLAIMER: &str =
 const USAGE: &str = "\
 usage: ruthenium [command]
 
+With no command, opens the game window. Options:
+  --vsync | --no-vsync   VSync on (default) or off (tearing, else mailbox)
+  --fps-cap <fps>        frame limiter (sleep, then spin, to exact deadlines)
+  --gpu <name>           prefer a GPU whose name contains <name> (or RUTHENIUM_GPU)
+  --validation | --no-validation
+                         Vulkan validation layer (default: on in debug builds if
+                         installed; RUTHENIUM_VALIDATION=1 requires it)
+  --stats                print frame-time statistics every second
+  --quit-after <s>       close after <s> seconds (for benchmarks and tests)
+  --exercise-swapchain   resize and toggle VSync every few frames (development)
+In the window, V toggles VSync.
+
 commands:
+  version
+      Print the version and the disclaimer.
   locate  [--from <folder>]
       List the launcher folders searched for a verified game install.
   prepare [--from <folder>] [--data-dir <folder>] [--java <java>] [--exporters <jar>]
@@ -22,16 +38,31 @@ commands:
       only what is out of date.";
 
 fn main() -> ExitCode {
+    let started = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        None => {
+        Some("version") => {
             println!("Ruthenium {}", env!("CARGO_PKG_VERSION"));
             println!("{DISCLAIMER}");
             ExitCode::SUCCESS
         }
         Some("locate") => prepare_cmd::locate(&args[1..]),
         Some("prepare") => prepare_cmd::prepare(&args[1..]),
-        Some(_) => {
+        Some("help" | "--help" | "-h") => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        a if a.is_none_or(|a| a.starts_with("--")) => match client::Options::parse(&args) {
+            Ok(opts) => {
+                println!("Ruthenium {} - {DISCLAIMER}", env!("CARGO_PKG_VERSION"));
+                client::run(&opts, started)
+            }
+            Err(e) => {
+                eprintln!("ruthenium: {e}\n\n{USAGE}");
+                ExitCode::FAILURE
+            }
+        },
+        _ => {
             eprintln!("{USAGE}");
             ExitCode::FAILURE
         }

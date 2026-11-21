@@ -1,0 +1,708 @@
+use std::ffi::{CStr, c_char};
+
+use ash::vk;
+use ash::vk::TaggedStructure;
+
+use crate::instance::Instance;
+use crate::{Error, VkContext};
+
+/// Provisional in the registry, so ash only has it behind a feature; it is just a name here.
+const PORTABILITY_SUBSET: &CStr = c"VK_KHR_portability_subset";
+
+/// How to pick among several GPUs.
+#[derive(Clone, Debug, Default)]
+pub struct GpuOptions {
+    /// Case-insensitive substring of the device name (`"nvidia"`, `"intel"`, `"4060"`).
+    /// A matching suitable GPU wins over the default order; `None` or `"auto"` keeps it.
+    pub prefer: Option<String>,
+}
+
+/// A GPU that was not chosen because it misses part of the baseline.
+#[derive(Clone, Debug)]
+pub struct Rejected {
+    pub name: String,
+    pub reasons: Vec<String>,
+}
+
+/// What the chosen GPU and driver can do beyond the baseline. Every optional path is gated
+/// on one of these bits and has a fallback.
+#[derive(Clone, Debug, Default)]
+pub struct DeviceCaps {
+    pub name: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub device_type: vk::PhysicalDeviceType,
+    pub driver_id: vk::DriverId,
+    /// Driver name and version string as the driver reports them.
+    pub driver: String,
+    pub api_version: u32,
+    pub pipeline_cache_uuid: [u8; vk::UUID_SIZE],
+    /// Nanoseconds per timestamp tick, and whether the graphics queue writes timestamps.
+    pub timestamp_period_ns: f32,
+    pub timestamps: bool,
+    /// All device-local memory is also host-visible (integrated GPUs, Apple, ARM).
+    pub unified_memory: bool,
+    /// A queue family with transfer but no graphics, for background uploads.
+    pub transfer_family: Option<u32>,
+    pub portability_subset: bool,
+    pub present_id: bool,
+    pub present_wait: bool,
+    pub present_id2: bool,
+    pub present_wait2: bool,
+    pub present_timing: bool,
+    pub swapchain_maintenance1: bool,
+    pub memory_budget: bool,
+    pub calibrated_timestamps: bool,
+    pub low_latency2: bool,
+    pub anti_lag: bool,
+}
+
+/// The logical device, its graphics queue and the window surface. Shared (`Arc`) by
+/// everything that creates GPU objects; it is destroyed after all of them.
+pub struct Gpu {
+    pub(crate) device: ash::Device,
+    pub(crate) swapchain_fn: ash::khr::swapchain::Device,
+    /// Present when the device is Vulkan 1.2; on 1.3 the core entry points are used.
+    sync2_fn: Option<ash::khr::synchronization2::Device>,
+    dynamic_rendering_fn: Option<ash::khr::dynamic_rendering::Device>,
+    pub(crate) physical: vk::PhysicalDevice,
+    pub(crate) queue: vk::Queue,
+    pub(crate) queue_family: u32,
+    pub(crate) surface: vk::SurfaceKHR,
+    caps: DeviceCaps,
+    pub(crate) instance: Instance,
+}
+
+impl std::fmt::Debug for Gpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gpu")
+            .field("caps", &self.caps)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: Vulkan handles and ash's function tables may be used from any thread; Ruthenium
+// externally synchronises queue access (one submitting thread), as Vulkan requires.
+unsafe impl Send for Gpu {}
+unsafe impl Sync for Gpu {}
+
+/// Everything learnt about one physical device while checking it against the baseline.
+struct Candidate {
+    physical: vk::PhysicalDevice,
+    queue_family: u32,
+    caps: DeviceCaps,
+    /// Extensions to enable (all checked to be present).
+    extensions: Vec<&'static CStr>,
+    core13: bool,
+}
+
+/// A baseline feature: its name for diagnostics and how to read it from the query.
+type FeatureCheck = (&'static str, fn(&Features) -> bool);
+
+#[derive(Default)]
+struct Features {
+    core: vk::PhysicalDeviceFeatures,
+    shader_draw_parameters: bool,
+    timeline_semaphore: bool,
+    host_query_reset: bool,
+    runtime_descriptor_array: bool,
+    sampled_image_array_non_uniform_indexing: bool,
+    descriptor_binding_partially_bound: bool,
+    descriptor_binding_variable_descriptor_count: bool,
+    descriptor_binding_sampled_image_update_after_bind: bool,
+    dynamic_rendering: bool,
+    synchronization2: bool,
+}
+
+const REQUIRED_FEATURES: &[FeatureCheck] = &[
+    ("dynamicRendering", |f| f.dynamic_rendering),
+    ("synchronization2", |f| f.synchronization2),
+    ("timelineSemaphore", |f| f.timeline_semaphore),
+    ("multiDrawIndirect", |f| {
+        f.core.multi_draw_indirect == vk::TRUE
+    }),
+    ("drawIndirectFirstInstance", |f| {
+        f.core.draw_indirect_first_instance == vk::TRUE
+    }),
+    ("shaderDrawParameters", |f| f.shader_draw_parameters),
+    ("runtimeDescriptorArray", |f| f.runtime_descriptor_array),
+    ("shaderSampledImageArrayNonUniformIndexing", |f| {
+        f.sampled_image_array_non_uniform_indexing
+    }),
+    ("descriptorBindingPartiallyBound", |f| {
+        f.descriptor_binding_partially_bound
+    }),
+    ("descriptorBindingVariableDescriptorCount", |f| {
+        f.descriptor_binding_variable_descriptor_count
+    }),
+    ("descriptorBindingSampledImageUpdateAfterBind", |f| {
+        f.descriptor_binding_sampled_image_update_after_bind
+    }),
+    ("samplerAnisotropy", |f| {
+        f.core.sampler_anisotropy == vk::TRUE
+    }),
+    ("hostQueryReset", |f| f.host_query_reset),
+];
+
+impl Gpu {
+    /// Picks a GPU that meets the baseline and can present to `surface`, and creates the
+    /// device. Takes ownership of `surface` (destroyed with the Gpu), whose window must
+    /// outlive the returned Gpu.
+    pub fn new(
+        instance: Instance,
+        surface: vk::SurfaceKHR,
+        options: &GpuOptions,
+    ) -> Result<Gpu, Error> {
+        let result = Self::create(&instance, surface, options);
+        match result {
+            Ok(parts) => Ok(Gpu::assemble(instance, surface, parts)),
+            Err(e) => {
+                // SAFETY: nothing else uses the surface; it was created from this instance.
+                unsafe { instance.surface_fn.destroy_surface(surface, None) };
+                Err(e)
+            }
+        }
+    }
+
+    fn create(
+        instance: &Instance,
+        surface: vk::SurfaceKHR,
+        options: &GpuOptions,
+    ) -> Result<(Candidate, ash::Device), Error> {
+        // SAFETY: plain instance query.
+        let physicals = unsafe { instance.raw.enumerate_physical_devices() }
+            .ctx("vkEnumeratePhysicalDevices")?;
+        let mut rejected = Vec::new();
+        let mut candidates = Vec::new();
+        for pd in physicals {
+            match evaluate(instance, pd, surface) {
+                Ok(c) => candidates.push(c),
+                Err(r) => rejected.push(r),
+            }
+        }
+        let prefer = options
+            .prefer
+            .as_deref()
+            .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("auto"));
+        let chosen =
+            pick(&mut candidates, prefer).ok_or(Error::NoSuitableDevice(rejected.clone()))?;
+        if let Some(p) = prefer
+            && !chosen.caps.name.to_lowercase().contains(&p.to_lowercase())
+        {
+            eprintln!(
+                "[gpu] no suitable GPU matches \"{p}\"; using {}",
+                chosen.caps.name
+            );
+        }
+        for r in &rejected {
+            eprintln!("[gpu] skipped {}: {}", r.name, r.reasons.join(", "));
+        }
+        let device = create_device(instance, &chosen)?;
+        Ok((chosen, device))
+    }
+
+    fn assemble(
+        instance: Instance,
+        surface: vk::SurfaceKHR,
+        (c, device): (Candidate, ash::Device),
+    ) -> Gpu {
+        // SAFETY: the device was created with one queue in this family.
+        let queue = unsafe { device.get_device_queue(c.queue_family, 0) };
+        let swapchain_fn = ash::khr::swapchain::Device::load(&instance.raw, &device);
+        let (sync2_fn, dynamic_rendering_fn) = if c.core13 {
+            (None, None)
+        } else {
+            (
+                Some(ash::khr::synchronization2::Device::load(
+                    &instance.raw,
+                    &device,
+                )),
+                Some(ash::khr::dynamic_rendering::Device::load(
+                    &instance.raw,
+                    &device,
+                )),
+            )
+        };
+        Gpu {
+            device,
+            swapchain_fn,
+            sync2_fn,
+            dynamic_rendering_fn,
+            physical: c.physical,
+            queue,
+            queue_family: c.queue_family,
+            surface,
+            caps: c.caps,
+            instance,
+        }
+    }
+
+    pub fn caps(&self) -> &DeviceCaps {
+        &self.caps
+    }
+
+    pub fn device(&self) -> &ash::Device {
+        &self.device
+    }
+
+    pub fn queue_family(&self) -> u32 {
+        self.queue_family
+    }
+
+    /// Whether the validation layer is active.
+    pub fn validating(&self) -> bool {
+        self.instance.validating()
+    }
+
+    /// `vkCmdPipelineBarrier2` (core 1.3 or KHR).
+    ///
+    /// # Safety
+    /// As `vkCmdPipelineBarrier2`.
+    pub unsafe fn cmd_pipeline_barrier2(
+        &self,
+        cmd: vk::CommandBuffer,
+        info: &vk::DependencyInfo<'_>,
+    ) {
+        // SAFETY: forwarded to the caller.
+        unsafe {
+            match &self.sync2_fn {
+                Some(f) => f.cmd_pipeline_barrier2(cmd, info),
+                None => self.device.cmd_pipeline_barrier2(cmd, info),
+            }
+        }
+    }
+
+    /// `vkCmdWriteTimestamp2` (core 1.3 or KHR).
+    ///
+    /// # Safety
+    /// As `vkCmdWriteTimestamp2`.
+    pub unsafe fn cmd_write_timestamp2(
+        &self,
+        cmd: vk::CommandBuffer,
+        stage: vk::PipelineStageFlags2,
+        pool: vk::QueryPool,
+        query: u32,
+    ) {
+        // SAFETY: forwarded to the caller.
+        unsafe {
+            match &self.sync2_fn {
+                Some(f) => f.cmd_write_timestamp2(cmd, stage, pool, query),
+                None => self.device.cmd_write_timestamp2(cmd, stage, pool, query),
+            }
+        }
+    }
+
+    /// `vkQueueSubmit2` on the graphics queue (core 1.3 or KHR).
+    ///
+    /// # Safety
+    /// As `vkQueueSubmit2`; the caller is the only thread submitting to this queue.
+    pub(crate) unsafe fn queue_submit2(
+        &self,
+        submits: &[vk::SubmitInfo2<'_>],
+    ) -> Result<(), Error> {
+        // SAFETY: forwarded to the caller.
+        unsafe {
+            match &self.sync2_fn {
+                Some(f) => f.queue_submit2(self.queue, submits, vk::Fence::null()),
+                None => self
+                    .device
+                    .queue_submit2(self.queue, submits, vk::Fence::null()),
+            }
+        }
+        .ctx("vkQueueSubmit2")
+    }
+
+    /// `vkCmdBeginRendering` (core 1.3 or KHR).
+    ///
+    /// # Safety
+    /// As `vkCmdBeginRendering`.
+    pub unsafe fn cmd_begin_rendering(&self, cmd: vk::CommandBuffer, info: &vk::RenderingInfo<'_>) {
+        // SAFETY: forwarded to the caller.
+        unsafe {
+            match &self.dynamic_rendering_fn {
+                Some(f) => f.cmd_begin_rendering(cmd, info),
+                None => self.device.cmd_begin_rendering(cmd, info),
+            }
+        }
+    }
+
+    /// `vkCmdEndRendering` (core 1.3 or KHR).
+    ///
+    /// # Safety
+    /// As `vkCmdEndRendering`.
+    pub unsafe fn cmd_end_rendering(&self, cmd: vk::CommandBuffer) {
+        // SAFETY: forwarded to the caller.
+        unsafe {
+            match &self.dynamic_rendering_fn {
+                Some(f) => f.cmd_end_rendering(cmd),
+                None => self.device.cmd_end_rendering(cmd),
+            }
+        }
+    }
+}
+
+impl Drop for Gpu {
+    fn drop(&mut self) {
+        // SAFETY: every object created from this device is owned by something holding an
+        // Arc<Gpu>, so all of them are gone; waiting idle covers work still queued.
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
+            self.instance.surface_fn.destroy_surface(self.surface, None);
+        }
+    }
+}
+
+/// Default order: discrete, then integrated, then virtual, then software; a preferred name
+/// match comes first. Ties keep enumeration order (the OS's GPU preference on Windows).
+fn pick(candidates: &mut Vec<Candidate>, prefer: Option<&str>) -> Option<Candidate> {
+    let rank = |t: vk::PhysicalDeviceType| match t {
+        vk::PhysicalDeviceType::DISCRETE_GPU => 0,
+        vk::PhysicalDeviceType::INTEGRATED_GPU => 1,
+        vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+        vk::PhysicalDeviceType::OTHER => 3,
+        _ => 4,
+    };
+    let prefer = prefer.map(str::to_lowercase);
+    let best = (0..candidates.len()).min_by_key(|&i| {
+        let c = &candidates[i].caps;
+        let matches = prefer
+            .as_ref()
+            .is_some_and(|p| c.name.to_lowercase().contains(p.as_str()));
+        (!matches, rank(c.device_type), i)
+    })?;
+    Some(candidates.swap_remove(best))
+}
+
+fn evaluate(
+    instance: &Instance,
+    pd: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+) -> Result<Candidate, Rejected> {
+    let raw = &instance.raw;
+    let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push(&mut driver_props);
+    // SAFETY: the instance is at least 1.2 (checked at creation); the chain is valid.
+    unsafe { raw.get_physical_device_properties2(pd, &mut props2) };
+    let props = props2.properties;
+    let name = props
+        .device_name_as_c_str()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut reasons = Vec::new();
+    let reject = |name: String, reasons: Vec<String>| Rejected { name, reasons };
+
+    if props.api_version < vk::API_VERSION_1_2 {
+        reasons.push(format!(
+            "driver supports Vulkan {} (needs 1.2)",
+            crate::version_string(props.api_version)
+        ));
+        return Err(reject(name, reasons));
+    }
+    let core13 = props.api_version >= vk::API_VERSION_1_3;
+
+    // SAFETY: plain query.
+    let exts = unsafe { raw.enumerate_device_extension_properties(pd) }.unwrap_or_default();
+    let has = |n: &CStr| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(n));
+
+    let mut extensions: Vec<&'static CStr> = vec![ash::khr::swapchain::NAME];
+    if !has(ash::khr::swapchain::NAME) {
+        reasons.push("no VK_KHR_swapchain".into());
+    }
+    let has_dynamic_rendering = core13 || has(ash::khr::dynamic_rendering::NAME);
+    let has_sync2 = core13 || has(ash::khr::synchronization2::NAME);
+    if !core13 {
+        for n in [
+            ash::khr::dynamic_rendering::NAME,
+            ash::khr::synchronization2::NAME,
+        ] {
+            if has(n) {
+                extensions.push(n);
+            }
+        }
+    }
+    let portability_subset = has(PORTABILITY_SUBSET);
+    if portability_subset {
+        extensions.push(PORTABILITY_SUBSET);
+    }
+
+    let features = query_features(raw, pd, core13, has_dynamic_rendering, has_sync2);
+    for (feature, check) in REQUIRED_FEATURES {
+        if !check(&features) {
+            reasons.push(format!("no {feature}"));
+        }
+    }
+
+    // A queue family that does graphics and compute and can present to our surface.
+    // SAFETY: plain queries.
+    let families = unsafe { raw.get_physical_device_queue_family_properties(pd) };
+    let gfx = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
+    let queue_family = families.iter().enumerate().find_map(|(i, f)| {
+        let i = i as u32;
+        let presents = unsafe {
+            instance
+                .surface_fn
+                .get_physical_device_surface_support(pd, i, surface)
+        }
+        .unwrap_or(false);
+        (f.queue_flags.contains(gfx) && presents).then_some(i)
+    });
+    let Some(queue_family) = queue_family else {
+        reasons.push("cannot present to this window".into());
+        return Err(reject(name, reasons));
+    };
+    // SAFETY: plain queries.
+    let formats = unsafe {
+        instance
+            .surface_fn
+            .get_physical_device_surface_formats(pd, surface)
+    }
+    .unwrap_or_default();
+    if formats.is_empty() {
+        reasons.push("no surface formats for this window".into());
+    }
+    if !reasons.is_empty() {
+        return Err(reject(name, reasons));
+    }
+
+    let transfer_family = families
+        .iter()
+        .position(|f| {
+            f.queue_flags.contains(vk::QueueFlags::TRANSFER) && !f.queue_flags.intersects(gfx)
+        })
+        .map(|i| i as u32);
+    // SAFETY: plain query.
+    let memory = unsafe { raw.get_physical_device_memory_properties(pd) };
+    let unified_memory = memory.memory_types_as_slice().iter().all(|t| {
+        !t.property_flags
+            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            || t.property_flags
+                .contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+    });
+    let driver_name = driver_props
+        .driver_name_as_c_str()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let driver_info = driver_props
+        .driver_info_as_c_str()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    let caps = DeviceCaps {
+        name,
+        vendor_id: props.vendor_id,
+        device_id: props.device_id,
+        device_type: props.device_type,
+        driver_id: driver_props.driver_id,
+        driver: format!("{driver_name} {driver_info}").trim().to_owned(),
+        api_version: props.api_version,
+        pipeline_cache_uuid: props.pipeline_cache_uuid,
+        timestamp_period_ns: props.limits.timestamp_period,
+        timestamps: families[queue_family as usize].timestamp_valid_bits > 0,
+        unified_memory,
+        transfer_family,
+        portability_subset,
+        present_id: has(ash::khr::present_id::NAME),
+        present_wait: has(ash::khr::present_wait::NAME),
+        present_id2: has(ash::khr::present_id2::NAME),
+        present_wait2: has(ash::khr::present_wait2::NAME),
+        present_timing: has(ash::ext::present_timing::NAME),
+        swapchain_maintenance1: has(ash::khr::swapchain_maintenance1::NAME)
+            || has(ash::ext::swapchain_maintenance1::NAME),
+        memory_budget: has(ash::ext::memory_budget::NAME),
+        calibrated_timestamps: has(ash::khr::calibrated_timestamps::NAME)
+            || has(ash::ext::calibrated_timestamps::NAME),
+        low_latency2: has(ash::nv::low_latency2::NAME),
+        anti_lag: has(ash::amd::anti_lag::NAME),
+    };
+    Ok(Candidate {
+        physical: pd,
+        queue_family,
+        caps,
+        extensions,
+        core13,
+    })
+}
+
+fn query_features(
+    raw: &ash::Instance,
+    pd: vk::PhysicalDevice,
+    core13: bool,
+    dyn_ext: bool,
+    sync2_ext: bool,
+) -> Features {
+    let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
+    let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+    let mut dynr = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+    let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default();
+    let core = {
+        let mut f2 = vk::PhysicalDeviceFeatures2::default()
+            .push(&mut f11)
+            .push(&mut f12);
+        // Only chain structs the device knows (core 1.3, or its extension is present).
+        if core13 {
+            f2 = f2.push(&mut f13);
+        } else {
+            if dyn_ext {
+                f2 = f2.push(&mut dynr);
+            }
+            if sync2_ext {
+                f2 = f2.push(&mut sync2);
+            }
+        }
+        // SAFETY: the chain only holds structs valid for this device.
+        unsafe { raw.get_physical_device_features2(pd, &mut f2) };
+        f2.features
+    };
+    let t = |b: vk::Bool32| b == vk::TRUE;
+    Features {
+        core,
+        shader_draw_parameters: t(f11.shader_draw_parameters),
+        timeline_semaphore: t(f12.timeline_semaphore),
+        host_query_reset: t(f12.host_query_reset),
+        runtime_descriptor_array: t(f12.runtime_descriptor_array),
+        sampled_image_array_non_uniform_indexing: t(
+            f12.shader_sampled_image_array_non_uniform_indexing
+        ),
+        descriptor_binding_partially_bound: t(f12.descriptor_binding_partially_bound),
+        descriptor_binding_variable_descriptor_count: t(
+            f12.descriptor_binding_variable_descriptor_count
+        ),
+        descriptor_binding_sampled_image_update_after_bind: t(
+            f12.descriptor_binding_sampled_image_update_after_bind
+        ),
+        dynamic_rendering: if core13 {
+            t(f13.dynamic_rendering)
+        } else {
+            t(dynr.dynamic_rendering)
+        },
+        synchronization2: if core13 {
+            t(f13.synchronization2)
+        } else {
+            t(sync2.synchronization2)
+        },
+    }
+}
+
+fn create_device(instance: &Instance, c: &Candidate) -> Result<ash::Device, Error> {
+    let core = vk::PhysicalDeviceFeatures::default()
+        .multi_draw_indirect(true)
+        .draw_indirect_first_instance(true)
+        .sampler_anisotropy(true);
+    let mut f11 = vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+    let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
+        .timeline_semaphore(true)
+        .host_query_reset(true)
+        .runtime_descriptor_array(true)
+        .shader_sampled_image_array_non_uniform_indexing(true)
+        .descriptor_binding_partially_bound(true)
+        .descriptor_binding_variable_descriptor_count(true)
+        .descriptor_binding_sampled_image_update_after_bind(true);
+    let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
+        .dynamic_rendering(true)
+        .synchronization2(true);
+    let mut dynr = vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+    let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+    let mut f2 = vk::PhysicalDeviceFeatures2::default()
+        .features(core)
+        .push(&mut f11)
+        .push(&mut f12);
+    f2 = if c.core13 {
+        f2.push(&mut f13)
+    } else {
+        f2.push(&mut dynr).push(&mut sync2)
+    };
+
+    let priorities = [1.0f32];
+    let queues = [vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(c.queue_family)
+        .queue_priorities(&priorities)];
+    let ext_ptrs: Vec<*const c_char> = c.extensions.iter().map(|e| e.as_ptr()).collect();
+    // SAFETY: f2's chain is made of live, valid feature structs (built just above).
+    let info = unsafe {
+        vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queues)
+            .enabled_extension_names(&ext_ptrs)
+            .extend(&mut f2)
+    };
+    // SAFETY: every enabled feature and extension was checked in evaluate().
+    unsafe { instance.raw.create_device(c.physical, &info, None) }.ctx("vkCreateDevice")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(name: &str, device_type: vk::PhysicalDeviceType) -> Candidate {
+        Candidate {
+            physical: vk::PhysicalDevice::null(),
+            queue_family: 0,
+            caps: DeviceCaps {
+                name: name.into(),
+                device_type,
+                ..DeviceCaps::default()
+            },
+            extensions: Vec::new(),
+            core13: true,
+        }
+    }
+
+    fn lab() -> Vec<Candidate> {
+        vec![
+            candidate(
+                "llvmpipe (LLVM 23.1.5, 256 bits)",
+                vk::PhysicalDeviceType::CPU,
+            ),
+            candidate(
+                "Intel(R) UHD Graphics (ADL-S GT0.5)",
+                vk::PhysicalDeviceType::INTEGRATED_GPU,
+            ),
+            candidate(
+                "NVIDIA GeForce RTX 4060 Laptop GPU",
+                vk::PhysicalDeviceType::DISCRETE_GPU,
+            ),
+        ]
+    }
+
+    #[test]
+    fn discrete_first_then_integrated_then_software() {
+        let mut c = lab();
+        assert!(pick(&mut c, None).unwrap().caps.name.starts_with("NVIDIA"));
+        assert!(pick(&mut c, None).unwrap().caps.name.starts_with("Intel"));
+        assert!(
+            pick(&mut c, None)
+                .unwrap()
+                .caps
+                .name
+                .starts_with("llvmpipe")
+        );
+        assert!(pick(&mut c, None).is_none());
+    }
+
+    #[test]
+    fn a_name_match_wins() {
+        assert!(
+            pick(&mut lab(), Some("intel"))
+                .unwrap()
+                .caps
+                .name
+                .starts_with("Intel")
+        );
+        assert!(
+            pick(&mut lab(), Some("LLVMPIPE"))
+                .unwrap()
+                .caps
+                .name
+                .starts_with("llvmpipe")
+        );
+        // No match: the default order.
+        assert!(
+            pick(&mut lab(), Some("radeon"))
+                .unwrap()
+                .caps
+                .name
+                .starts_with("NVIDIA")
+        );
+    }
+}

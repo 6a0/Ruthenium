@@ -22,3 +22,8 @@ todo = "warn"
 lto = "thin"
 codegen-units = 1
 debug = "line-tables-only"
+
+# ash master has the Vulkan 1.4.3xx extensions crates.io 0.38 lacks (present_id2/wait2,
+# present_timing, anti_lag). Patched so gpu-allocator links the same ash.
+[patch.crates-io]
+ash = { git = "https://github.com/ash-rs/ash", rev = "80e5856982af6651d56337f9a10e46308145c2d2" }

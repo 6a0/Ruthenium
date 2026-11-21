@@ -1,0 +1,30 @@
+[package]
+name = "ruthenium-platform"
+description = "Ruthenium's platform layer: SDL3 window, events, Vulkan surface, precise sleep"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Build SDL3 from source and link it statically (needs CMake and, on Linux, the
+# X11/Wayland development headers). Always on for Windows and macOS, where there
+# is no system SDL3; Linux links the system library unless this is set.
+sdl-static = ["sdl3-sys/build-from-source-static", "sdl-trim"]
+# Leaves out the SDL subsystems Ruthenium doesn't use (audio is cpal's, rendering
+# is Vulkan, vanilla has no controller support). Only affects source builds.
+sdl-trim = ["sdl3-sys/no-sdl-audio", "sdl3-sys/no-sdl-camera", "sdl3-sys/no-sdl-gpu", "sdl3-sys/no-sdl-haptic", "sdl3-sys/no-sdl-hidapi", "sdl3-sys/no-sdl-joystick", "sdl3-sys/no-sdl-render", "sdl3-sys/no-sdl-sensor", "sdl3-sys/no-sdl-tray"]
+
+[dependencies]
+ash = { version = "0.38.0", default-features = false, features = ["std"] }
+sdl3-sys = "0.7.3"
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+sdl3-sys = { version = "0.7.3", features = ["build-from-source-static", "no-sdl-audio", "no-sdl-camera", "no-sdl-gpu", "no-sdl-haptic", "no-sdl-hidapi", "no-sdl-joystick", "no-sdl-render", "no-sdl-sensor", "no-sdl-tray"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

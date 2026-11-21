@@ -1,0 +1,16 @@
+[package]
+name = "ruthenium-render"
+description = "Ruthenium's renderer: frame recording, passes and frame statistics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+profiling = "1.0.18"
+ruthenium-gpu = { path = "../ruthenium-gpu" }
+ruthenium-platform = { path = "../ruthenium-platform" }

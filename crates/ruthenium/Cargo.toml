@@ -10,5 +10,15 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Stream CPU zones and frame marks to the Tracy profiler.
+tracy = ["profiling/profile-with-tracy"]
+# Build SDL3 from source and link it statically (always on for Windows and macOS).
+sdl-static = ["ruthenium-platform/sdl-static"]
+
 [dependencies]
+profiling = "1.0.18"
+ruthenium-gpu = { path = "../ruthenium-gpu" }
+ruthenium-platform = { path = "../ruthenium-platform" }
 ruthenium-prepare = { path = "../ruthenium-prepare" }
+ruthenium-render = { path = "../ruthenium-render" }

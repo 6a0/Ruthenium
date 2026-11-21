@@ -10,7 +10,7 @@ Ruthenium is an open-source client for **Minecraft: Java Edition** (currently ta
 
 ## Status
 
-**Pre-alpha. Nothing is playable yet.** Work is at Stage 0: workspace, CI, game-file import, code generation, golden traces of the vanilla client and its baseline measurements ([docs/baseline.md](docs/baseline.md)).
+**Pre-alpha. Nothing is playable yet.** Stage 0 is done: workspace, CI, game-file import, code generation, golden traces of the vanilla client and its baseline measurements ([docs/baseline.md](docs/baseline.md)). Stage 1, the engine skeleton, has started: `cargo run -p ruthenium` opens an empty Vulkan window with a paced frame loop.
 
 ## How Ruthenium treats Mojang's content and accounts
 
@@ -28,6 +28,16 @@ cargo build
 cargo test --workspace
 cargo xtask check-content   # make sure no Mojang content is in the tree
 ```
+
+The window and input use SDL3, and rendering uses Vulkan (on macOS, Vulkan runs on Metal through MoltenVK). On Windows and macOS, SDL3 is built from source and linked statically, so you need CMake. On Linux, either install the SDL3 development package (Fedora `SDL3-devel`, Debian/Ubuntu `libsdl3-dev`), or build SDL3 from source with `--features ruthenium/sdl-static` (needs CMake and the X11 and Wayland development headers).
+
+```sh
+cargo run -p ruthenium -- --stats             # open the window; print frame-time statistics every second
+cargo run -p ruthenium -- --no-vsync --stats  # uncapped; --fps-cap 240 adds the frame limiter
+cargo run -p ruthenium -- --help
+```
+
+Debug builds turn on the Vulkan validation layer if it is installed (Fedora `vulkan-validation-layers`, Debian/Ubuntu `vulkan-validationlayers`). Set `RUTHENIUM_VALIDATION=1` to make it required.
 
 The per-version tables in `crates/ruthenium-data` (packet ids, registries, block states, entity-data serializer ids) are generated and committed, so building needs no game files. To regenerate them, run `cargo xtask codegen`. It needs JDK 25 and the official client jar (see below), and runs Mojang's data generator from that jar.
 
