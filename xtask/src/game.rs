@@ -36,6 +36,8 @@ pub struct Launch {
     pub mods: Vec<PathBuf>,
     pub jvm_args: Vec<String>,
     pub game_args: Vec<String>,
+    /// Environment changes: `Some` sets a variable, `None` removes it.
+    pub env: Vec<(String, Option<String>)>,
     pub width: u32,
     pub height: u32,
 }
@@ -164,6 +166,13 @@ impl Game {
             .args(["--width", &launch.width.to_string()])
             .args(["--height", &launch.height.to_string()])
             .args(&launch.game_args);
+
+        for (key, value) in &launch.env {
+            match value {
+                Some(v) => cmd.env(key, v),
+                None => cmd.env_remove(key),
+            };
+        }
 
         let log_path = game_dir.join("launch.log");
         let log =

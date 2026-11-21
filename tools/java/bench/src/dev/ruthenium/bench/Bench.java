@@ -93,6 +93,11 @@ public final class Bench {
         }
     }
 
+    /** True when cargo xtask bench started this client: the player's input is then ignored. */
+    public static boolean isActive() {
+        return active != null;
+    }
+
     /** World loading and saving show screens, which render frames from inside our own call. */
     private static boolean inFrame;
 
@@ -274,8 +279,8 @@ public final class Bench {
     private void applyMotion(Minecraft mc, long now) {
         if (scene.equals("fly")) {
             keepFlying(mc);
-            // Re-asserted every frame: vanilla resets key states to the physical keys when it grabs
-            // the mouse or opens a screen.
+            // Re-asserted every frame: vanilla resets key states to the physical keys when it opens a
+            // screen.
             mc.options.keyUp.setDown(true);
             mc.options.keySprint.setDown(true);
         }

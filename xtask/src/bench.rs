@@ -4,7 +4,8 @@
 //! Fabric Loader and one tiny mod, `tools/java/bench`: a single hook at the
 //! end of each frame that drives the scene and records frame intervals. No
 //! Fabric API is loaded. From outside, this task samples the process's
-//! resident memory (`/proc`) and its GPU memory (`nvidia-smi`, when present).
+//! resident memory (`/proc`) and the GPU's memory, clock and throttling (see
+//! [`crate::gpu`]; `--gpu` picks the GPU on a hybrid laptop).
 //!
 //! - `bench setup` creates the benchmark world from a fixed seed and
 //!   pre-generates the fly path; it is kept as a template in `cache/bench`.
@@ -18,6 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use crate::gpu::{self, Gpu};
 use crate::{game, mods};
 
 const WORLD: &str = "ruthenium-bench";
@@ -39,6 +41,7 @@ struct Options {
     results: Option<PathBuf>,
     screenshot: bool,
     render_distance: u32,
+    gpu: Gpu,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -55,6 +58,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         results: None,
         screenshot: false,
         render_distance: 12,
+        gpu: Gpu::Auto,
     };
     let list = |v: &str| v.split(',').map(str::to_owned).collect::<Vec<_>>();
     let mut it = args.iter();
@@ -77,6 +81,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--render-distance" => o.render_distance = num(value)? as u32,
             "--java" => o.java = Some(PathBuf::from(value)),
             "--results" => o.results = Some(PathBuf::from(value)),
+            "--gpu" => o.gpu = Gpu::parse(value)?,
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -207,6 +212,7 @@ fn launch(
             format!("-Druthenium.bench.screenshot={}", o.screenshot),
         ],
         game_args,
+        env: o.gpu.env()?,
         width: o.width,
         height: o.height,
     };
@@ -228,17 +234,16 @@ fn launch(
                 game_dir.join("launch.log").display()
             ));
         }
-        let (rss, vram) = (rss_kib(pid), vram_mib(pid));
-        let (gpu_temp, gpu_reasons, gpu_clock) = gpu_state().unwrap_or((None, None, None));
+        let (rss, g) = (rss_kib(pid), o.gpu.sample(pid));
         samples.push(json!([
             epoch_ms(),
             rss,
-            vram,
+            g.mem_mib,
             cpu_temp_c(),
             cpu_mhz(),
-            gpu_temp,
-            gpu_reasons,
-            gpu_clock
+            g.temp_c,
+            g.reasons,
+            g.clock_mhz
         ]));
         std::thread::sleep(Duration::from_millis(500));
     };
@@ -251,7 +256,20 @@ fn launch(
     })?;
     let mut v: Value =
         serde_json::from_str(&text).map_err(|e| format!("{}: {e}", out.display()))?;
+    let (vendor, name) = (
+        v["device"]["vendor"].as_str().unwrap_or(""),
+        v["device"]["name"].as_str().unwrap_or(""),
+    );
+    if !o.gpu.matches(vendor, name) {
+        return Err(format!(
+            "{} {}: asked for the {} GPU, but the game used {name:?} ({vendor})",
+            run.backend,
+            run.scene,
+            o.gpu.name()
+        ));
+    }
     v["backendRequested"] = json!(run.backend);
+    v["gpuRequested"] = json!(o.gpu.name());
     v["samples"] = Value::Array(samples);
     std::fs::write(&out, serde_json::to_string(&v).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
@@ -298,42 +316,8 @@ fn cpu_mhz() -> Option<f64> {
     mean(&mhz).map(|m| m.round())
 }
 
-/// GPU temperature, throttle reasons (a hex bit mask) and graphics clock.
-#[allow(clippy::type_complexity)]
-fn gpu_state() -> Option<(Option<f64>, Option<String>, Option<f64>)> {
-    let out = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=temperature.gpu,clocks_event_reasons.active,clocks.gr",
-            "--format=csv,noheader,nounits",
-        ])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut f = text.lines().next()?.split(',').map(str::trim);
-    Some((
-        f.next().and_then(|v| v.parse().ok()),
-        f.next().map(str::to_owned),
-        f.next().and_then(|v| v.parse().ok()),
-    ))
-}
-
-/// Thermal and hardware slowdown bits of NVIDIA's throttle reasons (not
-/// idle, not the normal software power cap).
-const GPU_SLOWDOWN_BITS: u64 = 0x08 | 0x20 | 0x40 | 0x80;
-
-/// GPU memory of one process from `nvidia-smi`'s process table.
-fn vram_mib(pid: u32) -> Option<u64> {
-    let out = Command::new("nvidia-smi").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let pid = pid.to_string();
-    let line = text
-        .lines()
-        .find(|l| l.split_whitespace().nth(4) == Some(pid.as_str()))?;
-    let mib = line.split_whitespace().rev().nth(1)?;
-    mib.strip_suffix("MiB")?.parse().ok()
-}
-
 fn prepare(root: &Path, o: &Options) -> Result<(game::Game, PathBuf), String> {
+    o.gpu.env()?; // fail before any results are written if the GPU isn't there
     let game = game::locate(o.java.as_deref())?;
     println!("bench: {} from {}", game.java_description, game.launcher);
     let jar = mods::build(root, "bench", &[])?;
@@ -383,7 +367,7 @@ fn run_all(root: &Path, o: &Options) -> Result<(), String> {
             .join(format!("{}", epoch_ms() / 1000))
     });
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    std::fs::write(dir.join("machine.json"), machine(&game).to_string())
+    std::fs::write(dir.join("machine.json"), machine(&game, o).to_string())
         .map_err(|e| e.to_string())?;
     for rep in 1..=o.reps {
         for backend in &o.backends {
@@ -425,7 +409,7 @@ fn read_trim(path: &str) -> Option<String> {
 }
 
 /// What the numbers depend on, recorded next to them.
-fn machine(game: &game::Game) -> Value {
+fn machine(game: &game::Game, o: &Options) -> Value {
     json!({
         "cpu": command_line("sh", &["-c", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2"]),
         "cpus": std::thread::available_parallelism().map(|n| n.get()).ok(),
@@ -436,6 +420,11 @@ fn machine(game: &game::Game) -> Value {
         "platformProfile": read_trim("/sys/firmware/acpi/platform_profile"),
         "powerProfile": command_line("powerprofilesctl", &["get"]),
         "gpu": command_line("nvidia-smi", &["--query-gpu=name,driver_version,memory.total,power.limit", "--format=csv,noheader"]),
+        "gpuRequested": o.gpu.name(),
+        "drmCards": gpu::drm_cards()
+            .iter()
+            .map(|c| format!("{} {}:{} {}", c.pdev, c.vendor, c.device, c.driver))
+            .collect::<Vec<_>>(),
         "session": std::env::var("XDG_SESSION_TYPE").ok(),
         "desktop": std::env::var("XDG_CURRENT_DESKTOP").ok(),
         "java": game.java_description,
@@ -501,8 +490,8 @@ fn summarize(v: &Value) -> Value {
     let slowdown: Vec<f64> = window
         .iter()
         .filter_map(|s| s[6].as_str())
-        .filter_map(|r| u64::from_str_radix(r.trim_start_matches("0x"), 16).ok())
-        .map(|bits| f64::from(u8::from(bits & GPU_SLOWDOWN_BITS != 0)))
+        .filter_map(gpu::is_slowdown)
+        .map(|slow| f64::from(u8::from(slow)))
         .collect();
     let max = |v: &[f64]| {
         v.iter()
@@ -541,6 +530,16 @@ fn summarize(v: &Value) -> Value {
         "gcCount": v["gcCount"],
         "gcTimeMs": v["gcTimeMs"],
     })
+}
+
+/// A whole number, or a dash for a value that wasn't measured (an
+/// integrated GPU has no temperature sensor of its own).
+fn dash(x: f64) -> String {
+    if x.is_nan() {
+        "–".into()
+    } else {
+        format!("{x:.0}")
+    }
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -599,6 +598,21 @@ fn report(root: &Path, dir: Option<PathBuf>) -> Result<(), String> {
         key(a).cmp(&key(b))
     });
     let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or(f64::NAN);
+    let mut devices: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            let d = &r.4["device"];
+            format!(
+                "{} → {} ({})",
+                r.0,
+                d["name"].as_str().unwrap_or("?"),
+                d["driver"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    devices.sort();
+    devices.dedup();
+    println!("\nDevices: {}", devices.join("; "));
     println!(
         "\n| Backend | Scene | Avg FPS | Median ms | 1% low FPS | 0.1% low FPS | Max ms | RSS MiB (mean / max) | VRAM MiB (mean / max) | GC (n / ms) | CPU / GPU °C max | GPU slowdown % | Runs |"
     );
@@ -619,7 +633,7 @@ fn report(root: &Path, dir: Option<PathBuf>) -> Result<(), String> {
             .and_then(|r| r.4["device"]["backend"].as_str())
             .unwrap_or("?");
         println!(
-            "| {backend} ({actual}) | {scene} | {:.0} | {:.2} | {:.0} | {:.0} | {:.1} | {:.0} / {:.0} | {:.0} / {:.0} | {:.0} / {:.0} | {:.0} / {:.0} | {:.0} | {} |",
+            "| {backend} ({actual}) | {scene} | {:.0} | {:.2} | {:.0} | {:.0} | {:.1} | {:.0} / {:.0} | {:.0} / {:.0} | {:.0} / {:.0} | {:.0} / {} | {:.0} | {} |",
             m("avgFps"),
             m("medianMs"),
             m("low1Fps"),
@@ -632,7 +646,7 @@ fn report(root: &Path, dir: Option<PathBuf>) -> Result<(), String> {
             m("gcCount"),
             m("gcTimeMs"),
             m("cpuTempMaxC"),
-            m("gpuTempMaxC"),
+            dash(m("gpuTempMaxC")),
             m("gpuSlowdownPct"),
             g.len()
         );

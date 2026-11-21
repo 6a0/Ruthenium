@@ -9,6 +9,7 @@ mod exporters;
 mod fabric;
 mod fetch_compile_deps;
 mod game;
+mod gpu;
 mod javamath_dump;
 mod jvm;
 mod launch_pins;

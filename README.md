@@ -52,6 +52,7 @@ Two development tools run the vanilla 26.3 client from your own install (offline
 cargo xtask trace          # record golden traces of scripted scenarios (docs/golden-traces.md)
 cargo xtask bench setup    # create the benchmark world, then:
 cargo xtask bench run      # frame times, memory and launch time on OpenGL and Vulkan (docs/baseline.md)
+cargo xtask bench run --gpu intel   # on a hybrid laptop: pin the game to one GPU (auto, nvidia, intel)
 ```
 
 They load Fabric Loader and Ruthenium's own small development mods (`tools/java/`). They need JDK 25 to compile the mods and a desktop session, since a game window opens.

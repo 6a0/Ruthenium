@@ -59,6 +59,7 @@ fn run_inner(root: &Path, args: &[String]) -> Result<(), String> {
             format!("-Druthenium.trace.only={only}"),
         ],
         game_args: Vec::new(),
+        env: Vec::new(),
         width: 854,
         height: 480,
     };
