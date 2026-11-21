@@ -34,6 +34,24 @@ pub fn supported_version() -> &'static GameVersion {
     &pins::V26_3
 }
 
+/// Ruthenium's per-user cache folder, for files it can rebuild (pipeline caches):
+/// `$XDG_CACHE_HOME/ruthenium` (default `~/.cache/ruthenium`), `~/Library/Caches/Ruthenium`
+/// on macOS, or `%LOCALAPPDATA%\Ruthenium\cache`.
+pub fn default_cache_dir(env: &discover::Env) -> Option<PathBuf> {
+    if cfg!(windows) {
+        Some(env.local_appdata.as_ref()?.join("Ruthenium").join("cache"))
+    } else if cfg!(target_os = "macos") {
+        Some(env.home.as_ref()?.join("Library/Caches/Ruthenium"))
+    } else {
+        Some(
+            env.xdg_cache_home
+                .clone()
+                .or_else(|| Some(env.home.as_ref()?.join(".cache")))?
+                .join("ruthenium"),
+        )
+    }
+}
+
 /// Ruthenium's per-user data folder: `$XDG_DATA_HOME/ruthenium` (default
 /// `~/.local/share/ruthenium`), `~/Library/Application Support/Ruthenium`
 /// on macOS, or `%LOCALAPPDATA%\Ruthenium`.

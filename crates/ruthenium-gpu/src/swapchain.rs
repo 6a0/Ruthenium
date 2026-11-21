@@ -29,6 +29,32 @@ impl PresentPolicy {
 /// UNORM with no sRGB conversion on write; colours are already display-encoded.
 const FORMATS: [vk::Format; 2] = [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_UNORM];
 
+/// The surface format Ruthenium renders to, out of what the surface offers.
+fn choose_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+    FORMATS
+        .iter()
+        .find_map(|&f| {
+            formats
+                .iter()
+                .find(|s| s.format == f && s.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+        })
+        .copied()
+        .unwrap_or(formats[0])
+}
+
+/// The colour format swapchains for this GPU's surface will have (pipelines are built for
+/// it before any swapchain exists, e.g. when the window starts minimised).
+pub(crate) fn surface_format(gpu: &Gpu) -> Result<vk::Format, Error> {
+    // SAFETY: plain query on a live physical device and surface.
+    let formats = unsafe {
+        gpu.instance
+            .surface_fn
+            .get_physical_device_surface_formats(gpu.physical, gpu.surface)
+    }
+    .ctx("vkGetPhysicalDeviceSurfaceFormatsKHR")?;
+    Ok(choose_format(&formats).format)
+}
+
 pub(crate) struct Swapchain {
     pub raw: vk::SwapchainKHR,
     pub format: vk::Format,
@@ -77,15 +103,7 @@ impl Swapchain {
         if extent.width == 0 || extent.height == 0 {
             return Ok(None);
         }
-        let format = FORMATS
-            .iter()
-            .find_map(|&f| {
-                formats
-                    .iter()
-                    .find(|s| s.format == f && s.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
-            })
-            .copied()
-            .unwrap_or(formats[0]);
+        let format = choose_format(&formats);
         let present_mode = policy
             .preference()
             .iter()

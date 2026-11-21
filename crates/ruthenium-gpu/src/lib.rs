@@ -12,12 +12,16 @@
 mod device;
 mod frame;
 mod instance;
+mod pipeline;
 mod swapchain;
 
 pub use ash::vk;
 pub use device::{DeviceCaps, Gpu, GpuOptions, Rejected};
 pub use frame::{FrameCtx, FrameLoop, GpuTime, MAX_FRAMES_IN_FLIGHT, Presented, Target};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};
+pub use pipeline::{
+    Blend, GraphicsDesc, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache, Pipelines,
+};
 pub use swapchain::{COLOR_RANGE, PresentPolicy};
 
 use std::fmt;

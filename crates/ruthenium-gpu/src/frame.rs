@@ -173,6 +173,15 @@ impl FrameLoop {
         &self.gpu
     }
 
+    /// The colour format frames are drawn in: the swapchain's, or the one a swapchain for
+    /// this window would have.
+    pub fn color_format(&self) -> Result<vk::Format, Error> {
+        match &self.swapchain {
+            Some(sc) => Ok(sc.format),
+            None => crate::swapchain::surface_format(&self.gpu),
+        }
+    }
+
     /// The present mode in use, if there is a swapchain.
     pub fn present_mode(&self) -> Option<vk::PresentModeKHR> {
         self.swapchain.as_ref().map(|s| s.present_mode)

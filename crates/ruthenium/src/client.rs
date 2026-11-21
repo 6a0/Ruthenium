@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use ruthenium_gpu::{GpuOptions, PresentPolicy, Presented, Validation};
 use ruthenium_platform::{DEFAULT_SIZE, Event, Platform, Sleeper, next_deadline};
-use ruthenium_render::{FrameTimes, Renderer, Summary, create_gpu};
+use ruthenium_render::{Background, FrameTimes, Renderer, Summary, create_gpu};
 
 /// SDL scancode of the V key: toggles VSync (development aid until options exist).
 const SCANCODE_V: u32 = 25;
@@ -20,7 +20,11 @@ const SCANCODE_V: u32 = 25;
 const HIDDEN_FRAME: Duration = Duration::from_millis(100);
 /// Frames before this are start-up noise and left out of the run summary.
 const WARMUP: Duration = Duration::from_secs(1);
-const CLEAR: [f32; 4] = [0.015, 0.012, 0.035, 1.0];
+/// Deep space: near-black blue at the top, a hint of violet at the bottom.
+const BACKGROUND: Background = Background {
+    top: [0.010, 0.010, 0.030, 1.0],
+    bottom: [0.060, 0.030, 0.090, 1.0],
+};
 
 #[derive(Debug)]
 pub struct Options {
@@ -33,6 +37,8 @@ pub struct Options {
     /// Development: resize the window and toggle VSync every few frames, to exercise
     /// swapchain recreation (run it under validation).
     pub exercise_swapchain: bool,
+    /// Keep the pipeline cache on disk (off: every launch compiles from scratch).
+    pub pipeline_cache: bool,
 }
 
 impl Options {
@@ -50,6 +56,7 @@ impl Options {
             quit_after: None,
             stats: false,
             exercise_swapchain: false,
+            pipeline_cache: true,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -79,6 +86,7 @@ impl Options {
                 }
                 "--stats" => o.stats = true,
                 "--exercise-swapchain" => o.exercise_swapchain = true,
+                "--no-pipeline-cache" => o.pipeline_cache = false,
                 other => return Err(format!("unknown option {other}")),
             }
         }
@@ -137,7 +145,13 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         );
     }
     // Declared after `window`, so it is dropped first: the surface must go before the window.
-    let mut renderer = Renderer::new(gpu, window.pixel_size(), opts.policy)?;
+    let cache_dir = opts
+        .pipeline_cache
+        .then(|| {
+            ruthenium_prepare::default_cache_dir(&ruthenium_prepare::discover::Env::from_process())
+        })
+        .flatten();
+    let mut renderer = Renderer::new(gpu, window.pixel_size(), opts.policy, cache_dir.as_deref())?;
 
     let mut sleeper = Sleeper::new();
     let mut deadline = Instant::now();
@@ -225,7 +239,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         // 3. Simulation: nothing yet.
 
         // 4. Render.
-        let report = renderer.render(CLEAR)?;
+        let report = renderer.render(&BACKGROUND)?;
         let now = Instant::now();
         profiling::finish_frame!();
 

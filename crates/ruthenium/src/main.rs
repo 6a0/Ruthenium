@@ -25,6 +25,7 @@ With no command, opens the game window. Options:
   --stats                print frame-time statistics every second
   --quit-after <s>       close after <s> seconds (for benchmarks and tests)
   --exercise-swapchain   resize and toggle VSync every few frames (development)
+  --no-pipeline-cache    don't load or save the pipeline cache
 In the window, V toggles VSync.
 
 commands:

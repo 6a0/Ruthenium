@@ -60,6 +60,7 @@ pub struct Env {
     pub home: Option<PathBuf>,
     pub xdg_data_home: Option<PathBuf>,
     pub xdg_config_home: Option<PathBuf>,
+    pub xdg_cache_home: Option<PathBuf>,
     pub appdata: Option<PathBuf>,
     pub local_appdata: Option<PathBuf>,
 }
@@ -76,6 +77,7 @@ impl Env {
             home: var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }),
             xdg_data_home: var("XDG_DATA_HOME"),
             xdg_config_home: var("XDG_CONFIG_HOME"),
+            xdg_cache_home: var("XDG_CACHE_HOME"),
             appdata: var("APPDATA"),
             local_appdata: var("LOCALAPPDATA"),
         }
