@@ -727,6 +727,295 @@ pub mod play {
         ]
     }
 
+    /// A step of a [`PositionPath`]: a position reached `ticks` after the last one.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct PositionStep {
+        pub position: [f64; 3],
+        pub ticks: i32,
+    }
+
+    /// Where an entity moves (`PositionPath`): straight to a point, or through steps.
+    /// A stepped path is never empty.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum PositionPath {
+        Linear([f64; 3]),
+        Stepped(Vec<PositionStep>),
+    }
+
+    impl PositionPath {
+        pub fn end(&self) -> [f64; 3] {
+            match self {
+                PositionPath::Linear(p) => *p,
+                PositionPath::Stepped(s) => s.last().map_or([0.0; 3], |s| s.position),
+            }
+        }
+
+        fn read(r: &mut Reader<'_>) -> Result<PositionPath, WireError> {
+            // `ByIdMap.continuous` with the zero fallback: any other id is linear.
+            match r.varint()? {
+                1 => {
+                    let n = r.count(usize::MAX)?;
+                    let mut steps = Vec::with_capacity(n.min(64));
+                    for _ in 0..n {
+                        steps.push(PositionStep {
+                            position: vec3(r)?,
+                            ticks: r.varint()?,
+                        });
+                    }
+                    if steps.is_empty() {
+                        return Err(WireError::Invalid("empty stepped path"));
+                    }
+                    Ok(PositionPath::Stepped(steps))
+                }
+                _ => Ok(PositionPath::Linear(vec3(r)?)),
+            }
+        }
+    }
+
+    /// A move relative to the entity's last sent position (`VecDelta`), in 1/4096ths of
+    /// a block: one delta, or steps each with the ticks it takes.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum VecDelta {
+        Linear([i16; 3]),
+        Stepped(Vec<([i16; 3], i32)>),
+    }
+
+    impl VecDelta {
+        fn read(r: &mut Reader<'_>, steps: i32) -> Result<VecDelta, WireError> {
+            let delta = |r: &mut Reader<'_>| -> Result<[i16; 3], WireError> {
+                Ok([r.u16()? as i16, r.u16()? as i16, r.u16()? as i16])
+            };
+            if steps <= 0 {
+                return Ok(VecDelta::Linear(delta(r)?));
+            }
+            // Each step takes at least 7 bytes.
+            if steps as usize > r.remaining() / 7 {
+                return Err(WireError::Invalid("move steps"));
+            }
+            let mut out = Vec::with_capacity(steps as usize);
+            for _ in 0..steps {
+                let ticks = r.varint()?;
+                out.push((delta(r)?, ticks));
+            }
+            Ok(VecDelta::Stepped(out))
+        }
+    }
+
+    /// An entity's new position, motion and rotation (`PositionMoveRotation`), each
+    /// absolute or relative as `relatives` says (the same bits as
+    /// [`PlayerPosition`]).
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct PositionChange {
+        pub position: [f64; 3],
+        pub delta: [f64; 3],
+        pub y_rot: f32,
+        pub x_rot: f32,
+        pub relatives: u32,
+    }
+
+    /// A new entity (`ClientboundAddEntityPacket`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct AddEntity {
+        pub entity_id: i32,
+        pub uuid: u128,
+        /// Network id in the entity type registry.
+        pub entity_type: i32,
+        pub position: [f64; 3],
+        pub movement: [f64; 3],
+        /// Rotations as bytes, 256 steps a turn.
+        pub x_rot: i8,
+        pub y_rot: i8,
+        pub y_head_rot: i8,
+        pub data: i32,
+    }
+
+    /// A synched-data value (`SynchedEntityData.DataValue`), as far as the client reads
+    /// them; registry holders and enums are their ids.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum DataValue {
+        Byte(i8),
+        Int(i32),
+        Long(i64),
+        Float(f32),
+        String(String),
+        /// A text component (skipped).
+        Component,
+        OptionalComponent(bool),
+        Boolean(bool),
+        Rotations([f32; 3]),
+        BlockPos([i32; 3]),
+        OptionalBlockPos(Option<[i32; 3]>),
+        /// An entity's UUID.
+        OptionalEntity(Option<u128>),
+        /// A block state id; for the optional kind, 0 is none.
+        BlockState(i32),
+        /// `OptionalInt`: none, or the value.
+        OptionalUnsignedInt(Option<i32>),
+        /// `Pose` ordinal.
+        Pose(i32),
+        /// Any value that is one VarInt: a direction, a registry holder, an enum.
+        Id(i32),
+        /// Villager type, profession and level.
+        VillagerData([i32; 3]),
+        Vector3([f32; 3]),
+        Quaternion([f32; 4]),
+        OptionalGlobalPos(Option<(String, [i32; 3])>),
+        /// Effect particles: how many (only the colour-only `entity_effect` kind is
+        /// read).
+        Particles(usize),
+    }
+
+    /// The `minecraft:entity_effect` particle type, the one particle the client reads
+    /// out of entity data (a colour, an int).
+    const ENTITY_EFFECT_PARTICLE: i32 = 28;
+
+    impl DataValue {
+        /// The value for serializer `kind`, or `None` for a kind the client can't read
+        /// yet (item stacks, other particles, inline holders, profiles): everything after
+        /// it is then lost.
+        fn read(r: &mut Reader<'_>, kind: i32) -> Result<Option<DataValue>, WireError> {
+            let block_pos = |r: &mut Reader<'_>| r.i64().map(unpack_block_pos);
+            let v = match kind {
+                0 => DataValue::Byte(r.u8()? as i8),
+                1 => DataValue::Int(r.varint()?),
+                2 => DataValue::Long(r.varlong()?),
+                3 => DataValue::Float(r.f32()?),
+                4 => DataValue::String(r.string(MAX_STRING)?.to_owned()),
+                5 => {
+                    text(r)?;
+                    DataValue::Component
+                }
+                6 => {
+                    let some = r.bool()?;
+                    if some {
+                        text(r)?;
+                    }
+                    DataValue::OptionalComponent(some)
+                }
+                8 => DataValue::Boolean(r.bool()?),
+                9 => DataValue::Rotations([r.f32()?, r.f32()?, r.f32()?]),
+                10 => DataValue::BlockPos(block_pos(r)?),
+                11 => DataValue::OptionalBlockPos(optional(r, block_pos)?),
+                13 => DataValue::OptionalEntity(optional(r, |r| r.uuid())?),
+                14 | 15 => DataValue::BlockState(r.varint()?),
+                17 => {
+                    let n = r.count(usize::MAX)?;
+                    for _ in 0..n {
+                        if r.varint()? != ENTITY_EFFECT_PARTICLE {
+                            return Ok(None);
+                        }
+                        r.i32()?;
+                    }
+                    DataValue::Particles(n)
+                }
+                18 => DataValue::VillagerData([r.varint()?, r.varint()?, r.varint()?]),
+                19 => DataValue::OptionalUnsignedInt(match r.varint()? {
+                    0 => None,
+                    n => Some(n - 1),
+                }),
+                20 => DataValue::Pose(r.varint()?),
+                // A direction, the variants (registry ids), then the states, the arm and
+                // the colour (enum ids).
+                12 | 21..=32 | 35..=38 | 42 | 43 => DataValue::Id(r.varint()?),
+                33 => DataValue::OptionalGlobalPos(optional(r, |r| {
+                    Ok((r.identifier()?, block_pos(r)?))
+                })?),
+                34 => {
+                    // A painting variant: 0 means the variant follows inline.
+                    match r.varint()? {
+                        0 => return Ok(None),
+                        n => DataValue::Id(n - 1),
+                    }
+                }
+                39 => DataValue::Vector3([r.f32()?, r.f32()?, r.f32()?]),
+                40 => DataValue::Quaternion([r.f32()?, r.f32()?, r.f32()?, r.f32()?]),
+                // Item stacks (7), other particles (16) and profiles (41).
+                _ => return Ok(None),
+            };
+            Ok(Some(v))
+        }
+    }
+
+    /// A team's settings (`ClientboundSetPlayerTeamPacket.Parameters`); the texts are
+    /// skipped.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TeamParameters {
+        pub name_tag_visibility: i32,
+        /// `Team.CollisionRule` id: 0 always, 1 never, 2 push other teams, 3 push own
+        /// team.
+        pub collision_rule: i32,
+        pub color: Option<i32>,
+        pub options: u8,
+    }
+
+    /// One player's part of a `ClientboundPlayerInfoUpdatePacket`: what the actions
+    /// carry that the client keeps so far.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PlayerInfoEntry {
+        pub uuid: u128,
+        /// With `ADD_PLAYER`: the profile's name.
+        pub name: Option<String>,
+        /// With `UPDATE_GAME_MODE`.
+        pub game_mode: Option<i32>,
+    }
+
+    /// `ClientboundPlayerInfoUpdatePacket.Action` bits.
+    pub const PLAYER_INFO_ADD: u8 = 1;
+    pub const PLAYER_INFO_GAME_MODE: u8 = 1 << 2;
+
+    fn vec3(r: &mut Reader<'_>) -> Result<[f64; 3], WireError> {
+        Ok([r.f64()?, r.f64()?, r.f64()?])
+    }
+
+    /// One entry of a player info update: the fields of each action in the set, in the
+    /// actions' order.
+    fn read_player_info(r: &mut Reader<'_>, actions: u8) -> Result<PlayerInfoEntry, WireError> {
+        let mut e = PlayerInfoEntry {
+            uuid: r.uuid()?,
+            name: None,
+            game_mode: None,
+        };
+        let has = |bit: u8| actions & 1 << bit != 0;
+        if has(0) {
+            e.name = Some(r.string(MAX_NAME)?.to_owned());
+            let n = r.count(16)?;
+            for _ in 0..n {
+                r.string(64)?;
+                r.string(MAX_STRING)?;
+                optional(r, |r| r.string(1024).map(|_| ()))?;
+            }
+        }
+        if has(1) {
+            // The chat session: its id, the key's expiry, the key and its signature.
+            optional(r, |r| {
+                r.uuid()?;
+                r.i64()?;
+                r.byte_array(512)?;
+                r.byte_array(4096)?;
+                Ok(())
+            })?;
+        }
+        if has(2) {
+            e.game_mode = Some(r.varint()?);
+        }
+        if has(3) {
+            r.bool()?;
+        }
+        if has(4) {
+            r.varint()?;
+        }
+        if has(5) {
+            optional(r, |r| text(r).map(|_| ()))?;
+        }
+        if has(6) {
+            r.varint()?;
+        }
+        if has(7) {
+            r.bool()?;
+        }
+        Ok(e)
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub enum Clientbound {
         Common(Common),
@@ -787,6 +1076,65 @@ pub mod play {
         /// An explosion: only the push it gives the local player is read.
         Explode {
             player_knockback: Option<[f64; 3]>,
+        },
+        AddEntity(Box<AddEntity>),
+        RemoveEntities {
+            ids: Vec<i32>,
+        },
+        /// `ClientboundMoveEntityPacket`: a move from the last sent position, a new
+        /// rotation (bytes), or both.
+        MoveEntity {
+            entity_id: i32,
+            delta: Option<VecDelta>,
+            rotation: Option<(i8, i8)>,
+            on_ground: bool,
+        },
+        /// `ClientboundTeleportEntityPacket`.
+        TeleportEntity {
+            entity_id: i32,
+            change: PositionChange,
+            on_ground: bool,
+        },
+        /// `ClientboundEntityPositionSyncPacket`: the exact position, every so often.
+        EntityPositionSync {
+            entity_id: i32,
+            path: PositionPath,
+            y_rot: f32,
+            x_rot: f32,
+            on_ground: bool,
+        },
+        /// `ClientboundSetEntityDataPacket`: (field id, value) in the server's order;
+        /// `complete` is false when a value couldn't be read and the rest was skipped.
+        SetEntityData {
+            entity_id: i32,
+            values: Vec<(u8, DataValue)>,
+            complete: bool,
+        },
+        SetPassengers {
+            vehicle: i32,
+            passengers: Vec<i32>,
+        },
+        /// `ClientboundSetPlayerTeamPacket`: method 0 adds the team, 1 removes it, 2
+        /// changes it, 3 adds players (names, or UUIDs for other entities), 4 removes
+        /// them.
+        SetPlayerTeam {
+            name: String,
+            method: u8,
+            parameters: Option<TeamParameters>,
+            players: Vec<String>,
+        },
+        /// `ClientboundPlayerInfoUpdatePacket`: the action bits and the entries.
+        PlayerInfoUpdate {
+            actions: u8,
+            entries: Vec<PlayerInfoEntry>,
+        },
+        PlayerInfoRemove {
+            ids: Vec<u128>,
+        },
+        SetHealth {
+            health: f32,
+            food: i32,
+            saturation: f32,
         },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
@@ -944,6 +1292,160 @@ pub mod play {
                     r.rest();
                     Clientbound::Explode { player_knockback }
                 }
+                C::AddEntity => Clientbound::AddEntity(Box::new(AddEntity {
+                    entity_id: r.varint()?,
+                    uuid: r.uuid()?,
+                    entity_type: r.varint()?,
+                    position: vec3(&mut r)?,
+                    movement: r.lp_vec3()?,
+                    x_rot: r.u8()? as i8,
+                    y_rot: r.u8()? as i8,
+                    y_head_rot: r.u8()? as i8,
+                    data: r.varint()?,
+                })),
+                C::RemoveEntities => {
+                    let n = r.count(usize::MAX)?;
+                    let mut ids = Vec::with_capacity(n.min(1024));
+                    for _ in 0..n {
+                        ids.push(r.varint()?);
+                    }
+                    Clientbound::RemoveEntities { ids }
+                }
+                kind @ (C::MoveEntityPos | C::MoveEntityPosRot) => {
+                    let entity_id = r.varint()?;
+                    // On the ground in bit 0, the number of steps above it.
+                    let properties = r.varint()?;
+                    let delta = VecDelta::read(&mut r, (properties as u32 >> 1) as i32)?;
+                    let rotation = if matches!(kind, C::MoveEntityPosRot) {
+                        Some((r.u8()? as i8, r.u8()? as i8))
+                    } else {
+                        None
+                    };
+                    Clientbound::MoveEntity {
+                        entity_id,
+                        delta: Some(delta),
+                        rotation,
+                        on_ground: properties & 1 != 0,
+                    }
+                }
+                C::MoveEntityRot => {
+                    let entity_id = r.varint()?;
+                    let on_ground = r.bool()?;
+                    Clientbound::MoveEntity {
+                        entity_id,
+                        delta: None,
+                        rotation: Some((r.u8()? as i8, r.u8()? as i8)),
+                        on_ground,
+                    }
+                }
+                C::TeleportEntity => Clientbound::TeleportEntity {
+                    entity_id: r.varint()?,
+                    change: PositionChange {
+                        position: vec3(&mut r)?,
+                        delta: vec3(&mut r)?,
+                        y_rot: r.f32()?,
+                        x_rot: r.f32()?,
+                        relatives: r.i32()? as u32,
+                    },
+                    on_ground: r.bool()?,
+                },
+                C::EntityPositionSync => Clientbound::EntityPositionSync {
+                    entity_id: r.varint()?,
+                    path: PositionPath::read(&mut r)?,
+                    y_rot: r.f32()?,
+                    x_rot: r.f32()?,
+                    on_ground: r.bool()?,
+                },
+                C::SetEntityData => {
+                    let entity_id = r.varint()?;
+                    let mut values = Vec::new();
+                    let mut complete = true;
+                    loop {
+                        let field = r.u8()?;
+                        if field == 255 {
+                            break;
+                        }
+                        let kind = r.varint()?;
+                        match DataValue::read(&mut r, kind)? {
+                            Some(v) => values.push((field, v)),
+                            None => {
+                                complete = false;
+                                r.rest();
+                                break;
+                            }
+                        }
+                    }
+                    Clientbound::SetEntityData {
+                        entity_id,
+                        values,
+                        complete,
+                    }
+                }
+                C::SetPassengers => {
+                    let vehicle = r.varint()?;
+                    let n = r.count(usize::MAX)?;
+                    let mut passengers = Vec::with_capacity(n.min(64));
+                    for _ in 0..n {
+                        passengers.push(r.varint()?);
+                    }
+                    Clientbound::SetPassengers {
+                        vehicle,
+                        passengers,
+                    }
+                }
+                C::SetPlayerTeam => {
+                    let name = r.string(MAX_STRING)?.to_owned();
+                    let method = r.u8()?;
+                    let parameters = if method == 0 || method == 2 {
+                        for _ in 0..3 {
+                            text(&mut r)?;
+                        }
+                        Some(TeamParameters {
+                            name_tag_visibility: r.varint()?,
+                            collision_rule: r.varint()?,
+                            color: optional(&mut r, |r| r.varint())?,
+                            options: r.u8()?,
+                        })
+                    } else {
+                        None
+                    };
+                    let mut players = Vec::new();
+                    if matches!(method, 0 | 3 | 4) {
+                        let n = r.count(usize::MAX)?;
+                        for _ in 0..n {
+                            players.push(r.string(MAX_STRING)?.to_owned());
+                        }
+                    }
+                    Clientbound::SetPlayerTeam {
+                        name,
+                        method,
+                        parameters,
+                        players,
+                    }
+                }
+                C::PlayerInfoUpdate => {
+                    // An `EnumSet` of the eight actions: one byte.
+                    let actions = r.u8()?;
+                    let n = r.count(usize::MAX)?;
+                    let mut entries = Vec::with_capacity(n.min(256));
+                    for _ in 0..n {
+                        entries.push(read_player_info(&mut r, actions)?);
+                    }
+                    Clientbound::PlayerInfoUpdate { actions, entries }
+                }
+                C::PlayerInfoRemove => {
+                    let n = r.count(usize::MAX)?;
+                    let mut ids = Vec::with_capacity(n.min(256));
+                    for _ in 0..n {
+                        ids.push(r.uuid()?);
+                    }
+                    Clientbound::PlayerInfoRemove { ids }
+                }
+                C::SetHealth => Clientbound::SetHealth {
+                    health: r.f32()?,
+                    food: r.varint()?,
+                    saturation: r.f32()?,
+                },
                 other => {
                     r.rest();
                     Clientbound::Other(other)
@@ -1169,5 +1671,140 @@ mod tests {
             play::Clientbound::ForgetLevelChunk { x: 5, z: -2 }
         );
         assert_eq!(play::keep_alive(1)[0], 28);
+    }
+
+    #[test]
+    fn play_reads_entity_packets() {
+        let decode =
+            |kind: pl::Clientbound, b: &[u8]| play::Clientbound::decode(kind.id(), b).unwrap();
+        // A zombie: id, UUID, type, position, no motion, rotations, data.
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 9);
+        wire::write_uuid(&mut b, 0x1234);
+        wire::write_varint(&mut b, 150);
+        for v in [0.5, -60.0, 1.25] {
+            wire::write_f64(&mut b, v);
+        }
+        wire::write_lp_vec3(&mut b, [0.0; 3]);
+        b.extend([0, 64, 0x80]);
+        wire::write_varint(&mut b, 0);
+        let play::Clientbound::AddEntity(a) = decode(pl::Clientbound::AddEntity, &b) else {
+            panic!()
+        };
+        assert_eq!((a.entity_id, a.uuid, a.entity_type), (9, 0x1234, 150));
+        assert_eq!(
+            (a.position, a.y_rot, a.y_head_rot),
+            ([0.5, -60.0, 1.25], 64, -128)
+        );
+
+        // Two steps, on the ground: the step count sits above the ground bit.
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 9);
+        wire::write_varint(&mut b, 2 << 1 | 1);
+        for (ticks, d) in [(1, [100i16, 0, -5]), (2, [0, 0, 7])] {
+            wire::write_varint(&mut b, ticks);
+            for v in d {
+                b.extend(v.to_be_bytes());
+            }
+        }
+        assert_eq!(
+            decode(pl::Clientbound::MoveEntityPos, &b),
+            play::Clientbound::MoveEntity {
+                entity_id: 9,
+                delta: Some(play::VecDelta::Stepped(vec![
+                    ([100, 0, -5], 1),
+                    ([0, 0, 7], 2)
+                ])),
+                rotation: None,
+                on_ground: true,
+            }
+        );
+        assert_eq!(
+            decode(pl::Clientbound::MoveEntityRot, &[9, 0, 32, 0xF0]),
+            play::Clientbound::MoveEntity {
+                entity_id: 9,
+                delta: None,
+                rotation: Some((32, -16)),
+                on_ground: false,
+            }
+        );
+
+        // Entity data: a pose, then an item stack, which isn't read: the rest is
+        // skipped.
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 9);
+        b.extend([6, 20, 5, 8, 7, 1, 2, 3, 255]);
+        assert_eq!(
+            decode(pl::Clientbound::SetEntityData, &b),
+            play::Clientbound::SetEntityData {
+                entity_id: 9,
+                values: vec![(6, play::DataValue::Pose(5))],
+                complete: false,
+            }
+        );
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 9);
+        b.extend([16, 8, 1, 9, 3]);
+        b.extend(20.0f32.to_be_bytes());
+        b.push(255);
+        let play::Clientbound::SetEntityData {
+            values, complete, ..
+        } = decode(pl::Clientbound::SetEntityData, &b)
+        else {
+            panic!()
+        };
+        assert!(complete);
+        assert_eq!(
+            values,
+            [
+                (16, play::DataValue::Boolean(true)),
+                (9, play::DataValue::Float(20.0))
+            ]
+        );
+
+        // A new team that never collides, with one member.
+        let mut b = Vec::new();
+        wire::write_string(&mut b, "nopush");
+        b.push(0);
+        for _ in 0..3 {
+            crate::nbt::write_network(&mut b, &Tag::String(String::new())).unwrap();
+        }
+        wire::write_varint(&mut b, 0);
+        wire::write_varint(&mut b, 1);
+        wire::write_bool(&mut b, false);
+        b.push(0);
+        wire::write_varint(&mut b, 1);
+        wire::write_string(&mut b, "Developer");
+        let play::Clientbound::SetPlayerTeam {
+            name,
+            method,
+            parameters,
+            players,
+        } = decode(pl::Clientbound::SetPlayerTeam, &b)
+        else {
+            panic!()
+        };
+        assert_eq!((name.as_str(), method), ("nopush", 0));
+        assert_eq!(parameters.map(|p| p.collision_rule), Some(1));
+        assert_eq!(players, ["Developer"]);
+
+        // A player joining: its name (no properties) and game mode.
+        let mut b = vec![play::PLAYER_INFO_ADD | play::PLAYER_INFO_GAME_MODE];
+        wire::write_varint(&mut b, 1);
+        wire::write_uuid(&mut b, 77);
+        wire::write_string(&mut b, "Alex");
+        wire::write_varint(&mut b, 0);
+        wire::write_varint(&mut b, 3);
+        assert_eq!(
+            decode(pl::Clientbound::PlayerInfoUpdate, &b),
+            play::Clientbound::PlayerInfoUpdate {
+                actions: 5,
+                entries: vec![play::PlayerInfoEntry {
+                    uuid: 77,
+                    name: Some("Alex".into()),
+                    game_mode: Some(3),
+                }],
+            }
+        );
     }
 }

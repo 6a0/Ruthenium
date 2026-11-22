@@ -1,6 +1,7 @@
 //! Replays the golden traces (`tests/golden/26.3`) through the movement code: the
-//! world each scenario built, the keys held and the camera's rotation each tick, and
-//! the player's state and movement packets compared with vanilla's after every tick.
+//! world each scenario built, the packets the client handled (entities, teams, the
+//! player's motion), the keys held and the camera's rotation each tick, and the
+//! player's state and movement packets compared with vanilla's after every tick.
 //!
 //! Needs the prepared game's exports: `RUTHENIUM_GAME_DIR` names `<data>/game` (as
 //! `ruthenium prepare` writes it). Skipped without it.
@@ -8,7 +9,10 @@
 use std::path::{Path, PathBuf};
 
 use ruthenium_data::v26_3::{Block, BlockState};
+use ruthenium_protocol::packets::play::Clientbound;
+use ruthenium_protocol::wire::Reader;
 use ruthenium_sim::blocks::{BlockTags, Blocks};
+use ruthenium_sim::entity::{Entities, EntityTypes, Local, PlayerInfos, Teams, TickContext};
 use ruthenium_sim::player::{Env, Keys, LocalPlayer, Pose};
 use ruthenium_sim::world::Level;
 use ruthenium_trace::Trace;
@@ -68,13 +72,22 @@ fn parse_state(s: &str) -> u32 {
     state.id()
 }
 
+/// The chunks the scenarios' world is built in.
+const CHUNKS: [(i32, i32); 56] = {
+    let mut out = [(0, 0); 56];
+    let mut i = 0;
+    while i < 56 {
+        out[i] = (i as i32 / 7 - 3, i as i32 % 7 - 3);
+        i += 1;
+    }
+    out
+};
+
 /// The scenario's world: the flat preset, then the header's reset and build commands.
 fn build_level(t: &Trace) -> Level {
     let mut level = Level::new(-64, 384);
-    for cx in -3..=4 {
-        for cz in -3..=3 {
-            level.add_empty_chunk(cx, cz);
-        }
+    for (cx, cz) in CHUNKS {
+        level.add_empty_chunk(cx, cz);
     }
     let layers = [
         (-64, "minecraft:bedrock"),
@@ -141,12 +154,17 @@ const SENT: [&str; 6] = [
 ];
 
 /// Replays a scenario; the first tick that differs from vanilla, described.
-fn replay(name: &str, blocks: &Blocks, tags: &BlockTags) -> Result<usize, String> {
+fn replay(
+    name: &str,
+    blocks: &Blocks,
+    tags: &BlockTags,
+    types: &EntityTypes,
+) -> Result<usize, String> {
     // The trace starts some ticks after the last position was sent; that count isn't
     // recorded, so try each until the first heartbeat lines up.
     let mut first = None;
     for reminder in 0..20 {
-        match replay_from(name, blocks, tags, reminder) {
+        match replay_from(name, blocks, tags, types, reminder) {
             Ok(n) => return Ok(n),
             Err((tick, e)) => {
                 if first.is_none() {
@@ -161,10 +179,97 @@ fn replay(name: &str, blocks: &Blocks, tags: &BlockTags) -> Result<usize, String
     Err(first.unwrap())
 }
 
+/// What the replayed client knows besides its player.
+struct Client {
+    entities: Entities,
+    teams: Teams,
+    players: PlayerInfos,
+    health: f32,
+}
+
+/// A packet the client handled, as `Session` handles it (the parts that reach the
+/// player and the entities around it).
+fn handle(bytes: &[u8], c: &mut Client, p: &mut LocalPlayer, types: &EntityTypes) {
+    let mut r = Reader::new(bytes);
+    let id = r.varint().unwrap() as u32;
+    let Ok(packet) = Clientbound::decode(id, r.rest()) else {
+        panic!("can't decode handled packet {id}");
+    };
+    match packet {
+        Clientbound::AddEntity(a) => c.entities.add(&a, types, &c.players),
+        Clientbound::RemoveEntities { ids } => {
+            for id in ids {
+                c.entities.remove(id);
+            }
+        }
+        Clientbound::MoveEntity {
+            entity_id,
+            delta,
+            rotation,
+            on_ground,
+        } => c
+            .entities
+            .move_entity(entity_id, delta.as_ref(), rotation, on_ground),
+        Clientbound::TeleportEntity {
+            entity_id,
+            change,
+            on_ground,
+        } => c.entities.teleport(entity_id, &change, on_ground),
+        Clientbound::EntityPositionSync {
+            entity_id,
+            path,
+            y_rot,
+            x_rot,
+            on_ground,
+        } => c
+            .entities
+            .position_sync(entity_id, &path, y_rot, x_rot, on_ground),
+        Clientbound::SetEntityData {
+            entity_id, values, ..
+        } => c.entities.set_data(entity_id, &values, types),
+        Clientbound::SetPassengers {
+            vehicle,
+            passengers,
+        } => c.entities.set_passengers(vehicle, &passengers),
+        Clientbound::SetPlayerTeam {
+            name,
+            method,
+            parameters,
+            players,
+        } => c.teams.apply(&name, method, parameters.as_ref(), &players),
+        Clientbound::UpdateAttributes {
+            entity_id,
+            attributes,
+        } => {
+            if entity_id == p.entity_id {
+                p.apply_attributes(&attributes);
+            } else {
+                c.entities.update_attributes(entity_id, &attributes);
+            }
+        }
+        Clientbound::SetEntityMotion {
+            entity_id,
+            movement,
+        } => {
+            if entity_id == p.entity_id {
+                p.delta = movement;
+            } else {
+                c.entities.set_motion(entity_id, movement);
+            }
+        }
+        Clientbound::SetHealth { health, food, .. } => {
+            c.health = health;
+            p.food = food;
+        }
+        _ => {}
+    }
+}
+
 fn replay_from(
     name: &str,
     blocks: &Blocks,
     tags: &BlockTags,
+    types: &EntityTypes,
     reminder: i32,
 ) -> Result<usize, (i64, String)> {
     let t = trace(name);
@@ -173,6 +278,7 @@ fn replay_from(
         level: &level,
         blocks,
         tags,
+        colliders: &[],
     };
     let tp: Vec<f64> = t.header["teleport"]
         .as_str()
@@ -188,20 +294,55 @@ fn replay_from(
     p.x_rot = tp[4] as f32;
     p.stand(&env);
     p.set_position_reminder(reminder);
+    let mut client = Client {
+        entities: Entities::new(p.entity_id, false),
+        teams: Teams::default(),
+        players: PlayerInfos::default(),
+        health: 20.0,
+    };
+    for (cx, cz) in CHUNKS {
+        client.entities.chunk_loaded(cx, cz);
+    }
+    let name = t.header["playerName"].as_str().unwrap_or("").to_owned();
     let mut ticks = 0;
     let records = &t.records;
+    // Packets handled after a tick began, applied before the next one (packets are
+    // handled at the start of a frame, never during a tick).
+    let mut pending: Vec<Vec<u8>> = Vec::new();
     let mut i = 0;
     while i < records.len() {
         let r = &records[i];
         i += 1;
+        if r.kind == "handle" {
+            if let Some(b) = r.bytes() {
+                handle(&b, &mut client, &mut p, types);
+            }
+            continue;
+        }
         if r.kind != "tick" {
             continue;
         }
         let n = r.tick().unwrap();
         p.y_rot = r.f32("yRot").unwrap();
         p.x_rot = r.f32("xRot").unwrap();
-        p.tick(&env, keys(&r.value["down"]));
-        let sent = p.send_changes();
+        let held = keys(&r.value["down"]);
+        let cx = TickContext {
+            env: &env,
+            teams: &client.teams,
+            players: &client.players,
+            local: Local {
+                name: &name,
+                spectator: false,
+                health: client.health,
+            },
+            tick_rate: 20.0,
+            runs_normally: true,
+        };
+        let mut sent = Vec::new();
+        client.entities.tick(&cx, &mut p, |p, colliders| {
+            p.tick(&Env { colliders, ..env }, held);
+            sent = p.send_changes();
+        });
         // Vanilla's packets and state for this tick.
         let mut want = Vec::new();
         let mut state = None;
@@ -212,6 +353,11 @@ fn replay_from(
             }
             if q.kind == "state" && q.tick() == Some(n) {
                 state = Some(q.clone());
+            }
+            if q.kind == "handle"
+                && let Some(b) = q.bytes()
+            {
+                pending.push(b);
             }
             i += 1;
         }
@@ -259,13 +405,16 @@ fn replay_from(
                 ),
             ));
         }
+        for b in pending.drain(..) {
+            handle(&b, &mut client, &mut p, types);
+        }
         ticks += 1;
     }
     Ok(ticks)
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 14] = [
+const EXACT: [&str; 17] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -280,6 +429,9 @@ const EXACT: [&str; 14] = [
     "waterfall",
     "lava",
     "combat_basics",
+    "entity_push",
+    "entity_moving",
+    "entity_rules",
 ];
 
 #[test]
@@ -290,6 +442,7 @@ fn golden_traces() {
     };
     let blocks = Blocks::load(&game.join("versions/26.3/exports")).unwrap();
     let tags = vanilla_tags(&game);
+    let types = EntityTypes::load(&game.join("versions/26.3/exports")).unwrap();
     let all = [
         "walk_directions",
         "mouse_turn",
@@ -305,10 +458,13 @@ fn golden_traces() {
         "waterfall",
         "lava",
         "combat_basics",
+        "entity_push",
+        "entity_moving",
+        "entity_rules",
     ];
     let mut failed = Vec::new();
     for name in all {
-        match replay(name, &blocks, &tags) {
+        match replay(name, &blocks, &tags, &types) {
             Ok(n) => eprintln!("{name}: all {n} ticks match"),
             Err(e) => {
                 eprintln!("{name}: {e}");

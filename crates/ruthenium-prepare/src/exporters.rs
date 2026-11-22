@@ -82,18 +82,49 @@ pub fn run(java: &Java, imported: &Imported, bundle: &Path) -> Result<(PathBuf, 
     Ok((out, ran))
 }
 
-/// Default size of an entity type.
+/// What the exporter knows of an entity type (`entity_dimensions` v2).
 #[derive(Debug, Clone, PartialEq)]
-pub struct EntityDimensions {
+pub struct EntityTypeData {
     /// Network (registry) id.
     pub id: u32,
     /// e.g. `minecraft:player`.
     pub key: String,
+    /// The type's default size (`EntityType.getDimensions`).
     pub width: f32,
     pub height: f32,
     pub eye_height: f32,
     /// The size ignores the entity's scale.
     pub fixed: bool,
+    /// Ticks between the server's position updates (`EntityType.updateInterval`),
+    /// `i32::MAX` for none.
+    pub update_interval: i32,
+    /// The simple names of the type's class and its superclasses up to `Entity`,
+    /// nearest first; empty if the exporter couldn't tell the class.
+    pub classes: Vec<String>,
+    /// The synched-data fields those classes declare: `Class.FIELD`, the id and the
+    /// serializer's id.
+    pub fields: Vec<(String, u8, u8)>,
+    /// The nearest static `BABY_DIMENSIONS` of those classes: width, height, fixed.
+    pub baby: Option<(f32, f32, bool)>,
+}
+
+impl EntityTypeData {
+    /// Whether the type's class is or extends `class` (a simple name).
+    pub fn is(&self, class: &str) -> bool {
+        self.classes.iter().any(|c| c == class)
+    }
+
+    /// The id of the synched-data field `name` (`Class.FIELD`).
+    pub fn field(&self, name: &str) -> Option<u8> {
+        self.fields.iter().find(|f| f.0 == name).map(|f| f.1)
+    }
+
+    /// The id of the nearest class's field called `field` (just the field's name).
+    pub fn nearest_field(&self, field: &str) -> Option<u8> {
+        self.classes
+            .iter()
+            .find_map(|c| self.field(&format!("{c}.{field}")))
+    }
 }
 
 /// Reads export files: `RTHX`, u32 version, name, then the payload. All
@@ -160,18 +191,41 @@ impl<'a> Reader<'a> {
 }
 
 /// Parses `entity_dimensions.bin`.
-pub fn read_entity_dimensions(bytes: &[u8]) -> Result<Vec<EntityDimensions>, String> {
-    let mut r = Reader::open(bytes, "entity_dimensions", 1)?;
+pub fn read_entity_types(bytes: &[u8]) -> Result<Vec<EntityTypeData>, String> {
+    let mut r = Reader::open(bytes, "entity_dimensions", 2)?;
     let count = r.u32()?;
     let mut out = Vec::with_capacity(count.min(4096) as usize);
     for _ in 0..count {
-        out.push(EntityDimensions {
-            id: r.u32()?,
-            key: r.string()?,
-            width: r.f32()?,
-            height: r.f32()?,
-            eye_height: r.f32()?,
-            fixed: r.u8()? != 0,
+        let id = r.u32()?;
+        let key = r.string()?;
+        let (width, height, eye_height) = (r.f32()?, r.f32()?, r.f32()?);
+        let fixed = r.u8()? != 0;
+        let update_interval = r.u32()? as i32;
+        let n = r.u8()?;
+        let mut classes = Vec::with_capacity(n.into());
+        for _ in 0..n {
+            classes.push(r.string()?);
+        }
+        let n = r.u32()?;
+        let mut fields = Vec::with_capacity(n.min(256) as usize);
+        for _ in 0..n {
+            fields.push((r.string()?, r.u8()?, r.u8()?));
+        }
+        let baby = match r.u8()? {
+            0 => None,
+            _ => Some((r.f32()?, r.f32()?, r.u8()? != 0)),
+        };
+        out.push(EntityTypeData {
+            id,
+            key,
+            width,
+            height,
+            eye_height,
+            fixed,
+            update_interval,
+            classes,
+            fields,
+            baby,
         });
     }
     r.finish()?;
@@ -312,9 +366,9 @@ mod tests {
     }
 
     #[test]
-    fn reads_entity_dimensions() {
+    fn reads_entity_types() {
         let mut b = b"RTHX".to_vec();
-        b.extend(1u32.to_le_bytes());
+        b.extend(2u32.to_le_bytes());
         string(&mut b, "entity_dimensions");
         b.extend(1u32.to_le_bytes());
         b.extend(7u32.to_le_bytes());
@@ -323,21 +377,39 @@ mod tests {
             b.extend(f.to_bits().to_le_bytes());
         }
         b.push(1);
-        let dims = read_entity_dimensions(&b).unwrap();
+        b.extend(3u32.to_le_bytes());
+        b.push(2);
+        string(&mut b, "Thing");
+        string(&mut b, "Entity");
+        b.extend(1u32.to_le_bytes());
+        string(&mut b, "Entity.DATA_POSE");
+        b.extend([6, 20]);
+        b.push(1);
+        for f in [0.25f32, 0.5] {
+            b.extend(f.to_bits().to_le_bytes());
+        }
+        b.push(0);
+        let types = read_entity_types(&b).unwrap();
         assert_eq!(
-            dims,
-            [EntityDimensions {
+            types,
+            [EntityTypeData {
                 id: 7,
                 key: "example:thing".into(),
                 width: 0.5,
                 height: 1.25,
                 eye_height: 1.0,
                 fixed: true,
+                update_interval: 3,
+                classes: vec!["Thing".into(), "Entity".into()],
+                fields: vec![("Entity.DATA_POSE".into(), 6, 20)],
+                baby: Some((0.25, 0.5, false)),
             }]
         );
-        assert!(read_entity_dimensions(&b[..b.len() - 1]).is_err());
+        assert!(types[0].is("Entity") && !types[0].is("LivingEntity"));
+        assert_eq!(types[0].nearest_field("DATA_POSE"), Some(6));
+        assert!(read_entity_types(&b[..b.len() - 1]).is_err());
         let mut extra = b.clone();
         extra.push(0);
-        assert!(read_entity_dimensions(&extra).is_err());
+        assert!(read_entity_types(&extra).is_err());
     }
 }

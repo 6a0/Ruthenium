@@ -85,6 +85,77 @@ pub fn lfloor(v: f64) -> i64 {
     v.floor() as i64
 }
 
+/// Java's `Math.round(double)`: to the nearest long, halves up (towards positive
+/// infinity, where Rust's `round` goes away from zero), saturating, NaN to 0.
+#[inline]
+pub fn round(v: f64) -> i64 {
+    let r = v.round();
+    // Within half of each other, so the difference is exact.
+    (if v - r == 0.5 { r + 1.0 } else { r }) as i64
+}
+
+/// Vanilla `Mth.wrapDegrees(float)`: into [-180, 180).
+#[inline]
+pub fn wrap_degrees(angle: f32) -> f32 {
+    let mut a = angle % 360.0;
+    if a >= 180.0 {
+        a -= 360.0;
+    }
+    if a < -180.0 {
+        a += 360.0;
+    }
+    a
+}
+
+/// Vanilla `Mth.wrapDegrees(double)`.
+#[inline]
+pub fn wrap_degrees_f64(angle: f64) -> f64 {
+    let mut a = angle % 360.0;
+    if a >= 180.0 {
+        a -= 360.0;
+    }
+    if a < -180.0 {
+        a += 360.0;
+    }
+    a
+}
+
+/// Vanilla `Mth.lerp(float, float, float)`.
+#[inline]
+pub fn lerp(alpha: f32, from: f32, to: f32) -> f32 {
+    from + alpha * (to - from)
+}
+
+/// Vanilla `Mth.lerp(double, double, double)`.
+#[inline]
+pub fn lerp_f64(alpha: f64, from: f64, to: f64) -> f64 {
+    from + alpha * (to - from)
+}
+
+/// Vanilla `Mth.rotLerp(float, float, float)`: the shorter way round.
+#[inline]
+pub fn rot_lerp(alpha: f32, from: f32, to: f32) -> f32 {
+    from + alpha * wrap_degrees(to - from)
+}
+
+/// Vanilla `Mth.rotLerp(double, double, double)`.
+#[inline]
+pub fn rot_lerp_f64(alpha: f64, from: f64, to: f64) -> f64 {
+    from + alpha * wrap_degrees_f64(to - from)
+}
+
+/// Vanilla `Mth.unpackDegrees`: a rotation sent as a byte, 256 steps a turn.
+#[inline]
+pub fn unpack_degrees(packed: i8) -> f32 {
+    (i32::from(packed) * 360) as f32 / 256.0
+}
+
+/// Vanilla `Mth.absMax(double, double)`.
+#[inline]
+pub fn abs_max(a: f64, b: f64) -> f64 {
+    a.abs().max(b.abs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +178,27 @@ mod tests {
         assert_eq!(floor(-1e300), i32::MIN);
         assert_eq!(floor_f32(-1e-45), -1);
         assert_eq!(lfloor(-1e300), i64::MIN);
+    }
+
+    #[test]
+    fn round_goes_half_up_like_java() {
+        assert_eq!(round(2.5), 3);
+        assert_eq!(round(-2.5), -2);
+        assert_eq!(round(-0.5), 0);
+        assert_eq!(round(0.49999999999999994), 0);
+        assert_eq!(round(-1.5000000000000002), -2);
+        assert_eq!(round(f64::NAN), 0);
+        assert_eq!(round(1e300), i64::MAX);
+    }
+
+    #[test]
+    fn degrees() {
+        assert_eq!(wrap_degrees(180.0), -180.0);
+        assert_eq!(wrap_degrees(-190.0), 170.0);
+        assert_eq!(wrap_degrees_f64(540.0), -180.0);
+        assert_eq!(rot_lerp(0.5, 170.0, -170.0), 180.0);
+        assert_eq!(unpack_degrees(-128), -180.0);
+        assert_eq!(unpack_degrees(64), 90.0);
     }
 
     #[test]

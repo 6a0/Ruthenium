@@ -58,7 +58,8 @@ public final class Recorder {
             "minecraft:container_set_slot", "minecraft:container_set_content", "minecraft:set_player_inventory",
             "minecraft:add_entity", "minecraft:remove_entities", "minecraft:move_entity_pos",
             "minecraft:move_entity_pos_rot", "minecraft:move_entity_rot", "minecraft:rotate_head",
-            "minecraft:swing_animation", "minecraft:set_equipment", "minecraft:sound");
+            "minecraft:swing_animation", "minecraft:set_equipment", "minecraft:sound",
+            "minecraft:set_passengers", "minecraft:set_player_team");
 
     private static final Gson GSON = new GsonBuilder().serializeSpecialFloatingPointValues().disableHtmlEscaping().create();
     private static final Object LOCK = new Object();

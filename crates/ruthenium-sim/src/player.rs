@@ -6,9 +6,10 @@
 //! block collisions with step-up, block friction and speed and jump factors, bouncing,
 //! the push out of suffocating blocks, poses, climbing, water and lava (depth, eyes
 //! under the surface, currents, swimming, swim sprinting, jumping and sinking in
-//! fluids). Not yet: flying and elytra, effects (dolphin's grace among them),
-//! vehicles, entity collisions and the world border, and the fence, wall and
-//! bounce-suppression tags.
+//! fluids), entities as solid as blocks (boats, shulkers; [`Env::colliders`]); other
+//! entities' pushes come from their ticks ([`crate::entity`]). Not yet: flying and
+//! elytra, effects (dolphin's grace among them), vehicles, the world border, and the
+//! fence, wall and bounce-suppression tags.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
@@ -20,7 +21,7 @@ use ruthenium_protocol::wire;
 
 use crate::blocks::{BlockTags, Blocks};
 use crate::fluid::FluidInteraction;
-use crate::shape::{Aabb, Axis, EPSILON, Placed, collide_all};
+use crate::shape::{Aabb, Axis, EPSILON, Placed, Shape, collide_all};
 use crate::world::Level;
 
 /// `Relative` bits.
@@ -120,7 +121,7 @@ pub struct Attribute {
 }
 
 impl Attribute {
-    fn new(base: f64, min: f64, max: f64) -> Attribute {
+    pub(crate) fn new(base: f64, min: f64, max: f64) -> Attribute {
         Attribute {
             base,
             modifiers: Vec::new(),
@@ -227,9 +228,12 @@ pub struct Env<'a> {
     pub level: &'a Level,
     pub blocks: &'a Blocks,
     pub tags: &'a BlockTags,
+    /// The boxes of the entities the player collides with (boats, shulkers:
+    /// `canBeCollidedWith`), as solid as blocks.
+    pub colliders: &'a [Aabb],
 }
 
-impl Env<'_> {
+impl<'a> Env<'a> {
     fn state(&self, p: [i32; 3]) -> u32 {
         self.level.block(p[0], p[1], p[2])
     }
@@ -238,8 +242,18 @@ impl Env<'_> {
         self.level.block_collisions(self.blocks, b)
     }
 
-    fn no_collision(&self, b: &Aabb) -> bool {
-        self.collisions(b).is_empty()
+    /// `noCollision`: no block shape and no entity in the way.
+    pub(crate) fn no_collision(&self, b: &Aabb) -> bool {
+        self.collisions(b).is_empty() && self.entity_colliders(b).next().is_none()
+    }
+
+    /// `getEntityCollisions`: the colliders touching the area (grown by 1e-7), none
+    /// for a vanishing area.
+    fn entity_colliders<'b>(&'b self, area: &Aabb) -> impl Iterator<Item = &'a Aabb> + 'b {
+        let size = (0..3).map(|i| area.max[i] - area.min[i]).sum::<f64>() / 3.0;
+        let grown = area.inflate([1.0E-7; 3]);
+        let colliders: &'a [Aabb] = if size < 1.0E-7 { &[] } else { self.colliders };
+        colliders.iter().filter(move |c| c.intersects(&grown))
     }
 
     fn has_chunk_at(&self, p: [i32; 3]) -> bool {
@@ -373,31 +387,45 @@ impl LocalPlayer {
     /// Applies a teleport (`PositionMoveRotation.calculateAbsolute`, then set without
     /// interpolation).
     pub fn teleport(&mut self, t: &PlayerPosition) {
-        let rel = |bit: u32| t.relatives & bit != 0;
-        let off = |bit: u32, v: f64| if rel(bit) { v } else { 0.0 };
-        let position = [
-            off(X, self.position[0]) + t.position[0],
-            off(Y, self.position[1]) + t.position[1],
-            off(Z, self.position[2]) + t.position[2],
-        ];
-        let y_rot = (if rel(Y_ROT) { self.y_rot } else { 0.0 }) + t.y_rot;
-        let x_rot = ((if rel(X_ROT) { self.x_rot } else { 0.0 }) + t.x_rot).clamp(-90.0, 90.0);
-        let mut moving = self.delta;
-        if rel(ROTATE_DELTA) {
-            let dy = self.y_rot - y_rot;
-            let dx = self.x_rot - x_rot;
-            moving = rotate_x(moving, (f64::from(dx) * DEGREES_TO_RADIANS) as f32);
-            moving = rotate_y(moving, (f64::from(dy) * DEGREES_TO_RADIANS) as f32);
+        (self.position, self.delta, self.y_rot, self.x_rot) = calculate_absolute(
+            self.position,
+            self.delta,
+            self.y_rot,
+            self.x_rot,
+            t.position,
+            t.delta,
+            t.y_rot,
+            t.x_rot,
+            t.relatives,
+        );
+    }
+
+    /// `handleUpdateAttributes`: each attribute's base, and its modifiers replaced by
+    /// the server's.
+    pub fn apply_attributes(
+        &mut self,
+        attributes: &[ruthenium_protocol::packets::play::AttributeSnapshot],
+    ) {
+        for a in attributes {
+            let Some(name) = u32::try_from(a.attribute)
+                .ok()
+                .and_then(ruthenium_data::v26_3::registries::Attribute::from_id)
+            else {
+                continue;
+            };
+            if let Some(instance) = self.attributes.get_mut(name.name()) {
+                instance.base = a.base;
+                instance.modifiers = a
+                    .modifiers
+                    .iter()
+                    .map(|(id, amount, operation)| Modifier {
+                        id: id.clone(),
+                        amount: *amount,
+                        operation: *operation,
+                    })
+                    .collect();
+            }
         }
-        let delta = |cur: f64, change: f64, bit: u32| if rel(bit) { cur + change } else { change };
-        self.delta = [
-            delta(moving[0], t.delta[0], DELTA_X),
-            delta(moving[1], t.delta[1], DELTA_Y),
-            delta(moving[2], t.delta[2], DELTA_Z),
-        ];
-        self.position = position;
-        self.y_rot = y_rot;
-        self.x_rot = x_rot;
     }
 
     /// `Entity.turn`: the mouse's turn for one frame (from [`crate::input::turn_amount`]),
@@ -982,7 +1010,7 @@ impl LocalPlayer {
 
     /// `LivingEntity.onClimbable`: the block the player is in is climbable, or an open
     /// trapdoor above a ladder facing the same way.
-    fn on_climbable(&self, env: &Env<'_>) -> bool {
+    pub(crate) fn on_climbable(&self, env: &Env<'_>) -> bool {
         let pos = self.block_position();
         let state = env.state(pos);
         if env.tags.climbable(state) {
@@ -1282,11 +1310,22 @@ impl LocalPlayer {
     fn collide(&self, env: &Env<'_>, movement: [f64; 3]) -> [f64; 3] {
         let b = self.bounding_box();
         let step = self.attributes.step_height.value() as f32;
+        // Entities first, found once for the move and the step up (`Shapes.create` of
+        // each box).
+        let entity_shapes: Vec<Shape> = env
+            .entity_colliders(&b.expand_towards(movement).expand_towards([
+                0.0,
+                f64::from(step),
+                0.0,
+            ]))
+            .map(box_shape)
+            .collect();
+        let with_entities = |blocks| entities_then(&entity_shapes, blocks);
         let len = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
         let result = if len == 0.0 {
             movement
         } else {
-            let shapes = env.collisions(&b.expand_towards(movement));
+            let shapes = with_entities(env.collisions(&b.expand_towards(movement)));
             collide_with_shapes(movement, &b, &shapes)
         };
         let x_c = movement[0] != result[0];
@@ -1303,7 +1342,7 @@ impl LocalPlayer {
             if !grounded_after {
                 area = area.expand_towards([0.0, -9.999999747378752E-6, 0.0]);
             }
-            let shapes = env.collisions(&area);
+            let shapes = with_entities(env.collisions(&area));
             let skip = result[1] as f32;
             for h in candidate_step_heights(&grounded, &shapes, step, skip) {
                 let stepped = collide_with_shapes(
@@ -1408,6 +1447,72 @@ impl Default for LocalPlayer {
 }
 
 /// `Entity.collideWithShapes`: y first, then the larger horizontal axis last.
+/// `PositionMoveRotation.calculateAbsolute`: the current position, motion and
+/// rotation changed by a teleport's, each value absolute or relative as `relatives`
+/// says (`Relative` bits); the motion turns with the rotation under `ROTATE_DELTA`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn calculate_absolute(
+    position: [f64; 3],
+    delta: [f64; 3],
+    y_rot: f32,
+    x_rot: f32,
+    change: [f64; 3],
+    change_delta: [f64; 3],
+    change_y: f32,
+    change_x: f32,
+    relatives: u32,
+) -> ([f64; 3], [f64; 3], f32, f32) {
+    let rel = |bit: u32| relatives & bit != 0;
+    let off = |bit: u32, v: f64| if rel(bit) { v } else { 0.0 };
+    let new_position = [
+        off(X, position[0]) + change[0],
+        off(Y, position[1]) + change[1],
+        off(Z, position[2]) + change[2],
+    ];
+    let new_y = (if rel(Y_ROT) { y_rot } else { 0.0 }) + change_y;
+    let new_x = ((if rel(X_ROT) { x_rot } else { 0.0 }) + change_x).clamp(-90.0, 90.0);
+    let mut moving = delta;
+    if rel(ROTATE_DELTA) {
+        let dy = y_rot - new_y;
+        let dx = x_rot - new_x;
+        moving = rotate_x(moving, (f64::from(dx) * DEGREES_TO_RADIANS) as f32);
+        moving = rotate_y(moving, (f64::from(dy) * DEGREES_TO_RADIANS) as f32);
+    }
+    let d = |cur: f64, change: f64, bit: u32| if rel(bit) { cur + change } else { change };
+    let new_delta = [
+        d(moving[0], change_delta[0], DELTA_X),
+        d(moving[1], change_delta[1], DELTA_Y),
+        d(moving[2], change_delta[2], DELTA_Z),
+    ];
+    (new_position, new_delta, new_y, new_x)
+}
+
+/// The entity shapes, then the block shapes (`collideBoundingBox`'s order).
+fn entities_then<'s>(entities: &'s [Shape], blocks: Vec<Placed<'s>>) -> Vec<Placed<'s>> {
+    let mut all: Vec<Placed<'s>> = entities
+        .iter()
+        .map(|shape| Placed {
+            shape,
+            offset: None,
+            pos: [0.0; 3],
+        })
+        .collect();
+    all.extend(blocks);
+    all
+}
+
+/// `Shapes.create` of an entity's box: one full cell spanning it.
+fn box_shape(b: &Aabb) -> Shape {
+    Shape::new(&ruthenium_prepare::exporters::ShapeData {
+        coords: [
+            vec![b.min[0], b.max[0]],
+            vec![b.min[1], b.max[1]],
+            vec![b.min[2], b.max[2]],
+        ],
+        full: vec![true],
+    })
+}
+
 fn collide_with_shapes(movement: [f64; 3], b: &Aabb, shapes: &[Placed<'_>]) -> [f64; 3] {
     if shapes.is_empty() {
         return movement;

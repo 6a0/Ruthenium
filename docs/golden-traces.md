@@ -34,7 +34,7 @@ Things this harness changes compared with normal play, which replay tests must a
 
 ## Replaying
 
-`crates/ruthenium-sim/tests/golden.rs` replays every trace through Ruthenium's movement code: it builds the scenario's world from the header's commands on the flat preset, then each tick sets the camera's rotation, holds the recorded keys, runs the player's tick and compares the position, velocity, ground and collision flags, sprinting and pose with the `state` record, and the movement packets (`player_input`, `player_command`, `move_player_*`) with the `out` records, byte for byte. It needs the prepared game (block shapes from the exporters, block tags from the jar):
+`crates/ruthenium-sim/tests/golden.rs` replays every trace through Ruthenium's movement code: it builds the scenario's world from the header's commands on the flat preset, applies the packets the client handled (entities added, moved and removed, their data, teams, the player's motion and attributes) where the trace handled them, then each tick sets the camera's rotation, holds the recorded keys, runs the entities' tick with the player's in its place and compares the position, velocity, ground and collision flags, sprinting and pose with the `state` record, and the movement packets (`player_input`, `player_command`, `move_player_*`) with the `out` records, byte for byte. It needs the prepared game (block shapes from the exporters, block tags from the jar):
 
 ```sh
 RUTHENIUM_GAME_DIR=~/.local/share/ruthenium/game cargo test -p ruthenium-sim --test golden -- --nocapture
@@ -62,8 +62,11 @@ Each scenario first clears a 41 × 25 area around the origin of a flat world and
 | `head_hitter` | sprint-jump under a ceiling 2 blocks above the floor |
 | `mouse_turn` | walk while the mouse turns the camera every tick |
 | `combat_basics` | hotbar keys and scrolling, attacks on an armor stand, a missed swing, shield use |
+| `entity_push` | mobs push the player: a zombie overlapping it, walking into it, a baby zombie, a slime |
+| `entity_moving` | a zombie moved through the standing player a little every tick (stepped moves, interpolated pushes), another sliding sideways, both killed |
+| `entity_rules` | team collision rules (never, push other teams, push own team), then a boat that pushes the player and that it steps onto |
 
-They are defined in `tools/java/trace/src/dev/ruthenium/trace/Scenarios.java`. To add one, add an entry there and record again.
+They are defined in `tools/java/trace/src/dev/ruthenium/trace/Scenarios.java`. To add one, add an entry there and record again. Scripts can run server commands while the trace records, so entities a scenario needs are summoned inside its script: their packets are then in the trace. A scenario that leaves mobs behind must remove them and wait until they are gone (dying mobs push for 20 ticks, and a large slime splits), or they push the player before the next trace starts.
 
 ## Format (`ruthenium-trace/1`)
 
@@ -74,7 +77,7 @@ JSON Lines. The first line is the header; every other line is one record with a 
 
 | `k` | When | Fields |
 |---|---|---|
-| `header` | first line | `format`, `game`, `protocol`, `scenario`, `description`, `world`, `reset`, `build`, `teleport`, `options` (toggle sprint/crouch, auto-jump, mouse sensitivity), `entityId`, `harness` |
+| `header` | first line | `format`, `game`, `protocol`, `scenario`, `description`, `world`, `reset`, `build`, `teleport`, `options` (toggle sprint/crouch, auto-jump, mouse sensitivity), `entityId`, `playerName` (the offline player's name, which teams list), `harness` |
 | `frame` | start of each client frame | `f` |
 | `tick` | start of each client tick, before the game reads input | `n`, `f`, `down` (key mappings held), `clicks` (queued presses of keys the game reads as clicks: attack, use, pick, drop, swap, inventory, hotbar), `yRot`, `xRot`, `slot` |
 | `state` | end of each client tick | `n`, `gameTime`, `pos`, `vel`, `yRot`, `xRot`, `onGround`, `hColl`, `minorHColl`, `vColl`, `vCollBelow`, `fall`, `sprinting`, `shiftDown`, `pose`, `flying`, `inWater`, `input` (the tick's movement input), `move` (move vector), `health`, `food` |
@@ -83,4 +86,4 @@ JSON Lines. The first line is the header; every other line is one record with a 
 | `handle` | a clientbound packet being processed on the game thread (sub-packets of a bundle get `bundled: true`) | `n`, `f`, `thread`, `proto`, `name`, and `hex` for packets that affect the local player |
 | `end` | last line | `ticks` |
 
-Inbound bytes are recorded only for the packets that affect the local player or its surroundings in a scenario: position and rotation, motion, explosions, attributes, effects, abilities, health, game events, tick rate, held slot, keep-alive and ping, damage, entity data and movement, block updates and acknowledgements, inventory slots, sounds. Chunk, light, registry, tag, recipe and advancement packets appear by name only, so traces hold Ruthenium's own measurements and no game data (see `docs/reference-policy.md`, rule 5).
+Inbound bytes are recorded only for the packets that affect the local player or its surroundings in a scenario: position and rotation, motion, explosions, attributes, effects, abilities, health, game events, tick rate, held slot, keep-alive and ping, damage, entities added and removed, their data, movement and passengers, teams, block updates and acknowledgements, inventory slots, sounds. Chunk, light, registry, tag, recipe and advancement packets appear by name only, so traces hold Ruthenium's own measurements and no game data (see `docs/reference-policy.md`, rule 5).

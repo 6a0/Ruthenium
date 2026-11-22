@@ -40,6 +40,7 @@ use ruthenium_protocol::packets::{Common, KnownPack, PackAction, play, read_bran
 
 use crate::blocks::{BlockTags, Blocks};
 use crate::clock::{self, TickClock};
+use crate::entity::{Entities, EntityTypes, Local as LocalInfo, PlayerInfos, Teams, TickContext};
 use crate::input::next_scroll_selection;
 use crate::level_load::LevelLoad;
 use crate::player::{Env, Keys, LocalPlayer, Pose};
@@ -60,6 +61,8 @@ pub struct SessionOptions {
 #[derive(Debug, Clone)]
 pub struct Physics {
     pub blocks: std::sync::Arc<Blocks>,
+    /// Entity types: sizes, update intervals, synched-data fields.
+    pub entity_types: std::sync::Arc<EntityTypes>,
     /// Vanilla's dimension types by name, for servers that send them as known-pack
     /// entries without data.
     pub dimension_types: HashMap<String, DimensionType>,
@@ -132,6 +135,8 @@ pub struct PlayerView {
     pub pose: Pose,
     pub selected_slot: i32,
     pub chunks: usize,
+    /// Other entities the client tracks.
+    pub entities: usize,
     /// Whether the player has loaded into the level.
     pub loaded: bool,
 }
@@ -302,7 +307,17 @@ struct Game {
     keys: Keys,
     /// Hotbar key presses not yet read (`KeyMapping.clickCount`).
     hotbar_clicks: [u32; 9],
+    /// The profile name the server knows the player by (its scoreboard name).
+    name: String,
+    /// The player list and the scoreboard's teams (the play listener's, gone with it
+    /// on a reconfiguration).
+    players: PlayerInfos,
+    teams: Teams,
 }
+
+/// The feature flag that switches minecarts to their new movement, which doesn't
+/// interpolate.
+const MINECART_IMPROVEMENTS: &str = "minecraft:minecart_improvements";
 
 /// `ClientboundGameEventPacket` events the session acts on.
 const GAME_EVENT_CHANGE_GAME_MODE: u8 = 3;
@@ -315,6 +330,10 @@ struct World {
     game_type: i32,
     player: LocalPlayer,
     level: Level,
+    /// The other entities in the level.
+    entities: Entities,
+    /// The player's health (`set_health`): a dead player isn't pushed.
+    health: f32,
     /// Bits of the biome palette (from the biome registry's size).
     biome_bits: u32,
     /// Until the player counts as loaded.
@@ -330,12 +349,20 @@ struct World {
 }
 
 impl World {
-    fn new(spawn: &play::SpawnInfo, now: i64, level: Level, biome_bits: u32) -> World {
+    fn new(
+        spawn: &play::SpawnInfo,
+        now: i64,
+        level: Level,
+        biome_bits: u32,
+        entities: Entities,
+    ) -> World {
         World {
             dimension: spawn.dimension.clone(),
             game_type: spawn.game_type,
             player: LocalPlayer::new(),
             level,
+            entities,
+            health: 20.0,
             biome_bits,
             load: Some(LevelLoad::start(now)),
             loaded: false,
@@ -376,6 +403,9 @@ impl Game {
             view: Arc::default(),
             keys: Keys::default(),
             hotbar_clicks: [0; 9],
+            name: String::new(),
+            players: PlayerInfos::default(),
+            teams: Teams::default(),
         }
     }
 
@@ -477,6 +507,7 @@ impl Game {
             pose: w.player.pose,
             selected_slot: w.selected_slot,
             chunks: w.level.chunk_count(),
+            entities: w.entities.len(),
             loaded: w.loaded,
         });
         *lock(&self.view) = view;
@@ -501,6 +532,7 @@ impl Game {
             Event::LoggedIn { profile } => {
                 self.phase = Phase::Configuration;
                 eprintln!("[session] logged in as {}", profile.name);
+                self.name = profile.name.clone();
                 self.report(SessionEvent::LoggedIn { name: profile.name });
             }
             Event::Configuration(p) => {
@@ -571,6 +603,16 @@ impl Game {
         (level, global_bits(biomes))
     }
 
+    /// A level's entities, the player's among them.
+    fn new_entities(&self, player_id: i32) -> Entities {
+        let improved = self
+            .configured
+            .features
+            .iter()
+            .any(|f| f == MINECART_IMPROVEMENTS);
+        Entities::new(player_id, improved)
+    }
+
     /// The block tags movement reads, from the server's tags (block registry ids).
     fn apply_tags(&mut self, tags: &[RegistryTags]) {
         let Some(blocks) = tags.iter().find(|t| t.registry == "minecraft:block") else {
@@ -625,20 +667,37 @@ impl Game {
                 }
             }
         }
-        // `level.tickEntities` ticks the player, then `player.sendChanges`; both only
-        // once it has loaded.
-        if w.loaded
-            && let Some(physics) = &self.physics
-        {
+        // `level.tickEntities`: the entities in order, the player among them, which
+        // ticks and sends its changes (`sendPosition`) only once it has loaded.
+        if let Some(physics) = &self.physics {
             let env = Env {
                 level: &w.level,
                 blocks: &physics.blocks,
                 tags: &self.tags,
+                colliders: &[],
             };
-            w.player.tick(&env, self.keys);
-            for p in w.player.send_changes() {
-                self.connection.send(p);
-            }
+            let cx = TickContext {
+                env: &env,
+                teams: &self.teams,
+                players: &self.players,
+                local: LocalInfo {
+                    name: &self.name,
+                    spectator: w.game_type == play::SPECTATOR,
+                    health: w.health,
+                },
+                tick_rate: w.tick_rate,
+                runs_normally: !w.frozen,
+            };
+            let (loaded, keys, connection) = (w.loaded, self.keys, &self.connection);
+            w.entities.tick(&cx, &mut w.player, |player, colliders| {
+                if loaded {
+                    let env = Env { colliders, ..env };
+                    player.tick(&env, keys);
+                    for p in player.send_changes() {
+                        connection.send(p);
+                    }
+                }
+            });
         }
         self.connection.send(play::client_tick_end());
     }
@@ -771,6 +830,8 @@ impl Game {
                 self.phase = Phase::Configuration;
                 self.collecting = Configured::default();
                 self.world = None;
+                self.players = PlayerInfos::default();
+                self.teams = Teams::default();
                 self.report(SessionEvent::Reconfiguring);
             }
             play::Clientbound::Login(login) => {
@@ -783,18 +844,30 @@ impl Game {
                     login.spawn.game_type
                 );
                 let (level, biome_bits) = self.new_level(&login.spawn);
-                let mut world = World::new(&login.spawn, now, level, biome_bits);
+                let entities = self.new_entities(login.player_id);
+                let mut world = World::new(&login.spawn, now, level, biome_bits, entities);
                 world.player.entity_id = login.player_id;
                 self.world = Some(world);
             }
             play::Clientbound::Respawn { spawn, .. } => {
                 let (level, biome_bits) = self.new_level(&spawn);
+                let id = self
+                    .world
+                    .as_ref()
+                    .ok_or("a respawn before the login")?
+                    .player
+                    .entity_id;
+                let entities = self.new_entities(id);
                 let w = self.world.as_mut().ok_or("a respawn before the login")?;
                 if spawn.dimension != w.dimension {
                     w.level = level;
+                    w.entities = entities;
                     w.biome_bits = biome_bits;
                     w.dimension = spawn.dimension.clone();
+                } else {
+                    w.entities.local_respawned();
                 }
+                w.health = 20.0;
                 w.game_type = spawn.game_type;
                 // `handleRespawn`: a new player, not loaded until the level is ready.
                 let old = std::mem::take(&mut w.player);
@@ -830,15 +903,17 @@ impl Game {
                 }
             }
             play::Clientbound::LevelChunk { x, z, data } => {
-                if let Some(w) = &mut self.world
-                    && let Err(e) = w.level.load_chunk(x, z, &data, w.biome_bits)
-                {
-                    return Err(format!("chunk {x} {z}: {e}"));
+                if let Some(w) = &mut self.world {
+                    if let Err(e) = w.level.load_chunk(x, z, &data, w.biome_bits) {
+                        return Err(format!("chunk {x} {z}: {e}"));
+                    }
+                    w.entities.chunk_loaded(x, z);
                 }
             }
             play::Clientbound::ForgetLevelChunk { x, z } => {
                 if let Some(w) = &mut self.world {
                     w.level.forget_chunk(x, z);
+                    w.entities.chunk_unloaded(x, z);
                 }
             }
             play::Clientbound::BlockUpdate { pos, state } => {
@@ -864,10 +939,12 @@ impl Game {
                 entity_id,
                 attributes,
             } => {
-                if let Some(w) = &mut self.world
-                    && entity_id == w.player.entity_id
-                {
-                    apply_attributes(&mut w.player, &attributes);
+                if let Some(w) = &mut self.world {
+                    if entity_id == w.player.entity_id {
+                        w.player.apply_attributes(&attributes);
+                    } else {
+                        w.entities.update_attributes(entity_id, &attributes);
+                    }
                 }
             }
             play::Clientbound::SetEntityMotion {
@@ -875,10 +952,12 @@ impl Game {
                 movement,
             } => {
                 // `lerpMotion`: the velocity is replaced (knockback).
-                if let Some(w) = &mut self.world
-                    && entity_id == w.player.entity_id
-                {
-                    w.player.delta = movement;
+                if let Some(w) = &mut self.world {
+                    if entity_id == w.player.entity_id {
+                        w.player.delta = movement;
+                    } else {
+                        w.entities.set_motion(entity_id, movement);
+                    }
                 }
             }
             play::Clientbound::Explode {
@@ -909,6 +988,89 @@ impl Game {
                     w.frozen = frozen;
                 }
             }
+            play::Clientbound::AddEntity(add) => {
+                if let Some(w) = &mut self.world
+                    && let Some(physics) = &self.physics
+                {
+                    w.entities.add(&add, &physics.entity_types, &self.players);
+                }
+            }
+            play::Clientbound::RemoveEntities { ids } => {
+                if let Some(w) = &mut self.world {
+                    for id in ids {
+                        w.entities.remove(id);
+                    }
+                }
+            }
+            play::Clientbound::MoveEntity {
+                entity_id,
+                delta,
+                rotation,
+                on_ground,
+            } => {
+                if let Some(w) = &mut self.world {
+                    w.entities
+                        .move_entity(entity_id, delta.as_ref(), rotation, on_ground);
+                }
+            }
+            play::Clientbound::TeleportEntity {
+                entity_id,
+                change,
+                on_ground,
+            } => {
+                if let Some(w) = &mut self.world {
+                    w.entities.teleport(entity_id, &change, on_ground);
+                }
+            }
+            play::Clientbound::EntityPositionSync {
+                entity_id,
+                path,
+                y_rot,
+                x_rot,
+                on_ground,
+            } => {
+                if let Some(w) = &mut self.world {
+                    w.entities
+                        .position_sync(entity_id, &path, y_rot, x_rot, on_ground);
+                }
+            }
+            play::Clientbound::SetEntityData {
+                entity_id, values, ..
+            } => {
+                if let Some(w) = &mut self.world
+                    && let Some(physics) = &self.physics
+                {
+                    w.entities
+                        .set_data(entity_id, &values, &physics.entity_types);
+                }
+            }
+            play::Clientbound::SetPassengers {
+                vehicle,
+                passengers,
+            } => {
+                if let Some(w) = &mut self.world {
+                    w.entities.set_passengers(vehicle, &passengers);
+                }
+            }
+            play::Clientbound::SetPlayerTeam {
+                name,
+                method,
+                parameters,
+                players,
+            } => self
+                .teams
+                .apply(&name, method, parameters.as_ref(), &players),
+            play::Clientbound::PlayerInfoUpdate { actions, entries } => {
+                self.players.update(actions, &entries);
+            }
+            play::Clientbound::PlayerInfoRemove { ids } => self.players.remove(&ids),
+            play::Clientbound::SetHealth { health, food, .. } => {
+                // `hurtTo` and the food level.
+                if let Some(w) = &mut self.world {
+                    w.health = health;
+                    w.player.food = food;
+                }
+            }
             // The connection thread answers these.
             play::Clientbound::ChunkBatchStart | play::Clientbound::ChunkBatchFinished { .. } => {}
             play::Clientbound::Other(kind) => {
@@ -919,31 +1081,6 @@ impl Game {
             }
         }
         Ok(())
-    }
-}
-
-/// `handleUpdateAttributes` for the local player: each attribute's base, and its
-/// modifiers replaced by the server's.
-fn apply_attributes(player: &mut LocalPlayer, attributes: &[play::AttributeSnapshot]) {
-    for a in attributes {
-        let Some(name) = u32::try_from(a.attribute)
-            .ok()
-            .and_then(ruthenium_data::v26_3::registries::Attribute::from_id)
-        else {
-            continue;
-        };
-        if let Some(instance) = player.attributes.get_mut(name.name()) {
-            instance.base = a.base;
-            instance.modifiers = a
-                .modifiers
-                .iter()
-                .map(|(id, amount, operation)| crate::player::Modifier {
-                    id: id.clone(),
-                    amount: *amount,
-                    operation: *operation,
-                })
-                .collect();
-        }
     }
 }
 

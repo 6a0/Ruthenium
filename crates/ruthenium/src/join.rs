@@ -12,6 +12,7 @@ use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, R
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
 use ruthenium_sim::blocks::Blocks;
+use ruthenium_sim::entity::EntityTypes;
 use ruthenium_sim::session::{DimensionType, Physics, Session, SessionOptions};
 
 use crate::account::Accounts;
@@ -77,10 +78,21 @@ impl GameData {
         known_packs.extend(features.iter().map(|f| KnownPack::vanilla(f, id)));
         let exports = ruthenium_prepare::exporters::exports_dir(&imported);
         let physics = match Blocks::load(&exports) {
-            Ok(blocks) => Some(Physics {
-                blocks: Arc::new(blocks),
-                dimension_types: dimension_types(&jar),
-            }),
+            Ok(blocks) => {
+                // Without entity types the player still moves; it just doesn't see
+                // other entities (an export from before they were added, say).
+                let entity_types = EntityTypes::load(&exports).unwrap_or_else(|e| {
+                    eprintln!(
+                        "[ruthenium] no entity types ({e}); run `ruthenium prepare`. Other entities won't push the player"
+                    );
+                    EntityTypes::default()
+                });
+                Some(Physics {
+                    blocks: Arc::new(blocks),
+                    entity_types: Arc::new(entity_types),
+                    dimension_types: dimension_types(&jar),
+                })
+            }
             Err(e) => {
                 eprintln!("[ruthenium] no block physics ({e}); run `ruthenium prepare`");
                 None

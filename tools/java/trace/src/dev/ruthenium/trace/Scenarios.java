@@ -3,6 +3,7 @@ package dev.ruthenium.trace;
 import java.util.List;
 import java.util.function.Function;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
+import net.fabricmc.fabric.api.client.gametest.v1.context.TestServerContext;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Options;
 
@@ -53,6 +54,13 @@ public final class Scenarios {
         }
     }
 
+    /** Mobs that stand still, stay, keep quiet and don't burn in daylight. */
+    private static final String STILL = "{NoAI:1b,PersistenceRequired:1b,Silent:1b}";
+
+    private static void fireproof(TestServerContext server) {
+        server.runCommand("effect give @e[type=!minecraft:player] minecraft:fire_resistance infinite 0 true");
+    }
+
     private static double[] start(double x, double y, double z, double yaw, double pitch) {
         return new double[] {x, y, z, yaw, pitch};
     }
@@ -60,7 +68,7 @@ public final class Scenarios {
     public static final List<Scenario> ALL = List.of(
             new Scenario("walk_directions",
                     "Walk 15 ticks in each of the eight key directions on stone, 5 idle ticks between.",
-                    List.of(), start(0.5, -60, 0.5, 0, 0), ctx -> {
+                    List.of(), start(0.5, -60, 0.5, 0, 0), (ctx, server) -> {
                         List<List<Function<Options, KeyMapping>>> directions = List.of(
                                 List.of(W), List.of(W, D), List.of(D), List.of(S, D),
                                 List.of(S), List.of(S, A), List.of(A), List.of(W, A));
@@ -77,13 +85,13 @@ public final class Scenarios {
                     }),
             new Scenario("sprint_jump",
                     "Hold forward, sprint and jump for 40 ticks (sprint-jump chain), then stop.",
-                    List.of(), start(0.5, -60, 0.5, -90, 0), ctx -> {
+                    List.of(), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 40, W, SPRINT, JUMP);
                         ctx.waitTicks(20);
                     }),
             new Scenario("sneak_edge",
                     "On a 5x5 platform 3 blocks high: sneak forward into the edge, sneak sideways along it, then walk off without sneaking.",
-                    List.of("fill 0 -60 -2 4 -58 2 minecraft:stone"), start(2.5, -57, 0.5, -90, 0), ctx -> {
+                    List.of("fill 0 -60 -2 4 -58 2 minecraft:stone"), start(2.5, -57, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 30, W, SNEAK);
                         ctx.waitTicks(5);
                         hold(ctx, 20, D, SNEAK);
@@ -94,14 +102,14 @@ public final class Scenarios {
             new Scenario("ice",
                     "Sprint from ice onto blue ice, then let go and slide.",
                     List.of("fill 0 -61 -1 9 -61 1 minecraft:ice", "fill 10 -61 -1 19 -61 1 minecraft:blue_ice"),
-                    start(0.5, -60, 0.5, -90, 0), ctx -> {
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 20, W, SPRINT);
                         ctx.waitTicks(60);
                     }),
             new Scenario("slime_bounce",
                     "Walk off a 10-block pillar onto slime, bounce until settled, then jump on the slime.",
                     List.of("fill 1 -61 -2 6 -61 2 minecraft:slime_block", "fill 0 -60 0 0 -51 0 minecraft:stone"),
-                    start(0.5, -50, 0.5, -90, 0), ctx -> {
+                    start(0.5, -50, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 6, W);
                         ctx.waitTicks(80);
                         hold(ctx, 20, JUMP);
@@ -110,7 +118,7 @@ public final class Scenarios {
             new Scenario("ladder",
                     "Climb a ladder by walking into it, hold on by sneaking, then let go and slide down.",
                     List.of("fill 2 -60 -1 2 -52 1 minecraft:stone", "fill 1 -60 0 1 -53 0 minecraft:ladder[facing=west]"),
-                    start(0.5, -60, 0.5, -90, 0), ctx -> {
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 40, W);
                         hold(ctx, 20, W, SNEAK);
                         hold(ctx, 20, SNEAK);
@@ -118,7 +126,7 @@ public final class Scenarios {
                     }),
             new Scenario("swim",
                     "Walk into a 2-deep pool, sprint-swim, then swim up.",
-                    List.of("fill 0 -62 -2 12 -61 2 minecraft:water"), start(-1.5, -60, 0.5, -90, 0), ctx -> {
+                    List.of("fill 0 -62 -2 12 -61 2 minecraft:water"), start(-1.5, -60, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 15, W);
                         hold(ctx, 40, W, SPRINT);
                         hold(ctx, 20, W, JUMP);
@@ -135,7 +143,7 @@ public final class Scenarios {
                             "fill 5 -60 -1 5 -60 1 minecraft:water[level=5]",
                             "fill 6 -60 -1 6 -60 1 minecraft:water[level=6]",
                             "fill 7 -60 -1 7 -60 1 minecraft:water[level=7]"),
-                    start(8.5, -60, 0.5, 90, 0), ctx -> {
+                    start(8.5, -60, 0.5, 90, 0), (ctx, server) -> {
                         hold(ctx, 40, W);
                         hold(ctx, 10, JUMP);
                         ctx.waitTicks(20);
@@ -150,7 +158,7 @@ public final class Scenarios {
                     List.of("fill 3 -60 -1 5 -53 1 minecraft:stone", "fill 5 -52 -1 5 -51 1 minecraft:stone",
                             "fill 4 -60 0 4 -53 0 minecraft:air", "fill 4 -60 0 4 -55 0 minecraft:water[level=8]",
                             "setblock 4 -54 0 minecraft:water"),
-                    start(3.5, -52, 0.5, -90, 0), ctx -> {
+                    start(3.5, -52, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 15, W);
                         ctx.waitTicks(25);
                         hold(ctx, 40, JUMP);
@@ -162,7 +170,7 @@ public final class Scenarios {
             new Scenario("lava",
                     "With fire resistance: walk into a 2-deep lava pool, sink, swim across holding jump and hop out over the far edge.",
                     List.of("effect give @a minecraft:fire_resistance 300 0 true", "fill 0 -62 -2 6 -61 2 minecraft:lava"),
-                    start(-1.5, -60, 0.5, -90, 0), ctx -> {
+                    start(-1.5, -60, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 30, W);
                         hold(ctx, 50, W, JUMP);
                         ctx.waitTicks(20);
@@ -172,20 +180,20 @@ public final class Scenarios {
                     List.of("setblock 2 -60 0 minecraft:smooth_stone_slab", "setblock 4 -60 0 minecraft:white_carpet",
                             "setblock 6 -60 0 minecraft:snow[layers=3]", "setblock 8 -60 0 minecraft:oak_stairs[facing=east]",
                             "setblock 10 -60 0 minecraft:stone"),
-                    start(0.5, -60, 0.5, -90, 0), ctx -> {
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 50, W);
                         hold(ctx, 15, W, JUMP);
                         ctx.waitTicks(10);
                     }),
             new Scenario("head_hitter",
                     "Sprint-jump under a ceiling 2 blocks above the floor.",
-                    List.of("fill 0 -58 -1 20 -58 1 minecraft:stone"), start(0.5, -60, 0.5, -90, 0), ctx -> {
+                    List.of("fill 0 -58 -1 20 -58 1 minecraft:stone"), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 40, W, SPRINT, JUMP);
                         ctx.waitTicks(10);
                     }),
             new Scenario("mouse_turn",
                     "Walk forward while the mouse turns the camera every tick (turns are applied per frame).",
-                    List.of(), start(0.5, -60, 0.5, 0, 0), ctx -> {
+                    List.of(), start(0.5, -60, 0.5, 0, 0), (ctx, server) -> {
                         ctx.getInput().holdKey(W);
                         for (int i = 0; i < 40; i++) {
                             ctx.getInput().moveCursor(25, 0);
@@ -203,7 +211,7 @@ public final class Scenarios {
                     List.of("summon minecraft:armor_stand 2.5 -60 0.5",
                             "item replace entity @a hotbar.0 with minecraft:diamond_sword",
                             "item replace entity @a hotbar.1 with minecraft:shield"),
-                    start(0.5, -60, 0.5, -90, 0), ctx -> {
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
                         ctx.getInput().pressKey(hotbar(0));
                         ctx.waitTicks(5);
                         ctx.getInput().pressKey(ATTACK);
@@ -220,5 +228,77 @@ public final class Scenarios {
                         ctx.getInput().pressKey(ATTACK);
                         ctx.getInput().pressKey(ATTACK);
                         ctx.waitTicks(20);
+                    }),
+            new Scenario("entity_push",
+                    "Mobs push the player: a zombie summoned overlapping it, walking into it and standing in it; a baby zombie to the side; a size-2 slime behind.",
+                    List.of("difficulty normal"), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:zombie 0.8 -60 0.6 " + STILL);
+                        fireproof(server);
+                        ctx.waitTicks(15);
+                        hold(ctx, 20, W);
+                        ctx.waitTicks(20);
+                        server.runCommand("execute at @p run summon minecraft:zombie ~0.2 ~ ~0.5 {NoAI:1b,PersistenceRequired:1b,Silent:1b,IsBaby:1b}");
+                        fireproof(server);
+                        ctx.waitTicks(20);
+                        hold(ctx, 10, D);
+                        ctx.waitTicks(10);
+                        server.runCommand("execute at @p run summon minecraft:slime ~-0.5 ~ ~-0.3 {NoAI:1b,PersistenceRequired:1b,Silent:1b,Size:1}");
+                        ctx.waitTicks(20);
+                        hold(ctx, 15, S);
+                        ctx.waitTicks(20);
+                        // Gone before the next scenario: a size-1 slime doesn't split, and
+                        // dying mobs push for the 20 ticks they take to go.
+                        server.runCommand("data merge entity @e[type=minecraft:slime,limit=1] {Size:0}");
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(30);
+                    }),
+            new Scenario("entity_moving",
+                    "A zombie moved 0.15 blocks a tick through the standing player (interpolated pushes), then a second one sliding sideways, then both killed.",
+                    List.of("difficulty normal"), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:zombie 3.5 -60 0.6 " + STILL);
+                        fireproof(server);
+                        ctx.waitTicks(10);
+                        for (int i = 0; i < 40; i++) {
+                            server.runCommand("execute as @e[type=minecraft:zombie] at @s run tp @s ~-0.15 ~ ~");
+                            ctx.waitTick();
+                        }
+                        ctx.waitTicks(10);
+                        server.runCommand("execute at @p run summon minecraft:zombie ~0.3 ~ ~2 " + STILL);
+                        fireproof(server);
+                        ctx.waitTicks(5);
+                        for (int i = 0; i < 30; i++) {
+                            server.runCommand("execute as @e[type=minecraft:zombie,sort=nearest,limit=1] at @s run tp @s ~ ~ ~-0.12");
+                            ctx.waitTick();
+                        }
+                        ctx.waitTicks(10);
+                        server.runCommand("kill @e[type=minecraft:zombie]");
+                        ctx.waitTicks(30);
+                    }),
+            new Scenario("entity_rules",
+                    "Team collision rules decide who pushes (never, pushOtherTeams with the zombie alone and with both on the team, pushOwnTeam), then a boat pushes the player.",
+                    List.of("difficulty normal"), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("team add ruthenium_rules");
+                        server.runCommand("summon minecraft:zombie 0.8 -60 0.6 " + STILL);
+                        fireproof(server);
+                        server.runCommand("team modify ruthenium_rules collisionRule never");
+                        server.runCommand("team join ruthenium_rules @e[type=minecraft:zombie]");
+                        ctx.waitTicks(15);
+                        server.runCommand("team modify ruthenium_rules collisionRule pushOtherTeams");
+                        ctx.waitTicks(15);
+                        server.runCommand("team join ruthenium_rules @p");
+                        ctx.waitTicks(15);
+                        server.runCommand("team modify ruthenium_rules collisionRule pushOwnTeam");
+                        ctx.waitTicks(15);
+                        server.runCommand("team leave @p");
+                        ctx.waitTicks(15);
+                        server.runCommand("team remove ruthenium_rules");
+                        server.runCommand("kill @e[type=minecraft:zombie]");
+                        ctx.waitTicks(30);
+                        server.runCommand("execute at @p run summon minecraft:oak_boat ~1.2 ~ ~0.2");
+                        ctx.waitTicks(10);
+                        hold(ctx, 15, W);
+                        ctx.waitTicks(20);
+                        server.runCommand("kill @e[type=minecraft:oak_boat]");
+                        ctx.waitTicks(5);
                     }));
 }

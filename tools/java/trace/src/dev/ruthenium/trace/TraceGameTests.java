@@ -67,7 +67,7 @@ public final class TraceGameTests implements FabricClientGameTest {
 
         ctx.runOnClient(mc -> Recorder.begin(dir.resolve(scenario.name() + ".jsonl"), header(mc, scenario, tp)));
         try {
-            scenario.script().run(ctx);
+            scenario.script().run(ctx, server);
         } finally {
             ctx.runOnClient(mc -> Recorder.end());
             releaseAll(ctx);
@@ -104,6 +104,7 @@ public final class TraceGameTests implements FabricClientGameTest {
         o.add("options", options);
         if (mc.player != null) {
             o.addProperty("entityId", mc.player.getId());
+            o.addProperty("playerName", mc.player.getGameProfile().name());
         }
         o.addProperty("harness", "Fabric client gametest: one client tick per frame, one server tick per client tick");
         return o;

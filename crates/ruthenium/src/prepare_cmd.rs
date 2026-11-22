@@ -210,7 +210,7 @@ pub fn prepare(args: &[String]) -> ExitCode {
     let exports = exporters::exports_dir(&imported);
     let dims = std::fs::read(exports.join(exporters::ENTITY_DIMENSIONS))
         .map_err(|e| e.to_string())
-        .and_then(|b| exporters::read_entity_dimensions(&b));
+        .and_then(|b| exporters::read_entity_types(&b));
     match dims {
         Ok(dims) => {
             println!(
