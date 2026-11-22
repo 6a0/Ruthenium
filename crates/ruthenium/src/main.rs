@@ -6,6 +6,7 @@ mod assets_cmd;
 mod client;
 mod menu;
 mod prepare_cmd;
+mod servers;
 
 use std::process::ExitCode;
 use std::time::Instant;

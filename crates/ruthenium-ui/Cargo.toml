@@ -18,3 +18,4 @@ nalgebra = "0.34"
 rayon = "1.12"
 rustybuzz = "0.20.1"
 ruthenium-assets = { path = "../ruthenium-assets" }
+ruthenium-protocol = { path = "../ruthenium-protocol" }

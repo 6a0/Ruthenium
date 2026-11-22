@@ -168,9 +168,7 @@ impl Platform {
                     break;
                 }
                 for e in &buf[..n as usize] {
-                    if let Some(ev) = Event::from_sdl(e.assume_init_ref()) {
-                        handle(ev);
-                    }
+                    Event::dispatch(e.assume_init_ref(), &mut handle);
                 }
                 if (n as usize) < BATCH {
                     break;
@@ -231,6 +229,39 @@ impl Window {
                 sdl3_sys::surface::SDL_DestroySurface(surface);
             }
         }
+    }
+
+    /// Starts delivering typed text as [`Event::TextInput`] (and shows the IME when
+    /// there is one), for a focused text field.
+    pub fn start_text_input(&self) {
+        // SAFETY: raw is a live window.
+        unsafe { sdl3_sys::keyboard::SDL_StartTextInput(self.raw) };
+    }
+
+    pub fn stop_text_input(&self) {
+        // SAFETY: raw is a live window.
+        unsafe { sdl3_sys::keyboard::SDL_StopTextInput(self.raw) };
+    }
+
+    /// The clipboard's text, if it holds any.
+    pub fn clipboard_text(&self) -> Option<String> {
+        // SAFETY: SDL is initialised (this window holds it); the returned string is ours
+        // to free with SDL_free, and is NUL-terminated.
+        unsafe {
+            let p = sdl3_sys::clipboard::SDL_GetClipboardText();
+            if p.is_null() {
+                return None;
+            }
+            let s = CStr::from_ptr(p).to_string_lossy().into_owned();
+            sdl3_sys::stdinc::SDL_free(p.cast());
+            (!s.is_empty()).then_some(s)
+        }
+    }
+
+    pub fn set_clipboard_text(&self, text: &str) {
+        let Ok(c) = CString::new(text) else { return };
+        // SAFETY: SDL is initialised; SDL copies the string.
+        unsafe { sdl3_sys::clipboard::SDL_SetClipboardText(c.as_ptr()) };
     }
 
     /// Asks the window manager for a new window size in points (it may refuse or adjust;

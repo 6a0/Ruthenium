@@ -2,7 +2,14 @@
 //! space-themed look, unrelated to vanilla's GUI. Layout is in UI units, scaled to the
 //! window by [`UiScale`]; shapes and glyphs come out in window pixels.
 
+use crate::Clip;
 use crate::text::{Fonts, GlyphAtlas, Line, TextList, TextStyle, Weight};
+
+pub mod form;
+pub mod servers;
+
+pub use form::{Field, FormButton, FormScreen, FormSpec, TextField};
+pub use servers::{Ping, RowView, ServerListScreen};
 
 /// Window pixels per UI unit: the layout is designed for a window 900 units tall, so it
 /// keeps its proportions at any size (never below 0.75 px per unit, so text stays
@@ -98,6 +105,8 @@ pub struct Shape {
     pub image: Option<ShapeImage>,
     /// Flat shapes: keep only a band this many pixels wide inside the edge (0 fills).
     pub ring: f32,
+    /// Set by [`ShapeList::push`] from the list's current clip.
+    pub clip: Clip,
 }
 
 /// A texture shown by a [`Shape`].
@@ -113,65 +122,111 @@ pub struct ShapeImage {
 #[derive(Debug, Default)]
 pub struct ShapeList {
     shapes: Vec<Shape>,
+    clip: Clip,
 }
 
 impl ShapeList {
     pub fn new() -> ShapeList {
         ShapeList {
             shapes: Vec::with_capacity(64),
+            clip: Clip::NONE,
         }
     }
 
     pub fn clear(&mut self) {
         self.shapes.clear();
+        self.clip = Clip::NONE;
+    }
+
+    /// The clip for shapes added from now on.
+    pub fn set_clip(&mut self, clip: Clip) {
+        self.clip = clip;
     }
 
     pub fn shapes(&self) -> &[Shape] {
         &self.shapes
     }
 
+    /// Multiplies the opacity of every shape so far by `k`.
+    pub fn fade_all(&mut self, k: f32) {
+        for s in &mut self.shapes {
+            s.clip.opacity *= k;
+        }
+    }
+
+    /// Adds `shape` under the current clip.
     pub fn push(&mut self, shape: Shape) {
-        self.shapes.push(shape);
+        self.shapes.push(Shape {
+            clip: self.clip,
+            ..shape
+        });
+    }
+
+    /// Glass over `r` (UI units) with corners of `radius` units.
+    pub fn glass_rect(
+        &mut self,
+        scale: &UiScale,
+        r: Rect,
+        radius: f32,
+        tint: [f32; 4],
+        highlight: f32,
+    ) {
+        let px = scale.px;
+        self.push(Shape {
+            rect: px_rect(scale, r),
+            fill: tint,
+            radius: radius * px,
+            glass: true,
+            highlight,
+            refraction: 0.44 * radius.min(0.5 * r.h) * px,
+            image: None,
+            ring: 0.0,
+            clip: Clip::NONE,
+        });
     }
 
     /// A glass pill over `r` (UI units).
     pub fn glass_pill(&mut self, scale: &UiScale, r: Rect, tint: [f32; 4], highlight: f32) {
-        let px = scale.px;
-        let rect = [r.x * px, r.y * px, (r.x + r.w) * px, (r.y + r.h) * px];
-        self.push(Shape {
-            rect,
-            fill: tint,
-            radius: 0.5 * r.h * px,
-            glass: true,
-            highlight,
-            refraction: 0.22 * r.h * px,
-            image: None,
-            ring: 0.0,
-        });
+        self.glass_rect(scale, r, 0.5 * r.h, tint, highlight);
     }
 
-    /// A flat ring `width` units wide just inside the edge of the pill `r` (UI units).
-    pub fn pill_ring(&mut self, scale: &UiScale, r: Rect, width: f32, color: [f32; 4]) {
+    /// A flat rounded rectangle (UI units).
+    pub fn rounded(&mut self, scale: &UiScale, r: Rect, radius: f32, color: [f32; 4]) {
+        self.ring(scale, r, radius, 0.0, color);
+    }
+
+    /// A flat band `width` units wide just inside the edge of `r` (0 fills it).
+    pub fn ring(&mut self, scale: &UiScale, r: Rect, radius: f32, width: f32, color: [f32; 4]) {
         let px = scale.px;
         self.push(Shape {
-            rect: [r.x * px, r.y * px, (r.x + r.w) * px, (r.y + r.h) * px],
+            rect: px_rect(scale, r),
             fill: color,
-            radius: 0.5 * r.h * px,
+            radius: radius * px,
             glass: false,
             highlight: 0.0,
             refraction: 0.0,
             image: None,
             ring: width * px,
+            clip: Clip::NONE,
         });
+    }
+
+    /// A flat ring `width` units wide just inside the edge of the pill `r` (UI units).
+    pub fn pill_ring(&mut self, scale: &UiScale, r: Rect, width: f32, color: [f32; 4]) {
+        self.ring(scale, r, 0.5 * r.h, width, color);
     }
 
     /// A texture over `r` (UI units), premultiplied alpha.
     pub fn image(&mut self, scale: &UiScale, r: Rect, texture: u32) {
-        let px = scale.px;
+        self.image_rounded(scale, r, 0.0, texture);
+    }
+
+    /// A texture over `r` with rounded corners (UI units), premultiplied alpha.
+    pub fn image_rounded(&mut self, scale: &UiScale, r: Rect, radius: f32, texture: u32) {
         self.push(Shape {
-            rect: [r.x * px, r.y * px, (r.x + r.w) * px, (r.y + r.h) * px],
+            rect: px_rect(scale, r),
             fill: [1.0; 4],
-            radius: 0.0,
+            radius: radius * scale.px,
             glass: false,
             highlight: 0.0,
             refraction: 0.0,
@@ -180,8 +235,15 @@ impl ShapeList {
                 uv: [0.0, 0.0, 1.0, 1.0],
             }),
             ring: 0.0,
+            clip: Clip::NONE,
         });
     }
+}
+
+/// `r` (UI units) as `x0, y0, x1, y1` window pixels.
+pub fn px_rect(scale: &UiScale, r: Rect) -> [f32; 4] {
+    let px = scale.px;
+    [r.x * px, r.y * px, (r.x + r.w) * px, (r.y + r.h) * px]
 }
 
 /// What a menu button asks for.
@@ -190,6 +252,20 @@ pub enum Action {
     Multiplayer,
     Settings,
     Quit,
+    /// Back to the previous screen (also Escape).
+    Back,
+    /// Server list.
+    Join,
+    DirectConnect,
+    AddServer,
+    EditServer,
+    DeleteServer,
+    Refresh,
+    /// Forms: the main button (Done, Join, Delete) and Cancel.
+    Confirm,
+    Cancel,
+    /// Steps a choice button to its next value (the resource pack setting).
+    Cycle,
 }
 
 /// A pill button.
@@ -205,6 +281,8 @@ pub struct Button {
 const TINT: [f32; 4] = [0.85, 0.88, 1.0, 0.04];
 const TINT_HOVER: [f32; 4] = [0.90, 0.93, 1.0, 0.12];
 const PRESS_TINT: f32 = 0.08;
+const TINT_DISABLED: [f32; 4] = [0.85, 0.88, 1.0, 0.02];
+const LABEL_DISABLED: [f32; 4] = [1.0, 1.0, 1.0, 0.32];
 /// Size change of a hovered and of a pressed pill (fractions of its size).
 const HOVER_GROW: f32 = 0.025;
 const PRESS_SHRINK: f32 = 0.035;
@@ -285,14 +363,72 @@ pub struct ButtonStates {
     mouse_down: Option<usize>,
     key_down: Option<usize>,
     motion: Vec<Motion>,
+    enabled: Vec<bool>,
 }
 
 impl ButtonStates {
     pub fn new(buttons: usize) -> ButtonStates {
         ButtonStates {
             motion: vec![Motion::default(); buttons],
+            enabled: vec![true; buttons],
             ..ButtonStates::default()
         }
+    }
+
+    /// Enables or disables button `i`. A disabled button does not light up, take
+    /// presses or keyboard focus.
+    pub fn set_enabled(&mut self, i: usize, on: bool) {
+        if let Some(e) = self.enabled.get_mut(i) {
+            *e = on;
+        }
+        if !on {
+            if self.mouse_down == Some(i) {
+                self.mouse_down = None;
+            }
+            if self.key_down == Some(i) {
+                self.key_down = None;
+            }
+        }
+    }
+
+    pub fn enabled(&self, i: usize) -> bool {
+        self.enabled.get(i).copied().unwrap_or(false)
+    }
+
+    /// The focused button, if any (whether or not its ring shows).
+    pub fn focused(&self) -> Option<usize> {
+        self.focus
+    }
+
+    /// Whether the focus ring shows (focus came from the keyboard).
+    pub fn focus_visible(&self) -> bool {
+        self.focus_visible
+    }
+
+    /// Moves focus, showing the ring or not.
+    pub fn set_focus(&mut self, i: Option<usize>, visible: bool) {
+        self.focus = i.filter(|&i| i < self.motion.len());
+        self.focus_visible = visible;
+        self.key_down = None;
+    }
+
+    /// The next enabled button after `from` going forwards or backwards, wrapping.
+    fn step(&self, from: Option<usize>, forwards: bool) -> Option<usize> {
+        let n = self.motion.len();
+        let mut i = from;
+        for _ in 0..n {
+            let next = match (i, forwards) {
+                (None, true) => 0,
+                (None, false) => n - 1,
+                (Some(i), true) => (i + 1) % n,
+                (Some(i), false) => (i + n - 1) % n,
+            };
+            if self.enabled(next) {
+                return Some(next);
+            }
+            i = Some(next);
+        }
+        None
     }
 
     /// How many buttons it tracks.
@@ -312,6 +448,7 @@ impl ButtonStates {
     /// The left mouse button went down over `hit`.
     pub fn mouse_down(&mut self, hit: Option<usize>) {
         self.hovered = hit;
+        let hit = hit.filter(|&i| self.enabled(i));
         self.focus = hit;
         self.focus_visible = false;
         self.mouse_down = hit;
@@ -335,12 +472,7 @@ impl ButtonStates {
         }
         match (key, down) {
             (Key::Next | Key::Previous, _) => {
-                self.focus = Some(match (self.focus, key) {
-                    (None, Key::Next) => 0,
-                    (None, _) => n - 1,
-                    (Some(i), Key::Next) => (i + 1) % n,
-                    (Some(i), _) => (i + n - 1) % n,
-                });
+                self.focus = self.step(self.focus, key == Key::Next);
                 self.focus_visible = true;
                 self.key_down = None;
                 None
@@ -349,8 +481,12 @@ impl ButtonStates {
                 self.focus_visible = true;
                 match self.focus {
                     // Nothing focused yet: the first key only shows where focus starts.
-                    None => self.focus = Some(0),
-                    Some(i) if self.key_down.is_none() && self.mouse_down.is_none() => {
+                    None => self.focus = self.step(None, true),
+                    Some(i)
+                        if self.enabled(i)
+                            && self.key_down.is_none()
+                            && self.mouse_down.is_none() =>
+                    {
                         self.key_down = Some(i);
                         self.motion[i].hold = MIN_PRESS;
                     }
@@ -372,7 +508,9 @@ impl ButtonStates {
     pub fn update(&mut self, dt: f32) {
         let dt = dt.max(0.0);
         for (i, m) in self.motion.iter_mut().enumerate() {
-            let hovered = self.hovered == Some(i) && self.mouse_down.is_none_or(|d| d == i);
+            let hovered = self.hovered == Some(i)
+                && self.enabled[i]
+                && self.mouse_down.is_none_or(|d| d == i);
             let held = self.key_down == Some(i) || self.mouse_down == Some(i) && hovered;
             let pressed = held || m.hold > 0.0;
             m.hold = (m.hold - dt).max(0.0);
@@ -398,7 +536,60 @@ impl ButtonStates {
     }
 }
 
-fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+/// Draws a glass pill button over `rect` with its label, lit, pressed and focused as
+/// `look` says; a disabled one is dim and still.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_button(
+    shapes: &mut ShapeList,
+    text: &mut TextList,
+    atlas: Option<&GlyphAtlas>,
+    s: &UiScale,
+    rect: Rect,
+    label: &Text,
+    look: ButtonLook,
+    enabled: bool,
+) {
+    if !enabled {
+        shapes.glass_pill(s, rect, TINT_DISABLED, 0.4);
+        if let Some(atlas) = atlas {
+            label.centred(text, atlas, s, rect, LABEL_DISABLED);
+        }
+        return;
+    }
+    // Focus lights a pill half as much as the pointer; the ring says the rest.
+    let lit = look.hover.max(0.5 * look.focus);
+    let k = 1.0 + HOVER_GROW * look.hover - PRESS_SHRINK * look.press;
+    let r = rect.scaled(k);
+    let mut tint = mix(TINT, TINT_HOVER, lit);
+    tint[3] += PRESS_TINT * look.press;
+    shapes.glass_pill(s, r, tint, 0.75 + 0.25 * lit + 0.2 * look.press);
+    if look.focus > 0.0 {
+        let mut ring = FOCUS;
+        ring[3] *= look.focus;
+        shapes.pill_ring(s, r.outset(FOCUS_GAP + FOCUS_WIDTH), FOCUS_WIDTH, ring);
+    }
+    if let Some(atlas) = atlas {
+        label.centred_scaled(text, atlas, s, r, k, mix(LABEL, LABEL_HOVER, lit));
+    }
+}
+
+/// Draws a focus ring around `r` (corner radius `radius`), `amount` from 0 to 1.
+pub(crate) fn draw_focus_ring(
+    shapes: &mut ShapeList,
+    s: &UiScale,
+    r: Rect,
+    radius: f32,
+    amount: f32,
+) {
+    if amount > 0.0 {
+        let mut ring = FOCUS;
+        ring[3] *= amount;
+        let out = FOCUS_GAP + FOCUS_WIDTH;
+        shapes.ring(s, r.outset(out), radius + out, FOCUS_WIDTH, ring);
+    }
+}
+
+pub(crate) fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
 }
 
@@ -410,6 +601,8 @@ pub const WEIGHTS: [Weight; 4] = [
     Weight::EXTRABOLD,
 ];
 
+pub(crate) const WHITE_TEXT: [f32; 4] = WHITE;
+
 const NAME: &str = "RUTHENIUM";
 const NAME_SIZE: f32 = 34.0;
 const LOGO: f32 = 112.0;
@@ -418,17 +611,19 @@ const SMALL_SIZE: f32 = 11.5;
 const WHITE: [f32; 4] = [0.95, 0.96, 1.0, 1.0];
 const LABEL: [f32; 4] = [1.0, 1.0, 1.0, 0.88];
 const LABEL_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-const FAINT: [f32; 4] = [0.85, 0.87, 1.0, 0.45];
+pub(crate) const FAINT: [f32; 4] = [0.85, 0.87, 1.0, 0.45];
+pub(crate) const SOFT: [f32; 4] = [0.88, 0.9, 1.0, 0.7];
 
 /// Shaped text with the size it was shaped at (pixels) and its cap height (pixels).
 #[derive(Debug, Clone)]
-struct Text {
-    line: Line,
-    cap: f32,
+pub(crate) struct Text {
+    pub(crate) line: Line,
+    /// Cap height in pixels.
+    pub(crate) cap: f32,
 }
 
 impl Text {
-    fn new(
+    pub(crate) fn new(
         fonts: &Fonts,
         text: &str,
         scale: &UiScale,
@@ -451,8 +646,45 @@ impl Text {
         }
     }
 
+    /// Width in UI units.
+    pub(crate) fn width(&self, scale: &UiScale) -> f32 {
+        self.line.width / scale.px
+    }
+
+    /// Draws it with its baseline's left end at `(x, y)` (UI units).
+    pub(crate) fn draw_at(
+        &self,
+        list: &mut TextList,
+        atlas: &GlyphAtlas,
+        scale: &UiScale,
+        x: f32,
+        y: f32,
+        color: [f32; 4],
+    ) {
+        list.line(atlas, &self.line, x * scale.px, y * scale.px, color);
+    }
+
+    /// Draws it in `r` (UI units), capitals centred vertically, starting at the left.
+    pub(crate) fn left_in(
+        &self,
+        list: &mut TextList,
+        atlas: &GlyphAtlas,
+        scale: &UiScale,
+        r: Rect,
+        color: [f32; 4],
+    ) {
+        let cy = (r.y + 0.5 * r.h) * scale.px;
+        list.line(
+            atlas,
+            &self.line,
+            r.x * scale.px,
+            cy + 0.5 * self.cap,
+            color,
+        );
+    }
+
     /// Draws it centred in `r` (UI units), optically: capitals centred vertically.
-    fn centred(
+    pub(crate) fn centred(
         &self,
         list: &mut TextList,
         atlas: &GlyphAtlas,
@@ -464,7 +696,7 @@ impl Text {
     }
 
     /// Like `centred`, `k` times as large.
-    fn centred_scaled(
+    pub(crate) fn centred_scaled(
         &self,
         list: &mut TextList,
         atlas: &GlyphAtlas,
@@ -579,22 +811,7 @@ impl TitleScreen {
             shapes.image(s, self.logo, logo);
         }
         for (i, (b, label)) in self.buttons.iter().zip(&self.labels).enumerate() {
-            let look = states.look(i);
-            // Focus lights a pill half as much as the pointer; the ring says the rest.
-            let lit = look.hover.max(0.5 * look.focus);
-            let k = 1.0 + HOVER_GROW * look.hover - PRESS_SHRINK * look.press;
-            let r = b.rect.scaled(k);
-            let mut tint = mix(TINT, TINT_HOVER, lit);
-            tint[3] += PRESS_TINT * look.press;
-            shapes.glass_pill(s, r, tint, 0.75 + 0.25 * lit + 0.2 * look.press);
-            if look.focus > 0.0 {
-                let mut ring = FOCUS;
-                ring[3] *= look.focus;
-                shapes.pill_ring(s, r.outset(FOCUS_GAP + FOCUS_WIDTH), FOCUS_WIDTH, ring);
-            }
-            if let Some(atlas) = atlas {
-                label.centred_scaled(text, atlas, s, r, k, mix(LABEL, LABEL_HOVER, lit));
-            }
+            draw_button(shapes, text, atlas, s, b.rect, label, states.look(i), true);
         }
         let Some(atlas) = atlas else { return };
         self.name_text.centred(text, atlas, s, self.name, WHITE);

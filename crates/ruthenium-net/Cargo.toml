@@ -1,0 +1,19 @@
+[package]
+name = "ruthenium-net"
+description = "Networking: server addresses, SRV lookup, the server list's status ping, servers.dat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22.1"
+hickory-resolver = "0.26.3"
+idna = "1.1.0"
+ruthenium-data = { path = "../ruthenium-data" }
+ruthenium-protocol = { path = "../ruthenium-protocol" }
+tokio = { version = "1.54.1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }

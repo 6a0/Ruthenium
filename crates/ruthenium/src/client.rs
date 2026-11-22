@@ -56,6 +56,16 @@ pub struct Options {
     pub exercise_uploads: bool,
     /// Development: write the window's contents to this PNG once the menus show, then quit.
     pub screenshot: Option<std::path::PathBuf>,
+    /// Development: wait this long after the menus show before the screenshot.
+    pub screenshot_after: Duration,
+    /// The server list file (default: `servers.dat` in Ruthenium's data folder).
+    pub servers_file: Option<std::path::PathBuf>,
+    /// Development: start on this menu screen (`servers`, `add`, `direct`, `delete`).
+    pub screen: Option<String>,
+    /// Development: select this server in the list.
+    pub select: Option<usize>,
+    /// The window's starting size in points.
+    pub window_size: (u32, u32),
 }
 
 impl Options {
@@ -79,6 +89,11 @@ impl Options {
             exercise_uploads: false,
             bench_out: None,
             screenshot: None,
+            screenshot_after: Duration::ZERO,
+            servers_file: None,
+            screen: None,
+            select: None,
+            window_size: DEFAULT_SIZE,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -114,6 +129,30 @@ impl Options {
                 "--exercise-uploads" => o.exercise_uploads = true,
                 "--bench-out" => o.bench_out = Some(value("a file")?.into()),
                 "--screenshot" => o.screenshot = Some(value("a file")?.into()),
+                "--screenshot-after" => {
+                    let v = value("a number of seconds")?;
+                    let s: f64 = v
+                        .parse()
+                        .map_err(|_| format!("--screenshot-after: not a number: {v}"))?;
+                    o.screenshot_after = Duration::from_secs_f64(s.clamp(0.0, 600.0));
+                }
+                "--window-size" => {
+                    let v = value("a size like 1280x720")?;
+                    let parsed = v
+                        .split_once('x')
+                        .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                        .filter(|&(w, h)| (64..=16384).contains(&w) && (64..=16384).contains(&h));
+                    o.window_size = parsed.ok_or(format!("--window-size: not a size: {v}"))?;
+                }
+                "--servers-file" => o.servers_file = Some(value("a file")?.into()),
+                "--screen" => o.screen = Some(value("a screen name")?),
+                "--select" => {
+                    let v = value("a server number")?;
+                    o.select = Some(
+                        v.parse()
+                            .map_err(|_| format!("--select: not a number: {v}"))?,
+                    );
+                }
                 other => return Err(format!("unknown option {other}")),
             }
         }
@@ -145,9 +184,13 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     #[cfg(feature = "tracy")]
     profiling::tracy_client::Client::start();
 
-    let mut menu = Menu::new();
+    let servers_file = opts.servers_file.clone().or_else(|| {
+        ruthenium_prepare::default_data_dir(&ruthenium_prepare::discover::Env::from_process())
+            .map(|d| d.join("servers.dat"))
+    });
+    let mut menu = Menu::new(servers_file);
     let mut platform = Platform::init(env!("CARGO_PKG_VERSION"))?;
-    let window = platform.create_window("Ruthenium", DEFAULT_SIZE.0, DEFAULT_SIZE.1)?;
+    let window = platform.create_window("Ruthenium", opts.window_size.0, opts.window_size.1)?;
     let t_window = started.elapsed();
     let gpu = create_gpu(
         &platform,
@@ -209,11 +252,16 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut resized = None;
     let mut toggle_vsync = false;
     let mut toggle_overlay = false;
-    // Left mouse button changes (down, x, y) and keys (scancode, down, repeat, shift),
-    // handed to the menu after the events are drained.
-    let mut clicks: Vec<(bool, f32, f32)> = Vec::with_capacity(4);
-    let mut keys: Vec<(u32, bool, bool, bool)> = Vec::with_capacity(4);
+    // Left mouse button changes (down, x, y, shift) and keys (scancode, down, repeat,
+    // shift, shortcut), handed to the menu after the events are drained, and typed text.
+    let mut clicks: Vec<(bool, f32, f32, bool)> = Vec::with_capacity(4);
+    let mut keys: Vec<(u32, bool, bool, bool, bool)> = Vec::with_capacity(4);
+    let mut typed = String::new();
+    let mut shift_held = false;
+    let mut text_input = false;
     let mut screenshot_requested = false;
+    let mut text_shown: Option<Instant> = None;
+    let mut start_screen = opts.screen.clone();
     let mut frames: u64 = 0;
 
     loop {
@@ -229,6 +277,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
 
         // 2. Input.
         let t_input = Instant::now();
+        // While a text field has focus, V is a letter, not the VSync toggle.
+        let typing = menu.wants_text_input();
         platform.poll_events(|e| match e {
             Event::Quit | Event::CloseRequested => quit = true,
             Event::PixelSizeChanged { width, height } => resized = Some((width, height)),
@@ -245,7 +295,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 down: true,
                 repeat: false,
                 ..
-            } => toggle_vsync = true,
+            } if !typing => toggle_vsync = true,
             Event::Key {
                 scancode: SCANCODE_F3,
                 down: true,
@@ -257,29 +307,54 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 down,
                 repeat,
                 shift,
+                shortcut,
                 ..
-            } => keys.push((scancode, down, repeat, shift)),
+            } => {
+                shift_held = shift;
+                keys.push((scancode, down, repeat, shift, shortcut));
+            }
+            Event::TextInput { .. } => typed.push_str(e.text()),
             Event::MouseMotion { x, y } => menu.mouse_moved(x, y),
             Event::MouseLeft => menu.mouse_left(),
+            Event::MouseWheel { y } => menu.wheel(y),
             Event::MouseButton {
                 button: 1,
                 down,
                 x,
                 y,
                 ..
-            } => clicks.push((down, x, y)),
+            } => clicks.push((down, x, y, shift_held)),
             _ => {}
         });
         let mut actions: Vec<Action> = clicks
             .drain(..)
-            .filter_map(|(down, x, y)| {
-                menu.mouse_button(down, x, y, window.pixel_size(), window.size())
+            .filter_map(|(down, x, y, shift)| {
+                menu.mouse_button(
+                    down,
+                    x,
+                    y,
+                    shift,
+                    window.pixel_size(),
+                    window.size(),
+                    &mut renderer,
+                )
             })
             .collect();
-        actions.extend(
-            keys.drain(..)
-                .filter_map(|(code, down, repeat, shift)| menu.key(code, down, repeat, shift)),
-        );
+        for (code, down, repeat, shift, shortcut) in keys.drain(..) {
+            actions.extend(menu.key(code, down, repeat, shift, shortcut, &window));
+        }
+        if !typed.is_empty() {
+            menu.text_input(&typed);
+            typed.clear();
+        }
+        if menu.wants_text_input() != text_input {
+            text_input = !text_input;
+            if text_input {
+                window.start_text_input();
+            } else {
+                window.stop_text_input();
+            }
+        }
         for action in actions {
             match action {
                 Action::Quit => quit = true,
@@ -326,7 +401,17 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         // 3. Simulation: nothing yet.
 
         // 4. Render.
+        if let Some(name) = start_screen.take() {
+            menu.open_servers(window.pixel_size());
+            if let Some(i) = opts.select {
+                menu.select_server(i);
+            }
+            menu.open_form_named(&name, window.pixel_size());
+        }
         let text_ready = menu.text_ready();
+        if text_ready && text_shown.is_none() {
+            text_shown = Some(Instant::now());
+        }
         let gui = menu.frame(&mut renderer, window.pixel_size(), window.size(), |rgba| {
             window.set_icon(rgba, crate::menu::ICON_SIZE)
         });
@@ -334,6 +419,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             && !screenshot_requested
             && text_ready
             && !gui.glyphs.is_empty()
+            && text_shown.is_some_and(|t| t.elapsed() >= opts.screenshot_after)
         {
             renderer.request_screenshot();
             screenshot_requested = true;

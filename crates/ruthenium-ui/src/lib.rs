@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+mod clip;
 pub mod draw;
 pub mod logo;
 pub mod modern;
@@ -17,5 +18,6 @@ pub mod scale;
 pub mod text;
 pub mod widget;
 
+pub use clip::Clip;
 pub use draw::{DrawList, NO_TEXTURE, Quad, SpriteInfo, Sprites};
 pub use scale::GuiScale;

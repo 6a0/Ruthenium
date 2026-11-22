@@ -9,7 +9,9 @@ struct Shape {
     vec4 fill;   // straight-alpha RGBA: the colour, the glass tint, or the image's tint
     vec4 params; // corner radius (px), kind (0 flat, 1 glass, 2 image), highlight, refraction (px)
     vec4 uv;     // image: u0, v0, u1, v1
-    uvec4 tex;   // image: x = texture index
+    uvec4 tex;   // x: image texture index; y: ring width (float bits); z, w: clip fades (float bits)
+    vec4 clip;   // x0, y0, x1, y1 in pixels
+    vec4 extra;  // x: opacity
 };
 #define FRAME_ELEMENT Shape
 #include "frame.glsl"

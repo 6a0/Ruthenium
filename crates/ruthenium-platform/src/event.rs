@@ -1,5 +1,12 @@
+use std::ffi::CStr;
+
 use sdl3_sys::events::*;
-use sdl3_sys::keycode::SDL_KMOD_SHIFT;
+use sdl3_sys::keycode::{SDL_KMOD_CTRL, SDL_KMOD_GUI, SDL_KMOD_SHIFT};
+use sdl3_sys::mouse::SDL_MOUSEWHEEL_FLIPPED;
+
+/// The longest piece of typed text one [`Event::TextInput`] carries; longer input
+/// arrives as several events.
+pub const TEXT_INPUT_BYTES: usize = 32;
 
 /// The subset of SDL events the client handles so far. Timestamps are SDL's nanosecond
 /// event timestamps (`SDL_GetTicksNS` clock).
@@ -39,19 +46,62 @@ pub enum Event {
     },
     /// The mouse left the window.
     MouseLeft,
+    /// The wheel turned: `y` notches, positive away from the user (scroll up), with the
+    /// system's natural-scrolling setting already applied.
+    MouseWheel {
+        y: f32,
+    },
     /// A key went down or up. `scancode` is the SDL scancode, the value vanilla stores in
-    /// options.txt. `shift` is whether a Shift key was held.
+    /// options.txt. `shift` is whether a Shift key was held; `shortcut` whether the
+    /// shortcut modifier was (Ctrl, or Cmd on macOS).
     Key {
         scancode: u32,
         down: bool,
         repeat: bool,
         shift: bool,
+        shortcut: bool,
         timestamp_ns: u64,
+    },
+    /// Text was typed (while text input is on, see `Window::start_text_input`): UTF-8,
+    /// whole characters, read with [`Event::text`].
+    TextInput {
+        bytes: [u8; TEXT_INPUT_BYTES],
+        len: u8,
     },
 }
 
 impl Event {
-    pub(crate) fn from_sdl(e: &SDL_Event) -> Option<Event> {
+    /// The text of a [`Event::TextInput`] (empty for other events).
+    pub fn text(&self) -> &str {
+        match self {
+            Event::TextInput { bytes, len } => {
+                std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or("")
+            }
+            _ => "",
+        }
+    }
+
+    /// Hands `e` to `handle` as zero or more events (text input in pieces).
+    pub(crate) fn dispatch(e: &SDL_Event, handle: &mut impl FnMut(Event)) {
+        // SAFETY: `type` is valid for every event, and text input events carry a NUL-
+        // terminated string (or null) that lives until the next event poll.
+        let text = unsafe {
+            if SDL_EventType(e.r#type) == SDL_EVENT_TEXT_INPUT && !e.text.text.is_null() {
+                Some(CStr::from_ptr(e.text.text))
+            } else {
+                None
+            }
+        };
+        if let Some(text) = text {
+            for piece in text_pieces(&text.to_string_lossy()) {
+                handle(piece);
+            }
+        } else if let Some(ev) = Event::from_sdl(e) {
+            handle(ev);
+        }
+    }
+
+    fn from_sdl(e: &SDL_Event) -> Option<Event> {
         // SAFETY: `type` is valid for every event; each arm reads only the union member
         // that SDL documents for that event type.
         unsafe {
@@ -88,10 +138,62 @@ impl Event {
                     down: e.key.down,
                     repeat: e.key.repeat,
                     shift: e.key.r#mod.0 & SDL_KMOD_SHIFT.0 != 0,
+                    shortcut: e.key.r#mod.0
+                        & if cfg!(target_os = "macos") {
+                            SDL_KMOD_GUI.0
+                        } else {
+                            SDL_KMOD_CTRL.0
+                        }
+                        != 0,
                     timestamp_ns: e.key.timestamp,
+                },
+                SDL_EVENT_MOUSE_WHEEL => Event::MouseWheel {
+                    y: if e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED {
+                        -e.wheel.y
+                    } else {
+                        e.wheel.y
+                    },
                 },
                 _ => return None,
             })
         }
+    }
+}
+
+/// Splits typed text into events of at most [`TEXT_INPUT_BYTES`] bytes, at character
+/// boundaries.
+fn text_pieces(text: &str) -> impl Iterator<Item = Event> + '_ {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let mut end = rest.len().min(TEXT_INPUT_BYTES);
+        while !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        let (piece, tail) = rest.split_at(end);
+        rest = tail;
+        let mut bytes = [0u8; TEXT_INPUT_BYTES];
+        bytes[..piece.len()].copy_from_slice(piece.as_bytes());
+        Some(Event::TextInput {
+            bytes,
+            len: piece.len() as u8,
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_text_arrives_in_whole_characters() {
+        let text = "héllo wörld, ünïcödé ïs splït ïntö pïècés";
+        let pieces: Vec<String> = text_pieces(text).map(|e| e.text().to_owned()).collect();
+        assert!(pieces.len() > 1);
+        assert!(pieces.iter().all(|p| p.len() <= TEXT_INPUT_BYTES));
+        assert_eq!(pieces.concat(), text);
+        assert_eq!(Event::Quit.text(), "");
     }
 }

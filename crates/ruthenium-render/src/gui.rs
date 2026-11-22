@@ -7,8 +7,9 @@ use ruthenium_ui::text::GlyphQuad;
 /// Bytes per quad in the frame's data (std430: two vec4s and four uints).
 pub const QUAD_BYTES: u32 = 48;
 
-/// Bytes per shape in the frame's data (std430: four vec4s and a uvec4).
-pub const SHAPE_BYTES: u32 = 80;
+/// Bytes per shape in the frame's data (std430: four vec4s, a uvec4, the clip vec4 and
+/// a vec4 whose x is the opacity).
+pub const SHAPE_BYTES: u32 = 112;
 
 /// One frame's GUI: vanilla-style quads (with the GUI scale they were laid out for) and
 /// the modern menus' shapes, drawn after the quads.
@@ -22,24 +23,28 @@ pub struct GuiFrame<'a> {
     pub font_atlas: u32,
 }
 
-/// Bytes per glyph in the frame's data (std430: four vec4s).
-pub const GLYPH_BYTES: u32 = 64;
+/// Bytes per glyph in the frame's data (std430: five vec4s).
+pub const GLYPH_BYTES: u32 = 80;
 
 pub fn write_glyphs(glyphs: &[GlyphQuad], out: &mut [u8]) {
-    for (g, chunk) in glyphs.iter().zip(out.as_chunks_mut::<64>().0) {
-        let params = [g.range, 0.0, 0.0, 0.0];
+    for (g, chunk) in glyphs.iter().zip(out.as_chunks_mut::<80>().0) {
+        let params = [g.range, g.clip.fade_top, g.clip.fade_bottom, g.clip.opacity];
         let words = chunk.as_chunks_mut::<4>().0;
-        for (w, v) in words
-            .iter_mut()
-            .zip(g.rect.iter().chain(&g.uv).chain(&g.color).chain(&params))
-        {
+        for (w, v) in words.iter_mut().zip(
+            g.rect
+                .iter()
+                .chain(&g.uv)
+                .chain(&g.color)
+                .chain(&params)
+                .chain(&g.clip.rect),
+        ) {
             *w = v.to_ne_bytes();
         }
     }
 }
 
 pub fn write_shapes(shapes: &[Shape], out: &mut [u8]) {
-    for (s, chunk) in shapes.iter().zip(out.as_chunks_mut::<80>().0) {
+    for (s, chunk) in shapes.iter().zip(out.as_chunks_mut::<112>().0) {
         // params.y: 0 flat, 1 glass, 2 image.
         let kind = match (s.image, s.glass) {
             (Some(_), _) => 2.0,
@@ -58,8 +63,16 @@ pub fn write_shapes(shapes: &[Shape], out: &mut [u8]) {
         words[16] = s.image.map_or(0, |i| i.texture).to_ne_bytes();
         // tex.y: ring width in pixels, as float bits (flat shapes; 0 fills).
         words[17] = s.ring.to_ne_bytes();
-        words[18] = [0; 4];
-        words[19] = [0; 4];
+        // tex.z, tex.w: the clip's top and bottom fades in pixels, as float bits.
+        words[18] = s.clip.fade_top.to_ne_bytes();
+        words[19] = s.clip.fade_bottom.to_ne_bytes();
+        for (w, v) in words[20..24].iter_mut().zip(&s.clip.rect) {
+            *w = v.to_ne_bytes();
+        }
+        words[24] = s.clip.opacity.to_ne_bytes();
+        words[25] = [0; 4];
+        words[26] = [0; 4];
+        words[27] = [0; 4];
     }
 }
 

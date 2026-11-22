@@ -379,23 +379,39 @@ pub struct GlyphQuad {
     pub color: [f32; 4],
     /// The field's range in screen pixels at this size (for the edge's sharpness).
     pub range: f32,
+    pub clip: crate::Clip,
 }
 
 /// Glyph quads for one frame.
 #[derive(Debug, Default)]
 pub struct TextList {
     quads: Vec<GlyphQuad>,
+    clip: crate::Clip,
 }
 
 impl TextList {
     pub fn new() -> TextList {
         TextList {
             quads: Vec::with_capacity(256),
+            clip: crate::Clip::NONE,
         }
     }
 
     pub fn clear(&mut self) {
         self.quads.clear();
+        self.clip = crate::Clip::NONE;
+    }
+
+    /// Multiplies the opacity of every glyph so far by `k`.
+    pub fn fade_all(&mut self, k: f32) {
+        for q in &mut self.quads {
+            q.clip.opacity *= k;
+        }
+    }
+
+    /// The clip for glyphs added from now on.
+    pub fn set_clip(&mut self, clip: crate::Clip) {
+        self.clip = clip;
     }
 
     pub fn quads(&self) -> &[GlyphQuad] {
@@ -432,6 +448,7 @@ impl TextList {
                 uv: slot.uv,
                 color,
                 range,
+                clip: self.clip,
             });
         }
     }

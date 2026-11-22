@@ -5,6 +5,7 @@
 
 #include "push.glsl"
 #include "textures.glsl"
+#include "clip.glsl"
 
 layout(push_constant) uniform Push {
     vec2 screen;
@@ -15,6 +16,8 @@ layout(push_constant) uniform Push {
 layout(location = 0) in vec2 v_uv;
 layout(location = 1) in vec4 v_color;
 layout(location = 2) in float v_range;
+layout(location = 3) flat in vec4 v_clip;
+layout(location = 4) flat in vec3 v_fade;
 layout(location = 0) out vec4 o_color;
 
 float median(vec3 c) {
@@ -24,7 +27,7 @@ float median(vec3 c) {
 void main() {
     vec3 field = sample_texture(pc.atlas, SAMPLER_LINEAR_CLAMP, v_uv).rgb;
     float distance = (median(field) - 0.5) * max(v_range, 1.0);
-    float coverage = clamp(distance + 0.5, 0.0, 1.0);
+    float coverage = clamp(distance + 0.5, 0.0, 1.0) * clip_coverage(v_clip, v_fade.x, v_fade.y) * v_fade.z;
     if (coverage <= 0.0) {
         discard;
     }

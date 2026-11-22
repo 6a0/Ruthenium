@@ -3,10 +3,11 @@
 // shapes (the "Liquid Glass" pills) show the blurred backdrop through a tint, bent
 // inwards near the rim like a thick lens, with a light rim from the top left; image
 // shapes show a texture (the logo). A shape with a ring width keeps only a band that wide
-// inside its edge (the focus ring).
+// inside its edge (the focus ring). Every shape is clipped to its clip rectangle.
 
 #include "push.glsl"
 #include "textures.glsl"
+#include "clip.glsl"
 
 struct Shape {
     vec4 rect;
@@ -14,6 +15,8 @@ struct Shape {
     vec4 params;
     vec4 uv;
     uvec4 tex;
+    vec4 clip;
+    vec4 extra;
 };
 #define FRAME_ELEMENT Shape
 #include "frame.glsl"
@@ -47,6 +50,7 @@ void main() {
     if (ring > 0.0) {
         coverage *= clamp(d + ring + 0.5, 0.0, 1.0);
     }
+    coverage *= clip_coverage(s.clip, uintBitsToFloat(s.tex.z), uintBitsToFloat(s.tex.w)) * s.extra.x;
     if (coverage <= 0.0) {
         discard;
     }

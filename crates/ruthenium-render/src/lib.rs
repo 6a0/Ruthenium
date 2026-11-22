@@ -206,6 +206,12 @@ impl Renderer {
             .create_with(&mut self.uploads, desc, mips, arrival)
     }
 
+    /// Destroys a texture once the frames that may use it have finished (see
+    /// [`TextureTable::destroy`]).
+    pub fn destroy_texture(&mut self, id: TextureId) {
+        self.textures.destroy(id);
+    }
+
     /// Whether frames recorded from now on may sample `id`.
     pub fn texture_ready(&self, id: TextureId) -> bool {
         self.textures.is_ready(id)
