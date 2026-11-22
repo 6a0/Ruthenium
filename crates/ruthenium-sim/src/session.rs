@@ -525,6 +525,10 @@ impl Game {
                 let w = self.world.as_mut().ok_or("a teleport before the login")?;
                 w.player.teleport(&t);
                 let p = &w.player;
+                eprintln!(
+                    "[session] teleport {} to {:.3} {:.3} {:.3} (relative bits {:#x})",
+                    t.id, p.position[0], p.position[1], p.position[2], t.relatives
+                );
                 self.connection.send(play::accept_teleportation(
                     t.id, p.position, p.y_rot, p.x_rot,
                 ));
