@@ -1902,11 +1902,13 @@ mod tests {
         a.or(b)
     }
 
-    /// Lets the accounts thread work until `done` holds (or fails after a few seconds).
+    /// Lets the accounts thread and the session work until `done` holds (or fails after
+    /// a few seconds); the session runs a game frame each time round, as in the client.
     fn until(m: &mut Menu, done: impl Fn(&Menu) -> bool) {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             m.sync_accounts();
+            m.game_frame();
             m.poll_session();
             if done(m) {
                 return;
