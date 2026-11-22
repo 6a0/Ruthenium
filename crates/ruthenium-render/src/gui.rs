@@ -56,7 +56,8 @@ pub fn write_shapes(shapes: &[Shape], out: &mut [u8]) {
             *w = v.to_ne_bytes();
         }
         words[16] = s.image.map_or(0, |i| i.texture).to_ne_bytes();
-        words[17] = [0; 4];
+        // tex.y: ring width in pixels, as float bits (flat shapes; 0 fills).
+        words[17] = s.ring.to_ne_bytes();
         words[18] = [0; 4];
         words[19] = [0; 4];
     }

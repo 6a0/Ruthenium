@@ -56,6 +56,27 @@ impl Rect {
     pub fn contains(&self, x: f32, y: f32) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
     }
+
+    /// Scaled by `k` about its centre.
+    pub fn scaled(&self, k: f32) -> Rect {
+        let (w, h) = (self.w * k, self.h * k);
+        Rect {
+            x: self.x + 0.5 * (self.w - w),
+            y: self.y + 0.5 * (self.h - h),
+            w,
+            h,
+        }
+    }
+
+    /// Grown by `d` on every side.
+    pub fn outset(&self, d: f32) -> Rect {
+        Rect {
+            x: self.x - d,
+            y: self.y - d,
+            w: self.w + 2.0 * d,
+            h: self.h + 2.0 * d,
+        }
+    }
 }
 
 /// One rounded shape for the renderer's shape pipeline (`shape.vert/frag`).
@@ -75,6 +96,8 @@ pub struct Shape {
     pub refraction: f32,
     /// Draw this texture (premultiplied alpha) instead of a fill, tinted by `fill`.
     pub image: Option<ShapeImage>,
+    /// Flat shapes: keep only a band this many pixels wide inside the edge (0 fills).
+    pub ring: f32,
 }
 
 /// A texture shown by a [`Shape`].
@@ -123,6 +146,22 @@ impl ShapeList {
             highlight,
             refraction: 0.22 * r.h * px,
             image: None,
+            ring: 0.0,
+        });
+    }
+
+    /// A flat ring `width` units wide just inside the edge of the pill `r` (UI units).
+    pub fn pill_ring(&mut self, scale: &UiScale, r: Rect, width: f32, color: [f32; 4]) {
+        let px = scale.px;
+        self.push(Shape {
+            rect: [r.x * px, r.y * px, (r.x + r.w) * px, (r.y + r.h) * px],
+            fill: color,
+            radius: 0.5 * r.h * px,
+            glass: false,
+            highlight: 0.0,
+            refraction: 0.0,
+            image: None,
+            ring: width * px,
         });
     }
 
@@ -140,6 +179,7 @@ impl ShapeList {
                 texture,
                 uv: [0.0, 0.0, 1.0, 1.0],
             }),
+            ring: 0.0,
         });
     }
 }
@@ -161,9 +201,206 @@ pub struct Button {
     pub action: Action,
 }
 
-/// Glass tint at rest and under the pointer.
+/// Glass tint at rest and lit (hovered or focused); a press adds `PRESS_TINT` alpha.
 const TINT: [f32; 4] = [0.85, 0.88, 1.0, 0.04];
 const TINT_HOVER: [f32; 4] = [0.90, 0.93, 1.0, 0.12];
+const PRESS_TINT: f32 = 0.08;
+/// Size change of a hovered and of a pressed pill (fractions of its size).
+const HOVER_GROW: f32 = 0.025;
+const PRESS_SHRINK: f32 = 0.035;
+/// Focus ring: its gap to the pill and its width (UI units), and its colour.
+const FOCUS_GAP: f32 = 3.0;
+const FOCUS_WIDTH: f32 = 2.0;
+const FOCUS: [f32; 4] = [0.82, 0.87, 1.0, 0.9];
+
+/// Time constants (seconds) of the pills' motion, towards lit and back: quick to answer,
+/// slower to let go.
+const HOVER_IN: f32 = 0.06;
+const HOVER_OUT: f32 = 0.15;
+const PRESS_IN: f32 = 0.03;
+const PRESS_OUT: f32 = 0.12;
+const FOCUS_IN: f32 = 0.05;
+const FOCUS_OUT: f32 = 0.12;
+/// A press shows for at least this long, so a quick click is still seen.
+const MIN_PRESS: f32 = 0.08;
+
+/// A value that eases towards its target, exponentially and at any frame rate.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Ease {
+    pub value: f32,
+}
+
+impl Ease {
+    /// Moves towards `target` over `dt` seconds with the time constant `rise` when going
+    /// up and `fall` when going down; snaps to it once within 1/500.
+    pub fn step(&mut self, target: f32, dt: f32, rise: f32, fall: f32) {
+        let tau = if target > self.value { rise } else { fall };
+        self.value += (target - self.value) * (1.0 - (-dt / tau).exp());
+        if (target - self.value).abs() < 0.002 {
+            self.value = target;
+        }
+    }
+}
+
+/// Keys the menus understand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    /// Down or Tab.
+    Next,
+    /// Up or Shift+Tab.
+    Previous,
+    /// Enter or Space.
+    Activate,
+}
+
+/// How lit, pressed and focused one button is this frame, each from 0 to 1.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ButtonLook {
+    pub hover: f32,
+    pub press: f32,
+    pub focus: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Motion {
+    hover: Ease,
+    press: Ease,
+    focus: Ease,
+    /// Seconds the press still shows after a quick click.
+    hold: f32,
+}
+
+/// Pointer and keyboard state of a screen's buttons, by index, and their motion.
+///
+/// Like a browser: a click focuses the button without showing the focus ring; the
+/// keyboard moves focus (wrapping) and shows the ring. Buttons act on release, of the
+/// mouse over the button it went down on, or of Enter/Space on the button focused when
+/// it went down; moving away first cancels. While the mouse holds a button, the others
+/// do not light up.
+#[derive(Debug, Clone, Default)]
+pub struct ButtonStates {
+    hovered: Option<usize>,
+    focus: Option<usize>,
+    focus_visible: bool,
+    mouse_down: Option<usize>,
+    key_down: Option<usize>,
+    motion: Vec<Motion>,
+}
+
+impl ButtonStates {
+    pub fn new(buttons: usize) -> ButtonStates {
+        ButtonStates {
+            motion: vec![Motion::default(); buttons],
+            ..ButtonStates::default()
+        }
+    }
+
+    /// How many buttons it tracks.
+    pub fn len(&self) -> usize {
+        self.motion.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.motion.is_empty()
+    }
+
+    /// The button under the pointer (`None` when off every button or out of the window).
+    pub fn hover(&mut self, hit: Option<usize>) {
+        self.hovered = hit;
+    }
+
+    /// The left mouse button went down over `hit`.
+    pub fn mouse_down(&mut self, hit: Option<usize>) {
+        self.hovered = hit;
+        self.focus = hit;
+        self.focus_visible = false;
+        self.mouse_down = hit;
+        self.key_down = None;
+        if let Some(i) = hit {
+            self.motion[i].hold = MIN_PRESS;
+        }
+    }
+
+    /// The left mouse button went up over `hit`: the button it activates, if any.
+    pub fn mouse_up(&mut self, hit: Option<usize>) -> Option<usize> {
+        self.hovered = hit;
+        self.mouse_down.take().filter(|&i| hit == Some(i))
+    }
+
+    /// A key went down or up: the button it activates, if any.
+    pub fn key(&mut self, key: Key, down: bool) -> Option<usize> {
+        let n = self.motion.len();
+        if n == 0 || !down && key != Key::Activate {
+            return None;
+        }
+        match (key, down) {
+            (Key::Next | Key::Previous, _) => {
+                self.focus = Some(match (self.focus, key) {
+                    (None, Key::Next) => 0,
+                    (None, _) => n - 1,
+                    (Some(i), Key::Next) => (i + 1) % n,
+                    (Some(i), _) => (i + n - 1) % n,
+                });
+                self.focus_visible = true;
+                self.key_down = None;
+                None
+            }
+            (Key::Activate, true) => {
+                self.focus_visible = true;
+                match self.focus {
+                    // Nothing focused yet: the first key only shows where focus starts.
+                    None => self.focus = Some(0),
+                    Some(i) if self.key_down.is_none() && self.mouse_down.is_none() => {
+                        self.key_down = Some(i);
+                        self.motion[i].hold = MIN_PRESS;
+                    }
+                    Some(_) => {}
+                }
+                None
+            }
+            (Key::Activate, false) => self.key_down.take().filter(|&i| self.focus == Some(i)),
+        }
+    }
+
+    /// Drops any press without acting (the window lost focus).
+    pub fn cancel(&mut self) {
+        self.mouse_down = None;
+        self.key_down = None;
+    }
+
+    /// Advances the motion by `dt` seconds.
+    pub fn update(&mut self, dt: f32) {
+        let dt = dt.max(0.0);
+        for (i, m) in self.motion.iter_mut().enumerate() {
+            let hovered = self.hovered == Some(i) && self.mouse_down.is_none_or(|d| d == i);
+            let held = self.key_down == Some(i) || self.mouse_down == Some(i) && hovered;
+            let pressed = held || m.hold > 0.0;
+            m.hold = (m.hold - dt).max(0.0);
+            let focused = self.focus_visible && self.focus == Some(i);
+            m.hover
+                .step(f32::from(u8::from(hovered)), dt, HOVER_IN, HOVER_OUT);
+            m.press
+                .step(f32::from(u8::from(pressed)), dt, PRESS_IN, PRESS_OUT);
+            m.focus
+                .step(f32::from(u8::from(focused)), dt, FOCUS_IN, FOCUS_OUT);
+        }
+    }
+
+    /// Button `i`'s look this frame (at rest for an index past the end).
+    pub fn look(&self, i: usize) -> ButtonLook {
+        self.motion
+            .get(i)
+            .map_or_else(ButtonLook::default, |m| ButtonLook {
+                hover: m.hover.value,
+                press: m.press.value,
+                focus: m.focus.value,
+            })
+    }
+}
+
+fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
+}
 
 /// The weights the menus use (the glyph atlas holds these).
 pub const WEIGHTS: [Weight; 4] = [
@@ -223,12 +460,26 @@ impl Text {
         r: Rect,
         color: [f32; 4],
     ) {
+        self.centred_scaled(list, atlas, scale, r, 1.0, color);
+    }
+
+    /// Like `centred`, `k` times as large.
+    fn centred_scaled(
+        &self,
+        list: &mut TextList,
+        atlas: &GlyphAtlas,
+        scale: &UiScale,
+        r: Rect,
+        k: f32,
+        color: [f32; 4],
+    ) {
         let (cx, cy) = ((r.x + 0.5 * r.w) * scale.px, (r.y + 0.5 * r.h) * scale.px);
-        list.line(
+        list.line_scaled(
             atlas,
             &self.line,
-            cx - 0.5 * self.line.width,
-            cy + 0.5 * self.cap,
+            cx - 0.5 * k * self.line.width,
+            cy + 0.5 * k * self.cap,
+            k,
             color,
         );
     }
@@ -314,29 +565,35 @@ impl TitleScreen {
     }
 
     /// Adds the screen's shapes and, once they are on the GPU, its text (`atlas`) and
-    /// logo (`logo`, a texture index); `mouse` is in UI units.
+    /// logo (`logo`, a texture index); `states` says how lit each button is.
     pub fn draw(
         &self,
         shapes: &mut ShapeList,
         text: &mut TextList,
         atlas: Option<&GlyphAtlas>,
         logo: Option<u32>,
-        mouse: Option<(f32, f32)>,
+        states: &ButtonStates,
     ) {
         let s = &self.scale;
         if let Some(logo) = logo {
             shapes.image(s, self.logo, logo);
         }
-        for (b, label) in self.buttons.iter().zip(&self.labels) {
-            let hovered = mouse.is_some_and(|(x, y)| b.rect.contains(x, y));
-            let (tint, light, ink) = if hovered {
-                (TINT_HOVER, 1.0, LABEL_HOVER)
-            } else {
-                (TINT, 0.75, LABEL)
-            };
-            shapes.glass_pill(s, b.rect, tint, light);
+        for (i, (b, label)) in self.buttons.iter().zip(&self.labels).enumerate() {
+            let look = states.look(i);
+            // Focus lights a pill half as much as the pointer; the ring says the rest.
+            let lit = look.hover.max(0.5 * look.focus);
+            let k = 1.0 + HOVER_GROW * look.hover - PRESS_SHRINK * look.press;
+            let r = b.rect.scaled(k);
+            let mut tint = mix(TINT, TINT_HOVER, lit);
+            tint[3] += PRESS_TINT * look.press;
+            shapes.glass_pill(s, r, tint, 0.75 + 0.25 * lit + 0.2 * look.press);
+            if look.focus > 0.0 {
+                let mut ring = FOCUS;
+                ring[3] *= look.focus;
+                shapes.pill_ring(s, r.outset(FOCUS_GAP + FOCUS_WIDTH), FOCUS_WIDTH, ring);
+            }
             if let Some(atlas) = atlas {
-                label.centred(text, atlas, s, b.rect, ink);
+                label.centred_scaled(text, atlas, s, r, k, mix(LABEL, LABEL_HOVER, lit));
             }
         }
         let Some(atlas) = atlas else { return };
@@ -350,12 +607,9 @@ impl TitleScreen {
         );
     }
 
-    /// The action of the button under a click at `(x, y)` (UI units).
-    pub fn click(&self, x: f32, y: f32) -> Option<Action> {
-        self.buttons
-            .iter()
-            .find(|b| b.rect.contains(x, y))
-            .map(|b| b.action)
+    /// The index of the button at `(x, y)` (UI units).
+    pub fn hit(&self, x: f32, y: f32) -> Option<usize> {
+        self.buttons.iter().position(|b| b.rect.contains(x, y))
     }
 }
 
@@ -388,14 +642,17 @@ mod tests {
         let first = t.buttons[0].rect;
         assert!(t.logo.y + t.logo.h < t.name.y && t.name.y + t.name.h < first.y);
         assert_eq!(t.logo.x + 0.5 * t.logo.w, 800.0);
-        assert_eq!(t.click(800.0, first.y + 1.0), Some(Action::Multiplayer));
+        assert_eq!(t.hit(800.0, first.y + 1.0), Some(0));
+        assert_eq!(t.buttons[0].action, Action::Multiplayer);
         let last = t.buttons[2].rect;
-        assert_eq!(t.click(800.0, last.y + last.h - 0.5), Some(Action::Quit));
-        assert_eq!(t.click(10.0, 10.0), None);
+        assert_eq!(t.hit(800.0, last.y + last.h - 0.5), Some(2));
+        assert_eq!(t.buttons[2].action, Action::Quit);
+        assert_eq!(t.hit(10.0, 10.0), None);
         // Pills: radius is half the height, in pixels.
         let mut shapes = ShapeList::new();
         let mut text = TextList::new();
-        t.draw(&mut shapes, &mut text, None, None, None);
+        let rest = ButtonStates::new(3);
+        t.draw(&mut shapes, &mut text, None, None, &rest);
         let p = shapes.shapes()[0];
         assert_eq!(p.radius, 0.5 * (p.rect[3] - p.rect[1]));
         assert!(p.glass);
@@ -403,12 +660,143 @@ mod tests {
         // With an atlas, labels are centred in their pills.
         let mut atlas = GlyphAtlas::new(1024);
         atlas.add_text(&fonts, Weight::SEMIBOLD, "Multiplayer");
-        t.draw(&mut shapes, &mut text, Some(&atlas), None, None);
+        t.draw(&mut shapes, &mut text, Some(&atlas), None, &rest);
         // The first label's glyphs come first (other labels share some of its letters).
         let q = &text.quads()[.."Multiplayer".len()];
         let (left, right) = (q.first().unwrap().rect[0], q.last().unwrap().rect[2]);
         let mid = 0.5 * (left + right) / s.px;
         assert!((mid - 800.0).abs() < 4.0, "label centre {mid}");
+    }
+
+    #[test]
+    fn ease_is_frame_rate_independent_and_settles() {
+        let (mut a, mut b) = (Ease::default(), Ease::default());
+        a.step(1.0, 0.05, 0.1, 0.2);
+        for _ in 0..10 {
+            b.step(1.0, 0.005, 0.1, 0.2);
+        }
+        assert!(
+            (a.value - b.value).abs() < 1e-4,
+            "{} vs {}",
+            a.value,
+            b.value
+        );
+        assert!((a.value - (1.0 - (-0.5f32).exp())).abs() < 1e-4);
+        // Falling uses the slower constant.
+        let mut c = Ease { value: 1.0 };
+        c.step(0.0, 0.05, 0.1, 0.2);
+        assert!((c.value - (-0.25f32).exp()).abs() < 1e-4);
+        // It reaches the target exactly.
+        for _ in 0..200 {
+            c.step(0.0, 0.016, 0.1, 0.2);
+        }
+        assert_eq!(c.value, 0.0);
+    }
+
+    fn run(states: &mut ButtonStates, seconds: f32) {
+        for _ in 0..(seconds / 0.004).round() as usize {
+            states.update(0.004);
+        }
+    }
+
+    #[test]
+    fn hover_fades_in_and_out() {
+        let mut st = ButtonStates::new(3);
+        st.hover(Some(1));
+        st.update(0.016);
+        let early = st.look(1).hover;
+        assert!(early > 0.0 && early < 1.0, "{early}");
+        run(&mut st, 0.5);
+        assert_eq!(st.look(1).hover, 1.0);
+        assert_eq!(st.look(0), ButtonLook::default());
+        st.hover(None);
+        st.update(0.016);
+        // Letting go is slower than lighting up.
+        assert!(1.0 - st.look(1).hover < early);
+        run(&mut st, 1.0);
+        assert_eq!(st.look(1), ButtonLook::default());
+    }
+
+    #[test]
+    fn clicks_act_on_release_over_the_same_button() {
+        let mut st = ButtonStates::new(3);
+        st.mouse_down(Some(0));
+        run(&mut st, 0.2);
+        assert!(st.look(0).press > 0.9);
+        // Dragging off un-presses it and does not light the other button.
+        st.hover(Some(1));
+        run(&mut st, 0.5);
+        assert!(st.look(0).press < 0.1);
+        assert_eq!(st.look(1).hover, 0.0);
+        assert_eq!(st.mouse_up(Some(1)), None);
+        // A quick click still shows a press, and acts.
+        st.mouse_down(Some(2));
+        assert_eq!(st.mouse_up(Some(2)), Some(2));
+        st.update(0.03);
+        assert!(st.look(2).press > 0.5, "{}", st.look(2).press);
+        run(&mut st, 1.0);
+        assert_eq!(st.look(2).press, 0.0);
+        // A click focuses without showing the ring.
+        assert_eq!(st.look(2).focus, 0.0);
+    }
+
+    #[test]
+    fn keyboard_moves_focus_and_activates_on_release() {
+        let mut st = ButtonStates::new(3);
+        // Up from nothing starts at the bottom; focus wraps.
+        st.key(Key::Previous, true);
+        st.key(Key::Next, true);
+        assert_eq!(st.focus, Some(0));
+        run(&mut st, 0.5);
+        assert_eq!(st.look(0).focus, 1.0);
+        st.key(Key::Previous, true);
+        assert_eq!(st.focus, Some(2));
+        assert_eq!(st.key(Key::Activate, true), None);
+        run(&mut st, 0.2);
+        assert!(st.look(2).press > 0.9);
+        assert_eq!(st.key(Key::Activate, false), Some(2));
+        // Moving focus while Enter is held cancels.
+        st.key(Key::Activate, true);
+        st.key(Key::Next, true);
+        assert_eq!(st.key(Key::Activate, false), None);
+        // Enter with nothing focused only shows focus.
+        let mut st = ButtonStates::new(3);
+        assert_eq!(st.key(Key::Activate, true), None);
+        assert_eq!(st.key(Key::Activate, false), None);
+        assert_eq!(st.focus, Some(0));
+        // A click after keyboard use hides the ring; cancel drops a held key.
+        st.mouse_down(Some(1));
+        st.mouse_up(Some(1));
+        run(&mut st, 0.5);
+        assert_eq!(st.look(0).focus, 0.0);
+        assert_eq!(st.look(1).focus, 0.0);
+        st.key(Key::Activate, true);
+        st.cancel();
+        assert_eq!(st.key(Key::Activate, false), None);
+    }
+
+    #[test]
+    fn lit_pills_grow_and_focus_draws_a_ring() {
+        let s = UiScale::new(1600, 900);
+        let fonts = Fonts::new(&WEIGHTS);
+        let t = TitleScreen::new(s, &fonts, "Ruthenium 0.0.0");
+        let mut st = ButtonStates::new(3);
+        st.hover(Some(0));
+        st.key(Key::Next, true);
+        st.key(Key::Next, true);
+        run(&mut st, 1.0);
+        let mut shapes = ShapeList::new();
+        let mut text = TextList::new();
+        t.draw(&mut shapes, &mut text, None, None, &st);
+        let sh = shapes.shapes();
+        // Pill 0 (hovered), pill 1 (focused) and its ring, pill 2.
+        assert_eq!(sh.len(), 4);
+        let width = |s: &Shape| s.rect[2] - s.rect[0];
+        assert!(width(&sh[0]) > width(&sh[3]));
+        assert!(sh[2].ring > 0.0 && !sh[2].glass);
+        assert!(sh[2].rect[0] < sh[1].rect[0] && sh[2].rect[3] > sh[1].rect[3]);
+        assert!((sh[2].radius - 0.5 * (sh[2].rect[3] - sh[2].rect[1])).abs() < 1e-3);
+        assert!(sh[0].fill[3] > sh[3].fill[3] && sh[1].fill[3] > sh[3].fill[3]);
     }
 
     #[test]

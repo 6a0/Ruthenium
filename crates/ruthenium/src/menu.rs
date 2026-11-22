@@ -8,13 +8,23 @@ use std::time::Instant;
 use ruthenium_gpu::{Arrival, TextureDesc, TextureId, UploadError};
 use ruthenium_render::{GuiFrame, Renderer};
 use ruthenium_ui::logo::Logo;
-use ruthenium_ui::modern::{Action, ShapeList, TitleScreen, UiScale, WEIGHTS};
+use ruthenium_ui::modern::{Action, ButtonStates, Key, ShapeList, TitleScreen, UiScale, WEIGHTS};
 use ruthenium_ui::text::{ATLAS_SIZE, Fonts, GlyphAtlas, TextList, TextStyle, Weight};
 
 /// Side of the logo texture's top level.
 const LOGO_SIZE: u32 = 512;
 /// Side of the window icon.
 pub const ICON_SIZE: u32 = 256;
+
+/// SDL scancodes the menus use.
+const SCANCODE_RETURN: u32 = 40;
+const SCANCODE_TAB: u32 = 43;
+const SCANCODE_SPACE: u32 = 44;
+const SCANCODE_DOWN: u32 = 81;
+const SCANCODE_UP: u32 = 82;
+const SCANCODE_KP_ENTER: u32 = 88;
+/// The longest step the menus' motion takes in one frame (after a stall or a hidden window).
+const MAX_STEP: f32 = 0.1;
 
 /// Every printable ASCII character: what the menus' text uses for now.
 const ASCII: &str = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
@@ -53,6 +63,9 @@ pub struct Menu {
     text: TextList,
     /// Mouse position in window coordinates.
     mouse: Option<(f32, f32)>,
+    /// The title screen's buttons: pointer, focus and motion (kept across layouts).
+    states: ButtonStates,
+    last_frame: Option<Instant>,
 }
 
 impl std::fmt::Debug for Menu {
@@ -116,6 +129,8 @@ impl Menu {
             shapes: ShapeList::new(),
             text: TextList::new(),
             mouse: None,
+            states: ButtonStates::new(0),
+            last_frame: None,
         }
     }
 
@@ -123,26 +138,64 @@ impl Menu {
         self.mouse = Some((x, y));
     }
 
+    /// The mouse left the window.
+    pub fn mouse_left(&mut self) {
+        self.mouse = None;
+    }
+
+    /// The window lost focus: drops any press.
+    pub fn cancel(&mut self) {
+        self.states.cancel();
+    }
+
+    /// A key went down or up: the action it triggers, if any.
+    pub fn key(&mut self, scancode: u32, down: bool, repeat: bool, shift: bool) -> Option<Action> {
+        let key = match scancode {
+            SCANCODE_DOWN => Key::Next,
+            SCANCODE_UP => Key::Previous,
+            SCANCODE_TAB if shift => Key::Previous,
+            SCANCODE_TAB => Key::Next,
+            SCANCODE_RETURN | SCANCODE_KP_ENTER | SCANCODE_SPACE if !repeat => Key::Activate,
+            _ => return None,
+        };
+        let i = self.states.key(key, down)?;
+        Some(self.title.as_ref()?.buttons.get(i)?.action)
+    }
+
     fn layout(&mut self, pixel_size: (u32, u32)) -> &TitleScreen {
         let scale = UiScale::new(pixel_size.0, pixel_size.1);
         if self.title.as_ref().is_none_or(|t| t.scale != scale) {
             let version = concat!("Ruthenium ", env!("CARGO_PKG_VERSION"));
-            self.title = Some(TitleScreen::new(scale, &self.fonts, version));
+            let title = TitleScreen::new(scale, &self.fonts, version);
+            if title.buttons.len() != self.states.len() {
+                self.states = ButtonStates::new(title.buttons.len());
+            }
+            self.title = Some(title);
         }
         self.title.as_ref().unwrap()
     }
 
-    /// The action of a left click at `(x, y)` (window coordinates), if it hit a button.
-    pub fn click(
+    /// The left mouse button went down or up at `(x, y)` (window coordinates): the action
+    /// of the button it released over, if any (buttons act on release).
+    pub fn mouse_button(
         &mut self,
+        down: bool,
         x: f32,
         y: f32,
         pixel_size: (u32, u32),
         window_size: (u32, u32),
     ) -> Option<Action> {
+        self.mouse = Some((x, y));
         let title = self.layout(pixel_size);
         let (ux, uy) = title.scale.from_window(x, y, window_size, pixel_size);
-        title.click(ux, uy)
+        let hit = title.hit(ux, uy);
+        if down {
+            self.states.mouse_down(hit);
+            None
+        } else {
+            let i = self.states.mouse_up(hit)?;
+            Some(self.title.as_ref()?.buttons[i].action)
+        }
     }
 
     /// Moves the menus' textures along: picks them up when prepared, then uploads them.
@@ -236,10 +289,20 @@ impl Menu {
         if let Some(rgba) = self.advance(renderer) {
             icon(&rgba);
         }
+        let now = Instant::now();
+        let dt = self
+            .last_frame
+            .map_or(0.0, |t| (now - t).as_secs_f32().min(MAX_STEP));
+        self.last_frame = Some(now);
         let mouse = self.mouse;
         self.layout(pixel_size);
         let title = self.title.as_ref().unwrap();
-        let mouse = mouse.map(|(x, y)| title.scale.from_window(x, y, window_size, pixel_size));
+        let hit = mouse.and_then(|(x, y)| {
+            let (ux, uy) = title.scale.from_window(x, y, window_size, pixel_size);
+            title.hit(ux, uy)
+        });
+        self.states.hover(hit);
+        self.states.update(dt);
         let (atlas, texture, logo) = match &self.atlas {
             Atlas::Ready {
                 atlas,
@@ -252,7 +315,7 @@ impl Menu {
         };
         self.shapes.clear();
         self.text.clear();
-        title.draw(&mut self.shapes, &mut self.text, atlas, logo, mouse);
+        title.draw(&mut self.shapes, &mut self.text, atlas, logo, &self.states);
         GuiFrame {
             shapes: self.shapes.shapes(),
             glyphs: self.text.quads(),

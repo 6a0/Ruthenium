@@ -1,4 +1,5 @@
 use sdl3_sys::events::*;
+use sdl3_sys::keycode::SDL_KMOD_SHIFT;
 
 /// The subset of SDL events the client handles so far. Timestamps are SDL's nanosecond
 /// event timestamps (`SDL_GetTicksNS` clock).
@@ -36,12 +37,15 @@ pub enum Event {
         y: f32,
         timestamp_ns: u64,
     },
+    /// The mouse left the window.
+    MouseLeft,
     /// A key went down or up. `scancode` is the SDL scancode, the value vanilla stores in
-    /// options.txt.
+    /// options.txt. `shift` is whether a Shift key was held.
     Key {
         scancode: u32,
         down: bool,
         repeat: bool,
+        shift: bool,
         timestamp_ns: u64,
     },
 }
@@ -67,6 +71,7 @@ impl Event {
                 SDL_EVENT_WINDOW_EXPOSED => Event::Exposed,
                 SDL_EVENT_WINDOW_FOCUS_GAINED => Event::FocusGained,
                 SDL_EVENT_WINDOW_FOCUS_LOST => Event::FocusLost,
+                SDL_EVENT_WINDOW_MOUSE_LEAVE => Event::MouseLeft,
                 SDL_EVENT_MOUSE_MOTION => Event::MouseMotion {
                     x: e.motion.x,
                     y: e.motion.y,
@@ -82,6 +87,7 @@ impl Event {
                     scancode: e.key.scancode.0 as u32,
                     down: e.key.down,
                     repeat: e.key.repeat,
+                    shift: e.key.r#mod.0 & SDL_KMOD_SHIFT.0 != 0,
                     timestamp_ns: e.key.timestamp,
                 },
                 _ => return None,

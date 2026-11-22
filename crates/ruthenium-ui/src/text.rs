@@ -405,13 +405,28 @@ impl TextList {
     /// Draws `line` with its baseline's left end at `(x, y)` pixels. Glyphs missing from
     /// the atlas are skipped.
     pub fn line(&mut self, atlas: &GlyphAtlas, line: &Line, x: f32, y: f32, color: [f32; 4]) {
-        let range = (RANGE / EM_TEXELS) as f32 * line.size;
+        self.line_scaled(atlas, line, x, y, 1.0, color);
+    }
+
+    /// Like [`TextList::line`], `scale` times the size it was shaped at (for small
+    /// animated changes; shape it again for a new size).
+    pub fn line_scaled(
+        &mut self,
+        atlas: &GlyphAtlas,
+        line: &Line,
+        x: f32,
+        y: f32,
+        scale: f32,
+        color: [f32; 4],
+    ) {
+        let size = line.size * scale;
+        let range = (RANGE / EM_TEXELS) as f32 * size;
         for &(g, gx, gy) in &line.glyphs {
             let Some(slot) = atlas.get(line.weight, g) else {
                 continue;
             };
-            let [px0, py0, px1, py1] = slot.plane.map(|v| v * line.size);
-            let (ox, oy) = (x + gx, y + gy);
+            let [px0, py0, px1, py1] = slot.plane.map(|v| v * size);
+            let (ox, oy) = (x + gx * scale, y + gy * scale);
             self.quads.push(GlyphQuad {
                 rect: [ox + px0, oy + py0, ox + px1, oy + py1],
                 uv: slot.uv,

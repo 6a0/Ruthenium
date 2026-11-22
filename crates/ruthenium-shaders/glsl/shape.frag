@@ -2,7 +2,8 @@
 // Ruthenium: rounded shapes with anti-aliased edges. Flat shapes are filled; glass
 // shapes (the "Liquid Glass" pills) show the blurred backdrop through a tint, bent
 // inwards near the rim like a thick lens, with a light rim from the top left; image
-// shapes show a texture (the logo).
+// shapes show a texture (the logo). A shape with a ring width keeps only a band that wide
+// inside its edge (the focus ring).
 
 #include "push.glsl"
 #include "textures.glsl"
@@ -42,6 +43,10 @@ void main() {
     float radius = min(s.params.x, min(half_size.x, half_size.y));
     float d = rounded_rect(p - centre, half_size, radius);
     float coverage = clamp(0.5 - d, 0.0, 1.0);
+    float ring = uintBitsToFloat(s.tex.y);
+    if (ring > 0.0) {
+        coverage *= clamp(d + ring + 0.5, 0.0, 1.0);
+    }
     if (coverage <= 0.0) {
         discard;
     }

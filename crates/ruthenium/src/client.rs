@@ -209,7 +209,10 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut resized = None;
     let mut toggle_vsync = false;
     let mut toggle_overlay = false;
-    let mut clicks: Vec<(f32, f32)> = Vec::with_capacity(4);
+    // Left mouse button changes (down, x, y) and keys (scancode, down, repeat, shift),
+    // handed to the menu after the events are drained.
+    let mut clicks: Vec<(bool, f32, f32)> = Vec::with_capacity(4);
+    let mut keys: Vec<(u32, bool, bool, bool)> = Vec::with_capacity(4);
     let mut screenshot_requested = false;
     let mut frames: u64 = 0;
 
@@ -236,6 +239,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             }
             Event::Occluded => occluded = true,
             Event::Exposed | Event::FocusGained => occluded = false,
+            Event::FocusLost => menu.cancel(),
             Event::Key {
                 scancode: SCANCODE_V,
                 down: true,
@@ -248,24 +252,38 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 repeat: false,
                 ..
             } => toggle_overlay = true,
+            Event::Key {
+                scancode,
+                down,
+                repeat,
+                shift,
+                ..
+            } => keys.push((scancode, down, repeat, shift)),
             Event::MouseMotion { x, y } => menu.mouse_moved(x, y),
+            Event::MouseLeft => menu.mouse_left(),
             Event::MouseButton {
                 button: 1,
-                down: true,
+                down,
                 x,
                 y,
                 ..
-            } => {
-                menu.mouse_moved(x, y);
-                clicks.push((x, y));
-            }
+            } => clicks.push((down, x, y)),
             _ => {}
         });
-        for (x, y) in clicks.drain(..) {
-            match menu.click(x, y, window.pixel_size(), window.size()) {
-                Some(Action::Quit) => quit = true,
-                Some(other) => eprintln!("[ruthenium] {other:?}: not there yet"),
-                None => {}
+        let mut actions: Vec<Action> = clicks
+            .drain(..)
+            .filter_map(|(down, x, y)| {
+                menu.mouse_button(down, x, y, window.pixel_size(), window.size())
+            })
+            .collect();
+        actions.extend(
+            keys.drain(..)
+                .filter_map(|(code, down, repeat, shift)| menu.key(code, down, repeat, shift)),
+        );
+        for action in actions {
+            match action {
+                Action::Quit => quit = true,
+                other => eprintln!("[ruthenium] {other:?}: not there yet"),
             }
         }
         if quit {
