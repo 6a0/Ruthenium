@@ -316,6 +316,8 @@ pub enum Component {
         potion: Option<i32>,
     },
     Instrument(Holder),
+    /// The block transformer (`minecraft:block_transformer` registry id).
+    BlockTransformer(i32),
     /// A container's slots in order; an empty slot is the empty stack.
     Container(Vec<ItemStack>),
     /// The mining rules; `damage_per_block` is the server's.
@@ -327,6 +329,10 @@ pub enum Component {
     },
     /// The blocks an adventure-mode player may break with the item.
     CanBreak(Vec<BlockPredicate>),
+    /// The blocks an adventure-mode player may place the item against.
+    CanPlaceOn(Vec<BlockPredicate>),
+    /// `block_state`: properties the placed block takes (name, value).
+    BlockState(Vec<(String, String)>),
     /// Any other component: its type id and its value's bytes as sent.
     Other {
         kind: i32,
@@ -482,6 +488,15 @@ fn read_component(r: &mut Reader<'_>, kind: i32, depth: u32) -> Result<Component
             can_destroy_blocks_in_creative: r.bool()?,
         },
         Kind::CanBreak => Component::CanBreak(list(r, usize::MAX, |r| block_predicate(r, depth))?),
+        Kind::CanPlaceOn => {
+            Component::CanPlaceOn(list(r, usize::MAX, |r| block_predicate(r, depth))?)
+        }
+        Kind::BlockState => Component::BlockState(list(r, usize::MAX, |r| {
+            Ok((
+                r.string(MAX_STRING)?.to_owned(),
+                r.string(MAX_STRING)?.to_owned(),
+            ))
+        })?),
         Kind::AttackAnimation => Component::AttackAnimation(swing_animation(r)?),
         Kind::InteractAnimation => Component::InteractAnimation(swing_animation(r)?),
         Kind::ChargedProjectiles => {
@@ -501,6 +516,7 @@ fn read_component(r: &mut Reader<'_>, kind: i32, depth: u32) -> Result<Component
             opt(r, |r| r.string(MAX_STRING).map(drop))?;
             Component::PotionContents { potion }
         }
+        Kind::BlockTransformer => Component::BlockTransformer(r.varint()?),
         Kind::Instrument => Component::Instrument(holder(r, |r| {
             // Sound, use duration, range, durability damage, description.
             sound(r)?;
@@ -553,7 +569,6 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
         | Kind::RepairCost
         | Kind::Enchantable
         | Kind::AdditionalTradeCost
-        | Kind::BlockTransformer
         | Kind::VillagerFood
         | Kind::Dye
         | Kind::MapId
@@ -595,7 +610,6 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
         Kind::ItemModel | Kind::TooltipStyle | Kind::NoteBlockSound => {
             r.identifier()?;
         }
-        Kind::CanPlaceOn => skip_list(r, usize::MAX, |r| block_predicate(r, depth).map(drop))?,
         Kind::AttributeModifiers => skip_list(r, usize::MAX, |r| {
             // Attribute, modifier id, amount, operation, slot group, display.
             r.varint()?;
@@ -682,10 +696,6 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
                 opt(r, |r| read_template(r, depth))?;
             }
         }
-        Kind::BlockState => skip_list(r, usize::MAX, |r| {
-            r.string(MAX_STRING)?;
-            r.string(MAX_STRING).map(drop)
-        })?,
         Kind::Bees => skip_list(r, usize::MAX, |r| {
             // Entity type and data, ticks in the hive, minimum ticks.
             r.varint()?;
@@ -753,8 +763,11 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
         | Kind::Container
         | Kind::PotionContents
         | Kind::Instrument
+        | Kind::BlockTransformer
         | Kind::Tool
-        | Kind::CanBreak => {
+        | Kind::CanBreak
+        | Kind::CanPlaceOn
+        | Kind::BlockState => {
             read_component(r, k.id() as i32, depth)?;
         }
     }

@@ -8,6 +8,7 @@
     "ListenerAndPacketMixin"
   ],
   "client": [
+    "ClientLevelMixin",
     "KeyMappingAccessor",
     "MinecraftMixin",
     "MultiPlayerGameModeAccessor"

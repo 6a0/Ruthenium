@@ -89,21 +89,33 @@ impl Predictions {
         let Some(old) = level.replace_block(pos[0], pos[1], pos[2], state) else {
             return false;
         };
-        if self.predicting {
-            let sequence = self.sequence;
-            match self.verified.iter_mut().find(|(p, _)| *p == pos) {
-                Some((_, v)) => v.sequence = sequence,
-                None => self.verified.push((
-                    pos,
-                    Verified {
-                        sequence,
-                        state: old,
-                        player_position,
-                    },
-                )),
-            }
-        }
+        self.retain_state(pos, old, player_position);
         true
+    }
+
+    /// While predicting, a changed block keeps the server's state (the first time it
+    /// changes) and moves on to this sequence.
+    pub(crate) fn retain_state(&mut self, pos: [i32; 3], old: u32, player_position: [f64; 3]) {
+        if !self.predicting {
+            return;
+        }
+        let sequence = self.sequence;
+        match self.verified.iter_mut().find(|(p, _)| *p == pos) {
+            Some((_, v)) => v.sequence = sequence,
+            None => self.verified.push((
+                pos,
+                Verified {
+                    sequence,
+                    state: old,
+                    player_position,
+                },
+            )),
+        }
+    }
+
+    /// Whether an action's prediction is running.
+    pub fn predicting(&self) -> bool {
+        self.predicting
     }
 
     /// `setServerVerifiedBlockState`: a block update from the server. A predicted

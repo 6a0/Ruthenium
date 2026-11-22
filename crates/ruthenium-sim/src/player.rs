@@ -27,7 +27,7 @@ use ruthenium_javamath::mth;
 use ruthenium_protocol::packets::play::{self, DataValue, PlayerPosition};
 use ruthenium_protocol::wire;
 
-use crate::blocks::{BlockTags, Blocks};
+use crate::blocks::{BlockTags, Blocks, Who};
 use crate::effect::{Effect, Effects};
 use crate::entity::EntityTypes;
 use crate::fluid::FluidInteraction;
@@ -491,13 +491,23 @@ impl<'a> Env<'a> {
         self.level.block(p[0], p[1], p[2])
     }
 
-    fn collisions(&self, b: &Aabb) -> Vec<Placed<'_>> {
-        self.level.block_collisions(self.blocks, b)
+    /// The block shapes an entity (`who`) may meet in `b`.
+    fn collisions(&self, b: &Aabb, who: Option<Who>) -> Vec<Placed<'_>> {
+        self.level
+            .block_collisions_for(self.blocks, b, false, who)
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect()
     }
 
     /// `noCollision`: no block shape and no entity in the way.
     pub(crate) fn no_collision(&self, b: &Aabb) -> bool {
-        self.collisions(b).is_empty() && self.entity_colliders(b).next().is_none()
+        self.no_collision_for(b, None)
+    }
+
+    /// `noCollision(entity, box)`: the same for an entity's own query.
+    pub(crate) fn no_collision_for(&self, b: &Aabb, who: Option<Who>) -> bool {
+        self.collisions(b, who).is_empty() && self.entity_colliders(b).next().is_none()
     }
 
     /// `getEntityCollisions`: the colliders touching the area (grown by 1e-7), none
@@ -1249,7 +1259,10 @@ impl LocalPlayer {
     }
 
     fn can_fit(&self, env: &Env<'_>, pose: Pose) -> bool {
-        env.no_collision(&pose.bounding_box(self.position).inflate([-EPSILON; 3]))
+        env.no_collision_for(
+            &pose.bounding_box(self.position).inflate([-EPSILON; 3]),
+            Some(self.who()),
+        )
     }
 
     /// `isMovingSlowly`: crouching, or crawling (the swimming pose out of water).
@@ -1589,7 +1602,7 @@ impl LocalPlayer {
         )
         .inflate([-EPSILON; 3]);
         !env.level
-            .block_collisions_at(env.blocks, &area, true)
+            .block_collisions_for(env.blocks, &area, true, Some(self.who()))
             .is_empty()
     }
 
@@ -1777,7 +1790,7 @@ impl LocalPlayer {
     /// `Entity.isFree`: no collision and no fluid in the box moved by `d`.
     fn is_free(&self, env: &Env<'_>, d: [f64; 3]) -> bool {
         let b = self.bounding_box().moved(d);
-        env.no_collision(&b) && !env.contains_any_liquid(&b)
+        env.no_collision_for(&b, Some(self.who())) && !env.contains_any_liquid(&b)
     }
 
     /// `LocalPlayer.modifyInput`.
@@ -2145,7 +2158,10 @@ impl LocalPlayer {
     /// by y, then z, then x.
     fn find_supporting_block(&self, env: &Env<'_>, area: &Aabb) -> Option<[i32; 3]> {
         let mut best: Option<([i32; 3], f64)> = None;
-        for (p, _) in env.level.block_collisions_at(env.blocks, area, false) {
+        for (p, _) in env
+            .level
+            .block_collisions_for(env.blocks, area, false, Some(self.who()))
+        {
             let d = |i: usize| f64::from(p[i]) + 0.5 - self.position[i];
             let dist = d(0) * d(0) + d(1) * d(1) + d(2) * d(2);
             let better = match best {
@@ -2204,14 +2220,26 @@ impl LocalPlayer {
 
     fn can_fall_at_least(&self, env: &Env<'_>, dx: f64, dz: f64, min_height: f64) -> bool {
         let b = self.bounding_box();
-        env.no_collision(&Aabb::new(
-            [
-                b.min[0] + EPSILON + dx,
-                b.min[1] - min_height - EPSILON,
-                b.min[2] + EPSILON + dz,
-            ],
-            [b.max[0] - EPSILON + dx, b.min[1], b.max[2] - EPSILON + dz],
-        ))
+        env.no_collision_for(
+            &Aabb::new(
+                [
+                    b.min[0] + EPSILON + dx,
+                    b.min[1] - min_height - EPSILON,
+                    b.min[2] + EPSILON + dz,
+                ],
+                [b.max[0] - EPSILON + dx, b.min[1], b.max[2] - EPSILON + dz],
+            ),
+            Some(self.who()),
+        )
+    }
+
+    /// The local player as a collision query's entity: the bottom of its box now,
+    /// and whether it descends (`isDescending` is `isShiftKeyDown`: sneak held).
+    fn who(&self) -> Who {
+        Who {
+            bottom: self.position[1],
+            descending: self.keys.shift,
+        }
     }
 
     /// `Entity.collide`: block collisions, then stepping up.
@@ -2233,7 +2261,8 @@ impl LocalPlayer {
         let result = if len == 0.0 {
             movement
         } else {
-            let shapes = with_entities(env.collisions(&b.expand_towards(movement)));
+            let shapes =
+                with_entities(env.collisions(&b.expand_towards(movement), Some(self.who())));
             collide_with_shapes(movement, &b, &shapes)
         };
         let x_c = movement[0] != result[0];
@@ -2250,7 +2279,7 @@ impl LocalPlayer {
             if !grounded_after {
                 area = area.expand_towards([0.0, -9.999999747378752E-6, 0.0]);
             }
-            let shapes = with_entities(env.collisions(&area));
+            let shapes = with_entities(env.collisions(&area, Some(self.who())));
             let skip = result[1] as f32;
             for h in candidate_step_heights(&grounded, &shapes, step, skip) {
                 let stepped = collide_with_shapes(

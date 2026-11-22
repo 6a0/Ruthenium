@@ -19,6 +19,28 @@ pub struct Blocks {
     passable: Vec<bool>,
     /// `Shapes.block()`, for outlines that fill the block.
     block: Shape,
+    /// What placing and using blocks needs: classes, flags, faces, signals.
+    kinds: crate::block::SharedKinds,
+    /// Scaffolding's thin floor (`SHAPE_UNSTABLE_BOTTOM`: the bottom eighth), which
+    /// a player just above unsupported scaffolding stands on.
+    scaffolding_bottom: Shape,
+}
+
+/// The entity a collision query is made for (`EntityCollisionContext`): the bottom
+/// of its box when the query began, and whether it is descending (the local player:
+/// sneak held). Scaffolding's collision depends on it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Who {
+    pub bottom: f64,
+    pub descending: bool,
+}
+
+impl Who {
+    /// `isAbove`: the entity's bottom is above the top of a shape whose highest
+    /// point is `max_y` within the block at `y` (less a float's hundred-thousandth).
+    fn is_above(&self, y: i32, max_y: f64) -> bool {
+        self.bottom > f64::from(y) + max_y - 9.999999747378752E-6
+    }
 }
 
 /// Blocks whose collision shape depends on who collides, and which never stop a
@@ -44,14 +66,167 @@ impl Blocks {
             states: data.states.clone(),
             passable,
             block: Shape::block(),
+            kinds: crate::block::SharedKinds::default(),
+            scaffolding_bottom: Shape::new(&ruthenium_prepare::exporters::ShapeData {
+                coords: [vec![0.0, 1.0], vec![0.0, 0.125], vec![0.0, 1.0]],
+                full: vec![true],
+            }),
         }
     }
 
-    /// Reads the export from the prepared game's exports folder.
+    /// The blocks with what placing and using them needs.
+    pub fn with_kinds(mut self, kinds: crate::block::Kinds) -> Blocks {
+        self.kinds = std::sync::Arc::new(kinds);
+        self
+    }
+
+    /// Reads the exports from the prepared game's exports folder (physics, and the
+    /// blocks' behaviour).
     pub fn load(exports: &Path) -> Result<Blocks, String> {
         let path = exports.join(ruthenium_prepare::exporters::BLOCK_PHYSICS);
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Blocks::new(&read_block_physics(&bytes)?))
+        let kinds = crate::block::Kinds::load(exports)?;
+        Ok(Blocks::new(&read_block_physics(&bytes)?).with_kinds(kinds))
+    }
+
+    /// Every block's kind and every state's flags.
+    pub fn kinds(&self) -> &crate::block::Kinds {
+        &self.kinds
+    }
+
+    /// The kind of the block a state belongs to.
+    pub fn kind(&self, id: u32) -> &crate::block::Kind {
+        self.kinds.of(id)
+    }
+
+    /// `instanceof`: the state's block is or extends the class.
+    pub fn is_class(&self, id: u32, class: crate::block::Class) -> bool {
+        self.kind(id).is(class)
+    }
+
+    fn flag(&self, id: u32, flag: u32) -> bool {
+        self.kinds.state(id).flags & flag != 0
+    }
+
+    /// `canBeReplaced()`: the state may be built over.
+    pub fn replaceable(&self, id: u32) -> bool {
+        self.flag(
+            id,
+            ruthenium_prepare::exporters::StateBehaviour::REPLACEABLE,
+        )
+    }
+
+    /// `isSolid()` (the legacy flag fluids and fire read).
+    pub fn solid(&self, id: u32) -> bool {
+        self.flag(id, ruthenium_prepare::exporters::StateBehaviour::SOLID)
+    }
+
+    /// `isSignalSource`.
+    pub fn signal_source(&self, id: u32) -> bool {
+        self.flag(
+            id,
+            ruthenium_prepare::exporters::StateBehaviour::SIGNAL_SOURCE,
+        )
+    }
+
+    /// `isRedstoneConductor`.
+    pub fn redstone_conductor(&self, id: u32) -> bool {
+        self.flag(
+            id,
+            ruthenium_prepare::exporters::StateBehaviour::REDSTONE_CONDUCTOR,
+        )
+    }
+
+    /// `isCollisionShapeFullBlock`.
+    pub fn collision_full_block(&self, id: u32) -> bool {
+        self.flag(
+            id,
+            ruthenium_prepare::exporters::StateBehaviour::COLLISION_FULL_BLOCK,
+        )
+    }
+
+    /// `hasBlockEntity`.
+    pub fn has_block_entity(&self, id: u32) -> bool {
+        self.flag(
+            id,
+            ruthenium_prepare::exporters::StateBehaviour::BLOCK_ENTITY,
+        )
+    }
+
+    /// `liquid()`.
+    pub fn liquid(&self, id: u32) -> bool {
+        self.flag(id, ruthenium_prepare::exporters::StateBehaviour::LIQUID)
+    }
+
+    /// `isSolidRender`.
+    pub fn solid_render(&self, id: u32) -> bool {
+        self.flag(
+            id,
+            ruthenium_prepare::exporters::StateBehaviour::SOLID_RENDER,
+        )
+    }
+
+    /// `canOcclude`.
+    pub fn can_occlude(&self, id: u32) -> bool {
+        self.flag(
+            id,
+            ruthenium_prepare::exporters::StateBehaviour::CAN_OCCLUDE,
+        )
+    }
+
+    /// `ignitedByLava`.
+    pub fn ignited_by_lava(&self, id: u32) -> bool {
+        self.flag(
+            id,
+            ruthenium_prepare::exporters::StateBehaviour::IGNITED_BY_LAVA,
+        )
+    }
+
+    /// `isFaceSturdy` with a support type, on the state's face towards `direction`.
+    pub fn face_sturdy(
+        &self,
+        id: u32,
+        direction: crate::direction::Direction,
+        support: crate::block::Support,
+    ) -> bool {
+        self.kinds
+            .state(id)
+            .sturdy(direction.index(), support as usize)
+    }
+
+    /// `getSignal` towards `direction` (the direction from the powered neighbour to
+    /// this block).
+    pub fn signal(&self, id: u32, direction: crate::direction::Direction) -> u8 {
+        self.kinds.state(id).signal[direction.index()]
+    }
+
+    /// `getDirectSignal`.
+    pub fn direct_signal(&self, id: u32, direction: crate::direction::Direction) -> u8 {
+        self.kinds.state(id).direct_signal[direction.index()]
+    }
+
+    /// `Block.isFaceFull(getCollisionShape(...), direction)`: the state's collision
+    /// shape covers its whole face towards `direction` (offset blocks as at the
+    /// origin).
+    pub fn collision_face_full(&self, id: u32, direction: crate::direction::Direction) -> bool {
+        self.shape(id)
+            .face_full(direction.axis(), direction.is_positive())
+    }
+
+    /// The same for the outline shape (`getShape`, as the crosshair meets it).
+    pub fn outline_face_full(&self, id: u32, direction: crate::direction::Direction) -> bool {
+        self.shapes[self.state(id).outline as usize]
+            .face_full(direction.axis(), direction.is_positive())
+    }
+
+    /// The outline shape (`getShape` with an empty context), unplaced.
+    pub fn outline_shape(&self, id: u32) -> &Shape {
+        &self.shapes[self.state(id).outline as usize]
+    }
+
+    /// `asItem`: the item the block gives (an item registry id).
+    pub fn item_of(&self, id: u32) -> u32 {
+        self.kind(id).item
     }
 
     pub fn len(&self) -> usize {
@@ -138,10 +313,36 @@ impl Blocks {
         }
         let offset = s
             .offset
+            .filter(|o| o.collision)
             .map(|o| offset(pos, o.vertical, o.max_horizontal, o.max_vertical));
         Some(Placed {
             shape,
             offset,
+            pos: [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
+        })
+    }
+
+    /// The collision shape an entity meets (`getCollisionShape` with its context).
+    /// Only scaffolding depends on who it is: solid (its top) for an entity standing
+    /// above it that isn't descending; its thin floor for one above the block below
+    /// it when the scaffolding is unsupported at the bottom of a column; else nothing.
+    /// Without an entity (`None`) every block has its exported shape.
+    pub fn collision_for(&self, id: u32, pos: [i32; 3], who: Option<Who>) -> Option<Placed<'_>> {
+        let Some(who) = who else {
+            return self.collision(id, pos);
+        };
+        if self.name(id) != "minecraft:scaffolding" {
+            return self.collision(id, pos);
+        }
+        if who.is_above(pos[1], 1.0) && !who.descending {
+            return self.collision(id, pos);
+        }
+        let s = ruthenium_data::v26_3::blocks::BlockState::from_id(id)?;
+        let unsupported =
+            s.value("distance").is_some_and(|d| d != "0") && s.value("bottom") == Some("true");
+        (unsupported && who.is_above(pos[1], 0.0)).then(|| Placed {
+            shape: &self.scaffolding_bottom,
+            offset: None,
             pos: [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
         })
     }
@@ -168,6 +369,7 @@ impl Blocks {
         }
         let offset = s
             .offset
+            .filter(|o| o.outline)
             .map(|o| offset(pos, o.vertical, o.max_horizontal, o.max_vertical));
         Some(place(shape, offset))
     }

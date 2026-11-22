@@ -116,6 +116,50 @@ impl Shape {
         self.sizes[axis as usize]
     }
 
+    /// Whether a full cell is at grid index `[x, y, z]` (out of range: no).
+    pub fn is_full_at(&self, x: isize, y: isize, z: isize) -> bool {
+        self.is_full_wide(x, y, z)
+    }
+
+    /// `Block.isFaceFull(shape, direction)`: the shape's slice at the face
+    /// (`getFaceShape`: the cell layer holding the point a ten-millionth inside the
+    /// face) covers the whole face of the block (`isShapeFullBlock`).
+    pub fn face_full(&self, axis: Axis, positive: bool) -> bool {
+        if self.empty {
+            return false;
+        }
+        let a = axis as usize;
+        let at = if positive { 1.0 - 1.0e-7 } else { 1.0e-7 };
+        let coords = &self.coords[a];
+        let Some(layer) = (0..self.sizes[a]).find(|&i| coords[i] <= at && at < coords[i + 1])
+        else {
+            return false;
+        };
+        let others: Vec<usize> = (0..3).filter(|&i| i != a).collect();
+        let covers = |i: usize| {
+            let c = &self.coords[i];
+            c[0] <= EPSILON && c[c.len() - 1] >= 1.0 - EPSILON
+        };
+        if !others.iter().all(|&i| covers(i)) {
+            return false;
+        }
+        let (b, c) = (others[0], others[1]);
+        let inside = |axis: usize, i: usize| {
+            let k = &self.coords[axis];
+            // Cells wholly outside the unit square don't count.
+            k[i + 1] > EPSILON && k[i] < 1.0 - EPSILON
+        };
+        (0..self.sizes[b]).filter(|&i| inside(b, i)).all(|i| {
+            (0..self.sizes[c]).filter(|&j| inside(c, j)).all(|j| {
+                let mut idx = [0isize; 3];
+                idx[a] = layer as isize;
+                idx[b] = i as isize;
+                idx[c] = j as isize;
+                self.is_full_wide(idx[0], idx[1], idx[2])
+            })
+        })
+    }
+
     /// `DiscreteVoxelShape.isFullWide`: out of range is not full.
     pub(crate) fn is_full_wide(&self, x: isize, y: isize, z: isize) -> bool {
         if x < 0 || y < 0 || z < 0 {

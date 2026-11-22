@@ -19,6 +19,7 @@ const MAIN_CLASS: &str = "dev.ruthenium.exporters.Main";
 pub const ENTITY_DIMENSIONS: &str = "entity_dimensions.bin";
 pub const BLOCK_PHYSICS: &str = "block_physics.bin";
 pub const ITEM_CLASSES: &str = "item_classes.bin";
+pub const BLOCK_BEHAVIOUR: &str = "block_behaviour.bin";
 
 /// The exporter bundle: `explicit`, then `RUTHENIUM_EXPORTERS`, then next to
 /// the executable, then `../java/` from it (`target/java/` in a dev build).
@@ -72,7 +73,12 @@ pub fn run(java: &Java, imported: &Imported, bundle: &Path) -> Result<(PathBuf, 
             imported,
             "exporters",
         )?;
-        for file in [ENTITY_DIMENSIONS, BLOCK_PHYSICS] {
+        for file in [
+            ENTITY_DIMENSIONS,
+            BLOCK_PHYSICS,
+            ITEM_CLASSES,
+            BLOCK_BEHAVIOUR,
+        ] {
             let expected = tmp.join(file);
             if !expected.is_file() {
                 return Err(StepError::MissingOutput(expected));
@@ -182,6 +188,20 @@ impl<'a> Reader<'a> {
         String::from_utf8(self.take(len.into())?.to_vec()).map_err(|e| e.to_string())
     }
 
+    fn u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_le_bytes(
+            self.take(2)?.try_into().expect("2 bytes"),
+        ))
+    }
+
+    /// A u16 count and that many `(name, value)` string pairs.
+    fn fields(&mut self) -> Result<Vec<(String, String)>, String> {
+        let n = self.u16()?;
+        (0..n)
+            .map(|_| Ok((self.string()?, self.string()?)))
+            .collect()
+    }
+
     fn finish(&self) -> Result<(), String> {
         if self.pos == self.bytes.len() {
             Ok(())
@@ -249,6 +269,10 @@ pub struct OffsetData {
     pub vertical: bool,
     pub max_horizontal: f32,
     pub max_vertical: f32,
+    /// The block moves its collision shape by the offset.
+    pub collision: bool,
+    /// The block moves its outline shape by the offset (short grass, for one, doesn't).
+    pub outline: bool,
 }
 
 /// A block state's physics.
@@ -318,7 +342,7 @@ pub struct BlockPhysics {
 
 /// Parses `block_physics.bin`.
 pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
-    let mut r = Reader::open(bytes, "block_physics", 5)?;
+    let mut r = Reader::open(bytes, "block_physics", 6)?;
     let n = r.u32()? as usize;
     let mut shapes = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
@@ -352,10 +376,15 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
             return Err(format!("bad fluid {fluid}"));
         }
         let offset = if flags & StatePhysics::OFFSET != 0 {
+            let vertical = r.u8()? == 2;
+            let (max_horizontal, max_vertical) = (r.f32()?, r.f32()?);
+            let moved = r.u8()?;
             Some(OffsetData {
-                vertical: r.u8()? == 2,
-                max_horizontal: r.f32()?,
-                max_vertical: r.f32()?,
+                vertical,
+                max_horizontal,
+                max_vertical,
+                collision: moved & 1 != 0,
+                outline: moved & 2 != 0,
             })
         } else {
             None
@@ -392,7 +421,7 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
     Ok(BlockPhysics { shapes, states })
 }
 
-/// What the exporter knows of an item's class (`item_classes` v1).
+/// What the exporter knows of an item's class (`item_classes` v2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemClassData {
     /// Network (registry) id.
@@ -406,6 +435,11 @@ pub struct ItemClassData {
     /// [`Self::RELEASE_USING`] (a class below `Item` declares the method) and
     /// [`Self::BLOCK_ITEM`].
     pub flags: u8,
+    /// The block a `BlockItem` places (a block registry id).
+    pub block: Option<u32>,
+    /// The instance fields the item's classes declare below `Item`: `Class.field`
+    /// and the value as the exporter writes it.
+    pub fields: Vec<(String, String)>,
 }
 
 impl ItemClassData {
@@ -419,11 +453,19 @@ impl ItemClassData {
     pub fn is(&self, class: &str) -> bool {
         self.classes.iter().any(|c| c == class)
     }
+
+    /// A field's value (`Class.field`).
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Parses `item_classes.bin`.
 pub fn read_item_classes(bytes: &[u8]) -> Result<Vec<ItemClassData>, String> {
-    let mut r = Reader::open(bytes, "item_classes", 1)?;
+    let mut r = Reader::open(bytes, "item_classes", 2)?;
     let count = r.u32()?;
     let mut out = Vec::with_capacity(count.min(8192) as usize);
     for _ in 0..count {
@@ -432,15 +474,187 @@ pub fn read_item_classes(bytes: &[u8]) -> Result<Vec<ItemClassData>, String> {
         let n = r.u8()?;
         let classes = (0..n).map(|_| r.string()).collect::<Result<_, _>>()?;
         let flags = r.u8()?;
+        let block = if flags & ItemClassData::BLOCK_ITEM != 0 {
+            Some(r.u32()?)
+        } else {
+            None
+        };
+        let fields = r.fields()?;
         out.push(ItemClassData {
             id,
             key,
             classes,
             flags,
+            block,
+            fields,
         });
     }
     r.finish()?;
     Ok(out)
+}
+
+/// What placing and using blocks needs of a block (`block_behaviour` v1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockBehaviourData {
+    /// e.g. `minecraft:oak_door`.
+    pub key: String,
+    /// The simple names of the block's class and its superclasses up to
+    /// `BlockBehaviour`, nearest first.
+    pub classes: Vec<String>,
+    /// For each behaviour (in [`BlockBehaviours::behaviours`] order), the index in
+    /// [`Self::classes`] of the class that declares it ([`Self::NONE`]: none does).
+    pub declared: Vec<u8>,
+    /// `asItem` (an item registry id; air's is 0).
+    pub item: u32,
+    /// Fire's ignite and burn odds for the block (0: it doesn't burn).
+    pub ignite_odds: u8,
+    pub burn_odds: u8,
+    /// The instance fields the block's classes declare below `Block`: `Class.field`
+    /// and the value as the exporter writes it.
+    pub fields: Vec<(String, String)>,
+}
+
+impl BlockBehaviourData {
+    /// No class of the block declares the behaviour (only optional ones).
+    pub const NONE: u8 = 255;
+
+    /// Whether the block's class is or extends `class` (a simple name).
+    pub fn is(&self, class: &str) -> bool {
+        self.classes.iter().any(|c| c == class)
+    }
+
+    /// A field's value (`Class.field`).
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A block state's flags and supporting faces (`block_behaviour` v1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StateBehaviour {
+    /// [`Self::REPLACEABLE`] and the other flags.
+    pub flags: u32,
+    /// The note block instrument the state gives (`instrument()`, an index in
+    /// [`BlockBehaviours::instruments`]).
+    pub instrument: u8,
+    /// For each `Direction` (ordinal order) three bits: `isFaceSturdy` with full,
+    /// centre and rigid support.
+    pub support: u32,
+    /// `getSignal` and `getDirectSignal` towards each direction (signal sources only).
+    pub signal: [u8; 6],
+    pub direct_signal: [u8; 6],
+}
+
+impl StateBehaviour {
+    /// `canBeReplaced()`: the state's `replaceable` property.
+    pub const REPLACEABLE: u32 = 1;
+    /// `isSolid()` (the legacy flag).
+    pub const SOLID: u32 = 2;
+    pub const SIGNAL_SOURCE: u32 = 8;
+    /// `isRedstoneConductor` at the origin of an empty level.
+    pub const REDSTONE_CONDUCTOR: u32 = 16;
+    /// `isCollisionShapeFullBlock`.
+    pub const COLLISION_FULL_BLOCK: u32 = 32;
+    pub const BLOCK_ENTITY: u32 = 64;
+    /// `liquid()`.
+    pub const LIQUID: u32 = 128;
+    pub const SOLID_RENDER: u32 = 256;
+    pub const CAN_OCCLUDE: u32 = 512;
+    pub const IGNITED_BY_LAVA: u32 = 1024;
+    pub const AIR: u32 = 2048;
+    pub const RANDOMLY_TICKING: u32 = 4096;
+    pub const ANALOG_OUTPUT: u32 = 8192;
+
+    /// `isFaceSturdy` for a direction's face (ordinal) and support type (0 full,
+    /// 1 centre, 2 rigid).
+    pub fn sturdy(&self, direction: usize, support: usize) -> bool {
+        self.support >> (direction * 3 + support) & 1 != 0
+    }
+}
+
+/// `block_behaviour.bin`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockBehaviours {
+    /// The note block instruments in order: name (`harp`), and whether it plays from
+    /// above a note block (mob heads).
+    pub instruments: Vec<(String, bool)>,
+    /// The behaviours each block lists the declaring class of, in order
+    /// (`getStateForPlacement`, `updateShape`...).
+    pub behaviours: Vec<String>,
+    pub blocks: Vec<BlockBehaviourData>,
+    pub states: Vec<StateBehaviour>,
+}
+
+/// Parses `block_behaviour.bin`.
+pub fn read_block_behaviour(bytes: &[u8]) -> Result<BlockBehaviours, String> {
+    let mut r = Reader::open(bytes, "block_behaviour", 2)?;
+    let n = r.u8()?;
+    let instruments = (0..n)
+        .map(|_| Ok((r.string()?, r.u8()? != 0)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let m = r.u8()?;
+    let behaviours: Vec<String> = (0..m).map(|_| r.string()).collect::<Result<_, _>>()?;
+    let n = r.u32()?;
+    let mut blocks = Vec::with_capacity(n.min(1 << 13) as usize);
+    for _ in 0..n {
+        let key = r.string()?;
+        let c = r.u8()?;
+        let classes: Vec<String> = (0..c).map(|_| r.string()).collect::<Result<_, _>>()?;
+        let declared: Vec<u8> = (0..m).map(|_| r.u8()).collect::<Result<_, _>>()?;
+        if let Some(d) = declared
+            .iter()
+            .find(|&&d| d != BlockBehaviourData::NONE && usize::from(d) >= classes.len())
+        {
+            return Err(format!("{key}: declaring class {d} out of range"));
+        }
+        let item = r.u32()?;
+        let (ignite_odds, burn_odds) = (r.u8()?, r.u8()?);
+        let fields = r.fields()?;
+        blocks.push(BlockBehaviourData {
+            key,
+            classes,
+            declared,
+            item,
+            ignite_odds,
+            burn_odds,
+            fields,
+        });
+    }
+    let n = r.u32()?;
+    let mut states = Vec::with_capacity(n.min(1 << 17) as usize);
+    for _ in 0..n {
+        let flags = r.u32()?;
+        let instrument = r.u8()?;
+        if usize::from(instrument) >= instruments.len() {
+            return Err(format!("instrument {instrument} out of range"));
+        }
+        let support = r.u32()?;
+        let mut s = StateBehaviour {
+            flags,
+            instrument,
+            support,
+            ..StateBehaviour::default()
+        };
+        if flags & StateBehaviour::SIGNAL_SOURCE != 0 {
+            for v in &mut s.signal {
+                *v = r.u8()?;
+            }
+            for v in &mut s.direct_signal {
+                *v = r.u8()?;
+            }
+        }
+        states.push(s);
+    }
+    r.finish()?;
+    Ok(BlockBehaviours {
+        instruments,
+        behaviours,
+        blocks,
+        states,
+    })
 }
 
 #[cfg(test)]
@@ -455,9 +669,9 @@ mod tests {
     #[test]
     fn reads_item_classes() {
         let mut b = b"RTHX".to_vec();
-        b.extend(1u32.to_le_bytes());
+        b.extend(2u32.to_le_bytes());
         string(&mut b, "item_classes");
-        b.extend(1u32.to_le_bytes());
+        b.extend(2u32.to_le_bytes());
         b.extend(9u32.to_le_bytes());
         string(&mut b, "example:bow");
         b.push(3);
@@ -465,11 +679,74 @@ mod tests {
             string(&mut b, c);
         }
         b.push(ItemClassData::USE | ItemClassData::RELEASE_USING);
+        b.extend(0u16.to_le_bytes());
+        b.extend(10u32.to_le_bytes());
+        string(&mut b, "example:torch");
+        b.push(2);
+        for c in ["StandingAndWallBlockItem", "BlockItem"] {
+            string(&mut b, c);
+        }
+        b.push(ItemClassData::USE_ON | ItemClassData::BLOCK_ITEM);
+        b.extend(7u32.to_le_bytes());
+        b.extend(1u16.to_le_bytes());
+        string(&mut b, "StandingAndWallBlockItem.wallBlock");
+        string(&mut b, "example:wall_torch");
         let items = read_item_classes(&b).unwrap();
         assert_eq!(items[0].key, "example:bow");
         assert!(items[0].is("ProjectileWeaponItem") && !items[0].is("BlockItem"));
-        assert_eq!(items[0].flags, 9);
+        assert_eq!((items[0].flags, items[0].block), (9, None));
+        assert_eq!(items[1].block, Some(7));
+        assert_eq!(
+            items[1].field("StandingAndWallBlockItem.wallBlock"),
+            Some("example:wall_torch")
+        );
         assert!(read_item_classes(&b[..b.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn reads_block_behaviour() {
+        let mut b = b"RTHX".to_vec();
+        b.extend(2u32.to_le_bytes());
+        string(&mut b, "block_behaviour");
+        b.push(2);
+        string(&mut b, "harp");
+        b.push(0);
+        string(&mut b, "zombie");
+        b.push(1);
+        b.push(2);
+        string(&mut b, "getStateForPlacement");
+        string(&mut b, "useWithoutItem");
+        b.extend(1u32.to_le_bytes());
+        string(&mut b, "example:door");
+        b.push(3);
+        for c in ["DoorBlock", "Block", "BlockBehaviour"] {
+            string(&mut b, c);
+        }
+        b.extend([0, 0]);
+        b.extend(5u32.to_le_bytes());
+        b.extend([5, 20]);
+        b.extend(1u16.to_le_bytes());
+        string(&mut b, "DoorBlock.type");
+        string(&mut b, "BlockSetType[name=oak]");
+        b.extend(2u32.to_le_bytes());
+        b.extend(StateBehaviour::REPLACEABLE.to_le_bytes());
+        b.push(0);
+        b.extend(0u32.to_le_bytes());
+        b.extend(StateBehaviour::SIGNAL_SOURCE.to_le_bytes());
+        b.push(1);
+        b.extend((1u32 << 5).to_le_bytes());
+        b.extend([15, 15, 15, 15, 15, 15, 0, 15, 0, 0, 0, 0]);
+        let data = read_block_behaviour(&b).unwrap();
+        assert_eq!(data.behaviours, ["getStateForPlacement", "useWithoutItem"]);
+        assert_eq!(data.instruments[1], ("zombie".to_owned(), true));
+        assert_eq!(data.states[1].instrument, 1);
+        let door = &data.blocks[0];
+        assert!(door.is("DoorBlock") && door.field("DoorBlock.type").is_some());
+        assert_eq!((door.item, door.ignite_odds, door.burn_odds), (5, 5, 20));
+        assert_eq!(data.states[0].flags, StateBehaviour::REPLACEABLE);
+        assert!(data.states[1].sturdy(1, 2) && !data.states[1].sturdy(1, 0));
+        assert_eq!(data.states[1].direct_signal[1], 15);
+        assert!(read_block_behaviour(&b[..b.len() - 1]).is_err());
     }
 
     #[test]

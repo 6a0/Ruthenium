@@ -1095,6 +1095,11 @@ pub mod play {
         SetHeldSlot {
             slot: i32,
         },
+        /// The recipe property sets (`campfire_input`, `furnace_input`...): each set's
+        /// key and item ids. The stonecutter's recipes after them aren't read.
+        UpdateRecipes {
+            item_sets: Vec<(String, Vec<i32>)>,
+        },
         TickingState {
             tick_rate: f32,
             frozen: bool,
@@ -1360,6 +1365,21 @@ pub mod play {
                     }
                 }
                 C::SetHeldSlot => Clientbound::SetHeldSlot { slot: r.varint()? },
+                C::UpdateRecipes => {
+                    let n = r.count(usize::MAX)?;
+                    let mut item_sets = Vec::with_capacity(n.min(64));
+                    for _ in 0..n {
+                        let key = r.identifier()?;
+                        let m = r.count(usize::MAX)?;
+                        let mut items = Vec::with_capacity(m.min(4096));
+                        for _ in 0..m {
+                            items.push(r.varint()?);
+                        }
+                        item_sets.push((key, items));
+                    }
+                    r.rest();
+                    Clientbound::UpdateRecipes { item_sets }
+                }
                 C::TickingState => Clientbound::TickingState {
                     tick_rate: r.f32()?,
                     frozen: r.bool()?,

@@ -70,6 +70,34 @@ public final class Scenarios {
     }
 
     /**
+     * Teleports the player to stand at (x, y, z) looking from its standing eyes at the point
+     * (tx, ty, tz), then waits for the teleport to land (a teleport's rotation overrides a look
+     * made in the same tick).
+     */
+    private static void aim(ClientGameTestContext ctx, TestServerContext server, double x, double y, double z,
+            double tx, double ty, double tz) {
+        double dx = tx - x;
+        double dy = ty - (y + 1.62);
+        double dz = tz - z;
+        double yaw = Math.toDegrees(Math.atan2(-dx, dz));
+        double pitch = Math.toDegrees(-Math.atan2(dy, Math.sqrt(dx * dx + dz * dz)));
+        server.runCommand(String.format(java.util.Locale.ROOT, "tp @p %.4f %.4f %.4f %.4f %.4f", x, y, z, yaw, pitch));
+        ctx.waitTicks(4);
+    }
+
+    /** One use click, then a pause past the use delay. */
+    private static void use(ClientGameTestContext ctx) {
+        ctx.getInput().pressKey(USE);
+        ctx.waitTicks(5);
+    }
+
+    /** Selects a hotbar slot and waits for it to be sent. */
+    private static void slot(ClientGameTestContext ctx, int slot) {
+        ctx.getInput().pressKey(hotbar(slot));
+        ctx.waitTicks(2);
+    }
+
+    /**
      * The breaking scenario's work area: the stone floor in front of the start mended, the
      * space above it cleared, {@code target} (if any) at 2 -60 0, and the player back at the
      * start looking at it.
@@ -88,6 +116,283 @@ public final class Scenarios {
     }
 
     public static final List<Scenario> ALL = List.of(
+            new Scenario("placing",
+                    "Placing blocks: sneak-bridging backwards off a platform with use held, then walking off its end without sneaking; one click into the player (refused) and towering with jump and use held; stairs at the bottom and top of a face and two at a corner; a bottom slab doubled, a top slab; two fences that join and a stone that joins them; a torch on the floor and one on a wall; a door and its top half; snow on snow; stone over short grass; scaffolding climbing; a ladder; a block from the off hand past a stick; a block in creative (kept).",
+                    List.of("item replace entity @a hotbar.0 with minecraft:stone 64",
+                            "item replace entity @a hotbar.1 with minecraft:oak_stairs 16",
+                            "item replace entity @a hotbar.2 with minecraft:oak_slab 16",
+                            "item replace entity @a hotbar.3 with minecraft:oak_fence 16",
+                            "item replace entity @a hotbar.4 with minecraft:torch 16",
+                            "item replace entity @a hotbar.5 with minecraft:oak_door 4",
+                            "item replace entity @a hotbar.6 with minecraft:scaffolding 16",
+                            "item replace entity @a hotbar.7 with minecraft:snow 16",
+                            "item replace entity @a hotbar.8 with minecraft:ladder 8",
+                            "item replace entity @a weapon.offhand with minecraft:cobblestone 8",
+                            "fill 0 -58 -1 2 -58 1 minecraft:stone",
+                            "setblock 17 -60 3 minecraft:stone",
+                            "setblock 17 -60 -6 minecraft:stone",
+                            "setblock 23 -60 8 minecraft:stone",
+                            "setblock 20 -60 -6 minecraft:stone",
+                            "setblock 29 -60 -6 minecraft:short_grass"),
+                    start(1.5, -57, 0.5, 90, 80), (ctx, server) -> {
+                        // Sneak-bridging east, walking backwards and facing the platform.
+                        ctx.waitTicks(10);
+                        ctx.getInput().holdKey(SNEAK);
+                        ctx.waitTicks(3);
+                        hold(ctx, 50, S, USE);
+                        ctx.getInput().releaseKey(SNEAK);
+                        ctx.waitTicks(5);
+                        // Off the bridge's end without sneaking, use still held.
+                        hold(ctx, 12, S, USE);
+                        ctx.waitTicks(25);
+                        // Towering: a click into the player first, refused.
+                        aim(ctx, server, 10.5, -60, 6.5, 10.5, -61, 6.5);
+                        use(ctx);
+                        hold(ctx, 60, JUMP, USE);
+                        ctx.waitTicks(20);
+                        // Stairs: on the floor, at the top of a face, and two meeting at a corner.
+                        slot(ctx, 1);
+                        aim(ctx, server, 14.5, -60, 0.5, 14.5, -60, 2.5);
+                        use(ctx);
+                        aim(ctx, server, 17.5, -60, 0.5, 17.5, -59.2, 3.0);
+                        use(ctx);
+                        aim(ctx, server, 20.5, -60, -0.5, 20.5, -60, 2.5);
+                        use(ctx);
+                        aim(ctx, server, 23.5, -60, 2.5, 21.5, -60, 2.5);
+                        use(ctx);
+                        // Slabs: a bottom slab doubled, then a top slab on a face's upper half.
+                        slot(ctx, 2);
+                        aim(ctx, server, 14.5, -60, -3.5, 14.5, -60, -5.5);
+                        use(ctx);
+                        aim(ctx, server, 14.5, -60, -3.5, 14.5, -59.5, -5.5);
+                        use(ctx);
+                        aim(ctx, server, 17.5, -60, -3.5, 17.5, -59.2, -5.0);
+                        use(ctx);
+                        // Fences that join, then a stone beside them.
+                        slot(ctx, 3);
+                        aim(ctx, server, 14.5, -60, 5.5, 14.5, -60, 8.5);
+                        use(ctx);
+                        aim(ctx, server, 15.5, -60, 5.5, 15.5, -60, 8.5);
+                        use(ctx);
+                        slot(ctx, 0);
+                        aim(ctx, server, 16.5, -60, 5.5, 16.5, -60, 8.5);
+                        use(ctx);
+                        // Torches: on the floor, and on a wall.
+                        slot(ctx, 4);
+                        aim(ctx, server, 20.5, -60, 5.5, 20.5, -60, 7.5);
+                        use(ctx);
+                        aim(ctx, server, 23.5, -60, 5.5, 23.5, -59.5, 8.0);
+                        use(ctx);
+                        // A door, which puts its top half above it.
+                        slot(ctx, 5);
+                        aim(ctx, server, 26.5, -60, 0.5, 26.5, -60, 2.5);
+                        use(ctx);
+                        // Snow, then snow on the snow.
+                        slot(ctx, 7);
+                        aim(ctx, server, 26.5, -60, -3.5, 26.5, -60, -5.5);
+                        use(ctx);
+                        aim(ctx, server, 26.5, -60, -3.5, 26.5, -59.875, -5.5);
+                        use(ctx);
+                        // Stone over short grass.
+                        slot(ctx, 0);
+                        aim(ctx, server, 29.5, -60, -3.5, 29.5, -59.6, -5.5);
+                        use(ctx);
+                        // Scaffolding, then clicked twice on its side: it climbs.
+                        slot(ctx, 6);
+                        aim(ctx, server, 29.5, -60, 0.5, 29.5, -60, 2.5);
+                        use(ctx);
+                        aim(ctx, server, 29.5, -60, 0.5, 29.5, -59.5, 2.0);
+                        use(ctx);
+                        use(ctx);
+                        // A ladder on a wall.
+                        slot(ctx, 8);
+                        aim(ctx, server, 20.5, -60, -3.5, 20.5, -59.5, -5.0);
+                        use(ctx);
+                        // The off hand's cobblestone, past a stick that places nothing.
+                        server.runCommand("item replace entity @p hotbar.4 with minecraft:stick");
+                        slot(ctx, 4);
+                        ctx.waitTicks(3);
+                        aim(ctx, server, 4.5, -60, 6.5, 4.5, -60, 8.5);
+                        use(ctx);
+                        // Creative: the stack stays whole.
+                        server.runCommand("gamemode creative @p");
+                        slot(ctx, 0);
+                        ctx.waitTicks(3);
+                        aim(ctx, server, 6.5, -60, 6.5, 6.5, -60, 8.5);
+                        use(ctx);
+                        server.runCommand("gamemode survival @p");
+                        ctx.waitTicks(10);
+                    }),
+            new Scenario("scaffolding",
+                    "Moving in scaffolding: walking into a column from the side (it has no sides); climbing it from inside with jump held until standing on its top; sneaking down through it to the ground; dropping onto a piece reaching out from the top, unsupported, whose thin floor holds the player even while sneaking; walking off it.",
+                    List.of("fill 2 -60 3 2 -56 3 minecraft:scaffolding[distance=0,bottom=false]",
+                            "setblock 2 -56 4 minecraft:scaffolding[distance=1,bottom=true]"),
+                    start(2.5, -60, 0.5, 0, 0), (ctx, server) -> {
+                        ctx.waitTicks(10);
+                        hold(ctx, 14, W);
+                        ctx.waitTicks(5);
+                        // Inside the column: climb to its top and stand there.
+                        server.runCommand("tp @p 2.5 -60 3.5 0 0");
+                        ctx.waitTicks(5);
+                        hold(ctx, 45, JUMP);
+                        ctx.waitTicks(15);
+                        // Sneaking lets the player down through the top.
+                        hold(ctx, 50, SNEAK);
+                        ctx.waitTicks(10);
+                        // The unsupported piece: its thin floor holds the player, sneaking or not.
+                        server.runCommand("tp @p 2.5 -55.5 4.5 0 0");
+                        ctx.waitTicks(15);
+                        hold(ctx, 15, SNEAK);
+                        ctx.waitTicks(5);
+                        hold(ctx, 12, W);
+                        ctx.waitTicks(20);
+                    }),
+            new Scenario("using_blocks",
+                    "Using blocks: a door opened, walked through and closed from the other side, an iron door that doesn't open by hand (stone in hand goes against it); a trapdoor in the floor opened under the player; a fence gate opened, walked through, closed and opened again from the other side (it turns); a lever twice, a button, a repeater's delay three times, a comparator, a note block, a daylight detector; a cake eaten when hungry; a candle on a cake; a dandelion potted; sweet berries picked; seeds in a composter; a sneaking click on the door with stone places it.",
+                    List.of("setblock 2 -60 3 minecraft:oak_door[half=lower,facing=north]",
+                            "setblock 2 -59 3 minecraft:oak_door[half=upper,facing=north]",
+                            "setblock 4 -60 3 minecraft:iron_door[half=lower,facing=north]",
+                            "setblock 4 -59 3 minecraft:iron_door[half=upper,facing=north]",
+                            "setblock 6 -61 3 minecraft:oak_trapdoor[half=top,facing=north]",
+                            "setblock 10 -60 3 minecraft:oak_fence_gate[facing=north]",
+                            "setblock 14 -60 3 minecraft:lever[face=floor,facing=north]",
+                            "setblock 16 -60 3 minecraft:stone_button[face=floor,facing=north]",
+                            "setblock 18 -60 3 minecraft:repeater[facing=north]",
+                            "setblock 20 -60 3 minecraft:comparator[facing=north]",
+                            "setblock 22 -60 3 minecraft:note_block",
+                            "setblock 24 -60 3 minecraft:daylight_detector",
+                            "setblock 26 -60 3 minecraft:cake",
+                            "setblock 28 -60 3 minecraft:cake",
+                            "setblock 2 -60 -4 minecraft:flower_pot",
+                            "setblock 4 -60 -4 minecraft:sweet_berry_bush[age=3]",
+                            "setblock 6 -60 -4 minecraft:composter",
+                            "item replace entity @a hotbar.1 with minecraft:candle 4",
+                            "item replace entity @a hotbar.2 with minecraft:dandelion 4",
+                            "item replace entity @a hotbar.3 with minecraft:wheat_seeds 16",
+                            "item replace entity @a hotbar.4 with minecraft:stone 16"),
+                    start(2.5, -60, 0.5, 0, 20), (ctx, server) -> {
+                        ctx.waitTicks(10);
+                        // The door: open it, walk through, turn round and close it.
+                        aim(ctx, server, 2.5, -60, 0.5, 2.5, -59.5, 3.2);
+                        use(ctx);
+                        hold(ctx, 25, W);
+                        ctx.waitTicks(5);
+                        aim(ctx, server, 2.5, -60, 5.5, 2.1, -59.5, 3.5);
+                        use(ctx);
+                        // The iron door: nothing happens with an empty hand; with stone in
+                        // hand the stone goes against it.
+                        aim(ctx, server, 4.5, -60, 0.5, 4.5, -59.5, 3.9);
+                        use(ctx);
+                        slot(ctx, 4);
+                        use(ctx);
+                        slot(ctx, 0);
+                        // The trapdoor in the floor, opened from on top of it: the player drops.
+                        aim(ctx, server, 6.5, -60, 3.5, 6.5, -61, 3.5);
+                        use(ctx);
+                        ctx.waitTicks(15);
+                        // The fence gate: opened, walked through, closed, opened from the far side.
+                        aim(ctx, server, 10.5, -60, 0.5, 10.5, -59.5, 3.5);
+                        use(ctx);
+                        hold(ctx, 25, W);
+                        ctx.waitTicks(5);
+                        aim(ctx, server, 10.5, -60, 5.5, 10.5, -59.5, 3.5);
+                        use(ctx);
+                        use(ctx);
+                        // Redstone parts.
+                        aim(ctx, server, 14.5, -60, 1.5, 14.5, -59.9, 3.5);
+                        use(ctx);
+                        use(ctx);
+                        aim(ctx, server, 16.5, -60, 1.5, 16.5, -59.95, 3.5);
+                        use(ctx);
+                        aim(ctx, server, 18.5, -60, 1.5, 18.5, -59.9, 3.5);
+                        use(ctx);
+                        use(ctx);
+                        use(ctx);
+                        aim(ctx, server, 20.5, -60, 1.5, 20.5, -59.9, 3.5);
+                        use(ctx);
+                        aim(ctx, server, 22.5, -60, 1.5, 22.5, -59.5, 3.0);
+                        use(ctx);
+                        aim(ctx, server, 24.5, -60, 1.5, 24.5, -59.7, 3.5);
+                        use(ctx);
+                        // A cake: refused at full hunger, eaten once hungry.
+                        aim(ctx, server, 26.5, -60, 1.5, 26.5, -59.6, 3.5);
+                        use(ctx);
+                        server.runCommand("effect give @p minecraft:hunger 5 255 true");
+                        ctx.waitTicks(110);
+                        use(ctx);
+                        // A candle on the other cake.
+                        slot(ctx, 1);
+                        aim(ctx, server, 28.5, -60, 1.5, 28.5, -59.6, 3.5);
+                        use(ctx);
+                        // A dandelion potted, berries picked, seeds composted.
+                        slot(ctx, 2);
+                        aim(ctx, server, 2.5, -60, -1.5, 2.5, -59.7, -3.5);
+                        use(ctx);
+                        slot(ctx, 0);
+                        aim(ctx, server, 4.5, -60, -1.5, 4.5, -59.5, -3.5);
+                        use(ctx);
+                        slot(ctx, 3);
+                        aim(ctx, server, 6.5, -60, -1.5, 6.5, -59.5, -3.5);
+                        use(ctx);
+                        use(ctx);
+                        // Sneaking with stone in hand: the door isn't used, the stone is placed.
+                        slot(ctx, 4);
+                        aim(ctx, server, 2.5, -60, 0.5, 2.5, -59.5, 3.9);
+                        ctx.getInput().holdKey(SNEAK);
+                        ctx.waitTicks(3);
+                        use(ctx);
+                        ctx.getInput().releaseKey(SNEAK);
+                        ctx.waitTicks(10);
+                    }),
+            new Scenario("tools_on_blocks",
+                    "Items used on blocks: a shovel making a path the player then walks onto, a hoe making farmland, an axe stripping a log, flint and steel lighting the floor, bone meal on a grass block, honeycomb on copper, a water bottle on dirt, a lily pad on water, powder snow from its bucket.",
+                    List.of("fill 0 -61 2 12 -61 4 minecraft:grass_block",
+                            "setblock 6 -60 3 minecraft:oak_log",
+                            "setblock 10 -60 3 minecraft:copper_block",
+                            "setblock 14 -61 3 minecraft:dirt",
+                            "setblock 18 -61 3 minecraft:water",
+                            "item replace entity @a hotbar.0 with minecraft:iron_shovel",
+                            "item replace entity @a hotbar.1 with minecraft:iron_hoe",
+                            "item replace entity @a hotbar.2 with minecraft:iron_axe",
+                            "item replace entity @a hotbar.3 with minecraft:flint_and_steel",
+                            "item replace entity @a hotbar.4 with minecraft:bone_meal 8",
+                            "item replace entity @a hotbar.5 with minecraft:honeycomb 4",
+                            "item replace entity @a hotbar.6 with minecraft:potion[potion_contents={potion:\"minecraft:water\"}]",
+                            "item replace entity @a hotbar.7 with minecraft:lily_pad 4",
+                            "item replace entity @a hotbar.8 with minecraft:powder_snow_bucket"),
+                    start(2.5, -60, 0.5, 0, 40), (ctx, server) -> {
+                        ctx.waitTicks(10);
+                        // A path, walked onto (a sixteenth lower).
+                        aim(ctx, server, 2.5, -60, 0.5, 2.5, -60, 2.5);
+                        use(ctx);
+                        hold(ctx, 15, W);
+                        ctx.waitTicks(5);
+                        slot(ctx, 1);
+                        aim(ctx, server, 4.5, -60, 0.5, 4.5, -60, 2.5);
+                        use(ctx);
+                        slot(ctx, 2);
+                        aim(ctx, server, 6.5, -60, 0.5, 6.5, -59.5, 3.0);
+                        use(ctx);
+                        slot(ctx, 3);
+                        aim(ctx, server, 8.5, -60, 0.5, 8.5, -60, 2.5);
+                        use(ctx);
+                        slot(ctx, 4);
+                        aim(ctx, server, 12.5, -60, 0.5, 12.5, -60, 3.5);
+                        use(ctx);
+                        slot(ctx, 5);
+                        aim(ctx, server, 10.5, -60, 0.5, 10.5, -59.5, 3.0);
+                        use(ctx);
+                        slot(ctx, 6);
+                        aim(ctx, server, 14.5, -60, 0.5, 14.5, -60, 3.5);
+                        use(ctx);
+                        slot(ctx, 7);
+                        aim(ctx, server, 18.5, -60, 0.5, 18.5, -60.1, 3.5);
+                        use(ctx);
+                        slot(ctx, 8);
+                        aim(ctx, server, 22.5, -60, 0.5, 22.5, -60, 2.5);
+                        use(ctx);
+                        ctx.waitTicks(10);
+                    }),
             new Scenario("walk_directions",
                     "Walk 15 ticks in each of the eight key directions on stone, 5 idle ticks between.",
                     List.of(), start(0.5, -60, 0.5, 0, 0), (ctx, server) -> {

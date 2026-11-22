@@ -74,6 +74,9 @@ pub struct Physics {
     pub dimension_types: HashMap<String, DimensionType>,
     /// Items: their classes and default components.
     pub items: std::sync::Arc<Items>,
+    /// Vanilla's block transformers by name, for servers that send them as known-pack
+    /// entries without data.
+    pub block_transformers: std::sync::Arc<crate::use_on::Transformers>,
 }
 
 /// What movement needs from a dimension type.
@@ -378,6 +381,12 @@ struct Game {
     world: Option<World>,
     physics: Option<Physics>,
     tags: BlockTags,
+    /// The item tags the server sent.
+    item_tags: crate::item::ItemTags,
+    /// The recipe property sets the server sent.
+    recipe_sets: crate::item::RecipeSets,
+    /// The block transformers of the configuration's registry.
+    transformers: crate::use_on::Transformers,
     clock: TickClock,
     started: Instant,
     view: Arc<Mutex<Option<PlayerView>>>,
@@ -488,6 +497,9 @@ impl Game {
             world: None,
             physics,
             tags: BlockTags::new(),
+            item_tags: crate::item::ItemTags::new(),
+            recipe_sets: crate::item::RecipeSets::new(),
+            transformers: crate::use_on::Transformers::default(),
             clock: TickClock::new(0),
             started: Instant::now(),
             view: Arc::default(),
@@ -735,6 +747,24 @@ impl Game {
         (level, global_bits(biomes))
     }
 
+    /// The block transformers the configuration's registry lists: each entry's own
+    /// data, else vanilla's of that name.
+    fn configured_transformers(&self) -> crate::use_on::Transformers {
+        let entries = self
+            .configured
+            .registries
+            .iter()
+            .find(|(r, _)| r == "minecraft:block_transformer")
+            .map(|(_, e)| e.as_slice())
+            .unwrap_or(&[]);
+        let vanilla = self
+            .physics
+            .as_ref()
+            .map(|p| p.block_transformers.clone())
+            .unwrap_or_default();
+        crate::use_on::Transformers::from_registry(entries, &vanilla)
+    }
+
     /// A level's entities, the player's among them.
     fn new_entities(&self, player_id: i32) -> Entities {
         let improved = self
@@ -747,6 +777,15 @@ impl Game {
 
     /// The block tags movement reads, from the server's tags (block registry ids).
     fn apply_tags(&mut self, tags: &[RegistryTags]) {
+        if let Some(items) = tags.iter().find(|t| t.registry == "minecraft:item") {
+            for (tag, ids) in &items.tags {
+                let names = ids.iter().filter_map(|&id| {
+                    ruthenium_data::v26_3::registries::Item::from_id(u32::try_from(id).ok()?)
+                        .map(|i| i.name())
+                });
+                self.item_tags.set(tag, names);
+            }
+        }
         let Some(blocks) = tags.iter().find(|t| t.registry == "minecraft:block") else {
             return;
         };
@@ -822,14 +861,19 @@ impl Game {
                     }
                 }
             }
-            let mut world = interact::World {
-                level: &mut w.level,
-                predictions: &mut w.predictions,
-                blocks: &physics.blocks,
-                tags: &self.tags,
-                entities: &w.entities,
-                fluid_shapes: &w.fluid_shapes,
-            };
+            let mut world = interact::World::new(
+                &mut w.level,
+                &mut w.predictions,
+                &physics.blocks,
+                &self.tags,
+                &w.entities,
+                &w.fluid_shapes,
+            )
+            .with_players(&self.players)
+            .with_items(&physics.items)
+            .with_item_tags(&self.item_tags)
+            .with_transformers(&self.transformers)
+            .with_recipe_sets(&self.recipe_sets);
             w.game_mode.handle_keybinds(
                 &mut w.player,
                 &mut world,
@@ -972,6 +1016,7 @@ impl Game {
                     c.tags = std::mem::take(&mut self.configured.tags);
                 }
                 self.configured = c;
+                self.transformers = self.configured_transformers();
                 log_configured(&self.configured, self.server_brand.as_deref());
                 self.connection
                     .switch(Protocol::Play, cfg::finish_configuration());
@@ -1172,6 +1217,12 @@ impl Game {
             play::Clientbound::Explode {
                 player_knockback: None,
             } => {}
+            play::Clientbound::UpdateRecipes { item_sets } => {
+                self.recipe_sets = crate::item::RecipeSets::new();
+                for (key, items) in item_sets {
+                    self.recipe_sets.set(&key, items);
+                }
+            }
             play::Clientbound::SetHeldSlot { slot } => {
                 // `Inventory.isHotbarSlot`.
                 if let Some(w) = &mut self.world

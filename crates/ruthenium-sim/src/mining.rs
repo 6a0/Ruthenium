@@ -75,6 +75,16 @@ pub fn can_break_in_adventure(stack: &Stack, state: u32, tags: &BlockTags) -> bo
         .is_some_and(|p| p.iter().any(|p| predicate_matches(p, state, tags)))
 }
 
+/// `canPlaceOnBlockInAdventureMode`: any of the stack's `can_place_on` entries
+/// matches the block (block entity conditions never do, as for `can_break`).
+pub fn can_place_on_in_adventure(stack: &Stack, state: u32, tags: &BlockTags) -> bool {
+    stack
+        .c
+        .can_place_on
+        .as_ref()
+        .is_some_and(|p| p.iter().any(|p| predicate_matches(p, state, tags)))
+}
+
 /// `BlockPredicate.matches`.
 fn predicate_matches(p: &BlockPredicate, state: u32, tags: &BlockTags) -> bool {
     if let Some(blocks) = &p.blocks {

@@ -21,8 +21,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod block;
 pub mod blocks;
 pub mod clock;
+pub mod direction;
 pub mod effect;
 pub mod entity;
 pub mod fluid;
@@ -33,8 +35,11 @@ pub mod item;
 pub mod level_load;
 pub mod mining;
 pub mod pick;
+pub mod place;
 pub mod player;
 pub mod predict;
 pub mod session;
 pub mod shape;
+pub mod transform;
+pub mod use_on;
 pub mod world;

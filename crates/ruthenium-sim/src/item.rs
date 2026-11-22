@@ -14,6 +14,8 @@ use ruthenium_protocol::item::{
     BlockPredicate, Component, ComponentPatch, Holder, HolderSet, ItemStack,
 };
 
+use crate::transform::TransformerRef;
+
 /// `ItemUseAnimation` ids.
 pub mod animation {
     pub const NONE: i32 = 0;
@@ -336,6 +338,13 @@ pub struct Components {
     pub name: &'static str,
     pub class: Class,
     pub block_item: bool,
+    /// The block a block item places (`BlockItem.getBlock`, a block registry id).
+    pub block: Option<u32>,
+    /// The simple names of the item's class and its superclasses up to `Item`.
+    pub classes: Arc<[String]>,
+    /// The instance fields the item's classes declare (`Class.field`, value), as the
+    /// exporter writes them: a standing-and-wall item's wall block, a bucket's fluid.
+    pub fields: Arc<[(String, String)]>,
     /// The class overrides `useOn`.
     pub use_on: bool,
     pub max_stack_size: Option<i32>,
@@ -355,7 +364,8 @@ pub struct Components {
     pub minimum_attack_charge: f32,
     /// `piercing_weapon`: attacks are jabs (spears).
     pub piercing_weapon: bool,
-    pub block_transformer: bool,
+    /// `block_transformer`: what the item turns blocks into (axes, shovels, hoes).
+    pub block_transformer: Option<TransformerRef>,
     pub instrument: Option<InstrumentRef>,
     /// Charged projectiles, any.
     pub charged: bool,
@@ -371,6 +381,14 @@ pub struct Components {
     pub tool: Option<Arc<Tool>>,
     /// `can_break`: what an adventure-mode player may break with it.
     pub can_break: Option<Arc<Vec<BlockPredicate>>>,
+    /// `can_place_on`: what an adventure-mode player may place it against.
+    pub can_place_on: Option<Arc<Vec<BlockPredicate>>>,
+    /// `block_state`: properties the block it places takes (name, value).
+    pub block_state: Option<Arc<Vec<(String, String)>>>,
+    /// `compostable`: a composter takes it.
+    pub compostable: bool,
+    /// `jukebox_playable`: a jukebox plays it.
+    pub jukebox_playable: bool,
 }
 
 impl Components {
@@ -412,6 +430,19 @@ impl Components {
         }
     }
 
+    /// Whether the item's class is or extends `class` (a simple name).
+    pub fn is(&self, class: &str) -> bool {
+        self.classes.iter().any(|c| c == class)
+    }
+
+    /// One of the item's fields (`Class.field`), as the exporter wrote it.
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     /// `useOnRelease`: crossbows.
     pub fn use_on_release(&self) -> bool {
         self.class == Class::Crossbow
@@ -436,12 +467,16 @@ impl Components {
                 Some(Kind::AttackRange) => self.attack_range = None,
                 Some(Kind::MinimumAttackCharge) => self.minimum_attack_charge = 0.0,
                 Some(Kind::PiercingWeapon) => self.piercing_weapon = false,
-                Some(Kind::BlockTransformer) => self.block_transformer = false,
+                Some(Kind::BlockTransformer) => self.block_transformer = None,
                 Some(Kind::Instrument) => self.instrument = None,
                 Some(Kind::ChargedProjectiles) => self.charged = false,
                 Some(Kind::Enchantments) => self.enchantments.clear(),
                 Some(Kind::Tool) => self.tool = None,
                 Some(Kind::CanBreak) => self.can_break = None,
+                Some(Kind::CanPlaceOn) => self.can_place_on = None,
+                Some(Kind::BlockState) => self.block_state = None,
+                Some(Kind::Compostable) => self.compostable = false,
+                Some(Kind::JukeboxPlayable) => self.jukebox_playable = false,
                 _ => {}
             }
         }
@@ -549,12 +584,18 @@ impl Components {
                     }))
                 }
                 Component::CanBreak(p) => self.can_break = Some(Arc::new(p.clone())),
-                Component::Other { kind, .. }
-                    if u32::try_from(*kind).ok().and_then(Kind::from_id)
-                        == Some(Kind::BlockTransformer) =>
-                {
-                    self.block_transformer = true
+                Component::CanPlaceOn(p) => self.can_place_on = Some(Arc::new(p.clone())),
+                Component::BlockState(p) => self.block_state = Some(Arc::new(p.clone())),
+                Component::BlockTransformer(id) => {
+                    self.block_transformer = Some(TransformerRef::Id(*id))
                 }
+                _ => {}
+            }
+        }
+        for &(kind, _) in &patch.added {
+            match u32::try_from(kind).ok().and_then(Kind::from_id) {
+                Some(Kind::Compostable) => self.compostable = true,
+                Some(Kind::JukeboxPlayable) => self.jukebox_playable = true,
                 _ => {}
             }
         }
@@ -690,6 +731,75 @@ impl Stack {
     }
 }
 
+/// Item tags, from the server's tags packet (`ItemStack.is(TagKey)`).
+#[derive(Debug, Clone, Default)]
+pub struct ItemTags {
+    /// Each tag's items, by item registry id.
+    all: HashMap<String, Vec<bool>>,
+}
+
+impl ItemTags {
+    pub fn new() -> ItemTags {
+        ItemTags::default()
+    }
+
+    /// Sets a tag's items, by item name (`minecraft:book`); unknown names are skipped.
+    pub fn set<'a>(&mut self, tag: &str, items: impl IntoIterator<Item = &'a str>) {
+        let mut by_item = Vec::new();
+        for i in items.into_iter().filter_map(Item::from_name) {
+            let i = i.id() as usize;
+            if by_item.len() <= i {
+                by_item.resize(i + 1, false);
+            }
+            by_item[i] = true;
+        }
+        self.all.insert(tag.to_owned(), by_item);
+    }
+
+    /// `ItemStack.is(tag)`: an empty stack, or an unknown tag, holds nothing.
+    pub fn is(&self, stack: &Stack, tag: &str) -> bool {
+        !stack.is_empty()
+            && usize::try_from(stack.item())
+                .ok()
+                .and_then(|i| self.all.get(tag)?.get(i).copied())
+                .unwrap_or(false)
+    }
+}
+
+/// The recipe property sets the server sent (`RecipePropertySet`: the items a
+/// campfire cooks, a furnace smelts...), by key.
+#[derive(Debug, Clone, Default)]
+pub struct RecipeSets {
+    sets: HashMap<String, Vec<bool>>,
+}
+
+impl RecipeSets {
+    pub fn new() -> RecipeSets {
+        RecipeSets::default()
+    }
+
+    /// Sets a property set's items, by item registry id.
+    pub fn set(&mut self, key: &str, items: impl IntoIterator<Item = i32>) {
+        let mut by_item = Vec::new();
+        for i in items.into_iter().filter_map(|i| usize::try_from(i).ok()) {
+            if by_item.len() <= i {
+                by_item.resize(i + 1, false);
+            }
+            by_item[i] = true;
+        }
+        self.sets.insert(key.to_owned(), by_item);
+    }
+
+    /// `RecipePropertySet.test`: the stack's item is in the set (an unknown set holds
+    /// nothing).
+    pub fn contains(&self, key: &str, stack: &Stack) -> bool {
+        usize::try_from(stack.item())
+            .ok()
+            .and_then(|i| self.sets.get(key)?.get(i).copied())
+            .unwrap_or(false)
+    }
+}
+
 /// Every item's defaults and class, and what the session knows of the synced
 /// registries the client's item use reads.
 #[derive(Debug, Clone, Default)]
@@ -735,6 +845,9 @@ impl Items {
                 name: item.name(),
                 class: Class::of(data),
                 block_item: data.flags & ItemClassData::BLOCK_ITEM != 0,
+                block: data.block,
+                classes: data.classes.clone().into(),
+                fields: data.fields.clone().into(),
                 use_on: data.flags & ItemClassData::USE_ON != 0,
                 ..Components::default()
             };
@@ -836,6 +949,15 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
     c.max_damage = int("minecraft:max_damage");
     c.damage = int("minecraft:damage");
     c.unbreakable = has("minecraft:unbreakable");
+    c.compostable = has("minecraft:compostable");
+    c.jukebox_playable = has("minecraft:jukebox_playable");
+    if let Some(o) = v.get("minecraft:block_state").and_then(|o| o.as_object()) {
+        let props = o
+            .iter()
+            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_owned())))
+            .collect();
+        c.block_state = Some(Arc::new(props));
+    }
     if let Some(o) = v.get("minecraft:consumable") {
         c.consumable = Some(Consumable {
             consume_seconds: f32_or(o, "consume_seconds", 1.6),
@@ -903,7 +1025,9 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
         .and_then(serde_json::Value::as_f64)
         .map_or(0.0, |f| f as f32);
     c.piercing_weapon = has("minecraft:piercing_weapon");
-    c.block_transformer = has("minecraft:block_transformer");
+    c.block_transformer = v
+        .get("minecraft:block_transformer")
+        .and_then(TransformerRef::from_json);
     c.instrument = v.get("minecraft:instrument").map(|i| match i.as_str() {
         Some(name) => InstrumentRef::Name(full_identifier(name)),
         None => InstrumentRef::Inline,
@@ -960,6 +1084,8 @@ mod tests {
             key: name.to_owned(),
             classes: classes.iter().map(|c| (*c).to_owned()).collect(),
             flags,
+            block: None,
+            fields: Vec::new(),
         };
         let classes = vec![
             class("minecraft:air", &["AirItem", "Item"], 0),

@@ -46,9 +46,10 @@ import net.minecraft.world.phys.Vec3;
  * <p>Records: {@code frame} (start of a client frame), {@code tick} (inputs at the start of a
  * client tick), {@code state} (player state at the end of the tick), {@code out} (every
  * serverbound packet with its encoded bytes), {@code recv} (a clientbound packet arriving, on the
- * network thread) and {@code handle} (a clientbound packet being processed on the game thread;
+ * network thread), {@code handle} (a clientbound packet being processed on the game thread;
  * with bytes only for the packets that affect the local player, so no chunk or registry data is
- * ever written).
+ * ever written) and {@code set} (a block the client level sets: predicted, acknowledged or
+ * updated by the server).
  *
  * <p>Floats and doubles are written with Java's shortest round-trip representation, so parsing
  * the text directly as f32 / f64 gives the exact value.
@@ -197,6 +198,32 @@ public final class Recorder {
                 o.addProperty("xRot", p.getXRot());
                 o.addProperty("slot", p.getInventory().getSelectedSlot());
             }
+            write(o);
+        }
+    }
+
+    /**
+     * A block the client level sets (a {@code set} record): where, the state, the update flags
+     * and limit, and whether an action's prediction is running. Game thread only.
+     */
+    public static void blockSet(BlockPos pos, net.minecraft.world.level.block.state.BlockState state, int flags,
+            int limit, boolean predicting) {
+        synchronized (LOCK) {
+            if (out == null || Thread.currentThread() != gameThread) {
+                return;
+            }
+            JsonObject o = record("set");
+            o.addProperty("n", tick);
+            o.addProperty("inTick", inTick);
+            JsonArray at = new JsonArray();
+            at.add(pos.getX());
+            at.add(pos.getY());
+            at.add(pos.getZ());
+            o.add("pos", at);
+            o.addProperty("state", Block.getId(state));
+            o.addProperty("flags", flags);
+            o.addProperty("limit", limit);
+            o.addProperty("predicting", predicting);
             write(o);
         }
     }

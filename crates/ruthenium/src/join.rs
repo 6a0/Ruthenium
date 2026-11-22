@@ -15,6 +15,7 @@ use ruthenium_sim::blocks::Blocks;
 use ruthenium_sim::entity::EntityTypes;
 use ruthenium_sim::item::Items;
 use ruthenium_sim::session::{DimensionType, Physics, Session, SessionOptions};
+use ruthenium_sim::use_on::Transformers;
 
 use crate::account::Accounts;
 
@@ -101,6 +102,7 @@ impl GameData {
                     entity_types: Arc::new(entity_types),
                     dimension_types: dimension_types(&jar),
                     items: Arc::new(items),
+                    block_transformers: Arc::new(block_transformers(&jar)),
                 })
             }
             Err(e) => {
@@ -135,6 +137,16 @@ fn dimension_types(jar: &Zip) -> HashMap<String, DimensionType> {
             Some((format!("minecraft:{file}"), t))
         })
         .collect()
+}
+
+/// Vanilla's block transformers from the jar's data pack (`data/minecraft/block_transformer`).
+fn block_transformers(jar: &Zip) -> Transformers {
+    const DIR: &str = "data/minecraft/block_transformer/";
+    let files: Vec<(String, std::borrow::Cow<'_, [u8]>)> = jar
+        .with_prefix(DIR)
+        .filter_map(|i| Some((jar.name(i).to_owned(), jar.read(i).ok()?)))
+        .collect();
+    Transformers::from_json_files(files)
 }
 
 /// Starts joining servers: loads the game data on a thread meanwhile.

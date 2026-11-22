@@ -65,6 +65,56 @@ fn vanilla_tags(game: &Path) -> BlockTags {
     tags
 }
 
+/// Vanilla's item tags from the jar's data pack, nested tags expanded.
+fn vanilla_item_tags(game: &Path) -> ruthenium_sim::item::ItemTags {
+    let jar = ruthenium_assets::zip::Zip::open(&game.join("versions/26.3/client.jar")).unwrap();
+    const DIR: &str = "data/minecraft/tags/item/";
+    fn items(jar: &ruthenium_assets::zip::Zip, tag: &str, out: &mut Vec<String>) {
+        let Some(i) = jar.find(&format!("{DIR}{tag}.json")) else {
+            return;
+        };
+        let v: serde_json::Value = serde_json::from_slice(&jar.read(i).unwrap()).unwrap();
+        for n in v["values"].as_array().unwrap() {
+            let n = n.as_str().or_else(|| n["id"].as_str()).unwrap();
+            match n.strip_prefix("#minecraft:") {
+                Some(nested) => items(jar, nested, out),
+                None => out.push(n.to_owned()),
+            }
+        }
+    }
+    let mut tags = ruthenium_sim::item::ItemTags::new();
+    let names: Vec<String> = jar
+        .with_prefix(DIR)
+        .filter_map(|i| {
+            Some(
+                jar.name(i)
+                    .strip_prefix(DIR)?
+                    .strip_suffix(".json")?
+                    .to_owned(),
+            )
+        })
+        .collect();
+    for tag in names {
+        let mut members = Vec::new();
+        items(&jar, &tag, &mut members);
+        tags.set(
+            &format!("minecraft:{tag}"),
+            members.iter().map(String::as_str),
+        );
+    }
+    tags
+}
+
+/// Vanilla's block transformers (axes, shovels, hoes) from the jar's data pack.
+fn vanilla_transformers(game: &Path) -> ruthenium_sim::use_on::Transformers {
+    let jar = ruthenium_assets::zip::Zip::open(&game.join("versions/26.3/client.jar")).unwrap();
+    let files: Vec<(String, Vec<u8>)> = jar
+        .with_prefix("data/minecraft/block_transformer/")
+        .map(|i| (jar.name(i).to_owned(), jar.read(i).unwrap().into_owned()))
+        .collect();
+    ruthenium_sim::use_on::Transformers::from_json_files(files)
+}
+
 fn trace(name: &str) -> Trace {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/26.3");
     Trace::parse(&std::fs::read_to_string(root.join(format!("{name}.jsonl"))).unwrap()).unwrap()
@@ -186,6 +236,8 @@ struct Data {
     tags: BlockTags,
     types: EntityTypes,
     items: Items,
+    item_tags: ruthenium_sim::item::ItemTags,
+    transformers: ruthenium_sim::use_on::Transformers,
 }
 
 fn replay(name: &str, d: &Data) -> Result<usize, String> {
@@ -530,8 +582,31 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 .unwrap()
                 .id();
             let count = w.get(7).map_or(1, |n| n.parse().unwrap());
+            // The one component a scenario gives: a potion's contents.
+            let mut added = Vec::new();
+            if let Some(name) = w[6]
+                .split_once("potion_contents={potion:\"")
+                .and_then(|(_, rest)| rest.split('"').next())
+            {
+                let potion = ruthenium_data::v26_3::registries::Potion::from_name(name).unwrap();
+                added.push((
+                    ruthenium_data::v26_3::registries::DataComponentType::PotionContents.id()
+                        as i32,
+                    ruthenium_protocol::item::Component::PotionContents {
+                        potion: Some(potion.id() as i32),
+                    },
+                ));
+            }
+            let stack = items.stack(&ruthenium_protocol::item::ItemStack {
+                item: id as i32,
+                count,
+                patch: ruthenium_protocol::item::ComponentPatch {
+                    added,
+                    removed: Vec::new(),
+                },
+            });
             if let Some(slot) = inventory_slot(w[4], p.inventory.selected) {
-                p.inventory.set(slot, items.new_stack(id as i32, count));
+                p.inventory.set(slot, stack);
             }
         }
     }
@@ -569,6 +644,8 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
     }
     let mut ticks = 0;
     let records = &t.records;
+    // Traces recorded before `set` records existed don't check the predicted blocks.
+    let records_sets = records.iter().any(|r| r.kind == "set");
     // Packets handled after a tick began, applied before the next one (packets are
     // handled at the start of a frame, never during a tick).
     let mut pending: Vec<Vec<u8>> = Vec::new();
@@ -624,15 +701,21 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             attack_clicks: clicks("key.attack"),
             pick_clicks: clicks("key.pickItem"),
         };
-        let mut world = interact::World {
-            level: &mut cl.level,
-            predictions: &mut cl.predictions,
+        let mut world = interact::World::new(
+            &mut cl.level,
+            &mut cl.predictions,
             blocks,
             tags,
-            entities: &client.entities,
-            fluid_shapes: &fluid_shapes,
-        };
+            &client.entities,
+            &fluid_shapes,
+        )
+        .with_players(&client.players)
+        .with_items(items)
+        .with_item_tags(&d.item_tags)
+        .with_transformers(&d.transformers);
+        world.set_log = Some(Vec::new());
         game_mode.handle_keybinds(&mut p, &mut world, &hit, &mut use_keys, &mut sent);
+        let sets_got = world.set_log.take().unwrap_or_default();
         let env = Env {
             level: &cl.level,
             blocks,
@@ -658,8 +741,19 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         // Vanilla's packets and state for this tick.
         let mut want = Vec::new();
         let mut state = None;
+        let mut sets_want = Vec::new();
         while i < records.len() && records[i].kind != "tick" {
             let q = &records[i];
+            if q.kind == "set" && q.tick() == Some(n) && q.bool("predicting") == Some(true) {
+                let at = &q.value["pos"];
+                let c = |k: usize| at[k].as_i64().unwrap() as i32;
+                sets_want.push((
+                    [c(0), c(1), c(2)],
+                    q.value["state"].as_u64().unwrap() as u32,
+                    q.value["flags"].as_u64().unwrap() as u32,
+                    q.value["limit"].as_i64().unwrap() as i32,
+                ));
+            }
             if q.kind == "out" && q.tick() == Some(n) && SENT.contains(&q.str("name").unwrap()) {
                 want.push(q.bytes().unwrap());
             }
@@ -674,6 +768,27 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             i += 1;
         }
         let s = state.ok_or((n, format!("tick {n}: no state")))?;
+        // The blocks the client set while predicting, where the trace records them.
+        if records_sets && sets_got != sets_want {
+            let show = |v: &[([i32; 3], u32, u32, i32)]| {
+                v.iter()
+                    .map(|(at, s, f, l)| {
+                        format!(
+                            "{at:?} {} f{f} l{l}",
+                            ruthenium_sim::block::state::describe(*s)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            return Err((
+                n,
+                format!(
+                    "tick {n}: the predicted blocks differ\n  got  {:?}\n  want {:?}",
+                    show(&sets_got),
+                    show(&sets_want)
+                ),
+            ));
+        }
         // The hands and the use, where the trace records them.
         if s.value.get("using").is_some() {
             let hit_kind = match hit {
@@ -801,7 +916,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 26] = [
+const EXACT: [&str; 30] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -828,6 +943,10 @@ const EXACT: [&str; 26] = [
     "ranged",
     "throwing",
     "breaking",
+    "placing",
+    "using_blocks",
+    "tools_on_blocks",
+    "scaffolding",
 ];
 
 #[test]
@@ -842,6 +961,8 @@ fn golden_traces() {
         tags: vanilla_tags(&game),
         types: EntityTypes::load(&exports).unwrap(),
         items: Items::load(&exports, &game.join("versions/26.3/generated/reports")).unwrap(),
+        item_tags: vanilla_item_tags(&game),
+        transformers: vanilla_transformers(&game),
     };
     let all = [
         "walk_directions",
@@ -870,6 +991,10 @@ fn golden_traces() {
         "ranged",
         "throwing",
         "breaking",
+        "placing",
+        "using_blocks",
+        "tools_on_blocks",
+        "scaffolding",
     ];
     let mut failed = Vec::new();
     for name in all {

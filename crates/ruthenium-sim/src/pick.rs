@@ -23,78 +23,7 @@ use crate::fluid::FluidState;
 use crate::player::Env;
 use crate::shape::{Aabb, Axis, Placed, Shape};
 
-/// `Direction`, in its ordinal order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Direction {
-    Down,
-    Up,
-    North,
-    South,
-    West,
-    East,
-}
-
-impl Direction {
-    /// `Direction.VALUES`.
-    pub const ALL: [Direction; 6] = [
-        Direction::Down,
-        Direction::Up,
-        Direction::North,
-        Direction::South,
-        Direction::West,
-        Direction::East,
-    ];
-
-    /// The 3D data value, which is also the ordinal and the network id.
-    pub fn id(self) -> u8 {
-        self as u8
-    }
-
-    pub fn from_id(id: u8) -> Option<Direction> {
-        Direction::ALL.get(usize::from(id)).copied()
-    }
-
-    /// The unit step towards the direction.
-    pub fn normal(self) -> [i32; 3] {
-        match self {
-            Direction::Down => [0, -1, 0],
-            Direction::Up => [0, 1, 0],
-            Direction::North => [0, 0, -1],
-            Direction::South => [0, 0, 1],
-            Direction::West => [-1, 0, 0],
-            Direction::East => [1, 0, 0],
-        }
-    }
-
-    pub fn opposite(self) -> Direction {
-        match self {
-            Direction::Down => Direction::Up,
-            Direction::Up => Direction::Down,
-            Direction::North => Direction::South,
-            Direction::South => Direction::North,
-            Direction::West => Direction::East,
-            Direction::East => Direction::West,
-        }
-    }
-
-    /// `getApproximateNearest`: the direction the vector points most along, in
-    /// floats; north when it points nowhere.
-    pub fn approximate_nearest(v: [f64; 3]) -> Direction {
-        let (x, y, z) = (v[0] as f32, v[1] as f32, v[2] as f32);
-        let mut result = Direction::North;
-        // `1.0E-45F`, the smallest float above zero.
-        let mut highest = f32::from_bits(1);
-        for d in Direction::ALL {
-            let n = d.normal();
-            let dot = x * n[0] as f32 + y * n[1] as f32 + z * n[2] as f32;
-            if dot > highest {
-                highest = dot;
-                result = d;
-            }
-        }
-        result
-    }
-}
+pub use crate::direction::Direction;
 
 /// `BlockHitResult`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -849,6 +778,8 @@ mod tests {
             vertical: false,
             max_horizontal: 0.25,
             max_vertical: 0.2,
+            collision: true,
+            outline: true,
         };
         Blocks::new(&BlockPhysics {
             shapes: vec![

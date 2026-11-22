@@ -188,6 +188,18 @@ impl Level {
         b: &Aabb,
         suffocating_only: bool,
     ) -> Vec<([i32; 3], Placed<'a>)> {
+        self.block_collisions_for(blocks, b, suffocating_only, None)
+    }
+
+    /// [`Level::block_collisions_at`] for an entity (`BlockCollisions` with its
+    /// collision context: scaffolding's shape depends on it).
+    pub fn block_collisions_for<'a>(
+        &self,
+        blocks: &'a Blocks,
+        b: &Aabb,
+        suffocating_only: bool,
+        who: Option<crate::blocks::Who>,
+    ) -> Vec<([i32; 3], Placed<'a>)> {
         let lo = |v: f64| ruthenium_javamath::mth::floor(v - EPSILON) - 1;
         let hi = |v: f64| ruthenium_javamath::mth::floor(v + EPSILON) + 1;
         let (x0, x1) = (lo(b.min[0]), hi(b.max[0]));
@@ -218,10 +230,10 @@ impl Level {
                     if face == 2 {
                         continue;
                     }
-                    let Some(placed) = blocks.collision(state, [x, y, z]) else {
+                    let Some(placed) = blocks.collision_for(state, [x, y, z], who) else {
                         continue;
                     };
-                    if blocks.is_full_block(state) {
+                    if blocks.is_full_block(state) && placed.shape.is_block() {
                         let cell = Aabb {
                             min: [f64::from(x), f64::from(y), f64::from(z)],
                             max: [f64::from(x) + 1.0, f64::from(y) + 1.0, f64::from(z) + 1.0],

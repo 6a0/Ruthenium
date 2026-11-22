@@ -235,6 +235,18 @@ pub struct TypeInfo {
     armor_stand_flags_field: Option<u8>,
     /// `AbstractArrow.IN_GROUND`.
     in_ground_field: Option<u8>,
+    /// `blocksBuilding`: whether it stops blocks being placed where it is.
+    pub blocks_building: BlocksBuilding,
+}
+
+/// `Entity.blocksBuilding` by type: living entities (players included), end crystals,
+/// falling blocks, primed TNT, minecarts and boats do; armor stands unless they are
+/// markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlocksBuilding {
+    No,
+    Yes,
+    UnlessMarker,
 }
 
 /// The ids of the player's synched-data fields the client reads (from the export, so
@@ -359,6 +371,19 @@ impl EntityTypes {
                 projectile: d.is("Projectile"),
                 armor_stand_flags_field: d.field("ArmorStand.DATA_CLIENT_FLAGS"),
                 in_ground_field: d.field("AbstractArrow.IN_GROUND"),
+                blocks_building: if d.is("ArmorStand") {
+                    BlocksBuilding::UnlessMarker
+                } else if living
+                    || d.is("EndCrystal")
+                    || d.is("FallingBlockEntity")
+                    || d.is("PrimedTnt")
+                    || d.is("AbstractMinecart")
+                    || d.is("AbstractBoat")
+                {
+                    BlocksBuilding::Yes
+                } else {
+                    BlocksBuilding::No
+                },
             };
             let i = d.id as usize;
             if types.len() <= i {

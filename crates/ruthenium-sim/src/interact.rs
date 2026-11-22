@@ -9,18 +9,20 @@
 //! [`LocalPlayer::attack`]), and of the block a player breaks disappearing (see
 //! [`crate::predict`]).
 //!
-//! Not predicted yet (the server's answer still arrives): what blocks and entities do
-//! when used (a block or item that has its own `useItemOn`, `useWithoutItem` or
-//! `useOn` is taken to have handled the click, which is what a placed block or an
-//! opened chest does), placing blocks and fluids, the shape updates a broken block
-//! makes its neighbours do (a plant on it popping, a fence losing its arm, the other
-//! half of a door or bed going), the world border, riding.
+//! A right click on a block asks the block first ([`crate::block`]: doors open,
+//! buttons press, cakes are eaten...), then the item ([`crate::place`] places blocks,
+//! [`crate::use_on`] runs the other items' `useOn` and the block transformers); what
+//! either changes is predicted, with the neighbours' shape updates.
+//!
+//! Not predicted yet (the server's answer still arrives): what entities do when used
+//! (beyond armor stands taking the click), placing fluids from buckets, the world
+//! border, riding.
 
 use ruthenium_data::v26_3::registries::EntityType;
 use ruthenium_protocol::packets::play;
 
 use crate::blocks::{BlockTags, Blocks};
-use crate::entity::Entities;
+use crate::entity::{Entities, PlayerInfos};
 use crate::inventory::{Hand, Inventory};
 use crate::item::{Class, Stack};
 use crate::mining;
@@ -37,6 +39,16 @@ pub enum Outcome {
     Success,
     Fail,
     Pass,
+    /// `TRY_WITH_EMPTY_HAND`: a block's `useItemOn` has nothing for the item, and
+    /// the main hand goes on to `useWithoutItem`.
+    TryEmptyHand,
+}
+
+impl Outcome {
+    /// `consumesAction`.
+    pub fn consumes_action(self) -> bool {
+        self == Outcome::Success
+    }
 }
 
 /// The use-related keys: whether use is held, and the presses not yet read
@@ -105,9 +117,112 @@ pub struct World<'a> {
     pub entities: &'a Entities,
     /// The client's fluid shapes (vanilla caches each at the height it was first met).
     pub fluid_shapes: &'a pick::FluidShapes,
+    /// The player list (spectators don't stop blocks being placed).
+    pub players: Option<&'a PlayerInfos>,
+    /// The local player's position and box as the current action began: predicted
+    /// blocks keep the position, and the box stops blocks being placed in it (unless
+    /// it spectates).
+    pub player_position: [f64; 3],
+    pub player_box: Option<crate::shape::Aabb>,
+    /// The level's shape updates under way.
+    pub updates: crate::block::level::ShapeUpdates,
+    /// The items' defaults, for stacks an action makes (an emptied bucket).
+    pub items: Option<&'a crate::item::Items>,
+    /// The item tags (none known without them).
+    pub item_tags: Option<&'a crate::item::ItemTags>,
+    /// The block transformers (axes, shovels, hoes; none known without them).
+    pub transformers: Option<&'a crate::use_on::Transformers>,
+    /// The recipe property sets (none known without them).
+    pub recipe_sets: Option<&'a crate::item::RecipeSets>,
+    /// When set, every `setBlock` call made while an action is predicted (position,
+    /// state, flags, update limit), in the order made (tests compare it with
+    /// vanilla's).
+    pub set_log: Option<Vec<crate::block::level::SetCall>>,
 }
 
-impl World<'_> {
+impl<'a> World<'a> {
+    /// The world of one tick's actions.
+    pub fn new(
+        level: &'a mut Level,
+        predictions: &'a mut Predictions,
+        blocks: &'a Blocks,
+        tags: &'a BlockTags,
+        entities: &'a Entities,
+        fluid_shapes: &'a pick::FluidShapes,
+    ) -> World<'a> {
+        World {
+            level,
+            predictions,
+            blocks,
+            tags,
+            entities,
+            fluid_shapes,
+            players: None,
+            player_position: [0.0; 3],
+            player_box: None,
+            updates: Default::default(),
+            items: None,
+            item_tags: None,
+            transformers: None,
+            recipe_sets: None,
+            set_log: None,
+        }
+    }
+
+    /// The recipe property sets.
+    pub fn with_recipe_sets(mut self, sets: &'a crate::item::RecipeSets) -> World<'a> {
+        self.recipe_sets = Some(sets);
+        self
+    }
+
+    /// Whether a stack's item is in a recipe property set (`minecraft:campfire_input`).
+    pub fn in_recipe_set(&self, stack: &Stack, key: &str) -> bool {
+        self.recipe_sets.is_some_and(|s| s.contains(key, stack))
+    }
+
+    /// The block transformers.
+    pub fn with_transformers(mut self, t: &'a crate::use_on::Transformers) -> World<'a> {
+        self.transformers = Some(t);
+        self
+    }
+
+    /// The item tags.
+    pub fn with_item_tags(mut self, tags: &'a crate::item::ItemTags) -> World<'a> {
+        self.item_tags = Some(tags);
+        self
+    }
+
+    /// `ItemStack.is(tag)` for an item tag (`minecraft:bookshelf_books`).
+    pub fn item_is(&self, stack: &Stack, tag: &str) -> bool {
+        self.item_tags.is_some_and(|t| t.is(stack, tag))
+    }
+
+    /// The items' defaults.
+    pub fn with_items(mut self, items: &'a crate::item::Items) -> World<'a> {
+        self.items = Some(items);
+        self
+    }
+
+    /// A new stack of an item, by name (empty without the items' defaults).
+    pub fn new_stack(&self, name: &str, count: i32) -> Stack {
+        let id =
+            ruthenium_data::v26_3::registries::Item::from_name(name).map_or(0, |i| i.id() as i32);
+        self.items
+            .map_or_else(Stack::empty, |items| items.new_stack(id, count))
+    }
+
+    /// The player list, for spectators.
+    pub fn with_players(mut self, players: &'a PlayerInfos) -> World<'a> {
+        self.players = Some(players);
+        self
+    }
+
+    /// Where the local player is as an action begins.
+    pub fn track_player(&mut self, p: &LocalPlayer) {
+        self.player_position = p.position;
+        self.player_box = (!p.spectator).then(|| p.bounding_box());
+    }
+
     /// The level as movement and picking read it.
     pub fn env(&self) -> Env<'_> {
         Env {
@@ -160,6 +275,7 @@ impl GameMode {
         keys: &mut UseKeys,
         out: &mut Vec<Vec<u8>>,
     ) {
+        w.track_player(p);
         while keys.swap_clicks > 0 {
             keys.swap_clicks -= 1;
             if !p.spectator {
@@ -467,9 +583,11 @@ impl GameMode {
             return false;
         }
         // `playerWillDestroy` and `destroy` only make particles and sounds on the
-        // client (the rest is the server's).
+        // client (the rest is the server's). `removeBlock`: the fluid stays, and the
+        // neighbours hear of it.
         let left = w.blocks.left_behind(old);
-        w.predictions.set_block(w.level, pos, left, p.position)
+        w.track_player(p);
+        w.set_block(pos, left, crate::block::flags::ALL)
     }
 
     /// `sameDestroyTarget`: the same block, with the same item in hand.
@@ -530,7 +648,7 @@ impl GameMode {
                 }
                 HitResult::Block(ref b) if !b.miss => match self.use_item_on(p, w, hand, b, out) {
                     Outcome::Success | Outcome::Fail => return,
-                    Outcome::Pass => {}
+                    Outcome::Pass | Outcome::TryEmptyHand => {}
                 },
                 HitResult::Block(_) => {}
             }
@@ -587,6 +705,7 @@ impl GameMode {
     ) -> Outcome {
         self.ensure_carried(&p.inventory, out);
         // The world border isn't tracked: every block is inside it.
+        w.track_player(p);
         let sequence = w.predictions.start();
         let result = perform_use_item_on(p, w, hand, b);
         w.predictions.end();
@@ -632,24 +751,11 @@ impl GameMode {
     }
 }
 
-/// `BlockState.attack` on the client: a redstone ore lights up (its other effects,
-/// a note block's note and a dragon egg's jump, are the server's).
+/// `BlockState.attack` on the client (a redstone ore lights up; the other blocks'
+/// attacks are the server's).
 fn block_attacked(p: &LocalPlayer, w: &mut World<'_>, pos: [i32; 3], state: u32) {
-    let name = w.blocks.name(state);
-    if !matches!(
-        name,
-        "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"
-    ) {
-        return;
-    }
-    let lit = ruthenium_data::v26_3::BlockState::from_id(state)
-        .and_then(|s| s.with("lit", "true"))
-        .map(|s| s.id());
-    if let Some(lit) = lit
-        && lit != state
-    {
-        w.predictions.set_block(w.level, pos, lit, p.position);
-    }
+    w.track_player(p);
+    crate::block::attack(w, p, state, pos);
 }
 
 /// `Player.isWithinEntityInteractionRange(entity, 0)`: the box's nearest point to the
@@ -665,51 +771,53 @@ fn within_entity_range(p: &LocalPlayer, b: &crate::shape::Aabb) -> bool {
     d < range * range
 }
 
-/// `performUseItemOn`: the block's own use, then the item's `useOn`.
-fn perform_use_item_on(p: &mut LocalPlayer, w: &World<'_>, hand: Hand, b: &BlockHit) -> Outcome {
+/// `performUseItemOn`: the block's own use (`useItemOn`, then for the main hand
+/// `useWithoutItem` when the block has nothing for the item), unless the player
+/// sneaks holding something; then the item's `useOn` (whose stack a player building
+/// without materials keeps whole).
+fn perform_use_item_on(
+    p: &mut LocalPlayer,
+    w: &mut World<'_>,
+    hand: Hand,
+    b: &BlockHit,
+) -> Outcome {
     if p.game_type() == play::SPECTATOR {
         return Outcome::Success;
     }
     let something = !p.hand(Hand::Main).is_empty() || !p.hand(Hand::Off).is_empty();
     let suppress = p.secondary_use() && something;
     if !suppress {
-        let state = w.level.block(b.pos[0], b.pos[1], b.pos[2]);
-        let s = w.blocks.state(state);
-        use ruthenium_prepare::exporters::StatePhysics;
-        // A block with its own use is taken to use the click (doors, chests, buttons...).
-        if s.interaction & StatePhysics::USE_ITEM_ON != 0 {
-            return Outcome::Success;
+        // Every block's feature is enabled (none are tracked).
+        let state = w.get(b.pos);
+        let r = crate::block::use_item_on(w, p, hand, state, b.pos, b);
+        if r.consumes_action() {
+            return r;
         }
-        // `TRY_WITH_EMPTY_HAND`: `useWithoutItem`, with the main hand only.
-        if hand == Hand::Main && s.interaction & StatePhysics::USE_WITHOUT_ITEM != 0 {
-            return Outcome::Success;
+        if r == Outcome::TryEmptyHand && hand == Hand::Main {
+            let r = crate::block::use_without_item(w, p, state, b.pos, b);
+            if r.consumes_action() {
+                return r;
+            }
         }
     }
-    let stack = p.hand(hand);
-    if stack.is_empty() || p.cooldowns.is_on_cooldown(stack) {
+    let stack = p.hand(hand).clone();
+    if stack.is_empty() || p.cooldowns.is_on_cooldown(&stack) {
         return Outcome::Pass;
     }
-    // `Item.useOn`.
-    if stack.c.block_transformer {
-        // `BlockTransformer.transformBlock`: an axe or the like with a shield in the
-        // other hand leaves the click to the shield; else it transforms (not predicted).
-        let blocking =
-            hand == Hand::Main && p.hand(Hand::Off).c.blocks_attacks && !p.secondary_use();
-        return if blocking {
-            Outcome::Pass
-        } else {
-            Outcome::Success
-        };
+    let result = crate::place::stack_use_on(w, p, hand, b);
+    if p.infinite_materials() {
+        // The count is put back on the stack that was used, if it is still held.
+        let held = p.inventory.hand_mut(hand);
+        if held.same_object(&stack) {
+            held.count = stack.count;
+        }
     }
-    if stack.c.block_item || stack.c.use_on {
-        return Outcome::Success;
-    }
-    Outcome::Pass
+    result
 }
 
 /// `ItemStack.use`: the item's use, and for an item used at once (no use
 /// duration), its remainder and cooldown.
-fn stack_use(p: &mut LocalPlayer, w: &World<'_>, hand: Hand) -> Outcome {
+fn stack_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> Outcome {
     let before = p.hand(hand).copy();
     let instantly = before.c.use_duration <= 0;
     let (result, transformed) = item_use(p, w, hand);
@@ -726,7 +834,7 @@ fn stack_use(p: &mut LocalPlayer, w: &World<'_>, hand: Hand) -> Outcome {
 
 /// `Item.use` and its overrides, on the client: the outcome and the stack the hand
 /// holds afterwards when it is a new one.
-fn item_use(p: &mut LocalPlayer, w: &World<'_>, hand: Hand) -> (Outcome, Option<Stack>) {
+fn item_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> (Outcome, Option<Stack>) {
     let stack = p.hand(hand).clone();
     let infinite = p.infinite_materials();
     let ok = (Outcome::Success, None);
@@ -802,7 +910,18 @@ fn item_use(p: &mut LocalPlayer, w: &World<'_>, hand: Hand) -> (Outcome, Option<
             (Outcome::Fail, None)
         }
         Class::FoodOnAStick | Class::Unknown => (Outcome::Pass, None),
-        Class::Bucket | Class::Boat | Class::SpawnEgg | Class::Bottle | Class::PlaceOnWater => {
+        Class::PlaceOnWater => {
+            // `PlaceOnWaterBlockItem.use`: `BlockItem.useOn` one block above the water
+            // (or whatever) the view's ray found, missed or not.
+            let hit = pov_hit(p, w, FluidMode::SourceOnly);
+            let above = BlockHit {
+                pos: Direction::Up.step(hit.pos),
+                ..hit
+            };
+            let ctx = crate::place::UseOnContext::new(p, hand, above);
+            (crate::place::block_item_use_on_as_placed(w, p, ctx), None)
+        }
+        Class::Bucket | Class::Boat | Class::SpawnEgg | Class::Bottle => {
             let fluid = match stack.c.class {
                 Class::Boat => FluidMode::Any,
                 Class::Bucket if stack.c.name == "minecraft:bucket" => FluidMode::SourceOnly,
@@ -825,6 +944,17 @@ fn item_use(p: &mut LocalPlayer, w: &World<'_>, hand: Hand) -> (Outcome, Option<
             }
         }
     }
+}
+
+/// `Item.use` itself (not an override), as `BlockItem.useOn` falls back on it for
+/// a block item that is also eaten.
+pub fn plain_item_use(p: &mut LocalPlayer, hand: Hand) -> Outcome {
+    let stack = p.hand(hand).clone();
+    let (result, transformed) = plain_use(p, hand, &stack);
+    if let Some(t) = transformed {
+        p.inventory.set_hand(hand, t);
+    }
+    result
 }
 
 /// `Item.use` itself: a consumable, an equippable that swaps, a blocking item or a

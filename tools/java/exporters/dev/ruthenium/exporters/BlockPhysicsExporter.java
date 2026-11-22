@@ -40,7 +40,7 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * game's collision code sees it, the block's friction and speed and jump factors, and
  * the state's fluid and sturdy faces.
  *
- * <p>Format {@code block_physics} v5, after the header:
+ * <p>Format {@code block_physics} v6, after the header:
  * <ul>
  *   <li>u32 shape count, then per shape, for x, y and z: u32 n and n f64 coordinates;
  *       then the (nx-1)(ny-1)(nz-1) voxels as bits, x outermost and z innermost, packed
@@ -142,6 +142,10 @@ final class BlockPhysicsExporter {
                 states.u8(vertical ? 2 : 1);
                 states.f32((Float) maxH.invoke(block));
                 states.f32((Float) maxV.invoke(block));
+                int moved = 0;
+                if (shape.getCoords(Direction.Axis.X) instanceof OffsetDoubleList) moved |= 1;
+                if (outlineShape.getCoords(Direction.Axis.X) instanceof OffsetDoubleList) moved |= 2;
+                states.u8(moved);
             }
             states.u32(outline);
             states.u32(interactionId);
@@ -150,7 +154,7 @@ final class BlockPhysicsExporter {
         }
 
         // The empty shape first, so 0 means "no collision".
-        ExportWriter w = new ExportWriter("block_physics", 5);
+        ExportWriter w = new ExportWriter("block_physics", 6);
         w.u32(shapes.size());
         for (byte[] s : shapes) {
             w.bytes(s);
