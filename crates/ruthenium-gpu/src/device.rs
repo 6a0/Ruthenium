@@ -25,6 +25,9 @@ pub struct GpuOptions {
     /// Case-insensitive substring of the device name (`"nvidia"`, `"intel"`, `"4060"`).
     /// A matching suitable GPU wins over the default order; `None` or `"auto"` keeps it.
     pub prefer: Option<String>,
+    /// Don't use a dedicated transfer queue even if the GPU has one: every upload goes on
+    /// the graphics queue (for A/B comparisons and driver problems).
+    pub no_transfer_queue: bool,
 }
 
 /// A GPU that was not chosen because it misses part of the baseline.
@@ -60,7 +63,8 @@ pub struct DeviceCaps {
     pub max_memory_allocations: u32,
     /// `optimalBufferCopyOffsetAlignment`: staging offsets are aligned to it.
     pub copy_offset_alignment: u64,
-    /// A queue family with transfer but no graphics, for background uploads.
+    /// A queue family with transfer but no graphics, compute or video, for background
+    /// uploads (whether it is used: [`Gpu::transfer_family`]).
     pub transfer_family: Option<u32>,
     pub portability_subset: bool,
     pub present_id: bool,
@@ -86,6 +90,8 @@ pub struct Gpu {
     pub(crate) physical: vk::PhysicalDevice,
     pub(crate) queue: vk::Queue,
     pub(crate) queue_family: u32,
+    /// The dedicated transfer queue and its family, if one is in use.
+    pub(crate) transfer: Option<(vk::Queue, u32)>,
     pub(crate) surface: vk::SurfaceKHR,
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Live `vkAllocateMemory` allocations, kept under `maxMemoryAllocationCount`.
@@ -116,6 +122,8 @@ struct Candidate {
     /// Extensions to enable (all checked to be present).
     extensions: Vec<&'static CStr>,
     core13: bool,
+    /// The transfer family to create a queue from (`caps.transfer_family` unless disabled).
+    use_transfer: Option<u32>,
 }
 
 /// A baseline feature: its name for diagnostics and how to read it from the query.
@@ -206,8 +214,12 @@ impl Gpu {
             .prefer
             .as_deref()
             .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("auto"));
-        let chosen =
+        let mut chosen =
             pick(&mut candidates, prefer).ok_or(Error::NoSuitableDevice(rejected.clone()))?;
+        chosen.use_transfer = chosen
+            .caps
+            .transfer_family
+            .filter(|_| !options.no_transfer_queue);
         if let Some(p) = prefer
             && !chosen.caps.name.to_lowercase().contains(&p.to_lowercase())
         {
@@ -230,6 +242,10 @@ impl Gpu {
     ) -> Gpu {
         // SAFETY: the device was created with one queue in this family.
         let queue = unsafe { device.get_device_queue(c.queue_family, 0) };
+        // SAFETY: as above, one queue in the transfer family if it was requested.
+        let transfer = c
+            .use_transfer
+            .map(|f| (unsafe { device.get_device_queue(f, 0) }, f));
         let swapchain_fn = ash::khr::swapchain::Device::load(&instance.raw, &device);
         let (sync2_fn, dynamic_rendering_fn) = if c.core13 {
             (None, None)
@@ -253,6 +269,7 @@ impl Gpu {
             physical: c.physical,
             queue,
             queue_family: c.queue_family,
+            transfer,
             surface,
             memory_properties: c.memory_properties,
             allocations: AtomicU32::new(0),
@@ -271,6 +288,19 @@ impl Gpu {
 
     pub fn queue_family(&self) -> u32 {
         self.queue_family
+    }
+
+    /// The family of the dedicated transfer queue, if uploads use one.
+    pub fn transfer_family(&self) -> Option<u32> {
+        self.transfer.map(|(_, f)| f)
+    }
+
+    /// The queue families buffers are shared between (`VK_SHARING_MODE_CONCURRENT`): the
+    /// graphics and transfer families when a transfer queue is in use, else none
+    /// (exclusive). Concurrent buffers need no ownership transfers; images stay exclusive
+    /// to the graphics queue.
+    pub(crate) fn buffer_families(&self) -> Option<[u32; 2]> {
+        self.transfer.map(|(_, f)| [self.queue_family, f])
     }
 
     /// Whether the validation layer is active.
@@ -325,12 +355,24 @@ impl Gpu {
         submits: &[vk::SubmitInfo2<'_>],
     ) -> Result<(), Error> {
         // SAFETY: forwarded to the caller.
+        unsafe { self.submit2_to(self.queue, submits) }
+    }
+
+    /// `vkQueueSubmit2` on `queue` (core 1.3 or KHR).
+    ///
+    /// # Safety
+    /// As `vkQueueSubmit2`; `queue` is one of this device's queues and the caller is the
+    /// only thread submitting to it.
+    pub(crate) unsafe fn submit2_to(
+        &self,
+        queue: vk::Queue,
+        submits: &[vk::SubmitInfo2<'_>],
+    ) -> Result<(), Error> {
+        // SAFETY: forwarded to the caller.
         unsafe {
             match &self.sync2_fn {
-                Some(f) => f.queue_submit2(self.queue, submits, vk::Fence::null()),
-                None => self
-                    .device
-                    .queue_submit2(self.queue, submits, vk::Fence::null()),
+                Some(f) => f.queue_submit2(queue, submits, vk::Fence::null()),
+                None => self.device.queue_submit2(queue, submits, vk::Fence::null()),
             }
         }
         .ctx("vkQueueSubmit2")
@@ -498,12 +540,7 @@ fn evaluate(
         return Err(reject(name, reasons));
     }
 
-    let transfer_family = families
-        .iter()
-        .position(|f| {
-            f.queue_flags.contains(vk::QueueFlags::TRANSFER) && !f.queue_flags.intersects(gfx)
-        })
-        .map(|i| i as u32);
+    let transfer_family = transfer_family(&families);
     // SAFETY: plain query.
     let memory = unsafe { raw.get_physical_device_memory_properties(pd) };
     let unified_memory = memory.memory_types_as_slice().iter().all(|t| {
@@ -559,7 +596,27 @@ fn evaluate(
         caps,
         extensions,
         core13,
+        use_transfer: None,
     })
+}
+
+/// A family of copy-engine queues: transfer without graphics or compute. Families that also
+/// do video or optical flow are skipped (NVIDIA lists those after its copy family; they
+/// are separate engines with fewer queues).
+fn transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
+    let not = vk::QueueFlags::GRAPHICS
+        | vk::QueueFlags::COMPUTE
+        | vk::QueueFlags::VIDEO_DECODE_KHR
+        | vk::QueueFlags::VIDEO_ENCODE_KHR
+        | vk::QueueFlags::OPTICAL_FLOW_NV;
+    families
+        .iter()
+        .position(|f| {
+            f.queue_count > 0
+                && f.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                && !f.queue_flags.intersects(not)
+        })
+        .map(|i| i as u32)
 }
 
 /// Slots the texture table can have under the device's update-after-bind limits.
@@ -664,14 +721,22 @@ fn create_device(instance: &Instance, c: &Candidate) -> Result<ash::Device, Erro
     };
 
     let priorities = [1.0f32];
-    let queues = [vk::DeviceQueueCreateInfo::default()
+    let mut queues = [vk::DeviceQueueCreateInfo::default()
         .queue_family_index(c.queue_family)
-        .queue_priorities(&priorities)];
+        .queue_priorities(&priorities); 2];
+    let queue_count = match c.use_transfer {
+        Some(f) => {
+            queues[1] = queues[1].queue_family_index(f);
+            2
+        }
+        None => 1,
+    };
+    let queues = &queues[..queue_count];
     let ext_ptrs: Vec<*const c_char> = c.extensions.iter().map(|e| e.as_ptr()).collect();
     // SAFETY: f2's chain is made of live, valid feature structs (built just above).
     let info = unsafe {
         vk::DeviceCreateInfo::default()
-            .queue_create_infos(&queues)
+            .queue_create_infos(queues)
             .enabled_extension_names(&ext_ptrs)
             .extend(&mut f2)
     };
@@ -695,6 +760,7 @@ mod tests {
             },
             extensions: Vec::new(),
             core13: true,
+            use_transfer: None,
         }
     }
 
@@ -728,6 +794,34 @@ mod tests {
                 .starts_with("llvmpipe")
         );
         assert!(pick(&mut c, None).is_none());
+    }
+
+    #[test]
+    fn transfer_family_is_a_copy_engine() {
+        let family = |queue_flags, queue_count| vk::QueueFamilyProperties {
+            queue_flags,
+            queue_count,
+            ..Default::default()
+        };
+        type Q = vk::QueueFlags;
+        // NVIDIA's order: graphics, copy, compute, then video decode and encode.
+        let nvidia = [
+            family(
+                Q::GRAPHICS | Q::COMPUTE | Q::TRANSFER | Q::SPARSE_BINDING,
+                16,
+            ),
+            family(Q::TRANSFER | Q::SPARSE_BINDING, 2),
+            family(Q::COMPUTE | Q::TRANSFER | Q::SPARSE_BINDING, 8),
+            family(Q::TRANSFER | Q::VIDEO_DECODE_KHR, 1),
+        ];
+        assert_eq!(transfer_family(&nvidia), Some(1));
+        // Video-only transfer families don't count.
+        let video = [
+            family(Q::GRAPHICS | Q::COMPUTE | Q::TRANSFER, 1),
+            family(Q::TRANSFER | Q::VIDEO_ENCODE_KHR, 1),
+        ];
+        assert_eq!(transfer_family(&video), None);
+        assert_eq!(transfer_family(&nvidia[..1]), None);
     }
 
     #[test]

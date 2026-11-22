@@ -17,10 +17,13 @@ mod pipeline;
 mod swapchain;
 mod textures;
 mod upload;
+mod upload_check;
 
 pub use ash::vk;
 pub use device::{DeviceCaps, Gpu, GpuOptions, Rejected};
-pub use frame::{FrameCtx, FrameLoop, GpuTime, MAX_FRAMES_IN_FLIGHT, Presented, Target};
+pub use frame::{
+    FrameCtx, FrameLoop, GpuTime, MAX_FRAME_WAITS, MAX_FRAMES_IN_FLIGHT, Presented, Target,
+};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};
 pub use memory::texel_bytes;
 pub use pipeline::{
@@ -31,7 +34,8 @@ pub use swapchain::{COLOR_RANGE, PresentPolicy};
 pub use textures::{
     MAX_MIP_LEVELS, SAMPLER_COUNT, SamplerId, TextureDesc, TextureId, TextureTable,
 };
-pub use upload::{ImageDst, ImageRegion, UploadError, UploadRing};
+pub use upload::{ImageDst, ImageRegion, UploadError, UploadRing, UploadTicket};
+pub use upload_check::{UploadCheck, UploadCheckReport};
 
 use std::fmt;
 

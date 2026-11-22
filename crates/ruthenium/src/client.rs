@@ -39,6 +39,11 @@ pub struct Options {
     pub exercise_swapchain: bool,
     /// Keep the pipeline cache on disk (off: every launch compiles from scratch).
     pub pipeline_cache: bool,
+    /// Upload buffers on the graphics queue even if the GPU has a transfer queue.
+    pub no_transfer_queue: bool,
+    /// Development: push checked data through the upload ring every frame (run it under
+    /// validation); a mismatch fails the run.
+    pub exercise_uploads: bool,
 }
 
 impl Options {
@@ -57,6 +62,8 @@ impl Options {
             stats: false,
             exercise_swapchain: false,
             pipeline_cache: true,
+            no_transfer_queue: false,
+            exercise_uploads: false,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -87,6 +94,8 @@ impl Options {
                 "--stats" => o.stats = true,
                 "--exercise-swapchain" => o.exercise_swapchain = true,
                 "--no-pipeline-cache" => o.pipeline_cache = false,
+                "--no-transfer-queue" => o.no_transfer_queue = true,
+                "--exercise-uploads" => o.exercise_uploads = true,
                 other => return Err(format!("unknown option {other}")),
             }
         }
@@ -127,6 +136,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         opts.validation,
         &GpuOptions {
             prefer: opts.gpu.clone(),
+            no_transfer_queue: opts.no_transfer_queue,
         },
     )?;
     {
@@ -152,6 +162,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         })
         .flatten();
     let mut renderer = Renderer::new(gpu, window.pixel_size(), opts.policy, cache_dir.as_deref())?;
+    if opts.exercise_uploads {
+        renderer.enable_upload_check()?;
+    }
 
     let mut sleeper = Sleeper::new();
     let mut deadline = Instant::now();
@@ -302,12 +315,29 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             run.p999_ms / run.p50_ms
         );
     }
+    let mut failed = false;
+    if let Some((c, deferred)) = renderer.upload_check() {
+        eprintln!(
+            "[ruthenium] upload check: {} chunks ({:.1} MiB) compared, {} mismatched; ready after {:.2} frames on average; {} retries when full, {} deferred transfer submits",
+            c.chunks,
+            c.bytes as f64 / f64::from(1 << 20),
+            c.mismatches,
+            c.mean_latency_frames(),
+            c.retries,
+            deferred
+        );
+        failed |= c.mismatches > 0 || c.chunks == 0;
+    }
     let validation = ruthenium_gpu::validation_messages();
     if validation > 0 {
         eprintln!("[ruthenium] {validation} Vulkan validation message(s)");
-        return Ok(ExitCode::FAILURE);
+        failed = true;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn print_line(

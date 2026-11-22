@@ -16,6 +16,9 @@ pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 /// never stalls the game loop (vanilla gives up only after 5 s).
 const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Semaphore waits a frame can carry besides its acquire (see [`FrameCtx::wait_timeline`]).
+pub const MAX_FRAME_WAITS: usize = 4;
+
 /// Per-frame-in-flight objects.
 struct Slot {
     pool: vk::CommandPool,
@@ -47,9 +50,39 @@ pub struct FrameCtx {
     pub number: u64,
     pub cmd: vk::CommandBuffer,
     slot: usize,
+    waits: [vk::SemaphoreSubmitInfo<'static>; MAX_FRAME_WAITS],
+    wait_count: usize,
 }
 
 impl FrameCtx {
+    /// Makes this frame's submit wait, before `stages`, until timeline `semaphore`
+    /// reaches `value` (another queue's work, such as uploads on the transfer queue). A
+    /// second wait on the same semaphore raises the first one's value.
+    ///
+    /// # Panics
+    /// If the frame already waits on [`MAX_FRAME_WAITS`] other semaphores.
+    pub fn wait_timeline(
+        &mut self,
+        semaphore: vk::Semaphore,
+        value: u64,
+        stages: vk::PipelineStageFlags2,
+    ) {
+        if let Some(w) = self.waits[..self.wait_count]
+            .iter_mut()
+            .find(|w| w.semaphore == semaphore)
+        {
+            w.value = w.value.max(value);
+            w.stage_mask |= stages;
+            return;
+        }
+        assert!(self.wait_count < MAX_FRAME_WAITS, "too many frame waits");
+        self.waits[self.wait_count] = vk::SemaphoreSubmitInfo::default()
+            .semaphore(semaphore)
+            .value(value)
+            .stage_mask(stages);
+        self.wait_count += 1;
+    }
+
     /// Which frame-in-flight slot this frame uses (`number % MAX_FRAMES_IN_FLIGHT`).
     /// Per-slot objects, such as the texture table's descriptor sets, are free to update:
     /// the slot's previous frame has finished.
@@ -288,6 +321,8 @@ impl FrameLoop {
                 number,
                 cmd,
                 slot: slot_index,
+                waits: [vk::SemaphoreSubmitInfo::default(); MAX_FRAME_WAITS],
+                wait_count: 0,
             },
             gpu_time,
         ))
@@ -390,9 +425,19 @@ impl FrameLoop {
                 .map(|s| s.render_done[t.index as usize])
         });
         let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(ctx.cmd)];
-        let waits = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(slot.acquire)
-            .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
+        // The acquire (if an image was acquired), then the frame's own waits.
+        let mut waits = [vk::SemaphoreSubmitInfo::default(); 1 + MAX_FRAME_WAITS];
+        let mut wait_count = 0;
+        if render_done.is_some() {
+            waits[0] = vk::SemaphoreSubmitInfo::default()
+                .semaphore(slot.acquire)
+                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+            wait_count = 1;
+        }
+        for w in &ctx.waits[..ctx.wait_count] {
+            waits[wait_count] = *w;
+            wait_count += 1;
+        }
         let mut signals = [
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(self.timeline)
@@ -407,7 +452,6 @@ impl FrameLoop {
                 .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
             signal_count = 2;
         }
-        let wait_count = usize::from(render_done.is_some());
         let submit = vk::SubmitInfo2::default()
             .command_buffer_infos(&cmds)
             .wait_semaphore_infos(&waits[..wait_count])

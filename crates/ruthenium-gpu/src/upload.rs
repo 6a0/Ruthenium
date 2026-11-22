@@ -9,8 +9,17 @@
 //! - All copies of a frame are recorded together, between one batch of barriers before and
 //!   one after (vanilla puts a full pipeline barrier after every single copy).
 //!
-//! Copies run on the graphics queue for now; a dedicated transfer queue (research 04 §4.3)
-//! slots in behind the same calls.
+//! **Queues** (research 04 §4.3). On a GPU with a dedicated transfer queue (a copy engine:
+//! NVIDIA, AMD), buffer copies are submitted there once per frame and signal the ring's own
+//! transfer timeline, so a burst of mesh uploads never occupies the graphics queue. Their
+//! data is usable from the first frame recorded after the copies have finished (usually
+//! the next one): check with [`UploadRing::is_ready`]. That frame's submit waits on the
+//! transfer timeline (already signalled, so the wait costs nothing), which makes the copies
+//! visible to it. Buffers are created with concurrent sharing, so no ownership transfers
+//! are needed. Image copies stay on the graphics queue (images are few, and an animated
+//! texture is needed in the frame that writes it). Without a transfer queue (Intel, Apple,
+//! mobile GPUs, `--no-transfer-queue`), every copy is recorded on the graphics queue
+//! before the frame's passes and is ready in that frame.
 //!
 //! Nothing here allocates once the ring exists.
 
@@ -19,11 +28,12 @@ use std::fmt;
 use std::sync::Arc;
 
 use ash::vk;
+use ash::vk::{Handle, TaggedStructure};
 
-use crate::Error;
 use crate::device::Gpu;
-use crate::frame::MAX_FRAMES_IN_FLIGHT;
+use crate::frame::{FrameCtx, MAX_FRAMES_IN_FLIGHT};
 use crate::memory::{Buffer, MemoryUse, texel_bytes};
+use crate::{Error, VkContext};
 
 /// Buffer copy regions one frame can record.
 const MAX_BUFFER_COPIES: usize = 4096;
@@ -36,6 +46,10 @@ const MAX_IMAGES: usize = 256;
 const MIN_ALIGN: u64 = 16;
 /// The largest alignment honoured; the ring's capacity is a multiple of it.
 const MAX_ALIGN: u64 = 256;
+/// Transfer submissions that may be unfinished at once. Normally at most two are: the copy
+/// engine finishes a frame's copies within that frame. If all are busy, the frame's buffer
+/// copies wait for the next frame instead of stalling.
+const TRANSFER_SLOTS: usize = MAX_FRAMES_IN_FLIGHT + 2;
 
 /// Why data could not be staged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +71,10 @@ impl fmt::Display for UploadError {
 }
 
 impl std::error::Error for UploadError {}
+
+/// When a buffer upload can be used: pass it to [`UploadRing::is_ready`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UploadTicket(u64);
 
 /// An image the ring writes to, as the copies and barriers need it.
 #[derive(Clone, Copy, Debug)]
@@ -95,6 +113,18 @@ impl ImageRegion {
     }
 }
 
+/// The end of one frame's bytes in the ring.
+#[derive(Clone, Copy, Debug)]
+struct Mark {
+    /// The frame that recorded the copies (its graphics timeline value).
+    frame: u64,
+    /// The ring's head after them.
+    head: u64,
+    /// Some of the bytes before `head` are copied on the transfer queue, by a submission
+    /// signalling a transfer timeline value of at least `frame`.
+    transfer: bool,
+}
+
 /// Byte positions in the ring. Positions only grow (a `u64` does not wrap in practice);
 /// position `p` is byte `p % capacity` of the buffer.
 #[derive(Debug)]
@@ -104,9 +134,8 @@ struct Ring {
     head: u64,
     /// Everything before this is free again.
     tail: u64,
-    /// For each recorded frame not yet known to be finished: its number and the head after
-    /// its copies. Oldest first; at most a few long.
-    marks: VecDeque<(u64, u64)>,
+    /// For each recorded frame not yet known to be finished, oldest first; at most a few.
+    marks: VecDeque<Mark>,
 }
 
 impl Ring {
@@ -115,7 +144,7 @@ impl Ring {
             capacity,
             head: 0,
             tail: 0,
-            marks: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT + 2),
+            marks: VecDeque::with_capacity(MAX_FRAMES_IN_FLIGHT + TRANSFER_SLOTS + 2),
         }
     }
 
@@ -139,18 +168,24 @@ impl Ring {
         Ok(start % self.capacity)
     }
 
-    /// Everything allocated so far is copied by `frame`.
-    fn close(&mut self, frame: u64) {
-        self.marks.push_back((frame, self.head));
+    /// Everything allocated so far is copied by `frame` and, if `transfer`, partly by a
+    /// transfer submission signalling `frame` or later.
+    fn close(&mut self, frame: u64, transfer: bool) {
+        self.marks.push_back(Mark {
+            frame,
+            head: self.head,
+            transfer,
+        });
     }
 
-    /// Frees the space of every frame up to `completed`.
-    fn retire(&mut self, completed: u64) {
-        while let Some(&(frame, head)) = self.marks.front() {
-            if frame > completed {
+    /// Frees the space of every frame up to `completed` on the graphics timeline whose
+    /// transfer copies, if any, are done (`transfer_completed` has reached the frame).
+    fn retire(&mut self, completed: u64, transfer_completed: u64) {
+        while let Some(&m) = self.marks.front() {
+            if m.frame > completed || (m.transfer && m.frame > transfer_completed) {
                 break;
             }
-            self.tail = head;
+            self.tail = m.head;
             self.marks.pop_front();
         }
         // Nothing in flight: start again at the beginning, so a large block fits whole.
@@ -158,6 +193,162 @@ impl Ring {
             let rewound = self.head.next_multiple_of(self.capacity);
             self.head = rewound;
             self.tail = rewound;
+        }
+    }
+}
+
+/// One command buffer for transfer submissions, reusable once its value is reached.
+#[derive(Debug)]
+struct TransferSlot {
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
+    /// Transfer timeline value its last submission signals (0: never used).
+    value: u64,
+}
+
+/// The dedicated transfer queue's side of the ring.
+#[derive(Debug)]
+struct Transfer {
+    queue: vk::Queue,
+    /// Signalled by each submission with the number of the frame that submitted it.
+    timeline: vk::Semaphore,
+    slots: [TransferSlot; TRANSFER_SLOTS],
+    /// The timeline's value when last read.
+    completed: u64,
+    /// The last value submitted.
+    submitted: u64,
+    /// Frames whose buffer copies waited a frame because every slot was busy.
+    deferred: u64,
+}
+
+impl Transfer {
+    fn new(gpu: &Gpu, queue: vk::Queue, family: u32) -> Result<Transfer, Error> {
+        let d = &gpu.device;
+        let mut t = Transfer {
+            queue,
+            timeline: vk::Semaphore::null(),
+            slots: std::array::from_fn(|_| TransferSlot {
+                pool: vk::CommandPool::null(),
+                cmd: vk::CommandBuffer::null(),
+                value: 0,
+            }),
+            completed: 0,
+            submitted: 0,
+            deferred: 0,
+        };
+        let created = (|| {
+            let mut type_info = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            let info = vk::SemaphoreCreateInfo::default().push(&mut type_info);
+            // SAFETY: plain object creation; destroyed by destroy(), also on error.
+            t.timeline = unsafe { d.create_semaphore(&info, None) }
+                .ctx("vkCreateSemaphore(transfer timeline)")?;
+            for s in &mut t.slots {
+                let pool_info = vk::CommandPoolCreateInfo::default()
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+                    .queue_family_index(family);
+                // SAFETY: as above.
+                unsafe {
+                    s.pool = d
+                        .create_command_pool(&pool_info, None)
+                        .ctx("vkCreateCommandPool(transfer)")?;
+                    let alloc = vk::CommandBufferAllocateInfo::default()
+                        .command_pool(s.pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1);
+                    s.cmd = d
+                        .allocate_command_buffers(&alloc)
+                        .ctx("vkAllocateCommandBuffers(transfer)")?[0];
+                }
+            }
+            Ok(())
+        })();
+        match created {
+            Ok(()) => Ok(t),
+            Err(e) => {
+                // SAFETY: nothing was submitted.
+                unsafe { t.destroy(gpu) };
+                Err(e)
+            }
+        }
+    }
+
+    /// Reads how far the transfer queue has got.
+    fn poll(&mut self, gpu: &Gpu) -> Result<u64, Error> {
+        // SAFETY: live timeline semaphore.
+        self.completed = unsafe { gpu.device.get_semaphore_counter_value(self.timeline) }
+            .ctx("vkGetSemaphoreCounterValue(transfer)")?;
+        Ok(self.completed)
+    }
+
+    /// Records and submits the buffer copies, signalling `value`. Returns false, having
+    /// done nothing, if every command buffer is still in use.
+    ///
+    /// # Safety
+    /// `value` is above every value submitted before; the staged bytes are written; every
+    /// destination is alive and its written ranges are not in use by unfinished work.
+    unsafe fn submit(
+        &mut self,
+        gpu: &Gpu,
+        src: vk::Buffer,
+        dsts: &[vk::Buffer],
+        regions: &[vk::BufferCopy],
+        value: u64,
+    ) -> Result<bool, Error> {
+        let completed = self.completed;
+        let Some(slot) = self.slots.iter_mut().find(|s| s.value <= completed) else {
+            return Ok(false);
+        };
+        let d = &gpu.device;
+        let cmd = slot.cmd;
+        // SAFETY: the slot's last submission has finished (its value is reached); one thread
+        // submits to the transfer queue (the ring's owner, through &mut self).
+        unsafe {
+            d.reset_command_pool(slot.pool, vk::CommandPoolResetFlags::empty())
+                .ctx("vkResetCommandPool(transfer)")?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            d.begin_command_buffer(cmd, &begin)
+                .ctx("vkBeginCommandBuffer(transfer)")?;
+            for_runs(dsts, |dst, range| {
+                d.cmd_copy_buffer(cmd, src, dst, &regions[range]);
+            });
+            d.end_command_buffer(cmd)
+                .ctx("vkEndCommandBuffer(transfer)")?;
+            let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+            // The signal makes the copies' writes available; the frames that use them wait
+            // on it, which makes them visible.
+            let signals = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(self.timeline)
+                .value(value)
+                .stage_mask(vk::PipelineStageFlags2::COPY)];
+            let submit = vk::SubmitInfo2::default()
+                .command_buffer_infos(&cmds)
+                .signal_semaphore_infos(&signals);
+            gpu.submit2_to(self.queue, std::slice::from_ref(&submit))?;
+        }
+        slot.value = value;
+        self.submitted = value;
+        Ok(true)
+    }
+
+    /// # Safety
+    /// No submission of this transfer is unfinished.
+    unsafe fn destroy(&mut self, gpu: &Gpu) {
+        let d = &gpu.device;
+        // SAFETY: guaranteed by the caller; null handles are skipped.
+        unsafe {
+            for s in &mut self.slots {
+                if !s.pool.is_null() {
+                    d.destroy_command_pool(s.pool, None);
+                    s.pool = vk::CommandPool::null();
+                }
+            }
+            if !self.timeline.is_null() {
+                d.destroy_semaphore(self.timeline, None);
+                self.timeline = vk::Semaphore::null();
+            }
         }
     }
 }
@@ -174,6 +365,13 @@ pub struct UploadRing {
     budget: u64,
     /// Bytes staged for the next frame.
     staged: u64,
+    /// Buffer copies go here if the device has a transfer queue in use.
+    transfer: Option<Transfer>,
+    /// The ticket of uploads staged now: the number the next recorded frame will have, at
+    /// the least.
+    next_frame: u64,
+    /// Tickets up to this are usable by the frame last recorded.
+    ready: u64,
     buffer_dsts: Vec<vk::Buffer>,
     buffer_regions: Vec<vk::BufferCopy>,
     image_dsts: Vec<vk::Image>,
@@ -189,6 +387,7 @@ impl fmt::Debug for UploadRing {
             .field("capacity", &self.ring.capacity)
             .field("budget", &self.budget)
             .field("staged", &self.staged)
+            .field("transfer_queue", &self.transfer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -217,6 +416,17 @@ impl UploadRing {
             .copy_offset_alignment
             .clamp(MIN_ALIGN, MAX_ALIGN)
             .next_power_of_two();
+        let transfer = match gpu.transfer {
+            Some((queue, family)) => match Transfer::new(&gpu, queue, family) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    // SAFETY: unused.
+                    unsafe { buffer.destroy(&gpu) };
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
         Ok(UploadRing {
             raw: buffer.raw,
             buffer: Some(buffer),
@@ -225,6 +435,9 @@ impl UploadRing {
             align,
             budget,
             staged: 0,
+            transfer,
+            next_frame: 1,
+            ready: 0,
             buffer_dsts: Vec::with_capacity(MAX_BUFFER_COPIES),
             buffer_regions: Vec::with_capacity(MAX_BUFFER_COPIES),
             image_dsts: Vec::with_capacity(MAX_IMAGE_COPIES),
@@ -254,6 +467,22 @@ impl UploadRing {
         self.staged
     }
 
+    /// Whether buffer copies run on a dedicated transfer queue.
+    pub fn uses_transfer_queue(&self) -> bool {
+        self.transfer.is_some()
+    }
+
+    /// Frames whose buffer copies had to wait a frame for a free transfer command buffer.
+    pub fn deferred_transfers(&self) -> u64 {
+        self.transfer.as_ref().map_or(0, |t| t.deferred)
+    }
+
+    /// Whether the frame last passed to [`Self::record`] (and every later one) may read
+    /// what the upload with this ticket wrote.
+    pub fn is_ready(&self, ticket: UploadTicket) -> bool {
+        ticket.0 <= self.ready
+    }
+
     /// Whether `bytes` more fit in this frame's budget. Anything fits in an empty frame, so
     /// an upload larger than the budget still goes, alone.
     fn within_budget(&self, bytes: u64) -> bool {
@@ -277,18 +506,22 @@ impl UploadRing {
         Ok(offset)
     }
 
-    /// Stages `data` to be copied to `dst` at `dst_offset` at the start of the next frame.
+    /// Stages `data` to be copied to `dst` at `dst_offset`, and returns when the copy can
+    /// be used ([`Self::is_ready`]): on the graphics queue, in the next frame; on a transfer
+    /// queue, once that frame's copies have finished.
     ///
     /// The destination range must not be in use by unfinished frames (write to fresh
-    /// ranges, and reuse a range only after the frames reading it have finished).
+    /// ranges, and reuse a range only after the frames reading it have finished), and must
+    /// not be read before the ticket is ready.
     pub fn upload_buffer(
         &mut self,
         dst: vk::Buffer,
         dst_offset: u64,
         data: &[u8],
-    ) -> Result<(), UploadError> {
+    ) -> Result<UploadTicket, UploadError> {
+        let ticket = UploadTicket(self.next_frame);
         if data.is_empty() {
-            return Ok(());
+            return Ok(ticket);
         }
         if self.buffer_regions.len() == MAX_BUFFER_COPIES || !self.within_budget(data.len() as u64)
         {
@@ -301,7 +534,7 @@ impl UploadRing {
             dst_offset,
             size: data.len() as u64,
         });
-        Ok(())
+        Ok(ticket)
     }
 
     /// Stages `regions` of `dst` (tightly packed texels, rows top to bottom) to be copied
@@ -392,21 +625,74 @@ impl UploadRing {
         Ok(())
     }
 
-    /// Records every staged copy into `cmd`, with the barriers that make them visible to
-    /// this frame's and later frames' shaders, and frees the space of frames up to
-    /// `completed`. Call it once per frame, before the frame's passes.
+    /// Sends the staged copies on their way, frees the space of finished frames, and makes
+    /// the finished copies visible to `ctx`'s frame. Call it once per frame, before the
+    /// frame's passes:
+    ///
+    /// - buffer copies are submitted to the transfer queue if there is one (and `ctx` gets
+    ///   a wait on the transfer timeline), else recorded into `ctx.cmd`;
+    /// - image copies are recorded into `ctx.cmd`, with the barriers that make them visible
+    ///   to this frame's and later frames' shaders.
     ///
     /// # Safety
-    /// `cmd` is recording frame `frame` (which signals that timeline value when done) on
-    /// the graphics queue; `completed` is a frame number the GPU has finished; every
-    /// destination buffer and image is still alive.
-    pub unsafe fn record(&mut self, cmd: vk::CommandBuffer, frame: u64, completed: u64) {
+    /// `ctx` is the frame being recorded on the graphics queue, and `completed` a frame
+    /// number the GPU has finished; frame numbers grow with each call; every destination
+    /// buffer and image is still alive.
+    pub unsafe fn record(&mut self, ctx: &mut FrameCtx, completed: u64) -> Result<(), Error> {
         profiling::scope!("record_uploads");
-        self.ring.retire(completed);
-        if self.buffer_regions.is_empty() && self.image_regions.is_empty() {
-            self.ring.close(frame);
-            return;
+        let frame = ctx.number;
+        debug_assert!(frame >= self.next_frame, "frames recorded out of order");
+        let mut transfer_bytes = false;
+        match &mut self.transfer {
+            Some(t) => {
+                let transfer_completed = t.poll(&self.gpu)?;
+                self.ring.retire(completed, transfer_completed);
+                if !self.buffer_regions.is_empty() {
+                    // SAFETY: frame numbers grow, so `frame` is above every earlier value;
+                    // the rest is the caller's contract and upload_buffer's.
+                    let sent = unsafe {
+                        t.submit(
+                            &self.gpu,
+                            self.raw,
+                            &self.buffer_dsts,
+                            &self.buffer_regions,
+                            frame,
+                        )?
+                    };
+                    if sent {
+                        self.buffer_dsts.clear();
+                        self.buffer_regions.clear();
+                    } else {
+                        // Kept for the next frame's submission, which signals a later value.
+                        t.deferred += 1;
+                    }
+                    transfer_bytes = true;
+                }
+                // Copies up to the completed value are done: this frame may use them. The
+                // wait is already satisfied; it makes their writes visible to the frame.
+                self.ready = transfer_completed;
+                if transfer_completed > 0 {
+                    ctx.wait_timeline(
+                        t.timeline,
+                        transfer_completed,
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
+                    );
+                }
+            }
+            None => {
+                self.ring.retire(completed, 0);
+                self.ready = frame;
+            }
         }
+        self.next_frame = frame + 1;
+        // On the transfer path the buffer lists hold only deferred copies here.
+        let graphics_buffers = self.transfer.is_none() && !self.buffer_regions.is_empty();
+        if !graphics_buffers && self.image_regions.is_empty() {
+            self.staged = 0;
+            self.ring.close(frame, transfer_bytes);
+            return Ok(());
+        }
+        let cmd = ctx.cmd;
         let gpu = &*self.gpu;
         let d = &gpu.device;
         let range = |i: &ImageDst| vk::ImageSubresourceRange {
@@ -468,10 +754,10 @@ impl UploadRing {
                     | vk::AccessFlags2::UNIFORM_READ
                     | vk::AccessFlags2::SHADER_STORAGE_READ,
             )];
-        let buffer_barriers = if self.buffer_regions.is_empty() {
-            &buffers_after[..0]
-        } else {
+        let buffer_barriers = if graphics_buffers {
             &buffers_after[..]
+        } else {
+            &buffers_after[..0]
         };
         // SAFETY: guaranteed by the caller; the staged bytes were written before this
         // frame's submit, which makes host writes visible to the device.
@@ -482,9 +768,11 @@ impl UploadRing {
                     &vk::DependencyInfo::default().image_memory_barriers(&self.pre),
                 );
             }
-            for_runs(&self.buffer_dsts, |dst, range| {
-                d.cmd_copy_buffer(cmd, self.raw, dst, &self.buffer_regions[range]);
-            });
+            if graphics_buffers {
+                for_runs(&self.buffer_dsts, |dst, range| {
+                    d.cmd_copy_buffer(cmd, self.raw, dst, &self.buffer_regions[range]);
+                });
+            }
             for_runs(&self.image_dsts, |dst, range| {
                 d.cmd_copy_buffer_to_image(
                     cmd,
@@ -501,13 +789,16 @@ impl UploadRing {
                     .image_memory_barriers(&self.post),
             );
         }
-        self.buffer_dsts.clear();
-        self.buffer_regions.clear();
+        if graphics_buffers {
+            self.buffer_dsts.clear();
+            self.buffer_regions.clear();
+        }
         self.image_dsts.clear();
         self.image_regions.clear();
         self.images.clear();
         self.staged = 0;
-        self.ring.close(frame);
+        self.ring.close(frame, transfer_bytes);
+        Ok(())
     }
 }
 
@@ -524,6 +815,20 @@ fn for_runs<T: Copy + PartialEq>(items: &[T], mut f: impl FnMut(T, std::ops::Ran
 
 impl Drop for UploadRing {
     fn drop(&mut self) {
+        if let Some(mut t) = self.transfer.take() {
+            // Copies on the transfer queue are not covered by the frame loop's idle wait.
+            let semaphores = [t.timeline];
+            let values = [t.submitted];
+            let info = vk::SemaphoreWaitInfo::default()
+                .semaphores(&semaphores)
+                .values(&values);
+            // SAFETY: live semaphore, every waited value was submitted; after the wait no
+            // transfer submission is unfinished.
+            unsafe {
+                let _ = self.gpu.device.wait_semaphores(&info, u64::MAX);
+                t.destroy(&self.gpu);
+            }
+        }
         if let Some(b) = self.buffer.take() {
             // SAFETY: the owner drops the ring only after the GPU is idle (the frame loop
             // waits in its Drop) or before any frame recorded its copies.
@@ -550,17 +855,17 @@ mod tests {
     fn space_returns_when_its_frame_finishes() {
         let mut r = Ring::new(1024);
         r.alloc(600, 16).unwrap();
-        r.close(1);
+        r.close(1, false);
         r.alloc(300, 16).unwrap();
-        r.close(2);
+        r.close(2, false);
         assert_eq!(r.alloc(600, 16), Err(UploadError::Full));
-        r.retire(0);
+        r.retire(0, 0);
         assert_eq!(r.alloc(600, 16), Err(UploadError::Full));
-        r.retire(1);
+        r.retire(1, 0);
         // 608..908 is still in use by frame 2; the block wraps to the start.
         assert_eq!(r.alloc(600, 16), Ok(0));
-        r.close(3);
-        r.retire(2);
+        r.close(3, false);
+        r.retire(2, 0);
         // Free now: 608..908 only (908..1024 was skipped by frame 3, which uses 0..600).
         assert_eq!(r.alloc(304, 16), Err(UploadError::Full));
         assert_eq!(r.alloc(288, 16), Ok(608));
@@ -570,10 +875,10 @@ mod tests {
     fn a_block_never_straddles_the_end() {
         let mut r = Ring::new(1024);
         r.alloc(900, 16).unwrap();
-        r.close(1);
+        r.close(1, false);
         r.alloc(16, 16).unwrap(); // 912..928
-        r.close(2);
-        r.retire(1);
+        r.close(2, false);
+        r.retire(1, 0);
         // 200 bytes don't fit in 928..1024: skip to 0 (free since frame 1 finished).
         assert_eq!(r.alloc(200, 16), Ok(0));
         // ...but not past the frame-2 bytes.
@@ -584,8 +889,25 @@ mod tests {
     fn an_idle_ring_rewinds_so_a_whole_ring_block_fits() {
         let mut r = Ring::new(1024);
         r.alloc(100, 16).unwrap();
-        r.close(1);
-        r.retire(1);
+        r.close(1, false);
+        r.retire(1, 0);
+        assert_eq!(r.alloc(1024, 16), Ok(0));
+    }
+
+    #[test]
+    fn transfer_bytes_wait_for_both_timelines() {
+        let mut r = Ring::new(1024);
+        r.alloc(512, 16).unwrap();
+        r.close(1, true);
+        r.alloc(256, 16).unwrap();
+        r.close(2, false);
+        // Graphics has finished both frames, but frame 1's transfer copies have not run:
+        // nothing is free, not even frame 2's bytes behind them.
+        r.retire(2, 0);
+        assert_eq!(r.alloc(512, 16), Err(UploadError::Full));
+        // A transfer value at or above the frame (it may have been deferred to a later
+        // submission) frees it, and the frames after it.
+        r.retire(2, 1);
         assert_eq!(r.alloc(1024, 16), Ok(0));
     }
 

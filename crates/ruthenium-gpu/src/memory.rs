@@ -23,6 +23,8 @@ pub(crate) enum MemoryUse {
     /// device-local host-visible memory, which on discrete GPUs without resizable BAR is a
     /// 256 MiB window better left to per-frame data.
     Upload,
+    /// Written by GPU copies and read by the CPU (readback, checks).
+    Readback,
 }
 
 impl MemoryUse {
@@ -41,6 +43,11 @@ impl MemoryUse {
                 F::HOST_VISIBLE | F::HOST_COHERENT,
                 F::empty(),
                 F::DEVICE_LOCAL | F::HOST_CACHED,
+            ),
+            MemoryUse::Readback => (
+                F::HOST_VISIBLE | F::HOST_COHERENT,
+                F::HOST_CACHED,
+                F::DEVICE_LOCAL,
             ),
         }
     }
@@ -208,10 +215,15 @@ impl Buffer {
         usage: vk::BufferUsageFlags,
         memory: MemoryUse,
     ) -> Result<Buffer, Error> {
-        let info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let families = gpu.buffer_families();
+        let info = vk::BufferCreateInfo::default().size(size).usage(usage);
+        // Shared with the transfer queue, if there is one, without ownership transfers.
+        let info = match &families {
+            Some(f) => info
+                .sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(f),
+            None => info.sharing_mode(vk::SharingMode::EXCLUSIVE),
+        };
         let d = &gpu.device;
         // SAFETY: plain object creation; destroyed below on error, or by destroy().
         let raw = unsafe { d.create_buffer(&info, None) }.ctx("vkCreateBuffer")?;
@@ -393,6 +405,7 @@ mod tests {
         let p = discrete();
         assert_eq!(ranked(&p, !0, MemoryUse::GpuOnly)[0], 1);
         assert_eq!(ranked(&p, !0, MemoryUse::Upload), vec![2, 3, 4]);
+        assert_eq!(ranked(&p, !0, MemoryUse::Readback), vec![3, 2, 4]);
     }
 
     #[test]
