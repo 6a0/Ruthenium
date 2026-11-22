@@ -12,7 +12,7 @@ workspace = true
 
 [features]
 # Stream CPU zones and frame marks to the Tracy profiler.
-tracy = ["profiling/profile-with-tracy"]
+tracy = ["profiling/profile-with-tracy", "ruthenium-gpu/tracy"]
 # Build SDL3 from source and link it statically (always on for Windows and macOS).
 sdl-static = ["ruthenium-platform/sdl-static"]
 

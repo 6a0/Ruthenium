@@ -222,17 +222,25 @@ impl Renderer {
         // was just read from the timeline; every upload destination is owned by self and
         // outlives the frame; the layout's set 0 is the texture table's.
         unsafe {
+            let zone = self.frames.zone_begin(&ctx, "uploads");
             self.uploads.record(&mut ctx, completed)?;
             self.textures
                 .begin_frame(ctx.slot(), ctx.number, completed, &self.uploads);
+            self.frames.zone_end(&ctx, zone);
             if let Some(c) = &mut self.check {
+                let zone = self.frames.zone_begin(&ctx, "upload check");
                 c.step(&mut self.uploads, &mut self.textures, &ctx, completed)?;
+                self.frames.zone_end(&ctx, zone);
             }
             self.textures.bind(ctx.cmd, ctx.slot(), self.layout.raw());
             self.frame_data.begin_frame(ctx.slot());
             self.frame_data.bind(ctx.cmd, self.layout.raw());
             // First frame (and after a rebuild): draw once with every pipeline.
-            self.pipelines.record_warm_up(ctx.cmd, &self.layout)?;
+            if !self.pipelines.warmed_up() {
+                let zone = self.frames.zone_begin(&ctx, "warm-up");
+                self.pipelines.record_warm_up(ctx.cmd, &self.layout)?;
+                self.frames.zone_end(&ctx, zone);
+            }
         }
         // Off-screen passes will be recorded here, before the late acquire.
         let target = self.frames.acquire(&ctx)?;
@@ -241,7 +249,8 @@ impl Renderer {
                 // SAFETY: as above; outside a render pass.
                 unsafe { self.pipelines.record_warm_up(ctx.cmd, &self.layout)? };
             }
-            let gpu = self.frames.gpu();
+            let zone = self.frames.zone_begin(&ctx, "window pass");
+            let gpu = self.frames.gpu().clone();
             let cmd = ctx.cmd;
             let to_attachment = [vk::ImageMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -328,6 +337,7 @@ impl Renderer {
                     &vk::DependencyInfo::default().image_memory_barriers(&to_present),
                 );
             }
+            self.frames.zone_end(&ctx, zone);
         }
         let presented = self.frames.submit(ctx, target)?;
         Ok(FrameReport {

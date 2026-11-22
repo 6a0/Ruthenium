@@ -10,6 +10,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# GPU zones in the Tracy profiler (the client binary starts Tracy).
+tracy = ["dep:tracy-client"]
+
 [dependencies]
 ash = { version = "0.38.0", default-features = false, features = ["std", "debug"] }
 profiling = "1.0.18"
+tracy-client = { version = "0.18.5", optional = true }

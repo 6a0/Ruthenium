@@ -395,6 +395,7 @@ version = "0.0.0"
 dependencies = [
  "ash",
  "profiling",
+ "tracy-client",
 ]
 
 [[package]]

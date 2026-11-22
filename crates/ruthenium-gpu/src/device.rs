@@ -53,6 +53,8 @@ pub struct DeviceCaps {
     /// Nanoseconds per timestamp tick, and whether the graphics queue writes timestamps.
     pub timestamp_period_ns: f32,
     pub timestamps: bool,
+    /// Valid bits of the graphics queue's timestamps (`timestampValidBits`).
+    pub timestamp_bits: u32,
     /// All device-local memory is also host-visible (integrated GPUs, Apple, ARM).
     pub unified_memory: bool,
     /// Slots in the shared texture table: what Ruthenium wants, capped by the
@@ -571,6 +573,7 @@ fn evaluate(
         pipeline_cache_uuid: props.pipeline_cache_uuid,
         timestamp_period_ns: props.limits.timestamp_period,
         timestamps: families[queue_family as usize].timestamp_valid_bits > 0,
+        timestamp_bits: families[queue_family as usize].timestamp_valid_bits,
         unified_memory,
         texture_slots,
         max_image_dimension_2d: props.limits.max_image_dimension2_d,

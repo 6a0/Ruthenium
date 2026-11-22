@@ -19,6 +19,11 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(100);
 /// Semaphore waits a frame can carry besides its acquire (see [`FrameCtx::wait_timeline`]).
 pub const MAX_FRAME_WAITS: usize = 4;
 
+/// Named GPU zones one frame can record (see [`FrameLoop::zone_begin`]); more are ignored.
+pub const MAX_GPU_ZONES: usize = 16;
+/// Timestamp queries per frame slot: the frame's start and end, then two per zone.
+const QUERIES_PER_SLOT: u32 = 2 + 2 * MAX_GPU_ZONES as u32;
+
 /// Per-frame-in-flight objects.
 struct Slot {
     pool: vk::CommandPool,
@@ -28,6 +33,14 @@ struct Slot {
     /// Timeline value of the last frame recorded in this slot (0: never used).
     frame: u64,
     timed: bool,
+    /// Zones recorded in the slot's frame.
+    #[cfg(feature = "tracy")]
+    zones: u32,
+    /// Tracy query ids in the order their timestamps were recorded.
+    #[cfg(feature = "tracy")]
+    events: [u16; QUERIES_PER_SLOT as usize],
+    #[cfg(feature = "tracy")]
+    event_count: usize,
 }
 
 /// A swapchain kept alive until the frames that used it are surely done.
@@ -102,6 +115,15 @@ pub struct Target {
     index: u32,
 }
 
+/// A GPU zone being recorded (see [`FrameLoop::zone_begin`]).
+#[derive(Debug)]
+#[must_use = "end it with FrameLoop::zone_end"]
+pub struct GpuZone {
+    /// Query index of its start; the end is the next one. None: not recorded.
+    #[cfg(feature = "tracy")]
+    query: Option<u32>,
+}
+
 /// What happened to a submitted frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Presented {
@@ -124,6 +146,9 @@ pub struct FrameLoop {
     policy: PresentPolicy,
     pixel_size: (u32, u32),
     stale: bool,
+    /// The graphics queue's GPU context in Tracy, if the profiler is running.
+    #[cfg(feature = "tracy")]
+    tracy: Option<tracy_client::GpuContext>,
 }
 
 impl std::fmt::Debug for FrameLoop {
@@ -152,7 +177,7 @@ impl FrameLoop {
         let query_pool = if gpu.caps().timestamps {
             let info = vk::QueryPoolCreateInfo::default()
                 .query_type(vk::QueryType::TIMESTAMP)
-                .query_count(2 * MAX_FRAMES_IN_FLIGHT as u32);
+                .query_count(QUERIES_PER_SLOT * MAX_FRAMES_IN_FLIGHT as u32);
             // SAFETY: as above.
             unsafe { d.create_query_pool(&info, None) }.ctx("vkCreateQueryPool")?
         } else {
@@ -165,6 +190,12 @@ impl FrameLoop {
                 acquire: vk::Semaphore::null(),
                 frame: 0,
                 timed: false,
+                #[cfg(feature = "tracy")]
+                zones: 0,
+                #[cfg(feature = "tracy")]
+                events: [0; QUERIES_PER_SLOT as usize],
+                #[cfg(feature = "tracy")]
+                event_count: 0,
             }),
             gpu,
             timeline,
@@ -175,6 +206,8 @@ impl FrameLoop {
             policy,
             pixel_size,
             stale: true,
+            #[cfg(feature = "tracy")]
+            tracy: None,
         };
         // Drop cleans up whatever was created if this fails part-way.
         for i in 0..MAX_FRAMES_IN_FLIGHT {
@@ -202,10 +235,16 @@ impl FrameLoop {
         if !fl.query_pool.is_null() {
             // SAFETY: hostQueryReset is enabled; the pool is unused.
             unsafe {
-                fl.gpu
-                    .device
-                    .reset_query_pool(fl.query_pool, 0, 2 * MAX_FRAMES_IN_FLIGHT as u32)
+                fl.gpu.device.reset_query_pool(
+                    fl.query_pool,
+                    0,
+                    QUERIES_PER_SLOT * MAX_FRAMES_IN_FLIGHT as u32,
+                )
             };
+        }
+        #[cfg(feature = "tracy")]
+        if !fl.query_pool.is_null() && tracy_client::Client::running().is_some() {
+            fl.tracy = fl.tracy_context()?;
         }
         fl.recreate_swapchain()?;
         Ok(fl)
@@ -290,6 +329,8 @@ impl FrameLoop {
         let previous = self.slots[slot_index].frame;
         self.wait_timeline(previous)?;
         let gpu_time = self.read_timestamps(slot_index);
+        #[cfg(feature = "tracy")]
+        self.upload_zones(slot_index);
         self.destroy_retired()?;
 
         let d = &self.gpu.device;
@@ -304,9 +345,14 @@ impl FrameLoop {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             d.begin_command_buffer(cmd, &begin)
                 .ctx("vkBeginCommandBuffer")?;
+            #[cfg(feature = "tracy")]
+            {
+                slot.zones = 0;
+                slot.event_count = 0;
+            }
             if !self.query_pool.is_null() {
-                let q = 2 * slot_index as u32;
-                d.cmd_reset_query_pool(cmd, self.query_pool, q, 2);
+                let q = QUERIES_PER_SLOT * slot_index as u32;
+                d.cmd_reset_query_pool(cmd, self.query_pool, q, QUERIES_PER_SLOT);
                 self.gpu.cmd_write_timestamp2(
                     cmd,
                     vk::PipelineStageFlags2::TOP_OF_PIPE,
@@ -314,6 +360,12 @@ impl FrameLoop {
                     q,
                 );
                 slot.timed = true;
+                #[cfg(feature = "tracy")]
+                if let Some(t) = &self.tracy {
+                    t.begin_span_alloc("frame", "gpu", file!(), line!(), q as u16);
+                    slot.events[0] = q as u16;
+                    slot.event_count = 1;
+                }
             }
         }
         Ok((
@@ -340,7 +392,7 @@ impl FrameLoop {
                 .device
                 .get_query_pool_results(
                     self.query_pool,
-                    2 * slot_index as u32,
+                    QUERIES_PER_SLOT * slot_index as u32,
                     &mut ticks,
                     vk::QueryResultFlags::TYPE_64,
                 )
@@ -406,16 +458,23 @@ impl FrameLoop {
         profiling::scope!("submit_present");
         let gpu = &self.gpu;
         let d = &gpu.device;
-        let slot = &self.slots[ctx.slot];
+        let slot = &mut self.slots[ctx.slot];
         // SAFETY: ctx.cmd is in the recording state (begin()).
         unsafe {
             if slot.timed {
+                let q = QUERIES_PER_SLOT * ctx.slot as u32 + 1;
                 gpu.cmd_write_timestamp2(
                     ctx.cmd,
                     vk::PipelineStageFlags2::ALL_COMMANDS,
                     self.query_pool,
-                    2 * ctx.slot as u32 + 1,
+                    q,
                 );
+                #[cfg(feature = "tracy")]
+                if let Some(t) = &self.tracy {
+                    t.end_span(q as u16);
+                    slot.events[slot.event_count] = q as u16;
+                    slot.event_count += 1;
+                }
             }
             d.end_command_buffer(ctx.cmd).ctx("vkEndCommandBuffer")?;
         }
@@ -486,6 +545,161 @@ impl FrameLoop {
                 call: "vkQueuePresentKHR",
                 result: e,
             }),
+        }
+    }
+
+    /// Starts a named GPU zone in `ctx`'s command buffer, shown in the Tracy profiler when
+    /// it is running (built with the `tracy` feature); otherwise it records nothing. Zones
+    /// may nest; each must be ended with [`Self::zone_end`] in the same frame, outside or
+    /// inside the same render pass it started in. A frame records at most
+    /// [`MAX_GPU_ZONES`]; more are ignored.
+    #[track_caller]
+    pub fn zone_begin(&mut self, ctx: &FrameCtx, name: &'static str) -> GpuZone {
+        #[cfg(feature = "tracy")]
+        if let Some(t) = &self.tracy {
+            let slot = &mut self.slots[ctx.slot];
+            if slot.timed && (slot.zones as usize) < MAX_GPU_ZONES {
+                let q = QUERIES_PER_SLOT * ctx.slot as u32 + 2 + 2 * slot.zones;
+                slot.zones += 1;
+                // SAFETY: ctx.cmd is recording; the query was reset at the frame's start.
+                unsafe {
+                    self.gpu.cmd_write_timestamp2(
+                        ctx.cmd,
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
+                        self.query_pool,
+                        q,
+                    )
+                };
+                let at = std::panic::Location::caller();
+                t.begin_span_alloc(name, "gpu", at.file(), at.line(), q as u16);
+                slot.events[slot.event_count] = q as u16;
+                slot.event_count += 1;
+                return GpuZone { query: Some(q) };
+            }
+        }
+        let _ = (ctx, name);
+        GpuZone {
+            #[cfg(feature = "tracy")]
+            query: None,
+        }
+    }
+
+    /// Ends a zone started with [`Self::zone_begin`] in the same frame.
+    pub fn zone_end(&mut self, ctx: &FrameCtx, zone: GpuZone) {
+        #[cfg(feature = "tracy")]
+        if let (Some(t), Some(q)) = (&self.tracy, zone.query) {
+            let slot = &mut self.slots[ctx.slot];
+            // SAFETY: as in zone_begin.
+            unsafe {
+                self.gpu.cmd_write_timestamp2(
+                    ctx.cmd,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    self.query_pool,
+                    q + 1,
+                )
+            };
+            t.end_span((q + 1) as u16);
+            slot.events[slot.event_count] = (q + 1) as u16;
+            slot.event_count += 1;
+        }
+        let _ = (ctx, zone);
+    }
+
+    /// Sends the slot's finished frame's timestamps to Tracy, in GPU-time order (as it
+    /// requires; recording order breaks ties, so an outer zone starts first and ends last).
+    #[cfg(feature = "tracy")]
+    fn upload_zones(&mut self, slot_index: usize) {
+        let Some(t) = &self.tracy else {
+            return;
+        };
+        let slot = &self.slots[slot_index];
+        let n = slot.event_count;
+        if n == 0 {
+            return;
+        }
+        let base = QUERIES_PER_SLOT * slot_index as u32;
+        let used = 2 + 2 * slot.zones as usize;
+        let mut ticks = [0u64; QUERIES_PER_SLOT as usize];
+        // SAFETY: the slot's frame has finished, so every query it wrote is available.
+        let read = unsafe {
+            self.gpu.device.get_query_pool_results(
+                self.query_pool,
+                base,
+                &mut ticks[..used],
+                vk::QueryResultFlags::TYPE_64,
+            )
+        };
+        if read.is_err() {
+            return;
+        }
+        let bits = self.gpu.caps().timestamp_bits;
+        let mask = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let mut order: [(u64, usize, u16); QUERIES_PER_SLOT as usize] =
+            [(0, 0, 0); QUERIES_PER_SLOT as usize];
+        for (i, &id) in slot.events[..n].iter().enumerate() {
+            order[i] = (ticks[(u32::from(id) - base) as usize] & mask, i, id);
+        }
+        order[..n].sort_unstable();
+        for &(ts, _, id) in &order[..n] {
+            t.upload_gpu_timestamp(id, ts as i64);
+        }
+    }
+
+    /// Creates the Tracy GPU context, calibrated with one timestamp read back right away.
+    #[cfg(feature = "tracy")]
+    fn tracy_context(&mut self) -> Result<Option<tracy_client::GpuContext>, Error> {
+        let Some(client) = tracy_client::Client::running() else {
+            return Ok(None);
+        };
+        let d = &self.gpu.device;
+        let slot = &self.slots[0];
+        // SAFETY: nothing has been submitted yet; the queue is idle after the wait, and the
+        // slot's pool is reset again by its first frame.
+        let ticks = unsafe {
+            d.reset_command_pool(slot.pool, vk::CommandPoolResetFlags::empty())
+                .ctx("vkResetCommandPool")?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            d.begin_command_buffer(slot.cmd, &begin)
+                .ctx("vkBeginCommandBuffer")?;
+            d.cmd_reset_query_pool(slot.cmd, self.query_pool, 0, 1);
+            self.gpu.cmd_write_timestamp2(
+                slot.cmd,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                self.query_pool,
+                0,
+            );
+            d.end_command_buffer(slot.cmd).ctx("vkEndCommandBuffer")?;
+            let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(slot.cmd)];
+            let submit = vk::SubmitInfo2::default().command_buffer_infos(&cmds);
+            self.gpu.queue_submit2(std::slice::from_ref(&submit))?;
+            d.queue_wait_idle(self.gpu.queue).ctx("vkQueueWaitIdle")?;
+            let mut ticks = [0u64; 1];
+            d.get_query_pool_results(
+                self.query_pool,
+                0,
+                &mut ticks,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )
+            .ctx("vkGetQueryPoolResults")?;
+            ticks[0]
+        };
+        let name = format!("{} graphics", self.gpu.caps().name);
+        match client.new_gpu_context(
+            Some(&name),
+            tracy_client::GpuContextType::Vulkan,
+            ticks as i64,
+            self.gpu.caps().timestamp_period_ns,
+        ) {
+            Ok(c) => Ok(Some(c)),
+            Err(e) => {
+                eprintln!("[gpu] no Tracy GPU context: {e}");
+                Ok(None)
+            }
         }
     }
 

@@ -23,7 +23,8 @@ mod upload_check;
 pub use ash::vk;
 pub use device::{DeviceCaps, Gpu, GpuOptions, Rejected};
 pub use frame::{
-    FrameCtx, FrameLoop, GpuTime, MAX_FRAME_WAITS, MAX_FRAMES_IN_FLIGHT, Presented, Target,
+    FrameCtx, FrameLoop, GpuTime, GpuZone, MAX_FRAME_WAITS, MAX_FRAMES_IN_FLIGHT, MAX_GPU_ZONES,
+    Presented, Target,
 };
 pub use frame_data::{FRAME_DATA_SET, FrameData};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};
