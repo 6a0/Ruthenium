@@ -86,6 +86,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                     println!("{t:7.3}s  playing");
                 }
                 SessionEvent::Reconfiguring => println!("{t:7.3}s  reconfiguring"),
+                SessionEvent::Loaded => println!("{t:7.3}s  in the world"),
                 SessionEvent::Closed(c) => {
                     let (title, reason) = closed_text(c, &data.lang);
                     println!("{t:7.3}s  closed: {title}: {reason}");

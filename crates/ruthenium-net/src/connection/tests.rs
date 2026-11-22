@@ -358,6 +358,29 @@ fn online_logins_join_the_session_with_the_servers_hash() {
 }
 
 #[test]
+fn chunk_batch_size_follows_vanilla() {
+    let t0 = std::time::Instant::now();
+    let mut c = ChunkBatchSize::default();
+    // 2 ms a chunk at first: 3.5 chunks a tick.
+    assert_eq!(c.desired_chunks_per_tick(), 3.5);
+    // A 10-chunk batch in 10 ms: 1 ms a chunk, averaged with the start (weight 1).
+    c.start(t0);
+    c.finish(10, t0 + Duration::from_millis(10));
+    assert_eq!(
+        c.desired_chunks_per_tick(),
+        (7_000_000.0f64 / 1_500_000.0) as f32
+    );
+    // A very slow batch is clamped to three times the average.
+    c.start(t0);
+    c.finish(1, t0 + Duration::from_secs(1));
+    let avg = (1_500_000.0 * 2.0 + 4_500_000.0) / 3.0;
+    assert_eq!(c.desired_chunks_per_tick(), (7_000_000.0 / avg) as f32);
+    // Empty batches change nothing.
+    c.finish(0, t0);
+    assert_eq!(c.desired_chunks_per_tick(), (7_000_000.0 / avg) as f32);
+}
+
+#[test]
 fn login_disconnects_and_local_only() {
     let events = session(Auth::Offline, |l, port| async move {
         let mut s = Server::accept(&l).await;

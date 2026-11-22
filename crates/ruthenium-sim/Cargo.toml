@@ -11,5 +11,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+ruthenium-javamath = { path = "../ruthenium-javamath" }
 ruthenium-net = { path = "../ruthenium-net" }
 ruthenium-protocol = { path = "../ruthenium-protocol" }

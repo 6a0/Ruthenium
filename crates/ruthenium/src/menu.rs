@@ -532,6 +532,15 @@ impl Menu {
                         vec![button("Disconnect", Action::Cancel)],
                     );
                 }
+                SessionEvent::Loaded if !self.leaving => {
+                    let title = self.server_name.clone();
+                    self.session_form(
+                        FormKind::Playing,
+                        &title,
+                        &["In the world. Ruthenium can't show it yet."],
+                        vec![button("Disconnect", Action::Cancel)],
+                    );
+                }
                 SessionEvent::Reconfiguring if !self.leaving => {
                     self.connecting_form(NetStage::Joining);
                 }

@@ -2,10 +2,16 @@
 //!
 //! - [`session`]: one session with a server, from connecting into play: the
 //!   configuration phase (registries, tags, known packs, features, cookies, resource-pack
-//!   answers, the code of conduct) and the switch into play and back.
+//!   answers, the code of conduct), the switch into play and back, and the ticks.
+//! - [`clock`]: when ticks run (vanilla's millisecond tick clock).
+//! - [`level_load`]: when the player counts as loaded into a level.
+//! - [`player`]: the local player's position and rotation.
 //!
-//! The tick scheduler, physics and the local player come here next (PLAN Stage 2).
+//! Physics and the local player's movement come here next (PLAN Stage 2).
 
 #![forbid(unsafe_code)]
 
+pub mod clock;
+pub mod level_load;
+pub mod player;
 pub mod session;

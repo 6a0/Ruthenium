@@ -5,7 +5,9 @@
 //! encryption ([`crate::transport`]); the whole login (`ClientHandshakePacketListenerImpl`,
 //! whose handlers don't move to the main thread), with the session join on a blocking
 //! thread; keep-alive replies, at once, in every phase after it (`handleKeepAlive`); and
-//! disconnect packets. Every other configuration and play packet is decoded here and
+//! disconnect packets, and the chunk batch acknowledgements (`handleChunkBatchStart` and
+//! `handleChunkBatchFinished` also stay on vanilla's Netty thread, timing the batch as
+//! it is decoded). Every other configuration and play packet is decoded here and
 //! handed on, in order, as an [`Event`] for the game thread, which answers through
 //! [`Connection::send`].
 //!
@@ -285,6 +287,57 @@ struct Net<'a> {
     events: &'a std_mpsc::Sender<Event>,
     /// The login has seen the server's hello.
     hello_seen: bool,
+    chunk_batches: ChunkBatchSize,
+}
+
+/// How many chunks a tick the client asks for (`ChunkBatchSizeCalculator`): the time
+/// from a batch's start to its end over its chunks, clamped to a third to three times
+/// the running average, averaged with up to 49 earlier samples' weight.
+#[derive(Debug, Clone)]
+pub struct ChunkBatchSize {
+    nanos_per_chunk: f64,
+    old_samples_weight: i32,
+    started: std::time::Instant,
+}
+
+impl Default for ChunkBatchSize {
+    fn default() -> ChunkBatchSize {
+        ChunkBatchSize {
+            nanos_per_chunk: 2_000_000.0,
+            old_samples_weight: 1,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl ChunkBatchSize {
+    pub fn start(&mut self, now: std::time::Instant) {
+        self.started = now;
+    }
+
+    pub fn finish(&mut self, batch_size: i32, now: std::time::Instant) {
+        if batch_size > 0 {
+            let duration = now.saturating_duration_since(self.started).as_nanos() as f64;
+            let per_chunk = duration / f64::from(batch_size);
+            // `Mth.clamp`: the lower bound wins if the bounds cross.
+            let lo = self.nanos_per_chunk / 3.0;
+            let hi = self.nanos_per_chunk * 3.0;
+            let clamped = if per_chunk < lo {
+                lo
+            } else if per_chunk > hi {
+                hi
+            } else {
+                per_chunk
+            };
+            let w = f64::from(self.old_samples_weight);
+            self.nanos_per_chunk = (self.nanos_per_chunk * w + clamped) / (w + 1.0);
+            self.old_samples_weight = (self.old_samples_weight + 1).min(49);
+        }
+    }
+
+    pub fn desired_chunks_per_tick(&self) -> f32 {
+        (7_000_000.0 / self.nanos_per_chunk) as f32
+    }
 }
 
 impl Net<'_> {
@@ -335,6 +388,16 @@ impl Net<'_> {
                     }
                     play::Clientbound::Common(Common::Disconnect { reason }) => {
                         Err(Reason::Text(reason))
+                    }
+                    play::Clientbound::ChunkBatchStart => {
+                        self.chunk_batches.start(std::time::Instant::now());
+                        Ok(())
+                    }
+                    play::Clientbound::ChunkBatchFinished { batch_size } => {
+                        self.chunk_batches
+                            .finish(batch_size, std::time::Instant::now());
+                        let desired = self.chunk_batches.desired_chunks_per_tick();
+                        self.send(&play::chunk_batch_received(desired)).await
                     }
                     p => {
                         self.paused = p.is_terminal();
@@ -468,6 +531,7 @@ async fn run(
         paused: false,
         events,
         hello_seen: false,
+        chunk_batches: ChunkBatchSize::default(),
     };
     let mut host = host;
     if host.encode_utf16().count() > MAX_HOST {

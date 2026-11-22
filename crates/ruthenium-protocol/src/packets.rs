@@ -632,14 +632,117 @@ pub mod configuration {
     }
 }
 
-/// Play: only the packets every phase shares, and the protocol switch, so far.
+/// Play: the packets every phase shares, the protocol switch, and joining the world
+/// (login, respawn, teleports, chunk batches, the tick rate) so far.
 pub mod play {
     use super::*;
+
+    /// Where and how the player spawns (`CommonPlayerSpawnInfo`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SpawnInfo {
+        /// Network id in the `dimension_type` registry.
+        pub dimension_type: i32,
+        pub dimension: String,
+        pub seed: i64,
+        pub game_type: i32,
+        pub previous_game_type: Option<i32>,
+        pub is_debug: bool,
+        pub is_flat: bool,
+        /// Dimension and packed block position.
+        pub last_death: Option<(String, i64)>,
+        pub portal_cooldown: i32,
+        pub sea_level: i32,
+    }
+
+    impl SpawnInfo {
+        fn read(r: &mut Reader<'_>) -> Result<SpawnInfo, WireError> {
+            Ok(SpawnInfo {
+                dimension_type: r.varint()?,
+                dimension: r.identifier()?,
+                seed: r.i64()?,
+                game_type: r.varint()?,
+                // `ByteBufCodecs.OPTIONAL_VAR_INT`: 0 is none, else the id plus one.
+                previous_game_type: match r.varint()? {
+                    0 => None,
+                    n => Some(n - 1),
+                },
+                is_debug: r.bool()?,
+                is_flat: r.bool()?,
+                last_death: optional(r, |r| Ok((r.identifier()?, r.i64()?)))?,
+                portal_cooldown: r.varint()?,
+                sea_level: r.varint()?,
+            })
+        }
+    }
+
+    /// The game type id of spectator mode (`GameType.SPECTATOR`).
+    pub const SPECTATOR: i32 = 3;
+
+    /// Joining the world (`ClientboundLoginPacket`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Login {
+        pub player_id: i32,
+        pub hardcore: bool,
+        pub levels: Vec<String>,
+        pub max_players: i32,
+        pub chunk_radius: i32,
+        pub simulation_distance: i32,
+        pub reduced_debug_info: bool,
+        pub show_death_screen: bool,
+        pub limited_crafting: bool,
+        pub spawn: SpawnInfo,
+        pub online_mode: bool,
+        pub enforces_secure_chat: bool,
+    }
+
+    /// A teleport (`ClientboundPlayerPositionPacket`): the values, each absolute or
+    /// relative as `relatives` says (bit `i` for `Relative` ordinal `i`: x, y, z,
+    /// y rotation, x rotation, delta x, y, z, rotate delta).
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct PlayerPosition {
+        pub id: i32,
+        pub position: [f64; 3],
+        pub delta: [f64; 3],
+        pub y_rot: f32,
+        pub x_rot: f32,
+        pub relatives: u32,
+    }
 
     #[derive(Debug, Clone, PartialEq)]
     pub enum Clientbound {
         Common(Common),
         StartConfiguration,
+        Login(Box<Login>),
+        Respawn {
+            spawn: Box<SpawnInfo>,
+            data_to_keep: u8,
+        },
+        PlayerPosition(PlayerPosition),
+        /// `ClientboundGameEventPacket`: the event id and its parameter.
+        GameEvent {
+            event: u8,
+            param: f32,
+        },
+        ChunkBatchStart,
+        ChunkBatchFinished {
+            batch_size: i32,
+        },
+        /// A chunk arrived; only its position is read so far.
+        LevelChunk {
+            x: i32,
+            z: i32,
+        },
+        ForgetLevelChunk {
+            x: i32,
+            z: i32,
+        },
+        SetHeldSlot {
+            slot: i32,
+        },
+        TickingState {
+            tick_rate: f32,
+            frozen: bool,
+        },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
     }
@@ -664,6 +767,67 @@ pub mod play {
                 C::Transfer => Clientbound::Common(Common::read_transfer(&mut r)?),
                 C::CustomReportDetails => Clientbound::Common(Common::read_report_details(&mut r)?),
                 C::StartConfiguration => Clientbound::StartConfiguration,
+                C::Login => {
+                    let player_id = r.i32()?;
+                    let hardcore = r.bool()?;
+                    let n = r.count(usize::MAX)?;
+                    let mut levels = Vec::with_capacity(n.min(64));
+                    for _ in 0..n {
+                        levels.push(r.identifier()?);
+                    }
+                    Clientbound::Login(Box::new(Login {
+                        player_id,
+                        hardcore,
+                        levels,
+                        max_players: r.varint()?,
+                        chunk_radius: r.varint()?,
+                        simulation_distance: r.varint()?,
+                        reduced_debug_info: r.bool()?,
+                        show_death_screen: r.bool()?,
+                        limited_crafting: r.bool()?,
+                        spawn: SpawnInfo::read(&mut r)?,
+                        online_mode: r.bool()?,
+                        enforces_secure_chat: r.bool()?,
+                    }))
+                }
+                C::Respawn => Clientbound::Respawn {
+                    spawn: Box::new(SpawnInfo::read(&mut r)?),
+                    data_to_keep: r.u8()?,
+                },
+                C::PlayerPosition => Clientbound::PlayerPosition(PlayerPosition {
+                    id: r.varint()?,
+                    position: [r.f64()?, r.f64()?, r.f64()?],
+                    delta: [r.f64()?, r.f64()?, r.f64()?],
+                    y_rot: r.f32()?,
+                    x_rot: r.f32()?,
+                    relatives: r.i32()? as u32,
+                }),
+                C::GameEvent => Clientbound::GameEvent {
+                    event: r.u8()?,
+                    param: r.f32()?,
+                },
+                C::ChunkBatchStart => Clientbound::ChunkBatchStart,
+                C::ChunkBatchFinished => Clientbound::ChunkBatchFinished {
+                    batch_size: r.varint()?,
+                },
+                C::LevelChunkWithLight => {
+                    let (x, z) = (r.i32()?, r.i32()?);
+                    r.rest();
+                    Clientbound::LevelChunk { x, z }
+                }
+                C::ForgetLevelChunk => {
+                    // `ChunkPos` as one long: x in the low half, z in the high half.
+                    let packed = r.i64()?;
+                    Clientbound::ForgetLevelChunk {
+                        x: packed as i32,
+                        z: (packed >> 32) as i32,
+                    }
+                }
+                C::SetHeldSlot => Clientbound::SetHeldSlot { slot: r.varint()? },
+                C::TickingState => Clientbound::TickingState {
+                    tick_rate: r.f32()?,
+                    frozen: r.bool()?,
+                },
                 other => {
                     r.rest();
                     Clientbound::Other(other)
@@ -684,6 +848,39 @@ pub mod play {
 
     pub fn pong(id: i32) -> Vec<u8> {
         wire::packet(pl::Serverbound::Pong.id(), |o| wire::write_i32(o, id))
+    }
+
+    /// The client's answer to a teleport: its id and where the player now is.
+    pub fn accept_teleportation(id: i32, pos: [f64; 3], y_rot: f32, x_rot: f32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::AcceptTeleportation.id(), |o| {
+            wire::write_varint(o, id);
+            for v in pos {
+                wire::write_f64(o, v);
+            }
+            wire::write_f32(o, y_rot);
+            wire::write_f32(o, x_rot);
+        })
+    }
+
+    pub fn chunk_batch_received(desired_chunks_per_tick: f32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ChunkBatchReceived.id(), |o| {
+            wire::write_f32(o, desired_chunks_per_tick)
+        })
+    }
+
+    pub fn client_tick_end() -> Vec<u8> {
+        wire::packet(pl::Serverbound::ClientTickEnd.id(), |_| {})
+    }
+
+    pub fn player_loaded() -> Vec<u8> {
+        wire::packet(pl::Serverbound::PlayerLoaded.id(), |_| {})
+    }
+
+    pub fn set_carried_item(slot: i32) -> Vec<u8> {
+        // `ServerboundSetCarriedItemPacket` writes the slot as a short.
+        wire::packet(pl::Serverbound::SetCarriedItem.id(), |o| {
+            o.extend_from_slice(&(slot as i16).to_be_bytes())
+        })
     }
 
     pub fn configuration_acknowledged() -> Vec<u8> {
@@ -828,9 +1025,33 @@ mod tests {
                 id: 0x1122_3344_5566_7788
             })
         );
-        let p = play::Clientbound::decode(50, &[1, 2, 3]).unwrap();
-        assert_eq!(p, play::Clientbound::Other(pl::Clientbound::Login));
+        let p = play::Clientbound::decode(10, &[1, 2, 3]).unwrap();
+        assert_eq!(
+            p,
+            play::Clientbound::Other(pl::Clientbound::ChangeDifficulty)
+        );
         assert!(play::Clientbound::decode(120, &[]).unwrap().is_terminal());
+        // A teleport: id 7, position, motion, rotation, relative x and y rotation.
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 7);
+        for v in [1.5, -60.0, 9.5, 0.0, 0.0, 0.0] {
+            wire::write_f64(&mut b, v);
+        }
+        wire::write_f32(&mut b, 90.0);
+        wire::write_f32(&mut b, 0.0);
+        wire::write_i32(&mut b, 0b1001);
+        let p = play::Clientbound::decode(73, &b).unwrap();
+        assert!(matches!(p, play::Clientbound::PlayerPosition(t)
+            if t.id == 7 && t.position == [1.5, -60.0, 9.5] && t.relatives == 9));
+        let a = play::accept_teleportation(7, [1.5, -60.0, 9.5], 90.0, 0.0);
+        assert_eq!((a[0], a[1], a.len()), (0, 7, 2 + 24 + 8));
+        assert_eq!(play::set_carried_item(3), [54, 0, 3]);
+        // A chunk position is one long: x low, z high.
+        let packed = ((-2i64) << 32) | (5i64 & 0xFFFF_FFFF);
+        assert_eq!(
+            play::Clientbound::decode(38, &packed.to_be_bytes()).unwrap(),
+            play::Clientbound::ForgetLevelChunk { x: 5, z: -2 }
+        );
         assert_eq!(play::keep_alive(1)[0], 28);
     }
 }

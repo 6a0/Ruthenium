@@ -116,6 +116,14 @@ pub fn write_i64(out: &mut Vec<u8>, v: i64) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
+pub fn write_f32(out: &mut Vec<u8>, v: f32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+pub fn write_f64(out: &mut Vec<u8>, v: f64) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
 /// A UUID as two big-endian longs, most significant first (`UUIDUtil.STREAM_CODEC`).
 pub fn write_uuid(out: &mut Vec<u8>, v: u128) {
     out.extend_from_slice(&v.to_be_bytes());
@@ -238,6 +246,14 @@ impl<'a> Reader<'a> {
 
     pub fn i32(&mut self) -> Result<i32, WireError> {
         Ok(i32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+
+    pub fn f32(&mut self) -> Result<f32, WireError> {
+        Ok(f32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+
+    pub fn f64(&mut self) -> Result<f64, WireError> {
+        Ok(f64::from_be_bytes(self.bytes(8)?.try_into().unwrap()))
     }
 
     pub fn uuid(&mut self) -> Result<u128, WireError> {
