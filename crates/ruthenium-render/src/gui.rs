@@ -2,12 +2,13 @@
 
 use ruthenium_ui::Quad;
 use ruthenium_ui::modern::Shape;
+use ruthenium_ui::text::GlyphQuad;
 
 /// Bytes per quad in the frame's data (std430: two vec4s and four uints).
 pub const QUAD_BYTES: u32 = 48;
 
-/// Bytes per shape in the frame's data (std430: three vec4s).
-pub const SHAPE_BYTES: u32 = 48;
+/// Bytes per shape in the frame's data (std430: four vec4s and a uvec4).
+pub const SHAPE_BYTES: u32 = 80;
 
 /// One frame's GUI: vanilla-style quads (with the GUI scale they were laid out for) and
 /// the modern menus' shapes, drawn after the quads.
@@ -16,23 +17,48 @@ pub struct GuiFrame<'a> {
     pub scale: u32,
     pub quads: &'a [Quad],
     pub shapes: &'a [Shape],
+    /// Text, drawn after the shapes, from the glyph atlas texture `font_atlas`.
+    pub glyphs: &'a [GlyphQuad],
+    pub font_atlas: u32,
 }
 
-pub fn write_shapes(shapes: &[Shape], out: &mut [u8]) {
-    for (s, chunk) in shapes.iter().zip(out.as_chunks_mut::<48>().0) {
-        let params = [
-            s.radius,
-            if s.glass { 1.0 } else { 0.0 },
-            s.highlight,
-            s.refraction,
-        ];
+/// Bytes per glyph in the frame's data (std430: four vec4s).
+pub const GLYPH_BYTES: u32 = 64;
+
+pub fn write_glyphs(glyphs: &[GlyphQuad], out: &mut [u8]) {
+    for (g, chunk) in glyphs.iter().zip(out.as_chunks_mut::<64>().0) {
+        let params = [g.range, 0.0, 0.0, 0.0];
         let words = chunk.as_chunks_mut::<4>().0;
         for (w, v) in words
             .iter_mut()
-            .zip(s.rect.iter().chain(&s.fill).chain(&params))
+            .zip(g.rect.iter().chain(&g.uv).chain(&g.color).chain(&params))
         {
             *w = v.to_ne_bytes();
         }
+    }
+}
+
+pub fn write_shapes(shapes: &[Shape], out: &mut [u8]) {
+    for (s, chunk) in shapes.iter().zip(out.as_chunks_mut::<80>().0) {
+        // params.y: 0 flat, 1 glass, 2 image.
+        let kind = match (s.image, s.glass) {
+            (Some(_), _) => 2.0,
+            (None, true) => 1.0,
+            (None, false) => 0.0,
+        };
+        let params = [s.radius, kind, s.highlight, s.refraction];
+        let uv = s.image.map_or([0.0; 4], |i| i.uv);
+        let words = chunk.as_chunks_mut::<4>().0;
+        for (w, v) in words
+            .iter_mut()
+            .zip(s.rect.iter().chain(&s.fill).chain(&params).chain(&uv))
+        {
+            *w = v.to_ne_bytes();
+        }
+        words[16] = s.image.map_or(0, |i| i.texture).to_ne_bytes();
+        words[17] = [0; 4];
+        words[18] = [0; 4];
+        words[19] = [0; 4];
     }
 }
 

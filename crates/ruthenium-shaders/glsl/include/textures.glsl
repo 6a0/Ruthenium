@@ -21,6 +21,12 @@ vec4 sample_texture(uint tex, uint smp, vec2 uv) {
     return texture(sampler2D(u_textures[nonuniformEXT(tex)], u_samplers[nonuniformEXT(smp)]), uv);
 }
 
+// With explicit gradients: for code after a discard, where implicit derivatives are
+// undefined.
+vec4 sample_texture_grad(uint tex, uint smp, vec2 uv, vec2 ddx, vec2 ddy) {
+    return textureGrad(sampler2D(u_textures[nonuniformEXT(tex)], u_samplers[nonuniformEXT(smp)]), uv, ddx, ddy);
+}
+
 ivec2 texture_size(uint tex) {
     return textureSize(sampler2D(u_textures[nonuniformEXT(tex)], u_samplers[SAMPLER_NEAREST_CLAMP]), 0);
 }

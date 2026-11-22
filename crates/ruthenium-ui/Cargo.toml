@@ -11,4 +11,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+fdsm = "0.8.0"
+fdsm-ttf-parser = "0.2.0"
+image = { version = "0.25", default-features = false }
+nalgebra = "0.34"
+rayon = "1.12"
+rustybuzz = "0.20.1"
 ruthenium-assets = { path = "../ruthenium-assets" }

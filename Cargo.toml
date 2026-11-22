@@ -18,6 +18,27 @@ missing_debug_implementations = "warn"
 dbg_macro = "warn"
 todo = "warn"
 
+# Glyph distance fields are generated at start-up; unoptimised, these crates are slow
+# enough to delay the menus' text in debug builds.
+[profile.dev.package.fdsm]
+opt-level = 3
+[profile.dev.package.nalgebra]
+opt-level = 3
+[profile.dev.package.rustybuzz]
+opt-level = 3
+[profile.dev.package.ttf-parser]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.simba]
+opt-level = 3
+[profile.dev.package.num-traits]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

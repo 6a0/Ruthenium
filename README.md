@@ -82,4 +82,6 @@ Ruthenium is published by **6a0**. Contact: **[sixazero@outlook.com](mailto:sixa
 
 The application is licensed under [GPL-3.0-or-later](LICENSE). Standalone libraries (for example `ruthenium-javamath`) are licensed MIT OR Apache-2.0, as stated in each crate. Contributions require a DCO sign-off; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
+The menus use [Nunito](https://github.com/googlefonts/nunito) by The Nunito Project Authors, bundled under the SIL Open Font License 1.1 (see [crates/ruthenium-ui/fonts](crates/ruthenium-ui/fonts)).
+
 Minecraft is a trademark of Mojang Synergies AB. Ruthenium is not affiliated with or endorsed by Mojang or Microsoft.

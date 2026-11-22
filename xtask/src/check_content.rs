@@ -29,6 +29,11 @@ const JAVA_DIR: &str = "tools/java/";
 /// Ruthenium's own artwork. PNGs anywhere else are rejected.
 const PNG_DIR: &str = "branding/";
 
+/// Bundled third-party fonts, each with its licence. Font files anywhere else are
+/// rejected (vanilla's fonts must never be committed).
+const FONT_DIR: &str = "crates/ruthenium-ui/fonts/";
+const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "ttc", "woff", "woff2"];
+
 /// Text that appears in decompiled Mojang classes but never in code that merely
 /// calls them. Split so this file does not match itself.
 const DENIED_TEXT: &[&str] = &[
@@ -146,6 +151,9 @@ fn rule_problems(rel: &str, bytes: &[u8]) -> Vec<String> {
     if ext == "png" && !lower.starts_with(PNG_DIR) {
         out.push(format!("{rel}: images are only allowed under {PNG_DIR}"));
     }
+    if FONT_EXTENSIONS.contains(&ext) && !lower.starts_with(FONT_DIR) {
+        out.push(format!("{rel}: fonts are only allowed under {FONT_DIR}"));
+    }
     if let Ok(text) = std::str::from_utf8(bytes) {
         for marker in DENIED_TEXT {
             if text.contains(marker) {
@@ -246,6 +254,7 @@ mod tests {
         assert!(!rule_problems("x/assets/minecraft/textures/a.png", b"").is_empty());
         assert!(!rule_problems("lib/client.jar", b"").is_empty());
         assert!(!rule_problems("src/Foo.java", b"").is_empty());
+        assert!(!rule_problems("assets/font.ttf", b"").is_empty());
         let decompiled = concat!("package ", "net.minecraft.client;\n");
         assert!(!rule_problems("tools/java/Foo.java", decompiled.as_bytes()).is_empty());
     }
@@ -254,6 +263,7 @@ mod tests {
     fn accepts_own_files() {
         assert!(rule_problems("crates/ruthenium/src/main.rs", b"fn main() {}").is_empty());
         assert!(rule_problems("branding/logo.png", b"").is_empty());
+        assert!(rule_problems("crates/ruthenium-ui/fonts/InterVariable.ttf", b"").is_empty());
         let exporter =
             "package dev.ruthenium.exporter;\nimport net.minecraft.world.level.block.Block;\n";
         assert!(rule_problems("tools/java/Exporter.java", exporter.as_bytes()).is_empty());

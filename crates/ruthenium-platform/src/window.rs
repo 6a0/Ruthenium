@@ -209,6 +209,30 @@ impl Window {
         (w.max(0) as u32, h.max(0) as u32)
     }
 
+    /// Sets the window's icon from `size` x `size` RGBA8 texels (straight alpha, rows
+    /// top first). Some window managers (Wayland compositors) take icons from the desktop
+    /// entry instead and ignore it.
+    pub fn set_icon(&self, rgba: &[u8], size: u32) {
+        assert_eq!(rgba.len(), (size * size * 4) as usize);
+        let mut pixels = rgba.to_vec();
+        let side = size.min(i32::MAX as u32 / 4) as i32;
+        // SAFETY: raw is a live window; the surface borrows `pixels`, which outlives it (SDL
+        // copies the icon in SDL_SetWindowIcon), and is destroyed here.
+        unsafe {
+            let surface = sdl3_sys::surface::SDL_CreateSurfaceFrom(
+                side,
+                side,
+                sdl3_sys::pixels::SDL_PIXELFORMAT_RGBA32,
+                pixels.as_mut_ptr().cast(),
+                side * 4,
+            );
+            if !surface.is_null() {
+                sdl3_sys::video::SDL_SetWindowIcon(self.raw, surface);
+                sdl3_sys::surface::SDL_DestroySurface(surface);
+            }
+        }
+    }
+
     /// Asks the window manager for a new window size in points (it may refuse or adjust;
     /// the result arrives as [`Event::PixelSizeChanged`]).
     pub fn request_size(&self, width: u32, height: u32) {

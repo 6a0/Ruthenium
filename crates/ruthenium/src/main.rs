@@ -10,7 +10,8 @@ mod prepare_cmd;
 use std::process::ExitCode;
 use std::time::Instant;
 
-/// Shown on every first-run, About and title screen (Minecraft Usage Guidelines).
+/// Printed by `ruthenium version` and at start-up, and for the first-run and About screens
+/// (Minecraft Usage Guidelines). Not on the title screen: no launcher puts it there.
 pub const DISCLAIMER: &str =
     "NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.";
 

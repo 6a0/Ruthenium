@@ -6,8 +6,10 @@
 
 struct Shape {
     vec4 rect;   // x0, y0, x1, y1 in pixels from the top left
-    vec4 fill;   // straight-alpha RGBA: the colour, or the glass tint
-    vec4 params; // corner radius (px), glass (0 = flat fill, 1 = glass), highlight, refraction (px)
+    vec4 fill;   // straight-alpha RGBA: the colour, the glass tint, or the image's tint
+    vec4 params; // corner radius (px), kind (0 flat, 1 glass, 2 image), highlight, refraction (px)
+    vec4 uv;     // image: u0, v0, u1, v1
+    uvec4 tex;   // image: x = texture index
 };
 #define FRAME_ELEMENT Shape
 #include "frame.glsl"

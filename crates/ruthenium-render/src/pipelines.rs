@@ -15,16 +15,19 @@ pub enum PipelineId {
     Gui,
     /// Rounded shapes and glass of the modern menus.
     Shape,
+    /// Text of the modern menus (distance-field glyphs).
+    Text,
     /// The development overlay's rectangles.
     Overlay,
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 5] = [
+    pub const ALL: [PipelineId; 6] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
         PipelineId::Shape,
+        PipelineId::Text,
         PipelineId::Overlay,
     ];
 
@@ -52,6 +55,13 @@ impl PipelineId {
                 name: "shape",
                 vertex: shaders::SHAPE_VERT.words(),
                 fragment: shaders::SHAPE_FRAG.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                blend: Blend::Alpha,
+            },
+            PipelineId::Text => GraphicsDesc {
+                name: "text",
+                vertex: shaders::TEXT_VERT.words(),
+                fragment: shaders::TEXT_FRAG.words(),
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 blend: Blend::Alpha,
             },

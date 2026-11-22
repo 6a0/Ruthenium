@@ -1,6 +1,8 @@
 //! Ruthenium's own menus (title, server list, accounts, settings, connecting): a modern,
 //! space-themed look, unrelated to vanilla's GUI. Layout is in UI units, scaled to the
-//! window by [`UiScale`]; shapes come out in window pixels.
+//! window by [`UiScale`]; shapes and glyphs come out in window pixels.
+
+use crate::text::{Fonts, GlyphAtlas, Line, TextList, TextStyle, Weight};
 
 /// Window pixels per UI unit: the layout is designed for a window 900 units tall, so it
 /// keeps its proportions at any size (never below 0.75 px per unit, so text stays
@@ -71,6 +73,17 @@ pub struct Shape {
     pub highlight: f32,
     /// How far, in pixels, the glass bends the backdrop at its rim.
     pub refraction: f32,
+    /// Draw this texture (premultiplied alpha) instead of a fill, tinted by `fill`.
+    pub image: Option<ShapeImage>,
+}
+
+/// A texture shown by a [`Shape`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShapeImage {
+    /// The renderer's texture index.
+    pub texture: u32,
+    /// `u0, v0, u1, v1`.
+    pub uv: [f32; 4],
 }
 
 /// Shapes for one frame, back to front.
@@ -109,6 +122,24 @@ impl ShapeList {
             glass: true,
             highlight,
             refraction: 0.22 * r.h * px,
+            image: None,
+        });
+    }
+
+    /// A texture over `r` (UI units), premultiplied alpha.
+    pub fn image(&mut self, scale: &UiScale, r: Rect, texture: u32) {
+        let px = scale.px;
+        self.push(Shape {
+            rect: [r.x * px, r.y * px, (r.x + r.w) * px, (r.y + r.h) * px],
+            fill: [1.0; 4],
+            radius: 0.0,
+            glass: false,
+            highlight: 0.0,
+            refraction: 0.0,
+            image: Some(ShapeImage {
+                texture,
+                uv: [0.0, 0.0, 1.0, 1.0],
+            }),
         });
     }
 }
@@ -134,13 +165,87 @@ pub struct Button {
 const TINT: [f32; 4] = [0.85, 0.88, 1.0, 0.04];
 const TINT_HOVER: [f32; 4] = [0.90, 0.93, 1.0, 0.12];
 
-/// The title screen: a wordmark (reserved space for now) above a centred column of
-/// glass pills.
+/// The weights the menus use (the glyph atlas holds these).
+pub const WEIGHTS: [Weight; 4] = [
+    Weight::REGULAR,
+    Weight::MEDIUM,
+    Weight::SEMIBOLD,
+    Weight::EXTRABOLD,
+];
+
+const NAME: &str = "RUTHENIUM";
+const NAME_SIZE: f32 = 34.0;
+const LOGO: f32 = 112.0;
+const LABEL_SIZE: f32 = 19.0;
+const SMALL_SIZE: f32 = 11.5;
+const WHITE: [f32; 4] = [0.95, 0.96, 1.0, 1.0];
+const LABEL: [f32; 4] = [1.0, 1.0, 1.0, 0.88];
+const LABEL_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+const FAINT: [f32; 4] = [0.85, 0.87, 1.0, 0.45];
+
+/// Shaped text with the size it was shaped at (pixels) and its cap height (pixels).
+#[derive(Debug, Clone)]
+struct Text {
+    line: Line,
+    cap: f32,
+}
+
+impl Text {
+    fn new(
+        fonts: &Fonts,
+        text: &str,
+        scale: &UiScale,
+        size: f32,
+        weight: Weight,
+        tracking: f32,
+    ) -> Text {
+        let px = size * scale.px;
+        let line = fonts.shape(
+            text,
+            TextStyle {
+                size: px,
+                weight,
+                tracking,
+            },
+        );
+        Text {
+            cap: fonts.cap_height(weight) * px,
+            line,
+        }
+    }
+
+    /// Draws it centred in `r` (UI units), optically: capitals centred vertically.
+    fn centred(
+        &self,
+        list: &mut TextList,
+        atlas: &GlyphAtlas,
+        scale: &UiScale,
+        r: Rect,
+        color: [f32; 4],
+    ) {
+        let (cx, cy) = ((r.x + 0.5 * r.w) * scale.px, (r.y + 0.5 * r.h) * scale.px);
+        list.line(
+            atlas,
+            &self.line,
+            cx - 0.5 * self.line.width,
+            cy + 0.5 * self.cap,
+            color,
+        );
+    }
+}
+
+/// The title screen: the logo and name above a centred column of glass pills, and the
+/// version in the bottom left.
 #[derive(Debug, Clone)]
 pub struct TitleScreen {
     pub scale: UiScale,
-    pub wordmark: Rect,
+    pub logo: Rect,
+    /// The box the name is centred in.
+    pub name: Rect,
     pub buttons: Vec<Button>,
+    name_text: Text,
+    labels: Vec<Text>,
+    version: Text,
 }
 
 impl TitleScreen {
@@ -148,7 +253,8 @@ impl TitleScreen {
     pub const BUTTON_HEIGHT: f32 = 52.0;
     pub const GAP: f32 = 14.0;
 
-    pub fn new(scale: UiScale) -> TitleScreen {
+    /// Lays the screen out; `version` is the bottom-left line.
+    pub fn new(scale: UiScale, fonts: &Fonts, version: &str) -> TitleScreen {
         let entries = [
             ("Multiplayer", Action::Multiplayer),
             ("Settings", Action::Settings),
@@ -156,19 +262,26 @@ impl TitleScreen {
         ];
         let n = entries.len() as f32;
         let column = n * Self::BUTTON_HEIGHT + (n - 1.0) * Self::GAP;
-        let wordmark_h = 120.0;
-        let space = 56.0;
-        // The wordmark and the column together sit a little above the middle.
-        let top = ((scale.height - (wordmark_h + space + column)) * 0.45).max(24.0);
+        let name_h = 44.0;
+        let header = LOGO + 14.0 + name_h;
+        let space = 44.0;
+        // The header and the column together sit a little above the middle.
+        let top = ((scale.height - (header + space + column)) * 0.45).max(24.0);
         let cx = scale.width * 0.5;
-        let wordmark = Rect {
-            x: cx - 260.0,
+        let logo = Rect {
+            x: cx - 0.5 * LOGO,
             y: top,
-            w: 520.0,
-            h: wordmark_h,
+            w: LOGO,
+            h: LOGO,
         };
-        let mut y = top + wordmark_h + space;
-        let buttons = entries
+        let name = Rect {
+            x: cx - 260.0,
+            y: top + LOGO + 14.0,
+            w: 520.0,
+            h: name_h,
+        };
+        let mut y = top + header + space;
+        let buttons: Vec<Button> = entries
             .into_iter()
             .map(|(label, action)| {
                 let b = Button {
@@ -185,24 +298,56 @@ impl TitleScreen {
                 b
             })
             .collect();
+        let labels = buttons
+            .iter()
+            .map(|b| Text::new(fonts, b.label, &scale, LABEL_SIZE, Weight::SEMIBOLD, 0.01))
+            .collect();
         TitleScreen {
+            name_text: Text::new(fonts, NAME, &scale, NAME_SIZE, Weight::EXTRABOLD, 0.22),
+            version: Text::new(fonts, version, &scale, SMALL_SIZE, Weight::MEDIUM, 0.02),
+            labels,
             scale,
-            wordmark,
+            logo,
+            name,
             buttons,
         }
     }
 
-    /// Adds the screen's shapes; `mouse` is in UI units.
-    pub fn draw(&self, shapes: &mut ShapeList, mouse: Option<(f32, f32)>) {
-        for b in &self.buttons {
-            let hovered = mouse.is_some_and(|(x, y)| b.rect.contains(x, y));
-            let (tint, light) = if hovered {
-                (TINT_HOVER, 1.0)
-            } else {
-                (TINT, 0.75)
-            };
-            shapes.glass_pill(&self.scale, b.rect, tint, light);
+    /// Adds the screen's shapes and, once they are on the GPU, its text (`atlas`) and
+    /// logo (`logo`, a texture index); `mouse` is in UI units.
+    pub fn draw(
+        &self,
+        shapes: &mut ShapeList,
+        text: &mut TextList,
+        atlas: Option<&GlyphAtlas>,
+        logo: Option<u32>,
+        mouse: Option<(f32, f32)>,
+    ) {
+        let s = &self.scale;
+        if let Some(logo) = logo {
+            shapes.image(s, self.logo, logo);
         }
+        for (b, label) in self.buttons.iter().zip(&self.labels) {
+            let hovered = mouse.is_some_and(|(x, y)| b.rect.contains(x, y));
+            let (tint, light, ink) = if hovered {
+                (TINT_HOVER, 1.0, LABEL_HOVER)
+            } else {
+                (TINT, 0.75, LABEL)
+            };
+            shapes.glass_pill(s, b.rect, tint, light);
+            if let Some(atlas) = atlas {
+                label.centred(text, atlas, s, b.rect, ink);
+            }
+        }
+        let Some(atlas) = atlas else { return };
+        self.name_text.centred(text, atlas, s, self.name, WHITE);
+        text.line(
+            atlas,
+            &self.version.line,
+            16.0 * s.px,
+            (s.height - 16.0) * s.px,
+            FAINT,
+        );
     }
 
     /// The action of the button under a click at `(x, y)` (UI units).
@@ -234,23 +379,36 @@ mod tests {
     #[test]
     fn title_column_is_centred_and_clickable() {
         let s = UiScale::new(1600, 900);
-        let t = TitleScreen::new(s);
+        let fonts = Fonts::new(&WEIGHTS);
+        let t = TitleScreen::new(s, &fonts, "Ruthenium 0.0.0");
         assert_eq!(t.buttons.len(), 3);
         for b in &t.buttons {
             assert_eq!(b.rect.x + b.rect.w * 0.5, 800.0);
         }
         let first = t.buttons[0].rect;
-        assert!(t.wordmark.y + t.wordmark.h < first.y);
+        assert!(t.logo.y + t.logo.h < t.name.y && t.name.y + t.name.h < first.y);
+        assert_eq!(t.logo.x + 0.5 * t.logo.w, 800.0);
         assert_eq!(t.click(800.0, first.y + 1.0), Some(Action::Multiplayer));
         let last = t.buttons[2].rect;
         assert_eq!(t.click(800.0, last.y + last.h - 0.5), Some(Action::Quit));
         assert_eq!(t.click(10.0, 10.0), None);
         // Pills: radius is half the height, in pixels.
         let mut shapes = ShapeList::new();
-        t.draw(&mut shapes, None);
+        let mut text = TextList::new();
+        t.draw(&mut shapes, &mut text, None, None, None);
         let p = shapes.shapes()[0];
         assert_eq!(p.radius, 0.5 * (p.rect[3] - p.rect[1]));
         assert!(p.glass);
+        assert!(text.quads().is_empty(), "no text before the atlas exists");
+        // With an atlas, labels are centred in their pills.
+        let mut atlas = GlyphAtlas::new(1024);
+        atlas.add_text(&fonts, Weight::SEMIBOLD, "Multiplayer");
+        t.draw(&mut shapes, &mut text, Some(&atlas), None, None);
+        // The first label's glyphs come first (other labels share some of its letters).
+        let q = &text.quads()[.."Multiplayer".len()];
+        let (left, right) = (q.first().unwrap().rect[0], q.last().unwrap().rect[2]);
+        let mid = 0.5 * (left + right) / s.px;
+        assert!((mid - 800.0).abs() < 4.0, "label centre {mid}");
     }
 
     #[test]

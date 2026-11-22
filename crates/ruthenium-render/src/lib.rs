@@ -462,6 +462,25 @@ impl Renderer {
                     d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
                     d.cmd_draw(cmd, 6, g.shapes.len() as u32, 0, 0);
                 }
+                if let Some(g) = gui.filter(|g| !g.glyphs.is_empty())
+                    && let Some((first, bytes)) = self
+                        .frame_data
+                        .alloc(g.glyphs.len() as u32, gui::GLYPH_BYTES)
+                {
+                    gui::write_glyphs(g.glyphs, bytes);
+                    let mut push = [0u8; 16];
+                    push[0..4].copy_from_slice(&(t.extent.width as f32).to_ne_bytes());
+                    push[4..8].copy_from_slice(&(t.extent.height as f32).to_ne_bytes());
+                    push[8..12].copy_from_slice(&g.font_atlas.to_ne_bytes());
+                    push[12..16].copy_from_slice(&first.to_ne_bytes());
+                    d.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.get(PipelineId::Text.index()),
+                    );
+                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
+                    d.cmd_draw(cmd, 6, g.glyphs.len() as u32, 0, 0);
+                }
                 let rects = self.overlay.build(t.extent.width, t.extent.height);
                 if let Some((first, bytes)) = self
                     .frame_data

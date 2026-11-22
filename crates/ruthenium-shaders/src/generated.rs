@@ -31,6 +31,12 @@ pub static SHAPE_FRAG: Spirv = crate::spirv!("shape.frag");
 /// `glsl/shape.vert`
 pub static SHAPE_VERT: Spirv = crate::spirv!("shape.vert");
 
+/// `glsl/text.frag`
+pub static TEXT_FRAG: Spirv = crate::spirv!("text.frag");
+
+/// `glsl/text.vert`
+pub static TEXT_VERT: Spirv = crate::spirv!("text.vert");
+
 /// Every shader, in file-name order.
 pub static ALL: &[&Spirv] = &[
     &BACKGROUND_FRAG,
@@ -42,4 +48,6 @@ pub static ALL: &[&Spirv] = &[
     &OVERLAY_VERT,
     &SHAPE_FRAG,
     &SHAPE_VERT,
+    &TEXT_FRAG,
+    &TEXT_VERT,
 ];

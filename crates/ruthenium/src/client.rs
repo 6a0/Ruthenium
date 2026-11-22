@@ -308,8 +308,15 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         // 3. Simulation: nothing yet.
 
         // 4. Render.
-        let gui = menu.frame(window.pixel_size(), window.size());
-        if opts.screenshot.is_some() && !screenshot_requested {
+        let text_ready = menu.text_ready();
+        let gui = menu.frame(&mut renderer, window.pixel_size(), window.size(), |rgba| {
+            window.set_icon(rgba, crate::menu::ICON_SIZE)
+        });
+        if opts.screenshot.is_some()
+            && !screenshot_requested
+            && text_ready
+            && !gui.glyphs.is_empty()
+        {
             renderer.request_screenshot();
             screenshot_requested = true;
         }

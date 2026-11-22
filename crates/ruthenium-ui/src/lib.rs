@@ -11,8 +11,10 @@
 #![forbid(unsafe_code)]
 
 pub mod draw;
+pub mod logo;
 pub mod modern;
 pub mod scale;
+pub mod text;
 pub mod widget;
 
 pub use draw::{DrawList, NO_TEXTURE, Quad, SpriteInfo, Sprites};

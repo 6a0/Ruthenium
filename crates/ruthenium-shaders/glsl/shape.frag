@@ -1,7 +1,8 @@
 #version 460
 // Ruthenium: rounded shapes with anti-aliased edges. Flat shapes are filled; glass
 // shapes (the "Liquid Glass" pills) show the blurred backdrop through a tint, bent
-// inwards near the rim like a thick lens, with a light rim from the top left.
+// inwards near the rim like a thick lens, with a light rim from the top left; image
+// shapes show a texture (the logo).
 
 #include "push.glsl"
 #include "textures.glsl"
@@ -10,6 +11,8 @@ struct Shape {
     vec4 rect;
     vec4 fill;
     vec4 params;
+    vec4 uv;
+    uvec4 tex;
 };
 #define FRAME_ELEMENT Shape
 #include "frame.glsl"
@@ -41,6 +44,20 @@ void main() {
     float coverage = clamp(0.5 - d, 0.0, 1.0);
     if (coverage <= 0.0) {
         discard;
+    }
+    if (s.params.y == 2.0) {
+        // An image in premultiplied alpha, mip-mapped: back to straight alpha for blending.
+        vec2 size = s.rect.zw - s.rect.xy;
+        vec2 t = clamp((p - s.rect.xy) / size, 0.0, 1.0);
+        // UV change per pixel, exact for an axis-aligned rectangle.
+        vec2 per_px = (s.uv.zw - s.uv.xy) / size;
+        vec4 c = sample_texture_grad(s.tex.x, SAMPLER_LINEAR_CLAMP, mix(s.uv.xy, s.uv.zw, t),
+                                     vec2(per_px.x, 0.0), vec2(0.0, per_px.y)) * s.fill;
+        if (c.a <= 0.0) {
+            discard;
+        }
+        o_color = vec4(c.rgb / c.a, c.a * coverage);
+        return;
     }
     if (s.params.y == 0.0 || pc.backdrop == 0u) {
         // Flat (or glass before the backdrop exists): plain fill.
