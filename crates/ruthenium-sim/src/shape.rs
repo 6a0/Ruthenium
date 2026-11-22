@@ -117,7 +117,7 @@ impl Shape {
     }
 
     /// `DiscreteVoxelShape.isFullWide`: out of range is not full.
-    fn is_full_wide(&self, x: isize, y: isize, z: isize) -> bool {
+    pub(crate) fn is_full_wide(&self, x: isize, y: isize, z: isize) -> bool {
         if x < 0 || y < 0 || z < 0 {
             return false;
         }
@@ -126,6 +126,53 @@ impl Shape {
             return false;
         }
         self.full[(x * self.sizes[1] + y) * self.sizes[2] + z]
+    }
+
+    /// `forAllBoxes` with neighbours merged (`BitSetDiscreteVoxelShape.forAllBoxes`):
+    /// the full cells as boxes of cell indices `[x1, y1, z1, x2, y2, z2]` (ends
+    /// exclusive), in vanilla's order: y outermost, then x; each run along z grows
+    /// along x, then along y, clearing the cells it takes.
+    pub fn boxes(&self) -> Vec<[usize; 6]> {
+        let [xs, ys, zs] = self.sizes;
+        let mut full = self.full.clone();
+        let index = |x: usize, y: usize, z: usize| (x * ys + y) * zs + z;
+        // `isZStripFull`: cells start_z..end_z of the column at (x, y) are all full.
+        let strip_full = |full: &[bool], start: usize, end: usize, x: usize, y: usize| {
+            x < xs && y < ys && (start..end).all(|z| full[index(x, y, z)])
+        };
+        let clear_strip = |full: &mut [bool], start: usize, end: usize, x: usize, y: usize| {
+            for z in start..end {
+                full[index(x, y, z)] = false;
+            }
+        };
+        let mut out = Vec::new();
+        for y in 0..ys {
+            for x in 0..xs {
+                let mut start_z: Option<usize> = None;
+                for z in 0..=zs {
+                    if z < zs && full[index(x, y, z)] {
+                        start_z.get_or_insert(z);
+                    } else if let Some(start) = start_z.take() {
+                        let mut end_x = x;
+                        let mut end_y = y;
+                        clear_strip(&mut full, start, z, x, y);
+                        while strip_full(&full, start, z, end_x + 1, y) {
+                            clear_strip(&mut full, start, z, end_x + 1, y);
+                            end_x += 1;
+                        }
+                        // `isXZRectangleFull` one layer up.
+                        while (x..=end_x).all(|cx| strip_full(&full, start, z, cx, end_y + 1)) {
+                            for cx in x..=end_x {
+                                clear_strip(&mut full, start, z, cx, end_y + 1);
+                            }
+                            end_y += 1;
+                        }
+                        out.push([x, y, start, end_x + 1, end_y + 1, z]);
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -139,6 +186,34 @@ pub struct Placed<'a> {
 }
 
 impl Placed<'_> {
+    /// A coordinate of the shape as the block gives it, before its position: offset
+    /// for blocks offset by position (`getCoords` of the moved shape).
+    pub fn local(&self, axis: Axis, i: usize) -> f64 {
+        let base = self.shape.coords[axis as usize][i];
+        match self.offset {
+            Some(o) => base + o[axis as usize],
+            None => base,
+        }
+    }
+
+    /// `findIndex` against [`Placed::local`] coordinates (a coordinate relative to
+    /// the block's position).
+    pub fn find_index_local(&self, axis: Axis, coord: f64) -> isize {
+        let mut from = 0usize;
+        let mut len = self.shape.size(axis) + 1;
+        while len > 0 {
+            let half = len / 2;
+            let middle = from + half;
+            if coord < self.local(axis, middle) {
+                len = half;
+            } else {
+                from = middle + 1;
+                len -= half + 1;
+            }
+        }
+        from as isize - 1
+    }
+
     pub fn get(&self, axis: Axis, i: usize) -> f64 {
         let a = axis as usize;
         let base = self.shape.coords[a][i];
@@ -333,6 +408,35 @@ mod tests {
         assert_eq!(slab_at.collide(Axis::X, &on, 0.3), 0.3);
         assert!(slab_at.overlaps(&Aabb::new([2.0, -60.0, 0.0], [2.5, -59.6, 0.5])));
         assert!(!slab_at.overlaps(&Aabb::new([2.0, -59.5, 0.0], [2.5, -59.0, 0.5])));
+    }
+
+    #[test]
+    fn boxes_merge_like_vanilla() {
+        // Stairs facing east, bottom half: a slab plus the upper east quarter.
+        let stairs = Shape::new(&ShapeData {
+            coords: [vec![0.0, 0.5, 1.0], vec![0.0, 0.5, 1.0], vec![0.0, 1.0]],
+            // (x, y, z): (0,0) (0,1) (1,0) (1,1) with z innermost.
+            full: vec![true, false, true, true],
+        });
+        // The bottom layer merges along x; the upper east cell stays alone.
+        assert_eq!(stairs.boxes(), [[0, 0, 0, 2, 1, 1], [1, 1, 0, 2, 2, 1]]);
+        assert_eq!(Shape::block().boxes(), [[0, 0, 0, 1, 1, 1]]);
+        // A full 2x2x2 grid is one box, grown along x then y.
+        let cube = Shape::new(&ShapeData {
+            coords: [
+                vec![0.0, 0.5, 1.0],
+                vec![0.0, 0.5, 1.0],
+                vec![0.0, 0.5, 1.0],
+            ],
+            full: vec![true; 8],
+        });
+        assert_eq!(cube.boxes(), [[0, 0, 0, 2, 2, 2]]);
+        // Two z runs in one column stay apart.
+        let gaps = Shape::new(&ShapeData {
+            coords: [vec![0.0, 1.0], vec![0.0, 1.0], vec![0.0, 0.25, 0.75, 1.0]],
+            full: vec![true, false, true],
+        });
+        assert_eq!(gaps.boxes(), [[0, 0, 0, 1, 1, 1], [0, 0, 2, 1, 1, 3]]);
     }
 
     #[test]

@@ -39,7 +39,7 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * game's collision code sees it, the block's friction and speed and jump factors, and
  * the state's fluid and sturdy faces.
  *
- * <p>Format {@code block_physics} v3, after the header:
+ * <p>Format {@code block_physics} v4, after the header:
  * <ul>
  *   <li>u32 shape count, then per shape, for x, y and z: u32 n and n f64 coordinates;
  *       then the (nx-1)(ny-1)(nz-1) voxels as bits, x outermost and z innermost, packed
@@ -51,10 +51,13 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  *       flowing water, lava, flowing lava; bit 3: falling; bits 4-7: amount), u8 sturdy
  *       faces ({@code isFaceSturdy} at the origin, one bit per {@code Direction} in
  *       ordinal order: down, up, north, south, west, east); with flag 8, also u8 offset
- *       type (1 XZ, 2 XYZ), f32 max horizontal and f32 max vertical offset.</li>
+ *       type (1 XZ, 2 XYZ), f32 max horizontal and f32 max vertical offset; then u32
+ *       outline shape and u32 interaction shape (in the same table) and u8 interaction (1: the block's class
+ *       overrides {@code useWithoutItem}, 2: it overrides {@code useItemOn}).</li>
  * </ul>
  *
- * <p>The shape is the collision shape at the origin with an empty collision context.
+ * <p>The shape is the collision shape at the origin with an empty collision context, the
+ * outline shape ({@code getShape}, what the crosshair picks) likewise.
  * For a block offset by position, its coordinates are those before the offset (the
  * game moves the base shape by the offset, then by the block's position).
  */
@@ -94,14 +97,11 @@ final class BlockPhysicsExporter {
             Block block = state.getBlock();
             VoxelShape shape = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, CollisionContext.empty());
             boolean offset = state.hasOffsetFunction();
-            byte[] encoded = encode(shape, (DiscreteVoxelShape) discrete.get(shape), delegate, offset);
-            String key = java.util.Base64.getEncoder().encodeToString(encoded);
-            Integer id = shapeIds.get(key);
-            if (id == null) {
-                id = shapes.size();
-                shapes.add(encoded);
-                shapeIds.put(key, id);
-            }
+            int id = intern(shape, discrete, delegate, offset, shapes, shapeIds);
+            VoxelShape outlineShape = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, CollisionContext.empty());
+            int outline = intern(outlineShape, discrete, delegate, offset, shapes, shapeIds);
+            VoxelShape interactionShape = state.getInteractionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+            int interactionId = intern(interactionShape, discrete, delegate, offset, shapes, shapeIds);
             int flags = 0;
             if (state.hasLargeCollisionShape()) flags |= LARGE;
             if (block.hasDynamicShape()) flags |= DYNAMIC;
@@ -136,10 +136,13 @@ final class BlockPhysicsExporter {
                 states.f32((Float) maxH.invoke(block));
                 states.f32((Float) maxV.invoke(block));
             }
+            states.u32(outline);
+            states.u32(interactionId);
+            states.u8(interaction(block.getClass()));
         }
 
         // The empty shape first, so 0 means "no collision".
-        ExportWriter w = new ExportWriter("block_physics", 3);
+        ExportWriter w = new ExportWriter("block_physics", 4);
         w.u32(shapes.size());
         for (byte[] s : shapes) {
             w.bytes(s);
@@ -147,6 +150,33 @@ final class BlockPhysicsExporter {
         w.u32(count);
         w.bytes(states.payload());
         w.writeTo(file);
+    }
+
+    /** A shape's index in the table, added if it is new. */
+    private static int intern(VoxelShape shape, Field discrete, Field delegate, boolean offset,
+            List<byte[]> shapes, Map<String, Integer> shapeIds) throws IllegalAccessException {
+        byte[] encoded = encode(shape, (DiscreteVoxelShape) discrete.get(shape), delegate, offset);
+        String key = java.util.Base64.getEncoder().encodeToString(encoded);
+        Integer id = shapeIds.get(key);
+        if (id == null) {
+            id = shapes.size();
+            shapes.add(encoded);
+            shapeIds.put(key, id);
+        }
+        return id;
+    }
+
+    /** Whether a block class (or a superclass below {@code BlockBehaviour}) declares the use methods. */
+    private static int interaction(Class<?> c) {
+        int flags = 0;
+        for (; c != null && c != BlockBehaviour.class; c = c.getSuperclass()) {
+            for (Method m : c.getDeclaredMethods()) {
+                if (m.isSynthetic() || m.isBridge()) continue;
+                if (m.getName().equals("useWithoutItem")) flags |= 1;
+                if (m.getName().equals("useItemOn")) flags |= 2;
+            }
+        }
+        return flags;
     }
 
     /** A fluid state as one byte: its type, whether it is falling, and its amount. */

@@ -37,6 +37,7 @@ public final class Scenarios {
     private static final Function<Options, KeyMapping> SPRINT = o -> o.keySprint;
     private static final Function<Options, KeyMapping> ATTACK = o -> o.keyAttack;
     private static final Function<Options, KeyMapping> USE = o -> o.keyUse;
+    private static final Function<Options, KeyMapping> SWAP = o -> o.keySwapOffhand;
 
     private static Function<Options, KeyMapping> hotbar(int slot) {
         return o -> o.keyHotbarSlots[slot];
@@ -215,10 +216,10 @@ public final class Scenarios {
                     }),
             new Scenario("combat_basics",
                     "Hotbar keys and scrolling, attacking an armor stand, a missed swing, two quick attacks and blocking with a shield.",
-                    List.of("summon minecraft:armor_stand 2.5 -60 0.5",
-                            "item replace entity @a hotbar.0 with minecraft:diamond_sword",
+                    List.of("item replace entity @a hotbar.0 with minecraft:diamond_sword",
                             "item replace entity @a hotbar.1 with minecraft:shield"),
                     start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:armor_stand 2.5 -60 0.5");
                         ctx.getInput().pressKey(hotbar(0));
                         ctx.waitTicks(5);
                         ctx.getInput().pressKey(ATTACK);
@@ -378,6 +379,159 @@ public final class Scenarios {
                         hold(ctx, 30, W, SPRINT);
                         ctx.waitTicks(10);
                         server.runCommand("effect clear @a");
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("eating",
+                    "Eating and drinking while walking: cooked beef refused at full hunger, then eaten after hunger drains it, eaten while sprinting and stopped half way; a golden apple, a water potion, a honey bottle and milk to the end; a golden apple looking at the floor.",
+                    List.of(), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("item replace entity @a hotbar.0 with minecraft:cooked_beef 4");
+                        server.runCommand("item replace entity @a hotbar.1 with minecraft:golden_apple 4");
+                        server.runCommand("item replace entity @a hotbar.2 with minecraft:potion[minecraft:potion_contents={potion:\"minecraft:water\"}]");
+                        server.runCommand("item replace entity @a hotbar.3 with minecraft:honey_bottle 2");
+                        server.runCommand("item replace entity @a hotbar.4 with minecraft:milk_bucket");
+                        ctx.waitTicks(5);
+                        hold(ctx, 15, W, USE);
+                        ctx.waitTicks(5);
+                        server.runCommand("effect give @a minecraft:hunger 4 255 true");
+                        ctx.waitTicks(85);
+                        hold(ctx, 45, W, USE);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        ctx.waitTicks(10);
+                        hold(ctx, 15, USE);
+                        ctx.waitTicks(5);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.getInput().pressKey(hotbar(1));
+                        ctx.waitTicks(2);
+                        hold(ctx, 40, W, USE);
+                        ctx.getInput().pressKey(hotbar(2));
+                        ctx.waitTicks(2);
+                        hold(ctx, 40, S, USE);
+                        ctx.getInput().pressKey(hotbar(3));
+                        ctx.waitTicks(2);
+                        hold(ctx, 45, W, USE);
+                        ctx.getInput().pressKey(hotbar(4));
+                        ctx.waitTicks(2);
+                        hold(ctx, 36, S, USE);
+                        ctx.getInput().pressKey(hotbar(1));
+                        ctx.getInput().lookAt(-90, 70);
+                        ctx.waitTicks(2);
+                        hold(ctx, 12, W, USE);
+                        ctx.waitTicks(10);
+                    }),
+            new Scenario("offhand",
+                    "The off hand: a golden apple eaten from it with an empty main hand, past a sword and past a bow without arrows, kept on through a hotbar change; a shield blocking from it while walking; swapping hands while blocking and while eating.",
+                    List.of(), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("item replace entity @a weapon.offhand with minecraft:golden_apple 16");
+                        server.runCommand("item replace entity @a hotbar.1 with minecraft:diamond_sword");
+                        server.runCommand("item replace entity @a hotbar.2 with minecraft:bow");
+                        server.runCommand("item replace entity @a hotbar.3 with minecraft:golden_apple 8");
+                        ctx.waitTicks(5);
+                        hold(ctx, 20, W, USE);
+                        ctx.waitTicks(3);
+                        ctx.getInput().pressKey(hotbar(1));
+                        ctx.waitTicks(2);
+                        hold(ctx, 15, S, USE);
+                        ctx.getInput().pressKey(hotbar(2));
+                        ctx.waitTicks(2);
+                        ctx.getInput().holdKey(USE);
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(10);
+                        ctx.getInput().pressKey(hotbar(0));
+                        ctx.waitTicks(30);
+                        ctx.getInput().releaseKey(USE);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(5);
+                        server.runCommand("item replace entity @a weapon.offhand with minecraft:shield");
+                        ctx.getInput().pressKey(hotbar(1));
+                        ctx.waitTicks(3);
+                        ctx.getInput().holdKey(USE);
+                        ctx.getInput().holdKey(S);
+                        ctx.waitTicks(12);
+                        ctx.getInput().pressKey(SWAP);
+                        ctx.waitTicks(12);
+                        ctx.getInput().releaseKey(USE);
+                        ctx.getInput().releaseKey(S);
+                        ctx.waitTicks(3);
+                        ctx.getInput().pressKey(hotbar(3));
+                        ctx.waitTicks(2);
+                        ctx.getInput().holdKey(USE);
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(10);
+                        ctx.getInput().pressKey(SWAP);
+                        ctx.waitTicks(20);
+                        ctx.getInput().releaseKey(USE);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                    }),
+            new Scenario("ranged",
+                    "Drawing a bow while walking and shooting, charging a crossbow and firing it, readying a trident and throwing it, a spyglass, a goat horn and its cooldown.",
+                    List.of(), start(0.5, -60, 0.5, -90, -10), (ctx, server) -> {
+                        server.runCommand("item replace entity @a hotbar.0 with minecraft:bow");
+                        server.runCommand("item replace entity @a hotbar.1 with minecraft:crossbow");
+                        server.runCommand("item replace entity @a hotbar.2 with minecraft:trident");
+                        server.runCommand("item replace entity @a hotbar.3 with minecraft:spyglass");
+                        server.runCommand("item replace entity @a hotbar.4 with minecraft:goat_horn");
+                        server.runCommand("item replace entity @a inventory.0 with minecraft:arrow 16");
+                        ctx.waitTicks(5);
+                        hold(ctx, 25, W, USE);
+                        ctx.waitTicks(5);
+                        ctx.getInput().pressKey(hotbar(1));
+                        ctx.waitTicks(2);
+                        hold(ctx, 32, S, USE);
+                        ctx.waitTicks(5);
+                        ctx.getInput().pressKey(USE);
+                        ctx.waitTicks(8);
+                        ctx.getInput().pressKey(hotbar(2));
+                        ctx.waitTicks(2);
+                        hold(ctx, 15, W, USE);
+                        ctx.waitTicks(8);
+                        ctx.getInput().pressKey(hotbar(3));
+                        ctx.waitTicks(2);
+                        hold(ctx, 15, S, USE);
+                        ctx.getInput().pressKey(hotbar(4));
+                        ctx.waitTicks(2);
+                        hold(ctx, 12, W, USE);
+                        ctx.waitTicks(3);
+                        hold(ctx, 10, S, USE);
+                        ctx.waitTicks(5);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("throwing",
+                    "Experience bottles thrown with two clicks a tick, then switching to a golden apple while still clicking, then holding to eat it; snowballs thrown by holding use; ender pearls straight up, held back by their cooldown, landing back on the player.",
+                    List.of(), start(0.5, -60, 0.5, -90, -30), (ctx, server) -> {
+                        server.runCommand("item replace entity @a hotbar.0 with minecraft:experience_bottle 64");
+                        server.runCommand("item replace entity @a hotbar.1 with minecraft:golden_apple 16");
+                        server.runCommand("item replace entity @a hotbar.2 with minecraft:snowball 16");
+                        server.runCommand("item replace entity @a hotbar.3 with minecraft:ender_pearl 4");
+                        ctx.waitTicks(5);
+                        ctx.getInput().holdKey(W);
+                        for (int i = 0; i < 20; i++) {
+                            ctx.getInput().pressKey(USE);
+                            ctx.getInput().pressKey(USE);
+                            ctx.waitTick();
+                        }
+                        ctx.getInput().pressKey(hotbar(1));
+                        for (int i = 0; i < 30; i++) {
+                            ctx.getInput().pressKey(USE);
+                            ctx.getInput().pressKey(USE);
+                            ctx.waitTick();
+                        }
+                        hold(ctx, 40, USE);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(5);
+                        ctx.getInput().pressKey(hotbar(2));
+                        ctx.waitTicks(2);
+                        hold(ctx, 20, S, USE);
+                        ctx.getInput().pressKey(hotbar(3));
+                        ctx.getInput().lookAt(-90, -90);
+                        ctx.waitTicks(2);
+                        hold(ctx, 30, USE);
+                        ctx.waitTicks(40);
+                        server.runCommand("kill @e[type=!minecraft:player]");
                         ctx.waitTicks(5);
                     }));
 }

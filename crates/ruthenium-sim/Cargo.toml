@@ -16,6 +16,7 @@ ruthenium-prepare = { path = "../ruthenium-prepare" }
 ruthenium-javamath = { path = "../ruthenium-javamath" }
 ruthenium-net = { path = "../ruthenium-net" }
 ruthenium-protocol = { path = "../ruthenium-protocol" }
+serde_json = "1.0.154"
 
 [dev-dependencies]
 ruthenium-assets = { path = "../ruthenium-assets" }

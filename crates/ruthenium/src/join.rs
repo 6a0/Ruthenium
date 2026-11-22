@@ -13,6 +13,7 @@ use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
 use ruthenium_sim::blocks::Blocks;
 use ruthenium_sim::entity::EntityTypes;
+use ruthenium_sim::item::Items;
 use ruthenium_sim::session::{DimensionType, Physics, Session, SessionOptions};
 
 use crate::account::Accounts;
@@ -87,10 +88,19 @@ impl GameData {
                     );
                     EntityTypes::default()
                 });
+                // Without items nothing in the hands can be used.
+                let reports = ruthenium_prepare::datagen::reports_dir(&imported);
+                let items = Items::load(&exports, &reports).unwrap_or_else(|e| {
+                    eprintln!(
+                        "[ruthenium] no item data ({e}); run `ruthenium prepare`. Items can't be used"
+                    );
+                    Items::default()
+                });
                 Some(Physics {
                     blocks: Arc::new(blocks),
                     entity_types: Arc::new(entity_types),
                     dimension_types: dimension_types(&jar),
+                    items: Arc::new(items),
                 })
             }
             Err(e) => {

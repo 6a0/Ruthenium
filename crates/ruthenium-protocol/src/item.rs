@@ -1,0 +1,1572 @@
+//! Item stacks as the server sends them, with their data component patches.
+//!
+//! A stack is `ItemStack.OPTIONAL_STREAM_CODEC`: a count (0 or less is the empty stack),
+//! the item's registry id, then the patch over the item's default components
+//! (`DataComponentPatch.STREAM_CODEC`): how many components are added, how many removed,
+//! each added one as its type id and value, then each removed type id. The values are
+//! not length-prefixed (that is only the untrusted serverbound codec), so every value
+//! must be read exactly: one byte too few or too many loses everything after it.
+//!
+//! Every component type has a reader here. The ones the client simulation uses are
+//! [`Component`]'s typed variants; the rest are kept as their raw bytes
+//! ([`Component::Other`]). Types without a network codec of their own (custom data,
+//! locks, recipes...) go over the wire as one network NBT tag, as vanilla's fallback
+//! (`ByteBufCodecs.fromCodecWithRegistries`) sends them.
+//!
+//! Encodings that recur:
+//! - a *registry holder* (`ByteBufCodecs.holderRegistry`) is the plain VarInt id;
+//! - a *holder* (`ByteBufCodecs.holder`) is a VarInt: 0 means the value follows inline,
+//!   anything else is the registry id plus one;
+//! - a *holder set* (`ByteBufCodecs.holderSet`) is a VarInt n: 0 means a tag
+//!   identifier follows, otherwise n - 1 registry ids follow;
+//! - text components and other codec-backed values are one network NBT tag.
+
+use ruthenium_data::v26_3::registries::DataComponentType as Kind;
+
+use crate::wire::{MAX_STRING, Reader, WireError};
+
+/// How deeply stacks and recursive values (a stack in a bundle in a bundle, an effect's
+/// hidden effect) may nest before the reader refuses them, so that a hostile packet
+/// can't exhaust the stack.
+const MAX_DEPTH: u32 = 64;
+
+/// An item stack: the item (`minecraft:item` registry id), how many, and the changes to
+/// the item's default components.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ItemStack {
+    pub item: i32,
+    pub count: i32,
+    pub patch: ComponentPatch,
+}
+
+impl ItemStack {
+    /// The empty stack (air, none of it).
+    pub const EMPTY: ItemStack = ItemStack {
+        item: 0,
+        count: 0,
+        patch: ComponentPatch::EMPTY,
+    };
+
+    /// Whether this is the empty stack: air, or a count of zero or less (as vanilla's
+    /// `ItemStack.isEmpty`).
+    pub fn is_empty(&self) -> bool {
+        self.item == 0 || self.count <= 0
+    }
+
+    /// The component of type `kind` the patch adds, if it adds one.
+    pub fn get(&self, kind: Kind) -> Option<&Component> {
+        self.patch.get(kind)
+    }
+
+    /// A stack that may be empty (`ItemStack.OPTIONAL_STREAM_CODEC`).
+    pub fn read_optional(r: &mut Reader<'_>) -> Result<ItemStack, WireError> {
+        read_optional(r, 0)
+    }
+
+    /// A stack that must not be empty (`ItemStack.STREAM_CODEC`).
+    pub fn read(r: &mut Reader<'_>) -> Result<ItemStack, WireError> {
+        let stack = read_optional(r, 0)?;
+        if stack.is_empty() {
+            return Err(WireError::Invalid("empty item stack"));
+        }
+        Ok(stack)
+    }
+
+    /// An `ItemStackTemplate` (what bundles, crossbows and use remainders hold): the item
+    /// first, then the count, then the patch; never empty.
+    pub fn read_template(r: &mut Reader<'_>) -> Result<ItemStack, WireError> {
+        read_template(r, 0)
+    }
+}
+
+fn deeper(depth: u32) -> Result<u32, WireError> {
+    if depth >= MAX_DEPTH {
+        return Err(WireError::Invalid("item data nested too deeply"));
+    }
+    Ok(depth + 1)
+}
+
+fn read_optional(r: &mut Reader<'_>, depth: u32) -> Result<ItemStack, WireError> {
+    let count = r.varint()?;
+    if count <= 0 {
+        return Ok(ItemStack::EMPTY);
+    }
+    let item = r.varint()?;
+    let patch = ComponentPatch::read(r, deeper(depth)?)?;
+    Ok(ItemStack { item, count, patch })
+}
+
+fn read_template(r: &mut Reader<'_>, depth: u32) -> Result<ItemStack, WireError> {
+    let item = r.varint()?;
+    let count = r.varint()?;
+    // `ItemStackTemplate` refuses air and a count of zero.
+    if item == 0 || count == 0 {
+        return Err(WireError::Invalid("empty item stack template"));
+    }
+    let patch = ComponentPatch::read(r, deeper(depth)?)?;
+    Ok(ItemStack { item, count, patch })
+}
+
+/// The changes a stack makes to its item's default components: the components it adds
+/// or replaces (type id, value) and the types it removes, in the server's order.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ComponentPatch {
+    pub added: Vec<(i32, Component)>,
+    pub removed: Vec<i32>,
+}
+
+impl ComponentPatch {
+    pub const EMPTY: ComponentPatch = ComponentPatch {
+        added: Vec::new(),
+        removed: Vec::new(),
+    };
+
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+
+    /// The value the patch gives `kind`, if it adds one.
+    pub fn get(&self, kind: Kind) -> Option<&Component> {
+        let id = kind.id() as i32;
+        self.added.iter().find(|(k, _)| *k == id).map(|(_, c)| c)
+    }
+
+    /// Whether the patch removes `kind` from the item's defaults.
+    pub fn removes(&self, kind: Kind) -> bool {
+        self.removed.contains(&(kind.id() as i32))
+    }
+
+    fn read(r: &mut Reader<'_>, depth: u32) -> Result<ComponentPatch, WireError> {
+        let added_count = r.count(usize::MAX)?;
+        let removed_count = r.count(usize::MAX)?;
+        let mut added = Vec::with_capacity(added_count.min(64));
+        for _ in 0..added_count {
+            let kind = r.varint()?;
+            added.push((kind, read_component(r, kind, depth)?));
+        }
+        let mut removed = Vec::with_capacity(removed_count.min(64));
+        for _ in 0..removed_count {
+            let kind = r.varint()?;
+            component_kind(kind)?;
+            removed.push(kind);
+        }
+        Ok(ComponentPatch { added, removed })
+    }
+}
+
+/// A registry entry given by id or written out inline (`ByteBufCodecs.holder`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holder {
+    /// The registry id.
+    Id(i32),
+    /// A value sent inline, not kept.
+    Inline,
+}
+
+/// An item's swing (`SwingAnimation`): the `SwingAnimationType` id and its length in
+/// ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwingAnimation {
+    pub kind: i32,
+    pub duration: i32,
+}
+
+/// A condition of a [`KineticWeapon`] effect (`KineticWeapon.Condition`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KineticCondition {
+    pub max_duration_ticks: i32,
+    pub min_speed: f32,
+    pub min_relative_speed: f32,
+}
+
+/// A charged weapon (`KineticWeapon`, the spear); its sounds are skipped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KineticWeapon {
+    pub contact_cooldown_ticks: i32,
+    pub delay_ticks: i32,
+    pub dismount_conditions: Option<KineticCondition>,
+    pub knockback_conditions: Option<KineticCondition>,
+    pub damage_conditions: Option<KineticCondition>,
+    pub forward_movement: f32,
+    pub damage_multiplier: f32,
+}
+
+/// A component's value: the typed ones the client uses, and the raw bytes of the rest.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Component {
+    MaxStackSize(i32),
+    MaxDamage(i32),
+    Damage(i32),
+    Unbreakable,
+    UseEffects {
+        can_sprint: bool,
+        interact_vibrations: bool,
+        speed_multiplier: f32,
+    },
+    MinimumAttackCharge(f32),
+    /// (`minecraft:enchantment` id, level) pairs.
+    Enchantments(Vec<(i32, i32)>),
+    Food {
+        nutrition: i32,
+        saturation: f32,
+        can_always_eat: bool,
+    },
+    /// The sound and the effects are skipped; `animation` is the `ItemUseAnimation` id.
+    Consumable {
+        consume_seconds: f32,
+        animation: i32,
+        has_consume_particles: bool,
+    },
+    UseRemainder(Box<ItemStack>),
+    UseCooldown {
+        seconds: f32,
+        cooldown_group: Option<String>,
+    },
+    Weapon {
+        item_damage_per_attack: i32,
+        disable_blocking_for_seconds: f32,
+    },
+    AttackRange {
+        min_reach: f32,
+        max_reach: f32,
+        min_creative_reach: f32,
+        max_creative_reach: f32,
+        hitbox_margin: f32,
+        mob_factor: f32,
+    },
+    /// `slot` is the `EquipmentSlot` id; the sounds, assets and allowed entities are
+    /// skipped.
+    Equippable {
+        slot: i32,
+        swappable: bool,
+        damage_on_hurt: bool,
+        equip_on_interact: bool,
+        can_be_sheared: bool,
+    },
+    Glider,
+    /// Its effects are skipped.
+    DeathProtection,
+    /// The damage reductions, item damage, bypassing types and sounds are skipped.
+    BlocksAttacks {
+        block_delay_seconds: f32,
+        disable_cooldown_scale: f32,
+    },
+    /// Its sounds are skipped.
+    PiercingWeapon {
+        deals_knockback: bool,
+        dismounts: bool,
+    },
+    KineticWeapon(KineticWeapon),
+    AttackAnimation(SwingAnimation),
+    InteractAnimation(SwingAnimation),
+    StoredEnchantments(Vec<(i32, i32)>),
+    ChargedProjectiles(Vec<ItemStack>),
+    BundleContents(Vec<ItemStack>),
+    /// The potion (`minecraft:potion` id), if any; the colour, custom effects and name
+    /// are skipped.
+    PotionContents {
+        potion: Option<i32>,
+    },
+    Instrument(Holder),
+    /// A container's slots in order; an empty slot is the empty stack.
+    Container(Vec<ItemStack>),
+    /// Any other component: its type id and its value's bytes as sent.
+    Other {
+        kind: i32,
+        data: Vec<u8>,
+    },
+}
+
+fn component_kind(kind: i32) -> Result<Kind, WireError> {
+    u32::try_from(kind)
+        .ok()
+        .and_then(Kind::from_id)
+        .ok_or(WireError::Invalid("data component type"))
+}
+
+/// Reads the value of a component of type `kind`.
+fn read_component(r: &mut Reader<'_>, kind: i32, depth: u32) -> Result<Component, WireError> {
+    let k = component_kind(kind)?;
+    let mut start = r.clone();
+    let c = match k {
+        Kind::MaxStackSize => Component::MaxStackSize(r.varint()?),
+        Kind::MaxDamage => Component::MaxDamage(r.varint()?),
+        Kind::Damage => Component::Damage(r.varint()?),
+        Kind::Unbreakable => Component::Unbreakable,
+        Kind::UseEffects => Component::UseEffects {
+            can_sprint: r.bool()?,
+            interact_vibrations: r.bool()?,
+            speed_multiplier: r.f32()?,
+        },
+        Kind::MinimumAttackCharge => Component::MinimumAttackCharge(r.f32()?),
+        Kind::Enchantments => Component::Enchantments(enchantments(r)?),
+        Kind::StoredEnchantments => Component::StoredEnchantments(enchantments(r)?),
+        Kind::Food => Component::Food {
+            nutrition: r.varint()?,
+            saturation: r.f32()?,
+            can_always_eat: r.bool()?,
+        },
+        Kind::Consumable => {
+            let consume_seconds = r.f32()?;
+            let animation = r.varint()?;
+            sound(r)?;
+            let has_consume_particles = r.bool()?;
+            skip_list(r, usize::MAX, |r| consume_effect(r, depth))?;
+            Component::Consumable {
+                consume_seconds,
+                animation,
+                has_consume_particles,
+            }
+        }
+        Kind::UseRemainder => Component::UseRemainder(Box::new(read_template(r, depth)?)),
+        Kind::UseCooldown => Component::UseCooldown {
+            seconds: r.f32()?,
+            cooldown_group: opt(r, |r| r.identifier())?,
+        },
+        Kind::Weapon => Component::Weapon {
+            item_damage_per_attack: r.varint()?,
+            disable_blocking_for_seconds: r.f32()?,
+        },
+        Kind::AttackRange => Component::AttackRange {
+            min_reach: r.f32()?,
+            max_reach: r.f32()?,
+            min_creative_reach: r.f32()?,
+            max_creative_reach: r.f32()?,
+            hitbox_margin: r.f32()?,
+            mob_factor: r.f32()?,
+        },
+        Kind::Equippable => {
+            let slot = r.varint()?;
+            sound(r)?;
+            // The asset id, the camera overlay, the entities that may wear it.
+            opt(r, |r| r.identifier())?;
+            opt(r, |r| r.identifier())?;
+            opt(r, holder_set)?;
+            let _dispensable = r.bool()?;
+            let c = Component::Equippable {
+                slot,
+                swappable: r.bool()?,
+                damage_on_hurt: r.bool()?,
+                equip_on_interact: r.bool()?,
+                can_be_sheared: r.bool()?,
+            };
+            sound(r)?;
+            c
+        }
+        Kind::Glider => Component::Glider,
+        Kind::DeathProtection => {
+            skip_list(r, usize::MAX, |r| consume_effect(r, depth))?;
+            Component::DeathProtection
+        }
+        Kind::BlocksAttacks => {
+            let c = Component::BlocksAttacks {
+                block_delay_seconds: r.f32()?,
+                disable_cooldown_scale: r.f32()?,
+            };
+            // Damage reductions: angle, optional types, base, factor.
+            skip_list(r, usize::MAX, |r| {
+                r.f32()?;
+                opt(r, holder_set)?;
+                r.f32()?;
+                r.f32()?;
+                Ok(())
+            })?;
+            // Item damage: threshold, base, factor.
+            for _ in 0..3 {
+                r.f32()?;
+            }
+            opt(r, holder_set)?;
+            opt(r, sound)?;
+            opt(r, sound)?;
+            c
+        }
+        Kind::PiercingWeapon => {
+            let c = Component::PiercingWeapon {
+                deals_knockback: r.bool()?,
+                dismounts: r.bool()?,
+            };
+            opt(r, sound)?;
+            opt(r, sound)?;
+            c
+        }
+        Kind::KineticWeapon => {
+            let condition = |r: &mut Reader<'_>| {
+                opt(r, |r| {
+                    Ok(KineticCondition {
+                        max_duration_ticks: r.varint()?,
+                        min_speed: r.f32()?,
+                        min_relative_speed: r.f32()?,
+                    })
+                })
+            };
+            let w = KineticWeapon {
+                contact_cooldown_ticks: r.varint()?,
+                delay_ticks: r.varint()?,
+                dismount_conditions: condition(r)?,
+                knockback_conditions: condition(r)?,
+                damage_conditions: condition(r)?,
+                forward_movement: r.f32()?,
+                damage_multiplier: r.f32()?,
+            };
+            opt(r, sound)?;
+            opt(r, sound)?;
+            Component::KineticWeapon(w)
+        }
+        Kind::AttackAnimation => Component::AttackAnimation(swing_animation(r)?),
+        Kind::InteractAnimation => Component::InteractAnimation(swing_animation(r)?),
+        Kind::ChargedProjectiles => {
+            Component::ChargedProjectiles(list(r, 1024, |r| read_template(r, depth))?)
+        }
+        Kind::BundleContents => {
+            Component::BundleContents(list(r, usize::MAX, |r| read_template(r, depth))?)
+        }
+        Kind::Container => Component::Container(list(r, 256, |r| {
+            Ok(opt(r, |r| read_template(r, depth))?.unwrap_or_default())
+        })?),
+        Kind::PotionContents => {
+            let potion = opt(r, |r| r.varint())?;
+            // Custom colour, custom effects, custom name.
+            opt(r, |r| r.i32())?;
+            skip_list(r, usize::MAX, |r| mob_effect(r, depth))?;
+            opt(r, |r| r.string(MAX_STRING).map(drop))?;
+            Component::PotionContents { potion }
+        }
+        Kind::Instrument => Component::Instrument(holder(r, |r| {
+            // Sound, use duration, range, durability damage, description.
+            sound(r)?;
+            r.f32()?;
+            r.f32()?;
+            r.varint()?;
+            nbt(r)
+        })?),
+        other => {
+            skip_value(r, other, depth)?;
+            let used = start.remaining() - r.remaining();
+            return Ok(Component::Other {
+                kind,
+                data: start.bytes(used)?.to_vec(),
+            });
+        }
+    };
+    Ok(c)
+}
+
+/// Reads past the value of a component that isn't typed.
+fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> {
+    match k {
+        // Types with no network codec: the persistent codec's NBT.
+        Kind::CustomData
+        | Kind::IntangibleProjectile
+        | Kind::MapDecorations
+        | Kind::DebugStickState
+        | Kind::Recipes
+        | Kind::Lock
+        | Kind::ContainerLoot => nbt(r)?,
+        // Text components.
+        Kind::CustomName | Kind::ItemName => nbt(r)?,
+        Kind::BucketEntityData => compound(r)?,
+        Kind::Lore => skip_list(r, 256, nbt)?,
+        // Units.
+        Kind::CreativeSlotLock | Kind::Waxed => {}
+        Kind::EnchantmentGlintOverride => {
+            r.bool()?;
+        }
+        Kind::PotionDurationScale => {
+            r.f32()?;
+        }
+        Kind::DyedColor => {
+            r.i32()?;
+        }
+        // One VarInt: a number, an enum id or a registry id.
+        Kind::DamageType
+        | Kind::Rarity
+        | Kind::RepairCost
+        | Kind::Enchantable
+        | Kind::AdditionalTradeCost
+        | Kind::BlockTransformer
+        | Kind::VillagerFood
+        | Kind::Dye
+        | Kind::MapId
+        | Kind::MapPostProcessing
+        | Kind::OminousBottleAmplifier
+        | Kind::BaseColor
+        | Kind::VillagerVariant
+        | Kind::WolfVariant
+        | Kind::WolfSoundVariant
+        | Kind::WolfCollar
+        | Kind::FoxVariant
+        | Kind::SalmonSize
+        | Kind::ParrotVariant
+        | Kind::TropicalFishPattern
+        | Kind::TropicalFishBaseColor
+        | Kind::TropicalFishPatternColor
+        | Kind::MooshroomVariant
+        | Kind::RabbitVariant
+        | Kind::PigVariant
+        | Kind::PigSoundVariant
+        | Kind::CowVariant
+        | Kind::CowSoundVariant
+        | Kind::ChickenVariant
+        | Kind::ChickenSoundVariant
+        | Kind::ZombieNautilusVariant
+        | Kind::FrogVariant
+        | Kind::HorseVariant
+        | Kind::LlamaVariant
+        | Kind::AxolotlVariant
+        | Kind::CatVariant
+        | Kind::CatSoundVariant
+        | Kind::CatCollar
+        | Kind::SheepColor
+        | Kind::ShulkerColor
+        | Kind::ProvidesPotteryPattern
+        | Kind::CushionColor => {
+            r.varint()?;
+        }
+        Kind::ItemModel | Kind::TooltipStyle | Kind::NoteBlockSound => {
+            r.identifier()?;
+        }
+        Kind::CanPlaceOn | Kind::CanBreak => {
+            skip_list(r, usize::MAX, |r| block_predicate(r, depth))?
+        }
+        Kind::AttributeModifiers => skip_list(r, usize::MAX, |r| {
+            // Attribute, modifier id, amount, operation, slot group, display.
+            r.varint()?;
+            r.identifier()?;
+            r.f64()?;
+            r.varint()?;
+            r.varint()?;
+            // Display: default (0) and hidden (1) carry nothing, an override (2) its
+            // text; ids out of range fall back to default.
+            if r.varint()? == 2 {
+                nbt(r)?;
+            }
+            Ok(())
+        })?,
+        Kind::CustomModelData => {
+            skip_list(r, usize::MAX, |r| r.f32().map(drop))?;
+            skip_list(r, usize::MAX, |r| r.bool().map(drop))?;
+            skip_list(r, usize::MAX, |r| r.string(MAX_STRING).map(drop))?;
+            skip_list(r, usize::MAX, |r| r.i32().map(drop))?;
+        }
+        Kind::TooltipDisplay => {
+            r.bool()?;
+            skip_list(r, usize::MAX, |r| r.varint().map(drop))?;
+        }
+        Kind::DamageResistant | Kind::Repairable | Kind::ProvidesBannerPatterns => holder_set(r)?,
+        Kind::Tool => {
+            skip_list(r, usize::MAX, |r| {
+                holder_set(r)?;
+                opt(r, |r| r.f32())?;
+                opt(r, |r| r.bool())?;
+                Ok(())
+            })?;
+            r.f32()?;
+            r.varint()?;
+            r.bool()?;
+        }
+        Kind::SuspiciousStewEffects => skip_list(r, usize::MAX, |r| {
+            r.varint()?;
+            r.varint().map(drop)
+        })?,
+        Kind::WritableBookContent => {
+            skip_list(r, 100, |r| filterable(r, |r| r.string(1024).map(drop)))?
+        }
+        Kind::WrittenBookContent => {
+            filterable(r, |r| r.string(32).map(drop))?;
+            r.string(MAX_STRING)?;
+            r.varint()?;
+            skip_list(r, usize::MAX, |r| filterable(r, nbt))?;
+            r.bool()?;
+        }
+        Kind::Trim => {
+            trim_material(r)?;
+            holder(r, |r| {
+                r.identifier()?;
+                nbt(r)?;
+                r.bool().map(drop)
+            })?;
+        }
+        Kind::ProvidesTrimMaterial => trim_material(r)?,
+        Kind::EntityData | Kind::BlockEntityData => {
+            r.varint()?;
+            compound(r)?;
+        }
+        Kind::JukeboxPlayable => {
+            holder(r, |r| {
+                // Sound, description, length in seconds, comparator output.
+                sound(r)?;
+                nbt(r)?;
+                r.f32()?;
+                r.varint().map(drop)
+            })?;
+        }
+        Kind::LodestoneTracker => {
+            opt(r, |r| {
+                r.identifier()?;
+                r.i64().map(drop)
+            })?;
+            r.bool()?;
+        }
+        Kind::FireworkExplosion => firework_explosion(r)?,
+        Kind::Fireworks => {
+            r.varint()?;
+            skip_list(r, 256, firework_explosion)?;
+        }
+        Kind::Profile => profile(r)?,
+        Kind::BannerPatterns => skip_list(r, usize::MAX, |r| {
+            holder(r, |r| {
+                r.identifier()?;
+                r.string(MAX_STRING).map(drop)
+            })?;
+            r.varint().map(drop)
+        })?,
+        Kind::PotDecorations => {
+            for _ in 0..4 {
+                opt(r, |r| read_template(r, depth))?;
+            }
+        }
+        Kind::BlockState => skip_list(r, usize::MAX, |r| {
+            r.string(MAX_STRING)?;
+            r.string(MAX_STRING).map(drop)
+        })?,
+        Kind::Bees => skip_list(r, usize::MAX, |r| {
+            // Entity type and data, ticks in the hive, minimum ticks.
+            r.varint()?;
+            compound(r)?;
+            r.varint()?;
+            r.varint().map(drop)
+        })?,
+        Kind::SulfurCubeContent => {
+            read_template(r, depth)?;
+        }
+        Kind::BreakSound => sound(r)?,
+        Kind::Compostable => resolvable_int(r)?,
+        Kind::CookingFuel | Kind::BrewingFuel => {
+            resolvable_int(r)?;
+            resolvable_float(r)?;
+        }
+        Kind::MobVisibility => {
+            holder_set(r)?;
+            r.f32()?;
+        }
+        Kind::PaintingVariant => {
+            holder(r, |r| {
+                // Width, height, asset, optional title and author.
+                r.varint()?;
+                r.varint()?;
+                r.identifier()?;
+                opt(r, nbt)?;
+                opt(r, nbt).map(drop)
+            })?;
+        }
+        Kind::SignTextFront | Kind::SignTextBack => {
+            // Four messages, optionally four filtered ones, the colour, glowing.
+            for _ in 0..4 {
+                nbt(r)?;
+            }
+            opt(r, |r| (0..4).try_for_each(|_| nbt(r)))?;
+            r.varint()?;
+            r.bool()?;
+        }
+        // The typed ones are read by `read_component`.
+        Kind::MaxStackSize
+        | Kind::MaxDamage
+        | Kind::Damage
+        | Kind::Unbreakable
+        | Kind::UseEffects
+        | Kind::MinimumAttackCharge
+        | Kind::Enchantments
+        | Kind::StoredEnchantments
+        | Kind::Food
+        | Kind::Consumable
+        | Kind::UseRemainder
+        | Kind::UseCooldown
+        | Kind::Weapon
+        | Kind::AttackRange
+        | Kind::Equippable
+        | Kind::Glider
+        | Kind::DeathProtection
+        | Kind::BlocksAttacks
+        | Kind::PiercingWeapon
+        | Kind::KineticWeapon
+        | Kind::AttackAnimation
+        | Kind::InteractAnimation
+        | Kind::ChargedProjectiles
+        | Kind::BundleContents
+        | Kind::Container
+        | Kind::PotionContents
+        | Kind::Instrument => {
+            read_component(r, k.id() as i32, depth)?;
+        }
+    }
+    Ok(())
+}
+
+/// `Some` value if a true boolean comes first (`ByteBufCodecs.optional`).
+fn opt<T>(
+    r: &mut Reader<'_>,
+    f: impl FnOnce(&mut Reader<'_>) -> Result<T, WireError>,
+) -> Result<Option<T>, WireError> {
+    if r.bool()? { f(r).map(Some) } else { Ok(None) }
+}
+
+/// A VarInt count of at most `max`, then that many values.
+fn list<T>(
+    r: &mut Reader<'_>,
+    max: usize,
+    mut f: impl FnMut(&mut Reader<'_>) -> Result<T, WireError>,
+) -> Result<Vec<T>, WireError> {
+    let n = r.count(max)?;
+    let mut out = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        out.push(f(r)?);
+    }
+    Ok(out)
+}
+
+fn skip_list(
+    r: &mut Reader<'_>,
+    max: usize,
+    mut f: impl FnMut(&mut Reader<'_>) -> Result<(), WireError>,
+) -> Result<(), WireError> {
+    let n = r.count(max)?;
+    for _ in 0..n {
+        f(r)?;
+    }
+    Ok(())
+}
+
+/// One network NBT tag; the end tag (vanilla's null) is refused, as `ByteBufCodecs.TAG`
+/// does.
+fn nbt(r: &mut Reader<'_>) -> Result<(), WireError> {
+    match r.nbt()? {
+        Some(_) => Ok(()),
+        None => Err(WireError::Invalid("missing NBT tag")),
+    }
+}
+
+/// One network NBT compound (`ByteBufCodecs.COMPOUND_TAG`).
+fn compound(r: &mut Reader<'_>) -> Result<(), WireError> {
+    match r.nbt()? {
+        Some(crate::nbt::Tag::Compound(_)) => Ok(()),
+        _ => Err(WireError::Invalid("expected an NBT compound")),
+    }
+}
+
+/// A holder: `Holder::Id` for a registry entry, or the inline value read by `inline`.
+fn holder(
+    r: &mut Reader<'_>,
+    inline: impl FnOnce(&mut Reader<'_>) -> Result<(), WireError>,
+) -> Result<Holder, WireError> {
+    match r.varint()? {
+        0 => {
+            inline(r)?;
+            Ok(Holder::Inline)
+        }
+        n => Ok(Holder::Id(n - 1)),
+    }
+}
+
+/// A holder set: a tag, or a list of registry ids.
+fn holder_set(r: &mut Reader<'_>) -> Result<(), WireError> {
+    match r.varint()? {
+        0 => {
+            r.identifier()?;
+        }
+        n if n > 0 => {
+            for _ in 1..n {
+                r.varint()?;
+            }
+        }
+        _ => return Err(WireError::Invalid("holder set size")),
+    }
+    Ok(())
+}
+
+/// `SoundEvent.STREAM_CODEC`: a holder whose inline value is the sound's identifier and
+/// an optional fixed range.
+fn sound(r: &mut Reader<'_>) -> Result<(), WireError> {
+    holder(r, |r| {
+        r.identifier()?;
+        opt(r, |r| r.f32()).map(drop)
+    })
+    .map(drop)
+}
+
+fn enchantments(r: &mut Reader<'_>) -> Result<Vec<(i32, i32)>, WireError> {
+    // A map from a registry holder (the plain id) to the level.
+    list(r, usize::MAX, |r| Ok((r.varint()?, r.varint()?)))
+}
+
+fn swing_animation(r: &mut Reader<'_>) -> Result<SwingAnimation, WireError> {
+    Ok(SwingAnimation {
+        kind: r.varint()?,
+        duration: r.varint()?,
+    })
+}
+
+/// `MobEffectInstance.STREAM_CODEC`: the effect id, then its details.
+fn mob_effect(r: &mut Reader<'_>, depth: u32) -> Result<(), WireError> {
+    r.varint()?;
+    mob_effect_details(r, depth)
+}
+
+/// Amplifier, duration, ambient, particles, icon, then optionally the hidden effect's
+/// details, recursively.
+fn mob_effect_details(r: &mut Reader<'_>, depth: u32) -> Result<(), WireError> {
+    r.varint()?;
+    r.varint()?;
+    r.bool()?;
+    r.bool()?;
+    r.bool()?;
+    let depth = deeper(depth)?;
+    opt(r, |r| mob_effect_details(r, depth)).map(drop)
+}
+
+/// `ConsumeEffect.STREAM_CODEC`: the `minecraft:consume_effect_type` id, then that
+/// type's fields.
+fn consume_effect(r: &mut Reader<'_>, depth: u32) -> Result<(), WireError> {
+    match r.varint()? {
+        // apply_effects: the effects and a probability.
+        0 => {
+            skip_list(r, usize::MAX, |r| mob_effect(r, depth))?;
+            r.f32()?;
+        }
+        // remove_effects.
+        1 => holder_set(r)?,
+        // clear_all_effects.
+        2 => {}
+        // teleport_randomly: the diameter and whether particles follow the direction.
+        3 => {
+            r.f32()?;
+            r.bool()?;
+        }
+        // play_sound.
+        4 => sound(r)?,
+        _ => return Err(WireError::Invalid("consume effect type")),
+    }
+    Ok(())
+}
+
+/// `BlockPredicate.STREAM_CODEC` (an adventure-mode predicate's entries): optional
+/// blocks, optional state properties, optional NBT, then the component matchers.
+fn block_predicate(r: &mut Reader<'_>, depth: u32) -> Result<(), WireError> {
+    opt(r, holder_set)?;
+    opt(r, |r| {
+        skip_list(r, usize::MAX, |r| {
+            r.string(MAX_STRING)?;
+            // Either an exact value, or an optional minimum and maximum.
+            if r.bool()? {
+                r.string(MAX_STRING)?;
+            } else {
+                opt(r, |r| r.string(MAX_STRING).map(drop))?;
+                opt(r, |r| r.string(MAX_STRING).map(drop))?;
+            }
+            Ok(())
+        })
+    })?;
+    opt(r, compound)?;
+    // `DataComponentMatchers`: exact components (type id and value)...
+    let depth = deeper(depth)?;
+    skip_list(r, usize::MAX, |r| {
+        let kind = r.varint()?;
+        read_component(r, kind, depth).map(drop)
+    })?;
+    // ...and partial predicates: a predicate type (true) or a component type (false),
+    // its id, and the predicate as NBT.
+    skip_list(r, 64, |r| {
+        r.bool()?;
+        r.varint()?;
+        nbt(r)
+    })
+}
+
+/// `ResolvableProfile.STREAM_CODEC`: a full game profile (true) or a partial one
+/// (false), then the skin patch.
+fn profile(r: &mut Reader<'_>) -> Result<(), WireError> {
+    if r.bool()? {
+        r.uuid()?;
+        r.string(16)?;
+    } else {
+        opt(r, |r| r.string(16).map(drop))?;
+        opt(r, |r| r.uuid())?;
+    }
+    // Properties: name, value, optional signature.
+    skip_list(r, 16, |r| {
+        r.string(64)?;
+        r.string(MAX_STRING)?;
+        opt(r, |r| r.string(1024).map(drop)).map(drop)
+    })?;
+    // Skin patch: body, cape and elytra textures, the model (slim or not).
+    for _ in 0..3 {
+        opt(r, |r| r.identifier())?;
+    }
+    opt(r, |r| r.bool())?;
+    Ok(())
+}
+
+/// `Filterable.streamCodec`: the raw value, then optionally the filtered one.
+fn filterable(
+    r: &mut Reader<'_>,
+    mut f: impl FnMut(&mut Reader<'_>) -> Result<(), WireError>,
+) -> Result<(), WireError> {
+    f(r)?;
+    if r.bool()? {
+        f(r)?;
+    }
+    Ok(())
+}
+
+/// A trim material holder: inline, its palette id and description.
+fn trim_material(r: &mut Reader<'_>) -> Result<(), WireError> {
+    holder(r, |r| {
+        r.identifier()?;
+        nbt(r)
+    })
+    .map(drop)
+}
+
+/// Shape, colours, fade colours, trail, twinkle.
+fn firework_explosion(r: &mut Reader<'_>) -> Result<(), WireError> {
+    r.varint()?;
+    skip_list(r, usize::MAX, |r| r.i32().map(drop))?;
+    skip_list(r, usize::MAX, |r| r.i32().map(drop))?;
+    r.bool()?;
+    r.bool()?;
+    Ok(())
+}
+
+/// `ResolvableInt`: a constant (true) or a context provider's key (false).
+fn resolvable_int(r: &mut Reader<'_>) -> Result<(), WireError> {
+    if r.bool()? {
+        r.i32()?;
+    } else {
+        r.identifier()?;
+    }
+    Ok(())
+}
+
+fn resolvable_float(r: &mut Reader<'_>) -> Result<(), WireError> {
+    if r.bool()? {
+        r.f32()?;
+    } else {
+        r.identifier()?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nbt::{self, Compound, Tag};
+    use crate::wire;
+
+    /// Builds bytes as the server writes them.
+    #[derive(Default)]
+    struct W(Vec<u8>);
+
+    impl W {
+        fn v(mut self, v: i32) -> W {
+            wire::write_varint(&mut self.0, v);
+            self
+        }
+        fn kind(self, k: Kind) -> W {
+            self.v(k.id() as i32)
+        }
+        fn f(mut self, v: f32) -> W {
+            wire::write_f32(&mut self.0, v);
+            self
+        }
+        fn i(mut self, v: i32) -> W {
+            wire::write_i32(&mut self.0, v);
+            self
+        }
+        fn b(mut self, v: bool) -> W {
+            wire::write_bool(&mut self.0, v);
+            self
+        }
+        fn s(mut self, v: &str) -> W {
+            wire::write_string(&mut self.0, v);
+            self
+        }
+        fn uuid(mut self, v: u128) -> W {
+            wire::write_uuid(&mut self.0, v);
+            self
+        }
+        fn text(mut self, v: &str) -> W {
+            nbt::write_network(&mut self.0, &Tag::String(v.into())).unwrap();
+            self
+        }
+        fn compound(mut self) -> W {
+            let mut c = Compound::new();
+            c.put("x", Tag::Int(1));
+            nbt::write_network(&mut self.0, &Tag::Compound(c)).unwrap();
+            self
+        }
+        fn raw(mut self, b: &[u8]) -> W {
+            self.0.extend_from_slice(b);
+            self
+        }
+    }
+
+    /// Reads one optional stack and checks every byte was used.
+    fn stack(w: W) -> ItemStack {
+        let mut r = Reader::new(&w.0);
+        let s = ItemStack::read_optional(&mut r).unwrap();
+        r.finish().unwrap();
+        s
+    }
+
+    /// A stack of one item 800 with a patch adding these components.
+    fn with(n: i32, components: W) -> W {
+        W::default().v(1).v(800).v(n).v(0).raw(&components.0)
+    }
+
+    #[test]
+    fn empty_and_plain_stacks() {
+        assert_eq!(stack(W::default().v(0)), ItemStack::EMPTY);
+        assert!(stack(W::default().v(0)).is_empty());
+        // Any count of zero or less is the empty stack, with nothing after it.
+        assert_eq!(stack(W::default().v(-3)), ItemStack::EMPTY);
+        let s = stack(W::default().v(5).v(42).v(0).v(0));
+        assert_eq!((s.item, s.count, s.patch.is_empty()), (42, 5, true));
+        assert!(!s.is_empty());
+        // The non-optional codec refuses the empty stack.
+        assert!(ItemStack::read(&mut Reader::new(&[0])).is_err());
+    }
+
+    #[test]
+    fn typed_components() {
+        let s = stack(with(
+            6,
+            W::default()
+                .kind(Kind::MaxStackSize)
+                .v(16)
+                .kind(Kind::Food)
+                .v(4)
+                .f(2.4)
+                .b(true)
+                .kind(Kind::UseCooldown)
+                .f(1.5)
+                .b(true)
+                .s("ender_pearl")
+                .kind(Kind::Weapon)
+                .v(1)
+                .f(5.0)
+                .kind(Kind::AttackAnimation)
+                .v(2)
+                .v(6)
+                .kind(Kind::Equippable)
+                .v(4) // head
+                .v(0) // inline sound
+                .s("item.armor.equip_generic")
+                .b(true)
+                .f(16.0)
+                .b(true) // asset id
+                .s("minecraft:iron")
+                .b(false) // camera overlay
+                .b(true) // allowed entities: a tag
+                .v(0)
+                .s("minecraft:skeletons")
+                .b(true) // dispensable
+                .b(true)
+                .b(false)
+                .b(true)
+                .b(false)
+                .v(12), // shearing sound by id
+        ));
+        let get = |k| s.get(k).cloned();
+        assert_eq!(get(Kind::MaxStackSize), Some(Component::MaxStackSize(16)));
+        assert_eq!(
+            get(Kind::Food),
+            Some(Component::Food {
+                nutrition: 4,
+                saturation: 2.4,
+                can_always_eat: true
+            })
+        );
+        assert_eq!(
+            get(Kind::UseCooldown),
+            Some(Component::UseCooldown {
+                seconds: 1.5,
+                cooldown_group: Some("minecraft:ender_pearl".into())
+            })
+        );
+        assert_eq!(
+            get(Kind::AttackAnimation),
+            Some(Component::AttackAnimation(SwingAnimation {
+                kind: 2,
+                duration: 6
+            }))
+        );
+        assert_eq!(
+            get(Kind::Equippable),
+            Some(Component::Equippable {
+                slot: 4,
+                swappable: true,
+                damage_on_hurt: false,
+                equip_on_interact: true,
+                can_be_sheared: false,
+            })
+        );
+        assert!(get(Kind::Weapon).is_some());
+    }
+
+    #[test]
+    fn consumable_with_effects_and_inline_sound() {
+        let s = stack(with(
+            2,
+            W::default()
+                .kind(Kind::Consumable)
+                .f(1.6)
+                .v(1) // eat
+                .v(0) // inline sound
+                .s("entity.generic.eat")
+                .b(false)
+                .b(true)
+                .v(3) // three effects
+                // apply_effects: regeneration II with a hidden weaker one, then the
+                // probability.
+                .v(0)
+                .v(1)
+                .v(9)
+                .v(1)
+                .v(100)
+                .b(false)
+                .b(true)
+                .b(true)
+                .b(true)
+                .v(0)
+                .v(600)
+                .b(false)
+                .b(true)
+                .b(true)
+                .b(false)
+                .f(1.0)
+                // remove_effects: a list of two effects.
+                .v(1)
+                .v(3)
+                .v(18)
+                .v(19)
+                // play_sound by id.
+                .v(4)
+                .v(31)
+                .kind(Kind::Damage)
+                .v(3),
+        ));
+        assert_eq!(
+            s.get(Kind::Consumable),
+            Some(&Component::Consumable {
+                consume_seconds: 1.6,
+                animation: 1,
+                has_consume_particles: true
+            })
+        );
+        assert_eq!(s.get(Kind::Damage), Some(&Component::Damage(3)));
+    }
+
+    #[test]
+    fn removed_components() {
+        let s = stack(
+            W::default()
+                .v(1)
+                .v(7)
+                .v(1)
+                .v(2)
+                .kind(Kind::Unbreakable)
+                .kind(Kind::Damage)
+                .kind(Kind::Food),
+        );
+        assert_eq!(s.patch.added, [(4, Component::Unbreakable)]);
+        assert_eq!(s.patch.removed, [3, 23]);
+        assert!(s.patch.removes(Kind::Food) && !s.patch.removes(Kind::Glider));
+    }
+
+    #[test]
+    fn nested_stacks() {
+        // A bundle holding a damaged sword (a template: item, count, patch) and three
+        // arrows, then a use remainder.
+        let s = stack(with(
+            2,
+            W::default()
+                .kind(Kind::BundleContents)
+                .v(2)
+                .v(900)
+                .v(1)
+                .v(1)
+                .v(0)
+                .kind(Kind::Damage)
+                .v(12)
+                .v(901)
+                .v(3)
+                .v(0)
+                .v(0)
+                .kind(Kind::UseRemainder)
+                .v(902)
+                .v(1)
+                .v(0)
+                .v(0),
+        ));
+        let Some(Component::BundleContents(items)) = s.get(Kind::BundleContents) else {
+            panic!("{s:?}")
+        };
+        assert_eq!((items[0].item, items[0].count), (900, 1));
+        assert_eq!(items[0].get(Kind::Damage), Some(&Component::Damage(12)));
+        assert_eq!((items[1].item, items[1].count), (901, 3));
+        let Some(Component::UseRemainder(r)) = s.get(Kind::UseRemainder) else {
+            panic!()
+        };
+        assert_eq!(r.item, 902);
+
+        // A shulker box: a slot list where empty slots are absent templates.
+        let s = stack(with(
+            1,
+            W::default()
+                .kind(Kind::Container)
+                .v(3)
+                .b(true)
+                .v(1)
+                .v(64)
+                .v(0)
+                .v(0)
+                .b(false)
+                .b(true)
+                .v(2)
+                .v(1)
+                .v(0)
+                .v(0),
+        ));
+        let Some(Component::Container(slots)) = s.get(Kind::Container) else {
+            panic!()
+        };
+        assert_eq!(slots.len(), 3);
+        assert!(slots[1].is_empty() && slots[2].item == 2);
+
+        // A stack in an item frame's entity data value nests the same way.
+        let s = stack(with(
+            1,
+            W::default()
+                .kind(Kind::ChargedProjectiles)
+                .v(1)
+                .v(5)
+                .v(1)
+                .v(1)
+                .v(0)
+                .kind(Kind::Glider),
+        ));
+        assert!(
+            matches!(s.get(Kind::ChargedProjectiles), Some(Component::ChargedProjectiles(v)) if v.len() == 1)
+        );
+    }
+
+    #[test]
+    fn text_component_then_another() {
+        let s = stack(with(
+            3,
+            W::default()
+                .kind(Kind::CustomName)
+                .text("Excalibur")
+                .kind(Kind::Lore)
+                .v(2)
+                .text("one")
+                .compound()
+                .kind(Kind::Damage)
+                .v(9),
+        ));
+        let Some(Component::Other { kind, data }) = s.get(Kind::CustomName) else {
+            panic!()
+        };
+        assert_eq!(*kind, 6);
+        // The raw value is the tag as sent: type 8, length, the string.
+        assert_eq!(data[..3], [8, 0, 9]);
+        assert_eq!(s.get(Kind::Damage), Some(&Component::Damage(9)));
+    }
+
+    #[test]
+    fn holders_inline_and_by_id() {
+        let s = stack(with(
+            1,
+            W::default()
+                .kind(Kind::Instrument)
+                .v(0)
+                .v(0)
+                .s("item.goat_horn.sound.0")
+                .b(false)
+                .f(7.0)
+                .f(256.0)
+                .v(1)
+                .text("Ponder"),
+        ));
+        assert_eq!(
+            s.get(Kind::Instrument),
+            Some(&Component::Instrument(Holder::Inline))
+        );
+        let s = stack(with(
+            2,
+            W::default()
+                .kind(Kind::Instrument)
+                .v(4)
+                .kind(Kind::BreakSound)
+                .v(0)
+                .s("entity.item.break")
+                .b(true)
+                .f(8.0),
+        ));
+        assert_eq!(
+            s.get(Kind::Instrument),
+            Some(&Component::Instrument(Holder::Id(3)))
+        );
+        // Enchantments are registry holders: plain ids, no offset.
+        let s = stack(with(
+            1,
+            W::default()
+                .kind(Kind::Enchantments)
+                .v(2)
+                .v(0)
+                .v(5)
+                .v(12)
+                .v(1),
+        ));
+        assert_eq!(
+            s.get(Kind::Enchantments),
+            Some(&Component::Enchantments(vec![(0, 5), (12, 1)]))
+        );
+        // A trim: an inline material then a pattern by id.
+        stack(with(
+            2,
+            W::default()
+                .kind(Kind::Trim)
+                .v(0)
+                .s("gold")
+                .text("Gold")
+                .v(3)
+                .kind(Kind::Glider),
+        ));
+    }
+
+    #[test]
+    fn holder_sets_tag_and_list() {
+        let s = stack(with(
+            3,
+            W::default()
+                .kind(Kind::Repairable)
+                .v(0)
+                .s("minecraft:wooden_tool_materials")
+                .kind(Kind::DamageResistant)
+                .v(3)
+                .v(10)
+                .v(11)
+                .kind(Kind::Tool)
+                .v(1)
+                .v(1) // an empty list of blocks
+                .b(true)
+                .f(8.0)
+                .b(false)
+                .f(1.0)
+                .v(1)
+                .b(true),
+        ));
+        assert!(matches!(
+            s.get(Kind::Tool),
+            Some(Component::Other { kind: 28, .. })
+        ));
+        let Some(Component::Other { data, .. }) = s.get(Kind::DamageResistant) else {
+            panic!()
+        };
+        assert_eq!(data[..], [3, 10, 11]);
+    }
+
+    #[test]
+    fn profiles() {
+        // A full profile with a property, and a slim model.
+        stack(with(
+            2,
+            W::default()
+                .kind(Kind::Profile)
+                .b(true)
+                .uuid(7)
+                .s("Steve")
+                .v(1)
+                .s("textures")
+                .s("e30=")
+                .b(true)
+                .s("sig")
+                .b(false)
+                .b(true)
+                .s("minecraft:entity/player/cape")
+                .b(false)
+                .b(true)
+                .b(true)
+                .kind(Kind::Glider),
+        ));
+        // A partial one: a name only.
+        let s = stack(with(
+            2,
+            W::default()
+                .kind(Kind::Profile)
+                .b(false)
+                .b(true)
+                .s("Alex")
+                .b(false)
+                .v(0)
+                .raw(&[0, 0, 0, 0])
+                .kind(Kind::Damage)
+                .v(1),
+        ));
+        assert_eq!(s.get(Kind::Damage), Some(&Component::Damage(1)));
+    }
+
+    #[test]
+    fn adventure_predicates() {
+        let s = stack(with(
+            2,
+            W::default()
+                .kind(Kind::CanBreak)
+                .v(1)
+                // Blocks: two ids.
+                .b(true)
+                .v(3)
+                .v(1)
+                .v(2)
+                // State properties: one exact, one ranged with only a minimum.
+                .b(true)
+                .v(2)
+                .s("facing")
+                .b(true)
+                .s("north")
+                .s("age")
+                .b(false)
+                .b(true)
+                .s("3")
+                .b(false)
+                // NBT.
+                .b(true)
+                .compound()
+                // Exact components: damage 0 and an enchantment list.
+                .v(2)
+                .kind(Kind::Damage)
+                .v(0)
+                .kind(Kind::Enchantments)
+                .v(1)
+                .v(4)
+                .v(2)
+                // Partial predicates: a predicate type with its NBT, and "any value"
+                // of a component type.
+                .v(2)
+                .b(true)
+                .v(1)
+                .compound()
+                .b(false)
+                .kind(Kind::Damage)
+                .compound()
+                .kind(Kind::Damage)
+                .v(5),
+        ));
+        assert_eq!(s.get(Kind::Damage), Some(&Component::Damage(5)));
+    }
+
+    #[test]
+    fn books() {
+        let s = stack(with(
+            2,
+            W::default()
+                .kind(Kind::WrittenBookContent)
+                .s("Title")
+                .b(true)
+                .s("T***e")
+                .s("Author")
+                .v(1)
+                .v(2)
+                .text("page one")
+                .b(false)
+                .text("page two")
+                .b(true)
+                .text("p*** two")
+                .b(true)
+                .kind(Kind::WritableBookContent)
+                .v(1)
+                .s("draft")
+                .b(false),
+        ));
+        assert_eq!(s.patch.added.len(), 2);
+    }
+
+    #[test]
+    fn fireworks() {
+        let s = stack(with(
+            2,
+            W::default()
+                .kind(Kind::Fireworks)
+                .v(2)
+                .v(1)
+                .v(4) // creeper
+                .v(2)
+                .i(0xFF0000)
+                .i(0x00FF00)
+                .v(0)
+                .b(true)
+                .b(false)
+                .kind(Kind::FireworkExplosion)
+                .v(0)
+                .v(0)
+                .v(1)
+                .i(0x123456)
+                .b(false)
+                .b(true),
+        ));
+        let Some(Component::Other { data, .. }) = s.get(Kind::Fireworks) else {
+            panic!()
+        };
+        assert_eq!(data.len(), 1 + 1 + 1 + 1 + 8 + 1 + 2);
+    }
+
+    #[test]
+    fn untyped_components_keep_their_bytes() {
+        let s = stack(with(
+            3,
+            W::default()
+                .kind(Kind::CustomData)
+                .compound()
+                .kind(Kind::SignTextFront)
+                .text("a")
+                .text("b")
+                .text("c")
+                .text("d")
+                .b(false)
+                .v(15)
+                .b(true)
+                .kind(Kind::PaintingVariant)
+                .v(0)
+                .v(2)
+                .v(1)
+                .s("kebab")
+                .b(true)
+                .text("Kebab")
+                .b(false),
+        ));
+        assert_eq!(s.patch.added.len(), 3);
+        let Some(Component::Other { data, .. }) = s.get(Kind::PaintingVariant) else {
+            panic!()
+        };
+        assert_eq!(data[..3], [0, 2, 1]);
+    }
+
+    #[test]
+    fn bad_input_is_refused() {
+        // An unknown component type.
+        let w = with(1, W::default().v(500));
+        assert!(ItemStack::read_optional(&mut Reader::new(&w.0)).is_err());
+        // A template of nothing.
+        let w = with(1, W::default().kind(Kind::UseRemainder).v(0).v(1).v(0).v(0));
+        assert!(ItemStack::read_optional(&mut Reader::new(&w.0)).is_err());
+        // An unknown consume effect.
+        let w = with(1, W::default().kind(Kind::DeathProtection).v(1).v(9));
+        assert!(ItemStack::read_optional(&mut Reader::new(&w.0)).is_err());
+        // Bundles nested past the limit.
+        let mut w = W::default();
+        for _ in 0..MAX_DEPTH + 1 {
+            w = w.v(1).v(1).v(1).v(0).kind(Kind::BundleContents).v(1);
+        }
+        assert!(ItemStack::read_optional(&mut Reader::new(&w.0)).is_err());
+    }
+}

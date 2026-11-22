@@ -43,7 +43,11 @@ use crate::clock::{self, TickClock};
 use crate::effect::Effect;
 use crate::entity::{Entities, EntityTypes, Local as LocalInfo, PlayerInfos, Teams, TickContext};
 use crate::input::next_scroll_selection;
+use crate::interact::{self, GameMode, UseKeys};
+use crate::inventory::Hand;
+use crate::item::Items;
 use crate::level_load::LevelLoad;
+use crate::pick;
 use crate::player::{Env, Keys, LocalPlayer, Pose};
 use crate::world::{Level, global_bits};
 
@@ -67,6 +71,8 @@ pub struct Physics {
     /// Vanilla's dimension types by name, for servers that send them as known-pack
     /// entries without data.
     pub dimension_types: HashMap<String, DimensionType>,
+    /// Items: their classes and default components.
+    pub items: std::sync::Arc<Items>,
 }
 
 /// What movement needs from a dimension type.
@@ -118,6 +124,11 @@ struct FrameInput {
     keys: Keys,
     /// Hotbar key presses, by slot (`KeyMapping.click`).
     hotbar_clicks: [u32; 9],
+    /// The use key held, and presses of the use, swap-hands and attack keys.
+    use_down: bool,
+    use_clicks: u32,
+    swap_clicks: u32,
+    attack_clicks: u32,
     /// Scroll-wheel notches, in order.
     scrolls: Vec<i32>,
     /// The frame's turn of the camera (`Entity.turn`'s amounts), after its ticks.
@@ -139,7 +150,13 @@ pub struct PlayerView {
     /// The effects on the player: (registry id, amplifier, ticks left or -1).
     pub effects: Vec<(i32, i32, i32)>,
     pub health: f32,
+    pub food: i32,
     pub selected_slot: i32,
+    /// The stacks in the hands (`id*count`, empty as "").
+    pub main_hand: String,
+    pub off_hand: String,
+    /// The item being used: the hand, the item and the ticks left.
+    pub using: Option<(&'static str, String, i32)>,
     pub chunks: usize,
     /// Other entities the client tracks.
     pub entities: usize,
@@ -215,9 +232,10 @@ impl Session {
     /// for it.
     pub fn frame(&self) {
         let mut input = lock(&self.input);
-        let keys = input.keys;
+        let (keys, use_down) = (input.keys, input.use_down);
         let frame = std::mem::take(&mut *input);
         input.keys = keys;
+        input.use_down = use_down;
         drop(input);
         let _ = self.commands.send(Command::Frame(frame));
     }
@@ -238,6 +256,27 @@ impl Session {
         if let Some(c) = lock(&self.input).hotbar_clicks.get_mut(usize::from(slot)) {
             *c += 1;
         }
+    }
+
+    /// The use key (the right mouse button) pressed or let go: a press counts as a click
+    /// (`KeyMapping.click`) the next tick reads.
+    pub fn set_use(&self, down: bool) {
+        let mut input = lock(&self.input);
+        if down && !input.use_down {
+            input.use_clicks += 1;
+        }
+        input.use_down = down;
+    }
+
+    /// A press of the swap-hands key (F).
+    pub fn swap_hands_key(&self) {
+        lock(&self.input).swap_clicks += 1;
+    }
+
+    /// A press of the attack key (attacks aren't ported; the press is read and dropped,
+    /// as the use key's handling expects).
+    pub fn attack_key(&self) {
+        lock(&self.input).attack_clicks += 1;
     }
 
     /// Scroll-wheel notches (from [`crate::input::ScrollWheel`]): the selected slot moves
@@ -313,6 +352,8 @@ struct Game {
     keys: Keys,
     /// Hotbar key presses not yet read (`KeyMapping.clickCount`).
     hotbar_clicks: [u32; 9],
+    /// The use-related keys not yet read.
+    use_keys: UseKeys,
     /// The profile name the server knows the player by (its scoreboard name), and its
     /// UUID (its player list entry).
     name: String,
@@ -331,6 +372,9 @@ const MINECART_IMPROVEMENTS: &str = "minecraft:minecart_improvements";
 const GAME_EVENT_CHANGE_GAME_MODE: u8 = 3;
 const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
 
+/// `EntityEvent.USE_ITEM_COMPLETE`.
+const ENTITY_EVENT_USE_ITEM_COMPLETE: u8 = 9;
+
 /// What the game thread knows of the level it is in.
 #[derive(Debug)]
 struct World {
@@ -345,10 +389,12 @@ struct World {
     load: Option<LevelLoad>,
     loaded: bool,
     level_started: i64,
-    /// The hotbar slot selected, and the last one sent (`MultiPlayerGameMode.carriedIndex`,
-    /// 0 for a new game mode, so a server's slot other than 0 is sent back once).
-    selected_slot: i32,
-    carried_index: i32,
+    /// `MultiPlayerGameMode` and `Minecraft`'s item use: the last hotbar slot sent (0 for
+    /// a new game mode, so a server's slot other than 0 is sent back once), the use
+    /// delay, the prediction sequence. The selected slot is the player's inventory's.
+    game_mode: GameMode,
+    /// The fluid shapes item use's raycasts have met (`FlowingFluid`'s cache).
+    fluid_shapes: pick::FluidShapes,
     tick_rate: f32,
     frozen: bool,
 }
@@ -373,8 +419,8 @@ impl World {
             load: Some(LevelLoad::start(now)),
             loaded: false,
             level_started: now,
-            selected_slot: 0,
-            carried_index: 0,
+            game_mode: GameMode::default(),
+            fluid_shapes: pick::FluidShapes::new(),
             tick_rate: 20.0,
             frozen: false,
         }
@@ -409,6 +455,7 @@ impl Game {
             view: Arc::default(),
             keys: Keys::default(),
             hotbar_clicks: [0; 9],
+            use_keys: UseKeys::default(),
             name: String::new(),
             uuid: 0,
             players: PlayerInfos::default(),
@@ -488,13 +535,18 @@ impl Game {
     /// now, hotbar presses wait for the ticks.
     fn take_input(&mut self, input: &FrameInput) {
         self.keys = input.keys;
+        self.use_keys.use_down = input.use_down;
+        self.use_keys.use_clicks += input.use_clicks;
+        self.use_keys.swap_clicks += input.swap_clicks;
+        self.use_keys.attack_clicks += input.attack_clicks;
         // Without a player (`minecraft.player == null`) the input goes nowhere.
         let Some(w) = &mut self.world else {
             return;
         };
         if !w.player.spectator {
             for &wheel in &input.scrolls {
-                w.selected_slot = next_scroll_selection(f64::from(wheel), w.selected_slot, 9);
+                let inv = &mut w.player.inventory;
+                inv.selected = next_scroll_selection(f64::from(wheel), inv.selected, 9);
             }
         }
         for (pending, new) in self.hotbar_clicks.iter_mut().zip(input.hotbar_clicks) {
@@ -521,7 +573,17 @@ impl Game {
                 .map(|e| (e.id, e.amplifier, e.duration))
                 .collect(),
             health: w.player.health,
-            selected_slot: w.selected_slot,
+            food: w.player.food,
+            selected_slot: w.player.inventory.selected,
+            main_hand: w.player.hand(Hand::Main).describe(),
+            off_hand: w.player.hand(Hand::Off).describe(),
+            using: w.player.is_using_item().then(|| {
+                (
+                    w.player.used_hand().name(),
+                    w.player.use_item().c.name.to_owned(),
+                    w.player.use_remaining(),
+                )
+            }),
             chunks: w.level.chunk_count(),
             entities: w.entities.len(),
             loaded: w.loaded,
@@ -649,12 +711,14 @@ impl Game {
         let Some(w) = &mut self.world else {
             return;
         };
-        // `gameMode.tick`: the held slot first, then the connection's tick, where the
-        // listener lets the player in once the level is ready.
-        if w.selected_slot != w.carried_index {
-            w.carried_index = w.selected_slot;
-            self.connection
-                .send(play::set_carried_item(w.carried_index));
+        let mut out = Vec::new();
+        // `rightClickDelay`, then `gameMode.tick`: the held slot first, then the
+        // connection's tick, where the listener lets the player in once the level is
+        // ready.
+        w.game_mode.tick_delay();
+        w.game_mode.ensure_carried(&w.player.inventory, &mut out);
+        for p in out.drain(..) {
+            self.connection.send(p);
         }
         if let Some(load) = &mut w.load {
             let (cx, cz) = w.player.chunk();
@@ -674,48 +738,68 @@ impl Game {
                 }
             }
         }
-        // `handleKeybinds`: one press per hotbar key per tick (spectators' hotbar keys
-        // open the spectator menu instead, which isn't there yet).
-        for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
-            if *pending > 0 {
-                *pending -= 1;
-                if !w.player.spectator {
-                    w.selected_slot = slot as i32;
+        let Some(physics) = &self.physics else {
+            self.use_keys = UseKeys {
+                use_down: self.use_keys.use_down,
+                ..UseKeys::default()
+            };
+            self.connection.send(play::client_tick_end());
+            return;
+        };
+        let env = Env {
+            level: &w.level,
+            blocks: &physics.blocks,
+            tags: &self.tags,
+            colliders: &[],
+        };
+        // `pick`, then `handleKeybinds` (not while the level-loading screen shows): one
+        // press per hotbar key per tick (spectators' hotbar keys open the spectator menu
+        // instead, which isn't there yet), then the hands.
+        if w.loaded {
+            let hit = pick_target(&env, &w.entities, &self.players, &w.player);
+            for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
+                if *pending > 0 {
+                    *pending -= 1;
+                    if !w.player.spectator {
+                        w.player.inventory.selected = slot as i32;
+                    }
                 }
+            }
+            let world = interact::World {
+                env: &env,
+                entities: &w.entities,
+                fluid_shapes: &w.fluid_shapes,
+            };
+            w.game_mode
+                .handle_keybinds(&mut w.player, &world, &hit, &mut self.use_keys, &mut out);
+            for p in out.drain(..) {
+                self.connection.send(p);
             }
         }
         // `level.tickEntities`: the entities in order, the player among them, which
         // ticks and sends its changes (`sendPosition`) only once it has loaded.
-        if let Some(physics) = &self.physics {
-            let env = Env {
-                level: &w.level,
-                blocks: &physics.blocks,
-                tags: &self.tags,
-                colliders: &[],
-            };
-            let cx = TickContext {
-                env: &env,
-                teams: &self.teams,
-                players: &self.players,
-                local: LocalInfo {
-                    name: &self.name,
-                    spectator: w.player.spectator,
-                    health: w.player.health,
-                },
-                tick_rate: w.tick_rate,
-                runs_normally: !w.frozen,
-            };
-            let (loaded, keys, connection) = (w.loaded, self.keys, &self.connection);
-            w.entities.tick(&cx, &mut w.player, |player, colliders| {
-                if loaded {
-                    let env = Env { colliders, ..env };
-                    player.tick(&env, keys);
-                    for p in player.send_changes() {
-                        connection.send(p);
-                    }
+        let cx = TickContext {
+            env: &env,
+            teams: &self.teams,
+            players: &self.players,
+            local: LocalInfo {
+                name: &self.name,
+                spectator: w.player.spectator,
+                health: w.player.health,
+            },
+            tick_rate: w.tick_rate,
+            runs_normally: !w.frozen,
+        };
+        let (loaded, keys, connection) = (w.loaded, self.keys, &self.connection);
+        w.entities.tick(&cx, &mut w.player, |player, colliders| {
+            if loaded {
+                let env = Env { colliders, ..env };
+                player.tick(&env, keys);
+                for p in player.send_changes() {
+                    connection.send(p);
                 }
-            });
-        }
+            }
+        });
         self.connection.send(play::client_tick_end());
     }
 
@@ -999,7 +1083,7 @@ impl Game {
                 if let Some(w) = &mut self.world
                     && (0..9).contains(&slot)
                 {
-                    w.selected_slot = slot;
+                    w.player.inventory.selected = slot;
                 }
             }
             play::Clientbound::TickingState { tick_rate, frozen } => {
@@ -1100,11 +1184,83 @@ impl Game {
                 }
             }
             play::Clientbound::PlayerInfoRemove { ids } => self.players.remove(&ids),
-            play::Clientbound::SetHealth { health, food, .. } => {
-                // `hurtTo` and the food level.
+            play::Clientbound::SetHealth {
+                health,
+                food,
+                saturation,
+            } => {
+                // `hurtTo` and the food data.
                 if let Some(w) = &mut self.world {
                     w.player.health = health;
                     w.player.food = food;
+                    w.player.saturation = saturation;
+                }
+            }
+            play::Clientbound::ContainerSetContent {
+                container_id,
+                state_id,
+                items,
+                carried,
+            } => {
+                // Container 0 is the inventory; other menus aren't tracked yet.
+                if let Some(w) = &mut self.world
+                    && let Some(physics) = &self.physics
+                    && container_id == 0
+                {
+                    let it = &physics.items;
+                    let stacks = items.iter().map(|s| it.stack(s)).collect();
+                    w.player
+                        .inventory
+                        .initialize(state_id, stacks, it.stack(&carried));
+                }
+            }
+            play::Clientbound::ContainerSetSlot {
+                container_id,
+                state_id,
+                slot,
+                item,
+            } => {
+                if let Some(w) = &mut self.world
+                    && let Some(physics) = &self.physics
+                    && container_id == 0
+                {
+                    let s = physics.items.stack(&item);
+                    w.player
+                        .inventory
+                        .set_menu_slot(i32::from(slot), state_id, s);
+                }
+            }
+            play::Clientbound::SetPlayerInventory { slot, item } => {
+                if let Some(w) = &mut self.world
+                    && let Some(physics) = &self.physics
+                    && let Ok(slot) = usize::try_from(slot)
+                {
+                    w.player.inventory.set(slot, physics.items.stack(&item));
+                }
+            }
+            play::Clientbound::SetCursorItem { item } => {
+                if let Some(w) = &mut self.world
+                    && let Some(physics) = &self.physics
+                {
+                    w.player.inventory.carried = physics.items.stack(&item);
+                }
+            }
+            play::Clientbound::Cooldown { group, duration } => {
+                if let Some(w) = &mut self.world {
+                    if duration == 0 {
+                        w.player.cooldowns.remove(&group);
+                    } else {
+                        w.player.cooldowns.add(&group, duration);
+                    }
+                }
+            }
+            play::Clientbound::EntityEvent { entity_id, event } => {
+                // `Player.handleEntityEvent`: the server finished the item's use.
+                if let Some(w) = &mut self.world
+                    && entity_id == w.player.entity_id
+                    && event == ENTITY_EVENT_USE_ITEM_COMPLETE
+                {
+                    w.player.complete_using_item();
                 }
             }
             play::Clientbound::PlayerAbilities {
@@ -1153,6 +1309,31 @@ impl Game {
         }
         Ok(())
     }
+}
+
+/// `LocalPlayer.raycastHitResult`: what the crosshair is on, from the eyes as the
+/// tick begins.
+pub fn pick_target(
+    env: &Env<'_>,
+    entities: &Entities,
+    players: &PlayerInfos,
+    player: &LocalPlayer,
+) -> pick::HitResult {
+    let camera = pick::Camera {
+        id: player.entity_id,
+        eye: player.pick_eye_position(),
+        view: pick::view_vector(player.x_rot, player.y_rot),
+        bounding_box: player.bounding_box(),
+    };
+    pick::pick(
+        env,
+        entities,
+        players,
+        &camera,
+        player.hand(Hand::Main).c.name,
+        player.attributes.block_interaction_range.value(),
+        player.attributes.entity_interaction_range.value(),
+    )
 }
 
 fn log_configured(c: &Configured, brand: Option<&str>) {

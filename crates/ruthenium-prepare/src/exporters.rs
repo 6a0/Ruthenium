@@ -18,6 +18,7 @@ pub const BUNDLE_NAME: &str = "ruthenium-exporters.jar";
 const MAIN_CLASS: &str = "dev.ruthenium.exporters.Main";
 pub const ENTITY_DIMENSIONS: &str = "entity_dimensions.bin";
 pub const BLOCK_PHYSICS: &str = "block_physics.bin";
+pub const ITEM_CLASSES: &str = "item_classes.bin";
 
 /// The exporter bundle: `explicit`, then `RUTHENIUM_EXPORTERS`, then next to
 /// the executable, then `../java/` from it (`target/java/` in a dev build).
@@ -268,9 +269,21 @@ pub struct StatePhysics {
     /// south, west, east).
     pub sturdy: u8,
     pub offset: Option<OffsetData>,
+    /// Index into [`BlockPhysics::shapes`] of the outline shape (`getShape`, what the
+    /// crosshair picks).
+    pub outline: u32,
+    /// Index of the interaction shape (`getInteractionShape`), which can change the
+    /// face a pick reports.
+    pub interaction_shape: u32,
+    /// Whether the block's class overrides `useWithoutItem` ([`Self::USE_WITHOUT_ITEM`])
+    /// and `useItemOn` ([`Self::USE_ITEM_ON`]).
+    pub interaction: u8,
 }
 
 impl StatePhysics {
+    pub const USE_WITHOUT_ITEM: u8 = 1;
+    pub const USE_ITEM_ON: u8 = 2;
+
     pub const LARGE_SHAPE: u8 = 1;
     pub const DYNAMIC_SHAPE: u8 = 2;
     /// The shape depends on who collides (liquids, powder snow, scaffolding, moving
@@ -298,7 +311,7 @@ pub struct BlockPhysics {
 
 /// Parses `block_physics.bin`.
 pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
-    let mut r = Reader::open(bytes, "block_physics", 3)?;
+    let mut r = Reader::open(bytes, "block_physics", 4)?;
     let n = r.u32()? as usize;
     let mut shapes = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
@@ -340,6 +353,17 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
         } else {
             None
         };
+        let outline = r.u32()?;
+        if outline as usize >= shapes.len() {
+            return Err(format!("outline shape {outline} out of range"));
+        }
+        let interaction_shape = r.u32()?;
+        if interaction_shape as usize >= shapes.len() {
+            return Err(format!(
+                "interaction shape {interaction_shape} out of range"
+            ));
+        }
+        let interaction = r.u8()?;
         states.push(StatePhysics {
             shape,
             flags,
@@ -350,10 +374,64 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
             fluid,
             sturdy,
             offset,
+            outline,
+            interaction_shape,
+            interaction,
         });
     }
     r.finish()?;
     Ok(BlockPhysics { shapes, states })
+}
+
+/// What the exporter knows of an item's class (`item_classes` v1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemClassData {
+    /// Network (registry) id.
+    pub id: u32,
+    /// e.g. `minecraft:bow`.
+    pub key: String,
+    /// The simple names of the item's class and its superclasses up to `Item`,
+    /// nearest first.
+    pub classes: Vec<String>,
+    /// [`Self::USE`], [`Self::USE_ON`], [`Self::INTERACT_LIVING_ENTITY`],
+    /// [`Self::RELEASE_USING`] (a class below `Item` declares the method) and
+    /// [`Self::BLOCK_ITEM`].
+    pub flags: u8,
+}
+
+impl ItemClassData {
+    pub const USE: u8 = 1;
+    pub const USE_ON: u8 = 2;
+    pub const INTERACT_LIVING_ENTITY: u8 = 4;
+    pub const RELEASE_USING: u8 = 8;
+    pub const BLOCK_ITEM: u8 = 16;
+
+    /// Whether the item's class is or extends `class` (a simple name).
+    pub fn is(&self, class: &str) -> bool {
+        self.classes.iter().any(|c| c == class)
+    }
+}
+
+/// Parses `item_classes.bin`.
+pub fn read_item_classes(bytes: &[u8]) -> Result<Vec<ItemClassData>, String> {
+    let mut r = Reader::open(bytes, "item_classes", 1)?;
+    let count = r.u32()?;
+    let mut out = Vec::with_capacity(count.min(8192) as usize);
+    for _ in 0..count {
+        let id = r.u32()?;
+        let key = r.string()?;
+        let n = r.u8()?;
+        let classes = (0..n).map(|_| r.string()).collect::<Result<_, _>>()?;
+        let flags = r.u8()?;
+        out.push(ItemClassData {
+            id,
+            key,
+            classes,
+            flags,
+        });
+    }
+    r.finish()?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -363,6 +441,26 @@ mod tests {
     fn string(out: &mut Vec<u8>, s: &str) {
         out.extend((s.len() as u16).to_le_bytes());
         out.extend(s.as_bytes());
+    }
+
+    #[test]
+    fn reads_item_classes() {
+        let mut b = b"RTHX".to_vec();
+        b.extend(1u32.to_le_bytes());
+        string(&mut b, "item_classes");
+        b.extend(1u32.to_le_bytes());
+        b.extend(9u32.to_le_bytes());
+        string(&mut b, "example:bow");
+        b.push(3);
+        for c in ["BowItem", "ProjectileWeaponItem", "Item"] {
+            string(&mut b, c);
+        }
+        b.push(ItemClassData::USE | ItemClassData::RELEASE_USING);
+        let items = read_item_classes(&b).unwrap();
+        assert_eq!(items[0].key, "example:bow");
+        assert!(items[0].is("ProjectileWeaponItem") && !items[0].is("BlockItem"));
+        assert_eq!(items[0].flags, 9);
+        assert!(read_item_classes(&b[..b.len() - 1]).is_err());
     }
 
     #[test]

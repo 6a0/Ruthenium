@@ -30,5 +30,6 @@ public final class Main {
 
         EntityDimensionsExporter.export(out.resolve(EntityDimensionsExporter.FILE));
         BlockPhysicsExporter.export(out.resolve(BlockPhysicsExporter.FILE));
+        ItemClassExporter.export(out.resolve(ItemClassExporter.FILE));
     }
 }

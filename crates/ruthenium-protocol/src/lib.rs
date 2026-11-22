@@ -5,10 +5,12 @@
 //!   Java's modified UTF-8.
 //! - [`text`]: text components, flattened into styled spans for drawing.
 //! - [`status`]: the server list's status response.
+//! - [`item`]: item stacks and their data components, as play packets carry them.
 //! - [`packets`]: the login and configuration packets, and those play shares with them.
 
 #![forbid(unsafe_code)]
 
+pub mod item;
 pub mod nbt;
 pub mod packets;
 pub mod status;

@@ -3,8 +3,9 @@
 //!
 //! `--script` plays input once the player is in the world, through the same calls the
 //! window makes: steps separated by spaces, each `KEYS@MS` or `KEYS@MS:DX,DY`. KEYS are
-//! `+`-joined `w a s d jump sneak sprint` and hotbar digits `1`-`9` (pressed once at
-//! the step's start), or `-` for none; held for MS milliseconds while the mouse moves
+//! `+`-joined `w a s d jump sneak sprint use` (`use` holds the right button), hotbar
+//! digits `1`-`9`, `click` (one press of the right button) and `swap` (the swap-hands
+//! key), the last three pressed once at the step's start, or `-` for none; held for MS milliseconds while the mouse moves
 //! DX, DY counts every frame (60 a second, the rate frames run at here), turned as the window turns them with the
 //! saved mouse sensitivity. For example
 //! `w@2000 w+sprint+jump@3000 w@2000:12,0 sneak+w@1500 2@100 -@1000`.
@@ -30,6 +31,9 @@ const FRAME: Duration = Duration::from_micros(16_667);
 struct Step {
     keys: Keys,
     hotbar: Vec<u8>,
+    use_held: bool,
+    clicks: u32,
+    swaps: u32,
     ms: u64,
     turn: (f32, f32),
 }
@@ -55,6 +59,9 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
             let mut st = Step {
                 keys: Keys::default(),
                 hotbar: Vec::new(),
+                use_held: false,
+                clicks: 0,
+                swaps: 0,
                 ms: ms.parse().map_err(|_| bad())?,
                 turn,
             };
@@ -67,6 +74,9 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                     "jump" => st.keys.jump = true,
                     "sneak" => st.keys.shift = true,
                     "sprint" => st.keys.sprint = true,
+                    "use" => st.use_held = true,
+                    "click" => st.clicks += 1,
+                    "swap" => st.swaps += 1,
                     d if d.len() == 1 && ("1"..="9").contains(&d) => {
                         st.hotbar.push(d.parse::<u8>().map_err(|_| bad())? - 1);
                     }
@@ -98,6 +108,7 @@ impl Player {
     fn begin(&mut self, session: &Session) {
         let Some(st) = self.steps.get(self.at) else {
             session.set_keys(Keys::default());
+            session.set_use(false);
             return;
         };
         println!(
@@ -108,6 +119,15 @@ impl Player {
         for &slot in &st.hotbar {
             session.hotbar_key(slot);
         }
+        for _ in 0..st.swaps {
+            session.swap_hands_key();
+        }
+        // A click: down and up again before the tick reads it.
+        for _ in 0..st.clicks {
+            session.set_use(false);
+            session.set_use(true);
+        }
+        session.set_use(st.use_held);
     }
 
     /// False once the script has ended.
@@ -126,8 +146,12 @@ impl Player {
             self.last_report = now;
             if let Some(v) = session.view() {
                 let p = v.position;
+                let using = match &v.using {
+                    Some((hand, item, left)) => format!(", using {item} ({hand}, {left} left)"),
+                    None => String::new(),
+                };
                 println!(
-                    "          at {:.3} {:.3} {:.3}, facing {:.2} {:.2}, slot {}{}{}",
+                    "          at {:.3} {:.3} {:.3}, facing {:.2} {:.2}, slot {}{}{}, hands [{}] [{}], food {}{using}",
                     p[0],
                     p[1],
                     p[2],
@@ -136,6 +160,9 @@ impl Player {
                     v.selected_slot + 1,
                     if v.on_ground { ", on the ground" } else { "" },
                     if v.sprinting { ", sprinting" } else { "" },
+                    v.main_hand,
+                    v.off_hand,
+                    v.food,
                 );
             }
         }
@@ -294,6 +321,9 @@ mod tests {
         assert_eq!((s[0].ms, s[0].turn), (2000, (0.0, 0.0)));
         assert_eq!((s[1].keys, s[1].turn), (Keys::default(), (12.0, -3.5)));
         assert_eq!(s[2].hotbar, vec![1]);
+        let s = parse_script("w+use@500 click+click+swap@50").unwrap();
+        assert!(s[0].use_held && s[0].keys.forward);
+        assert_eq!((s[1].clicks, s[1].swaps, s[1].use_held), (2, 1, false));
         assert!(parse_script("w@").is_err());
         assert!(parse_script("fly@100").is_err());
     }

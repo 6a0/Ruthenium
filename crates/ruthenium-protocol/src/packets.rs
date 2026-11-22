@@ -8,6 +8,7 @@
 
 use ruthenium_data::v26_3::packets::{configuration as cfg, login as lg, play as pl};
 
+use crate::item::ItemStack;
 use crate::nbt::Tag;
 use crate::wire::{self, MAX_STRING, Reader, WireError};
 
@@ -743,6 +744,11 @@ pub mod play {
         ]
     }
 
+    /// `BlockPos.asLong`, the inverse of [`unpack_block_pos`].
+    pub fn pack_block_pos([x, y, z]: [i32; 3]) -> i64 {
+        (x as i64 & 0x3FF_FFFF) << 38 | (z as i64 & 0x3FF_FFFF) << 12 | (y as i64 & 0xFFF)
+    }
+
     /// A step of a [`PositionPath`]: a position reached `ticks` after the last one.
     #[derive(Debug, Clone, Copy, PartialEq)]
     pub struct PositionStep {
@@ -879,6 +885,9 @@ pub mod play {
         /// Effect particles: how many (only the colour-only `entity_effect` kind is
         /// read).
         Particles(usize),
+        /// An item stack (possibly empty): a dropped item, a firework, an item frame's
+        /// item.
+        Item(ItemStack),
     }
 
     /// The `minecraft:entity_effect` particle type, the one particle the client reads
@@ -887,8 +896,8 @@ pub mod play {
 
     impl DataValue {
         /// The value for serializer `kind`, or `None` for a kind the client can't read
-        /// yet (item stacks, other particles, inline holders, profiles): everything after
-        /// it is then lost.
+        /// yet (other particles, inline painting variants, profiles): everything after it
+        /// is then lost.
         fn read(r: &mut Reader<'_>, kind: i32) -> Result<Option<DataValue>, WireError> {
             let block_pos = |r: &mut Reader<'_>| r.i64().map(unpack_block_pos);
             let v = match kind {
@@ -908,6 +917,7 @@ pub mod play {
                     }
                     DataValue::OptionalComponent(some)
                 }
+                7 => DataValue::Item(ItemStack::read_optional(r)?),
                 8 => DataValue::Boolean(r.bool()?),
                 9 => DataValue::Rotations([r.f32()?, r.f32()?, r.f32()?]),
                 10 => DataValue::BlockPos(block_pos(r)?),
@@ -945,7 +955,7 @@ pub mod play {
                 }
                 39 => DataValue::Vector3([r.f32()?, r.f32()?, r.f32()?]),
                 40 => DataValue::Quaternion([r.f32()?, r.f32()?, r.f32()?, r.f32()?]),
-                // Item stacks (7), other particles (16) and profiles (41).
+                // Particles (16) and profiles (41).
                 _ => return Ok(None),
             };
             Ok(Some(v))
@@ -1173,6 +1183,42 @@ pub mod play {
         RemoveMobEffect {
             entity_id: i32,
             effect: i32,
+        },
+        /// `ClientboundContainerSetContentPacket`: every slot of a container (0 is the
+        /// player's inventory menu) and the stack on the cursor.
+        ContainerSetContent {
+            container_id: i32,
+            state_id: i32,
+            items: Vec<ItemStack>,
+            carried: ItemStack,
+        },
+        /// `ClientboundContainerSetSlotPacket`: one slot of a container.
+        ContainerSetSlot {
+            container_id: i32,
+            state_id: i32,
+            slot: i16,
+            item: ItemStack,
+        },
+        /// `ClientboundSetPlayerInventoryPacket`: one slot of the player's inventory
+        /// (`Inventory` numbering), whatever menu is open.
+        SetPlayerInventory {
+            slot: i32,
+            item: ItemStack,
+        },
+        /// `ClientboundSetCursorItemPacket`.
+        SetCursorItem {
+            item: ItemStack,
+        },
+        /// `ClientboundCooldownPacket`: a cooldown group (an item id, or a
+        /// `use_cooldown` group) and its length in ticks; 0 ends it.
+        Cooldown {
+            group: String,
+            duration: i32,
+        },
+        /// `ClientboundEntityEventPacket`: an `EntityEvent` id for an entity.
+        EntityEvent {
+            entity_id: i32,
+            event: u8,
         },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
@@ -1500,6 +1546,42 @@ pub mod play {
                     entity_id: r.varint()?,
                     effect: r.varint()?,
                 },
+                C::ContainerSetContent => {
+                    let container_id = r.varint()?;
+                    let state_id = r.varint()?;
+                    let n = r.count(usize::MAX)?;
+                    let mut items = Vec::with_capacity(n.min(256));
+                    for _ in 0..n {
+                        items.push(ItemStack::read_optional(&mut r)?);
+                    }
+                    Clientbound::ContainerSetContent {
+                        container_id,
+                        state_id,
+                        items,
+                        carried: ItemStack::read_optional(&mut r)?,
+                    }
+                }
+                C::ContainerSetSlot => Clientbound::ContainerSetSlot {
+                    container_id: r.varint()?,
+                    state_id: r.varint()?,
+                    slot: r.u16()? as i16,
+                    item: ItemStack::read_optional(&mut r)?,
+                },
+                C::SetPlayerInventory => Clientbound::SetPlayerInventory {
+                    slot: r.varint()?,
+                    item: ItemStack::read_optional(&mut r)?,
+                },
+                C::SetCursorItem => Clientbound::SetCursorItem {
+                    item: ItemStack::read_optional(&mut r)?,
+                },
+                C::Cooldown => Clientbound::Cooldown {
+                    group: r.identifier()?,
+                    duration: r.varint()?,
+                },
+                C::EntityEvent => Clientbound::EntityEvent {
+                    entity_id: r.i32()?,
+                    event: r.u8()?,
+                },
                 other => {
                     r.rest();
                     Clientbound::Other(other)
@@ -1564,6 +1646,114 @@ pub mod play {
 
     pub fn configuration_acknowledged() -> Vec<u8> {
         wire::packet(pl::Serverbound::ConfigurationAcknowledged.id(), |_| {})
+    }
+
+    /// `InteractionHand` ids.
+    pub const MAIN_HAND: i32 = 0;
+    pub const OFF_HAND: i32 = 1;
+
+    /// `Direction` ids (`get3DDataValue`).
+    pub const DOWN: i32 = 0;
+    pub const UP: i32 = 1;
+    pub const NORTH: i32 = 2;
+    pub const SOUTH: i32 = 3;
+    pub const WEST: i32 = 4;
+    pub const EAST: i32 = 5;
+
+    /// `ServerboundPlayerActionPacket.Action` ordinals.
+    pub const ACTION_START_DESTROY_BLOCK: i32 = 0;
+    pub const ACTION_CHANGE_DESTROY_DIRECTION: i32 = 1;
+    pub const ACTION_ABORT_DESTROY_BLOCK: i32 = 2;
+    pub const ACTION_STOP_DESTROY_BLOCK: i32 = 3;
+    pub const ACTION_DROP_ALL_ITEMS: i32 = 4;
+    pub const ACTION_DROP_ITEM: i32 = 5;
+    pub const ACTION_RELEASE_USE_ITEM: i32 = 6;
+    pub const ACTION_SWAP_ITEM_WITH_OFFHAND: i32 = 7;
+    pub const ACTION_STAB: i32 = 8;
+
+    /// `ServerboundUseItemPacket`: using the item in `hand` (not on a block or an
+    /// entity), with the player's rotation at the time.
+    pub fn use_item(hand: i32, sequence: i32, y_rot: f32, x_rot: f32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::UseItem.id(), |o| {
+            wire::write_varint(o, hand);
+            wire::write_varint(o, sequence);
+            wire::write_f32(o, y_rot);
+            wire::write_f32(o, x_rot);
+        })
+    }
+
+    /// `ServerboundUseItemOnPacket`: using the item in `hand` on a block's face;
+    /// `cursor` is where the hit landed, relative to the block's corner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn use_item_on(
+        hand: i32,
+        block_pos: [i32; 3],
+        direction: i32,
+        cursor: [f32; 3],
+        inside: bool,
+        world_border_hit: bool,
+        sequence: i32,
+    ) -> Vec<u8> {
+        wire::packet(pl::Serverbound::UseItemOn.id(), |o| {
+            wire::write_varint(o, hand);
+            // `BlockHitResult.STREAM_CODEC`: the position, the face as a VarInt, the
+            // cursor, inside, world border.
+            wire::write_i64(o, pack_block_pos(block_pos));
+            wire::write_varint(o, direction);
+            for v in cursor {
+                wire::write_f32(o, v);
+            }
+            wire::write_bool(o, inside);
+            wire::write_bool(o, world_border_hit);
+            wire::write_varint(o, sequence);
+        })
+    }
+
+    /// `ServerboundPlayerActionPacket`: an `ACTION_*`, the block and face it concerns
+    /// (zeros for the item actions), and the block-change sequence.
+    pub fn player_action(
+        action: i32,
+        block_pos: [i32; 3],
+        direction: i32,
+        sequence: i32,
+    ) -> Vec<u8> {
+        wire::packet(pl::Serverbound::PlayerAction.id(), |o| {
+            wire::write_varint(o, action);
+            wire::write_i64(o, pack_block_pos(block_pos));
+            // Unlike the use packet's, this face is one unsigned byte.
+            o.push(direction as u8);
+            wire::write_varint(o, sequence);
+        })
+    }
+
+    /// `ServerboundPunchPacket`: the main-hand swing of an attack that hit nothing
+    /// (26.3 has no hand-choosing swing packet; the server swings the main hand).
+    pub fn punch() -> Vec<u8> {
+        wire::packet(pl::Serverbound::Punch.id(), |_| {})
+    }
+
+    /// `ServerboundAttackPacket`: attacking an entity.
+    pub fn attack(entity_id: i32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::Attack.id(), |o| {
+            wire::write_varint(o, entity_id)
+        })
+    }
+
+    /// `ServerboundInteractPacket`: using `hand` on an entity; `location` is where the
+    /// hit landed relative to the entity's position (sent as a low-precision vector),
+    /// and `using_secondary_action` whether the player sneaks.
+    pub fn interact(
+        entity_id: i32,
+        hand: i32,
+        location: [f64; 3],
+        using_secondary_action: bool,
+    ) -> Vec<u8> {
+        wire::packet(pl::Serverbound::Interact.id(), |o| {
+            wire::write_varint(o, entity_id);
+            wire::write_varint(o, hand);
+            wire::write_lp_vec3(o, location);
+            wire::write_bool(o, using_secondary_action);
+        })
     }
 
     pub fn cookie_response(key: &str, payload: Option<&[u8]>) -> Vec<u8> {
@@ -1837,11 +2027,10 @@ mod tests {
             }
         );
 
-        // Entity data: a pose, then an item stack, which isn't read: the rest is
-        // skipped.
+        // Entity data: a pose, then a particle, which isn't read: the rest is skipped.
         let mut b = Vec::new();
         wire::write_varint(&mut b, 9);
-        b.extend([6, 20, 5, 8, 7, 1, 2, 3, 255]);
+        b.extend([6, 20, 5, 8, 16, 1, 2, 3, 255]);
         assert_eq!(
             decode(pl::Clientbound::SetEntityData, &b),
             play::Clientbound::SetEntityData {
@@ -1914,5 +2103,188 @@ mod tests {
                 }],
             }
         );
+    }
+
+    /// A stack of `count` of `item` with a damage component, as the server writes it.
+    fn damaged_stack(b: &mut Vec<u8>, item: i32, count: i32, damage: i32) {
+        wire::write_varint(b, count);
+        wire::write_varint(b, item);
+        b.extend([1, 0, 3]);
+        wire::write_varint(b, damage);
+    }
+
+    #[test]
+    fn play_reads_item_packets() {
+        use crate::item::{Component, ItemStack};
+        let decode =
+            |kind: pl::Clientbound, b: &[u8]| play::Clientbound::decode(kind.id(), b).unwrap();
+
+        // The inventory menu: three slots (the middle one empty), and an empty cursor.
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 0);
+        wire::write_varint(&mut b, 41);
+        wire::write_varint(&mut b, 3);
+        damaged_stack(&mut b, 850, 1, 7);
+        b.push(0);
+        wire::write_varint(&mut b, 64);
+        wire::write_varint(&mut b, 35);
+        b.extend([0, 0]);
+        b.push(0);
+        let play::Clientbound::ContainerSetContent {
+            container_id,
+            state_id,
+            items,
+            carried,
+        } = decode(pl::Clientbound::ContainerSetContent, &b)
+        else {
+            panic!()
+        };
+        assert_eq!((container_id, state_id, items.len()), (0, 41, 3));
+        assert_eq!(
+            items[0].get(ruthenium_data::v26_3::registries::DataComponentType::Damage),
+            Some(&Component::Damage(7))
+        );
+        assert!(items[1].is_empty() && carried.is_empty());
+        assert_eq!((items[2].item, items[2].count), (35, 64));
+
+        // One slot: a short, which may be negative (-1 is the cursor in old menus).
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 2);
+        wire::write_varint(&mut b, 300);
+        b.extend((-1i16).to_be_bytes());
+        damaged_stack(&mut b, 850, 1, 0);
+        let play::Clientbound::ContainerSetSlot {
+            container_id,
+            state_id,
+            slot,
+            item,
+        } = decode(pl::Clientbound::ContainerSetSlot, &b)
+        else {
+            panic!()
+        };
+        assert_eq!((container_id, state_id, slot, item.item), (2, 300, -1, 850));
+
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 40);
+        b.extend([0]);
+        assert_eq!(
+            decode(pl::Clientbound::SetPlayerInventory, &b),
+            play::Clientbound::SetPlayerInventory {
+                slot: 40,
+                item: ItemStack::EMPTY
+            }
+        );
+        let mut b = Vec::new();
+        damaged_stack(&mut b, 1, 3, 2);
+        assert!(matches!(decode(pl::Clientbound::SetCursorItem, &b),
+            play::Clientbound::SetCursorItem { item } if item.count == 3));
+
+        let mut b = Vec::new();
+        wire::write_string(&mut b, "ender_pearl");
+        wire::write_varint(&mut b, 20);
+        assert_eq!(
+            decode(pl::Clientbound::Cooldown, &b),
+            play::Clientbound::Cooldown {
+                group: "minecraft:ender_pearl".into(),
+                duration: 20
+            }
+        );
+        // The entity id is a full int here, not a VarInt.
+        assert_eq!(
+            decode(pl::Clientbound::EntityEvent, &[0, 0, 1, 0, 35]),
+            play::Clientbound::EntityEvent {
+                entity_id: 256,
+                event: 35
+            }
+        );
+
+        // A dropped item's entity data: the stack, then a boolean.
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 9);
+        b.extend([8, 7]);
+        damaged_stack(&mut b, 850, 1, 4);
+        b.extend([9, 8, 1, 255]);
+        let play::Clientbound::SetEntityData {
+            values, complete, ..
+        } = decode(pl::Clientbound::SetEntityData, &b)
+        else {
+            panic!()
+        };
+        assert!(complete);
+        let play::DataValue::Item(stack) = &values[0].1 else {
+            panic!("{values:?}")
+        };
+        assert_eq!(
+            (stack.item, values[1].1.clone()),
+            (850, play::DataValue::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn play_item_serverbound_layouts() {
+        let id = |p: pl::Serverbound| p.id() as u8;
+        let mut want = vec![id(pl::Serverbound::UseItem), 1, 5];
+        want.extend(90.0f32.to_be_bytes());
+        want.extend((-10.0f32).to_be_bytes());
+        assert_eq!(play::use_item(play::OFF_HAND, 5, 90.0, -10.0), want);
+
+        let pos = [-3, 64, 1_000_000];
+        assert_eq!(play::unpack_block_pos(play::pack_block_pos(pos)), pos);
+        assert_eq!(
+            play::unpack_block_pos(play::pack_block_pos([5, -64, -7])),
+            [5, -64, -7]
+        );
+
+        let p = play::use_item_on(
+            play::MAIN_HAND,
+            pos,
+            play::UP,
+            [0.5, 1.0, 0.25],
+            false,
+            false,
+            9,
+        );
+        let (pid, rest) = body(&p);
+        assert_eq!(pid, pl::Serverbound::UseItemOn.id());
+        let mut r = Reader::new(rest);
+        assert_eq!(r.varint().unwrap(), 0);
+        assert_eq!(play::unpack_block_pos(r.i64().unwrap()), pos);
+        assert_eq!(r.varint().unwrap(), play::UP);
+        assert_eq!(
+            [r.f32().unwrap(), r.f32().unwrap(), r.f32().unwrap()],
+            [0.5, 1.0, 0.25]
+        );
+        assert_eq!(
+            (r.bool().unwrap(), r.bool().unwrap(), r.varint().unwrap()),
+            (false, false, 9)
+        );
+        r.finish().unwrap();
+
+        let p = play::player_action(play::ACTION_START_DESTROY_BLOCK, [1, 2, 3], play::EAST, 300);
+        let (pid, rest) = body(&p);
+        assert_eq!(pid, pl::Serverbound::PlayerAction.id());
+        assert_eq!(rest[0], 0);
+        assert_eq!(
+            play::unpack_block_pos(i64::from_be_bytes(rest[1..9].try_into().unwrap())),
+            [1, 2, 3]
+        );
+        assert_eq!(rest[9..], [5, 0xAC, 0x02]);
+        let p = play::player_action(play::ACTION_SWAP_ITEM_WITH_OFFHAND, [0; 3], play::DOWN, 0);
+        assert_eq!(p[1..], [7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+        assert_eq!(play::punch(), [id(pl::Serverbound::Punch)]);
+        assert_eq!(play::attack(300), [id(pl::Serverbound::Attack), 0xAC, 0x02]);
+        // Interacting at the entity's feet: a zero vector is one byte.
+        assert_eq!(
+            play::interact(7, play::MAIN_HAND, [0.0; 3], true),
+            [id(pl::Serverbound::Interact), 7, 0, 0, 1]
+        );
+        let p = play::interact(7, play::OFF_HAND, [0.25, 1.5, -0.25], false);
+        let mut r = Reader::new(&p[1..]);
+        assert_eq!((r.varint().unwrap(), r.varint().unwrap()), (7, 1));
+        let v = r.lp_vec3().unwrap();
+        assert!((v[1] - 1.5).abs() < 1e-3 && (v[2] + 0.25).abs() < 1e-3);
+        assert!(!r.bool().unwrap());
+        r.finish().unwrap();
     }
 }

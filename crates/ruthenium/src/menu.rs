@@ -1433,6 +1433,14 @@ impl Menu {
         }
     }
 
+    /// Another mouse button (SDL's numbering) went down or up: in the world, the right
+    /// one uses items.
+    pub fn other_mouse_button(&mut self, button: u8, down: bool) {
+        if matches!(self.screen, Screen::Game) {
+            self.game.mouse_button(button, down, self.session.as_ref());
+        }
+    }
+
     /// The left mouse button went down or up at `(x, y)` (window coordinates): the action
     /// the client must take, if any (buttons act on release).
     #[allow(clippy::too_many_arguments)]
@@ -1452,8 +1460,11 @@ impl Menu {
         let (ux, uy) = scale.from_window(x, y, window_size, pixel_size);
         let time = self.started.elapsed().as_secs_f64();
         let action = match &mut self.screen {
-            // Attacking and using items aren't there yet.
-            Screen::Game => None,
+            // Attacks aren't there yet; the press is read and dropped.
+            Screen::Game => {
+                self.game.mouse_button(1, down, self.session.as_ref());
+                None
+            }
             Screen::Settings => {
                 let screen = self.settings_screen.as_mut()?;
                 let e = if down {

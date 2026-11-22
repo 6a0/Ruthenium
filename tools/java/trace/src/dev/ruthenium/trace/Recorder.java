@@ -27,7 +27,12 @@ import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.BundlePacket;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.player.Input;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.EntityHitResult;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
 /**
@@ -59,7 +64,8 @@ public final class Recorder {
             "minecraft:add_entity", "minecraft:remove_entities", "minecraft:move_entity_pos",
             "minecraft:move_entity_pos_rot", "minecraft:move_entity_rot", "minecraft:rotate_head",
             "minecraft:swing_animation", "minecraft:set_equipment", "minecraft:sound",
-            "minecraft:set_passengers", "minecraft:set_player_team", "minecraft:player_info_update");
+            "minecraft:set_passengers", "minecraft:set_player_team", "minecraft:player_info_update",
+            "minecraft:cooldown");
 
     private static final Gson GSON = new GsonBuilder().serializeSpecialFloatingPointValues().disableHtmlEscaping().create();
     private static final Object LOCK = new Object();
@@ -236,8 +242,38 @@ public final class Recorder {
             o.add("move", move);
             o.addProperty("health", p.getHealth());
             o.addProperty("food", p.getFoodData().getFoodLevel());
+            o.addProperty("saturation", p.getFoodData().getSaturationLevel());
+            // Item use and the hands.
+            o.addProperty("using", p.isUsingItem());
+            if (p.isUsingItem()) {
+                o.addProperty("useHand", p.getUsedItemHand().name());
+                o.addProperty("useItem", stack(p.getUseItem()));
+                o.addProperty("useRemaining", p.getUseItemRemainingTicks());
+            }
+            o.addProperty("main", stack(p.getMainHandItem()));
+            o.addProperty("off", stack(p.getOffhandItem()));
+            // What the crosshair is on, as this tick's pick found it.
+            HitResult hit = mc.hitResult;
+            o.addProperty("hit", hit == null ? "NONE" : hit.getType().name());
+            if (hit instanceof BlockHitResult b && b.getType() == HitResult.Type.BLOCK) {
+                JsonArray pos = new JsonArray();
+                pos.add(b.getBlockPos().getX());
+                pos.add(b.getBlockPos().getY());
+                pos.add(b.getBlockPos().getZ());
+                o.add("hitBlock", pos);
+                o.addProperty("hitFace", b.getDirection().getSerializedName());
+                o.add("hitAt", vec(b.getLocation()));
+            } else if (hit instanceof EntityHitResult e) {
+                o.addProperty("hitEntity", e.getEntity().getId());
+                o.add("hitAt", vec(e.getLocation()));
+            }
             write(o);
         }
+    }
+
+    /** An item stack as {@code id*count}, empty as "". */
+    private static String stack(ItemStack s) {
+        return s.isEmpty() ? "" : BuiltInRegistries.ITEM.getKey(s.getItem()) + "*" + s.getCount();
     }
 
     private static JsonArray vec(Vec3 v) {

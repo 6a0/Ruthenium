@@ -17,6 +17,8 @@ pub struct Blocks {
     states: Vec<StatePhysics>,
     /// States whose shape the local player never meets (see [`Blocks::collision`]).
     passable: Vec<bool>,
+    /// `Shapes.block()`, for outlines that fill the block.
+    block: Shape,
 }
 
 /// Blocks whose collision shape depends on who collides, and which never stop a
@@ -41,6 +43,7 @@ impl Blocks {
             shapes: data.shapes.iter().map(Shape::new).collect(),
             states: data.states.clone(),
             passable,
+            block: Shape::block(),
         }
     }
 
@@ -131,6 +134,44 @@ impl Blocks {
         Some(Placed {
             shape,
             offset,
+            pos: [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
+        })
+    }
+
+    /// The outline shape (`getShape` with the picking entity's context), placed in the
+    /// world; `None` when it is empty. `held_item` is the item in the entity's main
+    /// hand (`minecraft:air` for none): light blocks and scaffolding fill the block
+    /// for one holding their item (`isHoldingItem`), the only outlines that depend on
+    /// the context. Offset blocks offset their outline like their collision shape.
+    pub fn outline(&self, id: u32, pos: [i32; 3], held_item: &str) -> Option<Placed<'_>> {
+        let place = |shape, offset| Placed {
+            shape,
+            offset,
+            pos: [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
+        };
+        let name = self.name(id);
+        if matches!(name, "minecraft:light" | "minecraft:scaffolding") && held_item == name {
+            return Some(place(&self.block, None));
+        }
+        let s = self.state(id);
+        let shape = &self.shapes[s.outline as usize];
+        if shape.is_empty() {
+            return None;
+        }
+        let offset = s
+            .offset
+            .map(|o| offset(pos, o.vertical, o.max_horizontal, o.max_vertical));
+        Some(place(shape, offset))
+    }
+
+    /// The interaction shape (`getInteractionShape`: cauldrons, composters, hoppers,
+    /// scaffolding), placed in the world; `None` when empty. No block with one is
+    /// offset by position.
+    pub fn interaction_shape(&self, id: u32, pos: [i32; 3]) -> Option<Placed<'_>> {
+        let shape = &self.shapes[self.state(id).interaction_shape as usize];
+        (!shape.is_empty()).then(|| Placed {
+            shape,
+            offset: None,
             pos: [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
         })
     }

@@ -164,6 +164,8 @@ pub struct KeyBinds {
     pub sprint: u32,
     /// `key.hotbar.1` to `key.hotbar.9`.
     pub hotbar: [u32; 9],
+    /// `key.swapOffhand`.
+    pub swap_offhand: u32,
 }
 
 impl KeyBinds {
@@ -176,6 +178,7 @@ impl KeyBinds {
         sneak: 225,  // Left Shift
         sprint: 224, // Left Ctrl
         hotbar: [30, 31, 32, 33, 34, 35, 36, 37, 38],
+        swap_offhand: 9, // F
     };
 
     /// The hotbar slot a key selects.

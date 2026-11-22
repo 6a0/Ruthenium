@@ -1,5 +1,5 @@
-//! In the world: the mouse grabbed and turning the camera, the movement and hotbar keys
-//! and the scroll wheel handed to the game thread, and, until the world is drawn, a
+//! In the world: the mouse grabbed and turning the camera, the movement, hotbar and
+//! swap-hands keys, the use button and the scroll wheel handed to the game thread, and, until the world is drawn, a
 //! readout of where the player is.
 //!
 //! Vanilla's rules: keys count only while no screen is open (`KeyMapping.releaseAll`
@@ -56,6 +56,18 @@ impl InGame {
         self.held.release_all();
         if let Some(s) = session {
             s.set_keys(Default::default());
+            s.set_use(false);
+        }
+    }
+
+    /// A mouse button went down or up in the world (SDL's numbering: 1 left, 3 right):
+    /// the left one attacks, the right one uses.
+    pub fn mouse_button(&mut self, button: u8, down: bool, session: Option<&Session>) {
+        let Some(s) = session else { return };
+        match button {
+            1 if down => s.attack_key(),
+            3 => s.set_use(down),
+            _ => {}
         }
     }
 
@@ -86,6 +98,12 @@ impl InGame {
             && let Some(s) = session
         {
             s.hotbar_key(slot);
+        }
+        if down
+            && scancode == self.binds.swap_offhand
+            && let Some(s) = session
+        {
+            s.swap_hands_key();
         }
         if let Some(s) = session {
             s.set_keys(self.held.keys(&self.binds));
@@ -205,7 +223,11 @@ pub fn draw_hud(
                 2 => "Adventure",
                 _ => "Spectator",
             };
-            let mut status = vec![mode.to_owned(), format!("health {:.1}", v.health)];
+            let mut status = vec![
+                mode.to_owned(),
+                format!("health {:.1}", v.health),
+                format!("food {}", v.food),
+            ];
             for &(id, amplifier, duration) in &v.effects {
                 let name = u32::try_from(id)
                     .ok()
@@ -221,6 +243,26 @@ pub fn draw_hud(
                 status.push(format!("{name} {} ({time})", amplifier + 1));
             }
             lines.push((status.join(", "), body));
+            let hand = |s: &str| {
+                if s.is_empty() {
+                    "empty".to_owned()
+                } else {
+                    s.trim_start_matches("minecraft:").replace('*', " x")
+                }
+            };
+            let mut hands = format!(
+                "Main hand: {}, off hand: {}",
+                hand(&v.main_hand),
+                hand(&v.off_hand)
+            );
+            if let Some((h, item, left)) = &v.using {
+                let h = if *h == "OFF_HAND" { "off" } else { "main" };
+                hands.push_str(&format!(
+                    "; using {} ({h} hand, {left} ticks left)",
+                    item.trim_start_matches("minecraft:")
+                ));
+            }
+            lines.push((hands, body));
             lines.push((format!("{} ({} chunks)", v.dimension, v.chunks), body));
         }
         None => lines.push(("Joining...".into(), body)),

@@ -12,9 +12,11 @@
 //! spectators going through everything. The effects that move the player (jump boost,
 //! levitation, slow falling, dolphin's grace, blindness stopping a sprint), and the
 //! server's copy of the player's entity data, which overrides the client's own (its
-//! sprinting flag, pose, no-gravity). Not yet: elytra, riptide, using items, the scale
-//! attribute, vehicles, the world border, and the fence, wall and bounce-suppression
-//! tags.
+//! sprinting flag, pose, no-gravity). Using items: the hands, the use the client
+//! predicts and the server's living flags start and stop, the slowdown and the sprint
+//! it blocks, food, cooldowns ([`crate::interact`] starts and releases uses). Not yet:
+//! elytra, riptide, the scale attribute, vehicles, the world border, and the fence, wall
+//! and bounce-suppression tags.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
@@ -29,6 +31,8 @@ use crate::blocks::{BlockTags, Blocks};
 use crate::effect::{Effect, Effects};
 use crate::entity::EntityTypes;
 use crate::fluid::FluidInteraction;
+use crate::inventory::{Cooldowns, Hand, Inventory};
+use crate::item::{Food, Stack};
 use crate::shape::{Aabb, Axis, EPSILON, Placed, Shape, collide_all};
 use crate::world::Level;
 
@@ -255,6 +259,8 @@ pub struct Attributes {
     pub movement_efficiency: Attribute,
     pub water_movement_efficiency: Attribute,
     pub bounciness: Attribute,
+    pub block_interaction_range: Attribute,
+    pub entity_interaction_range: Attribute,
 }
 
 impl Default for Attributes {
@@ -270,6 +276,8 @@ impl Default for Attributes {
             movement_efficiency: Attribute::new(0.0, 0.0, 1.0),
             water_movement_efficiency: Attribute::new(0.0, 0.0, 1.0),
             bounciness: Attribute::new(0.0, 0.0, 1.0),
+            block_interaction_range: Attribute::new(4.5, 0.0, 64.0),
+            entity_interaction_range: Attribute::new(3.0, 0.0, 64.0),
         }
     }
 }
@@ -288,6 +296,8 @@ impl Attributes {
             "minecraft:movement_efficiency" => &mut self.movement_efficiency,
             "minecraft:water_movement_efficiency" => &mut self.water_movement_efficiency,
             "minecraft:bounciness" => &mut self.bounciness,
+            "minecraft:block_interaction_range" => &mut self.block_interaction_range,
+            "minecraft:entity_interaction_range" => &mut self.entity_interaction_range,
             _ => return None,
         })
     }
@@ -306,6 +316,8 @@ impl Attributes {
             &mut a.movement_efficiency,
             &mut a.water_movement_efficiency,
             &mut a.bounciness,
+            &mut a.block_interaction_range,
+            &mut a.entity_interaction_range,
         ] {
             attribute.modifiers.clear();
         }
@@ -547,6 +559,22 @@ pub struct LocalPlayer {
     last_horizontal_collision: bool,
     was_sprinting: bool,
     position_reminder: i32,
+    /// Where the player was and how it was turned as its last tick began
+    /// (`xo`, `yRotO`...): the camera and the crosshair's pick interpolate from them.
+    pub old_position: [f64; 3],
+    pub old_rot: (f32, f32),
+    /// The inventory and the hands.
+    pub inventory: Inventory,
+    /// `ItemCooldowns`.
+    pub cooldowns: Cooldowns,
+    /// `FoodData.saturationLevel` (`set_health`, and eating).
+    pub saturation: f32,
+    /// `LivingEntity.useItem` and `useItemRemaining`; `LocalPlayer.startedUsingItem`
+    /// and `usingItemHand` (kept after the use ends, as vanilla keeps it).
+    use_item: Stack,
+    use_remaining: i32,
+    started_using: bool,
+    using_hand: Option<Hand>,
 }
 
 impl LocalPlayer {
@@ -599,6 +627,15 @@ impl LocalPlayer {
             last_horizontal_collision: false,
             was_sprinting: false,
             position_reminder: 0,
+            old_position: [0.0; 3],
+            old_rot: (-180.0, 0.0),
+            inventory: Inventory::default(),
+            cooldowns: Cooldowns::default(),
+            saturation: 5.0,
+            use_item: Stack::empty(),
+            use_remaining: 0,
+            started_using: false,
+            using_hand: None,
         }
     }
 
@@ -710,7 +747,10 @@ impl LocalPlayer {
                 DataValue::Boolean(b) if field == f.no_gravity => self.data.no_gravity = b,
                 DataValue::Pose(p) if field == f.pose => self.pose = Pose::from_id(p),
                 DataValue::Int(n) if field == f.ticks_frozen => self.data.ticks_frozen = n,
-                DataValue::Byte(b) if field == f.living_flags => self.data.living_flags = b as u8,
+                DataValue::Byte(b) if field == f.living_flags => {
+                    self.data.living_flags = b as u8;
+                    self.on_living_flags();
+                }
                 DataValue::Float(h) if field == f.health => self.health = h,
                 DataValue::Float(a) if field == f.absorption => self.data.absorption = a,
                 DataValue::Int(n) if field == f.score => self.data.score = n,
@@ -722,6 +762,206 @@ impl LocalPlayer {
     /// `isFallFlying`: the server's flag (elytra flight isn't ported).
     pub fn fall_flying(&self) -> bool {
         self.data.flags & flag::FALL_FLYING != 0
+    }
+
+    /// `getEyePosition()`: where the eyes are now.
+    pub fn eye_position(&self) -> [f64; 3] {
+        let p = self.position;
+        [p[0], p[1] + f64::from(self.pose.eye_height()), p[2]]
+    }
+
+    /// `getEyePosition(1.0)`, as the crosshair's pick takes it: interpolated all the way
+    /// from where the last tick began (`Mth.lerp`, which can round).
+    pub fn pick_eye_position(&self) -> [f64; 3] {
+        let (o, p) = (self.old_position, self.position);
+        let lerp = |a: f64, b: f64| a + 1.0 * (b - a);
+        [
+            lerp(o[0], p[0]),
+            lerp(o[1], p[1]) + f64::from(self.pose.eye_height()),
+            lerp(o[2], p[2]),
+        ]
+    }
+
+    /// `getItemInHand`.
+    pub fn hand(&self, hand: Hand) -> &Stack {
+        self.inventory.hand(hand)
+    }
+
+    /// `LocalPlayer.isUsingItem`: the client's own idea, which the server's living
+    /// flags start and stop.
+    pub fn is_using_item(&self) -> bool {
+        self.started_using
+    }
+
+    /// `getUsedItemHand`: the hand last used (the main hand before any).
+    pub fn used_hand(&self) -> Hand {
+        self.using_hand.unwrap_or(Hand::Main)
+    }
+
+    /// `getUseItem`.
+    pub fn use_item(&self) -> &Stack {
+        &self.use_item
+    }
+
+    /// `getUseItemRemainingTicks`.
+    pub fn use_remaining(&self) -> i32 {
+        self.use_remaining
+    }
+
+    /// `hasInfiniteMaterials`: creative's instant building.
+    pub fn infinite_materials(&self) -> bool {
+        self.abilities.instabuild
+    }
+
+    /// `isSecondaryUseActive` (`isShiftKeyDown`): sneak held as the last tick read it.
+    pub fn secondary_use(&self) -> bool {
+        self.keys.shift
+    }
+
+    /// `Player.canEat`.
+    pub fn can_eat(&self, can_always_eat: bool) -> bool {
+        self.abilities.invulnerable || can_always_eat || self.food < 20
+    }
+
+    /// `FoodData.eat(FoodProperties)`.
+    pub fn eat(&mut self, food: Food) {
+        self.food = (food.nutrition + self.food).clamp(0, 20);
+        let s = food.saturation + self.saturation;
+        // Mth.clamp(float): a NaN passes through.
+        let max = self.food as f32;
+        self.saturation = if s < 0.0 { 0.0 } else { s.min(max) };
+    }
+
+    /// `isSlowDueToUsingItem` (riding isn't ported).
+    fn slow_due_to_using_item(&self) -> bool {
+        self.started_using && !self.use_item.c.use_effects().can_sprint
+    }
+
+    /// `LocalPlayer.startUsingItem`: the item in the hand, if any, unless already using
+    /// one.
+    pub fn start_using_item(&mut self, hand: Hand) {
+        let stack = self.hand(hand).clone();
+        if !stack.is_empty() && !self.started_using {
+            // LivingEntity.startUsingItem (its own checks pass by now).
+            self.use_remaining = stack.c.use_duration;
+            self.use_item = stack;
+            self.started_using = true;
+            self.using_hand = Some(hand);
+        }
+    }
+
+    /// `LocalPlayer.stopUsingItem`.
+    pub fn stop_using_item(&mut self) {
+        self.use_item = Stack::empty();
+        self.use_remaining = 0;
+        self.started_using = false;
+    }
+
+    /// `LivingEntity.releaseUsingItem` on the client (the release packet is the
+    /// caller's): a crossbow updates once more; a riptide trident's spin isn't ported.
+    pub fn release_using_item(&mut self) {
+        let held = self.hand(self.used_hand()).clone();
+        if !self.use_item.is_empty() && held.same_item(&self.use_item) {
+            self.use_item = held;
+            if self.use_item.c.use_on_release() {
+                self.updating_using_item();
+            }
+        }
+        self.stop_using_item();
+    }
+
+    /// `LivingEntity.updatingUsingItem`: the use goes on while the hand holds the same
+    /// item, else it stops. The client never finishes it itself.
+    fn updating_using_item(&mut self) {
+        if !self.started_using {
+            return;
+        }
+        let held = self.hand(self.used_hand());
+        if held.same_item(&self.use_item) {
+            self.use_item = held.clone();
+            self.use_remaining -= 1;
+        } else {
+            self.stop_using_item();
+        }
+    }
+
+    /// `completeUsingItem`, on the server's `USE_ITEM_COMPLETE` event: unless the
+    /// hand's stack was replaced since the last tick (then it is only released), the
+    /// item is finished: eaten, drunk, turned into its remainder.
+    pub fn complete_using_item(&mut self) {
+        if !self.started_using {
+            return;
+        }
+        let hand = self.used_hand();
+        if !self.use_item.same_object(self.hand(hand)) {
+            self.release_using_item();
+            return;
+        }
+        if !self.use_item.is_empty() {
+            self.finish_using_item(hand);
+            self.stop_using_item();
+        }
+    }
+
+    /// `ItemStack.finishUsingItem` on the stack in a hand: `Item.finishUsingItem`
+    /// (consumables are consumed, food eaten) and `applyAfterUseComponentSideEffects`.
+    fn finish_using_item(&mut self, hand: Hand) {
+        let infinite = self.infinite_materials();
+        let before = self.hand(hand).clone();
+        if let Some(c) = before.c.consumable {
+            let _ = c;
+            if let Some(food) = before.c.food {
+                self.eat(food);
+            }
+            self.inventory.hand_mut(hand).consume(1, infinite);
+        }
+        self.after_use(hand, &before);
+    }
+
+    /// `applyAfterUseComponentSideEffects` for the stack now in `hand`, given the stack
+    /// as it was before the use: the use remainder, the use cooldown.
+    pub fn after_use(&mut self, hand: Hand, before: &Stack) {
+        if let Some(remainder) = before.c.remainder.clone() {
+            let used = self.hand(hand);
+            if !self.infinite_materials() && used.count < before.count {
+                let made = remainder.copy();
+                if used.is_empty() {
+                    self.inventory.set_hand(hand, made);
+                } else if !self.inventory.add(made) {
+                    // Dropped: the server's inventory update follows.
+                }
+            }
+        }
+        if let Some(cd) = &before.c.use_cooldown {
+            self.cooldowns.add(&before.cooldown_group(), cd.ticks());
+        }
+    }
+
+    /// The living flags changed (`onSyncedDataUpdated`): `LivingEntity`'s part keeps
+    /// the use item in step, then `LocalPlayer`'s starts or stops using as the server
+    /// says.
+    fn on_living_flags(&mut self) {
+        if self.started_using && self.use_item.is_empty() {
+            self.use_item = self.hand(self.used_hand()).clone();
+            if !self.use_item.is_empty() {
+                self.use_remaining = self.use_item.c.use_duration;
+            }
+        } else if !self.started_using && !self.use_item.is_empty() {
+            self.use_item = Stack::empty();
+            self.use_remaining = 0;
+        }
+        let flags = self.data.living_flags;
+        let using = flags & 1 != 0;
+        let hand = if flags & 2 != 0 {
+            Hand::Off
+        } else {
+            Hand::Main
+        };
+        if using && !self.started_using {
+            self.start_using_item(hand);
+        } else if !using && self.started_using {
+            self.stop_using_item();
+        }
     }
 
     /// Applies a teleport (`PositionMoveRotation.calculateAbsolute`, then set without
@@ -738,6 +978,20 @@ impl LocalPlayer {
             t.x_rot,
             t.relatives,
         );
+        // The old position and rotation move with it (no interpolation).
+        let (old, _, old_y, old_x) = calculate_absolute(
+            self.old_position,
+            [0.0; 3],
+            self.old_rot.0,
+            self.old_rot.1,
+            t.position,
+            t.delta,
+            t.y_rot,
+            t.x_rot,
+            t.relatives,
+        );
+        self.old_position = old;
+        self.old_rot = (old_y, old_x);
     }
 
     /// `handleUpdateAttributes`: each attribute's base, and its modifiers replaced by
@@ -928,6 +1182,9 @@ impl LocalPlayer {
     /// One client tick of the player (`LocalPlayer.tick`, only called once the player
     /// has loaded into the level). `keys` are the movement keys held.
     pub fn tick(&mut self, env: &Env<'_>, keys: Keys) {
+        // Level.tickNonPassenger: setOldPosAndRot.
+        self.old_position = self.position;
+        self.old_rot = (self.y_rot, self.x_rot);
         // Player.tick: spectators go through everything and are never on the ground;
         // updateIsUnderwater, from the fluids as last updated.
         self.no_physics = self.spectator;
@@ -936,10 +1193,13 @@ impl LocalPlayer {
         }
         self.was_underwater = self.fluids.eye_in(true);
         self.base_tick(env);
+        // LivingEntity.tick.
+        self.updating_using_item();
         self.ai_step(env, keys);
         let clamp = |v: f64| v.clamp(-2.9999999E7, 2.9999999E7);
         self.position[0] = clamp(self.position[0]);
         self.position[2] = clamp(self.position[2]);
+        self.cooldowns.tick();
         self.update_pose(env);
     }
 
@@ -1073,13 +1333,15 @@ impl LocalPlayer {
                 self.move_towards_closest_space(env, x, z);
             }
         }
-        if was_shift || keys.backward {
+        let slow_using = self.slow_due_to_using_item();
+        if was_shift || slow_using || keys.backward {
             self.sprint_trigger_time = 0;
         }
         let flying = self.abilities.flying;
         let can_start_sprinting = !self.sprinting
             && self.has_forward_impulse()
             && self.sprinting_possible(flying)
+            && !slow_using
             && (!self.fall_flying() || self.was_underwater)
             && (!self.moving_slowly() || self.was_underwater);
         if can_start_sprinting {
@@ -1396,6 +1658,11 @@ impl LocalPlayer {
             return (x, y);
         }
         let (mut x, mut y) = (x * 0.98, y * 0.98);
+        if self.started_using {
+            let f = self.use_item.c.use_effects().speed_multiplier;
+            x *= f;
+            y *= f;
+        }
         if self.moving_slowly() {
             let f = self.attributes.sneaking_speed.value() as f32;
             x *= f;
@@ -2133,6 +2400,9 @@ mod tests {
             fluid: 0,
             sturdy: 0,
             offset: None,
+            outline: shape,
+            interaction_shape: 0,
+            interaction: 0,
         };
         let blocks = Blocks::new(&BlockPhysics {
             shapes: vec![

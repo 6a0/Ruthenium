@@ -9,8 +9,12 @@
 //!   it (abilities, entity data) and the packets it sends.
 //! - [`effect`]: mob effects as the client keeps them.
 //! - [`entity`]: the other entities: where they are, their sizes, and their pushes.
+//! - [`item`], [`inventory`], [`interact`]: item stacks and their components, the
+//!   inventory and cooldowns, and using items with either hand.
+//! - [`pick`]: what the crosshair is on, and the raycasts items make.
 //! - [`input`]: the mouse's turn, the scroll wheel and the movement keys.
 //! - [`blocks`], [`shape`], [`world`], [`fluid`]: the level the player moves in.
+//! - [`pick`]: what the crosshair points at (block and entity raycasts).
 
 #![forbid(unsafe_code)]
 
@@ -20,7 +24,11 @@ pub mod effect;
 pub mod entity;
 pub mod fluid;
 pub mod input;
+pub mod interact;
+pub mod inventory;
+pub mod item;
 pub mod level_load;
+pub mod pick;
 pub mod player;
 pub mod session;
 pub mod shape;

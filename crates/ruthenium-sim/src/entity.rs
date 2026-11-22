@@ -132,6 +132,70 @@ enum Follow {
     Stepped(i32),
 }
 
+/// Whether the crosshair can pick an entity (`isPickable`, the overrides of its class
+/// chain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pickable {
+    /// `Entity`'s default, and the ender dragon (only its parts are picked).
+    No,
+    /// While not removed: living entities, boats, minecarts, primed TNT, falling
+    /// blocks.
+    NotRemoved,
+    /// Players: not removed and not spectators.
+    Player,
+    /// Armor stands: not removed and not markers.
+    ArmorStand,
+    /// Item frames, paintings and leash knots (`BlockAttachedEntity`), interactions,
+    /// end crystals, shulker bullets.
+    Always,
+    /// Other projectiles: in `#minecraft:redirectable_projectile`.
+    Projectile { redirectable: bool },
+    /// Arrows and tridents: also not stuck in the ground.
+    Arrow { redirectable: bool },
+}
+
+/// `#minecraft:redirectable_projectile` as vanilla's data pack has it. Servers can
+/// change entity tags, but the client reads only this one for picking, so it is not
+/// taken from the tags packet.
+const REDIRECTABLE_PROJECTILES: [&str; 3] = [
+    "minecraft:fireball",
+    "minecraft:wind_charge",
+    "minecraft:breeze_wind_charge",
+];
+
+impl Pickable {
+    fn new(d: &EntityTypeData) -> Pickable {
+        let redirectable = REDIRECTABLE_PROJECTILES.contains(&d.key.as_str());
+        // Most derived override first.
+        if d.is("EnderDragon") {
+            Pickable::No
+        } else if d.is("ArmorStand") {
+            Pickable::ArmorStand
+        } else if d.key == "minecraft:player" {
+            Pickable::Player
+        } else if d.is("LivingEntity")
+            || d.is("AbstractBoat")
+            || d.is("AbstractMinecart")
+            || d.is("PrimedTnt")
+            || d.is("FallingBlockEntity")
+        {
+            Pickable::NotRemoved
+        } else if d.is("BlockAttachedEntity")
+            || d.is("Interaction")
+            || d.is("EndCrystal")
+            || d.is("ShulkerBullet")
+        {
+            Pickable::Always
+        } else if d.is("AbstractArrow") {
+            Pickable::Arrow { redirectable }
+        } else if d.is("Projectile") {
+            Pickable::Projectile { redirectable }
+        } else {
+            Pickable::No
+        }
+    }
+}
+
 /// What the client needs of an entity type.
 #[derive(Debug, Clone)]
 pub struct TypeInfo {
@@ -157,6 +221,13 @@ pub struct TypeInfo {
     age_scale: f32,
     /// `AbstractCubeMob.ID_SIZE`: slimes and magma cubes scale by it.
     cube_size_field: Option<u8>,
+    pub pickable: Pickable,
+    /// A `Projectile`: picked with a radius of 1 (`getPickRadius`).
+    projectile: bool,
+    /// `ArmorStand.DATA_CLIENT_FLAGS`.
+    armor_stand_flags_field: Option<u8>,
+    /// `AbstractArrow.IN_GROUND`.
+    in_ground_field: Option<u8>,
 }
 
 /// The ids of the player's synched-data fields the client reads (from the export, so
@@ -273,6 +344,10 @@ impl EntityTypes {
                 }),
                 age_scale,
                 cube_size_field: d.field("AbstractCubeMob.ID_SIZE"),
+                pickable: Pickable::new(d),
+                projectile: d.is("Projectile"),
+                armor_stand_flags_field: d.field("ArmorStand.DATA_CLIENT_FLAGS"),
+                in_ground_field: d.field("AbstractArrow.IN_GROUND"),
             };
             let i = d.id as usize;
             if types.len() <= i {
@@ -521,6 +596,10 @@ pub struct Entity {
     pub passengers: Vec<i32>,
     pub removed: bool,
     pub tick_count: i32,
+    /// An armor stand's marker flag (`CLIENT_FLAG_MARKER`).
+    pub marker: bool,
+    /// An arrow stuck in a block (`IN_GROUND`).
+    pub in_ground: bool,
     /// `VecDeltaCodec`'s base: the last position the server sent.
     codec_base: [f64; 3],
     interpolation: Interpolation,
@@ -600,6 +679,8 @@ impl Entity {
             passengers: Vec::new(),
             removed: false,
             tick_count: 0,
+            marker: false,
+            in_ground: false,
             codec_base: [0.0; 3],
             interpolation,
             no_physics: info.player,
@@ -631,6 +712,36 @@ impl Entity {
 
     pub fn info(&self) -> &TypeInfo {
         &self.info
+    }
+
+    /// `isPickable` (`EntitySelector.CAN_BE_PICKED`): a player is a spectator by its
+    /// player-list entry (`AbstractClientPlayer.gameMode`).
+    pub fn is_pickable(&self, players: &PlayerInfos) -> bool {
+        match self.info.pickable {
+            Pickable::No => false,
+            Pickable::NotRemoved => !self.removed,
+            Pickable::Player => {
+                !self.removed
+                    && !players
+                        .get(self.uuid)
+                        .is_some_and(|i| i.game_mode == play::SPECTATOR)
+            }
+            Pickable::ArmorStand => !self.removed && !self.marker,
+            Pickable::Always => true,
+            Pickable::Projectile { redirectable } => redirectable,
+            Pickable::Arrow { redirectable } => redirectable && !self.in_ground,
+        }
+    }
+
+    /// `getPickRadius` of a pickable entity: 1 for projectiles, else 0.
+    pub fn pick_radius(&self) -> f32 {
+        if self.info.projectile { 1.0 } else { 0.0 }
+    }
+
+    /// `canBePickedFromInside`. Sulfur cubes wearing a body item can't be, but
+    /// equipment isn't tracked, so this is always true.
+    pub fn can_be_picked_from_inside(&self) -> bool {
+        true
     }
 
     /// `getDimensions(getPose())`.
@@ -903,6 +1014,15 @@ impl Entity {
         {
             self.cube_size = *n;
             self.refresh_dimensions();
+        } else if Some(field) == t.armor_stand_flags_field
+            && let DataValue::Byte(b) = value
+        {
+            // `ArmorStand.CLIENT_FLAG_MARKER`.
+            self.marker = b & 16 != 0;
+        } else if Some(field) == t.in_ground_field
+            && let DataValue::Boolean(b) = value
+        {
+            self.in_ground = *b;
         }
     }
 }
@@ -1123,6 +1243,44 @@ impl Entities {
 
     pub fn iter(&self) -> impl Iterator<Item = &Entity> {
         self.entities.values()
+    }
+
+    /// The entities whose box intersects `b`, in the order `Level.getEntities(except,
+    /// box, ...)` visits them (`EntitySectionStorage.getEntities`): sections near the
+    /// box by x, then by their key's order within each x (y 0 upwards, then the
+    /// negative ones, then z), each section's entities in the order they arrived. The
+    /// local player isn't among them.
+    pub fn in_box(&self, b: &Aabb) -> Vec<&Entity> {
+        let section = |v: f64| mth::floor(v) >> 4;
+        let (x0, y0, z0) = (
+            section(b.min[0] - 2.0),
+            section(b.min[1] - 4.0),
+            section(b.min[2] - 2.0),
+        );
+        let (x1, y1, z1) = (
+            section(b.max[0] + 2.0),
+            section(b.max[1] + 0.0),
+            section(b.max[2] + 2.0),
+        );
+        let mut out = Vec::new();
+        for x in x0..=x1 {
+            let range = pack_section(x, 0, 0)..=pack_section(x, -1, -1);
+            for (&key, ids) in self.sections.range(range) {
+                let y = (key << 44 >> 44) as i32;
+                let z = (key << 22 >> 42) as i32;
+                if y < y0 || y > y1 || z < z0 || z > z1 {
+                    continue;
+                }
+                for id in ids {
+                    if let Some(e) = self.entities.get(id)
+                        && e.bounding_box.intersects(b)
+                    {
+                        out.push(e);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// The ids in tick order, the local player's among them.
@@ -1359,8 +1517,9 @@ impl Entities {
         }
     }
 
-    /// `getRootVehicle`.
-    fn root_vehicle(&self, mut id: i32) -> i32 {
+    /// `getRootVehicle`: the bottom of the stack `id` rides in (itself when it
+    /// rides nothing); the local player's too.
+    pub fn root_vehicle(&self, mut id: i32) -> i32 {
         let mut guard = 0;
         while let Some(v) = self.vehicle_of(id) {
             id = v;
@@ -1478,6 +1637,10 @@ impl Entities {
     pub fn set_motion(&mut self, id: i32, movement: [f64; 3]) {
         if let Some(e) = self.entities.get_mut(&id) {
             e.delta = movement;
+            // `AbstractArrow.lerpMotion`: moving again, so out of the ground.
+            if matches!(e.info.pickable, Pickable::Arrow { .. }) && length_sqr(movement) > 0.0 {
+                e.in_ground = false;
+            }
         }
     }
 
@@ -1861,6 +2024,9 @@ mod tests {
                 fluid: 0,
                 sturdy: 0,
                 offset: None,
+                outline: 0,
+                interaction_shape: 0,
+                interaction: 0,
             }],
         });
         let mut level = Level::new(-64, 384);

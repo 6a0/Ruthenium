@@ -406,7 +406,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 y,
                 ..
             } => clicks.push((down, x, y, shift_held)),
-            _ => {}
+            Event::MouseButton { button, down, .. } => menu.other_mouse_button(button, down),
         });
         let mut actions: Vec<Action> = clicks
             .drain(..)
