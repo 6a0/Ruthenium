@@ -5,7 +5,7 @@
 //! window makes: steps separated by spaces, each `KEYS@MS` or `KEYS@MS:DX,DY`. KEYS are
 //! `+`-joined `w a s d jump sneak sprint` and hotbar digits `1`-`9` (pressed once at
 //! the step's start), or `-` for none; held for MS milliseconds while the mouse moves
-//! DX, DY counts every frame (60 a second), turned as the window turns them with the
+//! DX, DY counts every frame (60 a second, the rate frames run at here), turned as the window turns them with the
 //! saved mouse sensitivity. For example
 //! `w@2000 w+sprint+jump@3000 w@2000:12,0 sneak+w@1500 2@100 -@1000`.
 
@@ -21,6 +21,9 @@ use ruthenium_sim::session::{Session, SessionEvent};
 use crate::account::{AccountStatus, Accounts};
 use crate::join::{Joiner, closed_text, stage_text};
 use crate::settings::SettingsFile;
+
+/// The frame rate without a window: vanilla's default frame limit's neighbourhood.
+const FRAME: Duration = Duration::from_micros(16_667);
 
 /// One step of a `--script`.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,7 +83,6 @@ struct Player {
     steps: Vec<Step>,
     at: usize,
     step_started: Instant,
-    last_frame: Instant,
     last_report: Instant,
     mouse: MouseOptions,
     motion: input::MouseMotion,
@@ -114,14 +116,11 @@ impl Player {
             return false;
         };
         let now = Instant::now();
-        if now - self.last_frame >= Duration::from_micros(16_667) {
-            self.last_frame = now;
-            self.motion.moved(st.turn.0, st.turn.1, true);
-            let (dx, dy) = self.motion.take();
-            if (dx, dy) != (0.0, 0.0) {
-                let (xo, yo) = input::turn_amount(dx, dy, &self.mouse);
-                session.turn(xo, yo);
-            }
+        self.motion.moved(st.turn.0, st.turn.1, true);
+        let (dx, dy) = self.motion.take();
+        if (dx, dy) != (0.0, 0.0) {
+            let (xo, yo) = input::turn_amount(dx, dy, &self.mouse);
+            session.turn(xo, yo);
         }
         if now - self.last_report >= Duration::from_secs(1) {
             self.last_report = now;
@@ -210,7 +209,6 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
         steps,
         at: 0,
         step_started: now,
-        last_frame: now,
         last_report: now,
         mouse: settings.settings.mouse,
         // In the world, the mouse has been grabbed: the first motion is dropped.
@@ -224,6 +222,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let stay = Duration::from_secs_f64(seconds);
     let mut playing = false;
     let mut leaving = false;
+    let mut next_frame = Instant::now();
     loop {
         let mut closed = None;
         for e in session.poll() {
@@ -264,14 +263,22 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                 ExitCode::FAILURE
             });
         }
+        // A frame: the script's input, then the session's frame (packets, ticks, turn).
         if scripting && let Some(p) = &mut player {
             scripting = p.frame(&session);
         }
+        session.frame();
         if !leaving && started.elapsed() >= stay {
             leaving = true;
             session.disconnect();
         }
-        std::thread::sleep(Duration::from_millis(5));
+        next_frame += FRAME;
+        let now = Instant::now();
+        if next_frame > now {
+            std::thread::sleep(next_frame - now);
+        } else {
+            next_frame = now;
+        }
     }
 }
 

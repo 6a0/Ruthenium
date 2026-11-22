@@ -516,6 +516,19 @@ impl Menu {
         );
     }
 
+    /// The game's part of the frame, every frame the client runs (also while the window
+    /// is hidden): the mouse's turn, then the session's frame (`runTick`: packets, the
+    /// frame's input, ticks, the turn).
+    pub fn game_frame(&mut self) {
+        if matches!(self.screen, Screen::Game) {
+            self.game
+                .frame(&self.settings.settings.mouse, self.session.as_ref());
+        }
+        if let Some(s) = &self.session {
+            s.frame();
+        }
+    }
+
     /// Whether the mouse should be grabbed: in the world, the window focused.
     pub fn wants_mouse_grab(&self) -> bool {
         matches!(self.screen, Screen::Game) && self.game.focused()
@@ -1700,8 +1713,6 @@ impl Menu {
         let mut settings_ev = None;
         match &mut self.screen {
             Screen::Game => {
-                self.game
-                    .frame(&self.settings.settings.mouse, self.session.as_ref());
                 let view = self.session.as_ref().and_then(Session::view);
                 crate::ingame::draw_hud(
                     view.as_ref(),

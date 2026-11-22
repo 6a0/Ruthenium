@@ -453,6 +453,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         if quit {
             break;
         }
+        // The game's frame runs every time round, drawn or not, as vanilla's `runTick`.
+        menu.game_frame();
         if let Some(size) = resized.take() {
             renderer.frames_mut().resize(size);
         }

@@ -2,10 +2,19 @@
 //! `ClientCommonPacketListenerImpl` and, for now, the switch parts of
 //! `ClientPacketListener`).
 //!
-//! The connection's thread does the login and answers keep-alives; this thread takes
-//! every other packet in order and answers the ones vanilla answers on its main thread:
-//! pings (the "transactions" anticheats time), known packs, cookies, resource packs. The
-//! menus hear about it through [`SessionEvent`]s and answer the code of conduct.
+//! The connection's thread does the login and answers what vanilla answers on its network
+//! thread (keep-alives, chunk batches); this thread takes every other packet in order and
+//! answers the ones vanilla answers on its main thread: pings (the "transactions"
+//! anticheats time), known packs, cookies, resource packs. The menus hear about it through
+//! [`SessionEvent`]s and answer the code of conduct.
+//!
+//! Frames: this thread runs in step with the main thread's frames, as vanilla's single
+//! main thread does. The main thread sends each frame with its input
+//! ([`Session::frame`]), and the frame runs in `Minecraft.runTick`'s order: the ticks
+//! due are counted, every packet that has arrived is handled
+//! (`PacketProcessor.processQueuedPackets`), the frame's input is taken in, the ticks
+//! run, and the mouse turns the camera (`handleAccumulatedMovement`). So packets are
+//! answered when vanilla would answer them, once per frame, never the moment they arrive.
 //!
 //! Known packs: the client answers with the packs it has of those the server lists, in
 //! the server's order (`KnownPacksManager.trySelectingPacks`); the caller passes the
@@ -18,10 +27,10 @@
 //! back to configuration.
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ruthenium_net::connection::{
     Closed, ConnectOptions, Connection, Event, Local, Protocol, Reason, Stage,
@@ -35,9 +44,6 @@ use crate::input::next_scroll_selection;
 use crate::level_load::LevelLoad;
 use crate::player::{Env, Keys, LocalPlayer, Pose};
 use crate::world::{Level, global_bits};
-
-/// How often the thread looks for commands while no packet arrives.
-const COMMAND_POLL: Duration = Duration::from_millis(20);
 
 #[derive(Debug)]
 pub struct SessionOptions {
@@ -82,20 +88,22 @@ pub enum SessionEvent {
 enum Command {
     CodeOfConduct(bool),
     Disconnect,
+    /// One frame of the main thread, with its input.
+    Frame(FrameInput),
 }
 
-/// What the player does on the main thread, for the game thread to take in before it
-/// handles packets or ticks.
+/// What the player did during one frame on the main thread.
 #[derive(Debug, Default)]
-struct Controls {
-    /// The movement keys held (none while a screen is open).
+struct FrameInput {
+    /// The movement keys held as the frame's events left them (none while a screen is
+    /// open).
     keys: Keys,
-    /// `Entity.turn` amounts, one per frame, in order.
-    turns: Vec<(f64, f64)>,
-    /// Hotbar key presses, by slot (`KeyMapping.clickCount`).
+    /// Hotbar key presses, by slot (`KeyMapping.click`).
     hotbar_clicks: [u32; 9],
     /// Scroll-wheel notches, in order.
     scrolls: Vec<i32>,
+    /// The frame's turn of the camera (`Entity.turn`'s amounts), after its ticks.
+    turns: Vec<(f64, f64)>,
 }
 
 /// The local player as of the last tick, for the screen.
@@ -118,7 +126,8 @@ pub struct PlayerView {
 pub struct Session {
     commands: Sender<Command>,
     events: Receiver<SessionEvent>,
-    controls: Arc<Mutex<Controls>>,
+    /// The input of the frame under way, sent with [`Session::frame`].
+    input: Mutex<FrameInput>,
     view: Arc<Mutex<Option<PlayerView>>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -143,21 +152,19 @@ impl Session {
         if physics.is_none() {
             eprintln!("[session] no prepared game: the player won't move or send movement");
         }
-        let controls = Arc::new(Mutex::new(Controls::default()));
         let view = Arc::new(Mutex::new(None));
-        let (game_controls, game_view) = (controls.clone(), view.clone());
+        let game_view = view.clone();
         let thread = std::thread::Builder::new()
             .name("game".into())
             .spawn(move || {
                 let mut game = Game::new(connection, known_packs, physics, tx);
-                game.controls = game_controls;
                 game.view = game_view;
                 game.run(&command_rx);
             })?;
         Ok(Session {
             commands,
             events,
-            controls,
+            input: Mutex::default(),
             view,
             thread: Some(thread),
         })
@@ -177,32 +184,41 @@ impl Session {
         let _ = self.commands.send(Command::Disconnect);
     }
 
-    /// The movement keys held from now on (`Keys::default()` while a screen is open).
-    pub fn set_keys(&self, keys: Keys) {
-        lock(&self.controls).keys = keys;
+    /// Ends the main thread's frame: the game thread runs it (`Minecraft.runTick`) with
+    /// the input given since the last one. Call it once every frame the client runs,
+    /// also while the window is hidden or no screen of the session shows; packets wait
+    /// for it.
+    pub fn frame(&self) {
+        let mut input = lock(&self.input);
+        let keys = input.keys;
+        let frame = std::mem::take(&mut *input);
+        input.keys = keys;
+        drop(input);
+        let _ = self.commands.send(Command::Frame(frame));
     }
 
-    /// One frame's turn of the camera (`Entity.turn`'s amounts, from
-    /// [`crate::input::turn_amount`]). Turns apply in order, before the next packets
-    /// and ticks.
+    /// The movement keys held from now on (`Keys::default()` while a screen is open).
+    pub fn set_keys(&self, keys: Keys) {
+        lock(&self.input).keys = keys;
+    }
+
+    /// The frame's turn of the camera (`Entity.turn`'s amounts, from
+    /// [`crate::input::turn_amount`]), applied after the frame's ticks.
     pub fn turn(&self, xo: f64, yo: f64) {
-        lock(&self.controls).turns.push((xo, yo));
+        lock(&self.input).turns.push((xo, yo));
     }
 
     /// A press of the hotbar key for `slot` (0 to 8), read by the next tick.
     pub fn hotbar_key(&self, slot: u8) {
-        if let Some(c) = lock(&self.controls)
-            .hotbar_clicks
-            .get_mut(usize::from(slot))
-        {
+        if let Some(c) = lock(&self.input).hotbar_clicks.get_mut(usize::from(slot)) {
             *c += 1;
         }
     }
 
     /// Scroll-wheel notches (from [`crate::input::ScrollWheel`]): the selected slot moves
-    /// before the next tick.
+    /// before the frame's ticks.
     pub fn scroll(&self, wheel: i32) {
-        lock(&self.controls).scrolls.push(wheel);
+        lock(&self.input).scrolls.push(wheel);
     }
 
     /// The local player as of the last tick (`None` outside a level).
@@ -267,7 +283,6 @@ struct Game {
     tags: BlockTags,
     clock: TickClock,
     started: Instant,
-    controls: Arc<Mutex<Controls>>,
     view: Arc<Mutex<Option<PlayerView>>>,
     /// The keys the next ticks read.
     keys: Keys,
@@ -344,7 +359,6 @@ impl Game {
             tags: BlockTags::new(),
             clock: TickClock::new(0),
             started: Instant::now(),
-            controls: Arc::default(),
             view: Arc::default(),
             keys: Keys::default(),
             hotbar_clicks: [0; 9],
@@ -357,83 +371,82 @@ impl Game {
 
     fn run(&mut self, commands: &Receiver<Command>) {
         loop {
-            while let Ok(c) = commands.try_recv() {
-                match c {
-                    Command::Disconnect => self.connection.close(),
-                    Command::CodeOfConduct(accept) if self.waiting_for_code_of_conduct => {
-                        self.waiting_for_code_of_conduct = false;
-                        if accept {
-                            self.connection.send(cfg::accept_code_of_conduct());
-                        } else {
-                            // Vanilla disconnects with "multiplayer.disconnect.code_of_conduct".
-                            self.connection.close();
-                        }
+            let Ok(c) = commands.recv() else {
+                // The session was dropped (after asking to disconnect): no more frames.
+                self.connection.close();
+                return;
+            };
+            match c {
+                Command::Frame(input) => {
+                    if !self.frame(input) {
+                        return;
                     }
-                    Command::CodeOfConduct(_) => {}
                 }
+                Command::Disconnect => self.connection.close(),
+                Command::CodeOfConduct(accept) if self.waiting_for_code_of_conduct => {
+                    self.waiting_for_code_of_conduct = false;
+                    if accept {
+                        self.connection.send(cfg::accept_code_of_conduct());
+                    } else {
+                        // Vanilla disconnects with "multiplayer.disconnect.code_of_conduct".
+                        self.connection.close();
+                    }
+                }
+                Command::CodeOfConduct(_) => {}
             }
-            // Wait for a packet, or until the next tick falls due.
-            let mspt = self.ms_per_tick();
-            let now = self.millis();
-            let wait = Duration::from_millis(
-                (self.clock.next_tick_ms(mspt) - now).clamp(0, COMMAND_POLL.as_millis() as i64)
-                    as u64,
-            );
-            let first = match self.connection.events().recv_timeout(wait) {
-                Ok(e) => Some(e),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => {
+        }
+    }
+
+    /// One frame (`Minecraft.runTick`): the ticks due counted first, then every packet
+    /// that has arrived, the frame's input, the ticks, and the camera's turn. False once
+    /// the session has ended.
+    fn frame(&mut self, input: FrameInput) -> bool {
+        let ticks = self.clock.advance(self.millis(), self.ms_per_tick());
+        loop {
+            match self.connection.events().try_recv() {
+                Ok(e) => {
+                    if !self.handle(e) {
+                        return false;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
                     self.report(SessionEvent::Closed(Closed {
                         during_login: self.phase == Phase::Login,
                         reason: Reason::Local(Local::Io("the connection thread stopped".into())),
                     }));
-                    return;
+                    return false;
                 }
-            };
-            // The frames' input so far, then packets, then the ticks due
-            // (`Minecraft.runTick`; a frame turns the camera after its ticks, so every
-            // turn sent before now comes before these packets).
-            self.take_controls();
-            let mut next = first;
-            while let Some(e) = next {
-                if !self.handle(e) {
-                    return;
-                }
-                next = self.connection.events().try_recv().ok();
             }
-            let ticks = self.clock.advance(self.millis(), self.ms_per_tick());
-            if ticks > 0 {
-                self.take_controls();
-            }
-            for _ in 0..ticks {
-                self.tick();
-            }
-            self.update_view();
         }
+        self.take_input(&input);
+        for _ in 0..ticks {
+            self.tick();
+        }
+        // `handleAccumulatedMovement`, without a player nothing turns.
+        if let Some(w) = &mut self.world {
+            for &(xo, yo) in &input.turns {
+                w.player.turn(xo, yo);
+            }
+        }
+        self.update_view();
+        true
     }
 
-    /// Takes in what the player did on the main thread: the camera's turns and scrolls
-    /// apply now, keys and hotbar presses wait for the ticks.
-    fn take_controls(&mut self) {
-        let mut c = lock(&self.controls);
-        self.keys = c.keys;
-        let turns = std::mem::take(&mut c.turns);
-        let scrolls = std::mem::take(&mut c.scrolls);
-        let clicks = std::mem::take(&mut c.hotbar_clicks);
-        drop(c);
+    /// The frame's events (`runAllTasks`, after the packets): keys and scrolls apply
+    /// now, hotbar presses wait for the ticks.
+    fn take_input(&mut self, input: &FrameInput) {
+        self.keys = input.keys;
         // Without a player (`minecraft.player == null`) the input goes nowhere.
         let Some(w) = &mut self.world else {
             return;
         };
-        for (xo, yo) in turns {
-            w.player.turn(xo, yo);
-        }
         if w.game_type != play::SPECTATOR {
-            for wheel in scrolls {
+            for &wheel in &input.scrolls {
                 w.selected_slot = next_scroll_selection(f64::from(wheel), w.selected_slot, 9);
             }
         }
-        for (pending, new) in self.hotbar_clicks.iter_mut().zip(clicks) {
+        for (pending, new) in self.hotbar_clicks.iter_mut().zip(input.hotbar_clicks) {
             *pending += new;
         }
     }
