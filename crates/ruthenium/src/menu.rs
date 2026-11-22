@@ -271,8 +271,8 @@ pub struct Menu {
     stage_shown: Option<Stage>,
     /// Development: a sign-in stage to show without signing in (screenshots).
     preview_stage: Option<Stage>,
-    /// The face in the title's account chip.
-    face: FaceTexture,
+    /// The players' faces, by skin address (`None`: Steve).
+    faces: Vec<(Option<String>, FaceTexture)>,
     shapes: ShapeList,
     text: TextList,
     /// Mouse position in window coordinates.
@@ -371,7 +371,7 @@ impl Menu {
             accounts_seen: None,
             stage_shown: None,
             preview_stage: None,
-            face: FaceTexture::None,
+            faces: Vec::new(),
             shapes: ShapeList::new(),
             text: TextList::new(),
             mouse: None,
@@ -1079,29 +1079,42 @@ impl Menu {
         self.act(action?, Some(renderer), clipboard)
     }
 
-    /// Takes a newly loaded face for the account in use, and uploads the waiting one; a
-    /// replaced texture is destroyed.
-    fn upload_face(&mut self, renderer: &mut Renderer) {
-        if let Some(face) = self.accounts.take_face() {
-            if let FaceTexture::Ready(t) = std::mem::take(&mut self.face) {
+    /// Takes newly loaded faces, frees the ones no account needs any more, and uploads
+    /// the waiting ones; a replaced texture is destroyed.
+    fn upload_faces(&mut self, renderer: &mut Renderer) {
+        let free = |f: FaceTexture, renderer: &mut Renderer| {
+            if let FaceTexture::Ready(t) = f {
                 renderer.destroy_texture(t);
             }
-            self.face = face.map_or(FaceTexture::None, FaceTexture::Pending);
+        };
+        for (skin, face) in self.accounts.take_faces() {
+            let next = face.map_or(FaceTexture::None, FaceTexture::Pending);
+            match self.faces.iter_mut().find(|(k, _)| *k == skin) {
+                Some((_, f)) => free(std::mem::replace(f, next), renderer),
+                None => self.faces.push((skin, next)),
+            }
         }
-        let FaceTexture::Pending(face) = &self.face else {
-            return;
-        };
-        let desc = TextureDesc {
-            mip_levels: face.levels.len() as u32,
-            ..TextureDesc::rgba8(face.size, face.size)
-        };
-        let levels: Vec<&[u8]> = face.levels.iter().map(Vec::as_slice).collect();
-        match renderer.create_texture(desc, &levels, Arrival::NextFrame) {
-            Ok(t) => self.face = FaceTexture::Ready(t),
-            Err(ruthenium_gpu::Error::Upload(UploadError::Full)) => {}
-            Err(e) => {
-                eprintln!("[ruthenium] no player face: upload: {e}");
-                self.face = FaceTexture::None;
+        let keys = self.accounts.face_keys();
+        for (_, f) in self.faces.extract_if(.., |(k, _)| !keys.contains(k)) {
+            free(f, renderer);
+        }
+        for (_, f) in &mut self.faces {
+            let FaceTexture::Pending(face) = f else {
+                continue;
+            };
+            let desc = TextureDesc {
+                mip_levels: face.levels.len() as u32,
+                ..TextureDesc::rgba8(face.size, face.size)
+            };
+            let levels: Vec<&[u8]> = face.levels.iter().map(Vec::as_slice).collect();
+            match renderer.create_texture(desc, &levels, Arrival::NextFrame) {
+                Ok(t) => *f = FaceTexture::Ready(t),
+                // No room this frame: the rest wait too.
+                Err(ruthenium_gpu::Error::Upload(UploadError::Full)) => break,
+                Err(e) => {
+                    eprintln!("[ruthenium] no player face: upload: {e}");
+                    *f = FaceTexture::None;
+                }
             }
         }
     }
@@ -1217,11 +1230,19 @@ impl Menu {
             s.prepare(renderer, &self.fonts);
         }
         self.sync_accounts();
-        self.upload_face(renderer);
-        let face = match self.face {
-            FaceTexture::Ready(t) if renderer.texture_ready(t) => Some(t.index()),
-            _ => None,
+        self.upload_faces(renderer);
+        let face_of = |skin: Option<&String>| {
+            self.faces
+                .iter()
+                .find(|(k, _)| k.as_ref() == skin)
+                .and_then(|(_, f)| match f {
+                    FaceTexture::Ready(t) if renderer.texture_ready(*t) => Some(t.index()),
+                    _ => None,
+                })
         };
+        let list = self.accounts.list();
+        let face = face_of(list.first().and_then(|a| a.skin.as_ref()));
+        let row_faces: Vec<Option<u32>> = list.iter().map(|a| face_of(a.skin.as_ref())).collect();
         let (atlas, texture, logo) = match &self.atlas {
             Atlas::Ready {
                 atlas,
@@ -1264,6 +1285,7 @@ impl Menu {
             }
             Screen::Accounts => {
                 if let Some(a) = &mut self.accounts_screen {
+                    a.set_faces(row_faces);
                     a.pointer(pointer);
                     a.update(dt);
                     a.draw(&mut self.shapes, &mut self.text, atlas);

@@ -1,5 +1,5 @@
 //! The Accounts screen: the Microsoft accounts signed in, as glass rows with the
-//! player's initial, name and (for the account in use) how its sign-in went; buttons to
+//! player's face, name and (for the account in use) how its sign-in went; buttons to
 //! add an account, switch to the selected one, sign it out, and go back.
 //!
 //! The screen keeps layout, shaped text, scrolling, selection and hover; the client keeps
@@ -35,7 +35,7 @@ const ROW_GAP: f32 = 10.0;
 const ROW_RADIUS: f32 = 18.0;
 const PAD: f32 = 14.0;
 const AVATAR: f32 = 44.0;
-const AVATAR_RADIUS: f32 = 12.0;
+const AVATAR_RADIUS: f32 = 10.0;
 const TEXT_X: f32 = PAD + AVATAR + 16.0;
 const DOT: f32 = 7.0;
 const BUTTON_H: f32 = 44.0;
@@ -54,6 +54,8 @@ const BADGE: [f32; 4] = [0.62, 0.74, 1.0, 0.16];
 struct Row {
     name: Text,
     initial: Text,
+    /// The player's face (a texture index), once on the GPU; the initial until then.
+    face: Option<u32>,
     detail: Option<(Text, Presence)>,
     current: bool,
     hover: Ease,
@@ -186,9 +188,11 @@ impl AccountsScreen {
                     .chars()
                     .next()
                     .map_or_else(|| "?".to_owned(), |c| c.to_uppercase().collect());
-                let (hover, selected) = old
+                let (hover, selected, face) = old
                     .get(i)
-                    .map_or_else(Default::default, |r| (r.hover, r.selected));
+                    .map_or((Ease::default(), Ease::default(), None), |r| {
+                        (r.hover, r.selected, r.face)
+                    });
                 Row {
                     name: Text::new(fonts, v.name, &s, 17.0, Weight::SEMIBOLD, 0.0),
                     initial: Text::new(fonts, &initial, &s, 20.0, Weight::EXTRABOLD, 0.0),
@@ -196,12 +200,20 @@ impl AccountsScreen {
                         .detail
                         .map(|(d, p)| (Text::new(fonts, d, &s, 14.0, Weight::REGULAR, 0.0), p)),
                     current: v.current,
+                    face,
                     hover,
                     selected,
                 }
             })
             .collect();
         self.list.set_len(self.rows.len());
+    }
+
+    /// Each row's face texture (in row order; `None`: not on the GPU, the initial shows).
+    pub fn set_faces(&mut self, faces: impl IntoIterator<Item = Option<u32>>) {
+        for (row, face) in self.rows.iter_mut().zip(faces) {
+            row.face = face;
+        }
     }
 
     pub fn selected(&self) -> Option<usize> {
@@ -326,7 +338,10 @@ impl AccountsScreen {
             w: AVATAR,
             h: AVATAR,
         };
-        shapes.rounded(s, avatar, AVATAR_RADIUS, AVATAR_TINT);
+        match row.face {
+            Some(t) => shapes.image_rounded(s, avatar, AVATAR_RADIUS, t),
+            None => shapes.rounded(s, avatar, AVATAR_RADIUS, AVATAR_TINT),
+        }
         let badge = row.current.then(|| {
             let w = self.badge.width(s) + 20.0;
             Rect {
@@ -351,8 +366,10 @@ impl AccountsScreen {
             shapes.rounded(s, dot, 0.5 * DOT, p.color());
         }
         let Some(atlas) = atlas else { return };
-        row.initial
-            .centred(text, atlas, s, avatar, [0.9, 0.92, 1.0, 0.6]);
+        if row.face.is_none() {
+            row.initial
+                .centred(text, atlas, s, avatar, [0.9, 0.92, 1.0, 0.6]);
+        }
         if let Some(b) = badge {
             self.badge.centred(text, atlas, s, b, [0.86, 0.9, 1.0, 0.9]);
         }
@@ -437,5 +454,16 @@ mod tests {
         let glass = shapes.shapes().iter().filter(|s| s.glass).count();
         assert_eq!(glass, 3 + 4);
         assert_eq!(shapes.shapes().last().unwrap().clip, Clip::NONE);
+        // Faces replace the initials' tiles, and survive new rows.
+        screen.set_faces([Some(5), None, Some(6)]);
+        screen.set_rows(&fonts, &views(&["Alex", "Steve", "Notch"]));
+        shapes.clear();
+        screen.draw(&mut shapes, &mut text, None);
+        let faces: Vec<u32> = shapes
+            .shapes()
+            .iter()
+            .filter_map(|s| s.image.map(|i| i.texture))
+            .collect();
+        assert_eq!(faces, [5, 6]);
     }
 }

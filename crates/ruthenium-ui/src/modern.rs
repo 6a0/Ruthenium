@@ -763,8 +763,8 @@ const CHIP_H: f32 = 36.0;
 const CHIP_FACE: f32 = 24.0;
 const CHIP_FACE_RADIUS: f32 = 6.0;
 const CHIP_MARGIN: f32 = 16.0;
-/// Where the face sits from the chip's left edge (it is inset as far as from the top).
-const CHIP_INSET: f32 = 0.5 * (CHIP_H - CHIP_FACE);
+/// The face sits as far from the chip's left edge as from the text.
+const CHIP_GAP: f32 = 10.0;
 /// Shown instead of a face until one is ready.
 const FACE_PLACEHOLDER: [f32; 4] = [0.75, 0.8, 1.0, 0.14];
 
@@ -865,7 +865,7 @@ impl TitleScreen {
     pub fn set_account(&mut self, fonts: &Fonts, line: &str) {
         let s = self.scale;
         let text = Text::new(fonts, line, &s, CHIP_SIZE, Weight::MEDIUM, 0.0);
-        let w = CHIP_INSET + CHIP_FACE + 10.0 + text.width(&s) + 16.0;
+        let w = CHIP_GAP + CHIP_FACE + CHIP_GAP + text.width(&s) + 16.0;
         self.chip = Chip {
             rect: Rect {
                 x: CHIP_MARGIN,
@@ -919,11 +919,11 @@ impl TitleScreen {
             ring[3] *= look.focus;
             shapes.pill_ring(s, r.outset(FOCUS_GAP + FOCUS_WIDTH), FOCUS_WIDTH, ring);
         }
-        // The face shrinks and grows with the pill, keeping its inset.
+        // The face shrinks and grows with the pill, keeping its place.
         let k = r.h / CHIP_H;
         let head = Rect {
-            x: r.x + CHIP_INSET * k,
-            y: r.y + CHIP_INSET * k,
+            x: r.x + CHIP_GAP * k,
+            y: r.y + 0.5 * (r.h - CHIP_FACE * k),
             w: CHIP_FACE * k,
             h: CHIP_FACE * k,
         };
@@ -940,7 +940,7 @@ impl TitleScreen {
             FAINT,
         );
         let line = Rect {
-            x: head.x + head.w + 10.0,
+            x: head.x + head.w + CHIP_GAP * k,
             ..r
         };
         chip.text
@@ -1143,6 +1143,12 @@ mod tests {
         let face = shapes.shapes()[5];
         assert_eq!(face.image.map(|i| i.texture), Some(9));
         assert!(face.rect[0] > sh[4].rect[0] && face.rect[3] < sh[4].rect[3]);
+        // As far from the pill's left edge as the text is from the face.
+        let inset = face.rect[0] - sh[4].rect[0];
+        assert!((inset - CHIP_GAP * s.px).abs() < 1e-3);
+        assert!(
+            (t.chip.rect.x + CHIP_GAP + CHIP_FACE + CHIP_GAP) * s.px - face.rect[2] - inset < 1e-3
+        );
         assert_eq!(t.hit(20.0, 20.0), Some(3));
         assert_eq!(t.action(3), Some(Action::Accounts));
         let width = |s: &Shape| s.rect[2] - s.rect[0];

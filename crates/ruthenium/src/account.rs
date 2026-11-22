@@ -263,12 +263,12 @@ pub struct Accounts {
     open_page: Box<dyn Fn(&str)>,
     /// Where faces come from (none: no faces).
     faces: Option<FaceSource>,
-    /// The skin address of the face asked for last (`Some(None)`: Steve).
-    face_wanted: Option<Option<String>>,
+    /// The faces asked for, by skin address (`None`: Steve).
+    face_wanted: Vec<Option<String>>,
     face_tx: Sender<(Option<String>, Option<Face>)>,
     face_rx: Receiver<(Option<String>, Option<Face>)>,
-    /// A face loaded for the account in use, not yet taken (`Some(None)`: none at all).
-    face_ready: Option<Option<Face>>,
+    /// Faces loaded and not yet taken (a `None` face: none to be had).
+    face_ready: Vec<(Option<String>, Option<Face>)>,
 }
 
 impl std::fmt::Debug for Accounts {
@@ -329,10 +329,10 @@ impl Accounts {
         let (face_tx, face_rx) = channel();
         Accounts {
             faces: None,
-            face_wanted: None,
+            face_wanted: Vec::new(),
             face_tx,
             face_rx,
-            face_ready: None,
+            face_ready: Vec::new(),
             jobs,
             updates,
             list,
@@ -396,21 +396,37 @@ impl Accounts {
     #[cfg(test)]
     pub fn set_face_source(&mut self, from: FaceSource) {
         self.faces = Some(from);
-        self.face_wanted = None;
+        self.face_wanted.clear();
     }
 
-    /// A face newly loaded for the account in use (`Some(None)`: it has none to show).
-    pub fn take_face(&mut self) -> Option<Option<Face>> {
-        self.face_ready.take()
+    /// The faces the menus need, by skin address: every account's, and Steve's (`None`)
+    /// for accounts without a skin and for no account at all.
+    pub fn face_keys(&self) -> Vec<Option<String>> {
+        let mut keys = vec![None];
+        for a in &self.list {
+            if a.skin.is_some() && !keys.contains(&a.skin) {
+                keys.push(a.skin.clone());
+            }
+        }
+        keys
     }
 
-    /// Asks for the face of the account in use if it isn't the one asked for last, and
-    /// takes in loaded faces.
-    fn follow_face(&mut self) {
+    /// Faces loaded since the last call, by skin address (a `None` face: none to show).
+    pub fn take_faces(&mut self) -> Vec<(Option<String>, Option<Face>)> {
+        std::mem::take(&mut self.face_ready)
+    }
+
+    /// Asks for every face needed and not asked for yet (forgetting ones no longer
+    /// needed), and takes in loaded faces.
+    fn follow_faces(&mut self) {
         let Some(from) = &self.faces else { return };
-        let skin = self.list.first().and_then(|a| a.skin.clone());
-        if self.face_wanted.as_ref() != Some(&skin) {
-            self.face_wanted = Some(skin.clone());
+        let keys = self.face_keys();
+        self.face_wanted.retain(|k| keys.contains(k));
+        for skin in keys {
+            if self.face_wanted.contains(&skin) {
+                continue;
+            }
+            self.face_wanted.push(skin.clone());
             let (from, tx) = (from.clone(), self.face_tx.clone());
             let spawned = std::thread::Builder::new()
                 .name("face".into())
@@ -423,8 +439,8 @@ impl Accounts {
             }
         }
         while let Ok((skin, face)) = self.face_rx.try_recv() {
-            if self.face_wanted.as_ref() == Some(&skin) {
-                self.face_ready = Some(face);
+            if self.face_wanted.contains(&skin) {
+                self.face_ready.push((skin, face));
                 self.revision += 1;
             }
         }
@@ -433,7 +449,7 @@ impl Accounts {
     /// Takes in the worker's reports; true if anything changed.
     pub fn poll(&mut self) -> bool {
         let before = self.revision;
-        self.follow_face();
+        self.follow_faces();
         while let Ok(u) = self.updates.try_recv() {
             let flow = self.flow.as_ref().map(|f| f.id);
             match u {
@@ -478,7 +494,7 @@ impl Accounts {
             }
             self.revision += 1;
         }
-        self.follow_face();
+        self.follow_faces();
         self.revision != before
     }
 
@@ -966,12 +982,22 @@ pub(crate) mod tests {
         // No skin and no game files: no Steve either.
         assert_eq!(load_face(None, &from), None);
 
-        // The account in use's face arrives through `take_face`.
+        // Every account's face arrives through `take_faces`; Steve's is always asked for.
         let (mut a, _) = accounts_in(&dir.join("data"), &["Alex"], None);
+        a.list[0].skin = Some(url.into());
         a.set_face_source(from);
-        wait(&mut a, |a| a.face_ready.is_some());
-        assert_eq!(a.take_face(), Some(None));
-        assert_eq!(a.take_face(), None);
+        assert_eq!(a.face_keys(), [None, Some(url.to_owned())]);
+        wait(&mut a, |a| a.face_ready.len() == 2);
+        let mut faces = a.take_faces();
+        faces.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(faces[0], (None, None), "no game files, so no Steve");
+        assert_eq!(faces[1].0.as_deref(), Some(url));
+        assert!(faces[1].1.is_some());
+        assert!(a.take_faces().is_empty());
+        // Signing the account out forgets its face.
+        a.list.clear();
+        a.poll();
+        assert_eq!(a.face_wanted, [None]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
