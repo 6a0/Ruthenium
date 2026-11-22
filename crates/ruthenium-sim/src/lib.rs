@@ -12,6 +12,7 @@
 //! - [`item`], [`inventory`], [`interact`]: item stacks and their components, the
 //!   inventory and cooldowns, using items with either hand, attacking and breaking
 //!   blocks.
+//! - [`enchantment`]: what enchantments do to the client's values (riptide).
 //! - [`mining`]: how fast blocks break, and which the player may break.
 //! - [`predict`]: block changes the client predicts until the server confirms them.
 //! - [`pick`]: what the crosshair is on, and the raycasts items make.
@@ -27,6 +28,7 @@ pub mod blocks;
 pub mod clock;
 pub mod direction;
 pub mod effect;
+pub mod enchantment;
 pub mod entity;
 pub mod fluid;
 pub mod input;

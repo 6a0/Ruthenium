@@ -1,0 +1,357 @@
+//! Enchantments as the client reads them from the `minecraft:enchantment` registry: only
+//! the value effects the client's movement uses (a riptide trident's spin strength).
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use ruthenium_protocol::packets::configuration::RegistryEntry;
+use serde_json::Value;
+
+use crate::transform::nbt_to_json;
+
+/// `LevelBasedValue`: a number worked out from an enchantment's level.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LevelValue {
+    Constant(f32),
+    Linear {
+        base: f32,
+        per_level_above_first: f32,
+    },
+    Clamped {
+        value: Box<LevelValue>,
+        min: f32,
+        max: f32,
+    },
+    Fraction {
+        numerator: Box<LevelValue>,
+        denominator: Box<LevelValue>,
+    },
+    LevelsSquared {
+        added: f32,
+    },
+    Exponent {
+        base: Box<LevelValue>,
+        power: Box<LevelValue>,
+    },
+    Lookup {
+        values: Vec<f32>,
+        fallback: Box<LevelValue>,
+    },
+}
+
+impl LevelValue {
+    /// `calculate`.
+    pub fn calculate(&self, level: i32) -> f32 {
+        match self {
+            LevelValue::Constant(v) => *v,
+            LevelValue::Linear {
+                base,
+                per_level_above_first,
+            } => base + per_level_above_first * (level - 1) as f32,
+            LevelValue::Clamped { value, min, max } => {
+                // Mth.clamp(float): a NaN passes through.
+                let v = value.calculate(level);
+                if v < *min { *min } else { v.min(*max) }
+            }
+            LevelValue::Fraction {
+                numerator,
+                denominator,
+            } => {
+                let d = denominator.calculate(level);
+                if d == 0.0 {
+                    0.0
+                } else {
+                    numerator.calculate(level) / d
+                }
+            }
+            LevelValue::LevelsSquared { added } => (level * level) as f32 + added,
+            LevelValue::Exponent { base, power } => {
+                f64::from(base.calculate(level)).powf(f64::from(power.calculate(level))) as f32
+            }
+            LevelValue::Lookup { values, fallback } => {
+                match usize::try_from(level - 1)
+                    .ok()
+                    .filter(|_| level <= values.len() as i32)
+                {
+                    Some(i) => values[i],
+                    None => fallback.calculate(level),
+                }
+            }
+        }
+    }
+
+    /// The codec's forms: a bare number, or an object with a `type`.
+    pub fn from_json(v: &Value) -> Option<LevelValue> {
+        if let Some(n) = v.as_f64() {
+            return Some(LevelValue::Constant(n as f32));
+        }
+        let f = |k: &str| v.get(k)?.as_f64().map(|n| n as f32);
+        let boxed = |k: &str| LevelValue::from_json(v.get(k)?).map(Box::new);
+        Some(match type_name(v)? {
+            "constant" => LevelValue::Constant(f("value")?),
+            "linear" => LevelValue::Linear {
+                base: f("base")?,
+                per_level_above_first: f("per_level_above_first")?,
+            },
+            "clamped" => LevelValue::Clamped {
+                value: boxed("value")?,
+                min: f("min")?,
+                max: f("max")?,
+            },
+            "fraction" => LevelValue::Fraction {
+                numerator: boxed("numerator")?,
+                denominator: boxed("denominator")?,
+            },
+            "levels_squared" => LevelValue::LevelsSquared { added: f("added")? },
+            "exponent" => LevelValue::Exponent {
+                base: boxed("base")?,
+                power: boxed("power")?,
+            },
+            "lookup" => LevelValue::Lookup {
+                values: v
+                    .get("values")?
+                    .as_array()?
+                    .iter()
+                    .map(|n| n.as_f64().map(|n| n as f32))
+                    .collect::<Option<_>>()?,
+                fallback: boxed("fallback")?,
+            },
+            _ => return None,
+        })
+    }
+}
+
+/// `EnchantmentValueEffect`: how an enchantment changes a value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValueEffect {
+    Add(LevelValue),
+    Multiply(LevelValue),
+    Set(LevelValue),
+    AllOf(Vec<ValueEffect>),
+    Exponential {
+        base: LevelValue,
+        exponent: LevelValue,
+    },
+    /// Random: the client's value is left as it is.
+    RemoveBinomial,
+}
+
+impl ValueEffect {
+    /// `process`.
+    pub fn process(&self, level: i32, value: f32) -> f32 {
+        match self {
+            ValueEffect::Add(v) => value + v.calculate(level),
+            ValueEffect::Multiply(v) => value * v.calculate(level),
+            ValueEffect::Set(v) => v.calculate(level),
+            ValueEffect::AllOf(effects) => effects.iter().fold(value, |v, e| e.process(level, v)),
+            ValueEffect::Exponential { base, exponent } => {
+                (f64::from(value)
+                    * f64::from(base.calculate(level)).powf(f64::from(exponent.calculate(level))))
+                    as f32
+            }
+            ValueEffect::RemoveBinomial => value,
+        }
+    }
+
+    pub fn from_json(v: &Value) -> Option<ValueEffect> {
+        let level = |k: &str| LevelValue::from_json(v.get(k)?);
+        Some(match type_name(v)? {
+            "add" => ValueEffect::Add(level("value")?),
+            "multiply" => ValueEffect::Multiply(level("factor")?),
+            "set" => ValueEffect::Set(level("value")?),
+            "all_of" => ValueEffect::AllOf(
+                v.get("effects")?
+                    .as_array()?
+                    .iter()
+                    .map(ValueEffect::from_json)
+                    .collect::<Option<_>>()?,
+            ),
+            "exponential" => ValueEffect::Exponential {
+                base: level("base")?,
+                exponent: level("exponent")?,
+            },
+            "remove_binomial" => ValueEffect::RemoveBinomial,
+            _ => return None,
+        })
+    }
+}
+
+/// A `type` field without its `minecraft:` namespace.
+fn type_name(v: &Value) -> Option<&str> {
+    let t = v.get("type")?.as_str()?;
+    Some(t.strip_prefix("minecraft:").unwrap_or(t))
+}
+
+/// What the client uses of one enchantment.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Enchantment {
+    /// `minecraft:trident_spin_attack_strength`.
+    pub spin_attack_strength: Option<ValueEffect>,
+}
+
+impl Enchantment {
+    /// An enchantment as its codec writes it (only its `effects` are read).
+    pub fn from_json(v: &Value) -> Enchantment {
+        let effects = v.get("effects");
+        Enchantment {
+            spin_attack_strength: effects
+                .and_then(|e| e.get("minecraft:trident_spin_attack_strength"))
+                .and_then(ValueEffect::from_json),
+        }
+    }
+}
+
+/// The enchantment registry: by network id once the server sent it, by name for
+/// vanilla's own (the jar's data pack).
+#[derive(Debug, Clone, Default)]
+pub struct Enchantments {
+    by_id: Vec<Option<Arc<Enchantment>>>,
+    by_name: HashMap<String, Arc<Enchantment>>,
+}
+
+impl Enchantments {
+    /// Vanilla's enchantments from the jar's data pack: each file's path and contents.
+    pub fn from_json_files<N: AsRef<str>, B: AsRef<[u8]>>(
+        files: impl IntoIterator<Item = (N, B)>,
+    ) -> Enchantments {
+        let mut by_name = HashMap::new();
+        for (name, bytes) in files {
+            let file = name.as_ref().rsplit('/').next().unwrap_or_default();
+            let Some(stem) = file.strip_suffix(".json") else {
+                continue;
+            };
+            if let Ok(v) = serde_json::from_slice::<Value>(bytes.as_ref()) {
+                by_name.insert(
+                    format!("minecraft:{stem}"),
+                    Arc::new(Enchantment::from_json(&v)),
+                );
+            }
+        }
+        Enchantments {
+            by_id: Vec::new(),
+            by_name,
+        }
+    }
+
+    /// The registry as the server sent it: an entry's own data, else vanilla's entry
+    /// of that name (a known pack's, sent without data).
+    pub fn from_registry(entries: &[RegistryEntry], vanilla: &Enchantments) -> Enchantments {
+        let mut by_id = Vec::with_capacity(entries.len());
+        let mut by_name = HashMap::new();
+        for e in entries {
+            let ench = match &e.data {
+                Some(data) => Some(Arc::new(Enchantment::from_json(&nbt_to_json(data)))),
+                None => vanilla.by_name.get(&e.id).cloned(),
+            };
+            if let Some(ench) = &ench {
+                by_name.insert(e.id.clone(), ench.clone());
+            }
+            by_id.push(ench);
+        }
+        Enchantments { by_id, by_name }
+    }
+
+    /// Vanilla's registry order (the data pack's files sorted by name), as a server
+    /// that sends it as a known pack lists it.
+    pub fn vanilla_order(&self) -> Enchantments {
+        let mut names: Vec<&String> = self.by_name.keys().collect();
+        names.sort();
+        let entries: Vec<RegistryEntry> = names
+            .into_iter()
+            .map(|n| RegistryEntry {
+                id: n.clone(),
+                data: None,
+            })
+            .collect();
+        Enchantments::from_registry(&entries, self)
+    }
+
+    pub fn get(&self, id: i32) -> Option<&Enchantment> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|i| self.by_id.get(i)?.as_deref())
+    }
+
+    /// The network id of an enchantment, by name.
+    pub fn id_of(&self, name: &str) -> Option<i32> {
+        let e = self.by_name.get(name)?;
+        self.by_id
+            .iter()
+            .position(|x| x.as_ref().is_some_and(|x| Arc::ptr_eq(x, e)))
+            .and_then(|i| i32::try_from(i).ok())
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    /// `EnchantmentHelper.getTridentSpinAttackStrength`: each enchantment's effect on
+    /// the value, from 0, in the stack's order.
+    pub fn spin_attack_strength(&self, enchantments: &[(i32, i32)]) -> f32 {
+        let mut value = 0.0f32;
+        for &(id, level) in enchantments {
+            if let Some(effect) = self.get(id).and_then(|e| e.spin_attack_strength.as_ref()) {
+                value = effect.process(level, value);
+            }
+        }
+        value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn riptide_strength_by_level() {
+        let riptide = serde_json::json!({"effects": {"minecraft:trident_spin_attack_strength": {
+            "type": "minecraft:add",
+            "value": {"type": "minecraft:linear", "base": 1.5, "per_level_above_first": 0.75}
+        }}});
+        let sharp = serde_json::json!({"effects": {}});
+        let files = [
+            (
+                "data/minecraft/enchantment/riptide.json",
+                riptide.to_string(),
+            ),
+            (
+                "data/minecraft/enchantment/sharpness.json",
+                sharp.to_string(),
+            ),
+        ];
+        let vanilla = Enchantments::from_json_files(files.iter().map(|(n, b)| (n, b.as_bytes())));
+        let e = vanilla.vanilla_order();
+        assert_eq!(e.id_of("minecraft:riptide"), Some(0));
+        assert_eq!(e.spin_attack_strength(&[(1, 5)]), 0.0);
+        assert_eq!(e.spin_attack_strength(&[(0, 1)]), 1.5);
+        assert_eq!(e.spin_attack_strength(&[(1, 2), (0, 3)]), 3.0);
+        // A server's own entry replaces vanilla's.
+        let own = RegistryEntry {
+            id: "minecraft:riptide".into(),
+            data: None,
+        };
+        let e = Enchantments::from_registry(&[own], &Enchantments::default());
+        assert_eq!(e.spin_attack_strength(&[(0, 3)]), 0.0);
+    }
+
+    #[test]
+    fn level_values() {
+        let v = |j: Value| LevelValue::from_json(&j).unwrap();
+        assert_eq!(v(serde_json::json!(2.5)).calculate(3), 2.5);
+        assert_eq!(
+            v(serde_json::json!({"type": "levels_squared", "added": 1.0})).calculate(3),
+            10.0
+        );
+        let lookup = serde_json::json!({"type": "lookup", "values": [1.0, 2.0], "fallback": 9.0});
+        assert_eq!(v(lookup.clone()).calculate(2), 2.0);
+        assert_eq!(v(lookup).calculate(3), 9.0);
+        let clamp = serde_json::json!({"type": "clamped", "value": {"type": "linear", "base": 1.0, "per_level_above_first": 1.0}, "min": 0.0, "max": 2.0});
+        assert_eq!(v(clamp).calculate(5), 2.0);
+        let frac = serde_json::json!({"type": "fraction", "numerator": 1.0, "denominator": 0.0});
+        assert_eq!(v(frac).calculate(1), 0.0);
+    }
+}

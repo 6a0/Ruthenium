@@ -290,7 +290,7 @@ impl GameMode {
         let mut instant_attack = false;
         if p.is_using_item() {
             if !keys.use_down {
-                self.release_using_item(p, out);
+                self.release_using_item(p, w, out);
             }
             keys.attack_clicks = 0;
             keys.use_clicks = 0;
@@ -608,7 +608,12 @@ impl GameMode {
     }
 
     /// `MultiPlayerGameMode.releaseUsingItem`.
-    pub fn release_using_item(&mut self, p: &mut LocalPlayer, out: &mut Vec<Vec<u8>>) {
+    pub fn release_using_item(
+        &mut self,
+        p: &mut LocalPlayer,
+        w: &World<'_>,
+        out: &mut Vec<Vec<u8>>,
+    ) {
         self.ensure_carried(&p.inventory, out);
         out.push(play::player_action(
             play::ACTION_RELEASE_USE_ITEM,
@@ -616,7 +621,14 @@ impl GameMode {
             play::DOWN,
             0,
         ));
-        p.release_using_item();
+        let colliders = w.entities.colliders(p);
+        let env = crate::player::Env {
+            level: w.level,
+            blocks: w.blocks,
+            tags: w.tags,
+            colliders: &colliders,
+        };
+        p.release_using_item(&env);
     }
 
     /// `Minecraft.startUseItem`: the main hand, then the off hand, each on what the
@@ -860,7 +872,8 @@ fn item_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> (Outcome, Opt
         }
         Class::Trident => {
             // Rain isn't tracked: only water lets a riptide trident start.
-            if stack.next_damage_will_break() || stack.c.riptide && !p.in_water() {
+            if stack.next_damage_will_break() || stack.c.spin_attack_strength > 0.0 && !p.in_water()
+            {
                 return (Outcome::Fail, None);
             }
             p.start_using_item(hand);

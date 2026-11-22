@@ -115,6 +115,16 @@ fn vanilla_transformers(game: &Path) -> ruthenium_sim::use_on::Transformers {
     ruthenium_sim::use_on::Transformers::from_json_files(files)
 }
 
+/// Vanilla's enchantments from the jar's data pack, in the registry's order.
+fn vanilla_enchantments(game: &Path) -> ruthenium_sim::enchantment::Enchantments {
+    let jar = ruthenium_assets::zip::Zip::open(&game.join("versions/26.3/client.jar")).unwrap();
+    let files: Vec<(String, Vec<u8>)> = jar
+        .with_prefix("data/minecraft/enchantment/")
+        .map(|i| (jar.name(i).to_owned(), jar.read(i).unwrap().into_owned()))
+        .collect();
+    ruthenium_sim::enchantment::Enchantments::from_json_files(files).vanilla_order()
+}
+
 fn trace(name: &str) -> Trace {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/26.3");
     Trace::parse(&std::fs::read_to_string(root.join(format!("{name}.jsonl"))).unwrap()).unwrap()
@@ -612,7 +622,21 @@ fn handle(
         Clientbound::EntityEvent {
             entity_id,
             event: 9,
-        } if entity_id == p.entity_id => p.complete_using_item(),
+        } if entity_id == p.entity_id => {
+            let colliders = c.entities.colliders(p);
+            p.complete_using_item(&Env {
+                level: &l.level,
+                blocks: &d.blocks,
+                tags: &d.tags,
+                colliders: &colliders,
+            })
+        }
+        // `pushFromExplosion`: the knockback is added, if finite.
+        Clientbound::Explode {
+            player_knockback: Some(k),
+        } if k.iter().all(|v| v.is_finite()) => {
+            p.delta = [p.delta[0] + k[0], p.delta[1] + k[1], p.delta[2] + k[2]];
+        }
         _ => {}
     }
 }
@@ -1021,6 +1045,27 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 ));
             }
         }
+        // Gliding and a riptide spin, where the trace records them.
+        if let Some(ff) = s.bool("fallFlying") {
+            let got = (
+                p.fall_flying(),
+                p.is_auto_spin_attack(),
+                p.auto_spin_attack_ticks,
+            );
+            let want = (
+                ff,
+                s.bool("autoSpin").unwrap(),
+                s.value["spinTicks"].as_i64().unwrap() as i32,
+            );
+            if got != want {
+                return Err((
+                    n,
+                    format!(
+                        "tick {n}: gliding or the spin differs (gliding, spin flag, spin ticks)\n  got  {got:?}\n  want {want:?}"
+                    ),
+                ));
+            }
+        }
         let pose = Pose::from_name(s.str("pose").unwrap()).unwrap();
         let got = (
             p.position,
@@ -1082,7 +1127,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 51] = [
+const EXACT: [&str; 57] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1134,6 +1179,12 @@ const EXACT: [&str; 51] = [
     "honey_slide",
     "death_screen",
     "death_immediate",
+    "elytra_glide",
+    "elytra_death",
+    "elytra_water",
+    "elytra_fireworks",
+    "riptide",
+    "wind_charge",
 ];
 
 #[test]
@@ -1147,7 +1198,12 @@ fn golden_traces() {
         blocks: Blocks::load(&exports).unwrap(),
         tags: vanilla_tags(&game),
         types: EntityTypes::load(&exports).unwrap(),
-        items: Items::load(&exports, &game.join("versions/26.3/generated/reports")).unwrap(),
+        items: {
+            let mut items =
+                Items::load(&exports, &game.join("versions/26.3/generated/reports")).unwrap();
+            items.enchantments = vanilla_enchantments(&game);
+            items
+        },
         item_tags: vanilla_item_tags(&game),
         transformers: vanilla_transformers(&game),
     };
@@ -1203,6 +1259,12 @@ fn golden_traces() {
         "honey_slide",
         "death_screen",
         "death_immediate",
+        "elytra_glide",
+        "elytra_death",
+        "elytra_water",
+        "elytra_fireworks",
+        "riptide",
+        "wind_charge",
     ];
     let mut failed = Vec::new();
     for name in all {

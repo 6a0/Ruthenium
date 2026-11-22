@@ -56,6 +56,14 @@ pub fn cos(radians: f64) -> f32 {
     SIN_TABLE[index(radians * SIN_SCALE + QUARTER_TURN)]
 }
 
+/// Java's `Math.cos(double)`, for the few places the game calls it rather than
+/// `Mth.cos` (elytra lift). This is fdlibm's algorithm (`StrictMath.cos`); HotSpot's
+/// intrinsic is allowed to differ from it by an ulp, which the golden traces would show.
+#[inline]
+pub fn java_cos(radians: f64) -> f64 {
+    libm::cos(radians)
+}
+
 /// Vanilla `Mth.floor(float)`: `(int) Math.floor(v)`, saturating, NaN to 0.
 #[inline]
 pub fn floor_f32(v: f32) -> i32 {

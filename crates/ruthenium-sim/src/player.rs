@@ -18,7 +18,9 @@
 //! blocks the player moves through: cobwebs, berry bushes and powder snow holding it,
 //! bubble columns pushing and pulling, sliding down honey. Dying: no input, then out
 //! of the level 20 ticks later; a respawn is a new player ([`LocalPlayer::respawned`]).
-//! Not yet: elytra, riptide, the scale attribute, vehicles and the world border.
+//! Elytra flight (starting it, the glide, a rocket's boost from [`crate::entity`]) and a
+//! riptide trident's launch and spin. Not yet: a spin hitting an entity, the scale
+//! attribute, vehicles and the world border.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
@@ -470,6 +472,9 @@ impl Default for PlayerData {
     }
 }
 
+/// `ServerboundPlayerCommandPacket.Action.START_FALL_FLYING`.
+const PLAYER_COMMAND_START_FALL_FLYING: i32 = 6;
+
 /// `handleRespawn`'s `dataToKeep` bits.
 pub const KEEP_ATTRIBUTES: u8 = 1;
 pub const KEEP_ENTITY_DATA: u8 = 2;
@@ -639,6 +644,8 @@ pub struct LocalPlayer {
     /// the tick began).
     in_powder_snow: bool,
     was_in_powder_snow: bool,
+    /// `autoSpinAttackTicks`: a riptide spin's ticks left.
+    pub auto_spin_attack_ticks: i32,
 }
 
 /// `Entity.Movement`: a move from one place to another, with the movement asked for
@@ -732,6 +739,7 @@ impl LocalPlayer {
             movement_this_tick: Vec::new(),
             in_powder_snow: false,
             was_in_powder_snow: false,
+            auto_spin_attack_ticks: 0,
         }
     }
 
@@ -881,9 +889,72 @@ impl LocalPlayer {
         }
     }
 
-    /// `isFallFlying`: the server's flag (elytra flight isn't ported).
+    /// `isFallFlying`: the shared flag, which the client sets as it starts gliding
+    /// and the server's entity data sets and clears.
     pub fn fall_flying(&self) -> bool {
         self.data.flags & flag::FALL_FLYING != 0
+    }
+
+    fn set_fall_flying(&mut self, on: bool) {
+        if on {
+            self.data.flags |= flag::FALL_FLYING;
+        } else {
+            self.data.flags &= !flag::FALL_FLYING;
+        }
+    }
+
+    /// `isAutoSpinAttack`: the server's living flag (a riptide spin).
+    pub fn is_auto_spin_attack(&self) -> bool {
+        self.data.living_flags & 4 != 0
+    }
+
+    /// `Player.canGlide`: not flying, in the air (riding isn't simulated), without
+    /// levitation, with a glider worn where it is equipped that won't break.
+    fn can_glide(&self) -> bool {
+        if self.abilities.flying || self.on_ground || self.effects.has(MobEffect::Levitation) {
+            return false;
+        }
+        EquipmentSlot::VALUES.iter().any(|&slot| {
+            let s = self.inventory.get(self.inventory.slot_of(slot));
+            s.c.glider
+                && s.c.equippable.is_some_and(|e| e.slot == slot)
+                && !s.next_damage_will_break()
+        })
+    }
+
+    /// `Player.tryToStartFallFlying`: not in a liquid.
+    fn try_to_start_fall_flying(&mut self) -> bool {
+        if !self.fall_flying() && self.can_glide() && !self.in_water && !self.in_lava() {
+            self.set_fall_flying(true);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A firework rocket attached to the gliding player pushes it along the look
+    /// (`FireworkRocketEntity.tick`).
+    pub(crate) fn rocket_boost(&mut self) {
+        let look = self.look_angle();
+        let m = self.delta;
+        self.delta = [
+            m[0] + (look[0] * 0.1 + (look[0] * 1.5 - m[0]) * 0.5),
+            m[1] + (look[1] * 0.1 + (look[1] * 1.5 - m[1]) * 0.5),
+            m[2] + (look[2] * 0.1 + (look[2] * 1.5 - m[2]) * 0.5),
+        ];
+    }
+
+    /// `getLookAngle` (`calculateViewVector`, in floats).
+    fn look_angle(&self) -> [f64; 3] {
+        let x = self.x_rot * DEG_TO_RAD_F;
+        let y = -self.y_rot * DEG_TO_RAD_F;
+        let (y_cos, y_sin) = (mth::cos(f64::from(y)), mth::sin(f64::from(y)));
+        let (x_cos, x_sin) = (mth::cos(f64::from(x)), mth::sin(f64::from(x)));
+        [
+            f64::from(y_sin * x_cos),
+            f64::from(-x_sin),
+            f64::from(y_cos * x_cos),
+        ]
     }
 
     /// `getEyePosition()`: where the eyes are now.
@@ -980,16 +1051,54 @@ impl LocalPlayer {
     }
 
     /// `LivingEntity.releaseUsingItem` on the client (the release packet is the
-    /// caller's): a crossbow updates once more; a riptide trident's spin isn't ported.
-    pub fn release_using_item(&mut self) {
+    /// caller's): a riptide trident launches the player, a crossbow updates once more.
+    pub fn release_using_item(&mut self, env: &Env<'_>) {
         let held = self.hand(self.used_hand()).clone();
         if !self.use_item.is_empty() && held.same_item(&self.use_item) {
             self.use_item = held;
+            self.release_using(env);
             if self.use_item.c.use_on_release() {
                 self.updating_using_item();
             }
         }
         self.stop_using_item();
+    }
+
+    /// `Item.releaseUsing` for the item in use, as the client runs it: only a riptide
+    /// trident (`TridentItem.releaseUsing`) does anything here. Held 10 ticks or more,
+    /// in water (rain isn't tracked; riding isn't simulated) and not about to break, it
+    /// pushes the player along the look by its spin strength and starts a 20-tick spin,
+    /// lifting a player on the ground by 1.2 first.
+    fn release_using(&mut self, env: &Env<'_>) {
+        let item = &self.use_item;
+        if item.c.class != crate::item::Class::Trident
+            || item.c.use_duration - self.use_remaining < 10
+        {
+            return;
+        }
+        let strength = item.c.spin_attack_strength;
+        if !(strength > 0.0) || !self.in_water || item.next_damage_will_break() {
+            return;
+        }
+        let (y, x) = (self.y_rot * DEG_TO_RAD_F, self.x_rot * DEG_TO_RAD_F);
+        let mut xd = -mth::sin(f64::from(y)) * mth::cos(f64::from(x));
+        let mut yd = -mth::sin(f64::from(x));
+        let mut zd = mth::cos(f64::from(y)) * mth::cos(f64::from(x));
+        // Mth.sqrt(float).
+        let dist = f64::from(xd * xd + yd * yd + zd * zd).sqrt() as f32;
+        xd *= strength / dist;
+        yd *= strength / dist;
+        zd *= strength / dist;
+        // Entity.push: only finite pushes.
+        let (xd, yd, zd) = (f64::from(xd), f64::from(yd), f64::from(zd));
+        if xd.is_finite() && yd.is_finite() && zd.is_finite() {
+            self.delta = [self.delta[0] + xd, self.delta[1] + yd, self.delta[2] + zd];
+        }
+        // Player.startAutoSpinAttack: the living flag is the server's.
+        self.auto_spin_attack_ticks = 20;
+        if self.on_ground {
+            self.do_move(env, [0.0, 1.1999999284744263, 0.0]);
+        }
     }
 
     /// `LivingEntity.updatingUsingItem`: the use goes on while the hand holds the same
@@ -1010,13 +1119,13 @@ impl LocalPlayer {
     /// `completeUsingItem`, on the server's `USE_ITEM_COMPLETE` event: unless the
     /// hand's stack was replaced since the last tick (then it is only released), the
     /// item is finished: eaten, drunk, turned into its remainder.
-    pub fn complete_using_item(&mut self) {
+    pub fn complete_using_item(&mut self, env: &Env<'_>) {
         if !self.started_using {
             return;
         }
         let hand = self.used_hand();
         if !self.use_item.same_object(self.hand(hand)) {
-            self.release_using_item();
+            self.release_using_item(env);
             return;
         }
         if !self.use_item.is_empty() {
@@ -1386,9 +1495,12 @@ impl LocalPlayer {
         }
         self.was_underwater = self.fluids.eye_in(true);
         self.base_tick(env);
-        // LivingEntity.tick.
+        // LivingEntity.tick: a player taken out of the level this tick (dying) doesn't
+        // move any more.
         self.updating_using_item();
-        self.ai_step(env, keys);
+        if !self.removed {
+            self.ai_step(env, keys);
+        }
         let clamp = |v: f64| v.clamp(-2.9999999E7, 2.9999999E7);
         self.position[0] = clamp(self.position[0]);
         self.position[2] = clamp(self.position[2]);
@@ -1418,7 +1530,7 @@ impl LocalPlayer {
         self.first_tick = false;
         // LivingEntity.baseTick: tickDeath (the client level ticks deaths within the
         // simulation distance of the player, which the player always is), then
-        // tickEffects. The rest of this tick still runs after the removal.
+        // tickEffects. After the removal the tick goes on without `aiStep`.
         if self.is_dead_or_dying() {
             self.death_time += 1;
             if self.death_time == 20 {
@@ -1478,12 +1590,16 @@ impl LocalPlayer {
         };
     }
 
-    /// `Player.updatePlayerPose` (sleeping, elytra and riptide poses aside): a
-    /// spectator takes the pose it wants.
+    /// `Player.updatePlayerPose` (sleeping aside): a spectator takes the pose it
+    /// wants.
     fn update_pose(&mut self, env: &Env<'_>) {
         if self.can_fit(env, Pose::Swimming) {
             let desired = if self.is_swimming() {
                 Pose::Swimming
+            } else if self.fall_flying() {
+                Pose::FallFlying
+            } else if self.is_auto_spin_attack() {
+                Pose::SpinAttack
             } else if self.keys.shift && !self.abilities.flying {
                 Pose::Crouching
             } else {
@@ -1588,10 +1704,12 @@ impl LocalPlayer {
         }
         // Creative flight: a spectator always flies; otherwise a second press of jump
         // within 7 ticks of the first toggles it.
+        let mut just_toggled_flight = false;
         if self.abilities.may_fly {
             if self.game_type == play::SPECTATOR {
                 if !self.abilities.flying {
                     self.abilities.flying = true;
+                    just_toggled_flight = true;
                     self.on_update_abilities();
                 }
             } else if !was_jumping && keys.jump {
@@ -1602,10 +1720,21 @@ impl LocalPlayer {
                     if self.abilities.flying && self.on_ground {
                         self.jump_from_ground(env);
                     }
+                    just_toggled_flight = true;
                     self.on_update_abilities();
                     self.jump_trigger_time = 0;
                 }
             }
+        }
+        // A fresh press of jump in the air starts gliding.
+        if keys.jump
+            && !just_toggled_flight
+            && !was_jumping
+            && !self.on_climbable(env)
+            && self.try_to_start_fall_flying()
+        {
+            self.outbox
+                .push(self.player_command(PLAYER_COMMAND_START_FALL_FLYING));
         }
         // goDownInWater.
         if self.in_water && keys.shift && self.affected_by_fluids() {
@@ -1678,6 +1807,16 @@ impl LocalPlayer {
             .is_empty()
     }
 
+    /// `ServerboundPlayerCommandPacket`.
+    fn player_command(&self, action: i32) -> Vec<u8> {
+        use ruthenium_data::v26_3::packets::play::Serverbound as S;
+        wire::packet(S::PlayerCommand.id(), |o| {
+            wire::write_varint(o, self.entity_id);
+            wire::write_varint(o, action);
+            wire::write_varint(o, 0);
+        })
+    }
+
     /// `LivingEntity.aiStep`, then the travel.
     fn living_ai_step(&mut self, env: &Env<'_>) {
         if self.no_jump_delay > 0 {
@@ -1727,11 +1866,28 @@ impl LocalPlayer {
         } else {
             self.no_jump_delay = 0;
         }
+        // updateFallFlying: on the client, only checkFallDistanceAccumulation.
+        if self.fall_flying() && self.delta[1] > -0.5 && self.fall_distance > 1.0 {
+            self.fall_distance = 1.0;
+        }
+        let before_travel = self.bounding_box();
         if self.effects.has(MobEffect::SlowFalling) || self.effects.has(MobEffect::Levitation) {
             self.fall_distance = 0.0;
         }
         self.travel(env);
         self.apply_effects_from_blocks(env);
+        if self.auto_spin_attack_ticks > 0 {
+            self.auto_spin_attack_ticks -= 1;
+            self.check_auto_spin_attack(&before_travel);
+        }
+    }
+
+    /// `checkAutoSpinAttack` on the client: running into a wall ends the spin. (Hitting
+    /// a living entity on the way, which attacks it and bounces back, isn't ported.)
+    fn check_auto_spin_attack(&mut self, _before: &Aabb) {
+        if self.horizontal_collision {
+            self.auto_spin_attack_ticks = 0;
+        }
     }
 
     /// `Entity.applyEffectsFromBlocks`: the block stood on (`stepOn`), then the blocks
@@ -1998,14 +2154,66 @@ impl LocalPlayer {
         }
     }
 
-    /// `LivingEntity.travel` (elytra flight isn't ported).
+    /// `LivingEntity.travel`.
     fn living_travel(&mut self, env: &Env<'_>) {
         // shouldTravelInFluid: players never stand on fluids.
         if (self.in_water || self.in_lava()) && self.affected_by_fluids() {
             self.travel_in_fluid(env);
+        } else if self.fall_flying() {
+            self.travel_fall_flying(env);
         } else {
             self.travel_in_air(env);
         }
+    }
+
+    /// `travelFallFlying`: a climbable block ends the glide (`stopFallFlying`).
+    /// Flying into a wall hurts on the server only.
+    fn travel_fall_flying(&mut self, env: &Env<'_>) {
+        if self.on_climbable(env) {
+            self.travel_in_air(env);
+            self.set_fall_flying(false);
+        } else {
+            self.delta = self.fall_flying_movement(self.delta);
+            self.do_move(env, self.delta);
+        }
+    }
+
+    /// `updateFallFlyingMovement`: lift from the pitch, gravity turned into speed
+    /// along the look, a climb paid for with speed, and the heading pulled towards
+    /// the look; then drag.
+    fn fall_flying_movement(&self, movement: [f64; 3]) -> [f64; 3] {
+        let [mut x, mut y, mut z] = movement;
+        let look = self.look_angle();
+        let lean = self.x_rot * DEG_TO_RAD_F;
+        let look_hor = (look[0] * look[0] + look[2] * look[2]).sqrt();
+        let move_hor = (x * x + z * z).sqrt();
+        let gravity = self.effective_gravity();
+        let lift = {
+            let c = mth::java_cos(f64::from(lean));
+            c * c
+        };
+        y += gravity * (-1.0 + lift * 0.75);
+        if y < 0.0 && look_hor > 0.0 {
+            let convert = y * -0.1 * lift;
+            x += look[0] * convert / look_hor;
+            y += convert;
+            z += look[2] * convert / look_hor;
+        }
+        if lean < 0.0 && look_hor > 0.0 {
+            let convert = move_hor * f64::from(-mth::sin(f64::from(lean))) * 0.04;
+            x += -look[0] * convert / look_hor;
+            y += convert * 3.2;
+            z += -look[2] * convert / look_hor;
+        }
+        if look_hor > 0.0 {
+            x += (look[0] / look_hor * move_hor - x) * 0.1;
+            z += (look[2] / look_hor * move_hor - z) * 0.1;
+        }
+        [
+            x * 0.9900000095367432,
+            y * 0.9800000190734863,
+            z * 0.9900000095367432,
+        ]
     }
 
     /// `LivingEntity.travelInFluid`.
@@ -2228,6 +2436,9 @@ impl LocalPlayer {
         }
         let pos = self.block_position();
         let state = env.state(pos);
+        if self.fall_flying() && env.tags.is(state, "minecraft:can_glide_through") {
+            return false;
+        }
         if env.tags.climbable(state) {
             return true;
         }
@@ -3037,6 +3248,68 @@ mod tests {
         }
         assert!(p.on_ground && !p.abilities.flying);
         assert_eq!(p.send_changes()[0], [id, 0]);
+    }
+
+    /// An elytra, as the server sends it: a glider equipped on the chest.
+    fn elytra() -> Stack {
+        use ruthenium_data::v26_3::registries::DataComponentType as K;
+        use ruthenium_protocol::item::{Component, ComponentPatch, ItemStack};
+        crate::item::Items::default().stack(&ItemStack {
+            item: Item::Elytra.id() as i32,
+            count: 1,
+            patch: ComponentPatch {
+                added: vec![
+                    (K::Glider.id() as i32, Component::Glider),
+                    (
+                        K::Equippable.id() as i32,
+                        Component::Equippable {
+                            slot: 3,
+                            swappable: true,
+                            damage_on_hurt: true,
+                            equip_on_interact: false,
+                            can_be_sheared: false,
+                        },
+                    ),
+                ],
+                removed: Vec::new(),
+            },
+        })
+    }
+
+    #[test]
+    fn a_fresh_jump_press_in_the_air_starts_gliding() {
+        let (level, blocks, tags) = world();
+        let env = Env {
+            level: &level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+        };
+        let mut p = standing(&env, play::SURVIVAL);
+        p.entity_id = 7;
+        p.inventory.set(38, elytra());
+        // Jumping from the ground, and holding jump, never glides.
+        p.tick(&env, JUMP);
+        p.tick(&env, JUMP);
+        assert!(!p.fall_flying());
+        p.send_changes();
+        p.tick(&env, NONE);
+        p.tick(&env, JUMP);
+        assert!(p.fall_flying());
+        assert_eq!(p.pose, Pose::FallFlying);
+        let start = p.player_command(PLAYER_COMMAND_START_FALL_FLYING);
+        assert!(p.send_changes().contains(&start));
+        // The server ending it (its entity data) is final; landing doesn't end it here.
+        let types = player_types();
+        let flags = types.player_fields().shared_flags.unwrap();
+        p.set_data(&[(flags, DataValue::Byte(0))], &types);
+        assert!(!p.fall_flying());
+        // Without the elytra a press in the air does nothing.
+        let mut p = standing(&env, play::SURVIVAL);
+        for keys in [JUMP, NONE, JUMP] {
+            p.tick(&env, keys);
+        }
+        assert!(!p.fall_flying() && !p.on_ground);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use ruthenium_prepare::discover::Env;
 use ruthenium_sim::input::{self, MouseOptions};
-use ruthenium_sim::player::Keys;
+use ruthenium_sim::player::{Keys, Pose};
 use ruthenium_sim::session::{Session, SessionEvent};
 
 use crate::account::{AccountStatus, Accounts};
@@ -166,8 +166,13 @@ impl Player {
                     Some((hand, item, left)) => format!(", using {item} ({hand}, {left} left)"),
                     None => String::new(),
                 };
+                let pose = match v.pose {
+                    Pose::FallFlying => ", gliding",
+                    Pose::SpinAttack => ", spinning",
+                    _ => "",
+                };
                 println!(
-                    "          at {:.3} {:.3} {:.3}, facing {:.2} {:.2}, slot {}{}{}, hands [{}] [{}], food {}{using}",
+                    "          at {:.3} {:.3} {:.3}, facing {:.2} {:.2}, slot {}{}{}{pose}, hands [{}] [{}], food {}{using}",
                     p[0],
                     p[1],
                     p[2],

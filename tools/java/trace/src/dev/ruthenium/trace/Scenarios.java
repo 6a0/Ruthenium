@@ -150,6 +150,18 @@ public final class Scenarios {
         ctx.waitTicks(5);
     }
 
+    /** Waits until the client's player is on the ground or in water (at most {@code max} ticks). */
+    private static void waitUntilDown(ClientGameTestContext ctx, int max) {
+        for (int i = 0; i < max && !ctx.computeOnClient(mc -> mc.player.onGround() || mc.player.isInWater()); i++) {
+            ctx.waitTick();
+        }
+    }
+
+    /** Resistance V: no fall or wall damage. */
+    private static final String UNHURT = "effect give @a minecraft:resistance infinite 4 true";
+
+    private static final String ELYTRA = "item replace entity @a armor.chest with minecraft:elytra";
+
     /** Waits until the client's player has passed x = {@code x} going west (at most 100 ticks). */
     private static void waitUntilWestOf(ClientGameTestContext ctx, double x) {
         for (int i = 0; i < 100 && ctx.computeOnClient(mc -> mc.player.getX()) > x; i++) {
@@ -1617,6 +1629,137 @@ public final class Scenarios {
                         ctx.waitTicks(2);
                         hold(ctx, 30, USE);
                         ctx.waitTicks(40);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("elytra_glide",
+                    "Wearing an elytra: jump, then press jump again in the air to glide down to the floor, landing and sliding until the server ends the glide. Then from 20 blocks up, glide east diving (pitch 30), pull up (pitch -20: the descent flattens), glide through a curtain of weeping vines at x = 14 (gliding doesn't climb them), dive again and fly into a stone wall at x = 31 (resistance V: no damage).",
+                    List.of(ELYTRA, UNHURT,
+                            "fill 14 -50 -3 14 -50 3 minecraft:stone",
+                            "fill 14 -56 -3 14 -51 3 minecraft:weeping_vines_plant",
+                            "fill 14 -57 -3 14 -57 3 minecraft:weeping_vines[age=25]",
+                            "fill 31 -60 -6 31 -52 6 minecraft:stone"),
+                    start(-6.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        hold(ctx, 2, JUMP);
+                        ctx.waitTicks(3);
+                        hold(ctx, 2, JUMP);
+                        ctx.waitTicks(30);
+                        tp(ctx, server, -6.5, -40, 0.5, -90, 30);
+                        hold(ctx, 1, JUMP);
+                        ctx.waitTicks(16);
+                        ctx.getInput().lookAt(-90, -20);
+                        ctx.waitTicks(15);
+                        ctx.getInput().lookAt(-90, 30);
+                        waitUntilDown(ctx, 100);
+                        ctx.waitTicks(15);
+                    }),
+            new Scenario("elytra_death",
+                    "Wearing an elytra, glide east from 20 blocks up and die (/kill) mid-glide: the server ends the glide as the player dies, the body falls, and 20 ticks after dying the client takes it out of the level in mid-air, where it stops; respawn once the death screen's buttons work, back at the spawn point (4 -60 4), and walk.",
+                    List.of(ELYTRA, "spawnpoint @a 4 -60 4"),
+                    start(-6.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        tp(ctx, server, -6.5, -40, 0.5, -90, 20);
+                        hold(ctx, 1, JUMP);
+                        ctx.waitTicks(12);
+                        server.runCommand("kill @p");
+                        ctx.waitTicks(40);
+                        respawn(ctx);
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("elytra_water",
+                    "Wearing an elytra, glide from 14 blocks up into a two-deep pool (x 4 to 26): the glide goes on in the water (the server ends it only on the ground), so sneak down to the pool's floor to end it. Then hold W and press jump every few ticks: in the water jump doesn't start a glide, but bobbing out of it at the surface it does, and that glide goes on in the water. Then swim to the pool's east edge and jump out onto the floor still pressing jump.",
+                    List.of(ELYTRA, UNHURT, "fill 4 -62 -4 26 -61 4 minecraft:water"),
+                    start(-6.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        tp(ctx, server, -6.5, -46, 0.5, -90, 30);
+                        hold(ctx, 1, JUMP);
+                        waitUntilDown(ctx, 100);
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(-90, 0);
+                        hold(ctx, 25, SNEAK);
+                        ctx.waitTicks(5);
+                        ctx.getInput().holdKey(W);
+                        for (int i = 0; i < 25; i++) {
+                            hold(ctx, 2, JUMP);
+                            ctx.waitTicks(2);
+                        }
+                        waitUntilEastOf(ctx, 26.5, 200);
+                        for (int i = 0; i < 6; i++) {
+                            hold(ctx, 2, JUMP);
+                            ctx.waitTicks(2);
+                        }
+                        ctx.getInput().releaseKey(W);
+                        waitUntilDown(ctx, 60);
+                        ctx.waitTicks(10);
+                    }),
+            new Scenario("elytra_fireworks",
+                    "Wearing an elytra: glide from 10 blocks up, then use a firework rocket looking up (pitch -70): the client ticks the rocket attached to the player, which boosts it along its look while it glides. Then circle down turning 4 degrees a tick at pitch 15, using a second rocket on the way, until landing.",
+                    List.of(ELYTRA, UNHURT, "item replace entity @a hotbar.0 with minecraft:firework_rocket 16"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        tp(ctx, server, 0.5, -50, 0.5, -90, -70);
+                        hold(ctx, 2, JUMP);
+                        ctx.waitTicks(1);
+                        use(ctx);
+                        ctx.waitTicks(30);
+                        float yaw = -90;
+                        for (int i = 0; i < 400 && !ctx.computeOnClient(mc -> mc.player.onGround()); i++) {
+                            yaw += 4;
+                            ctx.getInput().lookAt(yaw, 15);
+                            if (i == 40) {
+                                ctx.getInput().pressKey(USE);
+                            }
+                            ctx.waitTick();
+                        }
+                        ctx.waitTicks(15);
+                    }),
+            new Scenario("riptide",
+                    "A trident with riptide III at the bottom of a two-deep pool (x 0 to 10): held too briefly (nothing); held 12 ticks looking east, launching along the look into the pool's east wall (the wall ends the spin); back at the west side looking up (pitch -60) from the bottom, launched up out of the water (lifted 1.2 first, being on the ground), spinning (the server's flag gives the spin pose) and falling back; then wearing an elytra, launched up again and pressing jump in the air to glide down steeply (pitch 45).",
+                    List.of(UNHURT, "fill 0 -62 -4 10 -61 4 minecraft:water"),
+                    start(-2.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("item replace entity @a hotbar.0 with minecraft:trident[enchantments={riptide:3}]");
+                        tp(ctx, server, 2.5, -62, 0.5, -90, 0);
+                        ctx.waitTicks(10);
+                        hold(ctx, 6, USE);
+                        ctx.waitTicks(5);
+                        hold(ctx, 12, USE);
+                        ctx.waitTicks(25);
+                        tp(ctx, server, 2.5, -62, 0.5, -90, -60);
+                        ctx.waitTicks(10);
+                        hold(ctx, 12, USE);
+                        ctx.waitTicks(10);
+                        waitUntilDown(ctx, 100);
+                        ctx.waitTicks(20);
+                        server.runCommand(ELYTRA);
+                        tp(ctx, server, 2.5, -62, 0.5, -90, -70);
+                        ctx.waitTicks(10);
+                        hold(ctx, 12, USE);
+                        ctx.waitTicks(8);
+                        hold(ctx, 2, JUMP);
+                        ctx.getInput().lookAt(-90, 45);
+                        ctx.waitTicks(5);
+                        waitUntilDown(ctx, 120);
+                        ctx.waitTicks(15);
+                    }),
+            new Scenario("wind_charge",
+                    "Wearing an elytra: jump looking straight down and throw a wind charge at the floor near the top of the jump: the explosion's knockback (the server's explode packet) launches the player, who presses jump in the air to glide east and lands. Then the same without gliding.",
+                    List.of(ELYTRA, UNHURT, "item replace entity @a hotbar.0 with minecraft:wind_charge 16"),
+                    start(0.5, -60, 0.5, -90, 90), (ctx, server) -> {
+                        hold(ctx, 2, JUMP);
+                        ctx.waitTicks(3);
+                        ctx.getInput().pressKey(USE);
+                        ctx.waitTicks(6);
+                        ctx.getInput().lookAt(-90, 10);
+                        hold(ctx, 2, JUMP);
+                        ctx.waitTicks(2);
+                        waitUntilDown(ctx, 120);
+                        ctx.waitTicks(15);
+                        ctx.getInput().lookAt(-90, 90);
+                        ctx.waitTicks(3);
+                        hold(ctx, 2, JUMP);
+                        ctx.waitTicks(3);
+                        ctx.getInput().pressKey(USE);
+                        ctx.waitTicks(4);
+                        waitUntilDown(ctx, 120);
+                        ctx.waitTicks(15);
                         server.runCommand("kill @e[type=!minecraft:player]");
                         ctx.waitTicks(5);
                     }));

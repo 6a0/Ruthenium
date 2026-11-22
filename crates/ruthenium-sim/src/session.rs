@@ -77,6 +77,9 @@ pub struct Physics {
     /// Vanilla's block transformers by name, for servers that send them as known-pack
     /// entries without data.
     pub block_transformers: std::sync::Arc<crate::use_on::Transformers>,
+    /// Vanilla's enchantments by name, for servers that send them as known-pack
+    /// entries without data.
+    pub enchantments: std::sync::Arc<crate::enchantment::Enchantments>,
 }
 
 /// What movement needs from a dimension type.
@@ -825,6 +828,25 @@ impl Game {
         crate::use_on::Transformers::from_registry(entries, &vanilla)
     }
 
+    /// The items read the enchantment registry the server sent (a riptide trident's
+    /// spin).
+    fn configure_enchantments(&mut self) {
+        let Some(physics) = &mut self.physics else {
+            return;
+        };
+        let entries = self
+            .configured
+            .registries
+            .iter()
+            .find(|(r, _)| r == "minecraft:enchantment")
+            .map(|(_, e)| e.as_slice())
+            .unwrap_or(&[]);
+        let mut items = (*physics.items).clone();
+        items.enchantments =
+            crate::enchantment::Enchantments::from_registry(entries, &physics.enchantments);
+        physics.items = std::sync::Arc::new(items);
+    }
+
     /// A level's entities, the player's among them.
     fn new_entities(&self, player_id: i32) -> Entities {
         let improved = self
@@ -1104,6 +1126,7 @@ impl Game {
                 }
                 self.configured = c;
                 self.transformers = self.configured_transformers();
+                self.configure_enchantments();
                 log_configured(&self.configured, self.server_brand.as_deref());
                 self.connection
                     .switch(Protocol::Play, cfg::finish_configuration());
@@ -1517,7 +1540,18 @@ impl Game {
                     && entity_id == w.player.entity_id
                 {
                     match event {
-                        ENTITY_EVENT_USE_ITEM_COMPLETE => w.player.complete_using_item(),
+                        ENTITY_EVENT_USE_ITEM_COMPLETE => {
+                            if let Some(physics) = &self.physics {
+                                let colliders = w.entities.colliders(&w.player);
+                                let env = Env {
+                                    level: &w.level,
+                                    blocks: &physics.blocks,
+                                    tags: &self.tags,
+                                    colliders: &colliders,
+                                };
+                                w.player.complete_using_item(&env);
+                            }
+                        }
                         24..=28 => w.player.permission_level = i32::from(event) - 24,
                         _ => {}
                     }

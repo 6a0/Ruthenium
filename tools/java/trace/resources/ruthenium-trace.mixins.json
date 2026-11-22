@@ -10,6 +10,7 @@
   "client": [
     "ClientLevelMixin",
     "KeyMappingAccessor",
+    "LivingEntityAccessor",
     "MinecraftMixin",
     "MultiPlayerGameModeAccessor"
   ],

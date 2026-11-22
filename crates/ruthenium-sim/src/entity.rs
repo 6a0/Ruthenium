@@ -235,6 +235,8 @@ pub struct TypeInfo {
     armor_stand_flags_field: Option<u8>,
     /// `AbstractArrow.IN_GROUND`.
     in_ground_field: Option<u8>,
+    /// `FireworkRocketEntity.DATA_ATTACHED_TO_TARGET`.
+    attached_to_field: Option<u8>,
     /// `blocksBuilding`: whether it stops blocks being placed where it is.
     pub blocks_building: BlocksBuilding,
 }
@@ -371,6 +373,7 @@ impl EntityTypes {
                 projectile: d.is("Projectile"),
                 armor_stand_flags_field: d.field("ArmorStand.DATA_CLIENT_FLAGS"),
                 in_ground_field: d.field("AbstractArrow.IN_GROUND"),
+                attached_to_field: d.field("FireworkRocketEntity.DATA_ATTACHED_TO_TARGET"),
                 blocks_building: if d.is("ArmorStand") {
                     BlocksBuilding::UnlessMarker
                 } else if living
@@ -636,6 +639,8 @@ pub struct Entity {
     pub marker: bool,
     /// An arrow stuck in a block (`IN_GROUND`).
     pub in_ground: bool,
+    /// A firework rocket's entity, the one it carries (`DATA_ATTACHED_TO_TARGET`).
+    pub attached_to: Option<i32>,
     /// `VecDeltaCodec`'s base: the last position the server sent.
     codec_base: [f64; 3],
     interpolation: Interpolation,
@@ -717,6 +722,7 @@ impl Entity {
             tick_count: 0,
             marker: false,
             in_ground: false,
+            attached_to: None,
             codec_base: [0.0; 3],
             interpolation,
             no_physics: info.player,
@@ -1059,6 +1065,10 @@ impl Entity {
             && let DataValue::Boolean(b) = value
         {
             self.in_ground = *b;
+        } else if Some(field) == t.attached_to_field
+            && let DataValue::OptionalUnsignedInt(id) = value
+        {
+            self.attached_to = *id;
         }
     }
 }
@@ -1813,6 +1823,15 @@ impl Entities {
                 .is_some_and(|i| i.game_mode == play::SPECTATOR);
         }
         let e = &self.entities[&id];
+        // `FireworkRocketEntity.tick`: a rocket attached to the local player boosts it
+        // while it glides (the rocket finds the player while it is in the level).
+        if e.attached_to.is_some()
+            && e.attached_to == self.local_id
+            && cx.local.alive
+            && player.fall_flying()
+        {
+            player.rocket_boost();
+        }
         // Passengers aren't moved with their vehicle yet, so they'd push from a stale
         // place.
         if riding {

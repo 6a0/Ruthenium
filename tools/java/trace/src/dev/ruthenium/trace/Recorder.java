@@ -6,6 +6,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.mojang.blaze3d.platform.InputConstants;
 import dev.ruthenium.trace.mixin.KeyMappingAccessor;
+import dev.ruthenium.trace.mixin.LivingEntityAccessor;
 import dev.ruthenium.trace.mixin.MultiPlayerGameModeAccessor;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
@@ -267,6 +268,11 @@ public final class Recorder {
             o.addProperty("pose", p.getPose().name());
             o.addProperty("flying", p.getAbilities().flying);
             o.addProperty("inWater", p.isInWater());
+            // Gliding (the shared flag), and a riptide spin: the server's living flag and the
+            // client's ticks left.
+            o.addProperty("fallFlying", p.isFallFlying());
+            o.addProperty("autoSpin", p.isAutoSpinAttack());
+            o.addProperty("spinTicks", ((LivingEntityAccessor) p).ruthenium$autoSpinAttackTicks());
             Input in = p.input.keyPresses;
             JsonArray input = new JsonArray();
             for (var e : List.of(

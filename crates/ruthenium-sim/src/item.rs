@@ -65,6 +65,18 @@ pub enum EquipmentSlot {
 }
 
 impl EquipmentSlot {
+    /// `EquipmentSlot.VALUES`.
+    pub const VALUES: [EquipmentSlot; 8] = [
+        EquipmentSlot::MainHand,
+        EquipmentSlot::Feet,
+        EquipmentSlot::Legs,
+        EquipmentSlot::Chest,
+        EquipmentSlot::Head,
+        EquipmentSlot::OffHand,
+        EquipmentSlot::Body,
+        EquipmentSlot::Saddle,
+    ];
+
     pub fn from_id(id: i32) -> EquipmentSlot {
         match id {
             1 => EquipmentSlot::Feet,
@@ -371,8 +383,10 @@ pub struct Components {
     pub charged: bool,
     /// (`minecraft:enchantment` id, level).
     pub enchantments: Vec<(i32, i32)>,
-    /// An enchantment with a riptide spin (`getTridentSpinAttackStrength > 0`).
-    pub riptide: bool,
+    /// `EnchantmentHelper.getTridentSpinAttackStrength`: above 0, a riptide trident.
+    pub spin_attack_strength: f32,
+    /// `glider`: worn in its equippable slot, it lets the player glide.
+    pub glider: bool,
     /// `getUseDuration`, worked out when the stack was made.
     pub use_duration: i32,
     /// The use remainder as a stack (a prototype: copy it).
@@ -477,6 +491,7 @@ impl Components {
                 Some(Kind::BlockState) => self.block_state = None,
                 Some(Kind::Compostable) => self.compostable = false,
                 Some(Kind::JukeboxPlayable) => self.jukebox_playable = false,
+                Some(Kind::Glider) => self.glider = false,
                 _ => {}
             }
         }
@@ -564,6 +579,7 @@ impl Components {
                 }
                 Component::ChargedProjectiles(p) => self.charged = !p.is_empty(),
                 Component::Enchantments(e) => self.enchantments = e.clone(),
+                Component::Glider => self.glider = true,
                 Component::Tool {
                     rules,
                     default_mining_speed,
@@ -808,8 +824,8 @@ pub struct Items {
     /// `minecraft:instrument` entries by id: name, and use duration in seconds when
     /// the server sent the entry's data.
     pub instruments: Vec<(String, Option<f32>)>,
-    /// `minecraft:enchantment` ids whose effects include a riptide spin.
-    pub riptide: Vec<i32>,
+    /// The `minecraft:enchantment` registry (empty until the server sends it).
+    pub enchantments: crate::enchantment::Enchantments,
 }
 
 impl Items {
@@ -861,7 +877,7 @@ impl Items {
         Items {
             defaults,
             instruments: Vec::new(),
-            riptide: Vec::new(),
+            enchantments: crate::enchantment::Enchantments::default(),
         }
     }
 
@@ -882,10 +898,7 @@ impl Items {
         let mut c = (*self.defaults(s.item)).clone();
         c.apply(&s.patch, self);
         c.use_duration = c.compute_use_duration(|i| self.instrument_seconds(i));
-        c.riptide = c
-            .enchantments
-            .iter()
-            .any(|(id, level)| *level > 0 && self.riptide.contains(id));
+        c.spin_attack_strength = self.enchantments.spin_attack_strength(&c.enchantments);
         c.remainder = c
             .use_remainder
             .as_ref()
@@ -951,6 +964,7 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
     c.unbreakable = has("minecraft:unbreakable");
     c.compostable = has("minecraft:compostable");
     c.jukebox_playable = has("minecraft:jukebox_playable");
+    c.glider = has("minecraft:glider");
     if let Some(o) = v.get("minecraft:block_state").and_then(|o| o.as_object()) {
         let props = o
             .iter()
