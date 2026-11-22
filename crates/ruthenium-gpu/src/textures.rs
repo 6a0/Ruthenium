@@ -8,8 +8,13 @@
 //!   beyond the baseline (`descriptorBindingUpdateUnusedWhilePending`) is needed.
 //! - Every slot not holding a ready texture shows [`TextureId::MISSING`], a magenta and
 //!   black checkerboard, so a stale or unknown index never reads a dead descriptor.
-//! - A texture becomes visible in the frame that records its upload, and a destroyed one is
-//!   freed only after every frame that could still sample it has finished.
+//! - A texture becomes visible once its first upload is ready ([`Arrival`]): in the frame
+//!   that records it, or, for background uploads on a transfer queue, in the first frame
+//!   after that queue has finished it. A destroyed one is freed only after every frame that
+//!   could still sample it, and its upload, have finished.
+//! - Once visible, a texture can be rewritten in part ([`TextureTable::update`]: animated
+//!   textures, atlas patches); a frame's updates are recorded before its passes, so the
+//!   frame samples the new texels.
 
 use std::fmt;
 use std::sync::Arc;
@@ -20,7 +25,7 @@ use ash::vk::TaggedStructure;
 use crate::device::Gpu;
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::memory::{Image, texel_bytes};
-use crate::upload::{ImageDst, ImageRegion, UploadError, UploadRing};
+use crate::upload::{ImageDst, ImageRegion, UploadError, UploadRing, UploadTicket};
 use crate::{Error, VkContext};
 
 /// Mip levels a texture may have (a 32768² texture has 16).
@@ -120,6 +125,18 @@ impl SamplerId {
     }
 }
 
+/// When a texture's first upload has to be visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// In the next frame: the copy is recorded on the graphics queue, before the frame's
+    /// passes (what the first frame draws, the missing texture).
+    NextFrame,
+    /// A frame or more later is fine (atlases behind a loading screen, skins): on a
+    /// transfer queue if there is one. Check [`TextureTable::is_ready`] before drawing it;
+    /// until then its slot shows the missing texture.
+    Background,
+}
+
 /// What texture to create.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextureDesc {
@@ -174,11 +191,21 @@ impl TextureDesc {
     }
 }
 
+/// Where a texture's first upload is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// Not staged yet.
+    Empty,
+    /// Staged; visible once the ticket is ready.
+    Arriving(UploadTicket),
+    /// Its slot shows it.
+    Ready,
+}
+
 struct Texture {
     image: Image,
     desc: TextureDesc,
-    /// Its upload has been staged; from that frame on its slot shows it.
-    uploaded: bool,
+    state: State,
 }
 
 /// Free indices of the table. Index 0 is the missing texture and never handed out.
@@ -226,6 +253,10 @@ pub struct TextureTable {
     slots: Slots,
     /// Destroyed textures, freed once the frame number they carry has finished.
     retiring: Vec<(u64, u32, Texture)>,
+    /// Textures whose first upload is staged but not ready, by index.
+    arriving: Vec<u32>,
+    /// Destroyed textures whose first upload is not ready yet: they retire once it is.
+    orphans: Vec<(UploadTicket, u32, Texture)>,
     /// Per set: (index, view) writes to make at the start of that set's next frame.
     pending: [Vec<(u32, vk::ImageView)>; MAX_FRAMES_IN_FLIGHT],
     /// Number of the last frame begun.
@@ -261,6 +292,8 @@ impl TextureTable {
             textures: Vec::with_capacity(256),
             slots: Slots::new(capacity),
             retiring: Vec::new(),
+            arriving: Vec::new(),
+            orphans: Vec::new(),
             pending: std::array::from_fn(|_| Vec::new()),
             frame: 0,
             gpu,
@@ -270,7 +303,7 @@ impl TextureTable {
         let missing = t.create_texture(TextureDesc::rgba8(MISSING_SIZE, MISSING_SIZE))?;
         t.textures.push(Some(missing));
         let pixels = missing_pixels();
-        t.upload(upload, TextureId::MISSING, &[&pixels])?;
+        t.upload(upload, TextureId::MISSING, &[&pixels], Arrival::NextFrame)?;
         // Every slot starts on the missing texture (written directly: no set is in use).
         let view = t.textures[0]
             .as_ref()
@@ -379,7 +412,7 @@ impl TextureTable {
         Ok(Texture {
             image,
             desc,
-            uploaded: false,
+            state: State::Empty,
         })
     }
 
@@ -403,9 +436,39 @@ impl TextureTable {
         Ok(TextureId(i as u32))
     }
 
+    /// Whether the texture's slot shows it in the frame last begun (and every later one).
+    ///
+    /// # Panics
+    /// If `id` is not a live texture.
+    pub fn is_ready(&self, id: TextureId) -> bool {
+        self.live(id).state == State::Ready
+    }
+
+    fn live(&self, id: TextureId) -> &Texture {
+        self.textures
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
+            .unwrap_or_else(|| panic!("{id:?} is not a live texture"))
+    }
+
+    fn live_mut(&mut self, id: TextureId) -> &mut Texture {
+        self.textures
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_mut)
+            .unwrap_or_else(|| panic!("{id:?} is not a live texture"))
+    }
+
+    /// The image and description of a texture, for reading it back.
+    pub(crate) fn image(&self, id: TextureId) -> (vk::Image, TextureDesc) {
+        let t = self.live(id);
+        (t.image.raw, t.desc)
+    }
+
     /// Stages every mip level of the texture (`mips[0]` is level 0; tightly packed rows,
-    /// top first) into `upload`. From the frame that records the copies on, the texture's
-    /// slot shows it. On `Err(Full)` nothing was staged: try again next frame.
+    /// top first) into `upload`. The first upload makes the texture visible when
+    /// `arrival` says; later ones replace its contents in the next frame (`arrival` is
+    /// then ignored). On `Err(Full)` nothing was staged: try again next frame; on
+    /// `Err(NotReady)`, once the first upload has arrived.
     ///
     /// # Panics
     /// If `id` is not a live texture, or `mips` doesn't match its levels and sizes.
@@ -414,10 +477,9 @@ impl TextureTable {
         upload: &mut UploadRing,
         id: TextureId,
         mips: &[&[u8]],
+        arrival: Arrival,
     ) -> Result<(), UploadError> {
-        let t = self.textures[id.0 as usize]
-            .as_mut()
-            .unwrap_or_else(|| panic!("{id:?} is not a live texture"));
+        let t = self.live_mut(id);
         assert_eq!(
             mips.len(),
             t.desc.mip_levels as usize,
@@ -427,22 +489,54 @@ impl TextureTable {
         for (level, data) in mips.iter().enumerate() {
             regions[level] = (ImageRegion::whole_mip(t.desc.extent(), level as u32), data);
         }
+        let state = t.state;
+        if let State::Arriving(_) = state {
+            return Err(UploadError::NotReady);
+        }
         let dst = ImageDst {
             image: t.image.raw,
             format: t.desc.format,
             extent: t.desc.extent(),
             mip_levels: t.desc.mip_levels,
-            fresh: !t.uploaded,
+            fresh: state == State::Empty,
+            background: arrival == Arrival::Background,
         };
-        upload.upload_image(&dst, &regions[..mips.len()])?;
-        if !t.uploaded {
-            t.uploaded = true;
-            let view = t.image.view;
-            for p in &mut self.pending {
-                p.push((id.0, view));
-            }
+        let ticket = upload.upload_image(&dst, &regions[..mips.len()])?;
+        if state == State::Empty {
+            t.state = State::Arriving(ticket);
+            self.arriving.push(id.0);
         }
         Ok(())
+    }
+
+    /// Stages rectangles of a visible texture (each region's texels tightly packed, rows
+    /// top first): animation frames, atlas patches. The next frame samples the new texels;
+    /// the rest of the texture keeps its contents. Either every region is staged or none
+    /// is. On `Err(Full)` try again next frame; on `Err(NotReady)`, once
+    /// [`Self::is_ready`].
+    ///
+    /// # Panics
+    /// If `id` is not a live texture, or a region lies outside its mip level or its data
+    /// is not exactly its size.
+    pub fn update(
+        &mut self,
+        upload: &mut UploadRing,
+        id: TextureId,
+        regions: &[(ImageRegion, &[u8])],
+    ) -> Result<(), UploadError> {
+        let t = self.live(id);
+        if t.state != State::Ready {
+            return Err(UploadError::NotReady);
+        }
+        let dst = ImageDst {
+            image: t.image.raw,
+            format: t.desc.format,
+            extent: t.desc.extent(),
+            mip_levels: t.desc.mip_levels,
+            fresh: false,
+            background: false,
+        };
+        upload.upload_image(&dst, regions).map(|_| ())
     }
 
     /// Creates a texture and stages its contents.
@@ -451,9 +545,10 @@ impl TextureTable {
         upload: &mut UploadRing,
         desc: TextureDesc,
         mips: &[&[u8]],
+        arrival: Arrival,
     ) -> Result<TextureId, Error> {
         let id = self.create(desc)?;
-        if let Err(e) = self.upload(upload, id, mips) {
+        if let Err(e) = self.upload(upload, id, mips, arrival) {
             self.destroy(id);
             return Err(Error::Upload(e));
         }
@@ -470,14 +565,23 @@ impl TextureTable {
         let t = self.textures[id.0 as usize]
             .take()
             .unwrap_or_else(|| panic!("{id:?} is not a live texture"));
-        if t.uploaded {
-            let missing = self.textures[0]
-                .as_ref()
-                .map(|m| m.image.view)
-                .expect("missing");
-            for p in &mut self.pending {
-                p.push((id.0, missing));
+        match t.state {
+            State::Ready => {
+                let missing = self.textures[0]
+                    .as_ref()
+                    .map(|m| m.image.view)
+                    .expect("missing");
+                for p in &mut self.pending {
+                    p.push((id.0, missing));
+                }
             }
+            State::Arriving(ticket) => {
+                // Its copies may not even be submitted yet: it retires once they are done.
+                self.arriving.retain(|&i| i != id.0);
+                self.orphans.push((ticket, id.0, t));
+                return;
+            }
+            State::Empty => {}
         }
         // Frames up to self.frame may sample it or record its staged copies, and each set
         // drops it at its own next frame: after self.frame + MAX_FRAMES_IN_FLIGHT, all have.
@@ -485,12 +589,42 @@ impl TextureTable {
             .push((self.frame + MAX_FRAMES_IN_FLIGHT as u64, id.0, t));
     }
 
-    /// Brings frame `frame`'s copy of the set (slot `slot`) up to date and frees textures
-    /// no unfinished frame can use. Call it at the start of every frame, after
-    /// `FrameLoop::begin` and before recording anything that samples.
-    pub fn begin_frame(&mut self, slot: usize, frame: u64, completed: u64) {
+    /// Shows the textures whose first upload is ready, brings frame `frame`'s copy of the
+    /// set (slot `slot`) up to date and frees textures no unfinished frame can use. Call it
+    /// at the start of every frame, after `upload.record` for that frame and before
+    /// recording anything that samples.
+    pub fn begin_frame(&mut self, slot: usize, frame: u64, completed: u64, upload: &UploadRing) {
         profiling::scope!("texture_table");
         self.frame = frame;
+        let mut i = 0;
+        while i < self.arriving.len() {
+            let index = self.arriving[i];
+            let t = self.textures[index as usize]
+                .as_mut()
+                .expect("arriving textures are live");
+            match t.state {
+                State::Arriving(ticket) if upload.is_ready(ticket) => {
+                    t.state = State::Ready;
+                    let view = t.image.view;
+                    for p in &mut self.pending {
+                        p.push((index, view));
+                    }
+                    self.arriving.swap_remove(i);
+                }
+                _ => i += 1,
+            }
+        }
+        let mut i = 0;
+        while i < self.orphans.len() {
+            if upload.is_ready(self.orphans[i].0) {
+                // Its copies were recorded or acquired by this frame at the latest.
+                let (_, index, t) = self.orphans.swap_remove(i);
+                self.retiring
+                    .push((frame + MAX_FRAMES_IN_FLIGHT as u64, index, t));
+            } else {
+                i += 1;
+            }
+        }
         let pending = &mut self.pending[slot];
         if !pending.is_empty() {
             // Only when textures change (loading), never in a steady frame.
@@ -566,6 +700,9 @@ impl Drop for TextureTable {
                 t.image.destroy(gpu);
             }
             for (_, _, t) in self.retiring.drain(..) {
+                t.image.destroy(gpu);
+            }
+            for (_, _, t) in self.orphans.drain(..) {
                 t.image.destroy(gpu);
             }
             if self.pool != vk::DescriptorPool::null() {

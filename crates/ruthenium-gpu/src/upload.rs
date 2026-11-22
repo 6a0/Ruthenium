@@ -16,10 +16,13 @@
 //! the next one): check with [`UploadRing::is_ready`]. That frame's submit waits on the
 //! transfer timeline (already signalled, so the wait costs nothing), which makes the copies
 //! visible to it. Buffers are created with concurrent sharing, so no ownership transfers
-//! are needed. Image copies stay on the graphics queue (images are few, and an animated
-//! texture is needed in the frame that writes it). Without a transfer queue (Intel, Apple,
-//! mobile GPUs, `--no-transfer-queue`), every copy is recorded on the graphics queue
-//! before the frame's passes and is ready in that frame.
+//! are needed. The first upload of an image that is not needed at once
+//! ([`ImageDst::background`]: atlases, skins) goes there too; images are exclusive to one
+//! queue family, so the transfer queue releases it and the frame that first may use it
+//! acquires it. Later writes to an image (animated textures, partial updates) are needed
+//! in the frame that makes them and stay on the graphics queue. Without a transfer queue
+//! (Intel, Apple, mobile GPUs, `--no-transfer-queue`), every copy is recorded on the
+//! graphics queue before the frame's passes and is ready in that frame.
 //!
 //! Nothing here allocates once the ring exists.
 
@@ -59,6 +62,8 @@ pub enum UploadError {
     Full,
     /// More than the whole ring or a frame's copy lists can ever hold; split it.
     TooLarge,
+    /// The texture's first upload has not arrived yet; try again in a later frame.
+    NotReady,
 }
 
 impl fmt::Display for UploadError {
@@ -66,6 +71,7 @@ impl fmt::Display for UploadError {
         f.write_str(match self {
             UploadError::Full => "the upload ring is full for this frame",
             UploadError::TooLarge => "the upload is larger than the upload ring",
+            UploadError::NotReady => "the texture's first upload has not arrived yet",
         })
     }
 }
@@ -88,6 +94,9 @@ pub struct ImageDst {
     /// may be discarded. Otherwise it is in SHADER_READ_ONLY_OPTIMAL and keeps the texels
     /// outside the written regions.
     pub fresh: bool,
+    /// The image is not needed in the next frame: its first upload may go on the transfer
+    /// queue and be ready a frame or more later.
+    pub background: bool,
 }
 
 /// A rectangle of one mip level.
@@ -197,6 +206,109 @@ impl Ring {
     }
 }
 
+/// Images released by the transfer queue and not yet acquired by the graphics queue.
+const MAX_RELEASED: usize = MAX_IMAGES * TRANSFER_SLOTS;
+
+/// Shader stages that sample uploaded images or read uploaded buffers.
+const SHADERS: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+    vk::PipelineStageFlags2::VERTEX_SHADER.as_raw()
+        | vk::PipelineStageFlags2::FRAGMENT_SHADER.as_raw()
+        | vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw(),
+);
+
+fn whole(i: &ImageDst) -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: i.mip_levels,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
+/// Buffer copies waiting for the next submission.
+#[derive(Debug)]
+struct BufferCopies {
+    dsts: Vec<vk::Buffer>,
+    regions: Vec<vk::BufferCopy>,
+}
+
+impl BufferCopies {
+    fn new() -> BufferCopies {
+        BufferCopies {
+            dsts: Vec::with_capacity(MAX_BUFFER_COPIES),
+            regions: Vec::with_capacity(MAX_BUFFER_COPIES),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.dsts.clear();
+        self.regions.clear();
+    }
+
+    /// # Safety
+    /// `cmd` is recording; `src` and every destination are alive.
+    unsafe fn record(&self, d: &ash::Device, cmd: vk::CommandBuffer, src: vk::Buffer) {
+        for_runs(&self.dsts, |dst, range| {
+            // SAFETY: guaranteed by the caller.
+            unsafe { d.cmd_copy_buffer(cmd, src, dst, &self.regions[range]) };
+        });
+    }
+}
+
+/// Image copies bound for one queue, waiting for the next submission.
+#[derive(Debug)]
+struct ImageCopies {
+    images: Vec<ImageDst>,
+    dsts: Vec<vk::Image>,
+    regions: Vec<vk::BufferImageCopy>,
+}
+
+impl ImageCopies {
+    fn new() -> ImageCopies {
+        ImageCopies {
+            images: Vec::with_capacity(MAX_IMAGES),
+            dsts: Vec::with_capacity(MAX_IMAGE_COPIES),
+            regions: Vec::with_capacity(MAX_IMAGE_COPIES),
+        }
+    }
+
+    fn find(&self, image: vk::Image) -> Option<usize> {
+        self.images.iter().position(|i| i.image == image)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.images.clear();
+        self.dsts.clear();
+        self.regions.clear();
+    }
+
+    /// # Safety
+    /// `cmd` is recording; `src` and every image are alive and in TRANSFER_DST_OPTIMAL.
+    unsafe fn record(&self, d: &ash::Device, cmd: vk::CommandBuffer, src: vk::Buffer) {
+        for_runs(&self.dsts, |dst, range| {
+            // SAFETY: guaranteed by the caller.
+            unsafe {
+                d.cmd_copy_buffer_to_image(
+                    cmd,
+                    src,
+                    dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &self.regions[range],
+                )
+            };
+        });
+    }
+}
+
 /// One command buffer for transfer submissions, reusable once its value is reached.
 #[derive(Debug)]
 struct TransferSlot {
@@ -210,6 +322,7 @@ struct TransferSlot {
 #[derive(Debug)]
 struct Transfer {
     queue: vk::Queue,
+    family: u32,
     /// Signalled by each submission with the number of the frame that submitted it.
     timeline: vk::Semaphore,
     slots: [TransferSlot; TRANSFER_SLOTS],
@@ -217,8 +330,12 @@ struct Transfer {
     completed: u64,
     /// The last value submitted.
     submitted: u64,
-    /// Frames whose buffer copies waited a frame because every slot was busy.
+    /// Frames whose transfer copies waited a frame because every slot was busy.
     deferred: u64,
+    /// Images uploaded and released to the graphics queue.
+    images: u64,
+    pre: Vec<vk::ImageMemoryBarrier2<'static>>,
+    post: Vec<vk::ImageMemoryBarrier2<'static>>,
 }
 
 impl Transfer {
@@ -226,6 +343,7 @@ impl Transfer {
         let d = &gpu.device;
         let mut t = Transfer {
             queue,
+            family,
             timeline: vk::Semaphore::null(),
             slots: std::array::from_fn(|_| TransferSlot {
                 pool: vk::CommandPool::null(),
@@ -235,6 +353,9 @@ impl Transfer {
             completed: 0,
             submitted: 0,
             deferred: 0,
+            images: 0,
+            pre: Vec::with_capacity(MAX_IMAGES),
+            post: Vec::with_capacity(MAX_IMAGES),
         };
         let created = (|| {
             let mut type_info = vk::SemaphoreTypeCreateInfo::default()
@@ -282,24 +403,56 @@ impl Transfer {
         Ok(self.completed)
     }
 
-    /// Records and submits the buffer copies, signalling `value`. Returns false, having
+    /// Records and submits the copies, signalling `value`. Images go from UNDEFINED to
+    /// TRANSFER_DST_OPTIMAL, are written, and are released to the graphics family in
+    /// SHADER_READ_ONLY_OPTIMAL (the graphics queue acquires them). Returns false, having
     /// done nothing, if every command buffer is still in use.
     ///
     /// # Safety
     /// `value` is above every value submitted before; the staged bytes are written; every
-    /// destination is alive and its written ranges are not in use by unfinished work.
+    /// destination is alive, its written ranges are not in use by unfinished work, and
+    /// every image is fresh (its old contents may be discarded).
     unsafe fn submit(
         &mut self,
         gpu: &Gpu,
         src: vk::Buffer,
-        dsts: &[vk::Buffer],
-        regions: &[vk::BufferCopy],
+        buffers: &BufferCopies,
+        images: &ImageCopies,
         value: u64,
     ) -> Result<bool, Error> {
         let completed = self.completed;
         let Some(slot) = self.slots.iter_mut().find(|s| s.value <= completed) else {
             return Ok(false);
         };
+        self.pre.clear();
+        self.post.clear();
+        for i in &images.images {
+            self.pre.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .image(i.image)
+                    .subresource_range(whole(i)),
+            );
+            // The release half of the queue family ownership transfer.
+            self.post.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .dst_access_mask(vk::AccessFlags2::NONE)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(self.family)
+                    .dst_queue_family_index(gpu.queue_family)
+                    .image(i.image)
+                    .subresource_range(whole(i)),
+            );
+        }
         let d = &gpu.device;
         let cmd = slot.cmd;
         // SAFETY: the slot's last submission has finished (its value is reached); one thread
@@ -311,18 +464,29 @@ impl Transfer {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             d.begin_command_buffer(cmd, &begin)
                 .ctx("vkBeginCommandBuffer(transfer)")?;
-            for_runs(dsts, |dst, range| {
-                d.cmd_copy_buffer(cmd, src, dst, &regions[range]);
-            });
+            if !self.pre.is_empty() {
+                gpu.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&self.pre),
+                );
+            }
+            buffers.record(d, cmd, src);
+            images.record(d, cmd, src);
+            if !self.post.is_empty() {
+                gpu.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&self.post),
+                );
+            }
             d.end_command_buffer(cmd)
                 .ctx("vkEndCommandBuffer(transfer)")?;
             let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
-            // The signal makes the copies' writes available; the frames that use them wait
-            // on it, which makes them visible.
+            // The signal (after everything, releases included) makes the writes available;
+            // the frames that use them wait on it, which makes them visible.
             let signals = [vk::SemaphoreSubmitInfo::default()
                 .semaphore(self.timeline)
                 .value(value)
-                .stage_mask(vk::PipelineStageFlags2::COPY)];
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
             let submit = vk::SubmitInfo2::default()
                 .command_buffer_infos(&cmds)
                 .signal_semaphore_infos(&signals);
@@ -330,6 +494,7 @@ impl Transfer {
         }
         slot.value = value;
         self.submitted = value;
+        self.images += images.images.len() as u64;
         Ok(true)
     }
 
@@ -365,18 +530,25 @@ pub struct UploadRing {
     budget: u64,
     /// Bytes staged for the next frame.
     staged: u64,
-    /// Buffer copies go here if the device has a transfer queue in use.
+    /// The dedicated transfer queue, if the device has one in use.
     transfer: Option<Transfer>,
     /// The ticket of uploads staged now: the number the next recorded frame will have, at
     /// the least.
     next_frame: u64,
     /// Tickets up to this are usable by the frame last recorded.
     ready: u64,
-    buffer_dsts: Vec<vk::Buffer>,
-    buffer_regions: Vec<vk::BufferCopy>,
-    image_dsts: Vec<vk::Image>,
-    image_regions: Vec<vk::BufferImageCopy>,
-    images: Vec<ImageDst>,
+    /// Buffer copies, for the transfer queue if there is one, else the graphics queue.
+    buffers: BufferCopies,
+    /// Image copies recorded into the frame.
+    graphics_images: ImageCopies,
+    /// First uploads of background images, for the transfer queue.
+    transfer_images: ImageCopies,
+    /// Images the transfer queue releases, with the submission's timeline value, waiting
+    /// for the graphics queue to acquire them.
+    released: Vec<(u64, ImageDst)>,
+    /// Staging offsets of the regions of the `upload_image` call in progress.
+    staged_offsets: Vec<u64>,
+    /// Scratch space for the frame's barriers.
     pre: Vec<vk::ImageMemoryBarrier2<'static>>,
     post: Vec<vk::ImageMemoryBarrier2<'static>>,
 }
@@ -438,12 +610,12 @@ impl UploadRing {
             transfer,
             next_frame: 1,
             ready: 0,
-            buffer_dsts: Vec::with_capacity(MAX_BUFFER_COPIES),
-            buffer_regions: Vec::with_capacity(MAX_BUFFER_COPIES),
-            image_dsts: Vec::with_capacity(MAX_IMAGE_COPIES),
-            image_regions: Vec::with_capacity(MAX_IMAGE_COPIES),
-            images: Vec::with_capacity(MAX_IMAGES),
-            pre: Vec::with_capacity(MAX_IMAGES),
+            buffers: BufferCopies::new(),
+            graphics_images: ImageCopies::new(),
+            transfer_images: ImageCopies::new(),
+            released: Vec::with_capacity(MAX_RELEASED),
+            staged_offsets: Vec::with_capacity(MAX_IMAGE_COPIES),
+            pre: Vec::with_capacity(MAX_IMAGES + MAX_RELEASED),
             post: Vec::with_capacity(MAX_IMAGES),
             gpu,
         })
@@ -467,14 +639,20 @@ impl UploadRing {
         self.staged
     }
 
-    /// Whether buffer copies run on a dedicated transfer queue.
+    /// Whether buffer copies and background image uploads run on a dedicated transfer
+    /// queue.
     pub fn uses_transfer_queue(&self) -> bool {
         self.transfer.is_some()
     }
 
-    /// Frames whose buffer copies had to wait a frame for a free transfer command buffer.
+    /// Frames whose transfer copies had to wait a frame for a free command buffer.
     pub fn deferred_transfers(&self) -> u64 {
         self.transfer.as_ref().map_or(0, |t| t.deferred)
+    }
+
+    /// Images whose first upload went on the transfer queue.
+    pub fn transferred_images(&self) -> u64 {
+        self.transfer.as_ref().map_or(0, |t| t.images)
     }
 
     /// Whether the frame last passed to [`Self::record`] (and every later one) may read
@@ -523,13 +701,13 @@ impl UploadRing {
         if data.is_empty() {
             return Ok(ticket);
         }
-        if self.buffer_regions.len() == MAX_BUFFER_COPIES || !self.within_budget(data.len() as u64)
+        if self.buffers.regions.len() == MAX_BUFFER_COPIES || !self.within_budget(data.len() as u64)
         {
             return Err(UploadError::Full);
         }
         let src_offset = self.stage(data)?;
-        self.buffer_dsts.push(dst);
-        self.buffer_regions.push(vk::BufferCopy {
+        self.buffers.dsts.push(dst);
+        self.buffers.regions.push(vk::BufferCopy {
             src_offset,
             dst_offset,
             size: data.len() as u64,
@@ -537,9 +715,15 @@ impl UploadRing {
         Ok(ticket)
     }
 
-    /// Stages `regions` of `dst` (tightly packed texels, rows top to bottom) to be copied
-    /// at the start of the next frame. Either every region is staged or none is. Once the
-    /// frame's copies are done the image is in SHADER_READ_ONLY_OPTIMAL.
+    /// Stages `regions` of `dst` (tightly packed texels, rows top to bottom), and returns
+    /// when the image can be sampled ([`Self::is_ready`]). Either every region is staged or
+    /// none is. Once ready, the image is in SHADER_READ_ONLY_OPTIMAL.
+    ///
+    /// The first upload of a [`ImageDst::background`] image goes on the transfer queue if
+    /// there is one, and is ready once it has finished there (usually a frame later);
+    /// everything else is recorded into the next frame and ready in it. An image whose
+    /// first upload is not ready yet must not be written again (only `fresh` writes may
+    /// join it in the same frame).
     ///
     /// # Panics
     /// If a region lies outside its mip level, or its data is not exactly its size.
@@ -547,9 +731,10 @@ impl UploadRing {
         &mut self,
         dst: &ImageDst,
         regions: &[(ImageRegion, &[u8])],
-    ) -> Result<(), UploadError> {
+    ) -> Result<UploadTicket, UploadError> {
+        let ticket = UploadTicket(self.next_frame);
         if regions.is_empty() {
-            return Ok(());
+            return Ok(ticket);
         }
         let texel = texel_bytes(dst.format)
             .unwrap_or_else(|| panic!("no upload path for {:?}", dst.format));
@@ -567,12 +752,32 @@ impl UploadRing {
                 "region data size"
             );
         }
-        let known = self.images.iter().position(|i| i.image == dst.image);
         if regions.len() > MAX_IMAGE_COPIES {
             return Err(UploadError::TooLarge);
         }
-        if self.image_regions.len() + regions.len() > MAX_IMAGE_COPIES
-            || (known.is_none() && self.images.len() == MAX_IMAGES)
+        let in_graphics = self.graphics_images.find(dst.image);
+        let in_transfer = self.transfer_images.find(dst.image);
+        debug_assert!(
+            dst.fresh
+                || (in_transfer.is_none()
+                    && !self.released.iter().any(|(_, i)| i.image == dst.image)),
+            "{:?} written before its first upload is ready",
+            dst.image
+        );
+        // Background first uploads (and fresh writes joining one) go to the transfer queue.
+        let to_transfer = self.transfer.is_some()
+            && in_graphics.is_none()
+            && (in_transfer.is_some() || (dst.fresh && dst.background));
+        let (copies, known) = if to_transfer {
+            (&self.transfer_images, in_transfer)
+        } else {
+            (&self.graphics_images, in_graphics)
+        };
+        if copies.regions.len() + regions.len() > MAX_IMAGE_COPIES
+            || (known.is_none() && copies.images.len() == MAX_IMAGES)
+            || (to_transfer
+                && known.is_none()
+                && self.released.len() + copies.images.len() >= MAX_RELEASED)
         {
             return Err(UploadError::Full);
         }
@@ -580,59 +785,65 @@ impl UploadRing {
         if !self.within_budget(total) {
             return Err(UploadError::Full);
         }
-        let (head, staged, copies) = (self.ring.head, self.staged, self.image_regions.len());
-        for (r, data) in regions {
+        let (head, staged) = (self.ring.head, self.staged);
+        self.staged_offsets.clear();
+        for (_, data) in regions {
             match self.stage(data) {
-                Ok(buffer_offset) => {
-                    self.image_dsts.push(dst.image);
-                    self.image_regions.push(vk::BufferImageCopy {
-                        buffer_offset,
-                        buffer_row_length: 0,
-                        buffer_image_height: 0,
-                        image_subresource: vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: r.mip,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        },
-                        image_offset: vk::Offset3D {
-                            x: r.x as i32,
-                            y: r.y as i32,
-                            z: 0,
-                        },
-                        image_extent: vk::Extent3D {
-                            width: r.width,
-                            height: r.height,
-                            depth: 1,
-                        },
-                    });
-                }
+                Ok(offset) => self.staged_offsets.push(offset),
                 Err(e) => {
                     // Undo the regions staged so far: the bytes were not handed out yet.
                     self.ring.head = head;
                     self.staged = staged;
-                    self.image_dsts.truncate(copies);
-                    self.image_regions.truncate(copies);
                     return Err(e);
                 }
             }
         }
+        let copies = if to_transfer {
+            &mut self.transfer_images
+        } else {
+            &mut self.graphics_images
+        };
+        for ((r, _), &buffer_offset) in regions.iter().zip(&self.staged_offsets) {
+            copies.dsts.push(dst.image);
+            copies.regions.push(vk::BufferImageCopy {
+                buffer_offset,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: r.mip,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D {
+                    x: r.x as i32,
+                    y: r.y as i32,
+                    z: 0,
+                },
+                image_extent: vk::Extent3D {
+                    width: r.width,
+                    height: r.height,
+                    depth: 1,
+                },
+            });
+        }
         match known {
             // Written twice this frame: if either write saw it unwritten, it is unwritten.
-            Some(i) => self.images[i].fresh |= dst.fresh,
-            None => self.images.push(*dst),
+            Some(i) => copies.images[i].fresh |= dst.fresh,
+            None => copies.images.push(*dst),
         }
-        Ok(())
+        Ok(ticket)
     }
 
     /// Sends the staged copies on their way, frees the space of finished frames, and makes
     /// the finished copies visible to `ctx`'s frame. Call it once per frame, before the
     /// frame's passes:
     ///
-    /// - buffer copies are submitted to the transfer queue if there is one (and `ctx` gets
-    ///   a wait on the transfer timeline), else recorded into `ctx.cmd`;
-    /// - image copies are recorded into `ctx.cmd`, with the barriers that make them visible
-    ///   to this frame's and later frames' shaders.
+    /// - with a transfer queue, buffer copies and background first uploads are submitted
+    ///   there; `ctx` gets a wait on the transfer timeline, and acquires the images whose
+    ///   transfer has finished;
+    /// - every other copy is recorded into `ctx.cmd`, with the barriers that make it
+    ///   visible to this frame's and later frames' shaders.
     ///
     /// # Safety
     /// `ctx` is the frame being recorded on the graphics queue, and `completed` a frame
@@ -642,31 +853,61 @@ impl UploadRing {
         profiling::scope!("record_uploads");
         let frame = ctx.number;
         debug_assert!(frame >= self.next_frame, "frames recorded out of order");
+        self.pre.clear();
+        self.post.clear();
         let mut transfer_bytes = false;
         match &mut self.transfer {
             Some(t) => {
                 let transfer_completed = t.poll(&self.gpu)?;
                 self.ring.retire(completed, transfer_completed);
-                if !self.buffer_regions.is_empty() {
+                if !self.buffers.is_empty() || !self.transfer_images.is_empty() {
                     // SAFETY: frame numbers grow, so `frame` is above every earlier value;
-                    // the rest is the caller's contract and upload_buffer's.
+                    // transfer images are all fresh (upload_image's routing); the rest is
+                    // the caller's contract and the upload calls'.
                     let sent = unsafe {
                         t.submit(
                             &self.gpu,
                             self.raw,
-                            &self.buffer_dsts,
-                            &self.buffer_regions,
+                            &self.buffers,
+                            &self.transfer_images,
                             frame,
                         )?
                     };
                     if sent {
-                        self.buffer_dsts.clear();
-                        self.buffer_regions.clear();
+                        for i in &self.transfer_images.images {
+                            self.released.push((frame, *i));
+                        }
+                        self.buffers.clear();
+                        self.transfer_images.clear();
                     } else {
                         // Kept for the next frame's submission, which signals a later value.
                         t.deferred += 1;
                     }
                     transfer_bytes = true;
+                }
+                // The acquire half of the ownership transfer, for every image whose release
+                // has finished. The frame's wait on the transfer timeline orders it after
+                // the release.
+                let mut i = 0;
+                while i < self.released.len() {
+                    if self.released[i].0 > transfer_completed {
+                        i += 1;
+                        continue;
+                    }
+                    let (_, img) = self.released.swap_remove(i);
+                    self.pre.push(
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                            .src_access_mask(vk::AccessFlags2::NONE)
+                            .dst_stage_mask(SHADERS)
+                            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                            .src_queue_family_index(t.family)
+                            .dst_queue_family_index(self.gpu.queue_family)
+                            .image(img.image)
+                            .subresource_range(whole(&img)),
+                    );
                 }
                 // Copies up to the completed value are done: this frame may use them. The
                 // wait is already satisfied; it makes their writes visible to the frame.
@@ -685,34 +926,19 @@ impl UploadRing {
             }
         }
         self.next_frame = frame + 1;
-        // On the transfer path the buffer lists hold only deferred copies here.
-        let graphics_buffers = self.transfer.is_none() && !self.buffer_regions.is_empty();
-        if !graphics_buffers && self.image_regions.is_empty() {
+        // On the transfer path the buffer list holds only deferred copies here.
+        let graphics_buffers = self.transfer.is_none() && !self.buffers.is_empty();
+        if !graphics_buffers && self.graphics_images.is_empty() && self.pre.is_empty() {
             self.staged = 0;
             self.ring.close(frame, transfer_bytes);
             return Ok(());
         }
-        let cmd = ctx.cmd;
-        let gpu = &*self.gpu;
-        let d = &gpu.device;
-        let range = |i: &ImageDst| vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            base_mip_level: 0,
-            level_count: i.mip_levels,
-            base_array_layer: 0,
-            layer_count: 1,
-        };
-        self.pre.clear();
-        self.post.clear();
-        let shaders = vk::PipelineStageFlags2::VERTEX_SHADER
-            | vk::PipelineStageFlags2::FRAGMENT_SHADER
-            | vk::PipelineStageFlags2::COMPUTE_SHADER;
-        for i in &self.images {
+        for i in &self.graphics_images.images {
             let (old, src_stage) = if i.fresh {
                 (vk::ImageLayout::UNDEFINED, vk::PipelineStageFlags2::NONE)
             } else {
                 // Earlier frames' reads must finish before the copy overwrites texels.
-                (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, shaders)
+                (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, SHADERS)
             };
             self.pre.push(
                 vk::ImageMemoryBarrier2::default()
@@ -723,18 +949,18 @@ impl UploadRing {
                     .old_layout(old)
                     .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .image(i.image)
-                    .subresource_range(range(i)),
+                    .subresource_range(whole(i)),
             );
             self.post.push(
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::COPY)
                     .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(shaders)
+                    .dst_stage_mask(SHADERS)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                     .image(i.image)
-                    .subresource_range(range(i)),
+                    .subresource_range(whole(i)),
             );
         }
         // Buffers are written only where no unfinished frame reads (upload_buffer's
@@ -745,7 +971,7 @@ impl UploadRing {
             .dst_stage_mask(
                 vk::PipelineStageFlags2::VERTEX_INPUT
                     | vk::PipelineStageFlags2::DRAW_INDIRECT
-                    | shaders,
+                    | SHADERS,
             )
             .dst_access_mask(
                 vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
@@ -759,6 +985,8 @@ impl UploadRing {
         } else {
             &buffers_after[..0]
         };
+        let cmd = ctx.cmd;
+        let gpu = &*self.gpu;
         // SAFETY: guaranteed by the caller; the staged bytes were written before this
         // frame's submit, which makes host writes visible to the device.
         unsafe {
@@ -769,33 +997,22 @@ impl UploadRing {
                 );
             }
             if graphics_buffers {
-                for_runs(&self.buffer_dsts, |dst, range| {
-                    d.cmd_copy_buffer(cmd, self.raw, dst, &self.buffer_regions[range]);
-                });
+                self.buffers.record(&gpu.device, cmd, self.raw);
             }
-            for_runs(&self.image_dsts, |dst, range| {
-                d.cmd_copy_buffer_to_image(
+            self.graphics_images.record(&gpu.device, cmd, self.raw);
+            if graphics_buffers || !self.post.is_empty() {
+                gpu.cmd_pipeline_barrier2(
                     cmd,
-                    self.raw,
-                    dst,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &self.image_regions[range],
+                    &vk::DependencyInfo::default()
+                        .memory_barriers(buffer_barriers)
+                        .image_memory_barriers(&self.post),
                 );
-            });
-            gpu.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default()
-                    .memory_barriers(buffer_barriers)
-                    .image_memory_barriers(&self.post),
-            );
+            }
         }
         if graphics_buffers {
-            self.buffer_dsts.clear();
-            self.buffer_regions.clear();
+            self.buffers.clear();
         }
-        self.image_dsts.clear();
-        self.image_regions.clear();
-        self.images.clear();
+        self.graphics_images.clear();
         self.staged = 0;
         self.ring.close(frame, transfer_bytes);
         Ok(())

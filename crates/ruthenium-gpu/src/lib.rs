@@ -32,7 +32,7 @@ pub use pipeline::{
 };
 pub use swapchain::{COLOR_RANGE, PresentPolicy};
 pub use textures::{
-    MAX_MIP_LEVELS, SAMPLER_COUNT, SamplerId, TextureDesc, TextureId, TextureTable,
+    Arrival, MAX_MIP_LEVELS, SAMPLER_COUNT, SamplerId, TextureDesc, TextureId, TextureTable,
 };
 pub use upload::{ImageDst, ImageRegion, UploadError, UploadRing, UploadTicket};
 pub use upload_check::{UploadCheck, UploadCheckReport};

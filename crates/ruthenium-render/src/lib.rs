@@ -13,9 +13,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ruthenium_gpu::{
-    COLOR_RANGE, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc, PUSH_CONSTANT_STAGES,
-    PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented, TextureDesc, TextureId,
-    TextureTable, UploadCheck, UploadCheckReport, UploadRing, Validation, vk,
+    Arrival, COLOR_RANGE, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
+    PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented,
+    TextureDesc, TextureId, TextureTable, UploadCheck, UploadCheckReport, UploadRing, Validation,
+    vk,
 };
 use ruthenium_platform::{Platform, Window};
 
@@ -111,9 +112,11 @@ impl Renderer {
             &mut uploads,
             TextureDesc::rgba8(starfield::SIZE, starfield::SIZE),
             &[&starfield::bake(starfield::SEED)],
+            // The first frame draws it.
+            Arrival::NextFrame,
         )?;
         eprintln!(
-            "[render] texture table: {} slots; upload ring {} MiB, {:.1} MiB per frame, buffer copies on the {}",
+            "[render] texture table: {} slots; upload ring {} MiB, {:.1} MiB per frame, buffer copies and background textures on the {}",
             textures.capacity(),
             uploads.capacity() >> 20,
             uploads.budget() as f64 / f64::from(1 << 20),
@@ -151,12 +154,16 @@ impl Renderer {
         Ok(())
     }
 
-    /// What the upload check has seen, if it is on; and how many frames' transfer copies
-    /// had to wait for a free command buffer.
-    pub fn upload_check(&self) -> Option<(UploadCheckReport, u64)> {
-        self.check
-            .as_ref()
-            .map(|c| (c.report(), self.uploads.deferred_transfers()))
+    /// What the upload check has seen, if it is on; how many frames' transfer copies had
+    /// to wait for a free command buffer; and how many images went on the transfer queue.
+    pub fn upload_check(&self) -> Option<(UploadCheckReport, u64, u64)> {
+        self.check.as_ref().map(|c| {
+            (
+                c.report(),
+                self.uploads.deferred_transfers(),
+                self.uploads.transferred_images(),
+            )
+        })
     }
 
     pub fn gpu(&self) -> &Arc<Gpu> {
@@ -194,14 +201,15 @@ impl Renderer {
         profiling::scope!("render");
         let (mut ctx, gpu_time) = self.frames.begin()?;
         let completed = self.frames.completed()?;
-        self.textures.begin_frame(ctx.slot(), ctx.number, completed);
         // SAFETY: ctx.cmd is recording frame ctx.number on the graphics queue; completed
         // was just read from the timeline; every upload destination is owned by self and
         // outlives the frame; the layout's set 0 is the texture table's.
         unsafe {
             self.uploads.record(&mut ctx, completed)?;
+            self.textures
+                .begin_frame(ctx.slot(), ctx.number, completed, &self.uploads);
             if let Some(c) = &mut self.check {
-                c.step(&mut self.uploads, &ctx, completed);
+                c.step(&mut self.uploads, &mut self.textures, &ctx, completed)?;
             }
             self.textures.bind(ctx.cmd, ctx.slot(), self.layout.raw());
         }
