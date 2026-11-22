@@ -12,10 +12,12 @@ use std::time::{Duration, Instant};
 
 use ruthenium_gpu::{GpuOptions, PresentPolicy, Presented, Validation};
 use ruthenium_platform::{DEFAULT_SIZE, Event, Platform, Sleeper, next_deadline};
-use ruthenium_render::{Background, FrameTimes, Renderer, Summary, create_gpu};
+use ruthenium_render::{Background, FrameTimes, OverlayStats, Renderer, Summary, create_gpu};
 
 /// SDL scancode of the V key: toggles VSync (development aid until options exist).
 const SCANCODE_V: u32 = 25;
+/// SDL scancode of F3: shows or hides the frame-stats overlay.
+const SCANCODE_F3: u32 = 60;
 /// Vanilla throttles a minimised window to 10 FPS (`FramerateLimitTracker.java:30`).
 const HIDDEN_FRAME: Duration = Duration::from_millis(100);
 /// Frames before this are start-up noise and left out of the run summary.
@@ -34,6 +36,8 @@ pub struct Options {
     pub validation: Validation,
     pub quit_after: Option<Duration>,
     pub stats: bool,
+    /// Start with the frame-stats overlay shown (F3 toggles it).
+    pub overlay: bool,
     /// Development: resize the window and toggle VSync every few frames, to exercise
     /// swapchain recreation (run it under validation).
     pub exercise_swapchain: bool,
@@ -60,6 +64,7 @@ impl Options {
             },
             quit_after: None,
             stats: false,
+            overlay: false,
             exercise_swapchain: false,
             pipeline_cache: true,
             no_transfer_queue: false,
@@ -92,6 +97,7 @@ impl Options {
                     o.quit_after = Some(Duration::from_secs_f64(s.max(0.0)));
                 }
                 "--stats" => o.stats = true,
+                "--overlay" => o.overlay = true,
                 "--exercise-swapchain" => o.exercise_swapchain = true,
                 "--no-pipeline-cache" => o.pipeline_cache = false,
                 "--no-transfer-queue" => o.no_transfer_queue = true,
@@ -161,7 +167,10 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             ruthenium_prepare::default_cache_dir(&ruthenium_prepare::discover::Env::from_process())
         })
         .flatten();
+    let gpu_name = gpu.caps().name.to_uppercase();
     let mut renderer = Renderer::new(gpu, window.pixel_size(), opts.policy, cache_dir.as_deref())?;
+    renderer.overlay_mut().set_visible(opts.overlay);
+    let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
         renderer.enable_upload_check()?;
     }
@@ -183,6 +192,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut occluded = false;
     let mut resized = None;
     let mut toggle_vsync = false;
+    let mut toggle_overlay = false;
     let mut frames: u64 = 0;
 
     loop {
@@ -214,6 +224,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 repeat: false,
                 ..
             } => toggle_vsync = true,
+            Event::Key {
+                scancode: SCANCODE_F3,
+                down: true,
+                repeat: false,
+                ..
+            } => toggle_overlay = true,
             _ => {}
         });
         if quit {
@@ -221,6 +237,10 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         }
         if let Some(size) = resized.take() {
             renderer.frames_mut().resize(size);
+        }
+        if std::mem::take(&mut toggle_overlay) {
+            let o = renderer.overlay_mut();
+            o.set_visible(!o.visible());
         }
         if std::mem::take(&mut toggle_vsync) {
             let next = match renderer.frames().policy() {
@@ -268,6 +288,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             if let Some(prev) = last_present {
                 let ns = (now - prev).as_nanos() as u64;
                 interval.push(ns);
+                renderer.overlay_mut().push_frame(ns as f32 / 1e6);
                 if started.elapsed() > WARMUP + first_frame.unwrap_or_default() {
                     run_interval.push(ns);
                 }
@@ -279,13 +300,29 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             gpu_times.push(g.nanos);
         }
 
-        if opts.stats && now - last_report >= Duration::from_secs(1) {
-            print_line(
-                &interval.summary(),
-                &cpu.summary(),
-                &gpu_times.summary(),
-                renderer.frames().present_mode(),
-            );
+        if now - last_report >= Duration::from_secs(1) {
+            let (f, c, g) = (interval.summary(), cpu.summary(), gpu_times.summary());
+            let mode = renderer.frames().present_mode();
+            if opts.stats {
+                print_line(&f, &c, &g, mode);
+            }
+            if renderer.overlay_mut().visible() && f.samples > 0 {
+                use std::fmt::Write as _;
+                mode_name.clear();
+                let _ = write!(mode_name, "{:?}", mode.unwrap_or_default());
+                renderer.overlay_mut().set_stats(&OverlayStats {
+                    fps: f.fps(),
+                    low_1: f.low_1_percent_fps(),
+                    low_01: f.low_01_percent_fps(),
+                    frame_ms: f.p50_ms,
+                    cpu_ms: c.p50_ms,
+                    gpu_ms: g.p50_ms,
+                    p999_over_median: f.p999_ms / f.p50_ms,
+                    max_ms: f.max_ms,
+                    present: &mode_name,
+                    gpu: &gpu_name,
+                });
+            }
             interval.clear();
             cpu.clear();
             gpu_times.clear();

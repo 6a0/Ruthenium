@@ -2,10 +2,12 @@
 //! ring and texture table, and a frame that draws the menu background, recorded and
 //! presented through [`ruthenium_gpu::FrameLoop`].
 
+mod overlay;
 mod pipelines;
 mod starfield;
 mod stats;
 
+pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
 pub use stats::{FrameTimes, Summary};
 
@@ -13,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ruthenium_gpu::{
-    Arrival, COLOR_RANGE, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
+    Arrival, COLOR_RANGE, FrameData, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
     PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented,
     TextureDesc, TextureId, TextureTable, UploadCheck, UploadCheckReport, UploadRing, Validation,
     vk,
@@ -74,6 +76,8 @@ const UPLOAD_RING_BYTES: u64 = 16 << 20;
 /// with the CPU. One larger upload still goes, alone in its frame.
 const UPLOAD_BUDGET_DISCRETE: u64 = 4 << 20;
 const UPLOAD_BUDGET_INTEGRATED: u64 = 3 << 19;
+/// Per-frame data each frame may write (GUI and overlay rectangles for now).
+const FRAME_DATA_BYTES: u64 = 1 << 20;
 
 /// Draws frames into the window.
 #[derive(Debug)]
@@ -85,6 +89,8 @@ pub struct Renderer {
     layout: PipelineLayout,
     textures: TextureTable,
     uploads: UploadRing,
+    frame_data: FrameData,
+    overlay: Overlay,
     cache: PipelineCache,
     stars: TextureId,
     /// `--exercise-uploads`.
@@ -125,7 +131,8 @@ impl Renderer {
                 None => "graphics queue".to_owned(),
             }
         );
-        let layout = PipelineLayout::new(gpu.clone(), &[textures.layout()])?;
+        let frame_data = FrameData::new(gpu.clone(), FRAME_DATA_BYTES)?;
+        let layout = PipelineLayout::new(gpu.clone(), &[textures.layout(), frame_data.layout()])?;
         let mut cache = PipelineCache::open(gpu.clone(), cache_dir)?;
         let pipelines = Pipelines::build(
             gpu,
@@ -140,6 +147,8 @@ impl Renderer {
             layout,
             textures,
             uploads,
+            frame_data,
+            overlay: Overlay::new(),
             cache,
             stars,
             check: None,
@@ -166,6 +175,11 @@ impl Renderer {
                 self.uploads.transferred_images(),
             )
         })
+    }
+
+    /// The development overlay (hidden until `set_visible`).
+    pub fn overlay_mut(&mut self) -> &mut Overlay {
+        &mut self.overlay
     }
 
     pub fn gpu(&self) -> &Arc<Gpu> {
@@ -215,6 +229,8 @@ impl Renderer {
                 c.step(&mut self.uploads, &mut self.textures, &ctx, completed)?;
             }
             self.textures.bind(ctx.cmd, ctx.slot(), self.layout.raw());
+            self.frame_data.begin_frame(ctx.slot());
+            self.frame_data.bind(ctx.cmd, self.layout.raw());
             // First frame (and after a rebuild): draw once with every pipeline.
             self.pipelines.record_warm_up(ctx.cmd, &self.layout)?;
         }
@@ -287,6 +303,25 @@ impl Renderer {
                 d.cmd_set_scissor(cmd, 0, &[area]);
                 d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
                 d.cmd_draw(cmd, 3, 1, 0, 0);
+                let rects = self.overlay.build(t.extent.width, t.extent.height);
+                if let Some((first, bytes)) = self
+                    .frame_data
+                    .alloc(rects.len() as u32, overlay::RECT_BYTES)
+                    && !rects.is_empty()
+                {
+                    overlay::write_rects(rects, bytes);
+                    let mut push = [0u8; 12];
+                    push[0..4].copy_from_slice(&(t.extent.width as f32).to_ne_bytes());
+                    push[4..8].copy_from_slice(&(t.extent.height as f32).to_ne_bytes());
+                    push[8..12].copy_from_slice(&first.to_ne_bytes());
+                    d.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.get(PipelineId::Overlay.index()),
+                    );
+                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
+                    d.cmd_draw(cmd, 6, rects.len() as u32, 0, 0);
+                }
                 gpu.cmd_end_rendering(cmd);
                 gpu.cmd_pipeline_barrier2(
                     cmd,

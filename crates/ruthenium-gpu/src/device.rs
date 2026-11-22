@@ -63,6 +63,8 @@ pub struct DeviceCaps {
     pub max_memory_allocations: u32,
     /// `optimalBufferCopyOffsetAlignment`: staging offsets are aligned to it.
     pub copy_offset_alignment: u64,
+    /// `minStorageBufferOffsetAlignment`: per-frame data regions are aligned to it.
+    pub storage_offset_alignment: u64,
     /// A queue family with transfer but no graphics, compute or video, for background
     /// uploads (whether it is used: [`Gpu::transfer_family`]).
     pub transfer_family: Option<u32>,
@@ -574,6 +576,7 @@ fn evaluate(
         max_image_dimension_2d: props.limits.max_image_dimension2_d,
         max_memory_allocations: props.limits.max_memory_allocation_count,
         copy_offset_alignment: props.limits.optimal_buffer_copy_offset_alignment,
+        storage_offset_alignment: props.limits.min_storage_buffer_offset_alignment,
         transfer_family,
         portability_subset,
         present_id: has(ash::khr::present_id::NAME),

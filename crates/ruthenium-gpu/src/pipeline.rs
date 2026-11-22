@@ -310,9 +310,9 @@ impl Pipelines {
     /// nothing.
     ///
     /// # Safety
-    /// `cmd` is recording a frame on the graphics queue, outside a render pass, with the
-    /// texture table bound at set 0 of `layout` (the layout these pipelines were built
-    /// with) and its missing texture ready.
+    /// `cmd` is recording a frame on the graphics queue, outside a render pass, with every
+    /// descriptor set of `layout` (the layout these pipelines were built with) bound: the
+    /// texture table, with its missing texture ready, and the frame's data.
     pub unsafe fn record_warm_up(
         &mut self,
         cmd: vk::CommandBuffer,

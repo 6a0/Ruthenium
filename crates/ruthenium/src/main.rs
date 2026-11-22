@@ -23,13 +23,14 @@ With no command, opens the game window. Options:
                          Vulkan validation layer (default: on in debug builds if
                          installed; RUTHENIUM_VALIDATION=1 requires it)
   --stats                print frame-time statistics every second
+  --overlay              start with the frame-stats overlay shown (F3 toggles it)
   --quit-after <s>       close after <s> seconds (for benchmarks and tests)
   --exercise-swapchain   resize and toggle VSync every few frames (development)
   --no-pipeline-cache    don't load or save the pipeline cache
   --no-transfer-queue    upload on the graphics queue even if there is a copy queue
   --exercise-uploads     check data pushed through the upload ring every frame
                          (development; a mismatch fails the run)
-In the window, V toggles VSync.
+In the window, V toggles VSync and F3 the frame-stats overlay.
 
 commands:
   version

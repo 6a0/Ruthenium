@@ -180,11 +180,21 @@ fn generated_rs(sources: &[String]) -> String {
         );
     }
     s += "\n/// Every shader, in file-name order.\npub static ALL: &[&Spirv] = &[";
-    s += &sources
+    let items: Vec<String> = sources
         .iter()
         .map(|n| format!("&{}", const_name(n)))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+    // Laid out as rustfmt does (`array_width` is 60 at the default width of 100), so
+    // `cargo fmt --check` and `--check` here agree on the committed file.
+    let one_line = items.join(", ");
+    if one_line.len() <= 60 {
+        s += &one_line;
+    } else {
+        s += "\n";
+        for item in &items {
+            s += &format!("    {item},\n");
+        }
+    }
     s += "];\n";
     s
 }

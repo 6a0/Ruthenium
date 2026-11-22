@@ -11,6 +11,7 @@
 
 mod device;
 mod frame;
+mod frame_data;
 mod instance;
 mod memory;
 mod pipeline;
@@ -24,6 +25,7 @@ pub use device::{DeviceCaps, Gpu, GpuOptions, Rejected};
 pub use frame::{
     FrameCtx, FrameLoop, GpuTime, MAX_FRAME_WAITS, MAX_FRAMES_IN_FLIGHT, Presented, Target,
 };
+pub use frame_data::{FRAME_DATA_SET, FrameData};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};
 pub use memory::texel_bytes;
 pub use pipeline::{

@@ -9,10 +9,12 @@ use ruthenium_shaders as shaders;
 pub enum PipelineId {
     /// Full-screen gradient behind the menus.
     Background,
+    /// The development overlay's rectangles.
+    Overlay,
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 1] = [PipelineId::Background];
+    pub const ALL: [PipelineId; 2] = [PipelineId::Background, PipelineId::Overlay];
 
     pub fn index(self) -> usize {
         self as usize
@@ -26,6 +28,13 @@ impl PipelineId {
                 fragment: shaders::BACKGROUND_FRAG.words(),
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 blend: Blend::Opaque,
+            },
+            PipelineId::Overlay => GraphicsDesc {
+                name: "overlay",
+                vertex: shaders::OVERLAY_VERT.words(),
+                fragment: shaders::OVERLAY_FRAG.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                blend: Blend::Alpha,
             },
         }
     }
@@ -78,6 +87,11 @@ mod tests {
         assert_eq!(
             define(glsl, "TEXTURE_MISSING"),
             Some(ruthenium_gpu::TextureId::MISSING.index())
+        );
+        let frame = include_str!("../../ruthenium-shaders/glsl/include/frame.glsl");
+        assert_eq!(
+            define(frame, "FRAME_DATA_SET"),
+            Some(ruthenium_gpu::FRAME_DATA_SET)
         );
         let push = include_str!("../../ruthenium-shaders/glsl/include/push.glsl");
         assert_eq!(

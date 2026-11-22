@@ -10,5 +10,16 @@ pub static BACKGROUND_FRAG: Spirv = crate::spirv!("background.frag");
 /// `glsl/background.vert`
 pub static BACKGROUND_VERT: Spirv = crate::spirv!("background.vert");
 
+/// `glsl/overlay.frag`
+pub static OVERLAY_FRAG: Spirv = crate::spirv!("overlay.frag");
+
+/// `glsl/overlay.vert`
+pub static OVERLAY_VERT: Spirv = crate::spirv!("overlay.vert");
+
 /// Every shader, in file-name order.
-pub static ALL: &[&Spirv] = &[&BACKGROUND_FRAG, &BACKGROUND_VERT];
+pub static ALL: &[&Spirv] = &[
+    &BACKGROUND_FRAG,
+    &BACKGROUND_VERT,
+    &OVERLAY_FRAG,
+    &OVERLAY_VERT,
+];

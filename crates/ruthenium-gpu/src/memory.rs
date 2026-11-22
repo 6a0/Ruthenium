@@ -25,6 +25,9 @@ pub(crate) enum MemoryUse {
     Upload,
     /// Written by GPU copies and read by the CPU (readback, checks).
     Readback,
+    /// Written by the CPU every frame, sequentially, and read by shaders: device-local
+    /// host-visible memory (the BAR window on discrete GPUs) if there is any.
+    Dynamic,
 }
 
 impl MemoryUse {
@@ -48,6 +51,11 @@ impl MemoryUse {
                 F::HOST_VISIBLE | F::HOST_COHERENT,
                 F::HOST_CACHED,
                 F::DEVICE_LOCAL,
+            ),
+            MemoryUse::Dynamic => (
+                F::HOST_VISIBLE | F::HOST_COHERENT,
+                F::DEVICE_LOCAL,
+                F::HOST_CACHED,
             ),
         }
     }
@@ -421,6 +429,7 @@ mod tests {
         assert_eq!(ranked(&p, !0, MemoryUse::GpuOnly)[0], 1);
         assert_eq!(ranked(&p, !0, MemoryUse::Upload), vec![2, 3, 4]);
         assert_eq!(ranked(&p, !0, MemoryUse::Readback), vec![3, 2, 4]);
+        assert_eq!(ranked(&p, !0, MemoryUse::Dynamic), vec![4, 2, 3]);
     }
 
     #[test]
