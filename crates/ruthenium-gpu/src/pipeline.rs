@@ -166,10 +166,53 @@ pub struct GraphicsDesc {
     pub blend: Blend,
 }
 
-/// The shared pipeline layout and every pipeline, built for one colour format.
+/// The one pipeline layout every pipeline uses: the descriptor sets (set 0 is the texture
+/// table) and the push-constant range. Created once and never rebuilt, so descriptor sets
+/// bound in a frame stay valid when the pipelines are rebuilt.
+pub struct PipelineLayout {
+    gpu: Arc<Gpu>,
+    raw: vk::PipelineLayout,
+}
+
+impl std::fmt::Debug for PipelineLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineLayout").finish_non_exhaustive()
+    }
+}
+
+impl PipelineLayout {
+    pub fn new(
+        gpu: Arc<Gpu>,
+        set_layouts: &[vk::DescriptorSetLayout],
+    ) -> Result<PipelineLayout, Error> {
+        let ranges = [vk::PushConstantRange::default()
+            .stage_flags(PUSH_CONSTANT_STAGES)
+            .size(PUSH_CONSTANT_BYTES)];
+        let info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(set_layouts)
+            .push_constant_ranges(&ranges);
+        // SAFETY: plain object creation; destroyed in Drop.
+        let raw = unsafe { gpu.device.create_pipeline_layout(&info, None) }
+            .ctx("vkCreatePipelineLayout")?;
+        Ok(PipelineLayout { gpu, raw })
+    }
+
+    pub fn raw(&self) -> vk::PipelineLayout {
+        self.raw
+    }
+}
+
+impl Drop for PipelineLayout {
+    fn drop(&mut self) {
+        // SAFETY: the owner drops the layout after the pipelines built with it and once no
+        // frame that bound it is pending (the frame loop waits in its Drop).
+        unsafe { self.gpu.device.destroy_pipeline_layout(self.raw, None) };
+    }
+}
+
+/// Every pipeline, built for one colour format with the shared layout.
 pub struct Pipelines {
     gpu: Arc<Gpu>,
-    layout: vk::PipelineLayout,
     pipelines: Vec<vk::Pipeline>,
     format: vk::Format,
 }
@@ -184,25 +227,19 @@ impl std::fmt::Debug for Pipelines {
 }
 
 impl Pipelines {
-    /// Builds every pipeline in `descs` (index = id) for `format`, in parallel, through
-    /// `cache`; then saves the cache if it grew.
+    /// Builds every pipeline in `descs` (index = id) for `format` with `layout`, in
+    /// parallel, through `cache`; then saves the cache if it grew.
     pub fn build(
         gpu: Arc<Gpu>,
         cache: &mut PipelineCache,
+        layout: &PipelineLayout,
         descs: &[GraphicsDesc],
         format: vk::Format,
     ) -> Result<Pipelines, Error> {
         let started = Instant::now();
-        let ranges = [vk::PushConstantRange::default()
-            .stage_flags(PUSH_CONSTANT_STAGES)
-            .size(PUSH_CONSTANT_BYTES)];
-        let info = vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&ranges);
-        // SAFETY: plain object creation; destroyed in Drop.
-        let layout = unsafe { gpu.device.create_pipeline_layout(&info, None) }
-            .ctx("vkCreatePipelineLayout")?;
+        let layout = layout.raw;
         let mut set = Pipelines {
             gpu,
-            layout,
             pipelines: Vec::with_capacity(descs.len()),
             format,
         };
@@ -250,10 +287,6 @@ impl Pipelines {
         self.pipelines[index]
     }
 
-    pub fn layout(&self) -> vk::PipelineLayout {
-        self.layout
-    }
-
     pub fn format(&self) -> vk::Format {
         self.format
     }
@@ -270,7 +303,6 @@ impl Drop for Pipelines {
                     d.destroy_pipeline(p, None);
                 }
             }
-            d.destroy_pipeline_layout(self.layout, None);
         }
     }
 }

@@ -54,4 +54,35 @@ mod tests {
             shaders::PUSH_CONSTANT_BYTES
         );
     }
+
+    /// The value of `#define name value` in a GLSL source.
+    fn define(source: &str, name: &str) -> Option<u32> {
+        source.lines().find_map(|l| {
+            let mut words = l.split_whitespace();
+            (words.next() == Some("#define") && words.next() == Some(name))
+                .then(|| words.next()?.parse().ok())
+                .flatten()
+        })
+    }
+
+    #[test]
+    fn texture_table_indices_agree_with_glsl() {
+        let glsl = include_str!("../../ruthenium-shaders/glsl/include/textures.glsl");
+        assert_eq!(
+            define(glsl, "SAMPLER_COUNT"),
+            Some(ruthenium_gpu::SAMPLER_COUNT)
+        );
+        for s in ruthenium_gpu::SamplerId::ALL {
+            assert_eq!(define(glsl, s.glsl_name()), Some(s.index()), "{s:?}");
+        }
+        assert_eq!(
+            define(glsl, "TEXTURE_MISSING"),
+            Some(ruthenium_gpu::TextureId::MISSING.index())
+        );
+        let push = include_str!("../../ruthenium-shaders/glsl/include/push.glsl");
+        assert_eq!(
+            define(push, "PUSH_CONSTANT_BYTES"),
+            Some(ruthenium_gpu::PUSH_CONSTANT_BYTES)
+        );
+    }
 }

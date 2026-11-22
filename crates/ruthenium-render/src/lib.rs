@@ -1,8 +1,9 @@
-//! Ruthenium's renderer. For now: GPU start-up for a window, the pipeline set, and a frame
-//! that draws the menu background, recorded and presented through
-//! [`ruthenium_gpu::FrameLoop`].
+//! Ruthenium's renderer. For now: GPU start-up for a window, the pipeline set, the upload
+//! ring and texture table, and a frame that draws the menu background, recorded and
+//! presented through [`ruthenium_gpu::FrameLoop`].
 
 mod pipelines;
+mod starfield;
 mod stats;
 
 pub use pipelines::PipelineId;
@@ -13,7 +14,8 @@ use std::sync::Arc;
 
 use ruthenium_gpu::{
     COLOR_RANGE, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc, PUSH_CONSTANT_STAGES,
-    PipelineCache, Pipelines, PresentPolicy, Presented, Validation, vk,
+    PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented, TextureDesc, TextureId,
+    TextureTable, UploadRing, Validation, vk,
 };
 use ruthenium_platform::{Platform, Window};
 
@@ -54,23 +56,36 @@ pub struct Background {
 }
 
 impl Background {
-    fn push_constants(&self) -> [u8; 32] {
-        let mut b = [0u8; 32];
+    /// `background.frag`'s push constants: the two colours, then the starfield texture.
+    fn push_constants(&self, stars: TextureId) -> [u8; 36] {
+        let mut b = [0u8; 36];
         for (i, v) in self.top.iter().chain(&self.bottom).enumerate() {
             b[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
         }
+        b[32..].copy_from_slice(&stars.index().to_ne_bytes());
         b
     }
 }
 
+/// Staging ring size (research 04 §4.3: 8 MiB on the lowest tier, 16 MiB by default).
+const UPLOAD_RING_BYTES: u64 = 16 << 20;
+/// Bytes one frame may upload: less on integrated GPUs, which share memory bandwidth
+/// with the CPU. One larger upload still goes, alone in its frame.
+const UPLOAD_BUDGET_DISCRETE: u64 = 4 << 20;
+const UPLOAD_BUDGET_INTEGRATED: u64 = 3 << 19;
+
 /// Draws frames into the window.
 #[derive(Debug)]
 pub struct Renderer {
-    // Fields drop in order: the frame loop first (its Drop waits for the GPU), then the
-    // pipelines it used, then the cache, which saves itself as it goes.
+    // Fields drop in order: the frame loop first (its Drop waits for the GPU), then what
+    // its frames used, then the cache, which saves itself as it goes.
     frames: FrameLoop,
     pipelines: Pipelines,
+    layout: PipelineLayout,
+    textures: TextureTable,
+    uploads: UploadRing,
     cache: PipelineCache,
+    stars: TextureId,
 }
 
 impl Renderer {
@@ -83,13 +98,41 @@ impl Renderer {
         cache_dir: Option<&Path>,
     ) -> Result<Renderer, ruthenium_gpu::Error> {
         let frames = FrameLoop::new(gpu.clone(), pixel_size, policy)?;
+        let budget = if gpu.caps().unified_memory {
+            UPLOAD_BUDGET_INTEGRATED
+        } else {
+            UPLOAD_BUDGET_DISCRETE
+        };
+        let mut uploads = UploadRing::new(gpu.clone(), UPLOAD_RING_BYTES, budget)?;
+        let mut textures = TextureTable::new(gpu.clone(), &mut uploads)?;
+        let stars = textures.create_with(
+            &mut uploads,
+            TextureDesc::rgba8(starfield::SIZE, starfield::SIZE),
+            &[&starfield::bake(starfield::SEED)],
+        )?;
+        eprintln!(
+            "[render] texture table: {} slots; upload ring {} MiB, {:.1} MiB per frame",
+            textures.capacity(),
+            uploads.capacity() >> 20,
+            uploads.budget() as f64 / f64::from(1 << 20)
+        );
+        let layout = PipelineLayout::new(gpu.clone(), &[textures.layout()])?;
         let mut cache = PipelineCache::open(gpu.clone(), cache_dir)?;
-        let pipelines =
-            Pipelines::build(gpu, &mut cache, &pipelines::descs(), frames.color_format()?)?;
+        let pipelines = Pipelines::build(
+            gpu,
+            &mut cache,
+            &layout,
+            &pipelines::descs(),
+            frames.color_format()?,
+        )?;
         Ok(Renderer {
             frames,
             pipelines,
+            layout,
+            textures,
+            uploads,
             cache,
+            stars,
         })
     }
 
@@ -113,7 +156,13 @@ impl Renderer {
         }
         self.frames.wait_for_gpu(1)?;
         let gpu = self.frames.gpu().clone();
-        self.pipelines = Pipelines::build(gpu, &mut self.cache, &pipelines::descs(), format)?;
+        self.pipelines = Pipelines::build(
+            gpu,
+            &mut self.cache,
+            &self.layout,
+            &pipelines::descs(),
+            format,
+        )?;
         Ok(())
     }
 
@@ -121,6 +170,15 @@ impl Renderer {
     pub fn render(&mut self, background: &Background) -> Result<FrameReport, ruthenium_gpu::Error> {
         profiling::scope!("render");
         let (ctx, gpu_time) = self.frames.begin()?;
+        let completed = self.frames.completed()?;
+        self.textures.begin_frame(ctx.slot(), ctx.number, completed);
+        // SAFETY: ctx.cmd is recording frame ctx.number on the graphics queue; completed
+        // was just read from the timeline; every upload destination is owned by self and
+        // outlives the frame; the layout's set 0 is the texture table's.
+        unsafe {
+            self.uploads.record(ctx.cmd, ctx.number, completed);
+            self.textures.bind(ctx.cmd, ctx.slot(), self.layout.raw());
+        }
         // Off-screen passes will be recorded here, before the late acquire.
         let target = self.frames.acquire(&ctx)?;
         if let Some(t) = target {
@@ -167,7 +225,7 @@ impl Renderer {
                 min_depth: 0.0,
                 max_depth: 1.0,
             };
-            let push = background.push_constants();
+            let push = background.push_constants(self.stars);
             let d = gpu.device();
             // SAFETY: cmd is recording; the image was acquired this frame and its acquire
             // semaphore is waited at COLOR_ATTACHMENT_OUTPUT, the first barrier's source stage;
@@ -185,7 +243,7 @@ impl Renderer {
                 );
                 d.cmd_set_viewport(cmd, 0, &[viewport]);
                 d.cmd_set_scissor(cmd, 0, &[area]);
-                d.cmd_push_constants(cmd, self.pipelines.layout(), PUSH_CONSTANT_STAGES, 0, &push);
+                d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
                 d.cmd_draw(cmd, 3, 1, 0, 0);
                 gpu.cmd_end_rendering(cmd);
                 gpu.cmd_pipeline_barrier2(

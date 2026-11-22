@@ -49,6 +49,15 @@ pub struct FrameCtx {
     slot: usize,
 }
 
+impl FrameCtx {
+    /// Which frame-in-flight slot this frame uses (`number % MAX_FRAMES_IN_FLIGHT`).
+    /// Per-slot objects, such as the texture table's descriptor sets, are free to update:
+    /// the slot's previous frame has finished.
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+}
+
 /// The acquired swapchain image to draw into this frame. Its layout is UNDEFINED; the
 /// frame must leave it in PRESENT_SRC_KHR.
 #[derive(Clone, Copy, Debug)]

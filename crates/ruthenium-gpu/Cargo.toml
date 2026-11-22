@@ -1,6 +1,6 @@
 [package]
 name = "ruthenium-gpu"
-description = "Ruthenium's Vulkan layer: instance, device selection, swapchain, frame loop"
+description = "Ruthenium's Vulkan layer: device selection, swapchain, frame loop, memory, upload ring, texture table, pipelines"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -12,17 +12,26 @@
 mod device;
 mod frame;
 mod instance;
+mod memory;
 mod pipeline;
 mod swapchain;
+mod textures;
+mod upload;
 
 pub use ash::vk;
 pub use device::{DeviceCaps, Gpu, GpuOptions, Rejected};
 pub use frame::{FrameCtx, FrameLoop, GpuTime, MAX_FRAMES_IN_FLIGHT, Presented, Target};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};
+pub use memory::texel_bytes;
 pub use pipeline::{
-    Blend, GraphicsDesc, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache, Pipelines,
+    Blend, GraphicsDesc, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout,
+    Pipelines,
 };
 pub use swapchain::{COLOR_RANGE, PresentPolicy};
+pub use textures::{
+    MAX_MIP_LEVELS, SAMPLER_COUNT, SamplerId, TextureDesc, TextureId, TextureTable,
+};
+pub use upload::{ImageDst, ImageRegion, UploadError, UploadRing};
 
 use std::fmt;
 
@@ -38,6 +47,8 @@ pub enum Error {
     Unsupported(String),
     /// No GPU meets the baseline; one entry per GPU with its reasons.
     NoSuitableDevice(Vec<Rejected>),
+    /// Data could not be staged for upload.
+    Upload(UploadError),
 }
 
 impl fmt::Display for Error {
@@ -45,6 +56,7 @@ impl fmt::Display for Error {
         match self {
             Error::Vk { call, result } => write!(f, "{call} failed: {result}"),
             Error::Unsupported(why) => f.write_str(why),
+            Error::Upload(e) => e.fmt(f),
             Error::NoSuitableDevice(rejected) if rejected.is_empty() => {
                 f.write_str("no Vulkan GPU found; update your graphics driver")
             }
@@ -63,6 +75,12 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<UploadError> for Error {
+    fn from(e: UploadError) -> Error {
+        Error::Upload(e)
+    }
+}
 
 /// Attaches the call name to a Vulkan result.
 pub(crate) trait VkContext<T> {

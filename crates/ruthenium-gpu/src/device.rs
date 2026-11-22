@@ -1,4 +1,5 @@
 use std::ffi::{CStr, c_char};
+use std::sync::atomic::AtomicU32;
 
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -8,6 +9,15 @@ use crate::{Error, VkContext};
 
 /// Provisional in the registry, so ash only has it behind a feature; it is just a name here.
 const PORTABILITY_SUBSET: &CStr = c"VK_KHR_portability_subset";
+
+/// Texture-table slots Ruthenium asks for; fewer if the device's descriptor limits are lower.
+const WANTED_TEXTURE_SLOTS: u32 = 16_384;
+/// Below this many bindless textures a GPU is rejected. Every descriptor-indexing driver
+/// we know of reports far more (hundreds of thousands).
+const MIN_TEXTURE_SLOTS: u32 = 1_024;
+/// Descriptors of the texture table's set that are not sampled images (its samplers), kept
+/// out of the per-stage resource limit.
+const NON_TEXTURE_DESCRIPTORS: u32 = 16;
 
 /// How to pick among several GPUs.
 #[derive(Clone, Debug, Default)]
@@ -42,6 +52,14 @@ pub struct DeviceCaps {
     pub timestamps: bool,
     /// All device-local memory is also host-visible (integrated GPUs, Apple, ARM).
     pub unified_memory: bool,
+    /// Slots in the shared texture table: what Ruthenium wants, capped by the
+    /// update-after-bind descriptor limits.
+    pub texture_slots: u32,
+    pub max_image_dimension_2d: u32,
+    /// `maxMemoryAllocationCount` (often 4096 on Windows).
+    pub max_memory_allocations: u32,
+    /// `optimalBufferCopyOffsetAlignment`: staging offsets are aligned to it.
+    pub copy_offset_alignment: u64,
     /// A queue family with transfer but no graphics, for background uploads.
     pub transfer_family: Option<u32>,
     pub portability_subset: bool,
@@ -69,6 +87,9 @@ pub struct Gpu {
     pub(crate) queue: vk::Queue,
     pub(crate) queue_family: u32,
     pub(crate) surface: vk::SurfaceKHR,
+    pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
+    /// Live `vkAllocateMemory` allocations, kept under `maxMemoryAllocationCount`.
+    pub(crate) allocations: AtomicU32,
     caps: DeviceCaps,
     pub(crate) instance: Instance,
 }
@@ -90,6 +111,7 @@ unsafe impl Sync for Gpu {}
 struct Candidate {
     physical: vk::PhysicalDevice,
     queue_family: u32,
+    memory_properties: vk::PhysicalDeviceMemoryProperties,
     caps: DeviceCaps,
     /// Extensions to enable (all checked to be present).
     extensions: Vec<&'static CStr>,
@@ -232,6 +254,8 @@ impl Gpu {
             queue,
             queue_family: c.queue_family,
             surface,
+            memory_properties: c.memory_properties,
+            allocations: AtomicU32::new(0),
             caps: c.caps,
             instance,
         }
@@ -381,7 +405,10 @@ fn evaluate(
 ) -> Result<Candidate, Rejected> {
     let raw = &instance.raw;
     let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
-    let mut props2 = vk::PhysicalDeviceProperties2::default().push(&mut driver_props);
+    let mut indexing = vk::PhysicalDeviceDescriptorIndexingProperties::default();
+    let mut props2 = vk::PhysicalDeviceProperties2::default()
+        .push(&mut driver_props)
+        .push(&mut indexing);
     // SAFETY: the instance is at least 1.2 (checked at creation); the chain is valid.
     unsafe { raw.get_physical_device_properties2(pd, &mut props2) };
     let props = props2.properties;
@@ -431,6 +458,12 @@ fn evaluate(
         if !check(&features) {
             reasons.push(format!("no {feature}"));
         }
+    }
+    let texture_slots = texture_slots(&indexing);
+    if texture_slots < MIN_TEXTURE_SLOTS {
+        reasons.push(format!(
+            "only {texture_slots} bindless textures (needs {MIN_TEXTURE_SLOTS})"
+        ));
     }
 
     // A queue family that does graphics and compute and can present to our surface.
@@ -500,6 +533,10 @@ fn evaluate(
         timestamp_period_ns: props.limits.timestamp_period,
         timestamps: families[queue_family as usize].timestamp_valid_bits > 0,
         unified_memory,
+        texture_slots,
+        max_image_dimension_2d: props.limits.max_image_dimension2_d,
+        max_memory_allocations: props.limits.max_memory_allocation_count,
+        copy_offset_alignment: props.limits.optimal_buffer_copy_offset_alignment,
         transfer_family,
         portability_subset,
         present_id: has(ash::khr::present_id::NAME),
@@ -518,10 +555,22 @@ fn evaluate(
     Ok(Candidate {
         physical: pd,
         queue_family,
+        memory_properties: memory,
         caps,
         extensions,
         core13,
     })
+}
+
+/// Slots the texture table can have under the device's update-after-bind limits.
+fn texture_slots(p: &vk::PhysicalDeviceDescriptorIndexingProperties<'_>) -> u32 {
+    WANTED_TEXTURE_SLOTS
+        .min(p.max_per_stage_descriptor_update_after_bind_sampled_images)
+        .min(p.max_descriptor_set_update_after_bind_sampled_images)
+        .min(
+            p.max_per_stage_update_after_bind_resources
+                .saturating_sub(NON_TEXTURE_DESCRIPTORS),
+        )
 }
 
 fn query_features(
@@ -638,6 +687,7 @@ mod tests {
         Candidate {
             physical: vk::PhysicalDevice::null(),
             queue_family: 0,
+            memory_properties: vk::PhysicalDeviceMemoryProperties::default(),
             caps: DeviceCaps {
                 name: name.into(),
                 device_type,
