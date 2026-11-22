@@ -5,7 +5,8 @@
 //! 2. Xbox Live user token, then XSTS for the Minecraft services ([`xbox`]).
 //! 3. Minecraft services ([`minecraft`]): access token, then the Java profile, which is
 //!    required (no profile, no play: Ruthenium has no offline mode), and the player's
-//!    privileges, which can turn Multiplayer off.
+//!    privileges, which can turn Multiplayer off. Without a profile, the store
+//!    entitlements say whether the account owns the game but hasn't picked a name yet.
 //!
 //! Ruthenium signs in as its own Azure app, [`CLIENT_ID`]. Until Mojang approves that app
 //! for the Minecraft API, step 3 answers 403: [`AuthError::NotApproved`].
@@ -19,6 +20,7 @@ pub mod pkce;
 pub mod store;
 pub mod xbox;
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
@@ -55,6 +57,8 @@ pub enum AuthError {
     NotApproved,
     /// The account doesn't own Minecraft: Java Edition (no profile).
     NoProfile,
+    /// The account owns Java Edition but has no profile yet (no name chosen).
+    NoProfileName,
     Mojang(u16, String),
     Keystore(String),
     BadResponse(String),
@@ -76,6 +80,9 @@ impl std::fmt::Display for AuthError {
             AuthError::NoProfile => {
                 f.write_str("this account doesn't own Minecraft: Java Edition (it has no Java profile)")
             }
+            AuthError::NoProfileName => f.write_str(
+                "this account owns Minecraft: Java Edition but has no profile yet: choose a name at minecraft.net or in the official launcher",
+            ),
             AuthError::Mojang(s, e) => write!(f, "Minecraft services error (HTTP {s}): {e}"),
             AuthError::Keystore(e) => write!(f, "couldn't use the credential store: {e}"),
             AuthError::BadResponse(e) => write!(f, "unexpected answer from the sign-in service: {e}"),
@@ -123,6 +130,7 @@ pub struct Auth {
     http: Box<dyn Http>,
     client_id: String,
     endpoints: Option<Endpoints>,
+    discovery_cache: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Auth {
@@ -144,12 +152,24 @@ impl Auth {
             http,
             client_id: client_id.to_owned(),
             endpoints: None,
+            discovery_cache: None,
         }
     }
 
+    /// Keeps the services' discovery document in the file `path` (see
+    /// [`Endpoints::discover_cached`]).
+    pub fn with_discovery_cache(mut self, path: &Path) -> Auth {
+        self.discovery_cache = Some(path.to_owned());
+        self
+    }
+
     fn endpoints(&mut self) -> Endpoints {
+        let (http, cache) = (&*self.http, self.discovery_cache.as_deref());
         self.endpoints
-            .get_or_insert_with(|| Endpoints::discover(&*self.http))
+            .get_or_insert_with(|| match cache {
+                Some(path) => Endpoints::discover_cached(http, path),
+                None => Endpoints::discover(http),
+            })
             .clone()
     }
 
@@ -197,7 +217,13 @@ impl Auth {
         let endpoints = self.endpoints();
         let http = &*self.http;
         let token = minecraft::login(http, &endpoints, &xsts)?;
-        let profile = minecraft::profile(http, &token)?;
+        let profile = match minecraft::profile(http, &token) {
+            // Bought but not set up yet, or not bought at all? Not knowing is "not bought".
+            Err(AuthError::NoProfile) if minecraft::owns_java(http, &token) == Ok(true) => {
+                return Err(AuthError::NoProfileName);
+            }
+            r => r?,
+        };
         // An account without attributes (or a hiccup reading them) keeps the defaults.
         let privileges = minecraft::privileges(http, &endpoints, &token).unwrap_or_default();
         Ok(SignedIn {
@@ -388,5 +414,27 @@ mod tests {
             auth.resume("r").unwrap_err(),
             AuthError::Xbox(XboxRefusal::ChildAccount)
         );
+    }
+
+    #[test]
+    fn entitlements_explain_a_missing_profile() {
+        let with_items = |items: Value| {
+            let mut http = services(200, 404);
+            http.routes
+                .push(("entitlements/mcstore", 200, json!({ "items": items })));
+            Auth::with_http(Box::new(http), "cid")
+                .resume("r")
+                .unwrap_err()
+        };
+        assert_eq!(
+            with_items(json!([{"name": "product_minecraft"}, {"name": "game_minecraft"}])),
+            AuthError::NoProfileName
+        );
+        assert_eq!(with_items(json!([])), AuthError::NoProfile);
+        // The profile is the gate: entitlements are only asked about when it is missing.
+        let mut http = services(200, 200);
+        http.routes
+            .insert(0, ("entitlements/mcstore", 500, json!({})));
+        assert!(Auth::with_http(Box::new(http), "cid").resume("r").is_ok());
     }
 }

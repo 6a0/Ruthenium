@@ -2,8 +2,12 @@
 //! gate: no profile, no play), the player's privileges and ban status, and the chat
 //! signing certificates (kept in memory only, never stored).
 //!
-//! Endpoints come from the services' discovery document when it can be read, else from
-//! the values it held on 2026-11-22.
+//! Endpoints come from the services' discovery document, kept on disk for a day and read
+//! again after that; when it can't be fetched, the copy on disk (however old), else the
+//! values it held on 2026-11-22.
+
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -13,6 +17,9 @@ use crate::xbox::XboxToken;
 
 const DISCOVERY: &str = "https://discovery.minecraftservices.com/minecraft/client";
 const PROFILE: &str = "https://api.minecraftservices.com/minecraft/profile";
+const ENTITLEMENTS: &str = "https://api.minecraftservices.com/entitlements/mcstore";
+/// How long a discovery document on disk is used before it is fetched again.
+pub const DISCOVERY_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The service addresses sign-in uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,11 +64,58 @@ impl Endpoints {
 
     /// Fetches the discovery document, falling back to the defaults.
     pub fn discover(http: &dyn Http) -> Endpoints {
-        match http.get(DISCOVERY, None) {
-            Ok(r) if r.ok() => Endpoints::from_discovery(&r.json()),
-            _ => Endpoints::default(),
+        fetch_discovery(http).map_or_else(Endpoints::default, |doc| Endpoints::from_discovery(&doc))
+    }
+
+    /// Like [`Self::discover`], with the document kept in the file `cache`: a copy younger
+    /// than [`DISCOVERY_MAX_AGE`] is used as it is; an older one is fetched again, and
+    /// used if that fails.
+    pub fn discover_cached(http: &dyn Http, cache: &Path) -> Endpoints {
+        let saved = std::fs::read_to_string(cache)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| Some((v.get("fetched")?.as_u64()?, v.get("document")?.clone())));
+        let now = unix_now();
+        if let Some((fetched, doc)) = &saved
+            && now.saturating_sub(*fetched) < DISCOVERY_MAX_AGE.as_secs()
+            && *fetched <= now
+        {
+            return Endpoints::from_discovery(doc);
+        }
+        match fetch_discovery(http) {
+            Some(doc) => {
+                let text = json!({ "fetched": now, "document": doc }).to_string();
+                if let Err(e) = write_atomically(cache, &text) {
+                    eprintln!("[ruthenium] couldn't keep the services' discovery document: {e}");
+                }
+                Endpoints::from_discovery(&doc)
+            }
+            None => saved.map_or_else(Endpoints::default, |(_, doc)| {
+                Endpoints::from_discovery(&doc)
+            }),
         }
     }
+}
+
+fn fetch_discovery(http: &dyn Http) -> Option<Value> {
+    let r = http.get(DISCOVERY, None).ok().filter(|r| r.ok())?;
+    let doc = r.json();
+    doc.get("discovery").is_some().then_some(doc)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("json.new");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// A Minecraft services access token.
@@ -148,6 +202,28 @@ pub fn profile(http: &dyn Http, token: &McToken) -> Result<Profile, AuthError> {
             })
             .and_then(|k| k.get("url")?.as_str().map(str::to_owned)),
     })
+}
+
+/// Whether the account's Minecraft store entitlements include Java Edition
+/// (`game_minecraft` or `product_minecraft`, Game Pass included). The answer is a signed
+/// token whose signature is not checked: it only explains a missing profile, it never
+/// lets anyone play (the profile does).
+pub fn owns_java(http: &dyn Http, token: &McToken) -> Result<bool, AuthError> {
+    let r = http.get(ENTITLEMENTS, Some(&token.access_token))?;
+    if !r.ok() {
+        return Err(AuthError::Mojang(r.status, error_message(&r.json())));
+    }
+    Ok(r.json()
+        .get("items")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|i| {
+                matches!(
+                    i.get("name").and_then(Value::as_str),
+                    Some("game_minecraft" | "product_minecraft")
+                )
+            })
+        }))
 }
 
 /// A ban from one of the services.
@@ -294,6 +370,65 @@ mod tests {
         let e = Endpoints::from_discovery(&doc);
         assert_eq!(e.login_xbox, "https://x/login");
         assert_eq!(e.attributes, Endpoints::default().attributes);
+    }
+
+    #[test]
+    fn discovery_is_kept_for_a_day() {
+        use crate::http::Reply;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Doc(AtomicUsize, u16);
+        impl Http for Doc {
+            fn post_form(&self, _: &str, _: &[(&str, &str)]) -> Result<Reply, AuthError> {
+                unreachable!()
+            }
+            fn post_json(&self, _: &str, _: &Value, _: Option<&str>) -> Result<Reply, AuthError> {
+                unreachable!()
+            }
+            fn get(&self, url: &str, _: Option<&str>) -> Result<Reply, AuthError> {
+                assert_eq!(url, DISCOVERY);
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(Reply {
+                    status: self.1,
+                    body: json!({"discovery": {"player": {"endpoints": {"getAttributes": {"uri": "https://x/attr"}}}}}).to_string(),
+                })
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("ruthenium-discovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = dir.join("discovery.json");
+        let up = Doc(AtomicUsize::new(0), 200);
+        assert_eq!(
+            Endpoints::discover_cached(&up, &cache).attributes,
+            "https://x/attr"
+        );
+        assert_eq!(
+            Endpoints::discover_cached(&up, &cache).attributes,
+            "https://x/attr"
+        );
+        assert_eq!(
+            up.0.load(Ordering::Relaxed),
+            1,
+            "the second read comes from disk"
+        );
+        // Stale: fetched again; when that fails, the stale copy still beats the defaults.
+        let old = json!({"fetched": 1, "document": {"discovery": {"player": {"endpoints": {"getAttributes": {"uri": "https://old/attr"}}}}}});
+        std::fs::write(&cache, old.to_string()).unwrap();
+        let down = Doc(AtomicUsize::new(0), 503);
+        assert_eq!(
+            Endpoints::discover_cached(&down, &cache).attributes,
+            "https://old/attr"
+        );
+        assert_eq!(down.0.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            Endpoints::discover_cached(&up, &cache).attributes,
+            "https://x/attr"
+        );
+        std::fs::remove_file(&cache).unwrap();
+        assert_eq!(
+            Endpoints::discover_cached(&down, &cache),
+            Endpoints::default()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -5,10 +5,14 @@
 use crate::Clip;
 use crate::text::{Fonts, GlyphAtlas, Line, TextList, TextStyle, Weight};
 
+pub mod accounts;
 pub mod form;
+pub mod list;
 pub mod servers;
 
+pub use accounts::{AccountView, AccountsScreen};
 pub use form::{Field, FormButton, FormScreen, FormSpec, TextField};
+pub use list::ScrollList;
 pub use servers::{Ping, RowView, ServerListScreen};
 
 /// Window pixels per UI unit: the layout is designed for a window 900 units tall, so it
@@ -264,6 +268,16 @@ pub enum Action {
     /// Forms: the main button (Done, Join, Delete) and Cancel.
     Confirm,
     Cancel,
+    /// The title's account chip: the Accounts screen.
+    Accounts,
+    /// Accounts: sign in another account, switch to the selected one, sign it out.
+    AddAccount,
+    UseAccount,
+    SignOut,
+    /// Signing in: switch to a device code, open the sign-in page again, copy the code.
+    UseCode,
+    OpenPage,
+    CopyCode,
     /// Steps a choice button to its next value (the resource pack setting).
     Cycle,
 }
@@ -606,6 +620,7 @@ pub(crate) const WHITE_TEXT: [f32; 4] = WHITE;
 const LOGO: f32 = 136.0;
 const LABEL_SIZE: f32 = 19.0;
 const SMALL_SIZE: f32 = 11.5;
+const CHIP_SIZE: f32 = 13.0;
 const WHITE: [f32; 4] = [0.95, 0.96, 1.0, 1.0];
 const LABEL: [f32; 4] = [1.0, 1.0, 1.0, 0.88];
 const LABEL_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -715,8 +730,42 @@ impl Text {
     }
 }
 
-/// The title screen: the logo above a centred column of glass pills, and the version in
-/// the bottom left. The logo is the brand: no name beside it.
+/// How the account chip's dot shows the sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    SignedOut,
+    Checking,
+    SignedIn,
+    /// Signed in with a limit (multiplayer off), or the sign-in failed.
+    Problem,
+}
+
+impl Presence {
+    fn color(self) -> [f32; 4] {
+        match self {
+            Presence::SignedOut => [0.85, 0.87, 1.0, 0.35],
+            Presence::Checking => [0.62, 0.74, 1.0, 0.9],
+            Presence::SignedIn => [0.45, 0.95, 0.62, 0.95],
+            Presence::Problem => [1.0, 0.72, 0.38, 0.95],
+        }
+    }
+}
+
+/// The title's account chip: a small glass pill, bottom right, with a dot and a line.
+#[derive(Debug, Clone)]
+struct Chip {
+    rect: Rect,
+    text: Text,
+    presence: Presence,
+}
+
+const CHIP_H: f32 = 36.0;
+const CHIP_DOT: f32 = 8.0;
+const CHIP_MARGIN: f32 = 16.0;
+
+/// The title screen: the logo above a centred column of glass pills, the version in the
+/// bottom left and the account chip in the bottom right. The logo is the brand: no name
+/// beside it.
 #[derive(Debug, Clone)]
 pub struct TitleScreen {
     pub scale: UiScale,
@@ -724,8 +773,8 @@ pub struct TitleScreen {
     pub buttons: Vec<Button>,
     labels: Vec<Text>,
     version: Text,
-    /// The signed-in account (or why not), bottom right.
-    account: Option<Text>,
+    /// The account (or why it isn't signed in): control number `buttons.len()`.
+    chip: Chip,
 }
 
 impl TitleScreen {
@@ -774,20 +823,55 @@ impl TitleScreen {
             .iter()
             .map(|b| Text::new(fonts, b.label, &scale, LABEL_SIZE, Weight::SEMIBOLD, 0.01))
             .collect();
-        TitleScreen {
+        let mut title = TitleScreen {
             version: Text::new(fonts, version, &scale, SMALL_SIZE, Weight::MEDIUM, 0.02),
             labels,
             scale,
             logo,
             buttons,
-            account: None,
+            chip: Chip {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.0,
+                    h: 0.0,
+                },
+                text: Text::new(fonts, "", &scale, CHIP_SIZE, Weight::MEDIUM, 0.0),
+                presence: Presence::SignedOut,
+            },
+        };
+        title.set_account(fonts, "Not signed in", Presence::SignedOut);
+        title
+    }
+
+    /// How many controls take pointer and keyboard focus: the pills, then the chip.
+    pub fn controls(&self) -> usize {
+        self.buttons.len() + 1
+    }
+
+    /// What control `i` does.
+    pub fn action(&self, i: usize) -> Option<Action> {
+        match self.buttons.get(i) {
+            Some(b) => Some(b.action),
+            None => (i == self.buttons.len()).then_some(Action::Accounts),
         }
     }
 
-    /// Sets the bottom-right account line (none: nothing there).
-    pub fn set_account(&mut self, fonts: &Fonts, line: Option<&str>) {
-        self.account =
-            line.map(|l| Text::new(fonts, l, &self.scale, SMALL_SIZE, Weight::MEDIUM, 0.02));
+    /// Sets the account chip's line and dot.
+    pub fn set_account(&mut self, fonts: &Fonts, line: &str, presence: Presence) {
+        let s = self.scale;
+        let text = Text::new(fonts, line, &s, CHIP_SIZE, Weight::MEDIUM, 0.0);
+        let w = 16.0 + CHIP_DOT + 10.0 + text.width(&s) + 18.0;
+        self.chip = Chip {
+            rect: Rect {
+                x: s.width - CHIP_MARGIN - w,
+                y: s.height - CHIP_MARGIN - CHIP_H,
+                w,
+                h: CHIP_H,
+            },
+            text,
+            presence,
+        };
     }
 
     /// Adds the screen's shapes and, once they are on the GPU, its text (`atlas`) and
@@ -816,6 +900,27 @@ impl TitleScreen {
                 states.enabled(i),
             );
         }
+        let chip = &self.chip;
+        let look = states.look(self.buttons.len());
+        let lit = look.hover.max(0.5 * look.focus);
+        let r = chip
+            .rect
+            .scaled(1.0 + 0.5 * HOVER_GROW * look.hover - PRESS_SHRINK * look.press);
+        let mut tint = mix(TINT, TINT_HOVER, lit);
+        tint[3] += PRESS_TINT * look.press;
+        shapes.glass_pill(s, r, tint, 0.6 + 0.3 * lit);
+        if look.focus > 0.0 {
+            let mut ring = FOCUS;
+            ring[3] *= look.focus;
+            shapes.pill_ring(s, r.outset(FOCUS_GAP + FOCUS_WIDTH), FOCUS_WIDTH, ring);
+        }
+        let dot = Rect {
+            x: r.x + 16.0,
+            y: r.y + 0.5 * (r.h - CHIP_DOT),
+            w: CHIP_DOT,
+            h: CHIP_DOT,
+        };
+        shapes.rounded(s, dot, 0.5 * CHIP_DOT, chip.presence.color());
         let Some(atlas) = atlas else { return };
         text.line(
             atlas,
@@ -824,15 +929,20 @@ impl TitleScreen {
             (s.height - 16.0) * s.px,
             FAINT,
         );
-        if let Some(a) = &self.account {
-            let x = s.width - 16.0 - a.width(s);
-            a.draw_at(text, atlas, s, x, s.height - 16.0, FAINT);
-        }
+        let line = Rect {
+            x: dot.x + CHIP_DOT + 10.0,
+            ..r
+        };
+        chip.text
+            .left_in(text, atlas, s, line, mix(SOFT, LABEL_HOVER, lit));
     }
 
-    /// The index of the button at `(x, y)` (UI units).
+    /// The index of the control at `(x, y)` (UI units): a pill, or the chip.
     pub fn hit(&self, x: f32, y: f32) -> Option<usize> {
-        self.buttons.iter().position(|b| b.rect.contains(x, y))
+        self.buttons
+            .iter()
+            .position(|b| b.rect.contains(x, y))
+            .or_else(|| self.chip.rect.contains(x, y).then_some(self.buttons.len()))
     }
 }
 
@@ -1012,8 +1122,9 @@ mod tests {
         let mut text = TextList::new();
         t.draw(&mut shapes, &mut text, None, None, &st);
         let sh = shapes.shapes();
-        // Pill 0 (hovered), pill 1 (focused) and its ring, pill 2.
-        assert_eq!(sh.len(), 4);
+        // Pill 0 (hovered), pill 1 (focused) and its ring, pill 2, the chip and its dot.
+        assert_eq!(sh.len(), 6);
+        assert!(sh[4].glass && !sh[5].glass);
         let width = |s: &Shape| s.rect[2] - s.rect[0];
         assert!(width(&sh[0]) > width(&sh[3]));
         assert!(sh[2].ring > 0.0 && !sh[2].glass);

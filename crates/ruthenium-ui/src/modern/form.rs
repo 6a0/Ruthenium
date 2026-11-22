@@ -1,6 +1,6 @@
-//! Small forms in the modern style: a title, optional message lines, text fields with
-//! their labels, and buttons. Used for Add Server, Edit Server, Direct Connect and
-//! confirmations.
+//! Small forms in the modern style: a title, optional message lines, an optional code
+//! shown large, text fields with their labels, and buttons. Used for Add Server, Edit
+//! Server, Direct Connect, signing in and confirmations.
 //!
 //! Controls take focus in order, fields first. A focused field shows its ring however it
 //! got focus and takes typed text; buttons show theirs only after keyboard use.
@@ -21,6 +21,9 @@ const FIELD_GAP: f32 = 20.0;
 const BUTTON_H: f32 = 52.0;
 const BUTTON_GAP: f32 = 12.0;
 const TEXT_SIZE: f32 = 17.0;
+/// A code shown large: its size and the height it takes.
+const CODE_SIZE: f32 = 44.0;
+const CODE_H: f32 = 72.0;
 const CARET_W: f32 = 2.0;
 /// Caret blink: on for this part of each second.
 const BLINK_ON: f32 = 0.6;
@@ -50,6 +53,8 @@ pub struct FormButton {
 pub struct FormSpec {
     pub title: String,
     pub message: Vec<String>,
+    /// A code to read off the screen (a sign-in code), large, under the message.
+    pub code: Option<String>,
     pub fields: Vec<Field>,
     /// [`Action::Cycle`] buttons get a row each; the rest share the last row.
     pub buttons: Vec<FormButton>,
@@ -246,6 +251,7 @@ pub struct FormScreen {
     pub states: ButtonStates,
     title: Text,
     message: Vec<(Text, Rect)>,
+    code: Option<(Text, Rect)>,
     title_rect: Rect,
     fields: Vec<FieldView>,
     labels: Vec<Text>,
@@ -323,6 +329,7 @@ impl FormScreen {
             states: ButtonStates::new(n),
             title: Text::new(fonts, &spec.title, &scale, 26.0, Weight::SEMIBOLD, 0.01),
             message: Vec::new(),
+            code: None,
             title_rect: Rect {
                 x: 0.0,
                 y: 0.0,
@@ -353,8 +360,14 @@ impl FormScreen {
         let last_row = !self.spec.buttons.is_empty() && cycles < self.spec.buttons.len();
         let rows = cycles + usize::from(last_row);
         let msg_h = self.spec.message.len() as f32 * 26.0;
+        let code_h = if self.spec.code.is_some() {
+            CODE_H
+        } else {
+            0.0
+        };
         let height = 44.0
             + if msg_h > 0.0 { 18.0 + msg_h } else { 0.0 }
+            + code_h
             + 30.0
             + self.fields.len() as f32 * (LABEL_GAP + FIELD_H + FIELD_GAP)
             + 10.0
@@ -395,6 +408,17 @@ impl FormScreen {
                 (t, r)
             })
             .collect();
+        self.code = self.spec.code.as_ref().map(|c| {
+            let t = Text::new(fonts, c, &scale, CODE_SIZE, Weight::EXTRABOLD, 0.14);
+            let r = Rect {
+                x,
+                y: y + 8.0,
+                w: WIDTH,
+                h: CODE_H - 8.0,
+            };
+            y += CODE_H;
+            (t, r)
+        });
         y += 30.0;
         for (f, spec) in self.fields.iter_mut().zip(&self.spec.fields) {
             f.label = Text::new(fonts, &spec.label, &scale, 14.0, Weight::MEDIUM, 0.01);
@@ -556,6 +580,9 @@ impl FormScreen {
             for (t, r) in &self.message {
                 t.centred(text, atlas, s, *r, SOFT);
             }
+            if let Some((t, r)) = &self.code {
+                t.centred(text, atlas, s, *r, WHITE_TEXT);
+            }
         }
         for (i, f) in self.fields.iter().enumerate() {
             let focused = self.states.focused() == Some(i);
@@ -711,6 +738,7 @@ mod tests {
         let spec = FormSpec {
             title: "Add Server".into(),
             message: vec![],
+            code: None,
             fields: vec![
                 Field {
                     label: "Server Name".into(),

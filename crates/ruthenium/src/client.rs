@@ -58,11 +58,14 @@ pub struct Options {
     pub screenshot: Option<std::path::PathBuf>,
     /// Development: wait this long after the menus show before the screenshot.
     pub screenshot_after: Duration,
+    /// Ruthenium's data folder (default: the per-user one): accounts, servers.
+    pub data_dir: Option<std::path::PathBuf>,
     /// The server list file (default: `servers.dat` in Ruthenium's data folder).
     pub servers_file: Option<std::path::PathBuf>,
-    /// Development: start on this menu screen (`servers`, `add`, `direct`, `delete`).
+    /// Development: start on this menu screen (`servers`, `add`, `direct`, `delete`,
+    /// `accounts`, `sign-in`, `code`, `sign-in-failed`, `sign-out`).
     pub screen: Option<String>,
-    /// Development: select this server in the list.
+    /// Development: select this server (or account) in the list.
     pub select: Option<usize>,
     /// The window's starting size in points.
     pub window_size: (u32, u32),
@@ -90,6 +93,7 @@ impl Options {
             bench_out: None,
             screenshot: None,
             screenshot_after: Duration::ZERO,
+            data_dir: None,
             servers_file: None,
             screen: None,
             select: None,
@@ -144,6 +148,7 @@ impl Options {
                         .filter(|&(w, h)| (64..=16384).contains(&w) && (64..=16384).contains(&h));
                     o.window_size = parsed.ok_or(format!("--window-size: not a size: {v}"))?;
                 }
+                "--data-dir" => o.data_dir = Some(value("a folder")?.into()),
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
                 "--screen" => o.screen = Some(value("a screen name")?),
                 "--select" => {
@@ -184,15 +189,21 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     #[cfg(feature = "tracy")]
     profiling::tracy_client::Client::start();
 
-    let servers_file = opts.servers_file.clone().or_else(|| {
-        ruthenium_prepare::default_data_dir(&ruthenium_prepare::discover::Env::from_process())
-            .map(|d| d.join("servers.dat"))
-    });
-    let mut menu = Menu::new(servers_file);
-    let (status, mut sign_in) = crate::account::check_at_launch(
-        ruthenium_prepare::default_data_dir(&ruthenium_prepare::discover::Env::from_process()),
+    let env = ruthenium_prepare::discover::Env::from_process();
+    let data_dir = opts
+        .data_dir
+        .clone()
+        .or_else(|| ruthenium_prepare::default_data_dir(&env));
+    let servers_file = opts
+        .servers_file
+        .clone()
+        .or_else(|| data_dir.as_ref().map(|d| d.join("servers.dat")));
+    // The account in use signs in again on the accounts thread meanwhile.
+    let accounts = crate::account::Accounts::start(
+        data_dir,
+        ruthenium_prepare::default_cache_dir(&env).as_deref(),
     );
-    menu.set_account(status);
+    let mut menu = Menu::new(servers_file, accounts);
     let mut platform = Platform::init(env!("CARGO_PKG_VERSION"))?;
     let window = platform.create_window("Ruthenium", opts.window_size.0, opts.window_size.1)?;
     let t_window = started.elapsed();
@@ -341,6 +352,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                     window.pixel_size(),
                     window.size(),
                     &mut renderer,
+                    &window,
                 )
             })
             .collect();
@@ -402,22 +414,25 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             }
         }
 
-        if let Some(rx) = &sign_in
-            && let Ok(status) = rx.try_recv()
-        {
-            menu.set_account(status);
-            sign_in = None;
-        }
-
         // 3. Simulation: nothing yet.
 
         // 4. Render.
         if let Some(name) = start_screen.take() {
-            menu.open_servers(window.pixel_size());
-            if let Some(i) = opts.select {
-                menu.select_server(i);
+            if matches!(
+                name.as_str(),
+                "accounts" | "sign-in" | "code" | "sign-in-failed" | "sign-out"
+            ) {
+                menu.open_accounts_named(&name, window.pixel_size());
+                if let Some(i) = opts.select {
+                    menu.select_account(i);
+                }
+            } else {
+                menu.open_servers(window.pixel_size());
+                if let Some(i) = opts.select {
+                    menu.select_server(i);
+                }
+                menu.open_form_named(&name, window.pixel_size());
             }
-            menu.open_form_named(&name, window.pixel_size());
         }
         let text_ready = menu.text_ready();
         if text_ready && text_shown.is_none() {

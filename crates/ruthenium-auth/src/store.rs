@@ -119,13 +119,19 @@ impl AccountStore {
             accounts,
             secrets,
         };
-        store.sort();
+        // Saved newest first; the sort is stable, so equal times keep that order.
+        store
+            .accounts
+            .sort_by_key(|a| std::cmp::Reverse(a.last_used));
         store
     }
 
-    fn sort(&mut self) {
-        self.accounts
-            .sort_by_key(|a| std::cmp::Reverse(a.last_used));
+    /// Moves `account` to the front as the one used now (never older than the one it
+    /// replaces there, so the order survives a reload even if the clock went back).
+    fn put_first(&mut self, mut account: Account) {
+        account.last_used = now().max(self.accounts.first().map_or(0, |a| a.last_used));
+        self.accounts.retain(|a| a.id != account.id);
+        self.accounts.insert(0, account);
     }
 
     /// Accounts, most recently used first.
@@ -161,8 +167,8 @@ impl AccountStore {
         std::fs::rename(&tmp, &self.path).map_err(io)
     }
 
-    /// Records a sign-in (or a refresh): the account becomes the current one and its
-    /// refresh token is replaced.
+    /// Records a sign-in: the account becomes the current one and its refresh token is
+    /// replaced.
     pub fn signed_in(
         &mut self,
         id: &str,
@@ -170,14 +176,41 @@ impl AccountStore {
         refresh_token: &str,
     ) -> Result<(), AuthError> {
         self.secrets.set(&secret_key(id), refresh_token)?;
-        self.accounts.retain(|a| a.id != id);
-        self.accounts.push(Account {
+        self.put_first(Account {
             id: id.to_owned(),
             name: name.to_owned(),
-            last_used: now(),
+            last_used: 0,
         });
-        self.sort();
         self.save()
+    }
+
+    /// Records a refresh: the account's new refresh token and its name as the services
+    /// now give it, without changing which account is current.
+    pub fn refreshed(
+        &mut self,
+        id: &str,
+        name: &str,
+        refresh_token: &str,
+    ) -> Result<(), AuthError> {
+        self.secrets.set(&secret_key(id), refresh_token)?;
+        match self.accounts.iter_mut().find(|a| a.id == id) {
+            Some(a) if a.name != name => {
+                a.name = name.to_owned();
+                self.save()
+            }
+            Some(_) => Ok(()),
+            // Signed out meanwhile: keep it signed out.
+            None => self.secrets.delete(&secret_key(id)),
+        }
+    }
+
+    /// Makes `id` the current account (switching accounts). False if there is none.
+    pub fn select(&mut self, id: &str) -> Result<bool, AuthError> {
+        let Some(a) = self.accounts.iter().find(|a| a.id == id).cloned() else {
+            return Ok(false);
+        };
+        self.put_first(a);
+        self.save().map(|()| true)
     }
 
     pub fn refresh_token(&self, id: &str) -> Result<Option<String>, AuthError> {
@@ -224,7 +257,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = AccountStore::with_secrets(&dir, Box::new(MemorySecrets::default()));
         s.signed_in("aaa", "Alex", "r1").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // Within the same second: the order still holds, here and after a reload.
         s.signed_in("bbb", "Steve", "r2").unwrap();
         assert_eq!(s.current().unwrap().name, "Steve");
         assert_eq!(s.find("alex").unwrap().id, "aaa");
@@ -241,8 +274,19 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             ["Steve", "Alex"]
         );
+        // A refresh renames but doesn't switch; selecting switches.
+        s.refreshed("aaa", "Alex2", "r3").unwrap();
+        assert_eq!(s.current().unwrap().name, "Steve");
+        assert_eq!(s.refresh_token("aaa").unwrap().as_deref(), Some("r3"));
+        assert!(s.select("aaa").unwrap());
+        assert!(!s.select("nobody").unwrap());
+        let again = AccountStore::with_secrets(&dir, Box::new(MemorySecrets::default()));
+        assert_eq!(again.current().unwrap().name, "Alex2");
         s.remove("bbb").unwrap();
-        assert_eq!(s.current().unwrap().name, "Alex");
+        assert_eq!(s.current().unwrap().name, "Alex2");
+        assert_eq!(s.refresh_token("bbb").unwrap(), None);
+        // A refresh that lands after a sign-out doesn't bring the secret back.
+        s.refreshed("bbb", "Steve", "late").unwrap();
         assert_eq!(s.refresh_token("bbb").unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }

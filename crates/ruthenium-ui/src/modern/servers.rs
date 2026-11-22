@@ -7,9 +7,10 @@
 
 use ruthenium_protocol::text::{Style, StyledText};
 
+use super::list::ScrollList;
 use super::{
     Action, Button, ButtonStates, Ease, FAINT, Rect, SOFT, ShapeList, Text, UiScale, WHITE_TEXT,
-    draw_button, draw_focus_ring, mix, px_rect,
+    draw_button, draw_focus_ring, mix,
 };
 use crate::Clip;
 use crate::text::{Fonts, GlyphAtlas, TextList, Weight};
@@ -61,12 +62,6 @@ const RIGHT: f32 = 128.0;
 const BUTTON_H: f32 = 44.0;
 const BUTTON_GAP: f32 = 12.0;
 const FOOTER_MARGIN: f32 = 30.0;
-const FADE: f32 = 28.0;
-/// Scrolling: units per wheel notch and the time constant of the glide.
-const WHEEL_STEP: f32 = 64.0;
-const SCROLL_TAU: f32 = 0.07;
-/// Two clicks on one row this close together (seconds) join it (vanilla's 250 ms).
-const DOUBLE_CLICK: f64 = 0.25;
 
 const ROW_TINT: [f32; 4] = [0.85, 0.88, 1.0, 0.03];
 const ROW_HOVER: [f32; 4] = [0.90, 0.93, 1.0, 0.08];
@@ -197,18 +192,12 @@ pub struct ServerListScreen {
     pub scale: UiScale,
     pub buttons: Vec<Button>,
     pub states: ButtonStates,
-    /// The list's area (UI units).
-    pub list: Rect,
+    /// The rows' area, scrolling and selection.
+    pub list: ScrollList,
     labels: Vec<Text>,
     title: Text,
     empty: [Text; 2],
     rows: Vec<Row>,
-    selected: Option<usize>,
-    hovered: Option<usize>,
-    scroll: f32,
-    scroll_target: f32,
-    /// The last click on a row: which and when (seconds).
-    last_click: Option<(usize, f64)>,
 }
 
 impl ServerListScreen {
@@ -238,12 +227,7 @@ impl ServerListScreen {
                 })
                 .collect(),
             states: ButtonStates::new(entries.len()),
-            list: Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 0.0,
-                h: 0.0,
-            },
+            list: ScrollList::new(ROW_H, ROW_GAP),
             labels: Vec::new(),
             title: Text::new(fonts, "Multiplayer", &scale, 28.0, Weight::SEMIBOLD, 0.01),
             empty: [
@@ -258,11 +242,6 @@ impl ServerListScreen {
                 ),
             ],
             rows: Vec::new(),
-            selected: None,
-            hovered: None,
-            scroll: 0.0,
-            scroll_target: 0.0,
-            last_click: None,
         };
         screen.layout(scale, fonts);
         screen
@@ -276,12 +255,12 @@ impl ServerListScreen {
         let cx = 0.5 * scale.width;
         let footer = 2.0 * BUTTON_H + BUTTON_GAP;
         let bottom = scale.height - FOOTER_MARGIN - footer - 26.0;
-        self.list = Rect {
+        self.list.set_area(Rect {
             x: cx - 0.5 * w,
             y: 104.0,
             w,
             h: (bottom - 104.0).max(ROW_H),
-        };
+        });
         // Top row: three buttons; bottom row: four, both as wide as the list allows.
         let row_w = w.min(690.0);
         let top_w = (row_w - 2.0 * BUTTON_GAP) / 3.0;
@@ -323,8 +302,6 @@ impl ServerListScreen {
                 0.0,
             ),
         ];
-        self.clamp_scroll();
-        self.scroll = self.scroll_target;
     }
 
     /// Replaces the rows (same order as before, or the selection is the caller's to fix).
@@ -372,78 +349,26 @@ impl ServerListScreen {
                 }
             })
             .collect();
-        if self.selected.is_some_and(|i| i >= self.rows.len()) {
-            self.selected = None;
-        }
-        self.clamp_scroll();
+        self.list.set_len(self.rows.len());
     }
 
     pub fn selected(&self) -> Option<usize> {
-        self.selected
+        self.list.selected()
     }
 
     /// Selects a row (or none) and scrolls it into view.
     pub fn select(&mut self, i: Option<usize>) {
-        self.selected = i.filter(|&i| i < self.rows.len());
-        if let Some(i) = self.selected {
-            let top = i as f32 * (ROW_H + ROW_GAP);
-            if top < self.scroll_target {
-                self.scroll_target = top;
-            } else if top + ROW_H > self.scroll_target + self.list.h {
-                self.scroll_target = top + ROW_H - self.list.h;
-            }
-            self.clamp_scroll();
-        }
+        self.list.select(i);
     }
 
     /// Moves the selection by `delta` rows (from none: the first or last row).
     pub fn move_selection(&mut self, delta: isize) {
-        let n = self.rows.len();
-        if n == 0 {
-            return;
-        }
-        let next = match self.selected {
-            None if delta > 0 => 0,
-            None => n - 1,
-            Some(i) => (i as isize + delta).clamp(0, n as isize - 1) as usize,
-        };
-        self.select(Some(next));
-    }
-
-    fn content_height(&self) -> f32 {
-        let n = self.rows.len() as f32;
-        (n * (ROW_H + ROW_GAP) - ROW_GAP).max(0.0)
-    }
-
-    fn max_scroll(&self) -> f32 {
-        (self.content_height() - self.list.h).max(0.0)
-    }
-
-    fn clamp_scroll(&mut self) {
-        self.scroll_target = self.scroll_target.clamp(0.0, self.max_scroll());
+        self.list.move_selection(delta);
     }
 
     /// The wheel turned `notches` (positive scrolls up).
     pub fn wheel(&mut self, notches: f32) {
-        self.scroll_target -= notches * WHEEL_STEP;
-        self.clamp_scroll();
-    }
-
-    fn row_rect(&self, i: usize) -> Rect {
-        Rect {
-            x: self.list.x,
-            y: self.list.y + i as f32 * (ROW_H + ROW_GAP) - self.scroll,
-            w: self.list.w,
-            h: ROW_H,
-        }
-    }
-
-    /// The row at `(x, y)` (UI units), if any.
-    pub fn hit_row(&self, x: f32, y: f32) -> Option<usize> {
-        if !self.list.contains(x, y) {
-            return None;
-        }
-        (0..self.rows.len()).find(|&i| self.row_rect(i).contains(x, y))
+        self.list.wheel(notches);
     }
 
     /// The button at `(x, y)` (UI units), if any.
@@ -453,7 +378,7 @@ impl ServerListScreen {
 
     /// The pointer moved to `(x, y)` (UI units), or left (`None`).
     pub fn pointer(&mut self, at: Option<(f32, f32)>) {
-        self.hovered = at.and_then(|(x, y)| self.hit_row(x, y));
+        self.list.pointer(at);
         self.states
             .hover(at.and_then(|(x, y)| self.hit_button(x, y)));
     }
@@ -461,32 +386,20 @@ impl ServerListScreen {
     /// The left button went down at `(x, y)` at `time` seconds: selects the row under
     /// it, and returns true for the second click of a double click on the same row.
     pub fn click_row(&mut self, x: f32, y: f32, time: f64) -> bool {
-        let Some(i) = self.hit_row(x, y) else {
-            return false;
-        };
-        self.select(Some(i));
-        let double = self
-            .last_click
-            .is_some_and(|(j, t)| j == i && time - t < DOUBLE_CLICK);
-        self.last_click = if double { None } else { Some((i, time)) };
-        double
+        self.list.click_row(x, y, time)
     }
 
     /// Advances scrolling and the rows' motion by `dt` seconds; enables the buttons that
     /// need a selection.
     pub fn update(&mut self, dt: f32) {
-        let k = 1.0 - (-dt.max(0.0) / SCROLL_TAU).exp();
-        self.scroll += (self.scroll_target - self.scroll) * k;
-        if (self.scroll - self.scroll_target).abs() < 0.05 {
-            self.scroll = self.scroll_target;
-        }
+        self.list.update(dt);
         for (i, r) in self.rows.iter_mut().enumerate() {
-            let lit = f32::from(u8::from(self.hovered == Some(i)));
+            let lit = f32::from(u8::from(self.list.hovered() == Some(i)));
             r.hover.step(lit, dt, 0.06, 0.15);
-            let sel = f32::from(u8::from(self.selected == Some(i)));
+            let sel = f32::from(u8::from(self.list.selected() == Some(i)));
             r.selected.step(sel, dt, 0.05, 0.12);
         }
-        let has = self.selected.is_some();
+        let has = self.list.selected().is_some();
         for b in [JOIN, EDIT, DELETE] {
             self.states.set_enabled(b, has);
         }
@@ -511,17 +424,18 @@ impl ServerListScreen {
             };
             self.title.centred(text, atlas, s, title, WHITE_TEXT);
             if self.rows.is_empty() {
-                let mid = self.list.y + 0.4 * self.list.h;
+                let area = self.list.area;
+                let mid = area.y + 0.4 * area.h;
                 let r0 = Rect {
-                    x: self.list.x,
+                    x: area.x,
                     y: mid - 30.0,
-                    w: self.list.w,
+                    w: area.w,
                     h: 30.0,
                 };
                 let r1 = Rect {
-                    x: self.list.x,
+                    x: area.x,
                     y: mid + 4.0,
-                    w: self.list.w,
+                    w: area.w,
                     h: 24.0,
                 };
                 self.empty[0].centred(text, atlas, s, r0, SOFT);
@@ -530,20 +444,12 @@ impl ServerListScreen {
         }
         // Rows, clipped to the list (with room for the selection ring), fading at an edge
         // only while there is more to scroll to beyond it.
-        let area = self.list.outset(8.0);
-        let fade_top = self.scroll.min(FADE) * s.px;
-        let fade_bottom = (self.max_scroll() - self.scroll).clamp(0.0, FADE) * s.px;
-        let clip = Clip {
-            rect: px_rect(s, area),
-            fade_top,
-            fade_bottom,
-            opacity: 1.0,
-        };
+        let clip = self.list.clip(s, 8.0);
         shapes.set_clip(clip);
         text.set_clip(clip);
         for (i, row) in self.rows.iter().enumerate() {
-            let r = self.row_rect(i);
-            if r.y + r.h < area.y || r.y > area.y + area.h {
+            let r = self.list.row_rect(i);
+            if !self.list.shows(r, 8.0) {
                 continue;
             }
             self.draw_row(shapes, text, atlas, row, r, i, time, clip);
@@ -710,19 +616,20 @@ mod tests {
             })
             .collect();
         screen.set_rows(&fonts, &views);
-        assert!(screen.max_scroll() > 0.0);
+        assert!(screen.list.max_scroll() > 0.0);
         // Selecting the last row scrolls it into view.
         screen.select(Some(19));
         screen.update(1.0);
-        let last = screen.row_rect(19);
-        assert!(last.y + last.h <= screen.list.y + screen.list.h + 0.01);
-        assert!(screen.hit_row(last.x + 10.0, last.y + 10.0) == Some(19));
+        let last = screen.list.row_rect(19);
+        let area = screen.list.area;
+        assert!(last.y + last.h <= area.y + area.h + 0.01);
+        assert!(screen.list.hit_row(last.x + 10.0, last.y + 10.0) == Some(19));
         // Keyboard moves clamp; the wheel scrolls back up.
         screen.move_selection(5);
         assert_eq!(screen.selected(), Some(19));
         screen.wheel(100.0);
         screen.update(1.0);
-        assert_eq!(screen.row_rect(0).y, screen.list.y);
+        assert_eq!(screen.list.row_rect(0).y, area.y);
         // Join, Edit and Delete need a selection.
         screen.select(None);
         screen.update(0.0);
@@ -745,7 +652,7 @@ mod tests {
             })
             .collect();
         screen.set_rows(&fonts, &views);
-        let r = screen.row_rect(1);
+        let r = screen.list.row_rect(1);
         let (x, y) = (r.x + 5.0, r.y + 5.0);
         assert!(!screen.click_row(x, y, 10.0));
         assert!(screen.click_row(x, y, 10.2));

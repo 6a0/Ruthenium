@@ -39,6 +39,8 @@ With no command, opens the game window. Options:
                          (development; a mismatch fails the run)
   --screenshot <file>    write the window to a PNG, then quit
                          (development)
+  --data-dir <folder>    Ruthenium's data folder (accounts, servers); default:
+                         the per-user one
 In the window, V toggles VSync and F3 the frame-stats overlay.
 
 commands:

@@ -1,5 +1,5 @@
-//! Ruthenium's out-of-game menus: the title screen, the server list and its forms. Lays
-//! them out for the window, prepares the glyph atlas and the logo in the background and
+//! Ruthenium's out-of-game menus: the title screen, the server list and its forms, the
+//! accounts and signing in. Lays them out for the window, prepares the glyph atlas and the logo in the background and
 //! uploads them, routes input to the screen showing, and builds each frame's shapes and
 //! text.
 
@@ -29,11 +29,12 @@ impl Clipboard for Window {
 use ruthenium_render::{GuiFrame, Renderer};
 use ruthenium_ui::logo::Logo;
 use ruthenium_ui::modern::{
-    Action, ButtonStates, Ease, Field, FormButton, FormScreen, FormSpec, Key, ShapeList,
-    TitleScreen, UiScale, WEIGHTS,
+    AccountView, AccountsScreen, Action, ButtonStates, Ease, Field, FormButton, FormScreen,
+    FormSpec, Key, Presence, ShapeList, TitleScreen, UiScale, WEIGHTS,
 };
 use ruthenium_ui::text::{ATLAS_SIZE, Fonts, GlyphAtlas, TextList, TextStyle, Weight};
 
+use crate::account::{AccountStatus, Accounts, Stage, failure_lines};
 use crate::servers::{Servers, valid_address};
 
 /// Side of the logo texture's top level.
@@ -64,6 +65,10 @@ const SCANCODE_KP_ENTER: u32 = 88;
 const MAX_STEP: f32 = 0.1;
 /// Time constant of the menus' fade-in once their text and logo are on the GPU.
 const APPEAR_TAU: f32 = 0.09;
+
+/// Letter pairs Nunito joins into one glyph (its `liga` feature), which the characters
+/// one by one never produce.
+const LIGATURES: &str = "ff fi fl ffi ffl";
 
 /// Every printable ASCII character: what the menus' text uses for now.
 const ASCII: &str = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
@@ -96,36 +101,106 @@ enum Atlas {
     Failed,
 }
 
-/// The account the menus show, as the launch-time sign-in check found it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccountStatus {
-    /// No account signed in.
-    None,
-    Checking(String),
-    SignedIn {
-        name: String,
-        may_play_online: bool,
-    },
-    Failed {
-        name: String,
-        reason: String,
-    },
+/// The title's account chip for `status`.
+fn chip(status: &AccountStatus) -> (String, Presence) {
+    match status {
+        AccountStatus::None => ("Sign in".into(), Presence::SignedOut),
+        AccountStatus::Checking(n) => (format!("Signing in as {n}..."), Presence::Checking),
+        AccountStatus::SignedIn {
+            name,
+            may_play_online: true,
+        } => (name.clone(), Presence::SignedIn),
+        AccountStatus::SignedIn { name, .. } => {
+            (format!("{name}: multiplayer is off"), Presence::Problem)
+        }
+        AccountStatus::Failed { name, reason } => (format!("{name}: {reason}"), Presence::Problem),
+    }
 }
 
-impl AccountStatus {
-    fn line(&self) -> String {
-        match self {
-            AccountStatus::None => "Not signed in".into(),
-            AccountStatus::Checking(n) => format!("Signing in as {n}..."),
-            AccountStatus::SignedIn {
-                name,
-                may_play_online: true,
-            } => format!("Signed in as {name}"),
-            AccountStatus::SignedIn { name, .. } => {
-                format!("{name}: multiplayer is turned off for this account")
-            }
-            AccountStatus::Failed { name, reason } => format!("{name}: {reason}"),
+/// The Accounts screen's line under the account in use.
+fn detail(status: &AccountStatus) -> (String, Presence) {
+    match status {
+        AccountStatus::None => ("Not signed in".into(), Presence::SignedOut),
+        AccountStatus::Checking(_) => ("Signing in...".into(), Presence::Checking),
+        AccountStatus::SignedIn {
+            may_play_online: true,
+            ..
+        } => ("Signed in".into(), Presence::SignedIn),
+        AccountStatus::SignedIn { .. } => (
+            "Signed in; multiplayer is turned off for this account".into(),
+            Presence::Problem,
+        ),
+        AccountStatus::Failed { reason, .. } => {
+            let mut c = reason.chars();
+            let line = c.next().map_or_else(String::new, |f| {
+                f.to_uppercase().chain(c).collect::<String>()
+            });
+            (line, Presence::Problem)
         }
+    }
+}
+
+/// A sign-in page's address as people type it: no scheme, no `www.`.
+fn short_url(url: &str) -> &str {
+    let u = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    u.strip_prefix("www.").unwrap_or(u).trim_end_matches('/')
+}
+
+/// The sign-in screen for `stage`.
+fn sign_in_spec(stage: &Stage) -> FormSpec {
+    let lines = |l: &[&str]| l.iter().map(|&s| s.to_owned()).collect::<Vec<_>>();
+    let (title, message, code, buttons) = match stage {
+        Stage::Starting { device: false } | Stage::Browser { .. } => (
+            "Sign in with Microsoft",
+            lines(&[
+                "Continue in the browser window that opened.",
+                "Ruthenium never sees your password.",
+            ]),
+            None,
+            vec![
+                button("Open Again", Action::OpenPage),
+                button("Use a Code", Action::UseCode),
+                button("Cancel", Action::Cancel),
+            ],
+        ),
+        Stage::Starting { device: true } => (
+            "Sign in with a code",
+            lines(&["Getting a code from Microsoft..."]),
+            None,
+            vec![button("Cancel", Action::Cancel)],
+        ),
+        Stage::Device(c) => (
+            "Sign in with a code",
+            vec![
+                format!("On any device, go to {}", short_url(&c.verification_uri)),
+                "and enter this code:".into(),
+            ],
+            Some(c.user_code.clone()),
+            vec![
+                button("Open Page", Action::OpenPage),
+                button("Copy Code", Action::CopyCode),
+                button("Cancel", Action::Cancel),
+            ],
+        ),
+        Stage::Failed { error, .. } => (
+            "Couldn't sign in",
+            failure_lines(error),
+            None,
+            vec![
+                button("Try Again", Action::Confirm),
+                button("Back", Action::Cancel),
+            ],
+        ),
+    };
+    FormSpec {
+        title: title.into(),
+        message,
+        code,
+        fields: Vec::new(),
+        buttons,
     }
 }
 
@@ -136,6 +211,20 @@ enum FormKind {
     Edit(usize),
     Direct,
     Delete(usize),
+    /// Signing in a new account (the form follows the sign-in's stage).
+    SignIn,
+    /// Confirming that account `i` (in the Accounts list) signs out.
+    SignOut(usize),
+}
+
+impl FormKind {
+    /// The screen the form goes back to.
+    fn parent(self) -> Screen {
+        match self {
+            FormKind::SignIn | FormKind::SignOut(_) => Screen::Accounts,
+            _ => Screen::Servers,
+        }
+    }
 }
 
 /// Form button indices.
@@ -145,6 +234,7 @@ const CYCLE: usize = 0;
 enum Screen {
     Title,
     Servers,
+    Accounts,
     Form(FormKind, Box<FormScreen>, PackStatus),
 }
 
@@ -162,7 +252,15 @@ pub struct Menu {
     servers_path: Option<PathBuf>,
     /// The last address typed into Direct Connect (vanilla keeps it in options.txt).
     last_direct: String,
-    account: AccountStatus,
+    accounts: Accounts,
+    /// The Accounts screen, while it or one of its forms shows.
+    accounts_screen: Option<AccountsScreen>,
+    /// The accounts' revision the screens show.
+    accounts_seen: Option<u64>,
+    /// The sign-in stage the sign-in form shows.
+    stage_shown: Option<Stage>,
+    /// Development: a sign-in stage to show without signing in (screenshots).
+    preview_stage: Option<Stage>,
     shapes: ShapeList,
     text: TextList,
     /// Mouse position in window coordinates.
@@ -187,15 +285,16 @@ fn glyph_atlas() -> GlyphAtlas {
     let glyphs: Vec<(Weight, u16)> = WEIGHTS
         .iter()
         .flat_map(|&w| {
-            let line = fonts.shape(
-                ASCII,
-                TextStyle {
-                    size: 1.0,
-                    weight: w,
-                    tracking: 0.0,
-                },
-            );
-            line.glyphs.into_iter().map(move |(g, _, _)| (w, g))
+            let style = TextStyle {
+                size: 1.0,
+                weight: w,
+                tracking: 0.0,
+            };
+            let fonts = &fonts;
+            [ASCII, LIGATURES]
+                .into_iter()
+                .flat_map(move |t| fonts.shape(t, style).glyphs)
+                .map(move |(g, _, _)| (w, g))
         })
         .collect();
     if !atlas.add_many(&fonts, &glyphs) {
@@ -240,7 +339,7 @@ fn button(label: &str, action: Action) -> FormButton {
 impl Menu {
     /// Starts building the glyph atlas on another thread. The server list lives in
     /// `servers_path` (none: not saved).
-    pub fn new(servers_path: Option<PathBuf>) -> Menu {
+    pub fn new(servers_path: Option<PathBuf>, accounts: Accounts) -> Menu {
         let handle = std::thread::Builder::new()
             .name("menu-assets".into())
             .spawn(prepare)
@@ -255,7 +354,11 @@ impl Menu {
             servers: None,
             servers_path,
             last_direct: String::new(),
-            account: AccountStatus::None,
+            accounts,
+            accounts_screen: None,
+            accounts_seen: None,
+            stage_shown: None,
+            preview_stage: None,
             shapes: ShapeList::new(),
             text: TextList::new(),
             mouse: None,
@@ -280,6 +383,9 @@ impl Menu {
         if let Some(s) = &mut self.servers {
             s.screen.states.cancel();
         }
+        if let Some(a) = &mut self.accounts_screen {
+            a.states.cancel();
+        }
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.states.cancel();
         }
@@ -299,34 +405,115 @@ impl Menu {
         self.scale = Some(scale);
         let version = concat!("Ruthenium ", env!("CARGO_PKG_VERSION"));
         let title = TitleScreen::new(scale, &self.fonts, version);
-        if title.buttons.len() != self.title_states.len() {
-            self.title_states = ButtonStates::new(title.buttons.len());
+        if title.controls() != self.title_states.len() {
+            self.title_states = ButtonStates::new(title.controls());
         }
         self.title = Some(title);
-        self.apply_account();
         if let Some(s) = &mut self.servers {
             s.screen.layout(scale, &self.fonts);
         }
+        if let Some(a) = &mut self.accounts_screen {
+            a.layout(scale, &self.fonts);
+        }
+        self.accounts_seen = None;
+        self.sync_accounts();
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.layout(scale, &self.fonts);
         }
         scale
     }
 
-    /// The account to show, and whether Multiplayer is allowed for it.
-    pub fn set_account(&mut self, status: AccountStatus) {
-        self.account = status;
+    /// Takes in the accounts' news and brings the screens up to date with it: the title's
+    /// chip and Multiplayer button, the Accounts list, and the sign-in form, which follows
+    /// the sign-in's stage and gives way to the Accounts list when it ends.
+    fn sync_accounts(&mut self) {
+        self.accounts.poll();
+        if self.accounts_seen == Some(self.accounts.revision()) {
+            return;
+        }
+        self.accounts_seen = Some(self.accounts.revision());
         self.apply_account();
+        if let Some(screen) = &mut self.accounts_screen {
+            let status = self.accounts.status();
+            let shown = detail(status);
+            let views: Vec<AccountView> = self
+                .accounts
+                .list()
+                .iter()
+                .enumerate()
+                .map(|(i, a)| AccountView {
+                    name: &a.name,
+                    current: i == 0,
+                    detail: (i == 0).then_some((shown.0.as_str(), shown.1)),
+                })
+                .collect();
+            screen.set_rows(&self.fonts, &views);
+        }
+        if let Screen::Form(FormKind::SignIn, ..) = self.screen {
+            let stage = self
+                .accounts
+                .stage()
+                .or(self.preview_stage.as_ref())
+                .cloned();
+            match stage {
+                None => self.screen = Screen::Accounts,
+                Some(s) if self.stage_shown.as_ref() != Some(&s) => {
+                    if let Some(scale) = self.scale {
+                        let form = FormScreen::new(scale, &self.fonts, sign_in_spec(&s));
+                        self.screen =
+                            Screen::Form(FormKind::SignIn, Box::new(form), PackStatus::Prompt);
+                    }
+                    self.stage_shown = Some(s);
+                }
+                Some(_) => {}
+            }
+        }
+        if let Screen::Form(FormKind::SignIn, form, _) = &mut self.screen
+            && matches!(self.stage_shown, Some(Stage::Starting { device: false }))
+        {
+            // Nothing to open again until the browser was sent somewhere.
+            form.set_button_enabled(0, false);
+        }
+    }
+
+    /// Opens the Accounts screen.
+    fn open_accounts(&mut self, scale: UiScale) {
+        self.accounts_screen = Some(AccountsScreen::new(scale, &self.fonts));
+        self.screen = Screen::Accounts;
+        self.accounts_seen = None;
+        self.sync_accounts();
+    }
+
+    /// Shows the sign-in form for the sign-in just started.
+    fn open_sign_in(&mut self) {
+        self.stage_shown = None;
+        if let Some(scale) = self.scale {
+            let form = FormScreen::new(
+                scale,
+                &self.fonts,
+                FormSpec {
+                    title: String::new(),
+                    message: Vec::new(),
+                    code: None,
+                    fields: Vec::new(),
+                    buttons: Vec::new(),
+                },
+            );
+            self.screen = Screen::Form(FormKind::SignIn, Box::new(form), PackStatus::Prompt);
+        }
+        self.accounts_seen = None;
+        self.sync_accounts();
     }
 
     fn apply_account(&mut self) {
-        let line = self.account.line();
+        let status = self.accounts.status();
+        let (line, presence) = chip(status);
         if let Some(t) = &mut self.title {
-            t.set_account(&self.fonts, Some(&line));
+            t.set_account(&self.fonts, &line, presence);
         }
         // Parental controls or a multiplayer ban turn Multiplayer off, as in vanilla.
         let allowed = !matches!(
-            self.account,
+            status,
             AccountStatus::SignedIn {
                 may_play_online: false,
                 ..
@@ -373,6 +560,7 @@ impl Menu {
                     }
                     .into(),
                     message: Vec::new(),
+                    code: None,
                     fields: vec![name_field(&e.name), addr_field(&e.ip)],
                     buttons: vec![
                         button(&pack_label(e.pack_status), Action::Cycle),
@@ -386,6 +574,7 @@ impl Menu {
                 FormSpec {
                     title: "Direct Connect".into(),
                     message: Vec::new(),
+                    code: None,
                     fields: vec![addr_field(&self.last_direct)],
                     buttons: vec![
                         button("Join Server", Action::Confirm),
@@ -403,6 +592,7 @@ impl Menu {
                             format!("'{}' will be removed from your list.", e.name),
                             "This can't be undone.".into(),
                         ],
+                        code: None,
                         fields: Vec::new(),
                         buttons: vec![
                             button("Delete", Action::Confirm),
@@ -412,6 +602,28 @@ impl Menu {
                     PackStatus::Prompt,
                 )
             }
+            FormKind::SignOut(i) => {
+                let Some(a) = self.accounts.list().get(i) else {
+                    return;
+                };
+                (
+                    FormSpec {
+                        title: "Sign Out?".into(),
+                        message: vec![
+                            format!("{} will be signed out of Ruthenium.", a.name),
+                            "You can sign in again at any time.".into(),
+                        ],
+                        code: None,
+                        fields: Vec::new(),
+                        buttons: vec![
+                            button("Sign Out", Action::Confirm),
+                            button("Cancel", Action::Cancel),
+                        ],
+                    },
+                    PackStatus::Prompt,
+                )
+            }
+            FormKind::SignIn => return self.open_sign_in(),
         };
         let form = FormScreen::new(scale, &self.fonts, spec);
         self.screen = Screen::Form(kind, Box::new(form), pack);
@@ -426,7 +638,7 @@ impl Menu {
         let addr = match kind {
             FormKind::Add | FormKind::Edit(_) => Some(1),
             FormKind::Direct => Some(0),
-            FormKind::Delete(_) => None,
+            FormKind::Delete(_) | FormKind::SignIn | FormKind::SignOut(_) => None,
         };
         if let Some(f) = addr {
             let ok = valid_address(form.field(f).value());
@@ -441,7 +653,12 @@ impl Menu {
     }
 
     /// Carries out `action`; returns it if the client must act on it (Quit).
-    fn act(&mut self, action: Action, renderer: Option<&mut Renderer>) -> Option<Action> {
+    fn act(
+        &mut self,
+        action: Action,
+        renderer: Option<&mut Renderer>,
+        clipboard: &dyn Clipboard,
+    ) -> Option<Action> {
         let scale = self.scale?;
         match (&mut self.screen, action) {
             (Screen::Title, Action::Multiplayer) => {
@@ -449,6 +666,7 @@ impl Menu {
                 self.screen = Screen::Servers;
             }
             (Screen::Title, Action::Quit) => return Some(Action::Quit),
+            (Screen::Title, Action::Accounts) => self.open_accounts(scale),
             (Screen::Title, other) => eprintln!("[ruthenium] {other:?}: not there yet"),
             (Screen::Servers, Action::Back) => {
                 // Without a renderer at hand (a key), the next frame frees the icons.
@@ -480,6 +698,51 @@ impl Menu {
                 if let Some(s) = &mut self.servers {
                     s.refresh();
                     s.sync_rows(&self.fonts);
+                }
+            }
+            (Screen::Accounts, Action::Back) => {
+                self.accounts_screen = None;
+                self.screen = Screen::Title;
+            }
+            (Screen::Accounts, Action::AddAccount) => {
+                self.accounts.sign_in(false);
+                self.open_sign_in();
+            }
+            (Screen::Accounts, Action::UseAccount) => {
+                let selected = self
+                    .accounts_screen
+                    .as_ref()
+                    .and_then(AccountsScreen::selected);
+                if let Some(i) = selected.filter(|&i| i > 0)
+                    && let Some(id) = self.accounts.list().get(i).map(|a| a.id.clone())
+                {
+                    self.accounts.use_account(&id);
+                    // The account moves to the top: the selection follows it.
+                    if let Some(a) = &mut self.accounts_screen {
+                        a.select(Some(0));
+                    }
+                    self.sync_accounts();
+                }
+            }
+            (Screen::Accounts, Action::SignOut) => {
+                if let Some(i) = self
+                    .accounts_screen
+                    .as_ref()
+                    .and_then(AccountsScreen::selected)
+                {
+                    self.open_form(FormKind::SignOut(i), scale);
+                }
+            }
+            (Screen::Form(FormKind::SignIn, ..), Action::UseCode) => {
+                self.accounts.sign_in(true);
+                self.sync_accounts();
+            }
+            (Screen::Form(FormKind::SignIn, ..), Action::OpenPage) => {
+                self.accounts.open_page_again()
+            }
+            (Screen::Form(FormKind::SignIn, ..), Action::CopyCode) => {
+                if let Some(Stage::Device(c)) = &self.stage_shown {
+                    clipboard.set(&c.user_code);
                 }
             }
             (Screen::Form(_, form, pack), Action::Cycle) => {
@@ -523,14 +786,37 @@ impl Menu {
                             s.sync_rows(&self.fonts);
                         }
                     }
+                    FormKind::SignOut(i) => {
+                        if let Some(id) = self.accounts.list().get(i).map(|a| a.id.clone()) {
+                            self.accounts.sign_out(&id);
+                        }
+                        if let Some(a) = &mut self.accounts_screen {
+                            a.select(None);
+                        }
+                    }
+                    // Try Again, the same way as before.
+                    FormKind::SignIn => {
+                        let device =
+                            matches!(self.stage_shown, Some(Stage::Failed { device: true, .. }));
+                        self.accounts.sign_in(device);
+                        self.open_sign_in();
+                        return None;
+                    }
                 }
-                self.screen = Screen::Servers;
+                self.screen = kind.parent();
+                self.sync_accounts();
             }
             (Screen::Form(kind, form, _), Action::Cancel | Action::Back) => {
-                if *kind == FormKind::Direct {
+                let kind = *kind;
+                if kind == FormKind::Direct {
                     self.last_direct = form.field(0).value().to_owned();
                 }
-                self.screen = Screen::Servers;
+                if kind == FormKind::SignIn {
+                    self.accounts.cancel_sign_in();
+                    self.stage_shown = None;
+                }
+                self.screen = kind.parent();
+                self.sync_accounts();
             }
             (_, other) => eprintln!("[ruthenium] {other:?}: not there yet"),
         }
@@ -565,7 +851,38 @@ impl Menu {
                     _ => nav,
                 }?;
                 let i = self.title_states.key(key, down)?;
-                Some(self.title.as_ref()?.buttons.get(i)?.action)
+                self.title.as_ref()?.action(i)
+            }
+            Screen::Accounts => {
+                let screen = self.accounts_screen.as_mut()?;
+                match scancode {
+                    SCANCODE_ESCAPE if down && !repeat => Some(Action::Back),
+                    SCANCODE_DELETE if down && !repeat && screen.selected().is_some() => {
+                        Some(Action::SignOut)
+                    }
+                    SCANCODE_UP | SCANCODE_DOWN if down => {
+                        screen
+                            .list
+                            .move_selection(if scancode == SCANCODE_UP { -1 } else { 1 });
+                        screen.states.set_focus(None, false);
+                        None
+                    }
+                    _ if nav.is_some() => {
+                        let i = screen.states.key(nav?, down)?;
+                        Some(screen.buttons[i].action)
+                    }
+                    SCANCODE_RETURN | SCANCODE_KP_ENTER | SCANCODE_SPACE if !repeat => {
+                        if screen.states.focus_visible() && screen.states.focused().is_some() {
+                            let i = screen.states.key(Key::Activate, down)?;
+                            Some(screen.buttons[i].action)
+                        } else if enter && down && screen.selected().is_some_and(|i| i > 0) {
+                            Some(Action::UseAccount)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
             }
             Screen::Servers => {
                 let s = self.servers.as_mut()?;
@@ -662,7 +979,7 @@ impl Menu {
             }
         };
         self.validate_form();
-        self.act(action?, None)
+        self.act(action?, None, clipboard)
     }
 
     /// Typed text, for the focused field.
@@ -675,8 +992,10 @@ impl Menu {
 
     /// The wheel turned `notches` (positive: up).
     pub fn wheel(&mut self, notches: f32) {
-        if let (Screen::Servers, Some(s)) = (&self.screen, &mut self.servers) {
-            s.screen.wheel(notches);
+        match (&self.screen, &mut self.servers, &mut self.accounts_screen) {
+            (Screen::Servers, Some(s), _) => s.screen.wheel(notches),
+            (Screen::Accounts, _, Some(a)) => a.list.wheel(notches),
+            _ => {}
         }
     }
 
@@ -692,6 +1011,7 @@ impl Menu {
         pixel_size: (u32, u32),
         window_size: (u32, u32),
         renderer: &mut Renderer,
+        clipboard: &dyn Clipboard,
     ) -> Option<Action> {
         self.mouse = Some((x, y));
         let scale = self.layout(pixel_size);
@@ -706,7 +1026,21 @@ impl Menu {
                     None
                 } else {
                     let i = self.title_states.mouse_up(hit)?;
-                    Some(title.buttons[i].action)
+                    title.action(i)
+                }
+            }
+            Screen::Accounts => {
+                let screen = self.accounts_screen.as_mut()?;
+                let hit = screen.hit_button(ux, uy);
+                if down {
+                    screen.states.mouse_down(hit);
+                    let double = hit.is_none() && screen.list.click_row(ux, uy, time);
+                    // A double click on another account switches to it.
+                    (double && screen.selected().is_some_and(|i| i > 0))
+                        .then_some(Action::UseAccount)
+                } else {
+                    let i = screen.states.mouse_up(hit)?;
+                    Some(screen.buttons[i].action)
                 }
             }
             Screen::Servers => {
@@ -729,7 +1063,7 @@ impl Menu {
                 }
             }
         };
-        self.act(action?, Some(renderer))
+        self.act(action?, Some(renderer), clipboard)
     }
 
     /// Moves the menus' textures along: picks them up when prepared, then uploads them.
@@ -842,6 +1176,7 @@ impl Menu {
             s.poll();
             s.prepare(renderer, &self.fonts);
         }
+        self.sync_accounts();
         let (atlas, texture, logo) = match &self.atlas {
             Atlas::Ready {
                 atlas,
@@ -879,6 +1214,13 @@ impl Menu {
                     s.screen.pointer(pointer);
                     s.screen.update(dt);
                     s.screen.draw(&mut self.shapes, &mut self.text, atlas, time);
+                }
+            }
+            Screen::Accounts => {
+                if let Some(a) = &mut self.accounts_screen {
+                    a.pointer(pointer);
+                    a.update(dt);
+                    a.draw(&mut self.shapes, &mut self.text, atlas);
                 }
             }
             Screen::Form(_, form, _) => {
@@ -925,6 +1267,43 @@ impl Menu {
         self.open_form(kind, scale);
     }
 
+    /// Development: opens the Accounts screen, or one of its forms without signing in
+    /// (for screenshots): "accounts", "sign-in", "code", "sign-in-failed", "sign-out".
+    pub fn open_accounts_named(&mut self, name: &str, pixel_size: (u32, u32)) {
+        let scale = self.layout(pixel_size);
+        self.open_accounts(scale);
+        self.preview_stage = match name {
+            "sign-in" => Some(Stage::Browser {
+                url: "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize".into(),
+            }),
+            "code" => Some(Stage::Device(ruthenium_auth::DeviceCode {
+                user_code: "R7KX4QPM".into(),
+                verification_uri: "https://www.microsoft.com/link".into(),
+                message: String::new(),
+                expires_in: 900,
+            })),
+            "sign-in-failed" => Some(Stage::Failed {
+                error: ruthenium_auth::AuthError::NotApproved,
+                device: false,
+            }),
+            "sign-out" => {
+                self.open_form(FormKind::SignOut(0), scale);
+                None
+            }
+            _ => None,
+        };
+        if self.preview_stage.is_some() {
+            self.open_sign_in();
+        }
+    }
+
+    /// Development: selects account `i` in the Accounts list.
+    pub fn select_account(&mut self, i: usize) {
+        if let Some(a) = &mut self.accounts_screen {
+            a.select(Some(i));
+        }
+    }
+
     /// Development: selects server `i` in the list.
     pub fn select_server(&mut self, i: usize) {
         if let Some(s) = &mut self.servers {
@@ -940,6 +1319,7 @@ mod tests {
     use ruthenium_net::server_list::ServerList;
 
     use super::*;
+    use crate::account::tests::accounts_in;
 
     #[derive(Default)]
     struct FakeClipboard(RefCell<Option<String>>);
@@ -966,24 +1346,159 @@ mod tests {
         a.or(b)
     }
 
+    /// Lets the accounts thread work until `done` holds (or fails after a few seconds).
+    fn until(m: &mut Menu, done: impl Fn(&Menu) -> bool) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            m.sync_accounts();
+            if done(m) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out: {:?}",
+                m.accounts
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ruthenium-menu-{name}-{}", std::process::id()))
+    }
+
+    fn names(m: &Menu) -> Vec<String> {
+        m.accounts.list().iter().map(|a| a.name.clone()).collect()
+    }
+
     #[test]
     fn privileges_can_turn_multiplayer_off() {
-        let mut m = Menu::new(None);
+        let dir = temp("privileges");
+        let (accounts, _) = accounts_in(&dir, &["Child", "Alex"], None);
+        let mut m = Menu::new(None, accounts);
         m.layout((1600, 900));
-        assert!(m.title_states.enabled(0));
-        m.set_account(AccountStatus::SignedIn {
-            name: "Alex".into(),
-            may_play_online: false,
+        until(&mut m, |m| {
+            matches!(m.accounts.status(), AccountStatus::SignedIn { .. })
         });
         assert!(!m.title_states.enabled(0));
         // A new layout (window resize) keeps it off.
         m.layout((1280, 720));
         assert!(!m.title_states.enabled(0));
-        m.set_account(AccountStatus::SignedIn {
-            name: "Alex".into(),
-            may_play_online: true,
-        });
+        m.accounts.use_account("id-Alex");
+        until(
+            &mut m,
+            |m| matches!(m.accounts.status(), AccountStatus::SignedIn { name, .. } if name == "Alex"),
+        );
         assert!(m.title_states.enabled(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accounts_sign_in_switch_and_sign_out() {
+        let dir = temp("accounts");
+        let (accounts, pages) = accounts_in(&dir, &["Alex"], Some(Ok("Notch")));
+        let clip = FakeClipboard::default();
+        let mut m = Menu::new(None, accounts);
+        m.layout((1600, 900));
+        // The account chip is the last control on the title: Tab reaches it.
+        let chip = m.title.as_ref().unwrap().controls() - 1;
+        for _ in 0..=chip {
+            press(&mut m, SCANCODE_TAB, false, false, &clip);
+        }
+        assert_eq!(m.title_states.focused(), Some(chip));
+        press(&mut m, SCANCODE_RETURN, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Accounts));
+
+        // Add Account signs in in the browser, then comes back to the list.
+        m.act(Action::AddAccount, None, &clip);
+        assert!(matches!(m.screen, Screen::Form(FormKind::SignIn, ..)));
+        until(&mut m, |m| matches!(m.screen, Screen::Accounts));
+        assert_eq!(
+            pages.lock().unwrap().as_slice(),
+            ["https://login.example/authorize"]
+        );
+        assert_eq!(names(&m), ["Notch", "Alex"]);
+
+        // Down twice selects Alex; Enter switches to it, and the selection follows.
+        press(&mut m, SCANCODE_DOWN, false, false, &clip);
+        press(&mut m, SCANCODE_DOWN, false, false, &clip);
+        press(&mut m, SCANCODE_RETURN, false, false, &clip);
+        assert_eq!(names(&m), ["Alex", "Notch"]);
+        assert_eq!(m.accounts_screen.as_ref().unwrap().selected(), Some(0));
+
+        // Delete asks first; confirming signs Alex out and Notch takes over.
+        press(&mut m, SCANCODE_DELETE, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Form(FormKind::SignOut(0), ..)));
+        m.act(Action::Confirm, None, &clip);
+        assert!(matches!(m.screen, Screen::Accounts));
+        until(
+            &mut m,
+            |m| matches!(m.accounts.status(), AccountStatus::SignedIn { name, .. } if name == "Notch"),
+        );
+        assert_eq!(names(&m), ["Notch"]);
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Title));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signing_in_with_a_code() {
+        let dir = temp("code");
+        let (accounts, _) = accounts_in(&dir, &[], None);
+        let clip = FakeClipboard::default();
+        let mut m = Menu::new(None, accounts);
+        m.layout((1600, 900));
+        m.act(Action::Accounts, None, &clip);
+        m.act(Action::AddAccount, None, &clip);
+        until(&mut m, |m| {
+            matches!(m.stage_shown, Some(Stage::Browser { .. }))
+        });
+        m.act(Action::UseCode, None, &clip);
+        until(&mut m, |m| matches!(m.stage_shown, Some(Stage::Device(_))));
+        m.act(Action::CopyCode, None, &clip);
+        assert_eq!(clip.get().as_deref(), Some("ABCD-1234"));
+        // Escape gives the sign-in up.
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Accounts));
+        assert!(m.accounts.stage().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_sign_in_says_why_and_can_try_again() {
+        let dir = temp("failed");
+        let (accounts, _) =
+            accounts_in(&dir, &[], Some(Err(ruthenium_auth::AuthError::NotApproved)));
+        let clip = FakeClipboard::default();
+        let mut m = Menu::new(None, accounts);
+        m.layout((1600, 900));
+        m.act(Action::Accounts, None, &clip);
+        m.act(Action::AddAccount, None, &clip);
+        until(&mut m, |m| {
+            matches!(m.stage_shown, Some(Stage::Failed { .. }))
+        });
+        let Screen::Form(FormKind::SignIn, form, _) = &m.screen else {
+            panic!("not the sign-in form");
+        };
+        assert_eq!(form.spec.title, "Couldn't sign in");
+        assert!(form.spec.message[0].contains("approved"));
+        // Try Again starts over (the fake now waits), Back gives up.
+        m.act(Action::Confirm, None, &clip);
+        until(&mut m, |m| {
+            matches!(m.stage_shown, Some(Stage::Browser { .. }))
+        });
+        m.act(Action::Cancel, None, &clip);
+        assert!(matches!(m.screen, Screen::Accounts));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn device_page_addresses_read_short() {
+        assert_eq!(
+            short_url("https://www.microsoft.com/link"),
+            "microsoft.com/link"
+        );
+        assert_eq!(short_url("http://example.com/"), "example.com");
     }
 
     #[test]
@@ -996,16 +1511,16 @@ mod tests {
         list.save(&path).unwrap();
         let clip = FakeClipboard::default();
 
-        let mut m = Menu::new(Some(path.clone()));
+        let mut m = Menu::new(Some(path.clone()), Accounts::disabled());
         m.layout((1600, 900));
-        assert_eq!(m.act(Action::Multiplayer, None), None);
+        assert_eq!(m.act(Action::Multiplayer, None, &clip), None);
         assert!(matches!(m.screen, Screen::Servers));
         // Down selects the first server; Enter would join it.
         press(&mut m, SCANCODE_DOWN, false, false, &clip);
         assert_eq!(m.servers.as_ref().unwrap().screen.selected(), Some(0));
 
         // Add Server: the name field has focus and takes text; V is just a letter.
-        m.act(Action::AddServer, None);
+        m.act(Action::AddServer, None, &clip);
         assert!(m.wants_text_input());
         m.text_input("Vanilla");
         // Done stays off until the address is valid.
@@ -1027,9 +1542,9 @@ mod tests {
 
         // Edit it: the resource pack choice cycles.
         m.servers.as_mut().unwrap().screen.select(Some(1));
-        m.act(Action::EditServer, None);
-        m.act(Action::Cycle, None);
-        m.act(Action::Confirm, None);
+        m.act(Action::EditServer, None, &clip);
+        m.act(Action::Cycle, None, &clip);
+        m.act(Action::Confirm, None, &clip);
         assert_eq!(
             ServerList::load(&path).servers[1].pack_status,
             PackStatus::Enabled
@@ -1042,19 +1557,19 @@ mod tests {
         press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
         assert!(matches!(m.screen, Screen::Servers));
         press(&mut m, SCANCODE_DELETE, false, false, &clip);
-        m.act(Action::Confirm, None);
+        m.act(Action::Confirm, None, &clip);
         let saved = ServerList::load(&path);
         assert_eq!(saved.servers.len(), 1);
         assert_eq!(saved.servers[0].name, "Vanilla");
 
         // Direct Connect keeps the address as a hidden server; Escape goes back.
-        m.act(Action::DirectConnect, None);
+        m.act(Action::DirectConnect, None, &clip);
         m.text_input("direct.example");
         press(&mut m, SCANCODE_RETURN, false, false, &clip);
         assert_eq!(ServerList::load(&path).hidden[0].ip, "direct.example");
         assert_eq!(m.last_direct, "direct.example");
         press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
         assert!(matches!(m.screen, Screen::Title));
-        std::fs::remove_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
