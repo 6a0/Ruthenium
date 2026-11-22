@@ -120,6 +120,36 @@ pub fn write_f32(out: &mut Vec<u8>, v: f32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
+/// `LpVec3.write` (the server's side; for tests).
+pub fn write_lp_vec3(out: &mut Vec<u8>, v: [f64; 3]) {
+    let sanitize = |x: f64| {
+        if x.is_nan() {
+            0.0
+        } else {
+            x.clamp(-1.7179869183E10, 1.7179869183E10)
+        }
+    };
+    let [x, y, z] = v.map(sanitize);
+    let length = x.abs().max(y.abs()).max(z.abs());
+    if length < 3.051944088384301E-5 {
+        out.push(0);
+        return;
+    }
+    let scale = length.ceil() as i64;
+    let partial = scale & 3 != scale;
+    let markers = if partial { scale & 3 | 4 } else { scale };
+    // Java's Math.round on a value that is never negative here.
+    let pack = |x: f64| ((x * 0.5 + 0.5) * 32766.0 + 0.5).floor() as i64;
+    let s = scale as f64;
+    let buffer = markers | pack(x / s) << 3 | pack(y / s) << 18 | pack(z / s) << 33;
+    out.push(buffer as u8);
+    out.push((buffer >> 8) as u8);
+    out.extend_from_slice(&((buffer >> 16) as i32).to_be_bytes());
+    if partial {
+        write_varint(out, (scale >> 2) as i32);
+    }
+}
+
 pub fn write_f64(out: &mut Vec<u8>, v: f64) {
     out.extend_from_slice(&v.to_be_bytes());
 }
@@ -252,6 +282,30 @@ impl<'a> Reader<'a> {
         Ok(f32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
     }
 
+    /// `LpVec3.read`: a vector in 15 bits per axis times a shared integer scale (velocities
+    /// in entity packets); one zero byte is the zero vector.
+    pub fn lp_vec3(&mut self) -> Result<[f64; 3], WireError> {
+        let lowest = self.u8()?;
+        if lowest == 0 {
+            return Ok([0.0; 3]);
+        }
+        let middle = self.u8()?;
+        let highest = self.bytes(4)?;
+        let highest = u32::from_be_bytes([highest[0], highest[1], highest[2], highest[3]]);
+        let buffer = i64::from(highest) << 16 | i64::from(middle) << 8 | i64::from(lowest);
+        let mut scale = i64::from(lowest & 3);
+        if lowest & 4 == 4 {
+            scale |= (i64::from(self.varint()?) & 0xFFFF_FFFF) << 2;
+        }
+        let unpack = |v: i64| ((v & 32767) as f64).min(32766.0) * 2.0 / 32766.0 - 1.0;
+        let s = scale as f64;
+        Ok([
+            unpack(buffer >> 3) * s,
+            unpack(buffer >> 18) * s,
+            unpack(buffer >> 33) * s,
+        ])
+    }
+
     pub fn f64(&mut self) -> Result<f64, WireError> {
         Ok(f64::from_be_bytes(self.bytes(8)?.try_into().unwrap()))
     }
@@ -353,6 +407,48 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn low_precision_vectors_read_as_vanilla_writes_them() {
+        // Two armor-stand knockbacks from the combat_basics golden trace.
+        let read = |b: &[u8]| Reader::new(b).lp_vec3().unwrap();
+        let unit = |q: i64| (q as f64).min(32766.0) * 2.0 / 32766.0 - 1.0;
+        let a = read(&[0x39, 0xf7, 0x82, 0x82, 0xff, 0xfd]);
+        let buffer: i64 = 0x8282fffd << 16 | 0xf7 << 8 | 0x39;
+        assert_eq!(
+            a,
+            [
+                unit(buffer >> 3 & 32767),
+                unit(buffer >> 18 & 32767),
+                unit(buffer >> 33 & 32767)
+            ]
+        );
+        assert!((a[0] + 0.017090886894952084).abs() < 1e-18 && a[1] == 0.0);
+        let b = read(&[0x59, 0xff, 0x80, 0x2c, 0xe1, 0x45]);
+        assert!((b[1] + 0.12000244155527073).abs() < 1e-18);
+        assert_eq!(read(&[0]), [0.0; 3]);
+        // Round trips within the format's precision, large scales with the varint too.
+        for v in [
+            [0.0, 0.4, 0.0],
+            [-0.36, 0.3608, 0.21],
+            [3.5, -1.25, 0.001],
+            [40.0, 0.0, -12.5],
+            [1e-6, 0.0, 0.0],
+        ] {
+            let mut out = Vec::new();
+            write_lp_vec3(&mut out, v);
+            let mut r = Reader::new(&out);
+            let back = r.lp_vec3().unwrap();
+            r.finish().unwrap();
+            let scale = v.iter().fold(0.0f64, |m, x| m.max(x.abs())).ceil().max(1.0);
+            for i in 0..3 {
+                assert!(
+                    (back[i] - v[i]).abs() <= scale / 32766.0,
+                    "{v:?} -> {back:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn varints_round_trip() {

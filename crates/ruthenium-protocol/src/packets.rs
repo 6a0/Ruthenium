@@ -779,6 +779,15 @@ pub mod play {
             tick_rate: f32,
             frozen: bool,
         },
+        /// An entity's new velocity (knockback, for the local player).
+        SetEntityMotion {
+            entity_id: i32,
+            movement: [f64; 3],
+        },
+        /// An explosion: only the push it gives the local player is read.
+        Explode {
+            player_knockback: Option<[f64; 3]>,
+        },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
     }
@@ -915,6 +924,26 @@ pub mod play {
                     tick_rate: r.f32()?,
                     frozen: r.bool()?,
                 },
+                C::SetEntityMotion => Clientbound::SetEntityMotion {
+                    entity_id: r.varint()?,
+                    movement: r.lp_vec3()?,
+                },
+                C::Explode => {
+                    // Centre, radius, block count, then the player's knockback; the
+                    // particles and sound after it aren't read.
+                    for _ in 0..3 {
+                        r.f64()?;
+                    }
+                    r.f32()?;
+                    r.i32()?;
+                    let player_knockback = if r.bool()? {
+                        Some([r.f64()?, r.f64()?, r.f64()?])
+                    } else {
+                        None
+                    };
+                    r.rest();
+                    Clientbound::Explode { player_knockback }
+                }
                 other => {
                     r.rest();
                     Clientbound::Other(other)

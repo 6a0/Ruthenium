@@ -842,6 +842,31 @@ impl Game {
                     apply_attributes(&mut w.player, &attributes);
                 }
             }
+            play::Clientbound::SetEntityMotion {
+                entity_id,
+                movement,
+            } => {
+                // `lerpMotion`: the velocity is replaced (knockback).
+                if let Some(w) = &mut self.world
+                    && entity_id == w.player.entity_id
+                {
+                    w.player.delta = movement;
+                }
+            }
+            play::Clientbound::Explode {
+                player_knockback: Some(k),
+            } => {
+                // `pushFromExplosion`: added to the velocity, if finite.
+                if let Some(w) = &mut self.world
+                    && k.iter().all(|v| v.is_finite())
+                {
+                    let d = &mut w.player.delta;
+                    *d = [d[0] + k[0], d[1] + k[1], d[2] + k[2]];
+                }
+            }
+            play::Clientbound::Explode {
+                player_knockback: None,
+            } => {}
             play::Clientbound::SetHeldSlot { slot } => {
                 // `Inventory.isHotbarSlot`.
                 if let Some(w) = &mut self.world
