@@ -15,3 +15,4 @@ profiling = "1.0.18"
 ruthenium-gpu = { path = "../ruthenium-gpu" }
 ruthenium-platform = { path = "../ruthenium-platform" }
 ruthenium-shaders = { path = "../ruthenium-shaders" }
+ruthenium-ui = { path = "../ruthenium-ui" }

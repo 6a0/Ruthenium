@@ -112,6 +112,8 @@ pub struct Target {
     pub view: vk::ImageView,
     pub extent: vk::Extent2D,
     pub format: vk::Format,
+    /// The image may be copied from (see [`crate::Screenshot`]).
+    pub readable: bool,
     index: u32,
 }
 
@@ -438,6 +440,7 @@ impl FrameLoop {
                     view: sc.views[i],
                     extent: sc.extent,
                     format: sc.format,
+                    readable: sc.readable,
                     index,
                 }))
             }

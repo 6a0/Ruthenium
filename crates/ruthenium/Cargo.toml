@@ -23,3 +23,4 @@ ruthenium-gpu = { path = "../ruthenium-gpu" }
 ruthenium-platform = { path = "../ruthenium-platform" }
 ruthenium-prepare = { path = "../ruthenium-prepare" }
 ruthenium-render = { path = "../ruthenium-render" }
+ruthenium-ui = { path = "../ruthenium-ui" }

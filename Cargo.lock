@@ -506,6 +506,7 @@ dependencies = [
  "ruthenium-platform",
  "ruthenium-prepare",
  "ruthenium-render",
+ "ruthenium-ui",
 ]
 
 [[package]]
@@ -567,6 +568,7 @@ dependencies = [
  "ruthenium-gpu",
  "ruthenium-platform",
  "ruthenium-shaders",
+ "ruthenium-ui",
 ]
 
 [[package]]
@@ -579,6 +581,13 @@ version = "0.0.0"
 dependencies = [
  "ruthenium-data",
  "serde_json",
+]
+
+[[package]]
+name = "ruthenium-ui"
+version = "0.0.0"
+dependencies = [
+ "ruthenium-assets",
 ]
 
 [[package]]

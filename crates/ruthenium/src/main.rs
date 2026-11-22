@@ -4,6 +4,7 @@
 
 mod assets_cmd;
 mod client;
+mod menu;
 mod prepare_cmd;
 
 use std::process::ExitCode;
@@ -32,6 +33,8 @@ With no command, opens the game window. Options:
   --no-transfer-queue    upload on the graphics queue even if there is a copy queue
   --exercise-uploads     check data pushed through the upload ring every frame
                          (development; a mismatch fails the run)
+  --screenshot <file>    write the window to a PNG, then quit
+                         (development)
 In the window, V toggles VSync and F3 the frame-stats overlay.
 
 commands:

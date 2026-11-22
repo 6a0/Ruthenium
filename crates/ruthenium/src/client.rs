@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use ruthenium_gpu::{GpuOptions, PresentPolicy, Presented, Validation};
 use ruthenium_platform::{DEFAULT_SIZE, Event, Platform, Sleeper, next_deadline};
 use ruthenium_render::{Background, FrameTimes, OverlayStats, Renderer, Summary, create_gpu};
+use ruthenium_ui::modern::Action;
+
+use crate::menu::Menu;
 
 /// SDL scancode of the V key: toggles VSync (development aid until options exist).
 const SCANCODE_V: u32 = 25;
@@ -51,6 +54,8 @@ pub struct Options {
     /// Development: push checked data through the upload ring every frame (run it under
     /// validation); a mismatch fails the run.
     pub exercise_uploads: bool,
+    /// Development: write the window's contents to this PNG once the menus show, then quit.
+    pub screenshot: Option<std::path::PathBuf>,
 }
 
 impl Options {
@@ -73,6 +78,7 @@ impl Options {
             no_transfer_queue: false,
             exercise_uploads: false,
             bench_out: None,
+            screenshot: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -107,6 +113,7 @@ impl Options {
                 "--no-transfer-queue" => o.no_transfer_queue = true,
                 "--exercise-uploads" => o.exercise_uploads = true,
                 "--bench-out" => o.bench_out = Some(value("a file")?.into()),
+                "--screenshot" => o.screenshot = Some(value("a file")?.into()),
                 other => return Err(format!("unknown option {other}")),
             }
         }
@@ -138,6 +145,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     #[cfg(feature = "tracy")]
     profiling::tracy_client::Client::start();
 
+    let mut menu = Menu::new();
     let mut platform = Platform::init(env!("CARGO_PKG_VERSION"))?;
     let window = platform.create_window("Ruthenium", DEFAULT_SIZE.0, DEFAULT_SIZE.1)?;
     let t_window = started.elapsed();
@@ -201,6 +209,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut resized = None;
     let mut toggle_vsync = false;
     let mut toggle_overlay = false;
+    let mut clicks: Vec<(f32, f32)> = Vec::with_capacity(4);
+    let mut screenshot_requested = false;
     let mut frames: u64 = 0;
 
     loop {
@@ -238,8 +248,26 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 repeat: false,
                 ..
             } => toggle_overlay = true,
+            Event::MouseMotion { x, y } => menu.mouse_moved(x, y),
+            Event::MouseButton {
+                button: 1,
+                down: true,
+                x,
+                y,
+                ..
+            } => {
+                menu.mouse_moved(x, y);
+                clicks.push((x, y));
+            }
             _ => {}
         });
+        for (x, y) in clicks.drain(..) {
+            match menu.click(x, y, window.pixel_size(), window.size()) {
+                Some(Action::Quit) => quit = true,
+                Some(other) => eprintln!("[ruthenium] {other:?}: not there yet"),
+                None => {}
+            }
+        }
         if quit {
             break;
         }
@@ -280,7 +308,37 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         // 3. Simulation: nothing yet.
 
         // 4. Render.
-        let report = renderer.render(&BACKGROUND)?;
+        let gui = menu.frame(window.pixel_size(), window.size());
+        if opts.screenshot.is_some() && !screenshot_requested {
+            renderer.request_screenshot();
+            screenshot_requested = true;
+        }
+        let report = renderer.render(&BACKGROUND, Some(gui))?;
+        if let Some(path) = &opts.screenshot
+            && let Some((w, h, rgba)) = renderer.take_screenshot()?
+        {
+            let png = ruthenium_assets::Image {
+                width: w,
+                height: h,
+                pixels: rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| {
+                        ruthenium_assets::image::argb(
+                            p[3].into(),
+                            p[0].into(),
+                            p[1].into(),
+                            p[2].into(),
+                        )
+                    })
+                    .collect(),
+            }
+            .encode_png();
+            std::fs::write(path, png)?;
+            eprintln!("[ruthenium] screenshot written to {}", path.display());
+            break;
+        }
         let now = Instant::now();
         profiling::finish_frame!();
 

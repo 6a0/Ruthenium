@@ -60,6 +60,8 @@ pub(crate) struct Swapchain {
     pub format: vk::Format,
     pub extent: vk::Extent2D,
     pub present_mode: vk::PresentModeKHR,
+    /// The images can be copied from (development screenshots).
+    pub readable: bool,
     pub images: Vec<vk::Image>,
     pub views: Vec<vk::ImageView>,
     /// One per image: signalled by the frame's submit, waited by its present. Indexed by
@@ -124,7 +126,9 @@ impl Swapchain {
         .into_iter()
         .find(|&a| caps.supported_composite_alpha.contains(a))
         .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
-        let usage = (vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST)
+        let usage = (vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::TRANSFER_SRC)
             & caps.supported_usage_flags;
 
         let info = vk::SwapchainCreateInfoKHR::default()
@@ -149,6 +153,7 @@ impl Swapchain {
             format: format.format,
             extent,
             present_mode,
+            readable: usage.contains(vk::ImageUsageFlags::TRANSFER_SRC),
             images: Vec::new(),
             views: Vec::new(),
             render_done: Vec::new(),

@@ -142,6 +142,45 @@ struct Mark {
 
 /// Byte positions in the ring. Positions only grow (a `u64` does not wrap in practice);
 /// position `p` is byte `p % capacity` of the buffer.
+/// Frames a refused large upload keeps its claim without retrying.
+const WAITING_FRAMES: u64 = 2;
+
+/// The per-frame budget's fairness rule. An upload larger than the budget only goes in a
+/// frame with nothing else staged, so a steady stream of small uploads (staged right after
+/// each frame records) could starve it forever. Once such an upload is refused, smaller
+/// ones are refused too unless both would fit, until one at least that large goes; a claim
+/// its caller stops retrying lapses after [`WAITING_FRAMES`].
+#[derive(Debug, Default, Clone, Copy)]
+struct Waiting {
+    /// Size of the largest refused upload, and the frame it was last refused in.
+    claim: Option<(u64, u64)>,
+}
+
+impl Waiting {
+    /// Whether `bytes` more may be staged now, with `staged` already staged for `frame`.
+    fn admit(&mut self, staged: u64, bytes: u64, budget: u64, frame: u64) -> bool {
+        if let Some((_, at)) = self.claim
+            && frame > at + WAITING_FRAMES
+        {
+            self.claim = None;
+        }
+        let claimed = self.claim.map_or(0, |(size, _)| size);
+        let fits = if bytes < claimed {
+            staged + bytes + claimed <= budget
+        } else {
+            staged == 0 || staged + bytes <= budget
+        };
+        if fits {
+            if bytes >= claimed {
+                self.claim = None;
+            }
+        } else if bytes >= claimed {
+            self.claim = Some((bytes, frame));
+        }
+        fits
+    }
+}
+
 #[derive(Debug)]
 struct Ring {
     capacity: u64,
@@ -536,6 +575,8 @@ pub struct UploadRing {
     budget: u64,
     /// Bytes staged for the next frame.
     staged: u64,
+    /// Keeps a large upload from being starved by a stream of small ones.
+    waiting: Waiting,
     /// The dedicated transfer queue, if the device has one in use.
     transfer: Option<Transfer>,
     /// The ticket of uploads staged now: the number the next recorded frame will have, at
@@ -620,6 +661,7 @@ impl UploadRing {
             align,
             budget,
             staged: 0,
+            waiting: Waiting::default(),
             transfer,
             next_frame: 1,
             recorded: 0,
@@ -688,9 +730,11 @@ impl UploadRing {
     }
 
     /// Whether `bytes` more fit in this frame's budget. Anything fits in an empty frame, so
-    /// an upload larger than the budget still goes, alone.
-    fn within_budget(&self, bytes: u64) -> bool {
-        self.staged == 0 || self.staged + bytes <= self.budget
+    /// an upload larger than the budget still goes, alone; see [`Waiting`] for how it gets
+    /// that empty frame.
+    fn within_budget(&mut self, bytes: u64) -> bool {
+        self.waiting
+            .admit(self.staged, bytes, self.budget, self.next_frame)
     }
 
     /// Reserves space for the next frame and copies `data` into it.
@@ -1093,6 +1137,30 @@ impl Drop for UploadRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_upload_is_not_starved_by_small_ones() {
+        let mut w = Waiting::default();
+        let budget = 100;
+        // Frame 1: small uploads staged first; the large one is refused and claims.
+        assert!(w.admit(0, 10, budget, 1));
+        assert!(!w.admit(10, 400, budget, 1));
+        // Frame 2: small uploads now wait (10 + 400 > 100) ...
+        assert!(!w.admit(0, 10, budget, 2));
+        // ... so the large one finds the frame empty and goes alone.
+        assert!(w.admit(0, 400, budget, 2));
+        // Then small ones go again.
+        assert!(w.admit(0, 10, budget, 3));
+        // A claim nobody retries lapses.
+        assert!(!w.admit(10, 400, budget, 4));
+        assert!(!w.admit(0, 10, budget, 5));
+        assert!(w.admit(0, 10, budget, 4 + WAITING_FRAMES + 1));
+        // Small uploads that fit beside a claim under the budget still go.
+        let mut w = Waiting::default();
+        assert!(!w.admit(60, 50, budget, 1));
+        assert!(w.admit(0, 10, budget, 2));
+        assert!(w.admit(10, 50, budget, 2));
+    }
 
     #[test]
     fn hands_out_aligned_blocks_until_full() {

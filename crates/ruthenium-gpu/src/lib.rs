@@ -15,6 +15,7 @@ mod frame_data;
 mod instance;
 mod memory;
 mod pipeline;
+mod screenshot;
 mod swapchain;
 mod textures;
 mod upload;
@@ -33,6 +34,7 @@ pub use pipeline::{
     Blend, GraphicsDesc, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout,
     Pipelines,
 };
+pub use screenshot::Screenshot;
 pub use swapchain::{COLOR_RANGE, PresentPolicy};
 pub use textures::{
     Arrival, MAX_MIP_LEVELS, SAMPLER_COUNT, SamplerId, TextureDesc, TextureId, TextureTable,

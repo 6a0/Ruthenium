@@ -1,12 +1,15 @@
 //! Ruthenium's renderer. For now: GPU start-up for a window, the pipeline set, the upload
-//! ring and texture table, and a frame that draws the menu background, recorded and
-//! presented through [`ruthenium_gpu::FrameLoop`].
+//! ring and texture table, and a frame that draws the menu background and the GUI's draw
+//! list, recorded and presented through [`ruthenium_gpu::FrameLoop`].
 
+mod backdrop;
+mod gui;
 mod overlay;
 mod pipelines;
 mod starfield;
 mod stats;
 
+pub use gui::GuiFrame;
 pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
 pub use stats::{FrameTimes, Summary};
@@ -17,8 +20,8 @@ use std::sync::Arc;
 use ruthenium_gpu::{
     Arrival, COLOR_RANGE, FrameData, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
     PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented,
-    TextureDesc, TextureId, TextureTable, UploadCheck, UploadCheckReport, UploadRing, Validation,
-    vk,
+    Screenshot, TextureDesc, TextureId, TextureTable, UploadCheck, UploadCheckReport, UploadRing,
+    Validation, vk,
 };
 use ruthenium_platform::{Platform, Window};
 
@@ -95,6 +98,13 @@ pub struct Renderer {
     stars: TextureId,
     /// `--exercise-uploads`.
     check: Option<UploadCheck>,
+    /// The next presented frame is copied for a screenshot.
+    screenshot_requested: bool,
+    screenshot: Option<Screenshot>,
+    /// The menus' backdrop, while frames draw shapes.
+    backdrop: Option<backdrop::Backdrop>,
+    /// The window's size as last acquired: the size the backdrop is made for.
+    window_extent: vk::Extent2D,
 }
 
 impl Renderer {
@@ -152,6 +162,13 @@ impl Renderer {
             cache,
             stars,
             check: None,
+            screenshot_requested: false,
+            screenshot: None,
+            backdrop: None,
+            window_extent: vk::Extent2D {
+                width: pixel_size.0,
+                height: pixel_size.1,
+            },
         })
     }
 
@@ -177,6 +194,39 @@ impl Renderer {
         })
     }
 
+    /// Creates a texture and stages its levels (see [`TextureTable::create_with`]). A
+    /// full upload ring is an error the caller retries next frame.
+    pub fn create_texture(
+        &mut self,
+        desc: TextureDesc,
+        mips: &[&[u8]],
+        arrival: Arrival,
+    ) -> Result<TextureId, ruthenium_gpu::Error> {
+        self.textures
+            .create_with(&mut self.uploads, desc, mips, arrival)
+    }
+
+    /// Whether frames recorded from now on may sample `id`.
+    pub fn texture_ready(&self, id: TextureId) -> bool {
+        self.textures.is_ready(id)
+    }
+
+    /// Copies the next frame drawn into the window (see [`Self::take_screenshot`]).
+    pub fn request_screenshot(&mut self) {
+        self.screenshot_requested = true;
+    }
+
+    /// A requested screenshot once its frame has finished: `(width, height, RGBA)`.
+    /// Swapchains that cannot be read give none, and the request stays pending.
+    pub fn take_screenshot(&mut self) -> Result<Option<(u32, u32, Vec<u8>)>, ruthenium_gpu::Error> {
+        match &self.screenshot {
+            Some(s) if s.done(&self.frames)? => {
+                Ok(self.screenshot.take().map(Screenshot::into_rgba))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// The development overlay (hidden until `set_visible`).
     pub fn overlay_mut(&mut self) -> &mut Overlay {
         &mut self.overlay
@@ -192,6 +242,30 @@ impl Renderer {
 
     pub fn frames_mut(&mut self) -> &mut FrameLoop {
         &mut self.frames
+    }
+
+    /// Creates the backdrop's images when shapes are drawn (before the texture table's
+    /// `begin_frame`, so this frame's set holds them), remakes them when the window size or
+    /// format changed, and frees them when no shapes are drawn.
+    fn update_backdrop(&mut self, wanted: bool) {
+        let (format, extent) = (self.pipelines.format(), self.window_extent);
+        let fits = self
+            .backdrop
+            .as_ref()
+            .is_some_and(|b| b.matches(format, extent));
+        if wanted && fits {
+            return;
+        }
+        if let Some(old) = self.backdrop.take() {
+            old.destroy(&mut self.textures);
+        }
+        if wanted && extent.width > 0 && extent.height > 0 {
+            match backdrop::Backdrop::new(&mut self.textures, format, extent) {
+                Ok(b) => self.backdrop = Some(b),
+                // Glass falls back to a flat tint.
+                Err(e) => eprintln!("[render] no glass backdrop: {e}"),
+            }
+        }
     }
 
     /// Rebuilds the pipelines if the swapchain's format changed (rare: a different monitor
@@ -213,11 +287,17 @@ impl Renderer {
         Ok(true)
     }
 
-    /// Records, submits and presents one frame showing `background`.
-    pub fn render(&mut self, background: &Background) -> Result<FrameReport, ruthenium_gpu::Error> {
+    /// Records, submits and presents one frame showing `background`, then the GUI.
+    pub fn render(
+        &mut self,
+        background: &Background,
+        gui: Option<GuiFrame<'_>>,
+    ) -> Result<FrameReport, ruthenium_gpu::Error> {
         profiling::scope!("render");
         let (mut ctx, gpu_time) = self.frames.begin()?;
         let completed = self.frames.completed()?;
+        let wants_backdrop = gui.is_some_and(|g| !g.shapes.is_empty());
+        self.update_backdrop(wants_backdrop);
         // SAFETY: ctx.cmd is recording frame ctx.number on the graphics queue; completed
         // was just read from the timeline; every upload destination is owned by self and
         // outlives the frame; the layout's set 0 is the texture table's.
@@ -249,6 +329,28 @@ impl Renderer {
                 // SAFETY: as above; outside a render pass.
                 unsafe { self.pipelines.record_warm_up(ctx.cmd, &self.layout)? };
             }
+            self.window_extent = t.extent;
+            // The backdrop for this size and format (else it is remade next frame).
+            let backdrop = match &mut self.backdrop {
+                Some(b) if wants_backdrop && b.matches(t.format, t.extent) => {
+                    let zone = self.frames.zone_begin(&ctx, "backdrop");
+                    // SAFETY: outside a render pass, sets bound; the images were created
+                    // before this frame's begin_frame.
+                    unsafe {
+                        b.record(
+                            self.frames.gpu(),
+                            ctx.cmd,
+                            &self.pipelines,
+                            &self.layout,
+                            background,
+                            self.stars,
+                        )
+                    };
+                    self.frames.zone_end(&ctx, zone);
+                    Some(b.textures())
+                }
+                _ => None,
+            };
             let zone = self.frames.zone_begin(&ctx, "window pass");
             let gpu = self.frames.gpu().clone();
             let cmd = ctx.cmd;
@@ -303,15 +405,63 @@ impl Renderer {
                     &vk::DependencyInfo::default().image_memory_barriers(&to_attachment),
                 );
                 gpu.cmd_begin_rendering(cmd, &rendering);
+                // With a backdrop, the background is already drawn: copy it.
+                let (pipeline, push) = match backdrop {
+                    Some((scene, _)) => {
+                        (PipelineId::Blur, backdrop::blur_push_copy(scene).to_vec())
+                    }
+                    None => (PipelineId::Background, push.to_vec()),
+                };
                 d.cmd_bind_pipeline(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
-                    self.pipelines.get(PipelineId::Background.index()),
+                    self.pipelines.get(pipeline.index()),
                 );
                 d.cmd_set_viewport(cmd, 0, &[viewport]);
                 d.cmd_set_scissor(cmd, 0, &[area]);
                 d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
                 d.cmd_draw(cmd, 3, 1, 0, 0);
+                if let Some(g) = gui.filter(|g| !g.quads.is_empty() && g.scale > 0)
+                    && let Some((first, bytes)) =
+                        self.frame_data.alloc(g.quads.len() as u32, gui::QUAD_BYTES)
+                {
+                    gui::write_quads(g.quads, bytes);
+                    let mut push = [0u8; 16];
+                    push[0..4].copy_from_slice(&(t.extent.width as f32).to_ne_bytes());
+                    push[4..8].copy_from_slice(&(t.extent.height as f32).to_ne_bytes());
+                    push[8..12].copy_from_slice(&(g.scale as f32).to_ne_bytes());
+                    push[12..16].copy_from_slice(&first.to_ne_bytes());
+                    d.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.get(PipelineId::Gui.index()),
+                    );
+                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
+                    d.cmd_draw(cmd, 6, g.quads.len() as u32, 0, 0);
+                }
+                if let Some(g) = gui.filter(|g| !g.shapes.is_empty())
+                    && let Some((first, bytes)) = self
+                        .frame_data
+                        .alloc(g.shapes.len() as u32, gui::SHAPE_BYTES)
+                {
+                    gui::write_shapes(g.shapes, bytes);
+                    let (scene, blurred) =
+                        backdrop.unwrap_or((TextureId::MISSING, TextureId::MISSING));
+                    let mut push = [0u8; 24];
+                    push[0..4].copy_from_slice(&(t.extent.width as f32).to_ne_bytes());
+                    push[4..8].copy_from_slice(&(t.extent.height as f32).to_ne_bytes());
+                    push[8..12].copy_from_slice(&scene.index().to_ne_bytes());
+                    push[12..16].copy_from_slice(&blurred.index().to_ne_bytes());
+                    push[16..20].copy_from_slice(&first.to_ne_bytes());
+                    push[20..24].copy_from_slice(&u32::from(backdrop.is_some()).to_ne_bytes());
+                    d.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.get(PipelineId::Shape.index()),
+                    );
+                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
+                    d.cmd_draw(cmd, 6, g.shapes.len() as u32, 0, 0);
+                }
                 let rects = self.overlay.build(t.extent.width, t.extent.height);
                 if let Some((first, bytes)) = self
                     .frame_data
@@ -332,10 +482,21 @@ impl Renderer {
                     d.cmd_draw(cmd, 6, rects.len() as u32, 0, 0);
                 }
                 gpu.cmd_end_rendering(cmd);
-                gpu.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_present),
-                );
+                let shot = if self.screenshot_requested && self.screenshot.is_none() {
+                    Screenshot::record(&gpu, &ctx, &t)?
+                } else {
+                    None
+                };
+                if let Some(s) = shot {
+                    // It made the transition to PRESENT_SRC itself.
+                    self.screenshot = Some(s);
+                    self.screenshot_requested = false;
+                } else {
+                    gpu.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().image_memory_barriers(&to_present),
+                    );
+                }
             }
             self.frames.zone_end(&ctx, zone);
         }

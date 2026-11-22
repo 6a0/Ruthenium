@@ -9,12 +9,24 @@ use ruthenium_shaders as shaders;
 pub enum PipelineId {
     /// Full-screen gradient behind the menus.
     Background,
+    /// The menus' blurred backdrop (downsample and Gaussian passes).
+    Blur,
+    /// GUI quads (ruthenium-ui's draw list).
+    Gui,
+    /// Rounded shapes and glass of the modern menus.
+    Shape,
     /// The development overlay's rectangles.
     Overlay,
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 2] = [PipelineId::Background, PipelineId::Overlay];
+    pub const ALL: [PipelineId; 5] = [
+        PipelineId::Background,
+        PipelineId::Blur,
+        PipelineId::Gui,
+        PipelineId::Shape,
+        PipelineId::Overlay,
+    ];
 
     pub fn index(self) -> usize {
         self as usize
@@ -28,6 +40,28 @@ impl PipelineId {
                 fragment: shaders::BACKGROUND_FRAG.words(),
                 topology: vk::PrimitiveTopology::TRIANGLE_LIST,
                 blend: Blend::Opaque,
+            },
+            PipelineId::Blur => GraphicsDesc {
+                name: "blur",
+                vertex: shaders::BACKGROUND_VERT.words(),
+                fragment: shaders::BLUR_FRAG.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                blend: Blend::Opaque,
+            },
+            PipelineId::Shape => GraphicsDesc {
+                name: "shape",
+                vertex: shaders::SHAPE_VERT.words(),
+                fragment: shaders::SHAPE_FRAG.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                blend: Blend::Alpha,
+            },
+            PipelineId::Gui => GraphicsDesc {
+                name: "gui",
+                vertex: shaders::GUI_VERT.words(),
+                fragment: shaders::GUI_FRAG.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                // Vanilla's TRANSLUCENT blend function.
+                blend: Blend::Alpha,
             },
             PipelineId::Overlay => GraphicsDesc {
                 name: "overlay",
@@ -88,6 +122,11 @@ mod tests {
             define(glsl, "TEXTURE_MISSING"),
             Some(ruthenium_gpu::TextureId::MISSING.index())
         );
+        let gui = include_str!("../../ruthenium-shaders/glsl/gui.frag");
+        assert!(gui.contains(&format!(
+            "#define GUI_NO_TEXTURE {:#X}u",
+            ruthenium_ui::NO_TEXTURE
+        )));
         let frame = include_str!("../../ruthenium-shaders/glsl/include/frame.glsl");
         assert_eq!(
             define(frame, "FRAME_DATA_SET"),

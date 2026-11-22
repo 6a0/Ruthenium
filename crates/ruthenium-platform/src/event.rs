@@ -2,7 +2,7 @@ use sdl3_sys::events::*;
 
 /// The subset of SDL events the client handles so far. Timestamps are SDL's nanosecond
 /// event timestamps (`SDL_GetTicksNS` clock).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event {
     /// The application was asked to quit (for example SIGTERM, or the last window closed).
     Quit,
@@ -22,6 +22,20 @@ pub enum Event {
     Exposed,
     FocusGained,
     FocusLost,
+    /// The mouse moved to `(x, y)`, in window coordinates (points, not pixels).
+    MouseMotion {
+        x: f32,
+        y: f32,
+    },
+    /// A mouse button (1 left, 2 middle, 3 right, as SDL numbers them) went down or up at
+    /// `(x, y)` in window coordinates.
+    MouseButton {
+        button: u8,
+        down: bool,
+        x: f32,
+        y: f32,
+        timestamp_ns: u64,
+    },
     /// A key went down or up. `scancode` is the SDL scancode, the value vanilla stores in
     /// options.txt.
     Key {
@@ -53,6 +67,17 @@ impl Event {
                 SDL_EVENT_WINDOW_EXPOSED => Event::Exposed,
                 SDL_EVENT_WINDOW_FOCUS_GAINED => Event::FocusGained,
                 SDL_EVENT_WINDOW_FOCUS_LOST => Event::FocusLost,
+                SDL_EVENT_MOUSE_MOTION => Event::MouseMotion {
+                    x: e.motion.x,
+                    y: e.motion.y,
+                },
+                SDL_EVENT_MOUSE_BUTTON_DOWN | SDL_EVENT_MOUSE_BUTTON_UP => Event::MouseButton {
+                    button: e.button.button,
+                    down: e.button.down,
+                    x: e.button.x,
+                    y: e.button.y,
+                    timestamp_ns: e.button.timestamp,
+                },
                 SDL_EVENT_KEY_DOWN | SDL_EVENT_KEY_UP => Event::Key {
                     scancode: e.key.scancode.0 as u32,
                     down: e.key.down,

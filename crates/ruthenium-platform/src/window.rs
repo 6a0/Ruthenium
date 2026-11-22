@@ -11,8 +11,9 @@ use sdl3_sys::events::{
 use sdl3_sys::hints::SDL_SetHint;
 use sdl3_sys::init::{SDL_INIT_VIDEO, SDL_Init, SDL_Quit, SDL_SetAppMetadata};
 use sdl3_sys::video::{
-    SDL_CreateWindow, SDL_DestroyWindow, SDL_GetWindowSizeInPixels, SDL_SetWindowSize,
-    SDL_WINDOW_HIGH_PIXEL_DENSITY, SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN, SDL_Window,
+    SDL_CreateWindow, SDL_DestroyWindow, SDL_GetWindowSize, SDL_GetWindowSizeInPixels,
+    SDL_SetWindowSize, SDL_WINDOW_HIGH_PIXEL_DENSITY, SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN,
+    SDL_Window,
 };
 use sdl3_sys::vulkan::{
     SDL_Vulkan_CreateSurface, SDL_Vulkan_GetInstanceExtensions,
@@ -197,6 +198,14 @@ impl Window {
         let (mut w, mut h) = (0, 0);
         // SAFETY: raw is a live window.
         unsafe { SDL_GetWindowSizeInPixels(self.raw, &mut w, &mut h) };
+        (w.max(0) as u32, h.max(0) as u32)
+    }
+
+    /// The window size in points (window coordinates, as mouse events report them).
+    pub fn size(&self) -> (u32, u32) {
+        let (mut w, mut h) = (0, 0);
+        // SAFETY: raw is a live window.
+        unsafe { SDL_GetWindowSize(self.raw, &mut w, &mut h) };
         (w.max(0) as u32, h.max(0) as u32)
     }
 

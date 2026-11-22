@@ -436,6 +436,51 @@ impl TextureTable {
         Ok(TextureId(i as u32))
     }
 
+    /// Creates a texture the renderer draws into (a render target) instead of uploading
+    /// to: colour attachment and sampled, one mip level, starting in `UNDEFINED` layout.
+    /// Its slot shows it from the next frame begun; layout transitions are the caller's,
+    /// and it must be in `SHADER_READ_ONLY_OPTIMAL` whenever a shader samples it. Returns
+    /// the id, the image and its view.
+    pub fn create_target(
+        &mut self,
+        format: vk::Format,
+        extent: vk::Extent2D,
+    ) -> Result<(TextureId, vk::Image, vk::ImageView), Error> {
+        let desc = TextureDesc {
+            width: extent.width,
+            height: extent.height,
+            mip_levels: 1,
+            format,
+        };
+        desc.check(self.gpu.caps().max_image_dimension_2d)
+            .map_err(Error::Unsupported)?;
+        let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_SRC;
+        let image = Image::new_2d(&self.gpu, format, extent, 1, usage)?;
+        let (raw, view) = (image.raw, image.view);
+        let Some(i) = self.slots.take() else {
+            // SAFETY: never used.
+            unsafe { image.destroy(&self.gpu) };
+            return Err(Error::Unsupported(format!(
+                "the texture table is full ({} textures)",
+                self.slots.capacity
+            )));
+        };
+        if self.textures.len() <= i as usize {
+            self.textures.resize_with(i as usize + 1, || None);
+        }
+        self.textures[i as usize] = Some(Texture {
+            image,
+            desc,
+            state: State::Ready,
+        });
+        for p in &mut self.pending {
+            p.push((i, view));
+        }
+        Ok((TextureId(i), raw, view))
+    }
+
     /// Whether the texture's slot shows it in the frame last begun (and every later one).
     ///
     /// # Panics
