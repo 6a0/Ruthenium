@@ -15,16 +15,22 @@ workspace = true
 tracy = ["profiling/profile-with-tracy", "ruthenium-gpu/tracy"]
 # Build SDL3 from source and link it statically (always on for Windows and macOS).
 sdl-static = ["ruthenium-platform/sdl-static"]
+# Development only (PLAN D3): join offline-mode servers on this machine or the local
+# network as an offline player, without an account. Never in release builds; CI checks.
+dev-offline = ["ruthenium-net/dev-offline"]
 
 [dependencies]
 profiling = "1.0.18"
 ruthenium-assets = { path = "../ruthenium-assets" }
 ruthenium-auth = { path = "../ruthenium-auth" }
+ruthenium-data = { path = "../ruthenium-data" }
 ruthenium-gpu = { path = "../ruthenium-gpu" }
 ruthenium-net = { path = "../ruthenium-net" }
 ruthenium-platform = { path = "../ruthenium-platform" }
 ruthenium-prepare = { path = "../ruthenium-prepare" }
 ruthenium-protocol = { path = "../ruthenium-protocol" }
 ruthenium-render = { path = "../ruthenium-render" }
+ruthenium-sim = { path = "../ruthenium-sim" }
 ruthenium-ui = { path = "../ruthenium-ui" }
+serde_json = "1.0.154"
 toml = "1.2.1"

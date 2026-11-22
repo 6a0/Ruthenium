@@ -169,6 +169,74 @@ fn error_message(v: &Value) -> String {
         .to_owned()
 }
 
+/// Why joining a server's session failed: the cases vanilla tells apart when it joins
+/// (`ClientHandshakePacketListenerImpl.authenticateServer`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinError {
+    /// The session service didn't answer, or failed.
+    Unavailable,
+    /// The access token isn't valid any more.
+    InvalidSession,
+    /// The account may not play online (child account settings, Xbox privileges).
+    NoMultiplayer,
+    /// The account is banned from playing online, or must change its name first.
+    Banned,
+    Other(String),
+}
+
+impl std::fmt::Display for JoinError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JoinError::Unavailable => {
+                f.write_str("the Minecraft session service can't be reached, try again later")
+            }
+            JoinError::InvalidSession => {
+                f.write_str("your sign-in has expired, sign in again from Accounts")
+            }
+            JoinError::NoMultiplayer => {
+                f.write_str("multiplayer is turned off in this account's settings")
+            }
+            JoinError::Banned => f.write_str("this account is suspended from playing online"),
+            JoinError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+impl std::error::Error for JoinError {}
+
+/// Tells the session service that the player is joining the server whose hash is
+/// `server_hash`, so the server can check it (`YggdrasilMinecraftSessionService.joinServer`):
+/// the token, the undashed profile id and the hash; no content back means yes.
+pub fn join_server(
+    http: &dyn Http,
+    url: &str,
+    access_token: &str,
+    profile_id: &str,
+    server_hash: &str,
+) -> Result<(), JoinError> {
+    let body = json!({
+        "accessToken": access_token,
+        "selectedProfile": profile_id,
+        "serverId": server_hash,
+    });
+    let r = http
+        .post_json(url, &body, None)
+        .map_err(|_| JoinError::Unavailable)?;
+    if r.ok() {
+        return Ok(());
+    }
+    let v = r.json();
+    let error = v.get("error").and_then(Value::as_str).unwrap_or("");
+    let message = error_message(&v);
+    Err(match (r.status, error) {
+        (_, "InsufficientPrivilegesException") => JoinError::NoMultiplayer,
+        (_, "UserBannedException" | "ForcedUsernameChangeException") => JoinError::Banned,
+        (401, _) | (403, "ForbiddenOperationException") => JoinError::InvalidSession,
+        (500.., _) => JoinError::Unavailable,
+        (s, _) => JoinError::Other(format!("the session service said {s}: {message}")),
+    })
+}
+
 /// A Java Edition profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
@@ -363,6 +431,50 @@ pub fn certificates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joining_a_server_maps_the_answers() {
+        use crate::http::Reply;
+        use std::sync::Mutex;
+        struct Join(u16, &'static str, Mutex<Option<Value>>);
+        impl Http for Join {
+            fn post_form(&self, _: &str, _: &[(&str, &str)]) -> Result<Reply, AuthError> {
+                unreachable!()
+            }
+            fn post_json(&self, url: &str, b: &Value, t: Option<&str>) -> Result<Reply, AuthError> {
+                assert_eq!((url, t), ("https://x/join", None));
+                *self.2.lock().unwrap() = Some(b.clone());
+                Ok(Reply {
+                    status: self.0,
+                    body: self.1.into(),
+                })
+            }
+            fn get(&self, _: &str, _: Option<&str>) -> Result<Reply, AuthError> {
+                unreachable!()
+            }
+        }
+        let join = |status, body| {
+            let h = Join(status, body, Mutex::new(None));
+            let r = join_server(&h, "https://x/join", "tok", "abc123", "-7c9d");
+            (r, h.2.into_inner().unwrap())
+        };
+        let (r, sent) = join(204, "");
+        assert_eq!(r, Ok(()));
+        assert_eq!(
+            sent.unwrap(),
+            json!({"accessToken": "tok", "selectedProfile": "abc123", "serverId": "-7c9d"})
+        );
+        let forbidden =
+            r#"{"error":"ForbiddenOperationException","path":"/session/minecraft/join"}"#;
+        assert_eq!(join(403, forbidden).0, Err(JoinError::InvalidSession));
+        let privileges = r#"{"error":"InsufficientPrivilegesException"}"#;
+        assert_eq!(join(403, privileges).0, Err(JoinError::NoMultiplayer));
+        assert_eq!(
+            join(403, r#"{"error":"UserBannedException"}"#).0,
+            Err(JoinError::Banned)
+        );
+        assert_eq!(join(503, "").0, Err(JoinError::Unavailable));
+    }
 
     #[test]
     fn discovery_overrides_defaults() {

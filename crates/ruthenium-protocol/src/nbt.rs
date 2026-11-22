@@ -177,6 +177,25 @@ pub fn read(bytes: &[u8]) -> Result<Compound, NbtError> {
     }
 }
 
+/// Reads one tag as the network sends it (`FriendlyByteBuf.readNbt` and
+/// `NbtIo.readAnyTag` since 1.20.2): a type byte and its payload, with no name. The end
+/// tag (a lone zero) is vanilla's "no tag" and reads as `None`. Returns the bytes used.
+pub fn read_network(bytes: &[u8]) -> Result<(Option<Tag>, usize), NbtError> {
+    let mut r = In { buf: bytes, pos: 0 };
+    let ty = r.u8()?;
+    if ty == END {
+        return Ok((None, 1));
+    }
+    let tag = r.payload(ty, 0)?;
+    Ok((Some(tag), r.pos))
+}
+
+/// Writes `tag` as the network sends it: a type byte and its payload, no name.
+pub fn write_network(out: &mut Vec<u8>, tag: &Tag) -> Result<(), NbtError> {
+    out.push(tag.id());
+    put_payload(out, tag)
+}
+
 /// Writes `root` as a file's root compound under the empty name.
 pub fn write(root: &Compound) -> Result<Vec<u8>, NbtError> {
     let mut out = vec![COMPOUND];
@@ -452,6 +471,23 @@ mod tests {
         assert_eq!(decode_mutf8(&[0xED, 0xA0, 0xB4]).unwrap(), "\u{FFFD}");
         assert!(decode_mutf8(&[0xC3]).is_err());
         assert!(decode_mutf8(&[0xF0, 0x9D, 0x84, 0x9E]).is_err());
+    }
+
+    #[test]
+    fn network_tags_have_no_name() {
+        // A string root: type 8, then the string; then a trailing byte that isn't ours.
+        let bytes = [8, 0, 2, b'h', b'i', 99];
+        assert_eq!(
+            read_network(&bytes).unwrap(),
+            (Some(Tag::String("hi".into())), 5)
+        );
+        assert_eq!(read_network(&[0, 7]).unwrap(), (None, 1));
+        let mut c = Compound::new();
+        c.put("bold", Tag::Byte(1));
+        let mut out = Vec::new();
+        write_network(&mut out, &Tag::Compound(c.clone())).unwrap();
+        assert_eq!(out, [10, 1, 0, 4, b'b', b'o', b'l', b'd', 1, 0]);
+        assert_eq!(read_network(&out).unwrap(), (Some(Tag::Compound(c)), 10));
     }
 
     #[test]

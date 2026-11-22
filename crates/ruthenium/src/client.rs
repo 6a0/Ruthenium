@@ -236,6 +236,10 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         settings.settings.frame_stats = true;
     }
     let mut menu = Menu::new(servers_file, accounts, settings);
+    menu.set_joiner(crate::join::Joiner::new(
+        data_dir.as_ref().map(|d| d.join("game")),
+        ruthenium_prepare::default_cache_dir(&env),
+    ));
     let mut applied: Settings = menu.settings().clone();
     let mut platform = Platform::init(env!("CARGO_PKG_VERSION"))?;
     let window = platform.create_window("Ruthenium", opts.window_size.0, opts.window_size.1)?;

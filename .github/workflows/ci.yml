@@ -153,3 +153,29 @@ jobs:
             libegl1-mesa-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libibus-1.0-dev
       - run: cargo clippy --workspace --all-targets $FEATURES
       - run: cargo test --workspace $FEATURES
+      # The development-only offline login (PLAN D3) compiles and passes its tests...
+      - run: cargo clippy -p ruthenium --all-targets $FEATURES --features ruthenium/dev-offline
+      - run: cargo test -p ruthenium $FEATURES --features ruthenium/dev-offline
+
+  release-binary:
+    # ...and never reaches a release build: its marker string must be absent.
+    name: No dev-offline in release builds
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: SDL3 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
+            libxss-dev libxtst-dev libxkbcommon-dev libwayland-dev wayland-protocols \
+            libegl1-mesa-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libibus-1.0-dev
+      - run: cargo build --release -p ruthenium --features ruthenium/sdl-static
+      - name: Check the binary for the dev-offline marker
+        run: |
+          if grep -q -a RUTHENIUM-DEV-OFFLINE-BUILD target/release/ruthenium; then
+            echo "::error::the release binary contains the dev-offline login"
+            exit 1
+          fi

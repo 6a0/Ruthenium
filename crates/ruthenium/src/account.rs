@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use ruthenium_assets::zip::Zip;
-use ruthenium_auth::{Account, AccountStore, Auth, AuthError, DeviceCode, SignedIn, skin};
+use ruthenium_auth::{Account, AccountStore, Auth, AuthError, DeviceCode, Session, SignedIn, skin};
 use ruthenium_ui::face::Face;
 
 /// Steve's skin in the client jar.
@@ -229,6 +229,7 @@ enum Update {
     Status {
         generation: u64,
         status: AccountStatus,
+        session: Option<Box<Session>>,
     },
     Page {
         flow: u64,
@@ -241,6 +242,7 @@ enum Update {
     SignedIn {
         flow: u64,
         status: AccountStatus,
+        session: Box<Session>,
     },
     SignInFailed {
         flow: u64,
@@ -254,6 +256,8 @@ pub struct Accounts {
     updates: Receiver<Update>,
     list: Vec<Account>,
     status: AccountStatus,
+    /// The signed-in session of the account in use (memory only), for joining servers.
+    session: Option<Session>,
     /// Bumped by every change of the account in use; older status reports are dropped.
     generation: u64,
     flow: Option<Flow>,
@@ -337,6 +341,7 @@ impl Accounts {
             updates,
             list,
             status: AccountStatus::None,
+            session: None,
             generation: 0,
             flow: None,
             next_flow: 0,
@@ -376,6 +381,11 @@ impl Accounts {
     /// Accounts, the one in use first.
     pub fn list(&self) -> &[Account] {
         &self.list
+    }
+
+    /// The session of the account in use, once it has signed in (memory only).
+    pub fn session(&self) -> Option<&Session> {
+        self.session.as_ref()
     }
 
     pub fn status(&self) -> &AccountStatus {
@@ -454,11 +464,16 @@ impl Accounts {
             let flow = self.flow.as_ref().map(|f| f.id);
             match u {
                 Update::List(list) => self.list = list,
-                Update::Status { generation, status } => {
+                Update::Status {
+                    generation,
+                    status,
+                    session,
+                } => {
                     if generation != self.generation {
                         continue;
                     }
                     self.status = status;
+                    self.session = session.map(|s| *s);
                 }
                 Update::Page { flow: f, url } if Some(f) == flow => {
                     (self.open_page)(&url);
@@ -469,9 +484,14 @@ impl Accounts {
                 }
                 // Signed in, even if the player moved on meanwhile: the account is now in
                 // use, so its status wins over any older report.
-                Update::SignedIn { flow: f, status } => {
+                Update::SignedIn {
+                    flow: f,
+                    status,
+                    session,
+                } => {
                     self.generation += 1;
                     self.status = status;
+                    self.session = Some(*session);
                     if Some(f) == flow {
                         self.flow = None;
                     }
@@ -596,16 +616,20 @@ fn work(open: Open, jobs: &Receiver<Job>, updates: &Sender<Update>) {
     let send = |u: Update| {
         let _ = updates.send(u);
     };
+    // The account's status, and its session if it signed in.
     let resume = |store: &mut AccountStore, backend: &mut dyn Backend, id: &str| {
         let Some(account) = store.accounts().iter().find(|a| a.id == id).cloned() else {
-            return AccountStatus::None;
+            return (AccountStatus::None, None);
         };
         let failed = |e: &AuthError| {
             eprintln!("[ruthenium] sign-in for {}: {e}", account.name);
-            AccountStatus::Failed {
-                name: account.name.clone(),
-                reason: short_reason(e),
-            }
+            (
+                AccountStatus::Failed {
+                    name: account.name.clone(),
+                    reason: short_reason(e),
+                },
+                None,
+            )
         };
         let token = match store.refresh_token(&account.id) {
             Ok(Some(t)) => t,
@@ -618,7 +642,7 @@ fn work(open: Open, jobs: &Receiver<Job>, updates: &Sender<Update>) {
                 if let Err(e) = store.refreshed(p, &s.refresh_token) {
                     eprintln!("[ruthenium] couldn't save the renewed sign-in: {e}");
                 }
-                AccountStatus::signed_in(&s)
+                (AccountStatus::signed_in(&s), Some(Box::new(s.session)))
             }
             Err(e) => failed(&e),
         }
@@ -626,16 +650,24 @@ fn work(open: Open, jobs: &Receiver<Job>, updates: &Sender<Update>) {
     for job in jobs {
         match job {
             Job::Resume { generation, id } => {
-                let status = resume(&mut store, &mut *backend, &id);
-                send(Update::Status { generation, status });
+                let (status, session) = resume(&mut store, &mut *backend, &id);
+                send(Update::Status {
+                    generation,
+                    status,
+                    session,
+                });
             }
             Job::Select { generation, id } => {
                 if let Err(e) = store.select(&id) {
                     eprintln!("[ruthenium] couldn't save the account in use: {e}");
                 }
                 send(Update::List(store.accounts().to_vec()));
-                let status = resume(&mut store, &mut *backend, &id);
-                send(Update::Status { generation, status });
+                let (status, session) = resume(&mut store, &mut *backend, &id);
+                send(Update::Status {
+                    generation,
+                    status,
+                    session,
+                });
             }
             Job::Remove { generation, id } => {
                 let was_current = store.current().is_some_and(|a| a.id == id);
@@ -644,11 +676,15 @@ fn work(open: Open, jobs: &Receiver<Job>, updates: &Sender<Update>) {
                 }
                 send(Update::List(store.accounts().to_vec()));
                 if was_current {
-                    let status = match store.current().map(|a| a.id.clone()) {
+                    let (status, session) = match store.current().map(|a| a.id.clone()) {
                         Some(next) => resume(&mut store, &mut *backend, &next),
-                        None => AccountStatus::None,
+                        None => (AccountStatus::None, None),
                     };
-                    send(Update::Status { generation, status });
+                    send(Update::Status {
+                        generation,
+                        status,
+                        session,
+                    });
                 }
             }
             Job::SignIn {
@@ -691,6 +727,7 @@ fn work(open: Open, jobs: &Receiver<Job>, updates: &Sender<Update>) {
                         send(Update::SignedIn {
                             flow,
                             status: AccountStatus::signed_in(&s),
+                            session: Box::new(s.session),
                         });
                     }
                     Err(error) => {

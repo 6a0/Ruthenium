@@ -1,5 +1,6 @@
 //! Ruthenium's out-of-game menus: the title screen, the server list and its forms, the
-//! accounts and signing in, and the settings. Lays them out for the window, prepares the glyph atlas and the logo in the background and
+//! accounts and signing in, the settings, and joining a server (connecting, the code of
+//! conduct, and why a session ended). Lays them out for the window, prepares the glyph atlas and the logo in the background and
 //! uploads them, routes input to the screen showing, and builds each frame's shapes and
 //! text.
 
@@ -37,10 +38,16 @@ use ruthenium_ui::text::{ATLAS_SIZE, Fonts, GlyphAtlas, TextList, TextStyle, Wei
 
 use ruthenium_ui::face::Face;
 
+use ruthenium_net::connection::Stage as NetStage;
+use ruthenium_sim::session::{Session, SessionEvent};
+
 use crate::account::{AccountStatus, Accounts, Stage, failure_lines};
+use crate::join::Joiner;
 use crate::servers::{Servers, valid_address};
 use crate::settings::{FRAME_STATS, FULLSCREEN, Settings, SettingsFile};
 
+/// The characters a form's message line holds.
+const MESSAGE_WIDTH: usize = 52;
 /// Side of the logo texture's top level.
 const LOGO_SIZE: u32 = 512;
 /// Side of the window icon.
@@ -230,6 +237,14 @@ enum FormKind {
     SignIn,
     /// Confirming that account `i` (in the Accounts list) signs out.
     SignOut(usize),
+    /// Joining a server: where the connection is, and Cancel.
+    Connecting,
+    /// The server's code of conduct, to accept or decline.
+    CodeOfConduct,
+    /// In play (the world doesn't show yet), and Disconnect.
+    Playing,
+    /// Why the session ended.
+    Disconnected,
 }
 
 impl FormKind {
@@ -292,6 +307,14 @@ pub struct Menu {
     /// How far the menus have faded in: nothing shows until the text and logo can, so
     /// they never pop in after the pills.
     appear: Ease,
+    /// Starts sessions with servers (none: joining isn't possible, as in tests).
+    joiner: Option<Joiner>,
+    /// The session with a server, while there is one.
+    session: Option<Session>,
+    /// The server the session is with, as the list names it.
+    server_name: String,
+    /// The player left the session (Cancel, Disconnect): its end needs no screen.
+    leaving: bool,
 }
 
 impl std::fmt::Debug for Menu {
@@ -390,6 +413,148 @@ impl Menu {
             started: Instant::now(),
             last_frame: None,
             appear: Ease::default(),
+            joiner: None,
+            session: None,
+            server_name: String::new(),
+            leaving: false,
+        }
+    }
+
+    /// Lets the menus join servers.
+    pub fn set_joiner(&mut self, joiner: Joiner) {
+        self.joiner = Some(joiner);
+    }
+
+    /// Shows a form about the session: `lines` wrapped to the form's width.
+    fn session_form(
+        &mut self,
+        kind: FormKind,
+        title: &str,
+        lines: &[&str],
+        buttons: Vec<FormButton>,
+    ) {
+        let Some(scale) = self.scale else { return };
+        let message = lines
+            .iter()
+            .flat_map(|l| crate::join::wrap(l, MESSAGE_WIDTH))
+            .collect();
+        let spec = FormSpec {
+            title: title.into(),
+            message,
+            code: None,
+            fields: Vec::new(),
+            buttons,
+        };
+        let form = FormScreen::new(scale, &self.fonts, spec);
+        self.screen = Screen::Form(kind, Box::new(form), PackStatus::Prompt);
+    }
+
+    fn connecting_form(&mut self, stage: NetStage) {
+        let title = self.server_name.clone();
+        self.session_form(
+            FormKind::Connecting,
+            &title,
+            &[crate::join::stage_text(stage)],
+            vec![button("Cancel", Action::Cancel)],
+        );
+    }
+
+    /// Starts joining `name` at `address`.
+    fn start_join(&mut self, name: &str, address: &str) {
+        self.server_name = name.to_owned();
+        self.leaving = false;
+        // A session still closing is dropped (and so disconnected) here.
+        self.session = None;
+        let started = match &mut self.joiner {
+            Some(j) => j.join(address, &self.accounts),
+            None => Err("Joining servers isn't possible here".into()),
+        };
+        match started {
+            Ok(s) => {
+                eprintln!("[ruthenium] joining {name} ({address})");
+                self.session = Some(s);
+                self.connecting_form(NetStage::Connecting);
+            }
+            Err(e) => {
+                eprintln!("[ruthenium] can't join {name}: {e}");
+                self.session_form(
+                    FormKind::Disconnected,
+                    "Couldn't connect to the server",
+                    &[&e],
+                    vec![button("Back to Server List", Action::Confirm)],
+                );
+            }
+        }
+    }
+
+    /// Leaves the session (Cancel, Disconnect, declining the code of conduct).
+    fn leave(&mut self) {
+        if let Some(s) = &self.session {
+            s.disconnect();
+        }
+        self.leaving = true;
+        self.screen = Screen::Servers;
+    }
+
+    /// Takes in the session's news and shows it.
+    fn poll_session(&mut self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        let events: Vec<SessionEvent> = session.poll().collect();
+        let ours = matches!(
+            self.screen,
+            Screen::Form(
+                FormKind::Connecting | FormKind::CodeOfConduct | FormKind::Playing,
+                ..
+            )
+        );
+        for e in events {
+            match e {
+                SessionEvent::Stage(s) if ours && !self.leaving => self.connecting_form(s),
+                SessionEvent::CodeOfConduct(text) if !self.leaving => {
+                    self.session_form(
+                        FormKind::CodeOfConduct,
+                        "Code of Conduct",
+                        &[&text],
+                        vec![
+                            button("Accept", Action::Confirm),
+                            button("Decline", Action::Cancel),
+                        ],
+                    );
+                }
+                SessionEvent::Playing if !self.leaving => {
+                    let title = self.server_name.clone();
+                    self.session_form(
+                        FormKind::Playing,
+                        &title,
+                        &["Connected. Ruthenium can't show the world yet."],
+                        vec![button("Disconnect", Action::Cancel)],
+                    );
+                }
+                SessionEvent::Reconfiguring if !self.leaving => {
+                    self.connecting_form(NetStage::Joining);
+                }
+                SessionEvent::Closed(c) => {
+                    self.session = None;
+                    if self.leaving || crate::join::left_on_purpose(&c) {
+                        self.leaving = false;
+                    } else {
+                        let lang = self.joiner.as_mut().map(|j| j.data());
+                        let empty = std::collections::HashMap::new();
+                        let (title, reason) =
+                            crate::join::closed_text(&c, lang.as_ref().map_or(&empty, |d| &d.lang));
+                        self.session_form(
+                            FormKind::Disconnected,
+                            &title,
+                            &[&reason],
+                            vec![button("Back to Server List", Action::Confirm)],
+                        );
+                    }
+                    return;
+                }
+                _ => {}
+            }
         }
     }
 
@@ -741,6 +906,11 @@ impl Menu {
                 )
             }
             FormKind::SignIn => return self.open_sign_in(),
+            // Opened by the session as it goes.
+            FormKind::Connecting
+            | FormKind::CodeOfConduct
+            | FormKind::Playing
+            | FormKind::Disconnected => return,
         };
         let form = FormScreen::new(scale, &self.fonts, spec);
         self.screen = Screen::Form(kind, Box::new(form), pack);
@@ -755,7 +925,13 @@ impl Menu {
         let addr = match kind {
             FormKind::Add | FormKind::Edit(_) => Some(1),
             FormKind::Direct => Some(0),
-            FormKind::Delete(_) | FormKind::SignIn | FormKind::SignOut(_) => None,
+            FormKind::Delete(_)
+            | FormKind::SignIn
+            | FormKind::SignOut(_)
+            | FormKind::Connecting
+            | FormKind::CodeOfConduct
+            | FormKind::Playing
+            | FormKind::Disconnected => None,
         };
         if let Some(f) = addr {
             let ok = valid_address(form.field(f).value());
@@ -797,8 +973,28 @@ impl Menu {
             }
             (Screen::Servers, Action::Join) => {
                 if let Some((_, s)) = self.servers.as_ref().and_then(Servers::selected) {
-                    eprintln!("[ruthenium] join {} ({}): not there yet", s.name, s.ip);
+                    let (name, ip) = (s.name.clone(), s.ip.clone());
+                    self.start_join(&name, &ip);
                 }
+            }
+            (
+                Screen::Form(FormKind::Connecting | FormKind::Playing, ..),
+                Action::Cancel | Action::Back,
+            ) => self.leave(),
+            (Screen::Form(FormKind::CodeOfConduct, ..), Action::Confirm) => {
+                if let Some(s) = &self.session {
+                    s.answer_code_of_conduct(true);
+                }
+                self.connecting_form(NetStage::Joining);
+            }
+            (Screen::Form(FormKind::CodeOfConduct, ..), Action::Cancel | Action::Back) => {
+                if let Some(s) = &self.session {
+                    s.answer_code_of_conduct(false);
+                }
+                self.leave();
+            }
+            (Screen::Form(FormKind::Disconnected, ..), Action::Confirm | Action::Cancel) => {
+                self.screen = Screen::Servers;
             }
             (Screen::Servers, Action::DirectConnect) => self.open_form(FormKind::Direct, scale),
             (Screen::Servers, Action::AddServer) => self.open_form(FormKind::Add, scale),
@@ -896,7 +1092,9 @@ impl Menu {
                         self.settings_changed = Some(Instant::now());
                         if let Some(s) = &mut self.servers {
                             let e = s.direct(&ip);
-                            eprintln!("[ruthenium] join {} ({}): not there yet", e.name, e.ip);
+                            let (name, ip) = (e.name.clone(), e.ip.clone());
+                            self.start_join(&name, &ip);
+                            return None;
                         }
                     }
                     FormKind::Delete(i) => {
@@ -913,6 +1111,11 @@ impl Menu {
                             a.select(None);
                         }
                     }
+                    // Handled above.
+                    FormKind::Connecting
+                    | FormKind::CodeOfConduct
+                    | FormKind::Playing
+                    | FormKind::Disconnected => {}
                     // Try Again, the same way as before.
                     FormKind::SignIn => {
                         let device =
@@ -1355,6 +1558,7 @@ impl Menu {
             .map_or(0.0, |t| (now - t).as_secs_f32().min(MAX_STEP));
         self.last_frame = Some(now);
         let scale = self.layout(pixel_size);
+        self.poll_session();
         let pointer = self
             .mouse
             .map(|(x, y)| scale.from_window(x, y, window_size, pixel_size));
@@ -1591,6 +1795,7 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             m.sync_accounts();
+            m.poll_session();
             if done(m) {
                 return;
             }
@@ -1609,6 +1814,49 @@ mod tests {
 
     fn names(m: &Menu) -> Vec<String> {
         m.accounts.list().iter().map(|a| a.name.clone()).collect()
+    }
+
+    fn form_kind(m: &Menu) -> Option<(FormKind, Vec<String>)> {
+        match &m.screen {
+            Screen::Form(k, f, _) => Some((*k, f.spec.message.clone())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn joining_shows_why_it_ends() {
+        let clip = FakeClipboard(RefCell::new(None));
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.start_join("Nowhere", "127.0.0.1:1");
+        assert_eq!(
+            form_kind(&m).map(|f| f.0),
+            Some(FormKind::Disconnected),
+            "no joiner"
+        );
+        m.act(Action::Confirm, None, &clip);
+        assert!(matches!(m.screen, Screen::Servers));
+        m.set_joiner(Joiner::new(None, None));
+        // A port nothing listens on.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        m.start_join("Local", &format!("127.0.0.1:{port}"));
+        if cfg!(feature = "dev-offline") {
+            // Development builds try, and say why it failed.
+            assert_eq!(form_kind(&m).map(|f| f.0), Some(FormKind::Connecting));
+            until(&mut m, |m| m.session.is_none());
+            let (kind, message) = form_kind(&m).unwrap();
+            assert_eq!(kind, FormKind::Disconnected);
+            assert!(message.join(" ").contains("refused"), "{message:?}");
+        } else {
+            // Release builds need a signed-in account.
+            let (kind, message) = form_kind(&m).unwrap();
+            assert_eq!(kind, FormKind::Disconnected);
+            assert!(message.join(" ").contains("Sign in"), "{message:?}");
+        }
     }
 
     #[test]
@@ -1846,12 +2094,16 @@ mod tests {
         assert_eq!(saved.servers.len(), 1);
         assert_eq!(saved.servers[0].name, "Vanilla");
 
-        // Direct Connect keeps the address as a hidden server; Escape goes back.
+        // Direct Connect keeps the address as a hidden server and joins it (here it
+        // can't: no joiner); Escape goes back to the list, and from there to the title.
         m.act(Action::DirectConnect, None, &clip);
         m.text_input("direct.example");
         press(&mut m, SCANCODE_RETURN, false, false, &clip);
         assert_eq!(ServerList::load(&path).hidden[0].ip, "direct.example");
         assert_eq!(m.settings().last_server, "direct.example");
+        assert!(matches!(m.screen, Screen::Form(FormKind::Disconnected, ..)));
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Servers));
         press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
         assert!(matches!(m.screen, Screen::Title));
         let _ = std::fs::remove_dir_all(&dir);

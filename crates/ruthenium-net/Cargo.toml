@@ -10,10 +10,23 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Offline logins (development builds only, PLAN D3).
+dev-offline = []
+
 [dependencies]
+aes = "0.9.4"
 base64 = "0.22.1"
+flate2 = { version = "1.1.11", default-features = false, features = ["zlib-rs"] }
+getrandom = "0.4.3"
 hickory-resolver = "0.26.3"
 idna = "1.1.0"
+md-5 = "0.11.0"
+rsa = { version = "0.10.0", features = ["pkcs1v15"] }
 ruthenium-data = { path = "../ruthenium-data" }
 ruthenium-protocol = { path = "../ruthenium-protocol" }
+sha1 = "0.11.0"
 tokio = { version = "1.54.1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["rt-multi-thread"] }

@@ -1,0 +1,15 @@
+[package]
+name = "ruthenium-sim"
+description = "The game thread: the session with a server, its configuration and (to come) the simulation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ruthenium-net = { path = "../ruthenium-net" }
+ruthenium-protocol = { path = "../ruthenium-protocol" }

@@ -53,6 +53,25 @@ impl Resolver {
         }
     }
 
+    /// The host the connection is to (the SRV target if there is one, as vanilla sends
+    /// it in the login handshake) and the socket address, or `None` if it doesn't
+    /// resolve.
+    ///
+    /// Vanilla sends `InetSocketAddress.getHostName()`, which for an address typed as
+    /// an IP literal is a reverse lookup; this sends the literal instead.
+    pub async fn resolve_named(&self, address: &ServerAddress) -> Option<(String, SocketAddr)> {
+        match self.redirect(address).await {
+            Some(target) => {
+                let host = target.host_ascii();
+                system(&host, target.port()).await.map(|a| (host, a))
+            }
+            None => {
+                let host = address.host_ascii();
+                system(&host, address.port()).await.map(|a| (host, a))
+            }
+        }
+    }
+
     /// The SRV redirect for `address`, if it has the default port and a record.
     pub async fn redirect(&self, address: &ServerAddress) -> Option<ServerAddress> {
         let srv = self.srv.as_ref()?;

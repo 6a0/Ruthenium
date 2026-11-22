@@ -6,6 +6,8 @@ mod account;
 mod assets_cmd;
 mod auth_cmd;
 mod client;
+mod connect_cmd;
+mod join;
 mod menu;
 mod prepare_cmd;
 mod servers;
@@ -66,7 +68,12 @@ commands:
       Sign in with a Microsoft account (in the browser, or with a code to enter
       on another device), list the accounts signed in, check one by signing in
       again from its saved sign-in, or sign one out. Saved sign-ins live in the
-      system's credential store.";
+      system's credential store.
+  connect <address> [--seconds <s>] [--data-dir <folder>]
+      Join a server without a window, print each step, and disconnect after
+      <s> seconds (default 10). Joins as the signed-in account; development
+      builds with the dev-offline feature join offline-mode servers on this
+      machine or the local network as an offline player.";
 
 fn main() -> ExitCode {
     let started = Instant::now();
@@ -81,6 +88,7 @@ fn main() -> ExitCode {
         Some("prepare") => prepare_cmd::prepare(&args[1..]),
         Some("assets") => assets_cmd::run(&args[1..]),
         Some("auth") => auth_cmd::run(&args[1..]),
+        Some("connect") => connect_cmd::run(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             ExitCode::SUCCESS

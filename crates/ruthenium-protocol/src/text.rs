@@ -9,14 +9,62 @@
 //! clears the other formats, `§r` goes back to the component's own style, and an
 //! unknown code is dropped with its `§`.
 //!
-//! Without language files, a translation shows its `fallback`, else its key, with
-//! `%s` and `%1$s` filled in. Scores, selectors, NBT and objects show nothing (the
+//! A translation takes its format from the language ([`Lang`]), else its `fallback`,
+//! else its key, with `%s` and `%1$s` filled in. Scores, selectors, NBT and objects show nothing (the
 //! server list resolves them without a source). Nesting past 16 levels is dropped, as the
 //! server list's sanitising does (`multiplayer/ServerStatusPinger.java`).
+//!
+//! The NBT form (play and configuration packets) is the same structure in tags: a string
+//! tag is literal text, a list is an array, a compound an object. Booleans are bytes
+//! there, and vanilla's codecs read any number as a boolean (non-zero is true) in either
+//! form.
 
 use serde_json::Value;
 
+use crate::nbt::Tag;
+
 const MAX_DEPTH: usize = 16;
+
+/// Translation formats by key: a language file.
+pub trait Lang {
+    fn get(&self, key: &str) -> Option<&str>;
+}
+
+/// No language: translations show their fallback or key.
+impl Lang for () {
+    fn get(&self, _: &str) -> Option<&str> {
+        None
+    }
+}
+
+impl Lang for std::collections::HashMap<String, String> {
+    fn get(&self, key: &str) -> Option<&str> {
+        std::collections::HashMap::get(self, key).map(String::as_str)
+    }
+}
+
+/// A tag as the JSON value with the same structure (numbers stay numbers).
+pub fn nbt_to_json(tag: &Tag) -> Value {
+    let num = |n: f64| serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number);
+    match tag {
+        Tag::Byte(v) => Value::from(*v),
+        Tag::Short(v) => Value::from(*v),
+        Tag::Int(v) => Value::from(*v),
+        Tag::Long(v) => Value::from(*v),
+        Tag::Float(v) => num(f64::from(*v)),
+        Tag::Double(v) => num(*v),
+        Tag::ByteArray(v) => Value::Array(v.iter().map(|&b| Value::from(b)).collect()),
+        Tag::String(s) => Value::String(s.clone()),
+        Tag::List(items) => Value::Array(items.iter().map(nbt_to_json).collect()),
+        Tag::Compound(c) => Value::Object(
+            c.iter()
+                .map(|(k, v)| (k.to_owned(), nbt_to_json(v)))
+                .collect(),
+        ),
+        Tag::IntArray(v) => Value::Array(v.iter().map(|&b| Value::from(b)).collect()),
+        Tag::LongArray(v) => Value::Array(v.iter().map(|&b| Value::from(b)).collect()),
+    }
+}
 
 /// The 16 named colours, by legacy code `0`..`f` (`ChatFormatting.java`).
 pub const NAMED_COLORS: [(&str, u32); 16] = [
@@ -62,7 +110,13 @@ struct Partial {
 
 impl Partial {
     fn from_json(o: &serde_json::Map<String, Value>) -> Partial {
-        let flag = |k: &str| o.get(k).and_then(Value::as_bool);
+        let flag = |k: &str| {
+            o.get(k).and_then(|v| match v {
+                Value::Bool(b) => Some(*b),
+                Value::Number(n) => n.as_f64().map(|n| n != 0.0),
+                _ => None,
+            })
+        };
         Partial {
             color: o.get("color").and_then(Value::as_str).and_then(parse_color),
             bold: flag("bold"),
@@ -115,11 +169,21 @@ impl StyledText {
         t
     }
 
-    /// A component in its JSON form.
+    /// A component in its JSON form, without a language.
     pub fn from_json(v: &Value) -> StyledText {
+        StyledText::from_json_in(v, &())
+    }
+
+    /// A component in its JSON form, translated with `lang`.
+    pub fn from_json_in(v: &Value, lang: &dyn Lang) -> StyledText {
         let mut t = StyledText::default();
-        t.component(v, Style::default(), 0);
+        t.component(v, Style::default(), 0, lang);
         t
+    }
+
+    /// A component in its NBT form, translated with `lang`.
+    pub fn from_nbt_in(tag: &Tag, lang: &dyn Lang) -> StyledText {
+        StyledText::from_json_in(&nbt_to_json(tag), lang)
     }
 
     /// The text without styles.
@@ -201,7 +265,7 @@ impl StyledText {
         self.push(rest, style);
     }
 
-    fn component(&mut self, v: &Value, parent: Style, depth: usize) {
+    fn component(&mut self, v: &Value, parent: Style, depth: usize, lang: &dyn Lang) {
         if depth >= MAX_DEPTH {
             return;
         }
@@ -218,9 +282,9 @@ impl StyledText {
                     Value::Object(o) => Partial::from_json(o).over(parent),
                     _ => parent,
                 };
-                self.component(first, parent, depth + 1);
+                self.component(first, parent, depth + 1, lang);
                 for item in rest {
-                    self.component(item, style, depth + 1);
+                    self.component(item, style, depth + 1, lang);
                 }
             }
             Value::Object(o) => {
@@ -235,15 +299,18 @@ impl StyledText {
                         _ => {}
                     }
                 } else if let Some(key) = o.get("translate").and_then(Value::as_str) {
-                    let format = o.get("fallback").and_then(Value::as_str).unwrap_or(key);
+                    let format = lang
+                        .get(key)
+                        .or_else(|| o.get("fallback").and_then(Value::as_str))
+                        .unwrap_or(key);
                     let args = o.get("with").and_then(Value::as_array);
-                    self.translate(format, args.map_or(&[], Vec::as_slice), style, depth);
+                    self.translate(format, args.map_or(&[], Vec::as_slice), style, depth, lang);
                 } else if let Some(key) = o.get("keybind").and_then(Value::as_str) {
                     self.push(key, style);
                 }
                 if let Some(Value::Array(extra)) = o.get("extra") {
                     for child in extra {
-                        self.component(child, style, depth + 1);
+                        self.component(child, style, depth + 1, lang);
                     }
                 }
             }
@@ -254,7 +321,14 @@ impl StyledText {
     /// Fills `%s` / `%2$s` in `format` with `args`; `%%` is a percent sign. A format
     /// with other specifiers, or an argument index past the end, shows the format as it
     /// is (vanilla shows the key when formatting fails).
-    fn translate(&mut self, format: &str, args: &[Value], style: Style, depth: usize) {
+    fn translate(
+        &mut self,
+        format: &str,
+        args: &[Value],
+        style: Style,
+        depth: usize,
+        lang: &dyn Lang,
+    ) {
         let mut pieces: Vec<Result<&str, usize>> = Vec::new();
         let mut next = 0;
         let mut rest = format;
@@ -305,7 +379,7 @@ impl StyledText {
         for p in pieces {
             match p {
                 Ok(s) => self.push_formatted(s, style),
-                Err(i) => self.component(&args[i], style, depth + 1),
+                Err(i) => self.component(&args[i], style, depth + 1, lang),
             }
         }
     }
@@ -387,6 +461,31 @@ mod tests {
         // A bad format shows as it is.
         let v = json!({"translate": "x", "fallback": "%d %s", "with": ["a"]});
         assert_eq!(StyledText::from_json(&v).plain(), "%d %s");
+    }
+
+    #[test]
+    fn languages_and_nbt() {
+        let mut lang = std::collections::HashMap::new();
+        lang.insert(
+            "multiplayer.disconnect.kicked".to_owned(),
+            "Kicked by an operator".to_owned(),
+        );
+        lang.insert("disconnect.genericReason".to_owned(), "%s".to_owned());
+        let v = json!({"translate": "multiplayer.disconnect.kicked", "fallback": "x"});
+        assert_eq!(
+            StyledText::from_json_in(&v, &lang).plain(),
+            "Kicked by an operator"
+        );
+        // NBT: a compound with byte booleans and a list of mixed children.
+        let mut c = crate::nbt::Compound::new();
+        c.put("translate", Tag::String("disconnect.genericReason".into()));
+        c.put("bold", Tag::Byte(1));
+        c.put("with", Tag::List(vec![Tag::String("Server closed".into())]));
+        let t = StyledText::from_nbt_in(&Tag::Compound(c), &lang);
+        assert_eq!(t.plain(), "Server closed");
+        assert!(t.spans[0].style.bold);
+        let s = StyledText::from_nbt_in(&Tag::String("§cBanned".into()), &());
+        assert_eq!(spans(&s), [("Banned", Some(0xFF5555), false)]);
     }
 
     #[test]

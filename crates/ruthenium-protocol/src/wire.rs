@@ -24,6 +24,12 @@ pub enum WireError {
     },
     NegativeLength(i32),
     BadUtf8,
+    /// Bytes left after a packet's last field: vanilla refuses the packet
+    /// (`PacketDecoder.java`), and so do we.
+    TrailingBytes(usize),
+    /// A value its field can't hold: an identifier with bad characters, an id out of
+    /// range, NBT that doesn't parse.
+    Invalid(&'static str),
 }
 
 impl fmt::Display for WireError {
@@ -34,6 +40,8 @@ impl fmt::Display for WireError {
             WireError::TooLong { len, max } => write!(f, "{len} is over the limit of {max}"),
             WireError::NegativeLength(n) => write!(f, "negative length {n}"),
             WireError::BadUtf8 => f.write_str("string is not UTF-8"),
+            WireError::TrailingBytes(n) => write!(f, "{n} byte(s) left over after the packet"),
+            WireError::Invalid(what) => write!(f, "bad {what}"),
         }
     }
 }
@@ -87,6 +95,63 @@ pub fn peek_varint(buf: &[u8], max_bytes: usize) -> Result<Option<(i32, usize)>,
 pub fn write_string(out: &mut Vec<u8>, s: &str) {
     write_varint(out, s.len() as i32);
     out.extend_from_slice(s.as_bytes());
+}
+
+/// Java's `writeUtf` default limit, and the length of most strings on the wire.
+pub const MAX_STRING: usize = 32767;
+
+pub fn write_bool(out: &mut Vec<u8>, v: bool) {
+    out.push(u8::from(v));
+}
+
+pub fn write_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+pub fn write_i32(out: &mut Vec<u8>, v: i32) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+pub fn write_i64(out: &mut Vec<u8>, v: i64) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+/// A UUID as two big-endian longs, most significant first (`UUIDUtil.STREAM_CODEC`).
+pub fn write_uuid(out: &mut Vec<u8>, v: u128) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+/// A byte array: VarInt length, then the bytes (`FriendlyByteBuf.writeByteArray`).
+pub fn write_byte_array(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_varint(out, bytes.len() as i32);
+    out.extend_from_slice(bytes);
+}
+
+/// A packet's bytes before framing: its id as a VarInt, then what `body` writes.
+pub fn packet(id: u32, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    write_varint(&mut out, id as i32);
+    body(&mut out);
+    out
+}
+
+/// Whether `s` is an identifier vanilla accepts (`Identifier.parse`): an optional
+/// namespace of `[a-z0-9_.-]` and a colon, then a path of `[a-z0-9_.-/]`.
+pub fn valid_identifier(s: &str) -> bool {
+    let (ns, path) = s.split_once(':').unwrap_or(("minecraft", s));
+    let ok = |c: u8, slash: bool| {
+        matches!(c, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-') || (slash && c == b'/')
+    };
+    ns.bytes().all(|c| ok(c, false)) && path.bytes().all(|c| ok(c, true))
+}
+
+/// `s` with its namespace spelled out (`stone` is `minecraft:stone`).
+pub fn full_identifier(s: &str) -> String {
+    match s.split_once(':') {
+        Some(("", path)) => format!("minecraft:{path}"),
+        Some(_) => s.to_owned(),
+        None => format!("minecraft:{s}"),
+    }
 }
 
 /// Frames a packet: `id` and `body` behind their total length.
@@ -158,6 +223,85 @@ impl<'a> Reader<'a> {
         Ok(i64::from_be_bytes(self.bytes(8)?.try_into().unwrap()))
     }
 
+    pub fn u8(&mut self) -> Result<u8, WireError> {
+        Ok(self.bytes(1)?[0])
+    }
+
+    /// Any byte but zero is true, as Netty's `readBoolean` reads it.
+    pub fn bool(&mut self) -> Result<bool, WireError> {
+        Ok(self.u8()? != 0)
+    }
+
+    pub fn u16(&mut self) -> Result<u16, WireError> {
+        Ok(u16::from_be_bytes(self.bytes(2)?.try_into().unwrap()))
+    }
+
+    pub fn i32(&mut self) -> Result<i32, WireError> {
+        Ok(i32::from_be_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+
+    pub fn uuid(&mut self) -> Result<u128, WireError> {
+        Ok(u128::from_be_bytes(self.bytes(16)?.try_into().unwrap()))
+    }
+
+    /// A byte array of at most `max` bytes (vanilla's default limit is what is left).
+    pub fn byte_array(&mut self, max: usize) -> Result<&'a [u8], WireError> {
+        let len = self.varint()?;
+        if len < 0 {
+            return Err(WireError::NegativeLength(len));
+        }
+        let len = len as usize;
+        if len > max {
+            return Err(WireError::TooLong { len, max });
+        }
+        self.bytes(len)
+    }
+
+    /// A list or map length of at most `max` (`ByteBufCodecs.readCount`).
+    pub fn count(&mut self, max: usize) -> Result<usize, WireError> {
+        let n = self.varint()?;
+        if n < 0 {
+            return Err(WireError::NegativeLength(n));
+        }
+        let n = n as usize;
+        if n > max {
+            return Err(WireError::TooLong { len: n, max });
+        }
+        Ok(n)
+    }
+
+    /// An identifier, its namespace spelled out (`FriendlyByteBuf.readIdentifier`).
+    pub fn identifier(&mut self) -> Result<String, WireError> {
+        let s = self.string(MAX_STRING)?;
+        if !valid_identifier(s) {
+            return Err(WireError::Invalid("identifier"));
+        }
+        Ok(full_identifier(s))
+    }
+
+    /// One NBT tag as the network sends it (`None` for the end tag, vanilla's null).
+    pub fn nbt(&mut self) -> Result<Option<crate::nbt::Tag>, WireError> {
+        let (tag, used) = crate::nbt::read_network(&self.buf[self.pos..])
+            .map_err(|_| WireError::Invalid("NBT"))?;
+        self.pos += used;
+        Ok(tag)
+    }
+
+    /// Everything left.
+    pub fn rest(&mut self) -> &'a [u8] {
+        let r = &self.buf[self.pos..];
+        self.pos = self.buf.len();
+        r
+    }
+
+    /// Ends a packet: an error if any bytes are left.
+    pub fn finish(&self) -> Result<(), WireError> {
+        match self.remaining() {
+            0 => Ok(()),
+            n => Err(WireError::TrailingBytes(n)),
+        }
+    }
+
     /// A string of at most `max` UTF-16 units (and so at most `3 * max` bytes).
     pub fn string(&mut self, max: usize) -> Result<&'a str, WireError> {
         let len = self.varint()?;
@@ -216,6 +360,36 @@ mod tests {
         two.extend_from_slice(&f);
         assert_eq!(split_frame(&two), Ok(Some((&f[1..], 5))));
         assert!(split_frame(&[0x80, 0x80, 0x80, 0x01]).is_err());
+    }
+
+    #[test]
+    fn fields_round_trip() {
+        let mut out = Vec::new();
+        write_bool(&mut out, true);
+        write_u16(&mut out, 25565);
+        write_i32(&mut out, -2);
+        write_i64(&mut out, i64::MIN);
+        write_uuid(&mut out, 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
+        write_byte_array(&mut out, &[1, 2, 3]);
+        write_string(&mut out, "stone");
+        let mut r = Reader::new(&out);
+        assert!(r.bool().unwrap());
+        assert_eq!(r.u16().unwrap(), 25565);
+        assert_eq!(r.i32().unwrap(), -2);
+        assert_eq!(r.i64().unwrap(), i64::MIN);
+        assert_eq!(
+            &out[15..23],
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF]
+        );
+        assert_eq!(r.uuid().unwrap(), 0x0123_4567_89AB_CDEF_FEDC_BA98_7654_3210);
+        assert!(r.clone().byte_array(2).is_err());
+        assert_eq!(r.byte_array(3).unwrap(), [1, 2, 3]);
+        assert_eq!(r.clone().finish(), Err(WireError::TrailingBytes(6)));
+        assert_eq!(r.identifier().unwrap(), "minecraft:stone");
+        r.finish().unwrap();
+        assert!(valid_identifier("ruthenium:policy/v1"));
+        assert!(!valid_identifier("Bad:Name"));
+        assert!(!valid_identifier("a:b:c"));
     }
 
     #[test]

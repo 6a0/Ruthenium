@@ -26,7 +26,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 pub use http::{Http, UreqHttp};
-pub use minecraft::{Certificates, Endpoints, Privileges, Profile};
+pub use minecraft::{Certificates, Endpoints, JoinError, Privileges, Profile};
 pub use msa::DeviceCode;
 pub use store::{Account, AccountStore};
 pub use xbox::XboxRefusal;
@@ -242,6 +242,58 @@ impl Auth {
 impl Default for Auth {
     fn default() -> Auth {
         Auth::new()
+    }
+}
+
+/// Joins servers' sessions as one signed-in player, for online-mode logins. Blocks on the
+/// network; safe to use from any thread.
+pub struct ServerJoin {
+    http: Box<dyn Http>,
+    discovery_cache: Option<PathBuf>,
+    access_token: String,
+    profile_id: String,
+}
+
+impl std::fmt::Debug for ServerJoin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerJoin")
+            .field("profile_id", &self.profile_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ServerJoin {
+    /// Over HTTPS, with the services' discovery document kept in `discovery_cache`.
+    pub fn new(session: &Session, discovery_cache: Option<&Path>) -> ServerJoin {
+        ServerJoin::with_http(Box::new(UreqHttp::new()), session, discovery_cache)
+    }
+
+    pub fn with_http(
+        http: Box<dyn Http>,
+        session: &Session,
+        discovery_cache: Option<&Path>,
+    ) -> ServerJoin {
+        ServerJoin {
+            http,
+            discovery_cache: discovery_cache.map(Path::to_owned),
+            access_token: session.access_token.clone(),
+            profile_id: session.profile.id.clone(),
+        }
+    }
+
+    /// Joins the session of the server whose hash is `server_hash`.
+    pub fn join(&self, server_hash: &str) -> Result<(), JoinError> {
+        let endpoints = match &self.discovery_cache {
+            Some(path) => Endpoints::discover_cached(&*self.http, path),
+            None => Endpoints::default(),
+        };
+        minecraft::join_server(
+            &*self.http,
+            &endpoints.session_join,
+            &self.access_token,
+            &self.profile_id,
+            server_hash,
+        )
     }
 }
 
