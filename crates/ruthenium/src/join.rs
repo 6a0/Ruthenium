@@ -11,7 +11,8 @@ use ruthenium_assets::zip::Zip;
 use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, Reason, Stage};
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
-use ruthenium_sim::session::{Session, SessionOptions};
+use ruthenium_sim::blocks::Blocks;
+use ruthenium_sim::session::{Physics, Session, SessionOptions};
 
 use crate::account::Accounts;
 
@@ -34,6 +35,8 @@ pub struct GameData {
     /// Vanilla's data packs at the game's version: `core` and the feature packs in the
     /// jar (`ServerPacksSource.createVanillaTrustedRepository`).
     pub known_packs: Vec<KnownPack>,
+    /// What movement needs: the exported block physics and vanilla's dimension heights.
+    pub physics: Option<Physics>,
 }
 
 impl GameData {
@@ -72,8 +75,36 @@ impl GameData {
         features.sort();
         features.dedup();
         known_packs.extend(features.iter().map(|f| KnownPack::vanilla(f, id)));
-        GameData { lang, known_packs }
+        let exports = ruthenium_prepare::exporters::exports_dir(&imported);
+        let physics = match Blocks::load(&exports) {
+            Ok(blocks) => Some(Physics {
+                blocks: Arc::new(blocks),
+                dimension_types: dimension_types(&jar),
+            }),
+            Err(e) => {
+                eprintln!("[ruthenium] no block physics ({e}); run `ruthenium prepare`");
+                None
+            }
+        };
+        GameData {
+            lang,
+            known_packs,
+            physics,
+        }
     }
+}
+
+/// Vanilla's dimension types' heights from the jar's data pack: name to (min_y, height).
+fn dimension_types(jar: &Zip) -> HashMap<String, (i32, i32)> {
+    const DIR: &str = "data/minecraft/dimension_type/";
+    jar.with_prefix(DIR)
+        .filter_map(|i| {
+            let file = jar.name(i).strip_prefix(DIR)?.strip_suffix(".json")?;
+            let v: serde_json::Value = serde_json::from_slice(&jar.read(i).ok()?).ok()?;
+            let n = |k: &str| v.get(k)?.as_i64().and_then(|n| i32::try_from(n).ok());
+            Some((format!("minecraft:{file}"), (n("min_y")?, n("height")?)))
+        })
+        .collect()
 }
 
 /// Starts joining servers: loads the game data on a thread meanwhile.
@@ -136,6 +167,7 @@ impl Joiner {
                 local_only,
             },
             known_packs: data.known_packs.clone(),
+            physics: data.physics.clone(),
         })
         .map_err(|e| format!("couldn't start the connection: {e}"))
     }

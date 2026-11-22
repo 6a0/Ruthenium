@@ -17,7 +17,7 @@
 //! and server links (ignored), and anything in play beyond pings, cookies and the switch
 //! back to configuration.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -28,9 +28,11 @@ use ruthenium_net::connection::{
 use ruthenium_protocol::packets::configuration::{self as cfg, RegistryEntry, RegistryTags};
 use ruthenium_protocol::packets::{Common, KnownPack, PackAction, play, read_brand};
 
+use crate::blocks::{BlockTags, Blocks};
 use crate::clock::{self, TickClock};
 use crate::level_load::LevelLoad;
-use crate::player::LocalPlayer;
+use crate::player::{Env, Keys, LocalPlayer};
+use crate::world::{Level, global_bits};
 
 /// How often the thread looks for commands while no packet arrives.
 const COMMAND_POLL: Duration = Duration::from_millis(20);
@@ -41,6 +43,18 @@ pub struct SessionOptions {
     /// The data packs the client has (the imported game's), offered back when the server
     /// lists them.
     pub known_packs: Vec<KnownPack>,
+    /// What the local player's movement needs from the prepared game; without it the
+    /// player doesn't move or send movement.
+    pub physics: Option<Physics>,
+}
+
+/// The prepared game's data movement uses.
+#[derive(Debug, Clone)]
+pub struct Physics {
+    pub blocks: std::sync::Arc<Blocks>,
+    /// Vanilla's dimension types by name: (min_y, height), for servers that send them
+    /// as known-pack entries without data.
+    pub dimension_types: HashMap<String, (i32, i32)>,
 }
 
 /// What the menus hear.
@@ -87,10 +101,14 @@ impl Session {
         let (commands, command_rx) = channel();
         let (tx, events) = channel();
         let known_packs = options.known_packs;
+        let physics = options.physics;
+        if physics.is_none() {
+            eprintln!("[session] no prepared game: the player won't move or send movement");
+        }
         let thread = std::thread::Builder::new()
             .name("game".into())
             .spawn(move || {
-                let mut game = Game::new(connection, known_packs, tx);
+                let mut game = Game::new(connection, known_packs, physics, tx);
                 game.run(&command_rx);
             })?;
         Ok(Session {
@@ -167,6 +185,8 @@ struct Game {
     play_packets: u64,
     /// The level, from the play login packet until the session goes back to configuration.
     world: Option<World>,
+    physics: Option<Physics>,
+    tags: BlockTags,
     clock: TickClock,
     started: Instant,
 }
@@ -181,8 +201,9 @@ struct World {
     dimension: String,
     game_type: i32,
     player: LocalPlayer,
-    /// The chunks the server has sent and not taken back.
-    chunks: HashSet<(i32, i32)>,
+    level: Level,
+    /// Bits of the biome palette (from the biome registry's size).
+    biome_bits: u32,
     /// Until the player counts as loaded.
     load: Option<LevelLoad>,
     loaded: bool,
@@ -196,12 +217,13 @@ struct World {
 }
 
 impl World {
-    fn new(spawn: &play::SpawnInfo, now: i64) -> World {
+    fn new(spawn: &play::SpawnInfo, now: i64, level: Level, biome_bits: u32) -> World {
         World {
             dimension: spawn.dimension.clone(),
             game_type: spawn.game_type,
             player: LocalPlayer::new(),
-            chunks: HashSet::new(),
+            level,
+            biome_bits,
             load: Some(LevelLoad::start(now)),
             loaded: false,
             level_started: now,
@@ -217,6 +239,7 @@ impl Game {
     fn new(
         connection: Connection,
         known_packs: Vec<KnownPack>,
+        physics: Option<Physics>,
         events: Sender<SessionEvent>,
     ) -> Game {
         Game {
@@ -233,6 +256,8 @@ impl Game {
             waiting_for_code_of_conduct: false,
             play_packets: 0,
             world: None,
+            physics,
+            tags: BlockTags::new(),
             clock: TickClock::new(0),
             started: Instant::now(),
         }
@@ -277,7 +302,7 @@ impl Game {
                     return;
                 }
             };
-            // Packets first, then the ticks due (\`Minecraft.runTick\`).
+            // Packets first, then the ticks due (`Minecraft.runTick`).
             let mut next = first;
             while let Some(e) = next {
                 if !self.handle(e) {
@@ -292,7 +317,7 @@ impl Game {
         }
     }
 
-    /// Vanilla's millisecond clock (\`Util.getMillis\`).
+    /// Vanilla's millisecond clock (`Util.getMillis`).
     fn millis(&self) -> i64 {
         self.started.elapsed().as_millis() as i64
     }
@@ -334,13 +359,59 @@ impl Game {
         true
     }
 
-    /// One client tick (\`Minecraft.tick\`), for the parts there are so far.
+    /// A level for a dimension: its height from the dimension type the server named
+    /// (the data it sent, or vanilla's for a known-pack entry), and the biome palette's
+    /// width from the biome registry.
+    fn new_level(&self, spawn: &play::SpawnInfo) -> (Level, u32) {
+        let registry = |name: &str| {
+            self.configured
+                .registries
+                .iter()
+                .find(|(r, _)| r == name)
+                .map(|(_, e)| e.as_slice())
+                .unwrap_or(&[])
+        };
+        let types = registry("minecraft:dimension_type");
+        let entry = usize::try_from(spawn.dimension_type)
+            .ok()
+            .and_then(|i| types.get(i));
+        let from_data = entry.and_then(|e| {
+            let c = e.data.as_ref()?.as_compound()?;
+            Some((c.int("min_y")?, c.int("height")?))
+        });
+        let vanilla =
+            entry.and_then(|e| self.physics.as_ref()?.dimension_types.get(&e.id).copied());
+        let (min_y, height) = from_data.or(vanilla).unwrap_or_else(|| {
+            eprintln!(
+                "[session] dimension type {} unknown; assuming the overworld's height",
+                spawn.dimension_type
+            );
+            (-64, 384)
+        });
+        let biomes = registry("minecraft:worldgen/biome").len();
+        (Level::new(min_y, height), global_bits(biomes))
+    }
+
+    /// The block tags movement reads, from the server's tags (block registry ids).
+    fn apply_tags(&mut self, tags: &[RegistryTags]) {
+        let Some(blocks) = tags.iter().find(|t| t.registry == "minecraft:block") else {
+            return;
+        };
+        for (tag, ids) in &blocks.tags {
+            let names = ids.iter().filter_map(|&id| {
+                ruthenium_data::v26_3::Block::from_id(u32::try_from(id).ok()?).map(|b| b.name())
+            });
+            self.tags.set(tag, names);
+        }
+    }
+
+    /// One client tick (`Minecraft.tick`), for the parts there are so far.
     fn tick(&mut self) {
         let now = self.millis();
         let Some(w) = &mut self.world else {
             return;
         };
-        // \`gameMode.tick\`: the held slot first, then the connection's tick, where the
+        // `gameMode.tick`: the held slot first, then the connection's tick, where the
         // listener lets the player in once the level is ready.
         if w.selected_slot != w.carried_index {
             w.carried_index = w.selected_slot;
@@ -348,7 +419,8 @@ impl Game {
                 .send(play::set_carried_item(w.carried_index));
         }
         if let Some(load) = &mut w.load {
-            let chunk = w.chunks.contains(&w.player.chunk());
+            let (cx, cz) = w.player.chunk();
+            let chunk = w.level.has_chunk(cx, cz);
             load.tick(now, chunk, w.game_type == play::SPECTATOR);
             if load.is_ready(now) {
                 w.load = None;
@@ -358,13 +430,27 @@ impl Game {
                     eprintln!(
                         "[session] in the world after {} ms ({} chunks)",
                         now - w.level_started,
-                        w.chunks.len()
+                        w.level.chunk_count()
                     );
                     let _ = self.events.send(SessionEvent::Loaded);
                 }
             }
         }
-        // \`player.sendChanges\` once loaded: needs physics, which comes next.
+        // `level.tickEntities` ticks the player, then `player.sendChanges`; both only
+        // once it has loaded. No keys are held yet: the world isn't shown.
+        if w.loaded
+            && let Some(physics) = &self.physics
+        {
+            let env = Env {
+                level: &w.level,
+                blocks: &physics.blocks,
+                tags: &self.tags,
+            };
+            w.player.tick(&env, Keys::default());
+            for p in w.player.send_changes() {
+                self.connection.send(p);
+            }
+        }
         self.connection.send(play::client_tick_end());
     }
 
@@ -439,7 +525,10 @@ impl Game {
             cfg::Clientbound::RegistryData { registry, entries } => {
                 self.collecting.add_registry(registry, entries);
             }
-            cfg::Clientbound::UpdateTags(tags) => self.collecting.tags = tags,
+            cfg::Clientbound::UpdateTags(tags) => {
+                self.apply_tags(&tags);
+                self.collecting.tags = tags;
+            }
             cfg::Clientbound::UpdateEnabledFeatures { features } => {
                 self.collecting.features = features;
             }
@@ -487,7 +576,7 @@ impl Game {
             }
             play::Clientbound::StartConfiguration => {
                 // Vanilla also sends a pending chat acknowledgement first; there is no
-                // chat yet. The level goes (\`clearLevel\`), and with it the ticks' packets.
+                // chat yet. The level goes (`clearLevel`), and with it the ticks' packets.
                 self.connection
                     .switch(Protocol::Configuration, play::configuration_acknowledged());
                 self.phase = Phase::Configuration;
@@ -504,19 +593,24 @@ impl Game {
                     login.simulation_distance,
                     login.spawn.game_type
                 );
-                self.world = Some(World::new(&login.spawn, now));
+                let (level, biome_bits) = self.new_level(&login.spawn);
+                let mut world = World::new(&login.spawn, now, level, biome_bits);
+                world.player.entity_id = login.player_id;
+                self.world = Some(world);
             }
             play::Clientbound::Respawn { spawn, .. } => {
+                let (level, biome_bits) = self.new_level(&spawn);
                 let w = self.world.as_mut().ok_or("a respawn before the login")?;
                 if spawn.dimension != w.dimension {
-                    w.chunks.clear();
+                    w.level = level;
+                    w.biome_bits = biome_bits;
                     w.dimension = spawn.dimension.clone();
                 }
                 w.game_type = spawn.game_type;
-                // \`handleRespawn\`: a new player, not loaded until the level is ready.
-                let rotation = (w.player.y_rot, w.player.x_rot);
-                w.player = LocalPlayer::new();
-                (w.player.y_rot, w.player.x_rot) = rotation;
+                // `handleRespawn`: a new player, not loaded until the level is ready.
+                let old = std::mem::take(&mut w.player);
+                w.player.entity_id = old.entity_id;
+                (w.player.y_rot, w.player.x_rot) = (old.y_rot, old.x_rot);
                 w.loaded = false;
                 w.load = Some(LevelLoad::start(now));
                 w.level_started = now;
@@ -546,18 +640,49 @@ impl Game {
                     }
                 }
             }
-            play::Clientbound::LevelChunk { x, z } => {
-                if let Some(w) = &mut self.world {
-                    w.chunks.insert((x, z));
+            play::Clientbound::LevelChunk { x, z, data } => {
+                if let Some(w) = &mut self.world
+                    && let Err(e) = w.level.load_chunk(x, z, &data, w.biome_bits)
+                {
+                    return Err(format!("chunk {x} {z}: {e}"));
                 }
             }
             play::Clientbound::ForgetLevelChunk { x, z } => {
                 if let Some(w) = &mut self.world {
-                    w.chunks.remove(&(x, z));
+                    w.level.forget_chunk(x, z);
+                }
+            }
+            play::Clientbound::BlockUpdate { pos, state } => {
+                if let Some(w) = &mut self.world {
+                    w.level.set_block(pos[0], pos[1], pos[2], state);
+                }
+            }
+            play::Clientbound::SectionBlocksUpdate { section, changes } => {
+                if let Some(w) = &mut self.world {
+                    for (rel, state) in changes {
+                        let rel = i32::from(rel);
+                        w.level.set_block(
+                            section[0] * 16 + (rel >> 8 & 15),
+                            section[1] * 16 + (rel & 15),
+                            section[2] * 16 + (rel >> 4 & 15),
+                            state,
+                        );
+                    }
+                }
+            }
+            play::Clientbound::UpdateTags(tags) => self.apply_tags(&tags),
+            play::Clientbound::UpdateAttributes {
+                entity_id,
+                attributes,
+            } => {
+                if let Some(w) = &mut self.world
+                    && entity_id == w.player.entity_id
+                {
+                    apply_attributes(&mut w.player, &attributes);
                 }
             }
             play::Clientbound::SetHeldSlot { slot } => {
-                // \`Inventory.isHotbarSlot\`.
+                // `Inventory.isHotbarSlot`.
                 if let Some(w) = &mut self.world
                     && (0..9).contains(&slot)
                 {
@@ -580,6 +705,31 @@ impl Game {
             }
         }
         Ok(())
+    }
+}
+
+/// `handleUpdateAttributes` for the local player: each attribute's base, and its
+/// modifiers replaced by the server's.
+fn apply_attributes(player: &mut LocalPlayer, attributes: &[play::AttributeSnapshot]) {
+    for a in attributes {
+        let Some(name) = u32::try_from(a.attribute)
+            .ok()
+            .and_then(ruthenium_data::v26_3::registries::Attribute::from_id)
+        else {
+            continue;
+        };
+        if let Some(instance) = player.attributes.get_mut(name.name()) {
+            instance.base = a.base;
+            instance.modifiers = a
+                .modifiers
+                .iter()
+                .map(|(id, amount, operation)| crate::player::Modifier {
+                    id: id.clone(),
+                    amount: *amount,
+                    operation: *operation,
+                })
+                .collect();
+        }
     }
 }
 

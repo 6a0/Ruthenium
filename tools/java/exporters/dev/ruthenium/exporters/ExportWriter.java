@@ -18,10 +18,21 @@ import java.nio.file.Path;
 final class ExportWriter {
     private final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
 
+    /** A file with its header; a {@code null} name makes a headerless fragment. */
     ExportWriter(String name, int version) {
-        bytes.writeBytes("RTHX".getBytes(StandardCharsets.US_ASCII));
-        u32(version);
-        string(name);
+        if (name != null) {
+            bytes.writeBytes("RTHX".getBytes(StandardCharsets.US_ASCII));
+            u32(version);
+            string(name);
+        }
+    }
+
+    void bytes(byte[] b) {
+        bytes.writeBytes(b);
+    }
+
+    byte[] payload() {
+        return bytes.toByteArray();
     }
 
     void u8(int v) {
@@ -37,6 +48,12 @@ final class ExportWriter {
 
     void f32(float v) {
         u32(Float.floatToRawIntBits(v));
+    }
+
+    void f64(double v) {
+        long bits = Double.doubleToRawLongBits(v);
+        u32((int) bits);
+        u32((int) (bits >>> 32));
     }
 
     void string(String s) {

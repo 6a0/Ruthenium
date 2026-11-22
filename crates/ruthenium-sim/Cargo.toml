@@ -11,6 +11,13 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+ruthenium-data = { path = "../ruthenium-data" }
+ruthenium-prepare = { path = "../ruthenium-prepare" }
 ruthenium-javamath = { path = "../ruthenium-javamath" }
 ruthenium-net = { path = "../ruthenium-net" }
 ruthenium-protocol = { path = "../ruthenium-protocol" }
+
+[dev-dependencies]
+ruthenium-assets = { path = "../ruthenium-assets" }
+ruthenium-trace = { path = "../ruthenium-trace" }
+serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }

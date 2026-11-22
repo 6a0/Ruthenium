@@ -11,7 +11,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blocks;
 pub mod clock;
 pub mod level_load;
 pub mod player;
 pub mod session;
+pub mod shape;
+pub mod world;

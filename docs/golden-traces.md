@@ -32,6 +32,16 @@ Things this harness changes compared with normal play, which replay tests must a
 - **Singleplayer.** The connection is the integrated server's in-memory one. The recorder encodes each packet itself with the protocol in effect, which gives the same bytes the network encoder would write before framing, compression and encryption.
 - **Inbound arrival.** Packets from the server arrive on the network thread at times that vary from run to run. `recv` records and the tick on which a `handle` happens (for example `set_time`, sent every 20 server ticks) can differ between recordings. Each trace records where they actually happened, which is what a replay needs.
 
+## Replaying
+
+`crates/ruthenium-sim/tests/golden.rs` replays every trace through Ruthenium's movement code: it builds the scenario's world from the header's commands on the flat preset, then each tick sets the camera's rotation, holds the recorded keys, runs the player's tick and compares the position, velocity, ground and collision flags, sprinting and pose with the `state` record, and the movement packets (`player_input`, `player_command`, `move_player_*`) with the `out` records, byte for byte. It needs the prepared game (block shapes from the exporters, block tags from the jar):
+
+```sh
+RUTHENIUM_GAME_DIR=~/.local/share/ruthenium/game cargo test -p ruthenium-sim --test golden -- --nocapture
+```
+
+Without `RUTHENIUM_GAME_DIR` it is skipped. The scenarios listed in `EXACT` must match every tick; the others are reported. The trace doesn't record how many ticks had passed since the last position packet when it starts, so the replay tries each count until the first heartbeat lines up.
+
 ## Scenarios
 
 Each scenario first clears a 41 × 25 area around the origin of a flat world and lays a stone floor (the `reset` commands in the header). It then builds its own blocks with commands (`build`) and teleports the player (`teleport`). The header therefore describes the whole world the trace ran in. No world files are involved. The player stands at y = -60; yaw 0 faces +Z, yaw -90 faces +X.

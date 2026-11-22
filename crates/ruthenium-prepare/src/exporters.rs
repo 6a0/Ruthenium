@@ -17,6 +17,7 @@ use crate::step;
 pub const BUNDLE_NAME: &str = "ruthenium-exporters.jar";
 const MAIN_CLASS: &str = "dev.ruthenium.exporters.Main";
 pub const ENTITY_DIMENSIONS: &str = "entity_dimensions.bin";
+pub const BLOCK_PHYSICS: &str = "block_physics.bin";
 
 /// The exporter bundle: `explicit`, then `RUTHENIUM_EXPORTERS`, then next to
 /// the executable, then `../java/` from it (`target/java/` in a dev build).
@@ -70,9 +71,11 @@ pub fn run(java: &Java, imported: &Imported, bundle: &Path) -> Result<(PathBuf, 
             imported,
             "exporters",
         )?;
-        let expected = tmp.join(ENTITY_DIMENSIONS);
-        if !expected.is_file() {
-            return Err(StepError::MissingOutput(expected));
+        for file in [ENTITY_DIMENSIONS, BLOCK_PHYSICS] {
+            let expected = tmp.join(file);
+            if !expected.is_file() {
+                return Err(StepError::MissingOutput(expected));
+            }
         }
         Ok(())
     })?;
@@ -136,6 +139,12 @@ impl<'a> Reader<'a> {
         Ok(f32::from_bits(self.u32()?))
     }
 
+    fn f64(&mut self) -> Result<f64, String> {
+        let lo = u64::from(self.u32()?);
+        let hi = u64::from(self.u32()?);
+        Ok(f64::from_bits(lo | hi << 32))
+    }
+
     fn string(&mut self) -> Result<String, String> {
         let len = u16::from_le_bytes(self.take(2)?.try_into().expect("2 bytes"));
         String::from_utf8(self.take(len.into())?.to_vec()).map_err(|e| e.to_string())
@@ -167,6 +176,110 @@ pub fn read_entity_dimensions(bytes: &[u8]) -> Result<Vec<EntityDimensions>, Str
     }
     r.finish()?;
     Ok(out)
+}
+
+/// A collision shape as the game stores it: the coordinates of its grid on each axis
+/// (one more than the cells) and which cells are full.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeData {
+    /// x, y and z coordinates.
+    pub coords: [Vec<f64>; 3],
+    /// Full cells, x outermost and z innermost.
+    pub full: Vec<bool>,
+}
+
+/// How a block's position offsets its shape (`BlockBehaviour.OffsetType`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OffsetData {
+    pub vertical: bool,
+    pub max_horizontal: f32,
+    pub max_vertical: f32,
+}
+
+/// A block state's physics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StatePhysics {
+    /// Index into [`BlockPhysics::shapes`]; 0 is the empty shape.
+    pub shape: u32,
+    pub flags: u8,
+    pub friction: f32,
+    pub speed_factor: f32,
+    pub jump_factor: f32,
+    /// `BlockBehaviour.bounceRestitution` (slime blocks and beds bounce).
+    pub bounce: f32,
+    pub offset: Option<OffsetData>,
+}
+
+impl StatePhysics {
+    pub const LARGE_SHAPE: u8 = 1;
+    pub const DYNAMIC_SHAPE: u8 = 2;
+    /// The shape depends on who collides (liquids, powder snow, scaffolding, moving
+    /// pistons).
+    pub const CONTEXT_SHAPE: u8 = 4;
+    pub const OFFSET: u8 = 8;
+    /// `isSuffocating` at the origin.
+    pub const SUFFOCATING: u8 = 16;
+}
+
+/// `block_physics.bin`: every block state's collision shape and movement factors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockPhysics {
+    pub shapes: Vec<ShapeData>,
+    pub states: Vec<StatePhysics>,
+}
+
+/// Parses `block_physics.bin`.
+pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
+    let mut r = Reader::open(bytes, "block_physics", 2)?;
+    let n = r.u32()? as usize;
+    let mut shapes = Vec::with_capacity(n.min(1 << 16));
+    for _ in 0..n {
+        let mut coords: [Vec<f64>; 3] = Default::default();
+        for axis in &mut coords {
+            let len = r.u32()? as usize;
+            if len == 0 || len > 1024 {
+                return Err(format!("bad coordinate count {len}"));
+            }
+            *axis = (0..len).map(|_| r.f64()).collect::<Result<_, _>>()?;
+        }
+        let cells = (coords[0].len() - 1) * (coords[1].len() - 1) * (coords[2].len() - 1);
+        let packed = r.take(cells.div_ceil(8))?;
+        let full = (0..cells)
+            .map(|i| packed[i / 8] >> (i % 8) & 1 != 0)
+            .collect();
+        shapes.push(ShapeData { coords, full });
+    }
+    let n = r.u32()? as usize;
+    let mut states = Vec::with_capacity(n.min(1 << 17));
+    for _ in 0..n {
+        let shape = r.u32()?;
+        if shape as usize >= shapes.len() {
+            return Err(format!("shape {shape} out of range"));
+        }
+        let flags = r.u8()?;
+        let (friction, speed_factor, jump_factor) = (r.f32()?, r.f32()?, r.f32()?);
+        let bounce = r.f32()?;
+        let offset = if flags & StatePhysics::OFFSET != 0 {
+            Some(OffsetData {
+                vertical: r.u8()? == 2,
+                max_horizontal: r.f32()?,
+                max_vertical: r.f32()?,
+            })
+        } else {
+            None
+        };
+        states.push(StatePhysics {
+            shape,
+            flags,
+            friction,
+            speed_factor,
+            jump_factor,
+            bounce,
+            offset,
+        });
+    }
+    r.finish()?;
+    Ok(BlockPhysics { shapes, states })
 }
 
 #[cfg(test)]

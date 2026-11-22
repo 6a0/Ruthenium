@@ -29,5 +29,6 @@ public final class Main {
         Bootstrap.bootStrap();
 
         EntityDimensionsExporter.export(out.resolve(EntityDimensionsExporter.FILE));
+        BlockPhysicsExporter.export(out.resolve(BlockPhysicsExporter.FILE));
     }
 }

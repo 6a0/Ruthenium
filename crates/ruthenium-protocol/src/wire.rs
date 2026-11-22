@@ -273,6 +273,19 @@ impl<'a> Reader<'a> {
         self.bytes(len)
     }
 
+    /// A VarLong (`VarLong.read`: at most ten bytes).
+    pub fn varlong(&mut self) -> Result<i64, WireError> {
+        let mut v: u64 = 0;
+        for i in 0..10 {
+            let b = self.u8()?;
+            v |= u64::from(b & 0x7F) << (7 * i);
+            if b & 0x80 == 0 {
+                return Ok(v as i64);
+            }
+        }
+        Err(WireError::VarIntTooLong)
+    }
+
     /// A list or map length of at most `max` (`ByteBufCodecs.readCount`).
     pub fn count(&mut self, max: usize) -> Result<usize, WireError> {
         let n = self.varint()?;

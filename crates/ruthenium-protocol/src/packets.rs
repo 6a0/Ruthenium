@@ -708,6 +708,25 @@ pub mod play {
         pub relatives: u32,
     }
 
+    /// An attribute's base and modifiers (`ClientboundUpdateAttributesPacket.AttributeSnapshot`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct AttributeSnapshot {
+        /// Network id in the attribute registry.
+        pub attribute: i32,
+        pub base: f64,
+        /// (id, amount, operation).
+        pub modifiers: Vec<(String, f64, u8)>,
+    }
+
+    /// `BlockPos.of`: x in the top 26 bits, z in the next 26, y in the low 12.
+    pub fn unpack_block_pos(v: i64) -> [i32; 3] {
+        [
+            (v >> 38) as i32,
+            (v << 52 >> 52) as i32,
+            (v << 26 >> 38) as i32,
+        ]
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub enum Clientbound {
         Common(Common),
@@ -727,10 +746,27 @@ pub mod play {
         ChunkBatchFinished {
             batch_size: i32,
         },
-        /// A chunk arrived; only its position is read so far.
+        /// A chunk: its position and its sections' data (`ClientboundLevelChunkPacketData`'s
+        /// buffer); heightmaps, block entities and light are skipped.
         LevelChunk {
             x: i32,
             z: i32,
+            data: Vec<u8>,
+        },
+        BlockUpdate {
+            pos: [i32; 3],
+            state: u32,
+        },
+        /// Changes in one section: the section and each (local position, state); local
+        /// positions are `x << 8 | z << 4 | y`.
+        SectionBlocksUpdate {
+            section: [i32; 3],
+            changes: Vec<(u16, u32)>,
+        },
+        UpdateTags(Vec<configuration::RegistryTags>),
+        UpdateAttributes {
+            entity_id: i32,
+            attributes: Vec<AttributeSnapshot>,
         },
         ForgetLevelChunk {
             x: i32,
@@ -812,8 +848,59 @@ pub mod play {
                 },
                 C::LevelChunkWithLight => {
                     let (x, z) = (r.i32()?, r.i32()?);
+                    // Heightmaps: (type, long array) pairs.
+                    let n = r.count(16)?;
+                    for _ in 0..n {
+                        r.varint()?;
+                        let longs = r.count(4096)?;
+                        r.bytes(longs * 8)?;
+                    }
+                    let data = r.byte_array(2 << 20)?.to_vec();
                     r.rest();
-                    Clientbound::LevelChunk { x, z }
+                    Clientbound::LevelChunk { x, z, data }
+                }
+                C::BlockUpdate => Clientbound::BlockUpdate {
+                    pos: unpack_block_pos(r.i64()?),
+                    state: r.varint()? as u32,
+                },
+                C::SectionBlocksUpdate => {
+                    let s = r.i64()?;
+                    let section = [
+                        (s >> 42) as i32,
+                        (s << 44 >> 44) as i32,
+                        (s << 22 >> 42) as i32,
+                    ];
+                    let n = r.count(4096)?;
+                    let mut changes = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let v = r.varlong()?;
+                        changes.push(((v & 4095) as u16, (v as u64 >> 12) as u32));
+                    }
+                    Clientbound::SectionBlocksUpdate { section, changes }
+                }
+                C::UpdateTags => Clientbound::UpdateTags(configuration::read_tags(&mut r)?),
+                C::UpdateAttributes => {
+                    let entity_id = r.varint()?;
+                    let n = r.count(128)?;
+                    let mut attributes = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let attribute = r.varint()?;
+                        let base = r.f64()?;
+                        let m = r.count(usize::MAX)?;
+                        let mut modifiers = Vec::with_capacity(m.min(64));
+                        for _ in 0..m {
+                            modifiers.push((r.identifier()?, r.f64()?, r.varint()? as u8));
+                        }
+                        attributes.push(AttributeSnapshot {
+                            attribute,
+                            base,
+                            modifiers,
+                        });
+                    }
+                    Clientbound::UpdateAttributes {
+                        entity_id,
+                        attributes,
+                    }
                 }
                 C::ForgetLevelChunk => {
                     // `ChunkPos` as one long: x in the low half, z in the high half.

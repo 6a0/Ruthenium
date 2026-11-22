@@ -2277,9 +2277,14 @@ version = "0.0.0"
 name = "ruthenium-sim"
 version = "0.0.0"
 dependencies = [
+ "ruthenium-assets",
+ "ruthenium-data",
  "ruthenium-javamath",
  "ruthenium-net",
+ "ruthenium-prepare",
  "ruthenium-protocol",
+ "ruthenium-trace",
+ "serde_json",
 ]
 
 [[package]]
