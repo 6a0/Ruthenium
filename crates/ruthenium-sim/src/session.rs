@@ -109,6 +109,20 @@ pub enum SessionEvent {
     /// The server went back to configuration (a server switch behind a proxy, a data pack
     /// reload).
     Reconfiguring,
+    /// The local player died and the death screen opened (`DeathScreen`): why (`None`
+    /// when the client found the player dead with no screen open), whether the world is
+    /// hardcore (Spectate World instead of Respawn) and the score. Its buttons wait for
+    /// [`SessionEvent::RespawnReady`]; Respawn is [`Session::respawn`].
+    Died {
+        cause: Option<ruthenium_protocol::nbt::Tag>,
+        hardcore: bool,
+        score: i32,
+    },
+    /// The death screen's buttons work now, 20 ticks after it opened.
+    RespawnReady,
+    /// The server brought the player back (`handleRespawn`): the death screen closes and
+    /// the level loads; [`SessionEvent::Loaded`] follows.
+    Respawned,
     /// The last event.
     Closed(Closed),
 }
@@ -116,6 +130,8 @@ pub enum SessionEvent {
 enum Command {
     CodeOfConduct(bool),
     Disconnect,
+    /// The death screen's Respawn (or Spectate World) button.
+    Respawn,
     /// One frame of the main thread, with its input.
     Frame(FrameInput),
 }
@@ -238,6 +254,12 @@ impl Session {
     /// Disconnects; a [`SessionEvent::Closed`] follows.
     pub fn disconnect(&self) {
         let _ = self.commands.send(Command::Disconnect);
+    }
+
+    /// Asks the server to bring the dead player back (`LocalPlayer.respawn`: the death
+    /// screen's Respawn button); [`SessionEvent::Respawned`] follows.
+    pub fn respawn(&self) {
+        let _ = self.commands.send(Command::Respawn);
     }
 
     /// Ends the main thread's frame: the game thread runs it (`Minecraft.runTick`) with
@@ -398,6 +420,12 @@ struct Game {
     use_keys: UseKeys,
     /// A screen is open over the world.
     screen_open: bool,
+    /// The death screen, while it is open: the ticks since it opened (`delayTicker`).
+    /// The session opens it itself, as vanilla's packet listener and `Gui.tick` do,
+    /// so it counts as a screen from that tick on.
+    death_screen: Option<u32>,
+    /// The world is hardcore (the login says).
+    hardcore: bool,
     /// The profile name the server knows the player by (its scoreboard name), and its
     /// UUID (its player list entry).
     name: String,
@@ -414,6 +442,7 @@ const MINECART_IMPROVEMENTS: &str = "minecraft:minecart_improvements";
 
 /// `ClientboundGameEventPacket` events the session acts on.
 const GAME_EVENT_CHANGE_GAME_MODE: u8 = 3;
+const GAME_EVENT_IMMEDIATE_RESPAWN: u8 = 11;
 const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
 
 /// `EntityEvent.USE_ITEM_COMPLETE`.
@@ -507,6 +536,8 @@ impl Game {
             hotbar_clicks: [0; 9],
             use_keys: UseKeys::default(),
             screen_open: false,
+            death_screen: None,
+            hardcore: false,
             name: String::new(),
             uuid: 0,
             players: PlayerInfos::default(),
@@ -532,6 +563,12 @@ impl Game {
                     }
                 }
                 Command::Disconnect => self.connection.close(),
+                Command::Respawn => {
+                    if self.world.is_some() {
+                        self.connection
+                            .send(play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN));
+                    }
+                }
                 Command::CodeOfConduct(accept) if self.waiting_for_code_of_conduct => {
                     self.waiting_for_code_of_conduct = false;
                     if accept {
@@ -592,6 +629,10 @@ impl Game {
         self.use_keys.attack_down = input.attack_down;
         self.use_keys.attack_clicks += input.attack_clicks;
         self.screen_open = input.screen_open;
+        // The death screen took the keys (`KeyMapping.releaseAll`) and keeps them.
+        if self.death_screen.is_some() {
+            self.release_keys();
+        }
         // Without a player (`minecraft.player == null`) the input goes nowhere.
         let Some(w) = &mut self.world else {
             return;
@@ -612,6 +653,25 @@ impl Game {
         for (pending, new) in self.hotbar_clicks.iter_mut().zip(input.hotbar_clicks) {
             *pending += new;
         }
+    }
+
+    /// `KeyMapping.releaseAll`: a screen opened.
+    fn release_keys(&mut self) {
+        self.keys = Keys::default();
+        self.use_keys.use_down = false;
+        self.use_keys.attack_down = false;
+    }
+
+    /// Opens the death screen (`new DeathScreen`): the keys are let go.
+    fn open_death_screen(&mut self, cause: Option<ruthenium_protocol::nbt::Tag>) {
+        self.death_screen = Some(0);
+        self.release_keys();
+        let score = self.world.as_ref().map_or(0, |w| w.player.data.score);
+        self.report(SessionEvent::Died {
+            cause,
+            hardcore: self.hardcore,
+            score,
+        });
     }
 
     /// Publishes the player's state for the screen.
@@ -815,7 +875,7 @@ impl Game {
         if let Some(load) = &mut w.load {
             let (cx, cz) = w.player.chunk();
             let chunk = w.level.has_chunk(cx, cz);
-            load.tick(now, chunk, w.player.spectator);
+            load.tick(now, chunk, w.player.spectator || !w.player.is_alive());
             if load.is_ready(now) {
                 w.load = None;
                 if !w.loaded {
@@ -830,6 +890,29 @@ impl Game {
                 }
             }
         }
+        // `Gui.tick`: with no screen open, a dead player gets the death screen, or asks
+        // to respawn at once (every tick, until the server answers); then the death
+        // screen ticks, its buttons working from its 20th tick.
+        let found_dead =
+            !self.screen_open && self.death_screen.is_none() && w.player.is_dead_or_dying();
+        let show_death_screen = w.player.show_death_screen;
+        if found_dead {
+            if show_death_screen {
+                self.open_death_screen(None);
+            } else {
+                self.connection
+                    .send(play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN));
+            }
+        }
+        if let Some(t) = &mut self.death_screen {
+            *t += 1;
+            if *t == 20 {
+                let _ = self.events.send(SessionEvent::RespawnReady);
+            }
+        }
+        let Some(w) = &mut self.world else {
+            return;
+        };
         let Some(physics) = &self.physics else {
             self.use_keys = UseKeys {
                 use_down: self.use_keys.use_down,
@@ -843,7 +926,7 @@ impl Game {
         // or another): one press per hotbar key per tick (spectators' hotbar keys open
         // the spectator menu instead, which isn't there yet), then the hands. A screen
         // makes attacks wait for the attack key to be let go.
-        if !w.loaded || self.screen_open {
+        if !w.loaded || self.screen_open || self.death_screen.is_some() {
             w.game_mode.screen_open();
         } else {
             let env = Env {
@@ -900,18 +983,22 @@ impl Game {
             local: LocalInfo {
                 name: &self.name,
                 spectator: w.player.spectator,
-                health: w.player.health,
+                alive: w.player.is_alive(),
             },
             tick_rate: w.tick_rate,
             runs_normally: !w.frozen,
         };
         let (loaded, keys, connection) = (w.loaded, self.keys, &self.connection);
         w.entities.tick(&cx, &mut w.player, |player, colliders| {
-            if loaded {
+            // A player taken out of the level (20 ticks after dying) no longer ticks,
+            // and `sendChanges` waits for a player still in it.
+            if loaded && player.is_alive() {
                 let env = Env { colliders, ..env };
                 player.tick(&env, keys);
-                for p in player.send_changes() {
-                    connection.send(p);
+                if player.is_alive() {
+                    for p in player.send_changes() {
+                        connection.send(p);
+                    }
                 }
             }
         });
@@ -1047,6 +1134,7 @@ impl Game {
                 self.phase = Phase::Configuration;
                 self.collecting = Configured::default();
                 self.world = None;
+                self.death_screen = None;
                 self.players = PlayerInfos::default();
                 self.teams = Teams::default();
                 self.report(SessionEvent::Reconfiguring);
@@ -1064,6 +1152,8 @@ impl Game {
                 let entities = self.new_entities(login.player_id);
                 let mut world = World::new(&login.spawn, now, level, biome_bits, entities);
                 world.player.entity_id = login.player_id;
+                world.player.show_death_screen = login.show_death_screen;
+                self.hardcore = login.hardcore;
                 self.world = Some(world);
             }
             play::Clientbound::Respawn {
@@ -1095,6 +1185,10 @@ impl Game {
                 w.loaded = false;
                 w.load = Some(LevelLoad::start(now));
                 w.level_started = now;
+                // The death screen closes for the level loading screen.
+                self.death_screen = None;
+                self.release_keys();
+                self.report(SessionEvent::Respawned);
             }
             play::Clientbound::PlayerPosition(t) => {
                 let w = self.world.as_mut().ok_or("a teleport before the login")?;
@@ -1122,6 +1216,7 @@ impl Game {
                         GAME_EVENT_CHANGE_GAME_MODE => {
                             w.player.set_game_type((param + 0.5).floor() as i32)
                         }
+                        GAME_EVENT_IMMEDIATE_RESPAWN => w.player.show_death_screen = param == 0.0,
                         GAME_EVENT_LEVEL_CHUNKS_LOAD_START => {
                             if let Some(l) = &mut w.load {
                                 l.loading_packets_received();
@@ -1330,6 +1425,21 @@ impl Game {
                 }
             }
             play::Clientbound::PlayerInfoRemove { ids } => self.players.remove(&ids),
+            play::Clientbound::PlayerCombatKill { player_id, message } => {
+                // `handlePlayerCombatKill`: the local player's death opens the death
+                // screen, or asks to respawn at once.
+                let Some(w) = &self.world else {
+                    return Ok(());
+                };
+                if player_id == w.player.entity_id {
+                    if w.player.show_death_screen {
+                        self.open_death_screen(Some(message));
+                    } else {
+                        self.connection
+                            .send(play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN));
+                    }
+                }
+            }
             play::Clientbound::SetHealth {
                 health,
                 food,

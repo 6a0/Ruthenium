@@ -6,6 +6,7 @@ import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestServerContext;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Options;
+import net.minecraft.client.gui.screens.DeathScreen;
 
 /**
  * The scenarios. Coordinates: the flat world's grass is at y = -61, so the player stands at y =
@@ -23,6 +24,7 @@ public final class Scenarios {
             "fill -8 -62 -12 32 -62 12 minecraft:dirt",
             "fill -8 -61 -12 32 -61 12 minecraft:stone",
             "gamemode survival @a",
+            "gamerule immediate_respawn false",
             "effect clear @a",
             "effect give @a minecraft:instant_health 1 10 true",
             "effect give @a minecraft:saturation 1 20 true",
@@ -128,6 +130,24 @@ public final class Scenarios {
         for (int i = 0; i < max && ctx.computeOnClient(mc -> mc.player.getX()) < x; i++) {
             ctx.waitTick();
         }
+    }
+
+    /** Whether the client's player is a new, living one that has loaded into the level with no screen open. */
+    private static boolean backInTheWorld(net.minecraft.client.Minecraft mc) {
+        return mc.player != null && mc.player.isAlive() && !mc.player.isDeadOrDying()
+                && mc.getConnection() != null && mc.getConnection().hasClientLoaded() && mc.gui.screen() == null;
+    }
+
+    /**
+     * Waits for the death screen, clicks Respawn once its buttons work (20 ticks after it
+     * opened), and waits until the new player is back in the world.
+     */
+    private static void respawn(ClientGameTestContext ctx) {
+        ctx.waitForScreen(DeathScreen.class);
+        ctx.waitTicks(25);
+        ctx.clickScreenButton("deathScreen.respawn");
+        ctx.waitFor(Scenarios::backInTheWorld);
+        ctx.waitTicks(5);
     }
 
     /** Waits until the client's player has passed x = {@code x} going west (at most 100 ticks). */
@@ -1022,6 +1042,46 @@ public final class Scenarios {
                         tp(ctx, server, 4.5, -52.0625, 0.5, 90, 0);
                         hold(ctx, 8, W);
                         ctx.waitTicks(30);
+                    }),
+            new Scenario("death_screen",
+                    "Sprint east holding W and die (/kill) still holding it: the death screen opens and lets go of the keys, the server's motion packet stops the body, and 20 ticks later the client takes the player out of the level (no more ticks or movement packets); Respawn once its buttons work, back at the spawn point (4 -60 4), and walk south. Then jump, die in the air (the body falls to the ground), respawn the same way and walk.",
+                    List.of("spawnpoint @a 4 -60 4"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        ctx.waitTicks(10);
+                        server.runCommand("kill @p");
+                        ctx.waitTicks(30);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.getInput().releaseKey(W);
+                        respawn(ctx);
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(5);
+                        hold(ctx, 4, JUMP);
+                        server.runCommand("kill @p");
+                        ctx.waitTicks(30);
+                        respawn(ctx);
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("death_immediate",
+                    "With immediate_respawn on: walk east holding W and die (/kill): the client asks to respawn while handling the death and again from Gui.tick the next tick (dead, no screen open), and is back at the spawn point (4 -60 4) the tick after, still walking (closing the level loading screen reads the held keys again). Then jump, die in the air, and come back the same way.",
+                    List.of("spawnpoint @a 4 -60 4", "gamerule immediate_respawn true"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(10);
+                        server.runCommand("kill @p");
+                        ctx.waitTicks(2);
+                        ctx.waitFor(Scenarios::backInTheWorld);
+                        ctx.getInput().releaseKey(W);
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(5);
+                        hold(ctx, 4, JUMP);
+                        server.runCommand("kill @p");
+                        ctx.waitTicks(2);
+                        ctx.waitFor(Scenarios::backInTheWorld);
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(5);
                     }),
             new Scenario("mouse_turn",
                     "Walk forward while the mouse turns the camera every tick (turns are applied per frame).",

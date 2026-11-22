@@ -312,6 +312,12 @@ pub fn closed_text(c: &Closed, lang: &HashMap<String, String>) -> (String, Strin
     (title.into(), reason)
 }
 
+/// A text component from the server (a death message, say) as plain text, translated
+/// with the game's `en_us.json`.
+pub fn plain_text(t: &ruthenium_protocol::nbt::Tag, lang: &HashMap<String, String>) -> String {
+    StyledText::from_nbt_in(t, lang).plain()
+}
+
 /// Whether the session ended because the player left (no screen to show).
 pub fn left_on_purpose(c: &Closed) -> bool {
     c.reason == Reason::Local(Local::Closed)

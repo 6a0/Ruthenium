@@ -10,6 +10,9 @@
 //! DX, DY counts every frame (60 a second, the rate frames run at here), turned as the window turns them with the
 //! saved mouse sensitivity. For example
 //! `w@2000 w+sprint+jump@3000 w@2000:12,0 sneak+w@1500 2@100 -@1000`.
+//!
+//! A death is printed, and Respawn pressed as soon as the death screen's buttons work;
+//! the script goes on (it doesn't start over) once the player is back.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,7 +24,7 @@ use ruthenium_sim::player::Keys;
 use ruthenium_sim::session::{Session, SessionEvent};
 
 use crate::account::{AccountStatus, Accounts};
-use crate::join::{Joiner, closed_text, stage_text};
+use crate::join::{Joiner, closed_text, plain_text, stage_text};
 use crate::settings::SettingsFile;
 
 /// The frame rate without a window: vanilla's default frame limit's neighbourhood.
@@ -255,6 +258,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
         motion: input::MouseMotion::new(),
     });
     let mut scripting = false;
+    let mut script_started = false;
     let mut joiner = Joiner::new(Some(data_dir.join("game")), cache_dir);
     let data = joiner.data();
     let session = joiner.join(&address, &accounts)?;
@@ -283,11 +287,30 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                 SessionEvent::Reconfiguring => println!("{t:7.3}s  reconfiguring"),
                 SessionEvent::Loaded => {
                     println!("{t:7.3}s  in the world");
-                    if let Some(p) = &mut player {
+                    if let Some(p) = &mut player
+                        && !script_started
+                    {
                         p.start(&session);
                         scripting = true;
+                        script_started = true;
                     }
                 }
+                SessionEvent::Died {
+                    cause,
+                    hardcore,
+                    score,
+                } => {
+                    let cause = cause
+                        .as_ref()
+                        .map_or_else(String::new, |c| format!(": {}", plain_text(c, &data.lang)));
+                    let kind = if *hardcore { " (hardcore)" } else { "" };
+                    println!("{t:7.3}s  died{kind}{cause} (score {score})");
+                }
+                SessionEvent::RespawnReady => {
+                    println!("{t:7.3}s  respawning");
+                    session.respawn();
+                }
+                SessionEvent::Respawned => println!("{t:7.3}s  respawned"),
                 SessionEvent::Closed(c) => {
                     let (title, reason) = closed_text(c, &data.lang);
                     println!("{t:7.3}s  closed: {title}: {reason}");

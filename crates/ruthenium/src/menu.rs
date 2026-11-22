@@ -248,6 +248,11 @@ enum FormKind {
     Paused,
     /// Why the session ended.
     Disconnected,
+    /// The death screen: Respawn (Spectate World in hardcore) and Title Screen, working
+    /// 20 ticks after it opened.
+    Died,
+    /// The death screen's Title Screen, confirmed (`DeathScreen.TitleConfirmScreen`).
+    QuitConfirm,
 }
 
 impl FormKind {
@@ -258,6 +263,18 @@ impl FormKind {
             _ => Screen::Servers,
         }
     }
+}
+
+/// The death screen's state, kept to show it again after the quit confirmation.
+#[derive(Debug, Clone)]
+struct DeathForm {
+    title: &'static str,
+    lines: Vec<String>,
+    hardcore: bool,
+    /// The buttons work (20 ticks after the screen opened).
+    ready: bool,
+    /// Respawn was pressed (`button.active = false`).
+    respawn_pressed: bool,
 }
 
 /// Form button indices.
@@ -320,6 +337,8 @@ pub struct Menu {
     server_name: String,
     /// The player left the session (Cancel, Disconnect): its end needs no screen.
     leaving: bool,
+    /// The death screen while the player is dead: its texts and buttons as shown.
+    death: Option<DeathForm>,
     /// Input in the world.
     game: InGame,
 }
@@ -424,6 +443,7 @@ impl Menu {
             session: None,
             server_name: String::new(),
             leaving: false,
+            death: None,
             game: InGame::default(),
         }
     }
@@ -519,6 +539,41 @@ impl Menu {
         );
     }
 
+    /// Shows the death screen as it stands: its buttons work once it has been open 20
+    /// ticks, Respawn not again once pressed.
+    fn death_form(&mut self) {
+        let Some(d) = self.death.clone() else { return };
+        let lines: Vec<&str> = d.lines.iter().map(String::as_str).collect();
+        let respawn = if d.hardcore {
+            "Spectate World"
+        } else {
+            "Respawn"
+        };
+        self.session_form(
+            FormKind::Died,
+            d.title,
+            &lines,
+            vec![
+                button(respawn, Action::Confirm),
+                button("Title Screen", Action::Cancel),
+            ],
+        );
+        if let Screen::Form(_, form, _) = &mut self.screen {
+            form.set_button_enabled(0, d.ready && !d.respawn_pressed);
+            form.set_button_enabled(1, d.ready);
+        }
+    }
+
+    /// The death screen's Respawn (`LocalPlayer.respawn`).
+    fn press_respawn(&mut self) {
+        if let Some(s) = &self.session {
+            s.respawn();
+        }
+        if let Some(d) = &mut self.death {
+            d.respawn_pressed = true;
+        }
+    }
+
     /// The game's part of the frame, every frame the client runs (also while the window
     /// is hidden): the mouse's turn, then the session's frame (`runTick`: packets, the
     /// frame's input, ticks, the turn).
@@ -551,6 +606,7 @@ impl Menu {
         if let Some(s) = &self.session {
             s.disconnect();
         }
+        self.death = None;
         self.leaving = true;
         self.screen = Screen::Servers;
     }
@@ -595,6 +651,48 @@ impl Menu {
                     );
                 }
                 SessionEvent::Loaded if !self.leaving => self.enter_game(),
+                SessionEvent::Died {
+                    cause,
+                    hardcore,
+                    score,
+                } if !self.leaving => {
+                    let lang = self.joiner.as_mut().map(|j| j.data());
+                    let empty = std::collections::HashMap::new();
+                    let lang = lang.as_ref().map_or(&empty, |d| &d.lang);
+                    let mut lines = Vec::new();
+                    if let Some(c) = &cause {
+                        lines.push(crate::join::plain_text(c, lang));
+                    }
+                    lines.push(format!("Score: {score}"));
+                    self.game.release(self.session.as_ref());
+                    self.death = Some(DeathForm {
+                        title: if hardcore { "Game Over!" } else { "You Died!" },
+                        lines,
+                        hardcore,
+                        ready: false,
+                        respawn_pressed: false,
+                    });
+                    self.death_form();
+                }
+                SessionEvent::RespawnReady => {
+                    if let Some(d) = &mut self.death {
+                        d.ready = true;
+                    }
+                    if matches!(self.screen, Screen::Form(FormKind::Died, ..)) {
+                        self.death_form();
+                    }
+                }
+                SessionEvent::Respawned if !self.leaving => {
+                    // The level loading screen, until the player is back in the world.
+                    self.death = None;
+                    let title = self.server_name.clone();
+                    self.session_form(
+                        FormKind::Playing,
+                        &title,
+                        &["Loading the world..."],
+                        vec![button("Disconnect", Action::Cancel)],
+                    );
+                }
                 SessionEvent::Reconfiguring if !self.leaving => {
                     self.connecting_form(NetStage::Joining);
                 }
@@ -978,7 +1076,9 @@ impl Menu {
             | FormKind::CodeOfConduct
             | FormKind::Playing
             | FormKind::Paused
-            | FormKind::Disconnected => return,
+            | FormKind::Disconnected
+            | FormKind::Died
+            | FormKind::QuitConfirm => return,
         };
         let form = FormScreen::new(scale, &self.fonts, spec);
         self.screen = Screen::Form(kind, Box::new(form), pack);
@@ -1000,7 +1100,9 @@ impl Menu {
             | FormKind::CodeOfConduct
             | FormKind::Playing
             | FormKind::Paused
-            | FormKind::Disconnected => None,
+            | FormKind::Disconnected
+            | FormKind::Died
+            | FormKind::QuitConfirm => None,
         };
         if let Some(f) = addr {
             let ok = valid_address(form.field(f).value());
@@ -1066,6 +1168,38 @@ impl Menu {
                 }
                 self.leave();
             }
+            (Screen::Form(FormKind::Died, ..), Action::Confirm) => {
+                if self
+                    .death
+                    .as_ref()
+                    .is_some_and(|d| d.ready && !d.respawn_pressed)
+                {
+                    self.press_respawn();
+                    self.death_form();
+                }
+            }
+            // Title Screen: straight out in hardcore, else after asking.
+            (Screen::Form(FormKind::Died, ..), Action::Cancel) => match &self.death {
+                Some(d) if d.ready && d.hardcore => self.leave(),
+                Some(d) if d.ready => self.session_form(
+                    FormKind::QuitConfirm,
+                    "Are you sure you want to quit?",
+                    &[],
+                    vec![
+                        button("Title Screen", Action::Confirm),
+                        button("Respawn", Action::Cancel),
+                    ],
+                ),
+                _ => {}
+            },
+            // The death screen doesn't close on Escape.
+            (Screen::Form(FormKind::Died, ..), Action::Back) => {}
+            (Screen::Form(FormKind::QuitConfirm, ..), Action::Confirm) => self.leave(),
+            (Screen::Form(FormKind::QuitConfirm, ..), Action::Cancel) => {
+                self.press_respawn();
+                self.death_form();
+            }
+            (Screen::Form(FormKind::QuitConfirm, ..), Action::Back) => self.death_form(),
             (Screen::Form(FormKind::Disconnected, ..), Action::Confirm | Action::Cancel) => {
                 self.screen = Screen::Servers;
             }
@@ -1189,7 +1323,9 @@ impl Menu {
                     | FormKind::CodeOfConduct
                     | FormKind::Playing
                     | FormKind::Paused
-                    | FormKind::Disconnected => {}
+                    | FormKind::Disconnected
+                    | FormKind::Died
+                    | FormKind::QuitConfirm => {}
                     // Try Again, the same way as before.
                     FormKind::SignIn => {
                         let device =
@@ -2146,6 +2282,47 @@ mod tests {
         assert_eq!(&saved, m.settings());
         assert!(saved.frame_stats && !saved.vsync);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_death_screen_waits_then_respawns_or_asks_before_quitting() {
+        let clip = FakeClipboard::default();
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.death = Some(DeathForm {
+            title: "You Died!",
+            lines: vec!["Steve fell from a high place".into(), "Score: 0".into()],
+            hardcore: false,
+            ready: false,
+            respawn_pressed: false,
+        });
+        m.death_form();
+        let buttons = |m: &Menu| match &m.screen {
+            Screen::Form(FormKind::Died, f, _) => (f.button_enabled(0), f.button_enabled(1)),
+            _ => panic!("not the death screen"),
+        };
+        // Nothing works for the first 20 ticks, and Escape never closes it.
+        assert_eq!(buttons(&m), (false, false));
+        m.act(Action::Confirm, None, &clip);
+        assert!(!m.death.as_ref().unwrap().respawn_pressed);
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        assert_eq!(buttons(&m), (false, false));
+        m.death.as_mut().unwrap().ready = true;
+        m.death_form();
+        assert_eq!(buttons(&m), (true, true));
+        // Title Screen asks first; going back shows the death screen again.
+        m.act(Action::Cancel, None, &clip);
+        assert!(matches!(m.screen, Screen::Form(FormKind::QuitConfirm, ..)));
+        m.act(Action::Back, None, &clip);
+        assert_eq!(buttons(&m), (true, true));
+        // Respawn works once.
+        m.act(Action::Confirm, None, &clip);
+        assert!(m.death.as_ref().unwrap().respawn_pressed);
+        assert_eq!(buttons(&m), (false, true));
+        // Quitting from the confirmation leaves.
+        m.act(Action::Cancel, None, &clip);
+        m.act(Action::Confirm, None, &clip);
+        assert!(matches!(m.screen, Screen::Servers) && m.death.is_none());
     }
 
     #[test]

@@ -1221,7 +1221,8 @@ pub struct Local<'a> {
     /// Its scoreboard name: the profile's name.
     pub name: &'a str,
     pub spectator: bool,
-    pub health: f32,
+    /// `isAlive`: still in the level (a dying player is, for 20 ticks).
+    pub alive: bool,
 }
 
 /// What one tick of the entities needs.
@@ -1886,10 +1887,10 @@ impl Entities {
         }
     }
 
-    /// `LivingEntity.isPushable` for the local player: alive, not a spectator, not
-    /// climbing.
+    /// `LivingEntity.isPushable` for the local player: alive (still in the level, even
+    /// while dying), not a spectator, not climbing.
     fn player_pushable(&self, cx: &TickContext<'_, '_>, player: &LocalPlayer) -> bool {
-        cx.local.health > 0.0 && !cx.local.spectator && !player.on_climbable(cx.env)
+        cx.local.alive && !cx.local.spectator && !player.on_climbable(cx.env)
     }
 
     /// `Entity.push(Entity)` between the local player and `other`: `sign` -1 when
@@ -2110,7 +2111,7 @@ mod tests {
             local: Local {
                 name: "Developer",
                 spectator: false,
-                health: 20.0,
+                alive: player.is_alive(),
             },
             tick_rate: 20.0,
             runs_normally: true,
@@ -2140,6 +2141,16 @@ mod tests {
         assert_eq!(p.delta, [x, 0.0, z]);
         // Out of reach: no push.
         let mut p = player_at([2.0, -60.0, 0.5]);
+        tick(&mut e, &Teams::default(), &mut p);
+        assert_eq!(p.delta, [0.0; 3]);
+        // A dying player is still pushed; once out of the level it isn't.
+        let mut p = player_at([0.5, -60.0, 0.5]);
+        p.health = 0.0;
+        tick(&mut e, &Teams::default(), &mut p);
+        assert_eq!(p.delta, [x, 0.0, z]);
+        let mut p = player_at([0.5, -60.0, 0.5]);
+        p.health = 0.0;
+        p.removed = true;
         tick(&mut e, &Teams::default(), &mut p);
         assert_eq!(p.delta, [0.0; 3]);
     }

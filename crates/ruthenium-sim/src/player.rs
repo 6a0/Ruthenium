@@ -16,8 +16,9 @@
 //! predicts and the server's living flags start and stop, the slowdown and the sprint
 //! it blocks, food, cooldowns ([`crate::interact`] starts and releases uses). The
 //! blocks the player moves through: cobwebs, berry bushes and powder snow holding it,
-//! bubble columns pushing and pulling, sliding down honey. Not yet: elytra, riptide,
-//! the scale attribute, vehicles and the world border.
+//! bubble columns pushing and pulling, sliding down honey. Dying: no input, then out
+//! of the level 20 ticks later; a respawn is a new player ([`LocalPlayer::respawned`]).
+//! Not yet: elytra, riptide, the scale attribute, vehicles and the world border.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
@@ -549,8 +550,18 @@ pub struct LocalPlayer {
     pub pose: Pose,
     pub attributes: Attributes,
     pub food: i32,
-    /// `getHealth` (`set_health` and the entity data).
+    /// `getHealth` (`set_health` and the entity data). At 0 or below the player is
+    /// dead or dying (`isDeadOrDying`).
     pub health: f32,
+    /// `deathTime`: the ticks since the player died (`LocalPlayer.tickDeath`).
+    pub death_time: i32,
+    /// `isRemoved`: 20 ticks after dying the client takes the player out of the level
+    /// (`remove(KILLED)`), so it no longer ticks or sends its changes, until a respawn
+    /// brings a new player.
+    pub removed: bool,
+    /// `shouldShowDeathScreen`: the login's flag and the `IMMEDIATE_RESPAWN` game
+    /// event's (false: dying asks to respawn at once).
+    pub show_death_screen: bool,
     /// The client's game mode (`MultiPlayerGameMode.localPlayerMode`): the abilities
     /// follow it, and in spectator mode the player always flies.
     game_type: i32,
@@ -671,6 +682,9 @@ impl LocalPlayer {
             attributes: Attributes::default(),
             food: 20,
             health: 20.0,
+            death_time: 0,
+            removed: false,
+            show_death_screen: true,
             game_type: play::SURVIVAL,
             spectator: false,
             creative: false,
@@ -780,8 +794,19 @@ impl LocalPlayer {
         };
         p.spectator = self.spectator;
         p.creative = self.creative;
+        p.show_death_screen = self.show_death_screen;
         p.set_game_type(self.game_type);
         p
+    }
+
+    /// `isDeadOrDying`: no health left (the client never sets `dead` for a player).
+    pub fn is_dead_or_dying(&self) -> bool {
+        self.health <= 0.0
+    }
+
+    /// `isAlive`: not taken out of the level.
+    pub fn is_alive(&self) -> bool {
+        !self.removed
     }
 
     pub fn game_type(&self) -> i32 {
@@ -1391,7 +1416,15 @@ impl LocalPlayer {
             self.fall_distance *= 0.5;
         }
         self.first_tick = false;
-        // LivingEntity.baseTick: tickEffects.
+        // LivingEntity.baseTick: tickDeath (the client level ticks deaths within the
+        // simulation distance of the player, which the player always is), then
+        // tickEffects. The rest of this tick still runs after the removal.
+        if self.is_dead_or_dying() {
+            self.death_time += 1;
+            if self.death_time == 20 {
+                self.removed = true;
+            }
+        }
         self.effects.tick();
     }
 
@@ -1665,7 +1698,7 @@ impl LocalPlayer {
         self.zza = my;
         self.jumping = self.keys.jump;
         // isImmobile: dead (sleeping isn't ported).
-        if self.health <= 0.0 {
+        if self.is_dead_or_dying() {
             self.jumping = false;
             self.xxa = 0.0;
             self.zza = 0.0;
@@ -3004,6 +3037,44 @@ mod tests {
         }
         assert!(p.on_ground && !p.abilities.flying);
         assert_eq!(p.send_changes()[0], [id, 0]);
+    }
+
+    #[test]
+    fn the_dead_lie_still_and_leave_after_20_ticks() {
+        let (level, blocks, tags) = world();
+        let env = Env {
+            level: &level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+        };
+        let forward = Keys {
+            forward: true,
+            ..NONE
+        };
+        let mut p = standing(&env, play::SURVIVAL);
+        p.health = 0.0;
+        assert!(p.is_dead_or_dying() && p.is_alive());
+        let x = p.position;
+        for t in 1..=19 {
+            p.tick(
+                &env,
+                Keys {
+                    jump: true,
+                    ..forward
+                },
+            );
+            assert_eq!((p.death_time, p.removed), (t, false));
+        }
+        // Keys move nothing (`isImmobile`), but the input is still sent.
+        assert_eq!(p.position, x);
+        assert!(p.keys.forward);
+        p.tick(&env, forward);
+        assert_eq!((p.death_time, p.removed), (20, true));
+        assert!(!p.is_alive());
+        // A respawn brings a new player.
+        let q = p.respawned(0);
+        assert!(q.is_alive() && !q.is_dead_or_dying() && q.death_time == 0);
     }
 
     #[test]

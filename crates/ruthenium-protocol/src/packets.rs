@@ -1172,6 +1172,12 @@ pub mod play {
             food: i32,
             saturation: f32,
         },
+        /// `ClientboundPlayerCombatKillPacket`: a player died (the local player, for
+        /// this client), with the death message.
+        PlayerCombatKill {
+            player_id: i32,
+            message: Tag,
+        },
         /// `ClientboundPlayerAbilitiesPacket`: the flag bits (`ABILITY_*`) and the
         /// speeds.
         PlayerAbilities {
@@ -1558,6 +1564,10 @@ pub mod play {
                     food: r.varint()?,
                     saturation: r.f32()?,
                 },
+                C::PlayerCombatKill => Clientbound::PlayerCombatKill {
+                    player_id: r.varint()?,
+                    message: text(&mut r)?,
+                },
                 C::PlayerAbilities => Clientbound::PlayerAbilities {
                     flags: r.u8()?,
                     flying_speed: r.f32()?,
@@ -1656,6 +1666,18 @@ pub mod play {
 
     pub fn player_loaded() -> Vec<u8> {
         wire::packet(pl::Serverbound::PlayerLoaded.id(), |_| {})
+    }
+
+    /// `ServerboundClientCommandPacket.Action` ordinals.
+    pub const CLIENT_COMMAND_PERFORM_RESPAWN: i32 = 0;
+    pub const CLIENT_COMMAND_REQUEST_STATS: i32 = 1;
+    pub const CLIENT_COMMAND_REQUEST_GAMERULE_VALUES: i32 = 2;
+
+    /// `ServerboundClientCommandPacket`: the action as its ordinal.
+    pub fn client_command(action: i32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ClientCommand.id(), |o| {
+            wire::write_varint(o, action)
+        })
     }
 
     /// `ServerboundPlayerAbilitiesPacket`: only whether the player flies.
@@ -2006,6 +2028,25 @@ mod tests {
         let id = pl::Serverbound::PlayerAbilities.id() as u8;
         assert_eq!(play::player_abilities(true), [id, 2]);
         assert_eq!(play::player_abilities(false), [id, 0]);
+    }
+
+    #[test]
+    fn play_reads_a_death_and_writes_the_respawn_request() {
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 300);
+        crate::nbt::write_network(&mut b, &Tag::String("Steve fell".into())).unwrap();
+        assert_eq!(
+            play::Clientbound::decode(pl::Clientbound::PlayerCombatKill.id(), &b).unwrap(),
+            play::Clientbound::PlayerCombatKill {
+                player_id: 300,
+                message: Tag::String("Steve fell".into()),
+            }
+        );
+        let id = pl::Serverbound::ClientCommand.id() as u8;
+        assert_eq!(
+            play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN),
+            [id, 0]
+        );
     }
 
     #[test]

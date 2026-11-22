@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.mojang.blaze3d.platform.InputConstants;
 import dev.ruthenium.trace.mixin.KeyMappingAccessor;
 import dev.ruthenium.trace.mixin.MultiPlayerGameModeAccessor;
 import io.netty.buffer.ByteBuf;
@@ -70,7 +71,7 @@ public final class Recorder {
             "minecraft:move_entity_pos_rot", "minecraft:move_entity_rot", "minecraft:rotate_head",
             "minecraft:swing_animation", "minecraft:set_equipment", "minecraft:sound",
             "minecraft:set_passengers", "minecraft:set_player_team", "minecraft:player_info_update",
-            "minecraft:cooldown");
+            "minecraft:cooldown", "minecraft:player_combat_kill", "minecraft:respawn");
 
     private static final Gson GSON = new GsonBuilder().serializeSpecialFloatingPointValues().disableHtmlEscaping().create();
     private static final Object LOCK = new Object();
@@ -192,6 +193,17 @@ public final class Recorder {
             }
             o.add("down", down);
             o.add("clicks", clicks);
+            // The keyboard keys physically held (what closing a screen reads back into the
+            // key mappings, `KeyMapping.setAll`).
+            JsonArray physical = new JsonArray();
+            for (KeyMapping key : keys(mc.options)) {
+                InputConstants.Key bound = ((KeyMappingAccessor) key).ruthenium$key();
+                if (bound.getType() == InputConstants.Type.KEYBOARD && bound.getValue() != InputConstants.UNKNOWN.getValue()
+                        && InputConstants.isKeyDown(bound.getValue())) {
+                    physical.add(key.getName());
+                }
+            }
+            o.add("physical", physical);
             LocalPlayer p = mc.player;
             if (p != null) {
                 o.addProperty("yRot", p.getYRot());
@@ -272,6 +284,15 @@ public final class Recorder {
             move.add(p.input.getMoveVector().y);
             o.add("move", move);
             o.addProperty("health", p.getHealth());
+            // Dying: the ticks since, and whether the client has taken the player out of
+            // the level; whether the player has loaded into the level (not after a
+            // respawn until the level is ready); the screen open, by class.
+            o.addProperty("deathTime", p.deathTime);
+            o.addProperty("removed", p.isRemoved());
+            if (mc.getConnection() != null) {
+                o.addProperty("loaded", mc.getConnection().hasClientLoaded());
+            }
+            o.addProperty("screen", mc.gui.screen() == null ? "" : mc.gui.screen().getClass().getSimpleName());
             o.addProperty("food", p.getFoodData().getFoodLevel());
             o.addProperty("saturation", p.getFoodData().getSaturationLevel());
             // Item use and the hands.

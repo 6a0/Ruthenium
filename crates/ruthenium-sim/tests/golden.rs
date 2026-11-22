@@ -208,11 +208,13 @@ fn keys(down: &serde_json::Value) -> Keys {
     }
 }
 
-/// The packets compared: the held slot (`gameMode.tick`), the attacks and the hands'
-/// use (`handleKeybinds`), then the player's tick: abilities when flight toggles, then
-/// `sendChanges`'s.
-const SENT: [&str; 15] = [
+/// The packets compared: the held slot and `player_loaded` (`gameMode.tick`), a
+/// respawn request (`Gui.tick`), the attacks and the hands' use (`handleKeybinds`), then
+/// the player's tick: abilities when flight toggles, then `sendChanges`'s.
+const SENT: [&str; 17] = [
     "minecraft:set_carried_item",
+    "minecraft:player_loaded",
+    "minecraft:client_command",
     "minecraft:attack",
     "minecraft:punch",
     "minecraft:spectator_action",
@@ -268,6 +270,54 @@ struct Client {
     /// The local player's name, and its UUID once its player list entry is seen.
     name: String,
     uuid: Option<u128>,
+    /// The player has loaded into the level. After a respawn the trace says when (vanilla
+    /// waits for the level to be drawn around the camera).
+    loaded: bool,
+    /// The death screen, while open: the ticks since it opened.
+    death_screen: Option<u32>,
+    /// Its Respawn button was pressed (it then stays inactive).
+    respawn_pressed: bool,
+    /// What the replay sent while handling packets, not yet matched with vanilla's.
+    sent_outside: std::collections::VecDeque<Vec<u8>>,
+}
+
+/// A record applied before the next tick: a packet the client handled, or one it sent
+/// outside a tick (a respawn request: handling a death, or the death screen's button).
+enum Pending {
+    Handled(Vec<u8>),
+    Sent(Vec<u8>),
+}
+
+/// A request to respawn vanilla sent outside a tick: one the replay sent handling a
+/// packet, else the death screen's Respawn button, which must be there and working.
+fn sent_outside(c: &mut Client, vanilla: &[u8], n: i64) -> Result<(), (i64, String)> {
+    let ours = match c.sent_outside.pop_front() {
+        Some(ours) => ours,
+        None if c.death_screen.is_some_and(|t| t >= 20) && !c.respawn_pressed => {
+            c.respawn_pressed = true;
+            play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN)
+        }
+        None => {
+            return Err((
+                n,
+                format!("after tick {n}: vanilla sent {vanilla:02x?} with no working death screen"),
+            ));
+        }
+    };
+    if ours != vanilla {
+        return Err((
+            n,
+            format!("after tick {n}: sent {ours:02x?}, vanilla {vanilla:02x?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether an `out` record is a respawn request sent outside a tick.
+fn outside_tick_request(q: &ruthenium_trace::Record) -> bool {
+    q.kind == "out"
+        && q.bool("inTick") == Some(false)
+        && q.str("name") == Some("minecraft:client_command")
 }
 
 /// `Inventory` slot names of `/item replace` (`hotbar.0`, `weapon.offhand`...).
@@ -476,6 +526,30 @@ fn handle(
             p.saturation = saturation;
         }
         Clientbound::SetHeldSlot { slot } if (0..9).contains(&slot) => p.inventory.selected = slot,
+        // `handleRespawn` in the same level: a new player that ticks last and waits for
+        // the level to load; the death screen closes.
+        Clientbound::Respawn {
+            spawn,
+            data_to_keep,
+        } => {
+            c.entities.local_respawned();
+            *p = p.respawned(data_to_keep);
+            p.set_game_type(spawn.game_type);
+            c.loaded = false;
+            c.death_screen = None;
+            c.respawn_pressed = false;
+        }
+        // `handlePlayerCombatKill`: the death screen, or a respawn request at once.
+        Clientbound::PlayerCombatKill { player_id, .. } if player_id == p.entity_id => {
+            if p.show_death_screen {
+                c.death_screen = Some(0);
+            } else {
+                c.sent_outside
+                    .push_back(play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN));
+            }
+        }
+        // IMMEDIATE_RESPAWN.
+        Clientbound::GameEvent { event: 11, param } => p.show_death_screen = param == 0.0,
         Clientbound::PlayerPosition(t) => {
             p.teleport(&t);
             l.predictions.on_teleport();
@@ -638,7 +712,14 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         players,
         name: name.clone(),
         uuid,
+        loaded: true,
+        death_screen: None,
+        respawn_pressed: false,
+        sent_outside: std::collections::VecDeque::new(),
     };
+    // Whether dying opens the death screen (the login's flag, or a game rule's game event
+    // before the trace began).
+    p.show_death_screen = t.header["showDeathScreen"].as_bool().unwrap_or(true);
     for (cx, cz) in CHUNKS {
         client.entities.chunk_loaded(cx, cz);
     }
@@ -648,7 +729,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
     let records_sets = records.iter().any(|r| r.kind == "set");
     // Packets handled after a tick began, applied before the next one (packets are
     // handled at the start of a frame, never during a tick).
-    let mut pending: Vec<Vec<u8>> = Vec::new();
+    let mut pending: Vec<Pending> = Vec::new();
     let mut i = 0;
     while i < records.len() {
         let r = &records[i];
@@ -657,6 +738,10 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             if let Some(b) = r.bytes() {
                 handle(&b, &mut client, &mut p, &mut cl, &mut game_mode, d);
             }
+            continue;
+        }
+        if outside_tick_request(r) {
+            sent_outside(&mut client, &r.bytes().unwrap(), -1)?;
             continue;
         }
         if r.kind != "tick" {
@@ -677,10 +762,29 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         let clicks = |k: &str| r.value["clicks"][k].as_u64().unwrap_or(0) as u32;
         let down = |k: &str| r.value["down"].as_array().unwrap().iter().any(|v| v == k);
         let mut sent = Vec::new();
-        // `rightClickDelay`, `gameMode.tick`, `pick`, then `handleKeybinds`: one press per
-        // hotbar key, then the hands.
+        // `rightClickDelay`, `gameMode.tick` (the held slot, then the connection's tick:
+        // `player_loaded` once the level is ready, which the trace says), `pick`,
+        // `Gui.tick`, then `handleKeybinds` unless a screen is open: one press per hotbar
+        // key, then the hands.
         game_mode.tick_delay();
         game_mode.ensure_carried(&p.inventory, &mut sent);
+        let loaded_now = records[i..]
+            .iter()
+            .take_while(|q| q.kind != "tick")
+            .find(|q| q.kind == "state")
+            .and_then(|q| q.bool("loaded"))
+            .unwrap_or(true);
+        let mut held = held;
+        if !client.loaded && loaded_now {
+            sent.push(play::player_loaded());
+            client.loaded = true;
+            // The level loading screen closes this tick (`Gui.tick`), and grabbing the
+            // mouse again reads the keys physically held (`KeyMapping.setAll`, except on
+            // macOS).
+            if let Some(physical) = r.value.get("physical") {
+                held = keys(physical);
+            }
+        }
         let env = Env {
             level: &cl.level,
             blocks,
@@ -688,8 +792,24 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             colliders: &[],
         };
         let hit = pick_target(&env, &client.entities, &client.players, &p);
+        // `Gui.tick`: a dead player with no screen open gets the death screen, which lets
+        // go of the keys at once, or asks to respawn (every tick until the server answers);
+        // then the death screen ticks.
+        let mut keys_released = false;
+        if client.loaded && client.death_screen.is_none() && p.is_dead_or_dying() {
+            if p.show_death_screen {
+                client.death_screen = Some(0);
+                keys_released = true;
+            } else {
+                sent.push(play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN));
+            }
+        }
+        if let Some(t) = &mut client.death_screen {
+            *t += 1;
+        }
+        let screen_open = client.death_screen.is_some() || !client.loaded;
         for slot in 0..9 {
-            if clicks(&format!("key.hotbar.{}", slot + 1)) > 0 && !p.spectator {
+            if clicks(&format!("key.hotbar.{}", slot + 1)) > 0 && !p.spectator && !screen_open {
                 p.inventory.selected = slot;
             }
         }
@@ -714,7 +834,11 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         .with_item_tags(&d.item_tags)
         .with_transformers(&d.transformers);
         world.set_log = Some(Vec::new());
-        game_mode.handle_keybinds(&mut p, &mut world, &hit, &mut use_keys, &mut sent);
+        if screen_open {
+            game_mode.screen_open();
+        } else {
+            game_mode.handle_keybinds(&mut p, &mut world, &hit, &mut use_keys, &mut sent);
+        }
         let sets_got = world.set_log.take().unwrap_or_default();
         let env = Env {
             level: &cl.level,
@@ -729,14 +853,22 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             local: Local {
                 name: &name,
                 spectator: p.spectator,
-                health: p.health,
+                alive: p.is_alive(),
             },
             tick_rate: 20.0,
             runs_normally: true,
         };
+        let held = if keys_released { Keys::default() } else { held };
+        let loaded = client.loaded;
+        // The player ticks once loaded and while still in the level; `sendChanges` only
+        // for a player still in it after the tick.
         client.entities.tick(&cx, &mut p, |p, colliders| {
-            p.tick(&Env { colliders, ..env }, held);
-            sent.extend(p.send_changes());
+            if loaded && p.is_alive() {
+                p.tick(&Env { colliders, ..env }, held);
+                if p.is_alive() {
+                    sent.extend(p.send_changes());
+                }
+            }
         });
         // Vanilla's packets and state for this tick.
         let mut want = Vec::new();
@@ -754,8 +886,15 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                     q.value["limit"].as_i64().unwrap() as i32,
                 ));
             }
-            if q.kind == "out" && q.tick() == Some(n) && SENT.contains(&q.str("name").unwrap()) {
+            if q.kind == "out"
+                && q.tick() == Some(n)
+                && q.bool("inTick") != Some(false)
+                && SENT.contains(&q.str("name").unwrap())
+            {
                 want.push(q.bytes().unwrap());
+            }
+            if outside_tick_request(q) {
+                pending.push(Pending::Sent(q.bytes().unwrap()));
             }
             if q.kind == "state" && q.tick() == Some(n) {
                 state = Some(q.clone());
@@ -763,7 +902,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             if q.kind == "handle"
                 && let Some(b) = q.bytes()
             {
-                pending.push(b);
+                pending.push(Pending::Handled(b));
             }
             i += 1;
         }
@@ -864,6 +1003,24 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 ));
             }
         }
+        // Dying, where the trace records it: the ticks since, whether the player is out
+        // of the level, and the death screen.
+        if let Some(dt) = s.value.get("deathTime").and_then(serde_json::Value::as_i64) {
+            let got = (p.death_time, p.removed, client.death_screen.is_some());
+            let want = (
+                dt as i32,
+                s.bool("removed").unwrap(),
+                s.str("screen") == Some("DeathScreen"),
+            );
+            if got != want {
+                return Err((
+                    n,
+                    format!(
+                        "tick {n}: dying differs (death time, removed, death screen)\n  got  {got:?}\n  want {want:?}"
+                    ),
+                ));
+            }
+        }
         let pose = Pose::from_name(s.str("pose").unwrap()).unwrap();
         let got = (
             p.position,
@@ -907,16 +1064,25 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 ),
             ));
         }
-        for b in pending.drain(..) {
-            handle(&b, &mut client, &mut p, &mut cl, &mut game_mode, d);
+        for e in std::mem::take(&mut pending) {
+            match e {
+                Pending::Handled(b) => handle(&b, &mut client, &mut p, &mut cl, &mut game_mode, d),
+                Pending::Sent(b) => sent_outside(&mut client, &b, n)?,
+            }
         }
         ticks += 1;
+    }
+    if let Some(ours) = client.sent_outside.front() {
+        return Err((
+            ticks as i64,
+            format!("the replay sent {ours:02x?}, vanilla didn't"),
+        ));
     }
     Ok(ticks)
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 49] = [
+const EXACT: [&str; 51] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -966,6 +1132,8 @@ const EXACT: [&str; 49] = [
     "berry_bushes",
     "powder_snow",
     "honey_slide",
+    "death_screen",
+    "death_immediate",
 ];
 
 #[test]
@@ -1033,6 +1201,8 @@ fn golden_traces() {
         "berry_bushes",
         "powder_snow",
         "honey_slide",
+        "death_screen",
+        "death_immediate",
     ];
     let mut failed = Vec::new();
     for name in all {
