@@ -548,6 +548,9 @@ pub struct UploadRing {
     released: Vec<(u64, ImageDst)>,
     /// Staging offsets of the regions of the `upload_image` call in progress.
     staged_offsets: Vec<u64>,
+    /// Development: every this many frames, act as if every transfer command buffer were
+    /// busy, so the deferred path runs (0: never).
+    defer_every: u64,
     /// Scratch space for the frame's barriers.
     pre: Vec<vk::ImageMemoryBarrier2<'static>>,
     post: Vec<vk::ImageMemoryBarrier2<'static>>,
@@ -615,6 +618,7 @@ impl UploadRing {
             transfer_images: ImageCopies::new(),
             released: Vec::with_capacity(MAX_RELEASED),
             staged_offsets: Vec::with_capacity(MAX_IMAGE_COPIES),
+            defer_every: 0,
             pre: Vec::with_capacity(MAX_IMAGES + MAX_RELEASED),
             post: Vec::with_capacity(MAX_IMAGES),
             gpu,
@@ -648,6 +652,13 @@ impl UploadRing {
     /// Frames whose transfer copies had to wait a frame for a free command buffer.
     pub fn deferred_transfers(&self) -> u64 {
         self.transfer.as_ref().map_or(0, |t| t.deferred)
+    }
+
+    /// Development: from now on, every `n`th frame's transfer copies wait for the next
+    /// frame, as when every transfer command buffer is busy (0 turns it off). Only
+    /// meaningful with a transfer queue.
+    pub fn force_deferral_every(&mut self, n: u64) {
+        self.defer_every = n;
     }
 
     /// Images whose first upload went on the transfer queue.
@@ -864,15 +875,17 @@ impl UploadRing {
                     // SAFETY: frame numbers grow, so `frame` is above every earlier value;
                     // transfer images are all fresh (upload_image's routing); the rest is
                     // the caller's contract and the upload calls'.
-                    let sent = unsafe {
-                        t.submit(
-                            &self.gpu,
-                            self.raw,
-                            &self.buffers,
-                            &self.transfer_images,
-                            frame,
-                        )?
-                    };
+                    let forced = self.defer_every > 0 && frame.is_multiple_of(self.defer_every);
+                    let sent = !forced
+                        && unsafe {
+                            t.submit(
+                                &self.gpu,
+                                self.raw,
+                                &self.buffers,
+                                &self.transfer_images,
+                                frame,
+                            )?
+                        };
                     if sent {
                         for i in &self.transfer_images.images {
                             self.released.push((frame, *i));

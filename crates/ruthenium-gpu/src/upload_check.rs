@@ -9,7 +9,9 @@
 //!
 //! Run under validation (with synchronization checks) it covers the ring's wrap-around,
 //! the per-frame budget, retries when full, partial image writes and, on GPUs with a copy
-//! engine, the transfer queue, its timeline wait and the image ownership transfer.
+//! engine, the transfer queue, its timeline wait and the image ownership transfer. The
+//! renderer also makes every third frame's transfer copies wait a frame
+//! ([`UploadRing::force_deferral_every`]), as when the copy engine falls behind.
 
 use std::sync::Arc;
 

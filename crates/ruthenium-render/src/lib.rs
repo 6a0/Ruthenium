@@ -150,6 +150,8 @@ impl Renderer {
     pub fn enable_upload_check(&mut self) -> Result<(), ruthenium_gpu::Error> {
         if self.check.is_none() {
             self.check = Some(UploadCheck::new(self.frames.gpu().clone())?);
+            // Also run the path where a frame's transfer copies wait for the next frame.
+            self.uploads.force_deferral_every(3);
         }
         Ok(())
     }
