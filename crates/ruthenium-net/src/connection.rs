@@ -501,6 +501,10 @@ async fn closed(commands: &mut mpsc::UnboundedReceiver<Command>) {
 fn connect_message(e: &std::io::Error, host: &str, socket: SocketAddr) -> String {
     // Vanilla shows Java's message, e.g. "Connection refused: localhost/127.0.0.1:25565".
     match e.kind() {
+        // Java writes the host before the slash only when it is a name.
+        std::io::ErrorKind::ConnectionRefused if host.parse::<IpAddr>().is_ok() => {
+            format!("Connection refused: /{socket}")
+        }
         std::io::ErrorKind::ConnectionRefused => {
             format!("Connection refused: {host}/{socket}")
         }

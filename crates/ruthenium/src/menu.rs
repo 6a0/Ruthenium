@@ -1682,6 +1682,12 @@ impl Menu {
     }
 
     /// Development: opens the server list straight away (for screenshots).
+    /// Development: joins `address` straight away (`--join`).
+    pub fn join_now(&mut self, address: &str, pixel_size: (u32, u32)) {
+        self.layout(pixel_size);
+        self.start_join(address, address);
+    }
+
     pub fn open_servers(&mut self, pixel_size: (u32, u32)) {
         let scale = self.layout(pixel_size);
         self.servers = Some(Servers::open(self.servers_path.clone(), scale, &self.fonts));

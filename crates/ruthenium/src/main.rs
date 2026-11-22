@@ -46,6 +46,7 @@ With no command, opens the game window. Options:
                          on the default settings unless --data-dir is given
   --data-dir <folder>    Ruthenium's data folder (accounts, servers, settings in
                          config/client.toml); default: the per-user one
+  --join <address>       join this server at once (development)
 The options above that change a setting override it for the run; it is saved with
 them if a setting changes. In the window, F3 toggles the frame-stats overlay and F11
 fullscreen.

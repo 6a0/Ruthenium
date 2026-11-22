@@ -75,6 +75,8 @@ pub struct Options {
     pub select: Option<usize>,
     /// The window's starting size in points.
     pub window_size: (u32, u32),
+    /// Development: join this server (an address as typed) from the server list at once.
+    pub join: Option<String>,
 }
 
 impl Options {
@@ -104,6 +106,7 @@ impl Options {
             screen: None,
             select: None,
             window_size: DEFAULT_SIZE,
+            join: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -155,6 +158,7 @@ impl Options {
                     o.window_size = parsed.ok_or(format!("--window-size: not a size: {v}"))?;
                 }
                 "--data-dir" => o.data_dir = Some(value("a folder")?.into()),
+                "--join" => o.join = Some(value("a server address")?),
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
                 "--screen" => o.screen = Some(value("a screen name")?),
                 "--select" => {
@@ -333,6 +337,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut screenshot_requested = false;
     let mut text_shown: Option<Instant> = None;
     let mut start_screen = opts.screen.clone();
+    let mut start_join = opts.join.clone();
     let mut frames: u64 = 0;
 
     loop {
@@ -525,6 +530,10 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 }
                 menu.open_form_named(&name, window.pixel_size());
             }
+        }
+        if let Some(address) = start_join.take() {
+            menu.open_servers(window.pixel_size());
+            menu.join_now(&address, window.pixel_size());
         }
         let text_ready = menu.text_ready();
         if text_ready && text_shown.is_none() {
