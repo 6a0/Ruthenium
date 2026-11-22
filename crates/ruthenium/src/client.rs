@@ -43,6 +43,9 @@ pub struct Options {
     pub exercise_swapchain: bool,
     /// Keep the pipeline cache on disk (off: every launch compiles from scratch).
     pub pipeline_cache: bool,
+    /// Write a JSON summary of the run (after warm-up) here at exit, for `cargo xtask
+    /// bench ab`.
+    pub bench_out: Option<std::path::PathBuf>,
     /// Upload buffers on the graphics queue even if the GPU has a transfer queue.
     pub no_transfer_queue: bool,
     /// Development: push checked data through the upload ring every frame (run it under
@@ -69,6 +72,7 @@ impl Options {
             pipeline_cache: true,
             no_transfer_queue: false,
             exercise_uploads: false,
+            bench_out: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -102,6 +106,7 @@ impl Options {
                 "--no-pipeline-cache" => o.pipeline_cache = false,
                 "--no-transfer-queue" => o.no_transfer_queue = true,
                 "--exercise-uploads" => o.exercise_uploads = true,
+                "--bench-out" => o.bench_out = Some(value("a file")?.into()),
                 other => return Err(format!("unknown option {other}")),
             }
         }
@@ -167,7 +172,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             ruthenium_prepare::default_cache_dir(&ruthenium_prepare::discover::Env::from_process())
         })
         .flatten();
-    let gpu_name = gpu.caps().name.to_uppercase();
+    let gpu_display = gpu.caps().name.clone();
+    let gpu_name = gpu_display.to_uppercase();
     let mut renderer = Renderer::new(gpu, window.pixel_size(), opts.policy, cache_dir.as_deref())?;
     renderer.overlay_mut().set_visible(opts.overlay);
     let mut mode_name = String::with_capacity(32);
@@ -183,6 +189,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut cpu = FrameTimes::new(1 << 13);
     let mut gpu_times = FrameTimes::new(1 << 13);
     let mut run_interval = FrameTimes::new(1 << 18);
+    let mut run_cpu = FrameTimes::new(1 << 18);
+    let mut run_gpu = FrameTimes::new(1 << 18);
     let mut last_present: Option<Instant> = None;
     let mut last_report = Instant::now();
     let mut first_frame: Option<Duration> = None;
@@ -295,9 +303,16 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             }
             last_present = Some(now);
         }
+        let measuring = started.elapsed() > WARMUP + first_frame.unwrap_or(Duration::MAX / 4);
         cpu.push((now - t_input).as_nanos() as u64);
+        if measuring {
+            run_cpu.push((now - t_input).as_nanos() as u64);
+        }
         if let Some(g) = report.gpu_time {
             gpu_times.push(g.nanos);
+            if measuring {
+                run_gpu.push(g.nanos);
+            }
         }
 
         if now - last_report >= Duration::from_secs(1) {
@@ -352,6 +367,19 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             run.p999_ms / run.p50_ms
         );
     }
+    if let Some(path) = &opts.bench_out {
+        let json = bench_json(
+            &run,
+            &run_cpu.summary(),
+            &run_gpu.summary(),
+            &gpu_display,
+            renderer.frames().present_mode(),
+        );
+        if let Err(e) = std::fs::write(path, json) {
+            eprintln!("[ruthenium] could not write {}: {e}", path.display());
+            return Ok(ExitCode::FAILURE);
+        }
+    }
     let mut failed = false;
     if let Some((c, deferred, transferred)) = renderer.upload_check() {
         eprintln!(
@@ -385,6 +413,37 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// The run summary `cargo xtask bench ab` reads (times in milliseconds).
+fn bench_json(
+    frame: &Summary,
+    cpu: &Summary,
+    gpu: &Summary,
+    gpu_name: &str,
+    mode: Option<ruthenium_gpu::vk::PresentModeKHR>,
+) -> String {
+    let series = |s: &Summary| {
+        format!(
+            "{{\"samples\": {}, \"mean\": {:.6}, \"p50\": {:.6}, \"p99\": {:.6}, \"p999\": {:.6}, \"max\": {:.6}}}",
+            s.samples, s.mean_ms, s.p50_ms, s.p99_ms, s.p999_ms, s.max_ms
+        )
+    };
+    let escaped: String = gpu_name
+        .chars()
+        .flat_map(|c| match c {
+            '"' | '\\' => vec!['\\', c],
+            c if c.is_control() => vec![],
+            c => vec![c],
+        })
+        .collect();
+    format!(
+        "{{\"version\": 1, \"gpu\": \"{escaped}\", \"present_mode\": \"{:?}\", \"frame\": {}, \"cpu\": {}, \"gpu_time\": {}}}\n",
+        mode.unwrap_or_default(),
+        series(frame),
+        series(cpu),
+        series(gpu)
+    )
 }
 
 fn print_line(

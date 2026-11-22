@@ -24,6 +24,7 @@ With no command, opens the game window. Options:
                          installed; RUTHENIUM_VALIDATION=1 requires it)
   --stats                print frame-time statistics every second
   --overlay              start with the frame-stats overlay shown (F3 toggles it)
+  --bench-out <file>     write a JSON summary of the run at exit (cargo xtask bench ab)
   --quit-after <s>       close after <s> seconds (for benchmarks and tests)
   --exercise-swapchain   resize and toggle VSync every few frames (development)
   --no-pipeline-cache    don't load or save the pipeline cache

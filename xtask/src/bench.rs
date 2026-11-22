@@ -99,7 +99,8 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
         Some("setup") => parse(&args[1..]).and_then(|o| setup(root, &o)),
         Some("run") => parse(&args[1..]).and_then(|o| run_all(root, &o)),
         Some("report") => report(root, args.get(1).map(PathBuf::from)),
-        _ => Err("usage: cargo xtask bench <setup|run|report> [options]".into()),
+        Some("ab") => crate::bench_ab::run(root, &args[1..]),
+        _ => Err("usage: cargo xtask bench <setup|run|report|ab> [options]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
