@@ -51,6 +51,9 @@ struct Chunk {
 pub struct Level {
     min_y: i32,
     height: i32,
+    /// The dimension's `gameplay/fast_lava` attribute (the nether's lava flows and
+    /// pushes faster).
+    fast_lava: bool,
     chunks: HashMap<(i32, i32), Chunk>,
 }
 
@@ -59,6 +62,7 @@ impl Level {
         Level {
             min_y,
             height,
+            fast_lava: false,
             chunks: HashMap::new(),
         }
     }
@@ -69,6 +73,14 @@ impl Level {
 
     pub fn height(&self) -> i32 {
         self.height
+    }
+
+    pub fn fast_lava(&self) -> bool {
+        self.fast_lava
+    }
+
+    pub fn set_fast_lava(&mut self, fast: bool) {
+        self.fast_lava = fast;
     }
 
     pub fn has_chunk(&self, x: i32, z: i32) -> bool {

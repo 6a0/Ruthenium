@@ -1,11 +1,13 @@
 //! Block states' physics from the exporters (`block_physics.bin`): collision shapes,
-//! friction, speed and jump factors, as the local player meets them.
+//! friction, speed and jump factors, fluids and sturdy faces, as the local player meets
+//! them.
 
 use std::path::Path;
 
 use ruthenium_data::v26_3::blocks::BlockState;
 use ruthenium_prepare::exporters::{BlockPhysics, StatePhysics, read_block_physics};
 
+use crate::fluid::FluidState;
 use crate::shape::{Placed, Shape};
 
 /// Every block state's physics, by state id.
@@ -83,6 +85,22 @@ impl Blocks {
         self.state(id).flags & StatePhysics::SUFFOCATING != 0
     }
 
+    /// The state's fluid (`BlockState.getFluidState`).
+    pub fn fluid(&self, id: u32) -> FluidState {
+        FluidState::from_bits(self.state(id).fluid)
+    }
+
+    /// `isFaceSturdy` for the face in a direction (`Direction` ordinal: down, up,
+    /// north, south, west, east), as at the origin.
+    pub fn sturdy(&self, id: u32, direction: usize) -> bool {
+        self.state(id).sturdy >> direction & 1 != 0
+    }
+
+    /// The block is an `IceBlock` (ice, frosted ice).
+    pub fn is_ice(&self, id: u32) -> bool {
+        self.state(id).flags & StatePhysics::ICE != 0
+    }
+
     /// The block's name (`minecraft:stone`).
     pub fn name(&self, id: u32) -> &'static str {
         BlockState::from_id(id).map_or("minecraft:air", |s| s.block().name())
@@ -132,6 +150,7 @@ impl Blocks {
 #[derive(Debug, Clone, Default)]
 pub struct BlockTags {
     climbable: Vec<bool>,
+    blocks_fluid_flow: Vec<bool>,
 }
 
 impl BlockTags {
@@ -144,6 +163,7 @@ impl BlockTags {
     pub fn set<'a>(&mut self, tag: &str, blocks: impl IntoIterator<Item = &'a str>) {
         let flags = match tag {
             "minecraft:climbable" => &mut self.climbable,
+            "minecraft:blocks_fluid_flow" => &mut self.blocks_fluid_flow,
             _ => return,
         };
         *flags = vec![false; ruthenium_data::v26_3::blocks::STATE_COUNT];
@@ -159,6 +179,11 @@ impl BlockTags {
     /// `BlockTags.CLIMBABLE`.
     pub fn climbable(&self, state: u32) -> bool {
         self.climbable.get(state as usize) == Some(&true)
+    }
+
+    /// `BlockTags.BLOCKS_FLUID_FLOW`.
+    pub fn blocks_fluid_flow(&self, state: u32) -> bool {
+        self.blocks_fluid_flow.get(state as usize) == Some(&true)
     }
 }
 

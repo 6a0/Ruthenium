@@ -124,6 +124,49 @@ public final class Scenarios {
                         hold(ctx, 20, W, JUMP);
                         ctx.waitTicks(20);
                     }),
+            new Scenario("water_current",
+                    "In a walled 3-wide channel of settled flowing water (sources at x = 0, levels 1 to 7 downstream): walk upstream against the current, jump in the sources, drift, sneak downstream, strafe, jump in the shallow end.",
+                    List.of("fill -1 -60 -2 9 -59 2 minecraft:stone", "fill 0 -60 -1 8 -59 1 minecraft:air",
+                            "fill 0 -60 -1 0 -60 1 minecraft:water",
+                            "fill 1 -60 -1 1 -60 1 minecraft:water[level=1]",
+                            "fill 2 -60 -1 2 -60 1 minecraft:water[level=2]",
+                            "fill 3 -60 -1 3 -60 1 minecraft:water[level=3]",
+                            "fill 4 -60 -1 4 -60 1 minecraft:water[level=4]",
+                            "fill 5 -60 -1 5 -60 1 minecraft:water[level=5]",
+                            "fill 6 -60 -1 6 -60 1 minecraft:water[level=6]",
+                            "fill 7 -60 -1 7 -60 1 minecraft:water[level=7]"),
+                    start(8.5, -60, 0.5, 90, 0), ctx -> {
+                        hold(ctx, 40, W);
+                        hold(ctx, 10, JUMP);
+                        ctx.waitTicks(20);
+                        ctx.getInput().lookAt(-90, 0);
+                        hold(ctx, 15, W, SNEAK);
+                        hold(ctx, 10, A);
+                        hold(ctx, 15, W, JUMP);
+                        ctx.waitTicks(20);
+                    }),
+            new Scenario("waterfall",
+                    "Drop into a 1x1 shaft of falling water fed by a source at the top, sink with the current, swim up, then swim-sprint looking up.",
+                    List.of("fill 3 -60 -1 5 -53 1 minecraft:stone", "fill 5 -52 -1 5 -51 1 minecraft:stone",
+                            "fill 4 -60 0 4 -53 0 minecraft:air", "fill 4 -60 0 4 -55 0 minecraft:water[level=8]",
+                            "setblock 4 -54 0 minecraft:water"),
+                    start(3.5, -52, 0.5, -90, 0), ctx -> {
+                        hold(ctx, 15, W);
+                        ctx.waitTicks(25);
+                        hold(ctx, 40, JUMP);
+                        ctx.waitTicks(30);
+                        ctx.getInput().lookAt(-90, -60);
+                        hold(ctx, 30, W, SPRINT);
+                        ctx.waitTicks(20);
+                    }),
+            new Scenario("lava",
+                    "With fire resistance: walk into a 2-deep lava pool, sink, swim across holding jump and hop out over the far edge.",
+                    List.of("effect give @a minecraft:fire_resistance 300 0 true", "fill 0 -62 -2 6 -61 2 minecraft:lava"),
+                    start(-1.5, -60, 0.5, -90, 0), ctx -> {
+                        hold(ctx, 30, W);
+                        hold(ctx, 50, W, JUMP);
+                        ctx.waitTicks(20);
+                    }),
             new Scenario("step_up",
                     "Walk over a slab, a carpet, a 3-layer snow block and stairs (stepping up), then jump onto a full block.",
                     List.of("setblock 2 -60 0 minecraft:smooth_stone_slab", "setblock 4 -60 0 minecraft:white_carpet",

@@ -12,7 +12,7 @@ use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, R
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
 use ruthenium_sim::blocks::Blocks;
-use ruthenium_sim::session::{Physics, Session, SessionOptions};
+use ruthenium_sim::session::{DimensionType, Physics, Session, SessionOptions};
 
 use crate::account::Accounts;
 
@@ -94,15 +94,23 @@ impl GameData {
     }
 }
 
-/// Vanilla's dimension types' heights from the jar's data pack: name to (min_y, height).
-fn dimension_types(jar: &Zip) -> HashMap<String, (i32, i32)> {
+/// Vanilla's dimension types from the jar's data pack: heights and fast lava, by name.
+fn dimension_types(jar: &Zip) -> HashMap<String, DimensionType> {
     const DIR: &str = "data/minecraft/dimension_type/";
     jar.with_prefix(DIR)
         .filter_map(|i| {
             let file = jar.name(i).strip_prefix(DIR)?.strip_suffix(".json")?;
             let v: serde_json::Value = serde_json::from_slice(&jar.read(i).ok()?).ok()?;
             let n = |k: &str| v.get(k)?.as_i64().and_then(|n| i32::try_from(n).ok());
-            Some((format!("minecraft:{file}"), (n("min_y")?, n("height")?)))
+            let fast_lava = v["attributes"][DimensionType::FAST_LAVA]
+                .as_bool()
+                .unwrap_or(false);
+            let t = DimensionType {
+                min_y: n("min_y")?,
+                height: n("height")?,
+                fast_lava,
+            };
+            Some((format!("minecraft:{file}"), t))
         })
         .collect()
 }

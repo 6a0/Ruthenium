@@ -7,12 +7,13 @@
 //! - [`level_load`]: when the player counts as loaded into a level.
 //! - [`player`]: the local player: movement, collisions and the packets it sends.
 //! - [`input`]: the mouse's turn, the scroll wheel and the movement keys.
-//! - [`blocks`], [`shape`], [`world`]: the level the player moves in.
+//! - [`blocks`], [`shape`], [`world`], [`fluid`]: the level the player moves in.
 
 #![forbid(unsafe_code)]
 
 pub mod blocks;
 pub mod clock;
+pub mod fluid;
 pub mod input;
 pub mod level_load;
 pub mod player;

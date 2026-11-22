@@ -17,12 +17,17 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.IceBlock;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.PowderSnowBlock;
 import net.minecraft.world.level.block.ScaffoldingBlock;
 import net.minecraft.world.level.block.piston.MovingPistonBlock;
 import net.minecraft.world.level.block.state.BlockBehaviour;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.material.FlowingFluid;
+import net.minecraft.world.level.material.Fluid;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.DiscreteVoxelShape;
@@ -31,19 +36,22 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 
 /**
  * What movement needs from every block state: its collision shape, exactly as the
- * game's collision code sees it, and the block's friction and speed and jump factors.
+ * game's collision code sees it, the block's friction and speed and jump factors, and
+ * the state's fluid and sturdy faces.
  *
- * <p>Format {@code block_physics} v2, after the header:
+ * <p>Format {@code block_physics} v3, after the header:
  * <ul>
  *   <li>u32 shape count, then per shape, for x, y and z: u32 n and n f64 coordinates;
  *       then the (nx-1)(ny-1)(nz-1) voxels as bits, x outermost and z innermost, packed
  *       eight to a byte, lowest bit first. Shape 0 is the empty shape.</li>
  *   <li>u32 state count, then per state in id order: u32 shape, u8 flags (1: large
  *       collision shape, 2: dynamic shape, 4: shape depends on who collides, 8: offset
- *       by position, 16: suffocating), f32 friction, f32 speed factor, f32 jump factor,
- *       f32 bounce restitution; with flag 8,
- *       also u8 offset type (1 XZ, 2 XYZ), f32 max horizontal and f32 max vertical
- *       offset.</li>
+ *       by position, 16: suffocating, 32: an {@code IceBlock}), f32 friction, f32 speed
+ *       factor, f32 jump factor, f32 bounce restitution, u8 fluid (bits 0-2: none, water,
+ *       flowing water, lava, flowing lava; bit 3: falling; bits 4-7: amount), u8 sturdy
+ *       faces ({@code isFaceSturdy} at the origin, one bit per {@code Direction} in
+ *       ordinal order: down, up, north, south, west, east); with flag 8, also u8 offset
+ *       type (1 XZ, 2 XYZ), f32 max horizontal and f32 max vertical offset.</li>
  * </ul>
  *
  * <p>The shape is the collision shape at the origin with an empty collision context.
@@ -58,6 +66,7 @@ final class BlockPhysicsExporter {
     private static final int CONTEXT = 4;
     private static final int OFFSET = 8;
     private static final int SUFFOCATING = 16;
+    private static final int ICE = 32;
 
     private BlockPhysicsExporter() {}
 
@@ -102,12 +111,19 @@ final class BlockPhysicsExporter {
             }
             if (offset) flags |= OFFSET;
             if (state.isSuffocating(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) flags |= SUFFOCATING;
+            if (block instanceof IceBlock) flags |= ICE;
             states.u32(id);
             states.u8(flags);
             states.f32(block.getFriction());
             states.f32(block.getSpeedFactor());
             states.f32(block.getJumpFactor());
             states.f32(bounce.getFloat(block));
+            states.u8(fluid(state.getFluidState()));
+            int sturdy = 0;
+            for (Direction d : Direction.values()) {
+                if (state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, d)) sturdy |= 1 << d.ordinal();
+            }
+            states.u8(sturdy);
             if (offset) {
                 boolean vertical = false;
                 for (int x = 0; x < 16 && !vertical; x++) {
@@ -123,7 +139,7 @@ final class BlockPhysicsExporter {
         }
 
         // The empty shape first, so 0 means "no collision".
-        ExportWriter w = new ExportWriter("block_physics", 2);
+        ExportWriter w = new ExportWriter("block_physics", 3);
         w.u32(shapes.size());
         for (byte[] s : shapes) {
             w.bytes(s);
@@ -131,6 +147,20 @@ final class BlockPhysicsExporter {
         w.u32(count);
         w.bytes(states.payload());
         w.writeTo(file);
+    }
+
+    /** A fluid state as one byte: its type, whether it is falling, and its amount. */
+    private static int fluid(FluidState f) {
+        if (f.isEmpty()) return 0;
+        Fluid type = f.getType();
+        int kind;
+        if (type == Fluids.WATER) kind = 1;
+        else if (type == Fluids.FLOWING_WATER) kind = 2;
+        else if (type == Fluids.LAVA) kind = 3;
+        else if (type == Fluids.FLOWING_LAVA) kind = 4;
+        else throw new IllegalStateException("unknown fluid " + type);
+        boolean falling = f.hasProperty(FlowingFluid.FALLING) && f.getValue(FlowingFluid.FALLING);
+        return kind | (falling ? 8 : 0) | f.getAmount() << 4;
     }
 
     /** A shape's coordinates and voxels, in the file's layout. */

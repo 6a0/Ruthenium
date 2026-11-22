@@ -60,9 +60,23 @@ pub struct SessionOptions {
 #[derive(Debug, Clone)]
 pub struct Physics {
     pub blocks: std::sync::Arc<Blocks>,
-    /// Vanilla's dimension types by name: (min_y, height), for servers that send them
-    /// as known-pack entries without data.
-    pub dimension_types: HashMap<String, (i32, i32)>,
+    /// Vanilla's dimension types by name, for servers that send them as known-pack
+    /// entries without data.
+    pub dimension_types: HashMap<String, DimensionType>,
+}
+
+/// What movement needs from a dimension type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DimensionType {
+    pub min_y: i32,
+    pub height: i32,
+    /// The `minecraft:gameplay/fast_lava` environment attribute.
+    pub fast_lava: bool,
+}
+
+impl DimensionType {
+    /// The environment attribute that speeds lava up.
+    pub const FAST_LAVA: &str = "minecraft:gameplay/fast_lava";
 }
 
 /// What the menus hear.
@@ -528,19 +542,33 @@ impl Game {
             .and_then(|i| types.get(i));
         let from_data = entry.and_then(|e| {
             let c = e.data.as_ref()?.as_compound()?;
-            Some((c.int("min_y")?, c.int("height")?))
+            let fast_lava = c
+                .get("attributes")
+                .and_then(|a| a.as_compound()?.boolean(DimensionType::FAST_LAVA))
+                .unwrap_or(false);
+            Some(DimensionType {
+                min_y: c.int("min_y")?,
+                height: c.int("height")?,
+                fast_lava,
+            })
         });
         let vanilla =
             entry.and_then(|e| self.physics.as_ref()?.dimension_types.get(&e.id).copied());
-        let (min_y, height) = from_data.or(vanilla).unwrap_or_else(|| {
+        let t = from_data.or(vanilla).unwrap_or_else(|| {
             eprintln!(
                 "[session] dimension type {} unknown; assuming the overworld's height",
                 spawn.dimension_type
             );
-            (-64, 384)
+            DimensionType {
+                min_y: -64,
+                height: 384,
+                fast_lava: false,
+            }
         });
         let biomes = registry("minecraft:worldgen/biome").len();
-        (Level::new(min_y, height), global_bits(biomes))
+        let mut level = Level::new(t.min_y, t.height);
+        level.set_fast_lava(t.fast_lava);
+        (level, global_bits(biomes))
     }
 
     /// The block tags movement reads, from the server's tags (block registry ids).

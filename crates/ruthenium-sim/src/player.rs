@@ -4,9 +4,11 @@
 //!
 //! Covered so far: walking, sprinting, sneaking and jumping on land and in the air,
 //! block collisions with step-up, block friction and speed and jump factors, bouncing,
-//! the push out of suffocating blocks, poses, climbing. Not yet: fluids and swimming,
-//! flying and elytra, effects, vehicles, entity collisions and the world border, and
-//! the fence, wall and bounce-suppression tags.
+//! the push out of suffocating blocks, poses, climbing, water and lava (depth, eyes
+//! under the surface, currents, swimming, swim sprinting, jumping and sinking in
+//! fluids). Not yet: flying and elytra, effects (dolphin's grace among them),
+//! vehicles, entity collisions and the world border, and the fence, wall and
+//! bounce-suppression tags.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
@@ -17,6 +19,7 @@ use ruthenium_protocol::packets::play::PlayerPosition;
 use ruthenium_protocol::wire;
 
 use crate::blocks::{BlockTags, Blocks};
+use crate::fluid::FluidInteraction;
 use crate::shape::{Aabb, Axis, EPSILON, Placed, collide_all};
 use crate::world::Level;
 
@@ -74,6 +77,15 @@ impl Pose {
             Pose::Standing => (0.6, 1.8),
             Pose::Crouching => (0.6, 1.5),
             Pose::Swimming => (0.6, 0.6),
+        }
+    }
+
+    /// The eye height (`Avatar.POSES`).
+    fn eye_height(self) -> f32 {
+        match self {
+            Pose::Standing => 1.62,
+            Pose::Crouching => 1.27,
+            Pose::Swimming => 0.4,
         }
     }
 
@@ -152,6 +164,7 @@ pub struct Attributes {
     pub friction_modifier: Attribute,
     pub air_drag_modifier: Attribute,
     pub movement_efficiency: Attribute,
+    pub water_movement_efficiency: Attribute,
     pub bounciness: Attribute,
 }
 
@@ -166,6 +179,7 @@ impl Default for Attributes {
             friction_modifier: Attribute::new(1.0, 0.0, 2048.0),
             air_drag_modifier: Attribute::new(1.0, 0.0, 2048.0),
             movement_efficiency: Attribute::new(0.0, 0.0, 1.0),
+            water_movement_efficiency: Attribute::new(0.0, 0.0, 1.0),
             bounciness: Attribute::new(0.0, 0.0, 1.0),
         }
     }
@@ -183,6 +197,7 @@ impl Attributes {
             "minecraft:friction_modifier" => &mut self.friction_modifier,
             "minecraft:air_drag_modifier" => &mut self.air_drag_modifier,
             "minecraft:movement_efficiency" => &mut self.movement_efficiency,
+            "minecraft:water_movement_efficiency" => &mut self.water_movement_efficiency,
             "minecraft:bounciness" => &mut self.bounciness,
             _ => return None,
         })
@@ -246,6 +261,8 @@ pub struct LocalPlayer {
     pub vertical_collision_below: bool,
     pub fall_distance: f64,
     pub sprinting: bool,
+    /// `isSwimming` (the shared flag the client sets itself).
+    pub swimming: bool,
     pub pose: Pose,
     pub attributes: Attributes,
     pub food: i32,
@@ -261,6 +278,13 @@ pub struct LocalPlayer {
     sprint_trigger_time: i32,
     supporting_block: Option<[i32; 3]>,
     on_ground_no_blocks: bool,
+    /// The fluids the player's box is in, as last updated.
+    fluids: FluidInteraction,
+    /// `wasTouchingWater` (`isInWater`).
+    in_water: bool,
+    /// `LocalPlayer.wasUnderwater`: the eyes were in water at the start of the tick.
+    was_underwater: bool,
+    first_tick: bool,
     // `sendChanges` state.
     last_sent_keys: Keys,
     last_sent: [f64; 3],
@@ -287,6 +311,7 @@ impl LocalPlayer {
             vertical_collision_below: false,
             fall_distance: 0.0,
             sprinting: false,
+            swimming: false,
             pose: Pose::Standing,
             attributes: Attributes::default(),
             food: 20,
@@ -300,6 +325,10 @@ impl LocalPlayer {
             sprint_trigger_time: 0,
             supporting_block: None,
             on_ground_no_blocks: false,
+            fluids: FluidInteraction::default(),
+            in_water: false,
+            was_underwater: false,
+            first_tick: true,
             last_sent_keys: Keys::default(),
             last_sent: [0.0; 3],
             last_sent_rot: (0.0, 0.0),
@@ -425,9 +454,42 @@ impl LocalPlayer {
         env.no_collision(&pose.bounding_box(self.position).inflate([-EPSILON; 3]))
     }
 
-    /// `isMovingSlowly` (crawling isn't possible without swimming yet).
+    /// `isMovingSlowly`: crouching, or crawling (the swimming pose out of water).
     fn moving_slowly(&self) -> bool {
-        self.crouching
+        self.crouching || self.pose == Pose::Swimming && !self.in_water
+    }
+
+    /// `isInWater`.
+    pub fn in_water(&self) -> bool {
+        self.in_water
+    }
+
+    /// `isInLava` (never on the first tick).
+    pub fn in_lava(&self) -> bool {
+        !self.first_tick && self.fluids.is_in(false)
+    }
+
+    /// `isInShallowWater`, with `LocalPlayer.isUnderWater`.
+    fn in_shallow_water(&self) -> bool {
+        self.in_water && !self.was_underwater
+    }
+
+    /// `LocalPlayer.isSprintingPossible` (not riding, no blindness yet).
+    fn sprinting_possible(&self, allowed_in_shallow_water: bool) -> bool {
+        self.enough_food() && (allowed_in_shallow_water || !self.in_shallow_water())
+    }
+
+    fn eye_y(&self) -> f64 {
+        self.position[1] + f64::from(self.pose.eye_height())
+    }
+
+    /// `getFluidJumpThreshold`.
+    fn fluid_jump_threshold(&self) -> f64 {
+        if f64::from(self.pose.eye_height()) < 0.4 {
+            0.0
+        } else {
+            0.4
+        }
     }
 
     fn has_forward_impulse(&self) -> bool {
@@ -437,7 +499,9 @@ impl LocalPlayer {
     /// One client tick of the player (`LocalPlayer.tick`, only called once the player
     /// has loaded into the level). `keys` are the movement keys held.
     pub fn tick(&mut self, env: &Env<'_>, keys: Keys) {
-        // Player.tick: Entity.baseTick has nothing to do on land, then aiStep.
+        // Player.tick: updateIsUnderwater, from the fluids as last updated.
+        self.was_underwater = self.fluids.eye_in(true);
+        self.base_tick(env);
         self.ai_step(env, keys);
         let clamp = |v: f64| v.clamp(-2.9999999E7, 2.9999999E7);
         self.position[0] = clamp(self.position[0]);
@@ -445,10 +509,63 @@ impl LocalPlayer {
         self.update_pose(env);
     }
 
+    /// `Entity.baseTick`'s movement parts: the fluids, swimming, lava halving the fall.
+    fn base_tick(&mut self, env: &Env<'_>) {
+        self.update_fluid_interaction(env);
+        self.update_swimming(env);
+        if self.in_lava() {
+            self.fall_distance *= 0.5;
+        }
+        self.first_tick = false;
+    }
+
+    /// `Entity.updateFluidInteraction`: what the box is in, the fall reset in water,
+    /// and the currents (players not flying are pushed by fluids).
+    fn update_fluid_interaction(&mut self, env: &Env<'_>) {
+        let b = self.bounding_box();
+        let eye = (
+            mth::floor(self.position[0]),
+            self.eye_y(),
+            mth::floor(self.position[2]),
+        );
+        self.fluids.update(env, &b, eye, false);
+        let in_water = self.fluids.is_in(true);
+        let in_lava = self.fluids.is_in(false);
+        if in_water {
+            self.fall_distance = 0.0;
+        }
+        self.in_water = in_water;
+        if in_water {
+            self.fluids.apply_current(true, &mut self.delta, 0.014);
+        }
+        if in_lava {
+            let scale = if env.level.fast_lava() {
+                0.007
+            } else {
+                0.0023333333333333335
+            };
+            self.fluids.apply_current(false, &mut self.delta, scale);
+        }
+    }
+
+    /// `Entity.updateSwimming`: keeps swimming while sprinting in water; starts with
+    /// the eyes under water (as the tick began) in a water block.
+    fn update_swimming(&mut self, env: &Env<'_>) {
+        self.swimming = if self.swimming {
+            self.sprinting && self.in_water
+        } else {
+            self.sprinting
+                && self.was_underwater
+                && env.fluid(self.block_position()).fluid.is_water()
+        };
+    }
+
     /// `Player.updatePlayerPose`.
     fn update_pose(&mut self, env: &Env<'_>) {
         if self.can_fit(env, Pose::Swimming) {
-            let desired = if self.keys.shift {
+            let desired = if self.swimming {
+                Pose::Swimming
+            } else if self.keys.shift {
                 Pose::Crouching
             } else {
                 Pose::Standing
@@ -470,7 +587,8 @@ impl LocalPlayer {
         }
         let was_shift = self.keys.shift;
         let had_forward = self.has_forward_impulse();
-        self.crouching = self.can_fit(env, Pose::Crouching)
+        self.crouching = !self.swimming
+            && self.can_fit(env, Pose::Crouching)
             && (self.keys.shift || !self.can_fit(env, Pose::Standing));
         // KeyboardInput.tick.
         self.keys = keys;
@@ -510,8 +628,8 @@ impl LocalPlayer {
         }
         let can_start_sprinting = !self.sprinting
             && self.has_forward_impulse()
-            && self.enough_food()
-            && !self.moving_slowly();
+            && self.sprinting_possible(false)
+            && (!self.moving_slowly() || self.was_underwater);
         if can_start_sprinting {
             if !had_forward {
                 if self.sprint_trigger_time > 0 {
@@ -526,12 +644,24 @@ impl LocalPlayer {
             }
         }
         if self.sprinting {
-            let stop = !self.enough_food()
-                || !self.has_forward_impulse()
-                || self.horizontal_collision && !self.minor_horizontal_collision;
+            let stop = if self.swimming {
+                // shouldStopSwimSprinting.
+                !self.sprinting_possible(true)
+                    || !self.in_water
+                    || !self.has_forward_impulse() && !self.on_ground && !keys.shift
+            } else {
+                // shouldStopRunSprinting.
+                !self.sprinting_possible(false)
+                    || !self.has_forward_impulse()
+                    || self.horizontal_collision && !self.minor_horizontal_collision
+            };
             if stop {
                 self.set_sprinting(false);
             }
+        }
+        // goDownInWater.
+        if self.in_water && keys.shift {
+            self.delta[1] += -0.03999999910593033;
         }
         // Player.aiStep -> LivingEntity.aiStep.
         self.living_ai_step(env);
@@ -602,14 +732,147 @@ impl LocalPlayer {
         self.zza = my;
         self.jumping = self.keys.jump;
         if self.jumping {
-            if self.on_ground && self.no_jump_delay == 0 {
-                self.jump_from_ground(env);
-                self.no_jump_delay = 10;
+            let in_lava = self.in_lava();
+            let height = self.fluids.height(!in_lava);
+            let in_water_with_height = self.in_water && height > 0.0;
+            let threshold = self.fluid_jump_threshold();
+            if !in_water_with_height || self.on_ground && !(height > threshold) {
+                if !in_lava || self.on_ground && self.fluids.height(false) <= threshold {
+                    if (self.on_ground || in_water_with_height && height <= threshold)
+                        && self.no_jump_delay == 0
+                    {
+                        self.jump_from_ground(env);
+                        self.no_jump_delay = 10;
+                    }
+                } else {
+                    // jumpInLiquid(LAVA).
+                    self.delta[1] += 0.03999999910593033;
+                }
+            } else {
+                // jumpInLiquid(WATER).
+                self.delta[1] += 0.03999999910593033;
             }
         } else {
             self.no_jump_delay = 0;
         }
-        self.travel_in_air(env);
+        self.travel(env);
+    }
+
+    /// `Player.travel` (swimming follows the look), then `LivingEntity.travel`.
+    fn travel(&mut self, env: &Env<'_>) {
+        if self.swimming {
+            // getLookAngle().y.
+            let look_y = f64::from(-mth::sin(f64::from(self.x_rot * DEG_TO_RAD_F)));
+            let multiplier = if look_y < -0.2 { 0.085 } else { 0.06 };
+            let above = [
+                mth::floor(self.position[0]),
+                mth::floor(self.position[1] + 1.0 - 0.1),
+                mth::floor(self.position[2]),
+            ];
+            if look_y <= 0.0 || self.jumping || !env.fluid(above).is_empty() {
+                self.delta[1] += (look_y - self.delta[1]) * multiplier;
+            }
+        }
+        // shouldTravelInFluid: players never stand on fluids.
+        if self.in_water || self.in_lava() {
+            self.travel_in_fluid(env);
+        } else {
+            self.travel_in_air(env);
+        }
+    }
+
+    /// `LivingEntity.travelInFluid`.
+    fn travel_in_fluid(&mut self, env: &Env<'_>) {
+        let is_falling = self.delta[1] <= 0.0;
+        let old_y = self.position[1];
+        let gravity = self.attributes.gravity.value();
+        if self.in_water {
+            self.travel_in_water(env, gravity, is_falling, old_y);
+        } else {
+            self.travel_in_lava(env, gravity, is_falling, old_y);
+        }
+    }
+
+    /// `LivingEntity.travelInWater`.
+    fn travel_in_water(&mut self, env: &Env<'_>, gravity: f64, is_falling: bool, old_y: f64) {
+        let mut slow_down: f32 = if self.sprinting { 0.9 } else { 0.8 };
+        let mut speed: f32 = 0.02;
+        let mut water_walker = self.attributes.water_movement_efficiency.value() as f32;
+        if !self.on_ground {
+            water_walker *= 0.5;
+        }
+        if water_walker > 0.0 {
+            slow_down += (0.54600006 - slow_down) * water_walker;
+            let own = self.attributes.movement_speed.value() as f32;
+            speed += (own - speed) * water_walker;
+        }
+        self.move_relative(speed);
+        self.do_move(env, self.delta);
+        let mut m = self.delta;
+        if self.horizontal_collision && self.on_climbable(env) {
+            m[1] = 0.2;
+        }
+        let s = f64::from(slow_down);
+        let m = [m[0] * s, m[1] * 0.800000011920929, m[2] * s];
+        self.delta = self.fluid_falling_adjusted(gravity, is_falling, m);
+        self.jump_out_of_fluid(env, old_y);
+    }
+
+    /// `LivingEntity.travelInLava`.
+    fn travel_in_lava(&mut self, env: &Env<'_>, gravity: f64, is_falling: bool, old_y: f64) {
+        self.move_relative(0.02);
+        self.do_move(env, self.delta);
+        let d = self.delta;
+        if self.fluids.height(false) <= self.fluid_jump_threshold() {
+            let m = [d[0] * 0.5, d[1] * 0.800000011920929, d[2] * 0.5];
+            self.delta = self.fluid_falling_adjusted(gravity, is_falling, m);
+        } else {
+            self.delta = [d[0] * 0.5, d[1] * 0.5, d[2] * 0.5];
+        }
+        if gravity != 0.0 {
+            self.delta[1] += -gravity / 4.0;
+        }
+        self.jump_out_of_fluid(env, old_y);
+    }
+
+    /// `LivingEntity.getFluidFallingAdjustedMovement`.
+    fn fluid_falling_adjusted(&self, gravity: f64, is_falling: bool, m: [f64; 3]) -> [f64; 3] {
+        if gravity != 0.0 && !self.sprinting {
+            let y = if is_falling
+                && (m[1] - 0.005).abs() >= 0.003
+                && (m[1] - gravity / 16.0).abs() < 0.003
+            {
+                -0.003
+            } else {
+                m[1] - gravity / 16.0
+            };
+            [m[0], y, m[2]]
+        } else {
+            m
+        }
+    }
+
+    /// `LivingEntity.jumpOutOfFluid`: against a wall with room above, hop out.
+    fn jump_out_of_fluid(&mut self, env: &Env<'_>, old_y: f64) {
+        let m = self.delta;
+        if self.horizontal_collision
+            && self.is_free(
+                env,
+                [
+                    m[0],
+                    m[1] + 0.6000000238418579 - self.position[1] + old_y,
+                    m[2],
+                ],
+            )
+        {
+            self.delta[1] = 0.30000001192092896;
+        }
+    }
+
+    /// `Entity.isFree`: no collision and no fluid in the box moved by `d`.
+    fn is_free(&self, env: &Env<'_>, d: [f64; 3]) -> bool {
+        let b = self.bounding_box().moved(d);
+        env.no_collision(&b) && !env.contains_any_liquid(&b)
     }
 
     /// `LocalPlayer.modifyInput`.
@@ -841,8 +1104,12 @@ impl LocalPlayer {
             self.horizontal_collision && self.horizontal_collision_minor(movement);
         let effect_pos = self.on_pos(env, 0.2);
         let effect_state = env.state(effect_pos);
-        // checkFallDamage (out of water).
-        if movement[1] < 0.0 {
+        // LivingEntity.checkFallDamage: out of water the fluids are updated again
+        // (currents and all), then Entity.checkFallDamage.
+        if !self.in_water {
+            self.update_fluid_interaction(env);
+        }
+        if !self.in_water && movement[1] < 0.0 {
             self.fall_distance -= f64::from(movement[1] as f32);
         }
         if self.on_ground {

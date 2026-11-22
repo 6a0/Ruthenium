@@ -17,23 +17,27 @@ fn game() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("RUTHENIUM_GAME_DIR")?))
 }
 
-/// Vanilla's block tags from the jar's data pack (plain block lists only).
+/// Vanilla's block tags from the jar's data pack, nested tags expanded.
 fn vanilla_tags(game: &Path) -> BlockTags {
     let jar = ruthenium_assets::zip::Zip::open(&game.join("versions/26.3/client.jar")).unwrap();
-    let mut tags = BlockTags::new();
-    // The tags movement reads.
-    #[allow(clippy::single_element_loop)]
-    for tag in ["climbable"] {
+    fn blocks(jar: &ruthenium_assets::zip::Zip, tag: &str, out: &mut Vec<String>) {
         let i = jar
             .find(&format!("data/minecraft/tags/block/{tag}.json"))
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&jar.read(i).unwrap()).unwrap();
-        let names: Vec<String> = v["values"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|n| n.as_str().map(str::to_owned))
-            .collect();
+        for n in v["values"].as_array().unwrap() {
+            let n = n.as_str().or_else(|| n["id"].as_str()).unwrap();
+            match n.strip_prefix("#minecraft:") {
+                Some(nested) => blocks(jar, nested, out),
+                None => out.push(n.to_owned()),
+            }
+        }
+    }
+    let mut tags = BlockTags::new();
+    // The tags movement reads.
+    for tag in ["climbable", "blocks_fluid_flow"] {
+        let mut names = Vec::new();
+        blocks(&jar, tag, &mut names);
         tags.set(
             &format!("minecraft:{tag}"),
             names.iter().map(String::as_str),
@@ -260,9 +264,8 @@ fn replay_from(
     Ok(ticks)
 }
 
-/// Scenarios the movement code must reproduce exactly. The rest need what isn't
-/// ported yet (fluids).
-const EXACT: [&str; 10] = [
+/// Scenarios the movement code must reproduce exactly (all of them now).
+const EXACT: [&str; 14] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -272,6 +275,10 @@ const EXACT: [&str; 10] = [
     "ice",
     "slime_bounce",
     "ladder",
+    "swim",
+    "water_current",
+    "waterfall",
+    "lava",
     "combat_basics",
 ];
 
@@ -294,6 +301,9 @@ fn golden_traces() {
         "slime_bounce",
         "ladder",
         "swim",
+        "water_current",
+        "waterfall",
+        "lava",
         "combat_basics",
     ];
     let mut failed = Vec::new();

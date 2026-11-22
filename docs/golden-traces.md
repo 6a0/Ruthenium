@@ -55,6 +55,9 @@ Each scenario first clears a 41 × 25 area around the origin of a flat world and
 | `slime_bounce` | walk off a 10-block pillar onto slime, bounce, jump on slime |
 | `ladder` | climb a ladder, hold on by sneaking, slide down |
 | `swim` | walk into a 2-deep pool, sprint-swim, swim up |
+| `water_current` | a walled channel of settled flowing water: walk upstream, jump, drift, sneak downstream, strafe, jump in the shallow end |
+| `waterfall` | drop into a 1×1 shaft of falling water, sink with the current, swim up |
+| `lava` | with fire resistance, wade into a 2-deep lava pool, sink, swim with jump held |
 | `step_up` | walk over a slab, carpet, snow layers and stairs, jump onto a block |
 | `head_hitter` | sprint-jump under a ceiling 2 blocks above the floor |
 | `mouse_turn` | walk while the mouse turns the camera every tick |

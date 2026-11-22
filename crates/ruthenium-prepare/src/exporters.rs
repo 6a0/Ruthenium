@@ -207,6 +207,12 @@ pub struct StatePhysics {
     pub jump_factor: f32,
     /// `BlockBehaviour.bounceRestitution` (slime blocks and beds bounce).
     pub bounce: f32,
+    /// The state's fluid (`getFluidState`): bits 0-2 the type (`FLUID_*`), bit 3
+    /// falling, bits 4-7 the amount.
+    pub fluid: u8,
+    /// `isFaceSturdy` at the origin, one bit per `Direction` ordinal (down, up, north,
+    /// south, west, east).
+    pub sturdy: u8,
     pub offset: Option<OffsetData>,
 }
 
@@ -219,6 +225,14 @@ impl StatePhysics {
     pub const OFFSET: u8 = 8;
     /// `isSuffocating` at the origin.
     pub const SUFFOCATING: u8 = 16;
+    /// The block is an `IceBlock` (ice, frosted ice).
+    pub const ICE: u8 = 32;
+
+    pub const FLUID_NONE: u8 = 0;
+    pub const FLUID_WATER: u8 = 1;
+    pub const FLUID_FLOWING_WATER: u8 = 2;
+    pub const FLUID_LAVA: u8 = 3;
+    pub const FLUID_FLOWING_LAVA: u8 = 4;
 }
 
 /// `block_physics.bin`: every block state's collision shape and movement factors.
@@ -230,7 +244,7 @@ pub struct BlockPhysics {
 
 /// Parses `block_physics.bin`.
 pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
-    let mut r = Reader::open(bytes, "block_physics", 2)?;
+    let mut r = Reader::open(bytes, "block_physics", 3)?;
     let n = r.u32()? as usize;
     let mut shapes = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
@@ -259,6 +273,10 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
         let flags = r.u8()?;
         let (friction, speed_factor, jump_factor) = (r.f32()?, r.f32()?, r.f32()?);
         let bounce = r.f32()?;
+        let (fluid, sturdy) = (r.u8()?, r.u8()?);
+        if fluid & 7 > StatePhysics::FLUID_FLOWING_LAVA {
+            return Err(format!("bad fluid {fluid}"));
+        }
         let offset = if flags & StatePhysics::OFFSET != 0 {
             Some(OffsetData {
                 vertical: r.u8()? == 2,
@@ -275,6 +293,8 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
             speed_factor,
             jump_factor,
             bounce,
+            fluid,
+            sturdy,
             offset,
         });
     }

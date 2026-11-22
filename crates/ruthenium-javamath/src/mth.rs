@@ -68,6 +68,17 @@ pub fn floor(v: f64) -> i32 {
     v.floor() as i32
 }
 
+/// Vanilla `Mth.ceil(double)`: the int cast, plus one when the value is greater.
+#[inline]
+pub fn ceil(v: f64) -> i32 {
+    let truncated = v as i32;
+    if v > f64::from(truncated) {
+        truncated + 1
+    } else {
+        truncated
+    }
+}
+
 /// Vanilla `Mth.lfloor(double)`: `(long) Math.floor(v)`, saturating, NaN to 0.
 #[inline]
 pub fn lfloor(v: f64) -> i64 {
