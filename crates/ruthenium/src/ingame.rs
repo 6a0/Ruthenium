@@ -267,6 +267,12 @@ pub fn draw_hud(
                 "; attack {:.0}%",
                 f64::from(v.attack_strength) * 100.0
             ));
+            if let Some(([x, y, z], progress)) = v.breaking {
+                hands.push_str(&format!(
+                    "; breaking {x} {y} {z} {:.0}%",
+                    f64::from(progress.min(1.0)) * 100.0
+                ));
+            }
             lines.push((hands, body));
             lines.push((format!("{} ({} chunks)", v.dimension, v.chunks), body));
         }

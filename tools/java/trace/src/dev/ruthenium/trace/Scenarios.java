@@ -69,6 +69,20 @@ public final class Scenarios {
         hold(ctx, ticks, JUMP);
     }
 
+    /**
+     * The breaking scenario's work area: the stone floor in front of the start mended, the
+     * space above it cleared, {@code target} (if any) at 2 -60 0, and the player back at the
+     * start looking at it.
+     */
+    private static void breakingArea(TestServerContext server, String target) {
+        server.runCommand("fill 0 -61 -2 5 -61 2 minecraft:stone");
+        server.runCommand("fill 0 -60 -2 5 -58 2 minecraft:air");
+        if (target != null) {
+            server.runCommand("setblock 2 -60 0 " + target);
+        }
+        server.runCommand("tp @p 0.5 -60 0.5 -90 30");
+    }
+
     private static double[] start(double x, double y, double z, double yaw, double pitch) {
         return new double[] {x, y, z, yaw, pitch};
     }
@@ -299,6 +313,145 @@ public final class Scenarios {
                         ctx.waitTicks(15);
                         ctx.getInput().pressKey(ATTACK);
                         ctx.waitTicks(10);
+                    }),
+            new Scenario("breaking",
+                    "Breaking blocks: dirt by hand (finished, then the floor behind started and given up); stone with a wooden pickaxe, its face changed half way, then two floor blocks in turn; a torch broken at once, twice, and once while digging the floor; the block under the player (it falls, and digs on in the air); haste II, mining fatigue, digging while jumping; a stone pickaxe with efficiency III; iron ore with a wooden pickaxe; a waterlogged pane (water left behind); redstone ore lit by the first hit; creative breaking every sixth tick, a waterlogged pane there, and a sword that breaks nothing; adventure mode with a pickaxe that may break only stone.",
+                    List.of("gamerule block_drops false",
+                            "item replace entity @a hotbar.1 with minecraft:wooden_pickaxe",
+                            "item replace entity @a hotbar.2 with minecraft:stone_pickaxe[enchantments={efficiency:3}]",
+                            "item replace entity @a hotbar.3 with minecraft:diamond_sword",
+                            "setblock 2 -60 0 minecraft:dirt"),
+                    start(0.5, -60, 0.5, -90, 30), (ctx, server) -> {
+                        // Dirt by hand: 15 ticks; then the floor behind, given up.
+                        ctx.waitTicks(10);
+                        hold(ctx, 24, ATTACK);
+                        ctx.waitTicks(5);
+                        // Stone with a wooden pickaxe: the west face, then the top face of the
+                        // same block, finished; the floor beside the player, then the floor
+                        // behind the stone (the first given up for it), let go.
+                        breakingArea(server, "minecraft:stone");
+                        ctx.getInput().pressKey(hotbar(1));
+                        ctx.waitTicks(10);
+                        ctx.getInput().holdKey(ATTACK);
+                        ctx.waitTicks(6);
+                        ctx.getInput().lookAt(-90, 20);
+                        ctx.waitTicks(25);
+                        ctx.getInput().lookAt(-90, 50);
+                        ctx.waitTicks(12);
+                        ctx.getInput().lookAt(-90, 30);
+                        ctx.waitTicks(6);
+                        ctx.getInput().releaseKey(ATTACK);
+                        ctx.waitTicks(5);
+                        // A torch breaks at once: a click, then the key held (the floor behind
+                        // is started at once, and given up).
+                        breakingArea(server, "minecraft:torch");
+                        ctx.getInput().pressKey(hotbar(0));
+                        ctx.waitTicks(10);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(5);
+                        server.runCommand("setblock 2 -60 0 minecraft:torch");
+                        ctx.waitTicks(5);
+                        hold(ctx, 6, ATTACK);
+                        ctx.waitTicks(5);
+                        // Digging the floor, then a click on a torch with the key still held: the
+                        // floor given up, the torch broken at once, and breaking stopped in the
+                        // same tick (the floor given up a second time).
+                        breakingArea(server, "minecraft:torch");
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(-90, 50);
+                        ctx.waitTicks(5);
+                        ctx.getInput().holdKey(ATTACK);
+                        ctx.waitTicks(4);
+                        ctx.getInput().releaseKey(ATTACK);
+                        ctx.getInput().lookAt(-90, 30);
+                        ctx.getInput().holdKey(ATTACK);
+                        ctx.waitTicks(3);
+                        ctx.getInput().releaseKey(ATTACK);
+                        ctx.waitTicks(5);
+                        // The block under the player: it falls, and digs the dirt below in the air.
+                        breakingArea(server, null);
+                        server.runCommand("tp @p 0.5 -60 0.5 -90 90");
+                        ctx.getInput().pressKey(hotbar(1));
+                        ctx.waitTicks(10);
+                        hold(ctx, 30, ATTACK);
+                        ctx.waitTicks(10);
+                        // Haste II, then mining fatigue (given up), then digging while jumping.
+                        breakingArea(server, "minecraft:dirt");
+                        ctx.getInput().pressKey(hotbar(0));
+                        server.runCommand("effect give @p minecraft:haste 60 1 true");
+                        ctx.waitTicks(10);
+                        hold(ctx, 14, ATTACK);
+                        ctx.waitTicks(3);
+                        server.runCommand("effect clear @p minecraft:haste");
+                        server.runCommand("effect give @p minecraft:mining_fatigue 60 0 true");
+                        server.runCommand("setblock 2 -60 0 minecraft:dirt");
+                        ctx.waitTicks(5);
+                        hold(ctx, 10, ATTACK);
+                        server.runCommand("effect clear @p minecraft:mining_fatigue");
+                        ctx.waitTicks(5);
+                        ctx.getInput().holdKey(JUMP);
+                        hold(ctx, 30, ATTACK);
+                        ctx.getInput().releaseKey(JUMP);
+                        ctx.waitTicks(10);
+                        // Efficiency III on a stone pickaxe: 4 ticks.
+                        breakingArea(server, "minecraft:stone");
+                        ctx.getInput().pressKey(hotbar(2));
+                        ctx.waitTicks(10);
+                        hold(ctx, 8, ATTACK);
+                        ctx.waitTicks(3);
+                        // Iron ore with a wooden pickaxe: the pickaxe's speed, but the wrong tier
+                        // (a hundredth, not a thirtieth, per tick); given up.
+                        breakingArea(server, "minecraft:iron_ore");
+                        ctx.getInput().pressKey(hotbar(1));
+                        ctx.waitTicks(10);
+                        hold(ctx, 6, ATTACK);
+                        ctx.waitTicks(3);
+                        // A waterlogged pane leaves its water.
+                        breakingArea(server, "minecraft:glass_pane[waterlogged=true]");
+                        ctx.getInput().pressKey(hotbar(0));
+                        ctx.waitTicks(10);
+                        hold(ctx, 11, ATTACK);
+                        server.runCommand("fill 0 -60 -2 5 -60 2 minecraft:air");
+                        ctx.waitTicks(10);
+                        // Redstone ore lights up at the first hit.
+                        breakingArea(server, "minecraft:redstone_ore");
+                        ctx.waitTicks(10);
+                        hold(ctx, 4, ATTACK);
+                        ctx.waitTicks(5);
+                        // Creative: the dirt at once, then the floor behind every sixth tick;
+                        // a sword breaks nothing.
+                        breakingArea(server, "minecraft:dirt");
+                        server.runCommand("gamemode creative @p");
+                        ctx.waitTicks(10);
+                        hold(ctx, 16, ATTACK);
+                        ctx.waitTicks(5);
+                        // A waterlogged pane: its water isn't air, so holding the key goes on
+                        // in the same tick.
+                        breakingArea(server, "minecraft:glass_pane[waterlogged=true]");
+                        ctx.waitTicks(10);
+                        hold(ctx, 3, ATTACK);
+                        server.runCommand("fill 0 -60 -2 5 -60 2 minecraft:air");
+                        ctx.waitTicks(5);
+                        breakingArea(server, "minecraft:dirt");
+                        ctx.getInput().pressKey(hotbar(3));
+                        ctx.waitTicks(10);
+                        hold(ctx, 13, ATTACK);
+                        server.runCommand("gamemode survival @p");
+                        ctx.waitTicks(5);
+                        // Adventure mode: a pickaxe that may break only stone. Not the dirt
+                        // (only swings), then the stone floor, then not the dirt under it.
+                        breakingArea(server, "minecraft:dirt");
+                        server.runCommand("gamemode adventure @p");
+                        server.runCommand("item replace entity @p hotbar.4 with minecraft:wooden_pickaxe[can_break={blocks:\"minecraft:stone\"}]");
+                        ctx.getInput().pressKey(hotbar(4));
+                        ctx.waitTicks(10);
+                        hold(ctx, 5, ATTACK);
+                        ctx.getInput().lookAt(-90, 50);
+                        ctx.waitTicks(2);
+                        hold(ctx, 32, ATTACK);
+                        server.runCommand("gamemode survival @p");
+                        server.runCommand("gamerule block_drops true");
+                        ctx.waitTicks(5);
                     }),
             new Scenario("entity_push",
                     "Mobs push the player: a zombie summoned overlapping it, walking into it and standing in it; a baby zombie to the side; a size-2 slime behind.",

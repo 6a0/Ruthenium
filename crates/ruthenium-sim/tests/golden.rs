@@ -19,6 +19,7 @@ use ruthenium_sim::inventory::{Hand, SLOT_OFFHAND};
 use ruthenium_sim::item::Items;
 use ruthenium_sim::pick::HitResult;
 use ruthenium_sim::player::{Env, Keys, LocalPlayer, Pose};
+use ruthenium_sim::predict::Predictions;
 use ruthenium_sim::session::pick_target;
 use ruthenium_sim::world::Level;
 use ruthenium_trace::Trace;
@@ -27,13 +28,15 @@ fn game() -> Option<PathBuf> {
     Some(PathBuf::from(std::env::var_os("RUTHENIUM_GAME_DIR")?))
 }
 
-/// Vanilla's block tags from the jar's data pack, nested tags expanded.
+/// Vanilla's block tags from the jar's data pack (all of them: movement's, and the
+/// ones tools' rules name), nested tags expanded.
 fn vanilla_tags(game: &Path) -> BlockTags {
     let jar = ruthenium_assets::zip::Zip::open(&game.join("versions/26.3/client.jar")).unwrap();
+    const DIR: &str = "data/minecraft/tags/block/";
     fn blocks(jar: &ruthenium_assets::zip::Zip, tag: &str, out: &mut Vec<String>) {
-        let i = jar
-            .find(&format!("data/minecraft/tags/block/{tag}.json"))
-            .unwrap();
+        let Some(i) = jar.find(&format!("{DIR}{tag}.json")) else {
+            return;
+        };
         let v: serde_json::Value = serde_json::from_slice(&jar.read(i).unwrap()).unwrap();
         for n in v["values"].as_array().unwrap() {
             let n = n.as_str().or_else(|| n["id"].as_str()).unwrap();
@@ -44,13 +47,19 @@ fn vanilla_tags(game: &Path) -> BlockTags {
         }
     }
     let mut tags = BlockTags::new();
-    // The tags movement reads.
-    for tag in ["climbable", "blocks_fluid_flow"] {
-        let mut names = Vec::new();
-        blocks(&jar, tag, &mut names);
+    let names: Vec<String> = jar
+        .with_prefix(DIR)
+        .filter_map(|i| {
+            let n = jar.name(i).strip_prefix(DIR)?.strip_suffix(".json")?;
+            Some(n.to_owned())
+        })
+        .collect();
+    for tag in names {
+        let mut members = Vec::new();
+        blocks(&jar, &tag, &mut members);
         tags.set(
             &format!("minecraft:{tag}"),
-            names.iter().map(String::as_str),
+            members.iter().map(String::as_str),
         );
     }
     tags
@@ -230,7 +239,8 @@ fn inventory_slot(name: &str, selected: i32) -> Option<usize> {
 }
 
 /// The sequence of the first predicted action in the trace (`use_item`,
-/// `use_item_on`): the replay's prediction counter starts one before it.
+/// `use_item_on`, starting or finishing breaking a block): the replay's prediction
+/// counter starts one before it.
 fn first_sequence(t: &Trace) -> Option<i32> {
     t.records.iter().find_map(|r| {
         if r.kind != "out" {
@@ -256,14 +266,40 @@ fn first_sequence(t: &Trace) -> Option<i32> {
                 rd.bool().ok()?;
                 rd.varint().ok()
             }
+            "minecraft:player_action" => {
+                let action = rd.varint().ok()?;
+                if action != play::ACTION_START_DESTROY_BLOCK
+                    && action != play::ACTION_STOP_DESTROY_BLOCK
+                {
+                    return None;
+                }
+                rd.i64().ok()?;
+                rd.u8().ok()?;
+                rd.varint().ok()
+            }
             _ => None,
         }
     })
 }
 
+/// The level as the replayed client has it: blocks, and the ones it predicted.
+struct ClientLevel {
+    level: Level,
+    predictions: Predictions,
+}
+
 /// A packet the client handled, as `Session` handles it (the parts that reach the
-/// player and the entities around it).
-fn handle(bytes: &[u8], c: &mut Client, p: &mut LocalPlayer, types: &EntityTypes, items: &Items) {
+/// player, the blocks and the entities around it). A teleport's packets (breaking
+/// given up) aren't compared: the scenarios don't teleport while breaking.
+fn handle(
+    bytes: &[u8],
+    c: &mut Client,
+    p: &mut LocalPlayer,
+    l: &mut ClientLevel,
+    game_mode: &mut GameMode,
+    d: &Data,
+) {
+    let (types, items) = (&d.types, &d.items);
     let mut r = Reader::new(bytes);
     let id = r.varint().unwrap() as u32;
     let Ok(packet) = Clientbound::decode(id, r.rest()) else {
@@ -388,7 +424,34 @@ fn handle(bytes: &[u8], c: &mut Client, p: &mut LocalPlayer, types: &EntityTypes
             p.saturation = saturation;
         }
         Clientbound::SetHeldSlot { slot } if (0..9).contains(&slot) => p.inventory.selected = slot,
-        Clientbound::PlayerPosition(t) => p.teleport(&t),
+        Clientbound::PlayerPosition(t) => {
+            p.teleport(&t);
+            l.predictions.on_teleport();
+            game_mode.stop_destroy_block(p, &mut Vec::new());
+        }
+        Clientbound::BlockUpdate { pos, state } => {
+            l.predictions.server_block(&mut l.level, pos, state)
+        }
+        Clientbound::SectionBlocksUpdate { section, changes } => {
+            for (rel, state) in changes {
+                let rel = i32::from(rel);
+                let pos = [
+                    section[0] * 16 + (rel >> 8 & 15),
+                    section[1] * 16 + (rel & 15),
+                    section[2] * 16 + (rel >> 4 & 15),
+                ];
+                l.predictions.server_block(&mut l.level, pos, state);
+            }
+        }
+        Clientbound::BlockChangedAck { sequence } => {
+            l.predictions
+                .acknowledge(sequence, &mut l.level, &d.blocks, p)
+        }
+        Clientbound::EntityEvent { entity_id, event }
+            if entity_id == p.entity_id && (24..=28).contains(&event) =>
+        {
+            p.permission_level = i32::from(event) - 24
+        }
         Clientbound::ContainerSetContent {
             container_id: 0,
             state_id,
@@ -429,11 +492,14 @@ fn handle(bytes: &[u8], c: &mut Client, p: &mut LocalPlayer, types: &EntityTypes
 }
 
 fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, String)> {
-    let (blocks, tags, types, items) = (&d.blocks, &d.tags, &d.types, &d.items);
+    let (blocks, tags, items) = (&d.blocks, &d.tags, &d.items);
     let t = trace(name);
-    let level = build_level(&t);
+    let mut cl = ClientLevel {
+        level: build_level(&t),
+        predictions: Predictions::new(),
+    };
     let env = Env {
-        level: &level,
+        level: &cl.level,
         blocks,
         tags,
         colliders: &[],
@@ -470,10 +536,9 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         }
     }
     // The client's item use: the first tick's slot was sent before the trace began.
-    let mut game_mode = GameMode {
-        sequence: first_sequence(&t).map_or(0, |s| s - 1),
-        ..GameMode::default()
-    };
+    let mut game_mode = GameMode::default();
+    cl.predictions
+        .set_sequence(first_sequence(&t).map_or(0, |s| s - 1));
     let mut first_tick = true;
     let fluid_shapes = ruthenium_sim::pick::FluidShapes::new();
     let name = t.header["playerName"].as_str().unwrap_or("").to_owned();
@@ -513,7 +578,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         i += 1;
         if r.kind == "handle" {
             if let Some(b) = r.bytes() {
-                handle(&b, &mut client, &mut p, types, items);
+                handle(&b, &mut client, &mut p, &mut cl, &mut game_mode, d);
             }
             continue;
         }
@@ -539,6 +604,12 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         // hotbar key, then the hands.
         game_mode.tick_delay();
         game_mode.ensure_carried(&p.inventory, &mut sent);
+        let env = Env {
+            level: &cl.level,
+            blocks,
+            tags,
+            colliders: &[],
+        };
         let hit = pick_target(&env, &client.entities, &client.players, &p);
         for slot in 0..9 {
             if clicks(&format!("key.hotbar.{}", slot + 1)) > 0 && !p.spectator {
@@ -553,12 +624,21 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             attack_clicks: clicks("key.attack"),
             pick_clicks: clicks("key.pickItem"),
         };
-        let world = interact::World {
-            env: &env,
+        let mut world = interact::World {
+            level: &mut cl.level,
+            predictions: &mut cl.predictions,
+            blocks,
+            tags,
             entities: &client.entities,
             fluid_shapes: &fluid_shapes,
         };
-        game_mode.handle_keybinds(&mut p, &world, &hit, &mut use_keys, &mut sent);
+        game_mode.handle_keybinds(&mut p, &mut world, &hit, &mut use_keys, &mut sent);
+        let env = Env {
+            level: &cl.level,
+            blocks,
+            tags,
+            colliders: &[],
+        };
         let cx = TickContext {
             env: &env,
             teams: &client.teams,
@@ -638,6 +718,37 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 ));
             }
         }
+        // The block being broken, where the trace records it.
+        if let Some(exp) = s.value.get("destroying") {
+            let got = serde_json::json!({
+                "destroying": game_mode.is_destroying,
+                "pos": game_mode.destroy_pos,
+                "progress": game_mode.destroy_progress.to_bits(),
+                "ticks": game_mode.destroy_ticks.to_bits(),
+                "delay": game_mode.destroy_delay,
+                "state": cl.level.block(
+                    game_mode.destroy_pos[0],
+                    game_mode.destroy_pos[1],
+                    game_mode.destroy_pos[2],
+                ),
+            });
+            let want = serde_json::json!({
+                "destroying": exp.as_bool().unwrap(),
+                "pos": s.value["destroyPos"],
+                "progress": s.f32("destroyProgress").unwrap().to_bits(),
+                "ticks": s.f32("destroyTicks").unwrap().to_bits(),
+                "delay": s.value["destroyDelay"],
+                "state": s.value["destroyState"],
+            });
+            if got != want {
+                return Err((
+                    n,
+                    format!(
+                        "tick {n} (heartbeat count {reminder}): breaking differs\n  got  {got}\n  want {want}\n  sent {sent:02x?}"
+                    ),
+                ));
+            }
+        }
         let pose = Pose::from_name(s.str("pose").unwrap()).unwrap();
         let got = (
             p.position,
@@ -682,7 +793,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             ));
         }
         for b in pending.drain(..) {
-            handle(&b, &mut client, &mut p, types, items);
+            handle(&b, &mut client, &mut p, &mut cl, &mut game_mode, d);
         }
         ticks += 1;
     }
@@ -690,7 +801,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 25] = [
+const EXACT: [&str; 26] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -716,6 +827,7 @@ const EXACT: [&str; 25] = [
     "offhand",
     "ranged",
     "throwing",
+    "breaking",
 ];
 
 #[test]
@@ -757,6 +869,7 @@ fn golden_traces() {
         "offhand",
         "ranged",
         "throwing",
+        "breaking",
     ];
     let mut failed = Vec::new();
     for name in all {

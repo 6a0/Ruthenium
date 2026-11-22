@@ -265,6 +265,11 @@ pub struct Attributes {
     /// modifiers). The attack damage and knockback attributes aren't sent to clients,
     /// so the client keeps the player's defaults (see [`LocalPlayer::attack`]).
     pub attack_speed: Attribute,
+    /// Added to a tool's speed on blocks it is fast on (efficiency).
+    pub mining_efficiency: Attribute,
+    pub block_break_speed: Attribute,
+    /// The mining speed's factor with the eyes under water (aqua affinity).
+    pub submerged_mining_speed: Attribute,
 }
 
 impl Default for Attributes {
@@ -283,6 +288,9 @@ impl Default for Attributes {
             block_interaction_range: Attribute::new(4.5, 0.0, 64.0),
             entity_interaction_range: Attribute::new(3.0, 0.0, 64.0),
             attack_speed: Attribute::new(4.0, 0.0, 1024.0),
+            mining_efficiency: Attribute::new(0.0, 0.0, 1024.0),
+            block_break_speed: Attribute::new(1.0, 0.0, 1024.0),
+            submerged_mining_speed: Attribute::new(0.2, 0.0, 20.0),
         }
     }
 }
@@ -304,6 +312,9 @@ impl Attributes {
             "minecraft:block_interaction_range" => &mut self.block_interaction_range,
             "minecraft:entity_interaction_range" => &mut self.entity_interaction_range,
             "minecraft:attack_speed" => &mut self.attack_speed,
+            "minecraft:mining_efficiency" => &mut self.mining_efficiency,
+            "minecraft:block_break_speed" => &mut self.block_break_speed,
+            "minecraft:submerged_mining_speed" => &mut self.submerged_mining_speed,
             _ => return None,
         })
     }
@@ -325,6 +336,9 @@ impl Attributes {
             &mut a.block_interaction_range,
             &mut a.entity_interaction_range,
             &mut a.attack_speed,
+            &mut a.mining_efficiency,
+            &mut a.block_break_speed,
+            &mut a.submerged_mining_speed,
         ] {
             attribute.modifiers.clear();
         }
@@ -532,6 +546,8 @@ pub struct LocalPlayer {
     pub spectator: bool,
     /// `isCreative`: the player list's game mode for this player is creative.
     pub creative: bool,
+    /// The operator level the server gave (entity events 24 to 28: 0 to 4).
+    pub permission_level: i32,
     pub abilities: Abilities,
     pub effects: Effects,
     pub data: PlayerData,
@@ -616,6 +632,7 @@ impl LocalPlayer {
             game_type: play::SURVIVAL,
             spectator: false,
             creative: false,
+            permission_level: 0,
             abilities: Abilities::default(),
             effects: Effects::default(),
             data: PlayerData::default(),
@@ -737,6 +754,20 @@ impl LocalPlayer {
         if game_mode == play::SPECTATOR {
             self.delta[1] = 0.0;
         }
+    }
+
+    /// `Entity.absSnapTo`: moved there, with no interpolation from where it was (the
+    /// horizontal position clamped to the world's limits).
+    pub fn abs_snap_to(&mut self, pos: [f64; 3]) {
+        let x = pos[0].clamp(-3.0e7, 3.0e7);
+        let z = pos[2].clamp(-3.0e7, 3.0e7);
+        self.position = [x, pos[1], z];
+        self.old_position = self.position;
+    }
+
+    /// `isEyeInFluid(WATER)`, as the last fluid update left it.
+    pub fn is_eye_in_water(&self) -> bool {
+        self.fluids.eye_in(true)
     }
 
     /// `handleUpdateMobEffect`.
@@ -2500,6 +2531,7 @@ mod tests {
             outline: shape,
             interaction_shape: 0,
             interaction: 0,
+            destroy_time: 0.0,
         };
         let blocks = Blocks::new(&BlockPhysics {
             shapes: vec![

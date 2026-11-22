@@ -154,6 +154,21 @@ impl Level {
         }
     }
 
+    /// Sets a block as `LevelChunk.setBlockState` does: the state it replaced, or `None`
+    /// when nothing changed (the same state, no chunk loaded there, or outside the
+    /// level).
+    pub fn replace_block(&mut self, x: i32, y: i32, z: i32, state: u32) -> Option<u32> {
+        if y < self.min_y || y >= self.min_y + self.height || !self.has_chunk(x >> 4, z >> 4) {
+            return None;
+        }
+        let old = self.block(x, y, z);
+        if old == state {
+            return None;
+        }
+        self.set_block(x, y, z, state);
+        Some(old)
+    }
+
     /// The block collision shapes that `box` could meet, in the order the game's
     /// `BlockCollisions` yields them: a cursor over the box grown by one block, x
     /// fastest, then y, then z; corner cells skipped, edge cells only for shapes

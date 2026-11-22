@@ -49,6 +49,7 @@ use crate::item::Items;
 use crate::level_load::LevelLoad;
 use crate::pick;
 use crate::player::{Env, Keys, LocalPlayer, Pose};
+use crate::predict::Predictions;
 use crate::world::{Level, global_bits};
 
 #[derive(Debug)]
@@ -132,6 +133,8 @@ struct FrameInput {
     attack_clicks: u32,
     /// A screen is open over the world (keys and clicks aren't read).
     screen_open: bool,
+    /// The game was paused this frame (`pauseGame`): breaking stops.
+    paused: bool,
     /// Scroll-wheel notches, in order.
     scrolls: Vec<i32>,
     /// The frame's turn of the camera (`Entity.turn`'s amounts), after its ticks.
@@ -163,6 +166,8 @@ pub struct PlayerView {
     /// The attack's charge (`getAttackStrengthScale(0)`, what the attack indicator
     /// shows), 0 to 1.
     pub attack_strength: f32,
+    /// The block being broken and how far (`destroyProgress`, 0 to 1).
+    pub breaking: Option<([i32; 3], f32)>,
     pub chunks: usize,
     /// Other entities the client tracks.
     pub entities: usize,
@@ -302,6 +307,11 @@ impl Session {
         lock(&self.input).screen_open = open;
     }
 
+    /// The game is paused (`pauseGame`: the Game Menu opens): breaking a block stops.
+    pub fn pause(&self) {
+        lock(&self.input).paused = true;
+    }
+
     /// Scroll-wheel notches (from [`crate::input::ScrollWheel`]): the selected slot moves
     /// before the frame's ticks.
     pub fn scroll(&self, wheel: i32) {
@@ -416,8 +426,10 @@ struct World {
     level_started: i64,
     /// `MultiPlayerGameMode` and `Minecraft`'s item use: the last hotbar slot sent (0 for
     /// a new game mode, so a server's slot other than 0 is sent back once), the use
-    /// delay, the prediction sequence. The selected slot is the player's inventory's.
+    /// delay, the block being broken. The selected slot is the player's inventory's.
     game_mode: GameMode,
+    /// The level's predicted blocks and sequence (new with each level).
+    predictions: Predictions,
     /// The fluid shapes item use's raycasts have met (`FlowingFluid`'s cache).
     fluid_shapes: pick::FluidShapes,
     tick_rate: f32,
@@ -445,6 +457,7 @@ impl World {
             loaded: false,
             level_started: now,
             game_mode: GameMode::default(),
+            predictions: Predictions::new(),
             fluid_shapes: pick::FluidShapes::new(),
             tick_rate: 20.0,
             frozen: false,
@@ -571,6 +584,13 @@ impl Game {
         let Some(w) = &mut self.world else {
             return;
         };
+        if input.paused {
+            let mut out = Vec::new();
+            w.game_mode.stop_destroy_block(&mut w.player, &mut out);
+            for p in out {
+                self.connection.send(p);
+            }
+        }
         if !w.player.spectator {
             for &wheel in &input.scrolls {
                 let inv = &mut w.player.inventory;
@@ -613,6 +633,10 @@ impl Game {
                 )
             }),
             attack_strength: w.player.attack_strength_scale(0.0),
+            breaking: w
+                .game_mode
+                .is_destroying
+                .then_some((w.game_mode.destroy_pos, w.game_mode.destroy_progress)),
             chunks: w.level.chunk_count(),
             entities: w.entities.len(),
             loaded: w.loaded,
@@ -776,12 +800,6 @@ impl Game {
             self.connection.send(play::client_tick_end());
             return;
         };
-        let env = Env {
-            level: &w.level,
-            blocks: &physics.blocks,
-            tags: &self.tags,
-            colliders: &[],
-        };
         // `pick`, then `handleKeybinds` unless a screen is open (the level-loading screen
         // or another): one press per hotbar key per tick (spectators' hotbar keys open
         // the spectator menu instead, which isn't there yet), then the hands. A screen
@@ -789,6 +807,12 @@ impl Game {
         if !w.loaded || self.screen_open {
             w.game_mode.screen_open();
         } else {
+            let env = Env {
+                level: &w.level,
+                blocks: &physics.blocks,
+                tags: &self.tags,
+                colliders: &[],
+            };
             let hit = pick_target(&env, &w.entities, &self.players, &w.player);
             for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
                 if *pending > 0 {
@@ -798,17 +822,31 @@ impl Game {
                     }
                 }
             }
-            let world = interact::World {
-                env: &env,
+            let mut world = interact::World {
+                level: &mut w.level,
+                predictions: &mut w.predictions,
+                blocks: &physics.blocks,
+                tags: &self.tags,
                 entities: &w.entities,
                 fluid_shapes: &w.fluid_shapes,
             };
-            w.game_mode
-                .handle_keybinds(&mut w.player, &world, &hit, &mut self.use_keys, &mut out);
+            w.game_mode.handle_keybinds(
+                &mut w.player,
+                &mut world,
+                &hit,
+                &mut self.use_keys,
+                &mut out,
+            );
             for p in out.drain(..) {
                 self.connection.send(p);
             }
         }
+        let env = Env {
+            level: &w.level,
+            blocks: &physics.blocks,
+            tags: &self.tags,
+            colliders: &[],
+        };
         // `level.tickEntities`: the entities in order, the player among them, which
         // ticks and sends its changes (`sendPosition`) only once it has loaded.
         let cx = TickContext {
@@ -998,6 +1036,7 @@ impl Game {
                 let w = self.world.as_mut().ok_or("a respawn before the login")?;
                 if spawn.dimension != w.dimension {
                     w.level = level;
+                    w.predictions = Predictions::new();
                     w.entities = entities;
                     w.biome_bits = biome_bits;
                     w.dimension = spawn.dimension.clone();
@@ -1023,6 +1062,14 @@ impl Game {
                 self.connection.send(play::accept_teleportation(
                     t.id, p.position, p.y_rot, p.x_rot,
                 ));
+                // Acknowledgements of earlier actions no longer move the player, and
+                // breaking stops.
+                w.predictions.on_teleport();
+                let mut out = Vec::new();
+                w.game_mode.stop_destroy_block(&mut w.player, &mut out);
+                for p in out {
+                    self.connection.send(p);
+                }
             }
             play::Clientbound::GameEvent { event, param } => {
                 if let Some(w) = &mut self.world {
@@ -1053,22 +1100,36 @@ impl Game {
                     w.entities.chunk_unloaded(x, z);
                 }
             }
+            // `setServerVerifiedBlockState`: a predicted block keeps the server's state
+            // until the prediction is acknowledged.
             play::Clientbound::BlockUpdate { pos, state } => {
                 if let Some(w) = &mut self.world {
-                    w.level.set_block(pos[0], pos[1], pos[2], state);
+                    w.predictions.server_block(&mut w.level, pos, state);
                 }
             }
             play::Clientbound::SectionBlocksUpdate { section, changes } => {
                 if let Some(w) = &mut self.world {
                     for (rel, state) in changes {
                         let rel = i32::from(rel);
-                        w.level.set_block(
+                        let pos = [
                             section[0] * 16 + (rel >> 8 & 15),
                             section[1] * 16 + (rel & 15),
                             section[2] * 16 + (rel >> 4 & 15),
-                            state,
-                        );
+                        ];
+                        w.predictions.server_block(&mut w.level, pos, state);
                     }
+                }
+            }
+            play::Clientbound::BlockChangedAck { sequence } => {
+                if let Some(w) = &mut self.world
+                    && let Some(physics) = &self.physics
+                {
+                    w.predictions.acknowledge(
+                        sequence,
+                        &mut w.level,
+                        &physics.blocks,
+                        &mut w.player,
+                    );
                 }
             }
             play::Clientbound::UpdateTags(tags) => self.apply_tags(&tags),
@@ -1289,12 +1350,16 @@ impl Game {
                 }
             }
             play::Clientbound::EntityEvent { entity_id, event } => {
-                // `Player.handleEntityEvent`: the server finished the item's use.
+                // `Player.handleEntityEvent`: the server finished the item's use; the
+                // player's operator level (events 24 to 28: levels 0 to 4).
                 if let Some(w) = &mut self.world
                     && entity_id == w.player.entity_id
-                    && event == ENTITY_EVENT_USE_ITEM_COMPLETE
                 {
-                    w.player.complete_using_item();
+                    match event {
+                        ENTITY_EVENT_USE_ITEM_COMPLETE => w.player.complete_using_item(),
+                        24..=28 => w.player.permission_level = i32::from(event) - 24,
+                        _ => {}
+                    }
                 }
             }
             play::Clientbound::PlayerAbilities {

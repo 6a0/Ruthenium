@@ -163,6 +163,54 @@ pub enum Holder {
     Inline,
 }
 
+/// A set of registry entries (`HolderSet`): a tag, or entries by registry id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HolderSet {
+    /// A tag's identifier, without the `#`.
+    Tag(String),
+    Ids(Vec<i32>),
+}
+
+/// One rule of a [`Component::Tool`] (`Tool.Rule`): the blocks it covers, the mining
+/// speed it gives them, and whether it makes them drop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolRule {
+    pub blocks: HolderSet,
+    pub speed: Option<f32>,
+    pub correct_for_drops: Option<bool>,
+}
+
+/// How a [`PropertyMatcher`] matches a value (`StatePropertiesPredicate`'s matchers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueMatcher {
+    Exact(String),
+    /// Either end may be open.
+    Range {
+        min: Option<String>,
+        max: Option<String>,
+    },
+}
+
+/// A block state property's condition in a [`BlockPredicate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyMatcher {
+    pub name: String,
+    pub value: ValueMatcher,
+}
+
+/// One entry of an adventure-mode predicate (`BlockPredicate`): the blocks and state
+/// properties it asks for; the NBT and component conditions on the block entity are
+/// only noted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockPredicate {
+    pub blocks: Option<HolderSet>,
+    pub properties: Option<Vec<PropertyMatcher>>,
+    /// It has an NBT condition.
+    pub nbt: bool,
+    /// It has exact or partial component conditions.
+    pub components: bool,
+}
+
 /// An item's swing (`SwingAnimation`): the `SwingAnimationType` id and its length in
 /// ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +318,15 @@ pub enum Component {
     Instrument(Holder),
     /// A container's slots in order; an empty slot is the empty stack.
     Container(Vec<ItemStack>),
+    /// The mining rules; `damage_per_block` is the server's.
+    Tool {
+        rules: Vec<ToolRule>,
+        default_mining_speed: f32,
+        damage_per_block: i32,
+        can_destroy_blocks_in_creative: bool,
+    },
+    /// The blocks an adventure-mode player may break with the item.
+    CanBreak(Vec<BlockPredicate>),
     /// Any other component: its type id and its value's bytes as sent.
     Other {
         kind: i32,
@@ -412,6 +469,19 @@ fn read_component(r: &mut Reader<'_>, kind: i32, depth: u32) -> Result<Component
             opt(r, sound)?;
             Component::KineticWeapon(w)
         }
+        Kind::Tool => Component::Tool {
+            rules: list(r, usize::MAX, |r| {
+                Ok(ToolRule {
+                    blocks: read_holder_set(r)?,
+                    speed: opt(r, |r| r.f32())?,
+                    correct_for_drops: opt(r, |r| r.bool())?,
+                })
+            })?,
+            default_mining_speed: r.f32()?,
+            damage_per_block: r.varint()?,
+            can_destroy_blocks_in_creative: r.bool()?,
+        },
+        Kind::CanBreak => Component::CanBreak(list(r, usize::MAX, |r| block_predicate(r, depth))?),
         Kind::AttackAnimation => Component::AttackAnimation(swing_animation(r)?),
         Kind::InteractAnimation => Component::InteractAnimation(swing_animation(r)?),
         Kind::ChargedProjectiles => {
@@ -525,9 +595,7 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
         Kind::ItemModel | Kind::TooltipStyle | Kind::NoteBlockSound => {
             r.identifier()?;
         }
-        Kind::CanPlaceOn | Kind::CanBreak => {
-            skip_list(r, usize::MAX, |r| block_predicate(r, depth))?
-        }
+        Kind::CanPlaceOn => skip_list(r, usize::MAX, |r| block_predicate(r, depth).map(drop))?,
         Kind::AttributeModifiers => skip_list(r, usize::MAX, |r| {
             // Attribute, modifier id, amount, operation, slot group, display.
             r.varint()?;
@@ -553,17 +621,6 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
             skip_list(r, usize::MAX, |r| r.varint().map(drop))?;
         }
         Kind::DamageResistant | Kind::Repairable | Kind::ProvidesBannerPatterns => holder_set(r)?,
-        Kind::Tool => {
-            skip_list(r, usize::MAX, |r| {
-                holder_set(r)?;
-                opt(r, |r| r.f32())?;
-                opt(r, |r| r.bool())?;
-                Ok(())
-            })?;
-            r.f32()?;
-            r.varint()?;
-            r.bool()?;
-        }
         Kind::SuspiciousStewEffects => skip_list(r, usize::MAX, |r| {
             r.varint()?;
             r.varint().map(drop)
@@ -695,7 +752,9 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
         | Kind::BundleContents
         | Kind::Container
         | Kind::PotionContents
-        | Kind::Instrument => {
+        | Kind::Instrument
+        | Kind::Tool
+        | Kind::CanBreak => {
             read_component(r, k.id() as i32, depth)?;
         }
     }
@@ -769,18 +828,24 @@ fn holder(
 
 /// A holder set: a tag, or a list of registry ids.
 fn holder_set(r: &mut Reader<'_>) -> Result<(), WireError> {
+    read_holder_set(r).map(drop)
+}
+
+/// A holder set (`ByteBufCodecs.holderSet`): 0 and a tag, or the count plus one and
+/// the ids.
+fn read_holder_set(r: &mut Reader<'_>) -> Result<HolderSet, WireError> {
     match r.varint()? {
-        0 => {
-            r.identifier()?;
-        }
+        0 => Ok(HolderSet::Tag(r.identifier()?)),
         n if n > 0 => {
-            for _ in 1..n {
-                r.varint()?;
+            let n = (n - 1) as usize;
+            let mut ids = Vec::with_capacity(n.min(256));
+            for _ in 0..n {
+                ids.push(r.varint()?);
             }
+            Ok(HolderSet::Ids(ids))
         }
-        _ => return Err(WireError::Invalid("holder set size")),
+        _ => Err(WireError::Invalid("holder set size")),
     }
-    Ok(())
 }
 
 /// `SoundEvent.STREAM_CODEC`: a holder whose inline value is the sound's identifier and
@@ -850,34 +915,42 @@ fn consume_effect(r: &mut Reader<'_>, depth: u32) -> Result<(), WireError> {
 
 /// `BlockPredicate.STREAM_CODEC` (an adventure-mode predicate's entries): optional
 /// blocks, optional state properties, optional NBT, then the component matchers.
-fn block_predicate(r: &mut Reader<'_>, depth: u32) -> Result<(), WireError> {
-    opt(r, holder_set)?;
-    opt(r, |r| {
-        skip_list(r, usize::MAX, |r| {
-            r.string(MAX_STRING)?;
+fn block_predicate(r: &mut Reader<'_>, depth: u32) -> Result<BlockPredicate, WireError> {
+    let blocks = opt(r, read_holder_set)?;
+    let properties = opt(r, |r| {
+        list(r, usize::MAX, |r| {
+            let name = r.string(MAX_STRING)?.to_owned();
             // Either an exact value, or an optional minimum and maximum.
-            if r.bool()? {
-                r.string(MAX_STRING)?;
+            let value = if r.bool()? {
+                ValueMatcher::Exact(r.string(MAX_STRING)?.to_owned())
             } else {
-                opt(r, |r| r.string(MAX_STRING).map(drop))?;
-                opt(r, |r| r.string(MAX_STRING).map(drop))?;
-            }
-            Ok(())
+                ValueMatcher::Range {
+                    min: opt(r, |r| r.string(MAX_STRING).map(str::to_owned))?,
+                    max: opt(r, |r| r.string(MAX_STRING).map(str::to_owned))?,
+                }
+            };
+            Ok(PropertyMatcher { name, value })
         })
     })?;
-    opt(r, compound)?;
+    let nbt_condition = opt(r, compound)?.is_some();
     // `DataComponentMatchers`: exact components (type id and value)...
     let depth = deeper(depth)?;
-    skip_list(r, usize::MAX, |r| {
+    let exact = list(r, usize::MAX, |r| {
         let kind = r.varint()?;
         read_component(r, kind, depth).map(drop)
     })?;
     // ...and partial predicates: a predicate type (true) or a component type (false),
     // its id, and the predicate as NBT.
-    skip_list(r, 64, |r| {
+    let partial = list(r, 64, |r| {
         r.bool()?;
         r.varint()?;
         nbt(r)
+    })?;
+    Ok(BlockPredicate {
+        blocks,
+        properties,
+        nbt: nbt_condition,
+        components: !exact.is_empty() || !partial.is_empty(),
     })
 }
 
@@ -1366,10 +1439,23 @@ mod tests {
                 .v(1)
                 .b(true),
         ));
-        assert!(matches!(
+        assert_eq!(
             s.get(Kind::Tool),
-            Some(Component::Other { kind: 28, .. })
-        ));
+            Some(&Component::Tool {
+                rules: vec![ToolRule {
+                    blocks: HolderSet::Ids(vec![]),
+                    speed: Some(8.0),
+                    correct_for_drops: None,
+                }],
+                default_mining_speed: 1.0,
+                damage_per_block: 1,
+                can_destroy_blocks_in_creative: true,
+            })
+        );
+        let Some(Component::Other { data, .. }) = s.get(Kind::Repairable) else {
+            panic!()
+        };
+        assert_eq!(data[0], 0);
         let Some(Component::Other { data, .. }) = s.get(Kind::DamageResistant) else {
             panic!()
         };
@@ -1463,6 +1549,27 @@ mod tests {
                 .v(5),
         ));
         assert_eq!(s.get(Kind::Damage), Some(&Component::Damage(5)));
+        assert_eq!(
+            s.get(Kind::CanBreak),
+            Some(&Component::CanBreak(vec![BlockPredicate {
+                blocks: Some(HolderSet::Ids(vec![1, 2])),
+                properties: Some(vec![
+                    PropertyMatcher {
+                        name: "facing".into(),
+                        value: ValueMatcher::Exact("north".into()),
+                    },
+                    PropertyMatcher {
+                        name: "age".into(),
+                        value: ValueMatcher::Range {
+                            min: Some("3".into()),
+                            max: None,
+                        },
+                    },
+                ]),
+                nbt: true,
+                components: true,
+            }]))
+        );
     }
 
     #[test]

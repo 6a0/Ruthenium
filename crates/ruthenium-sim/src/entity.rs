@@ -2038,6 +2038,7 @@ mod tests {
                 outline: 0,
                 interaction_shape: 0,
                 interaction: 0,
+                destroy_time: 0.0,
             }],
         });
         let mut level = Level::new(-64, 384);

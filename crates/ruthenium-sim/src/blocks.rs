@@ -193,13 +193,63 @@ impl Blocks {
     pub fn shape(&self, id: u32) -> &Shape {
         &self.shapes[self.state(id).shape as usize]
     }
+
+    /// How hard the block is to break (`getDestroySpeed`): -1 when it can't be.
+    pub fn destroy_time(&self, id: u32) -> f32 {
+        self.state(id).destroy_time
+    }
+
+    /// `requiresCorrectToolForDrops`.
+    pub fn requires_correct_tool(&self, id: u32) -> bool {
+        self.state(id).flags & StatePhysics::REQUIRES_TOOL != 0
+    }
+
+    /// The block is a `GameMasterBlock` (command, structure, jigsaw and test blocks).
+    pub fn is_game_master(&self, id: u32) -> bool {
+        self.state(id).flags & StatePhysics::GAME_MASTER != 0
+    }
+
+    /// What breaking the block leaves (`getFluidState().createLegacyBlock()`): air, or
+    /// the fluid it held as a liquid block (a waterlogged block leaves a water source).
+    pub fn left_behind(&self, id: u32) -> u32 {
+        let f = self.fluid(id);
+        if f.is_empty() {
+            return AIR;
+        }
+        let name = if f.fluid.is_water() {
+            "minecraft:water"
+        } else {
+            "minecraft:lava"
+        };
+        // `FlowingFluid.getLegacyLevel`.
+        let level = if f.is_source() {
+            0
+        } else {
+            8 - f.amount.min(8) + if f.falling { 8 } else { 0 }
+        };
+        ruthenium_data::v26_3::Block::from_name(name)
+            .and_then(|b| b.default_state().with("level", &level.to_string()))
+            .map_or(AIR, |s| s.id())
+    }
 }
 
-/// Block tags movement reads, per state: from the server's tags packet in a session.
+/// The air block's state.
+pub const AIR: u32 = 0;
+
+/// The block (registry id) a state belongs to.
+pub fn block_of(state: u32) -> Option<u32> {
+    BlockState::from_id(state).map(|s| s.block().id())
+}
+
+/// The block tags, from the server's tags packet in a session: the ones movement reads
+/// per state, and every tag by block for the rest (tools' rules, adventure-mode
+/// predicates).
 #[derive(Debug, Clone, Default)]
 pub struct BlockTags {
     climbable: Vec<bool>,
     blocks_fluid_flow: Vec<bool>,
+    /// Each tag's blocks, by block registry id.
+    all: std::collections::HashMap<String, Vec<bool>>,
 }
 
 impl BlockTags {
@@ -207,22 +257,44 @@ impl BlockTags {
         BlockTags::default()
     }
 
-    /// Sets a tag's blocks, by block name (`minecraft:ladder`). Tags movement doesn't
-    /// read are ignored.
+    /// Sets a tag's blocks, by block name (`minecraft:ladder`); unknown names are
+    /// skipped.
     pub fn set<'a>(&mut self, tag: &str, blocks: impl IntoIterator<Item = &'a str>) {
+        let blocks: Vec<_> = blocks
+            .into_iter()
+            .filter_map(ruthenium_data::v26_3::Block::from_name)
+            .collect();
+        let mut by_block = Vec::new();
+        for b in &blocks {
+            let i = b.id() as usize;
+            if by_block.len() <= i {
+                by_block.resize(i + 1, false);
+            }
+            by_block[i] = true;
+        }
+        self.all.insert(tag.to_owned(), by_block);
         let flags = match tag {
             "minecraft:climbable" => &mut self.climbable,
             "minecraft:blocks_fluid_flow" => &mut self.blocks_fluid_flow,
             _ => return,
         };
         *flags = vec![false; ruthenium_data::v26_3::blocks::STATE_COUNT];
-        for name in blocks {
-            if let Some(b) = ruthenium_data::v26_3::Block::from_name(name) {
-                for s in b.states() {
-                    flags[s.id() as usize] = true;
-                }
+        for b in blocks {
+            for s in b.states() {
+                flags[s.id() as usize] = true;
             }
         }
+    }
+
+    /// `BlockState.is(tag)`: an unknown tag holds no blocks.
+    pub fn is(&self, state: u32, tag: &str) -> bool {
+        block_of(state).is_some_and(|b| {
+            self.all
+                .get(tag)
+                .and_then(|t| t.get(b as usize))
+                .copied()
+                .unwrap_or(false)
+        })
     }
 
     /// `BlockTags.CLIMBABLE`.

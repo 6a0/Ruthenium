@@ -278,6 +278,9 @@ pub struct StatePhysics {
     /// Whether the block's class overrides `useWithoutItem` ([`Self::USE_WITHOUT_ITEM`])
     /// and `useItemOn` ([`Self::USE_ITEM_ON`]).
     pub interaction: u8,
+    /// How hard the block is to break (`getDestroySpeed`); -1 for blocks that can't be
+    /// broken.
+    pub destroy_time: f32,
 }
 
 impl StatePhysics {
@@ -294,6 +297,10 @@ impl StatePhysics {
     pub const SUFFOCATING: u8 = 16;
     /// The block is an `IceBlock` (ice, frosted ice).
     pub const ICE: u8 = 32;
+    /// `requiresCorrectToolForDrops`.
+    pub const REQUIRES_TOOL: u8 = 64;
+    /// A `GameMasterBlock` (command, structure and jigsaw blocks...).
+    pub const GAME_MASTER: u8 = 128;
 
     pub const FLUID_NONE: u8 = 0;
     pub const FLUID_WATER: u8 = 1;
@@ -311,7 +318,7 @@ pub struct BlockPhysics {
 
 /// Parses `block_physics.bin`.
 pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
-    let mut r = Reader::open(bytes, "block_physics", 4)?;
+    let mut r = Reader::open(bytes, "block_physics", 5)?;
     let n = r.u32()? as usize;
     let mut shapes = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
@@ -364,6 +371,7 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
             ));
         }
         let interaction = r.u8()?;
+        let destroy_time = r.f32()?;
         states.push(StatePhysics {
             shape,
             flags,
@@ -377,6 +385,7 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
             outline,
             interaction_shape,
             interaction,
+            destroy_time,
         });
     }
     r.finish()?;

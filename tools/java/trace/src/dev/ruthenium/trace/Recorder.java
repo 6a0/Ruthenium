@@ -5,6 +5,7 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import dev.ruthenium.trace.mixin.KeyMappingAccessor;
+import dev.ruthenium.trace.mixin.MultiPlayerGameModeAccessor;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
@@ -19,7 +20,9 @@ import java.util.Set;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.network.Connection;
 import net.minecraft.network.PacketListener;
 import net.minecraft.network.ProtocolInfo;
@@ -30,6 +33,7 @@ import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
@@ -266,6 +270,23 @@ public final class Recorder {
             } else if (hit instanceof EntityHitResult e) {
                 o.addProperty("hitEntity", e.getEntity().getId());
                 o.add("hitAt", vec(e.getLocation()));
+            }
+            // Breaking: the block (kept after breaking ends), its state now, the progress,
+            // the ticks spent and the delay before the next block.
+            MultiPlayerGameMode gameMode = mc.gameMode;
+            if (gameMode != null && mc.level != null) {
+                MultiPlayerGameModeAccessor a = (MultiPlayerGameModeAccessor) gameMode;
+                BlockPos at = a.ruthenium$destroyBlockPos();
+                o.addProperty("destroying", gameMode.isDestroying());
+                JsonArray pos = new JsonArray();
+                pos.add(at.getX());
+                pos.add(at.getY());
+                pos.add(at.getZ());
+                o.add("destroyPos", pos);
+                o.addProperty("destroyState", Block.getId(mc.level.getBlockState(at)));
+                o.addProperty("destroyProgress", a.ruthenium$destroyProgress());
+                o.addProperty("destroyTicks", a.ruthenium$destroyTicks());
+                o.addProperty("destroyDelay", a.ruthenium$destroyDelay());
             }
             write(o);
         }

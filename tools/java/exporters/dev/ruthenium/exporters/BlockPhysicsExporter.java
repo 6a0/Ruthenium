@@ -17,6 +17,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.GameMasterBlock;
 import net.minecraft.world.level.block.IceBlock;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.PowderSnowBlock;
@@ -39,21 +40,23 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * game's collision code sees it, the block's friction and speed and jump factors, and
  * the state's fluid and sturdy faces.
  *
- * <p>Format {@code block_physics} v4, after the header:
+ * <p>Format {@code block_physics} v5, after the header:
  * <ul>
  *   <li>u32 shape count, then per shape, for x, y and z: u32 n and n f64 coordinates;
  *       then the (nx-1)(ny-1)(nz-1) voxels as bits, x outermost and z innermost, packed
  *       eight to a byte, lowest bit first. Shape 0 is the empty shape.</li>
  *   <li>u32 state count, then per state in id order: u32 shape, u8 flags (1: large
  *       collision shape, 2: dynamic shape, 4: shape depends on who collides, 8: offset
- *       by position, 16: suffocating, 32: an {@code IceBlock}), f32 friction, f32 speed
+ *       by position, 16: suffocating, 32: an {@code IceBlock}, 64: requires the correct
+ *       tool for drops, 128: a {@code GameMasterBlock}), f32 friction, f32 speed
  *       factor, f32 jump factor, f32 bounce restitution, u8 fluid (bits 0-2: none, water,
  *       flowing water, lava, flowing lava; bit 3: falling; bits 4-7: amount), u8 sturdy
  *       faces ({@code isFaceSturdy} at the origin, one bit per {@code Direction} in
  *       ordinal order: down, up, north, south, west, east); with flag 8, also u8 offset
  *       type (1 XZ, 2 XYZ), f32 max horizontal and f32 max vertical offset; then u32
- *       outline shape and u32 interaction shape (in the same table) and u8 interaction (1: the block's class
- *       overrides {@code useWithoutItem}, 2: it overrides {@code useItemOn}).</li>
+ *       outline shape and u32 interaction shape (in the same table), u8 interaction (1: the block's class
+ *       overrides {@code useWithoutItem}, 2: it overrides {@code useItemOn}) and f32 destroy time
+ *       ({@code getDestroySpeed}, -1 for unbreakable blocks).</li>
  * </ul>
  *
  * <p>The shape is the collision shape at the origin with an empty collision context, the
@@ -70,6 +73,8 @@ final class BlockPhysicsExporter {
     private static final int OFFSET = 8;
     private static final int SUFFOCATING = 16;
     private static final int ICE = 32;
+    private static final int REQUIRES_TOOL = 64;
+    private static final int GAME_MASTER = 128;
 
     private BlockPhysicsExporter() {}
 
@@ -112,6 +117,8 @@ final class BlockPhysicsExporter {
             if (offset) flags |= OFFSET;
             if (state.isSuffocating(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) flags |= SUFFOCATING;
             if (block instanceof IceBlock) flags |= ICE;
+            if (state.requiresCorrectToolForDrops()) flags |= REQUIRES_TOOL;
+            if (block instanceof GameMasterBlock) flags |= GAME_MASTER;
             states.u32(id);
             states.u8(flags);
             states.f32(block.getFriction());
@@ -139,10 +146,11 @@ final class BlockPhysicsExporter {
             states.u32(outline);
             states.u32(interactionId);
             states.u8(interaction(block.getClass()));
+            states.f32(state.getDestroySpeed(EmptyBlockGetter.INSTANCE, BlockPos.ZERO));
         }
 
         // The empty shape first, so 0 means "no collision".
-        ExportWriter w = new ExportWriter("block_physics", 4);
+        ExportWriter w = new ExportWriter("block_physics", 5);
         w.u32(shapes.size());
         for (byte[] s : shapes) {
             w.bytes(s);

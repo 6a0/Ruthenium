@@ -9,7 +9,8 @@
   ],
   "client": [
     "KeyMappingAccessor",
-    "MinecraftMixin"
+    "MinecraftMixin",
+    "MultiPlayerGameModeAccessor"
   ],
   "injectors": {
     "defaultRequire": 1

@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ruthenium_data::v26_3::registries::{DataComponentType as Kind, Item};
 use ruthenium_prepare::exporters::{ItemClassData, read_item_classes};
-use ruthenium_protocol::item::{Component, ComponentPatch, Holder, ItemStack};
+use ruthenium_protocol::item::{
+    BlockPredicate, Component, ComponentPatch, Holder, HolderSet, ItemStack,
+};
 
 /// `ItemUseAnimation` ids.
 pub mod animation {
@@ -273,6 +275,60 @@ impl AttackRange {
     }
 }
 
+/// Blocks a tool rule names: a block tag, or blocks by registry id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockSet {
+    /// The tag's identifier, without the `#`.
+    Tag(String),
+    Blocks(Vec<u32>),
+}
+
+impl BlockSet {
+    fn from_holder_set(h: &HolderSet) -> BlockSet {
+        match h {
+            HolderSet::Tag(t) => BlockSet::Tag(t.clone()),
+            HolderSet::Ids(ids) => {
+                BlockSet::Blocks(ids.iter().filter_map(|&i| u32::try_from(i).ok()).collect())
+            }
+        }
+    }
+
+    /// A report's `"blocks"`: `#tag`, one block, or a list of blocks.
+    fn from_json(v: &serde_json::Value) -> Option<BlockSet> {
+        let block =
+            |n: &str| ruthenium_data::v26_3::Block::from_name(&full_identifier(n)).map(|b| b.id());
+        match v {
+            serde_json::Value::String(s) => Some(match s.strip_prefix('#') {
+                Some(tag) => BlockSet::Tag(full_identifier(tag)),
+                None => BlockSet::Blocks(block(s).into_iter().collect()),
+            }),
+            serde_json::Value::Array(a) => Some(BlockSet::Blocks(
+                a.iter()
+                    .filter_map(|n| n.as_str().and_then(block))
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// One of a tool's rules (`Tool.Rule`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolRule {
+    pub blocks: BlockSet,
+    pub speed: Option<f32>,
+    pub correct_for_drops: Option<bool>,
+}
+
+/// The `tool` component: how fast the item mines which blocks, and which it may
+/// harvest.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tool {
+    pub rules: Vec<ToolRule>,
+    pub default_mining_speed: f32,
+    pub can_destroy_blocks_in_creative: bool,
+}
+
 /// A stack's effective components, the ones item use reads, and its item's class.
 #[derive(Debug, Clone, Default)]
 pub struct Components {
@@ -311,6 +367,10 @@ pub struct Components {
     pub use_duration: i32,
     /// The use remainder as a stack (a prototype: copy it).
     pub remainder: Option<Arc<Stack>>,
+    /// `tool`: mining speeds and harvesting.
+    pub tool: Option<Arc<Tool>>,
+    /// `can_break`: what an adventure-mode player may break with it.
+    pub can_break: Option<Arc<Vec<BlockPredicate>>>,
 }
 
 impl Components {
@@ -380,6 +440,8 @@ impl Components {
                 Some(Kind::Instrument) => self.instrument = None,
                 Some(Kind::ChargedProjectiles) => self.charged = false,
                 Some(Kind::Enchantments) => self.enchantments.clear(),
+                Some(Kind::Tool) => self.tool = None,
+                Some(Kind::CanBreak) => self.can_break = None,
                 _ => {}
             }
         }
@@ -467,6 +529,26 @@ impl Components {
                 }
                 Component::ChargedProjectiles(p) => self.charged = !p.is_empty(),
                 Component::Enchantments(e) => self.enchantments = e.clone(),
+                Component::Tool {
+                    rules,
+                    default_mining_speed,
+                    can_destroy_blocks_in_creative,
+                    ..
+                } => {
+                    self.tool = Some(Arc::new(Tool {
+                        rules: rules
+                            .iter()
+                            .map(|r| ToolRule {
+                                blocks: BlockSet::from_holder_set(&r.blocks),
+                                speed: r.speed,
+                                correct_for_drops: r.correct_for_drops,
+                            })
+                            .collect(),
+                        default_mining_speed: *default_mining_speed,
+                        can_destroy_blocks_in_creative: *can_destroy_blocks_in_creative,
+                    }))
+                }
+                Component::CanBreak(p) => self.can_break = Some(Arc::new(p.clone())),
                 Component::Other { kind, .. }
                     if u32::try_from(*kind).ok().and_then(Kind::from_id)
                         == Some(Kind::BlockTransformer) =>
@@ -830,6 +912,34 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
         .get("minecraft:charged_projectiles")
         .and_then(|p| p.as_array())
         .is_some_and(|p| !p.is_empty());
+    c.tool = v.get("minecraft:tool").map(|o| {
+        let rules = o
+            .get("rules")
+            .and_then(|r| r.as_array())
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter_map(|r| {
+                        Some(ToolRule {
+                            blocks: BlockSet::from_json(r.get("blocks")?)?,
+                            speed: r
+                                .get("speed")
+                                .and_then(serde_json::Value::as_f64)
+                                .map(|s| s as f32),
+                            correct_for_drops: r
+                                .get("correct_for_drops")
+                                .and_then(serde_json::Value::as_bool),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Arc::new(Tool {
+            rules,
+            default_mining_speed: f32_or(o, "default_mining_speed", 1.0),
+            can_destroy_blocks_in_creative: bool_or(o, "can_destroy_blocks_in_creative", true),
+        })
+    });
 }
 
 fn full_identifier(s: &str) -> String {

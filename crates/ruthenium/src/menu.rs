@@ -504,6 +504,9 @@ impl Menu {
     /// The Game Menu (`pauseGame`): keys let go, the mouse freed.
     fn pause(&mut self) {
         self.game.release(self.session.as_ref());
+        if let Some(s) = &self.session {
+            s.pause();
+        }
         let title = self.server_name.clone();
         self.session_form(
             FormKind::Paused,

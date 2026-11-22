@@ -10,7 +10,10 @@
 //! - [`effect`]: mob effects as the client keeps them.
 //! - [`entity`]: the other entities: where they are, their sizes, and their pushes.
 //! - [`item`], [`inventory`], [`interact`]: item stacks and their components, the
-//!   inventory and cooldowns, and using items with either hand.
+//!   inventory and cooldowns, using items with either hand, attacking and breaking
+//!   blocks.
+//! - [`mining`]: how fast blocks break, and which the player may break.
+//! - [`predict`]: block changes the client predicts until the server confirms them.
 //! - [`pick`]: what the crosshair is on, and the raycasts items make.
 //! - [`input`]: the mouse's turn, the scroll wheel and the movement keys.
 //! - [`blocks`], [`shape`], [`world`], [`fluid`]: the level the player moves in.
@@ -28,8 +31,10 @@ pub mod interact;
 pub mod inventory;
 pub mod item;
 pub mod level_load;
+pub mod mining;
 pub mod pick;
 pub mod player;
+pub mod predict;
 pub mod session;
 pub mod shape;
 pub mod world;

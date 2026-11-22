@@ -1072,6 +1072,11 @@ pub mod play {
             pos: [i32; 3],
             state: u32,
         },
+        /// The server has handled the client's predicted block changes up to this
+        /// sequence.
+        BlockChangedAck {
+            sequence: i32,
+        },
         /// Changes in one section: the section and each (local position, state); local
         /// positions are `x << 8 | z << 4 | y`.
         SectionBlocksUpdate {
@@ -1300,6 +1305,9 @@ pub mod play {
                     r.rest();
                     Clientbound::LevelChunk { x, z, data }
                 }
+                C::BlockChangedAck => Clientbound::BlockChangedAck {
+                    sequence: r.varint()?,
+                },
                 C::BlockUpdate => Clientbound::BlockUpdate {
                     pos: unpack_block_pos(r.i64()?),
                     state: r.varint()? as u32,
