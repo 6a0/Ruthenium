@@ -282,7 +282,7 @@ fn cushion_fits(w: &World<'_>, b: &Aabb) -> bool {
             .outline(w.get(pos), pos, "minecraft:air")
             .is_some_and(|s| bounds(&s).intersects(&anchor))
     });
-    let smothered = cells(&next_deflated(b)).all(|pos| w.blocks.suffocating(w.get(pos)));
+    let smothered = cells(&next_deflated(b)).all(|pos| w.blocks.suffocating(w.get(pos), w.tags));
     let slice = next_deflated(&Aabb {
         min: b.min,
         max: [b.max[0], b.min[1] + BASE, b.max[2]],

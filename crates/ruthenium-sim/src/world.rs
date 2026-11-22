@@ -174,30 +174,29 @@ impl Level {
     /// fastest, then y, then z; corner cells skipped, edge cells only for shapes
     /// taller or wider than a block.
     pub fn block_collisions<'a>(&self, blocks: &'a Blocks, b: &Aabb) -> Vec<Placed<'a>> {
-        self.block_collisions_at(blocks, b, false)
+        self.block_collisions_at(blocks, b)
             .into_iter()
             .map(|(_, p)| p)
             .collect()
     }
 
-    /// [`Level::block_collisions`] with each shape's block position;
-    /// `suffocating_only` keeps only blocks that suffocate (`collidesWithSuffocatingBlock`).
+    /// [`Level::block_collisions`] with each shape's block position.
     pub fn block_collisions_at<'a>(
         &self,
         blocks: &'a Blocks,
         b: &Aabb,
-        suffocating_only: bool,
     ) -> Vec<([i32; 3], Placed<'a>)> {
-        self.block_collisions_for(blocks, b, suffocating_only, None)
+        self.block_collisions_for(blocks, b, None, None)
     }
 
     /// [`Level::block_collisions_at`] for an entity (`BlockCollisions` with its
-    /// collision context: scaffolding's shape depends on it).
+    /// collision context: scaffolding's shape depends on it). With `suffocating`, only
+    /// the blocks that suffocate by those tags (`collidesWithSuffocatingBlock`).
     pub fn block_collisions_for<'a>(
         &self,
         blocks: &'a Blocks,
         b: &Aabb,
-        suffocating_only: bool,
+        suffocating: Option<&crate::blocks::BlockTags>,
         who: Option<crate::blocks::Who>,
     ) -> Vec<([i32; 3], Placed<'a>)> {
         let lo = |v: f64| ruthenium_javamath::mth::floor(v - EPSILON) - 1;
@@ -219,7 +218,7 @@ impl Level {
                     if state == 0 {
                         continue;
                     }
-                    if suffocating_only && !blocks.suffocating(state) {
+                    if suffocating.is_some_and(|tags| !blocks.suffocating(state, tags)) {
                         continue;
                     }
                     if face == 1 && !blocks.large_shape(state) {

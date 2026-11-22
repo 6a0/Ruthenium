@@ -111,6 +111,154 @@ public final class Scenarios {
         server.runCommand("tp @p 0.5 -60 0.5 -90 30");
     }
 
+    /** Teleports the player and waits for the teleport to land. */
+    private static void tp(ClientGameTestContext ctx, TestServerContext server, double x, double y, double z,
+            double yaw, double pitch) {
+        server.runCommand(String.format(java.util.Locale.ROOT, "tp @p %.4f %.4f %.4f %.4f %.4f", x, y, z, yaw, pitch));
+        ctx.waitTicks(4);
+    }
+
+    /** Waits until the client's player has passed x = {@code x} going east (at most 100 ticks). */
+    private static void waitUntilEastOf(ClientGameTestContext ctx, double x) {
+        for (int i = 0; i < 100 && ctx.computeOnClient(mc -> mc.player.getX()) < x; i++) {
+            ctx.waitTick();
+        }
+    }
+
+    /**
+     * A block the player meets in {@link #BLOCK_SHAPES_A} and {@link #BLOCK_SHAPES_B}: the
+     * state at 4 -60 0 and, for two-block things, the state at 5 -60 0.
+     */
+    private record Shaped(String state, String east) {
+    }
+
+    /**
+     * Runs into the block from the west, sprint-jumps onto or over it, then drops onto its top
+     * and sneaks to its east, south, west and north edges.
+     */
+    private static void blockShapes(ClientGameTestContext ctx, TestServerContext server, List<Shaped> blocks) {
+        for (var b : blocks) {
+            if (b.state().startsWith("minecraft:cactus")) {
+                server.runCommand("setblock 4 -61 0 minecraft:sand strict");
+            }
+            server.runCommand("setblock 4 -60 0 " + b.state() + " strict");
+            if (b.east() != null) {
+                server.runCommand("setblock 5 -60 0 " + b.east() + " strict");
+            }
+            tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+            hold(ctx, 16, W, SPRINT);
+            ctx.waitTicks(3);
+            hold(ctx, 10, W, SPRINT, JUMP);
+            ctx.waitTicks(10);
+            tp(ctx, server, 4.5, -58, 0.5, -90, 0);
+            ctx.waitTicks(10);
+            hold(ctx, 15, W, SNEAK);
+            hold(ctx, 12, D, SNEAK);
+            hold(ctx, 25, S, SNEAK);
+            hold(ctx, 25, A, SNEAK);
+            ctx.waitTicks(3);
+            server.runCommand("setblock 4 -60 0 minecraft:air strict");
+            server.runCommand("setblock 5 -60 0 minecraft:air strict");
+            server.runCommand("setblock 4 -61 0 minecraft:stone strict");
+            ctx.waitTicks(2);
+        }
+    }
+
+    private static final List<Shaped> BLOCK_SHAPES_A = List.of(
+            new Shaped("minecraft:cactus", null),
+            new Shaped("minecraft:chest[facing=west]", null),
+            new Shaped("minecraft:ender_chest[facing=west]", null),
+            new Shaped("minecraft:brewing_stand", null),
+            new Shaped("minecraft:oak_fence", null),
+            new Shaped("minecraft:iron_bars", null),
+            new Shaped("minecraft:glass_pane", null),
+            new Shaped("minecraft:end_portal_frame[facing=west,eye=false]", null),
+            new Shaped("minecraft:end_portal_frame[facing=west,eye=true]", null),
+            new Shaped("minecraft:player_head", null),
+            new Shaped("minecraft:anvil[facing=west]", null),
+            new Shaped("minecraft:white_carpet", null));
+
+    private static final List<Shaped> BLOCK_SHAPES_B = List.of(
+            new Shaped("minecraft:oak_stairs[facing=east]", null),
+            new Shaped("minecraft:smooth_stone_slab", null),
+            new Shaped("minecraft:enchanting_table", null),
+            new Shaped("minecraft:hopper", null),
+            new Shaped("minecraft:oak_fence_gate[facing=east]", null),
+            new Shaped("minecraft:piston[facing=up]", null),
+            new Shaped("minecraft:piston[facing=east,extended=true]", "minecraft:piston_head[facing=east]"),
+            new Shaped("minecraft:red_bed[facing=east,part=foot]", "minecraft:red_bed[facing=east,part=head]"),
+            new Shaped("minecraft:daylight_detector", null),
+            new Shaped("minecraft:cobblestone_wall", null),
+            new Shaped("minecraft:oak_trapdoor", null),
+            new Shaped("minecraft:campfire[lit=false]", null));
+
+    /** A lane along x from -6 up to a stone wall at x = {@code wall} (3 wide, centred on z). */
+    private static List<String> lane(int z, String floor, boolean trapdoors, boolean ceiling, int wall) {
+        var c = new java.util.ArrayList<String>();
+        c.add(String.format("fill -6 -61 %d %d -61 %d %s", z - 1, wall - 1, z + 1, floor));
+        if (trapdoors) {
+            c.add(String.format("fill -6 -60 %d %d -60 %d minecraft:oak_trapdoor", z - 1, wall - 1, z + 1));
+        }
+        if (ceiling) {
+            c.add(String.format("fill -6 -58 %d %d -58 %d minecraft:stone", z - 1, wall - 1, z + 1));
+        }
+        c.add(String.format("fill %d -60 %d %d -58 %d minecraft:stone", wall, z - 1, wall, z + 1));
+        return c;
+    }
+
+    /** Lists joined. */
+    @SafeVarargs
+    private static List<String> all(List<String>... parts) {
+        var c = new java.util.ArrayList<String>();
+        for (var p : parts) {
+            c.addAll(p);
+        }
+        return c;
+    }
+
+    /** A walled channel of settled flowing water over {@code floor}: the source at x = 0, levels 1 to 7 downstream. */
+    private static List<String> channel(int z, String floor) {
+        var c = new java.util.ArrayList<String>();
+        c.add(String.format("fill -1 -60 %d 9 -59 %d minecraft:stone", z - 2, z + 2));
+        c.add(String.format("fill 0 -60 %d 8 -59 %d minecraft:air", z - 1, z + 1));
+        c.add(String.format("fill 0 -61 %d 8 -61 %d %s", z - 1, z + 1, floor));
+        c.add(String.format("fill 0 -60 %d 0 -60 %d minecraft:water", z - 1, z + 1));
+        for (int level = 1; level <= 7; level++) {
+            c.add(String.format("fill %d -60 %d %d -60 %d minecraft:water[level=%d]", level, z - 1, level, z + 1, level));
+        }
+        return c;
+    }
+
+    /** The staircase's rows: x = i is 3 wide with its top at y = -51 - i. */
+    private static List<String> staircase() {
+        var c = new java.util.ArrayList<String>();
+        for (int i = 0; i <= 8; i++) {
+            c.add(String.format("fill %d -60 -1 %d %d 1 minecraft:stone", i, i, -52 - i));
+        }
+        return c;
+    }
+
+    /** Walks (or sprints) down the staircase, sneaking for 0 to 3 ticks as the player passes each edge. */
+    private static void downTheStairs(ClientGameTestContext ctx, boolean sprint, int shift) {
+        ctx.getInput().holdKey(W);
+        if (sprint) {
+            ctx.getInput().holdKey(SPRINT);
+        }
+        for (int i = 0; i <= 8; i++) {
+            waitUntilEastOf(ctx, i + 1.0);
+            int sneak = (i + shift) % 4;
+            if (sneak > 0) {
+                ctx.getInput().holdKey(SNEAK);
+                ctx.waitTicks(sneak);
+                ctx.getInput().releaseKey(SNEAK);
+            }
+        }
+        ctx.waitTicks(10);
+        ctx.getInput().releaseKey(W);
+        ctx.getInput().releaseKey(SPRINT);
+        ctx.waitTicks(10);
+    }
+
     private static double[] start(double x, double y, double z, double yaw, double pitch) {
         return new double[] {x, y, z, yaw, pitch};
     }
@@ -516,6 +664,215 @@ public final class Scenarios {
                     "Sprint-jump under a ceiling 2 blocks above the floor.",
                     List.of("fill 0 -58 -1 20 -58 1 minecraft:stone"), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
                         hold(ctx, 40, W, SPRINT, JUMP);
+                        ctx.waitTicks(10);
+                    }),
+            new Scenario("shallow_water",
+                    "Two walled channels of settled flowing water (the source at x = 0, levels 1 to 7 downstream, so about half a block deep midway), one over slime and one over ice: jump off the end wall onto the slime, bounce, walk and jump against the current; then step off onto the ice, walk, sprint, slide and jump.",
+                    all(channel(-4, "minecraft:slime_block"), channel(4, "minecraft:ice")),
+                    start(9.5, -58, -3.5, 90, 0), (ctx, server) -> {
+                        hold(ctx, 6, W, SPRINT, JUMP);
+                        ctx.waitTicks(30);
+                        hold(ctx, 30, W);
+                        hold(ctx, 20, W, JUMP);
+                        ctx.waitTicks(10);
+                        tp(ctx, server, 9.5, -58, 4.5, 90, 0);
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(10);
+                        hold(ctx, 15, W);
+                        hold(ctx, 15, W, SPRINT);
+                        ctx.waitTicks(15);
+                        hold(ctx, 10, JUMP);
+                        ctx.waitTicks(15);
+                    }),
+            new Scenario("swim_under",
+                    "A 2-deep pool with a 1-high stretch under waterlogged bottom slabs (x 4 to 7) and lily pads on the surface (x 10 to 12): sink, sprint-swim along the bottom under the slabs, let go of forward there (the swim sprint carries on), swim on under the lily pads and stop, swim up into them (the pose drops to crouching), then forward.",
+                    List.of("fill 0 -62 -1 14 -61 1 minecraft:water",
+                            "fill 4 -61 -1 7 -61 1 minecraft:smooth_stone_slab[waterlogged=true]",
+                            "fill 10 -60 -1 12 -60 1 minecraft:lily_pad"),
+                    start(-1.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(15);
+                        ctx.getInput().lookAt(-90, 25);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        waitUntilEastOf(ctx, 5.0);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        // Letting go of forward ends the sprint; under the slabs the pose stays swimming.
+                        ctx.waitTicks(6);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 8.5);
+                        ctx.getInput().holdKey(SPRINT);
+                        waitUntilEastOf(ctx, 11.0);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.waitTicks(15);
+                        ctx.getInput().lookAt(-90, 0);
+                        hold(ctx, 25, JUMP);
+                        hold(ctx, 30, W, JUMP);
+                        ctx.waitTicks(15);
+                    }),
+            new Scenario("crawl",
+                    "A block appears at head height, forcing the crawling pose; crawl through a 1-high tunnel (x 2 to 8), jumping and sneaking inside it, then out the far end and stand up.",
+                    List.of("fill 2 -60 -1 8 -59 1 minecraft:stone", "fill 2 -60 0 8 -60 0 minecraft:air"),
+                    start(1.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.waitTicks(3);
+                        server.runCommand("setblock 1 -59 0 minecraft:stone");
+                        ctx.waitTicks(8);
+                        hold(ctx, 15, W);
+                        hold(ctx, 10, W, JUMP);
+                        hold(ctx, 10, W, SNEAK);
+                        hold(ctx, 15, W, SPRINT);
+                        hold(ctx, 95, W);
+                        ctx.waitTicks(15);
+                    }),
+            new Scenario("fence_slime_water",
+                    "A row of alternating slime blocks and waterlogged fences standing in still water 2 deep: sprint-jump along it from the wall, then turn and walk back.",
+                    all(List.of("fill -1 -60 -3 14 -59 3 minecraft:stone", "fill 0 -60 -2 13 -59 2 minecraft:water"),
+                            java.util.stream.IntStream.rangeClosed(0, 13).mapToObj(x -> x % 2 == 0
+                                    ? "setblock " + x + " -60 0 minecraft:slime_block"
+                                    : "setblock " + x + " -60 0 minecraft:oak_fence[east=true,west=true,waterlogged=true]").toList()),
+                    start(-0.5, -58, 0.5, -90, 0), (ctx, server) -> {
+                        hold(ctx, 50, W, SPRINT, JUMP);
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(90, 0);
+                        hold(ctx, 60, W);
+                        ctx.waitTicks(10);
+                    }),
+            new Scenario("ice_lanes",
+                    "Four ice lanes, each ending at a wall: sprint on bare ice; on bottom trapdoors laid on ice; sprint-jump under a ceiling 2 blocks above the ice; sprint-jump on trapdoors on ice under the same ceiling. Let go and slide after each.",
+                    all(lane(-9, "minecraft:ice", false, false, 1), lane(-3, "minecraft:ice", true, false, 1),
+                            lane(3, "minecraft:ice", false, true, 6), lane(9, "minecraft:ice", true, true, 6)),
+                    start(-5.5, -60, -8.5, -90, 0), (ctx, server) -> {
+                        hold(ctx, 30, W, SPRINT);
+                        ctx.waitTicks(30);
+                        tp(ctx, server, -5.5, -59.8125, -2.5, -90, 0);
+                        hold(ctx, 30, W, SPRINT);
+                        ctx.waitTicks(30);
+                        tp(ctx, server, -5.5, -60, 3.5, -90, 0);
+                        hold(ctx, 30, W, SPRINT, JUMP);
+                        ctx.waitTicks(30);
+                        tp(ctx, server, -5.5, -59.8125, 9.5, -90, 0);
+                        hold(ctx, 30, W, SPRINT, JUMP);
+                        ctx.waitTicks(30);
+                    }),
+            new Scenario("slime_lanes",
+                    "Sprint-jump on slime under a ceiling 2 blocks above it, then on bottom trapdoors laid on slime under the same ceiling (each lane ends at a wall); then sneak-walk and walk on the slime.",
+                    all(lane(-3, "minecraft:slime_block", false, true, 6), lane(3, "minecraft:slime_block", true, true, -2)),
+                    start(-5.5, -60, -2.5, -90, 0), (ctx, server) -> {
+                        hold(ctx, 40, W, SPRINT, JUMP);
+                        ctx.waitTicks(20);
+                        tp(ctx, server, -5.5, -59.8125, 3.5, -90, 0);
+                        hold(ctx, 40, W, SPRINT, JUMP);
+                        ctx.waitTicks(20);
+                        tp(ctx, server, -5.5, -60, -2.5, -90, 0);
+                        hold(ctx, 20, W, SNEAK);
+                        hold(ctx, 20, W);
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("soul_sand",
+                    "Sprint from stone across five blocks of soul sand and off again, walk back across, then walk and jump onto it.",
+                    List.of("fill 4 -61 -1 8 -61 1 minecraft:soul_sand"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        hold(ctx, 30, W, SPRINT);
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(90, 0);
+                        hold(ctx, 50, W);
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(-90, 0);
+                        hold(ctx, 8, W);
+                        hold(ctx, 20, W, JUMP);
+                        ctx.waitTicks(10);
+                    }),
+            new Scenario("climbing",
+                    "A ladder on a 5-high pillar: sprint along the wall into the ladder's edge; sprint into its face and climb to the top; sneak back to the top edge, then walk off. A vine on another pillar: walk into it, climb, climb holding only jump, slide, hold on sneaking, slide down.",
+                    List.of("fill 4 -60 -1 4 -56 1 minecraft:stone", "fill 3 -60 0 3 -56 0 minecraft:ladder[facing=west]",
+                            "fill 4 -60 5 4 -55 7 minecraft:stone", "fill 3 -60 6 3 -56 6 minecraft:vine[east=true]"),
+                    start(3.65, -60, -3.5, 0, 0), (ctx, server) -> {
+                        hold(ctx, 15, W, SPRINT);
+                        ctx.waitTicks(5);
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        hold(ctx, 20, W, SPRINT);
+                        hold(ctx, 50, W);
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(90, 0);
+                        hold(ctx, 20, W, SNEAK);
+                        ctx.waitTicks(5);
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(30);
+                        tp(ctx, server, 0.5, -60, 6.5, -90, 0);
+                        hold(ctx, 15, W);
+                        hold(ctx, 20, W);
+                        hold(ctx, 20, JUMP);
+                        ctx.waitTicks(8);
+                        hold(ctx, 15, SNEAK);
+                        ctx.waitTicks(40);
+                    }),
+            new Scenario("stair_sneak",
+                    "Down a staircase of 3-wide rows, each a block lower than the last: walking, then sprinting, the player sneaks for 0 to 3 ticks as it passes each edge, carrying its speed off the step.",
+                    staircase(), start(0.5, -51, 0.5, -90, 0), (ctx, server) -> {
+                        downTheStairs(ctx, false, 0);
+                        tp(ctx, server, 0.5, -51, 0.5, -90, 0);
+                        downTheStairs(ctx, true, 2);
+                    }),
+            new Scenario("water_cube",
+                    "A lone water source 1 block above the ground, set without updates so it doesn't flow: walk into it, jump and swim in it, sprint through it, come back and sink out of it.",
+                    List.of("setblock 3 -59 0 minecraft:water strict"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        hold(ctx, 10, W);
+                        hold(ctx, 30, JUMP);
+                        hold(ctx, 15, W, SPRINT);
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(90, 0);
+                        hold(ctx, 12, W);
+                        hold(ctx, 15, W, JUMP);
+                        ctx.waitTicks(20);
+                        server.runCommand("setblock 3 -59 0 minecraft:air strict");
+                        ctx.waitTicks(2);
+                    }),
+            new Scenario("block_shapes_a",
+                    "Each block alone at 4 -60 0 (cactus, chest, ender chest, brewing stand, fence, iron bars, glass pane, end portal frames without and with an eye, player head, anvil, carpet): sprint into it from the west, sprint-jump onto or over it, then drop onto its top and sneak to its east, south, west and north edges.",
+                    List.of(), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> blockShapes(ctx, server, BLOCK_SHAPES_A)),
+            new Scenario("block_shapes_b",
+                    "As block_shapes_a with stairs, a slab, an enchanting table, a hopper, a fence gate, a retracted piston, an extended piston with its head, a bed, a daylight detector, a wall, a trapdoor and an unlit campfire.",
+                    List.of(), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> blockShapes(ctx, server, BLOCK_SHAPES_B)),
+            new Scenario("bounce",
+                    "Drop onto a bed from 5 blocks, then jump on it; with a bounciness attribute of 0.5, drop onto stone, onto a honey block (which suppresses bouncing), and onto stone sneaking.",
+                    List.of("setblock 4 -60 0 minecraft:red_bed[facing=east,part=foot]",
+                            "setblock 5 -60 0 minecraft:red_bed[facing=east,part=head]", "setblock 4 -60 6 minecraft:honey_block"),
+                    start(1.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        tp(ctx, server, 4.5, -55, 0.5, -90, 0);
+                        ctx.waitTicks(40);
+                        hold(ctx, 30, JUMP);
+                        ctx.waitTicks(10);
+                        server.runCommand("attribute @p minecraft:bounciness base set 0.5");
+                        ctx.waitTicks(2);
+                        tp(ctx, server, 1.5, -55, 3.5, -90, 0);
+                        ctx.waitTicks(40);
+                        tp(ctx, server, 4.5, -55, 6.5, -90, 0);
+                        ctx.waitTicks(30);
+                        tp(ctx, server, 1.5, -55, 3.5, -90, 0);
+                        hold(ctx, 30, SNEAK);
+                        server.runCommand("attribute @p minecraft:bounciness base reset");
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("speed_zero",
+                    "With a movement speed of 0: walk, jump, sprint-jump. Then walk normally and have the speed set to 0 mid-walk while still holding forward.",
+                    List.of(), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("attribute @p minecraft:movement_speed base set 0");
+                        ctx.waitTicks(3);
+                        hold(ctx, 20, W);
+                        hold(ctx, 15, W, JUMP);
+                        hold(ctx, 20, W, SPRINT, JUMP);
+                        ctx.waitTicks(5);
+                        server.runCommand("attribute @p minecraft:movement_speed base reset");
+                        ctx.waitTicks(3);
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(10);
+                        server.runCommand("attribute @p minecraft:movement_speed base set 0");
+                        ctx.waitTicks(20);
+                        ctx.getInput().releaseKey(W);
+                        server.runCommand("attribute @p minecraft:movement_speed base reset");
                         ctx.waitTicks(10);
                     }),
             new Scenario("mouse_turn",

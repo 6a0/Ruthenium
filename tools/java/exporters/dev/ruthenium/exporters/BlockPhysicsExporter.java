@@ -47,7 +47,8 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  *       eight to a byte, lowest bit first. Shape 0 is the empty shape.</li>
  *   <li>u32 state count, then per state in id order: u32 shape, u8 flags (1: large
  *       collision shape, 2: dynamic shape, 4: shape depends on who collides, 8: offset
- *       by position, 16: suffocating, 32: an {@code IceBlock}, 64: requires the correct
+ *       by position, 16: suffocating by a rule of the block's own (the default rule reads a tag:
+ *       see {@code block_behaviour}), 32: an {@code IceBlock}, 64: requires the correct
  *       tool for drops, 128: a {@code GameMasterBlock}), f32 friction, f32 speed
  *       factor, f32 jump factor, f32 bounce restitution, u8 fluid (bits 0-2: none, water,
  *       flowing water, lava, flowing lava; bit 3: falling; bits 4-7: amount), u8 sturdy

@@ -5,7 +5,9 @@
 use std::path::Path;
 
 use ruthenium_data::v26_3::blocks::BlockState;
-use ruthenium_prepare::exporters::{BlockPhysics, StatePhysics, read_block_physics};
+use ruthenium_prepare::exporters::{
+    BlockPhysics, StateBehaviour, StatePhysics, read_block_physics,
+};
 
 use crate::fluid::FluidState;
 use crate::shape::{Placed, Shape};
@@ -258,9 +260,13 @@ impl Blocks {
         self.state(id).bounce
     }
 
-    /// `isSuffocating`.
-    pub fn suffocating(&self, id: u32) -> bool {
+    /// `isSuffocating`: a block's own rule, or the default one (in the server's
+    /// `causes_suffocation` tag, with a full collision shape).
+    pub fn suffocating(&self, id: u32, tags: &BlockTags) -> bool {
         self.state(id).flags & StatePhysics::SUFFOCATING != 0
+            || self.flag(id, StateBehaviour::SUFFOCATES_BY_TAG)
+                && self.flag(id, StateBehaviour::COLLISION_FULL_BLOCK)
+                && tags.causes_suffocation(id)
     }
 
     /// The state's fluid (`BlockState.getFluidState`).
@@ -450,6 +456,7 @@ pub fn block_of(state: u32) -> Option<u32> {
 pub struct BlockTags {
     climbable: Vec<bool>,
     blocks_fluid_flow: Vec<bool>,
+    causes_suffocation: Vec<bool>,
     /// Each tag's blocks, by block registry id.
     all: std::collections::HashMap<String, Vec<bool>>,
 }
@@ -478,6 +485,7 @@ impl BlockTags {
         let flags = match tag {
             "minecraft:climbable" => &mut self.climbable,
             "minecraft:blocks_fluid_flow" => &mut self.blocks_fluid_flow,
+            "minecraft:causes_suffocation" => &mut self.causes_suffocation,
             _ => return,
         };
         *flags = vec![false; ruthenium_data::v26_3::blocks::STATE_COUNT];
@@ -502,6 +510,11 @@ impl BlockTags {
     /// `BlockTags.CLIMBABLE`.
     pub fn climbable(&self, state: u32) -> bool {
         self.climbable.get(state as usize) == Some(&true)
+    }
+
+    /// `BlockTags.CAUSES_SUFFOCATION`.
+    pub fn causes_suffocation(&self, state: u32) -> bool {
+        self.causes_suffocation.get(state as usize) == Some(&true)
     }
 
     /// `BlockTags.BLOCKS_FLUID_FLOW`.

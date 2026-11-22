@@ -42,7 +42,7 @@ import net.minecraft.util.RandomSource;
  * placing and using run, the settings its constructor was given, and per state the
  * flags, the faces it supports other blocks on and the redstone power it gives.
  *
- * <p>Format {@code block_behaviour} v2, after the header:
+ * <p>Format {@code block_behaviour} v3, after the header:
  * <ul>
  *   <li>u8 instrument count, then per note block instrument in order its name and u8 1
  *       if it works above a note block (mob heads).</li>
@@ -84,6 +84,13 @@ final class BlockBehaviourExporter {
     static final int AIR = 2048;
     static final int RANDOMLY_TICKING = 4096;
     static final int ANALOG_OUTPUT = 8192;
+    /**
+     * The state suffocates by the default rule, which reads a data-driven tag: when it is in
+     * {@code causes_suffocation} and its collision shape is a full block. Tags aren't bound
+     * here, so the physics export's suffocating flag is set only for blocks given their own
+     * rule.
+     */
+    static final int SUFFOCATES_BY_TAG = 16384;
 
     /** The behaviours, as a name and the parameter types that tell overloads apart. */
     private record Behaviour(String name, String method, boolean optional, Class<?>... params) {
@@ -120,7 +127,13 @@ final class BlockBehaviourExporter {
     // isSolid and liquid are deprecated in the game for code that has better questions to ask; these are the flags themselves.
     @SuppressWarnings("deprecation")
     static void export(Path file) throws Exception {
-        ExportWriter w = new ExportWriter("block_behaviour", 2);
+        ExportWriter w = new ExportWriter("block_behaviour", 3);
+        // The default suffocation rule is one shared object: every Properties starts with it.
+        Field propertiesRule = BlockBehaviour.Properties.class.getDeclaredField("isSuffocating");
+        propertiesRule.setAccessible(true);
+        Object defaultRule = propertiesRule.get(BlockBehaviour.Properties.of());
+        Field stateRule = BlockBehaviour.BlockStateBase.class.getDeclaredField("isSuffocating");
+        stateRule.setAccessible(true);
         net.minecraft.world.level.block.state.properties.NoteBlockInstrument[] instruments =
             net.minecraft.world.level.block.state.properties.NoteBlockInstrument.values();
         w.u8(instruments.length);
@@ -205,6 +218,7 @@ final class BlockBehaviourExporter {
             if (state.isAir()) flags |= AIR;
             if (state.isRandomlyTicking()) flags |= RANDOMLY_TICKING;
             if (state.hasAnalogOutputSignal()) flags |= ANALOG_OUTPUT;
+            if (stateRule.get(state) == defaultRule) flags |= SUFFOCATES_BY_TAG;
             w.u32(flags);
             w.u8(state.instrument().ordinal());
             int support = 0;

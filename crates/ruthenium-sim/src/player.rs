@@ -15,8 +15,8 @@
 //! sprinting flag, pose, no-gravity). Using items: the hands, the use the client
 //! predicts and the server's living flags start and stop, the slowdown and the sprint
 //! it blocks, food, cooldowns ([`crate::interact`] starts and releases uses). Not yet:
-//! elytra, riptide, the scale attribute, vehicles, the world border, and the fence, wall
-//! and bounce-suppression tags.
+//! elytra, riptide, the scale attribute, vehicles, the world border, and the effects of
+//! the blocks the player moves through (cobwebs, bubble columns).
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
@@ -27,6 +27,7 @@ use ruthenium_javamath::mth;
 use ruthenium_protocol::packets::play::{self, DataValue, PlayerPosition};
 use ruthenium_protocol::wire;
 
+use crate::block::Class;
 use crate::blocks::{BlockTags, Blocks, Who};
 use crate::effect::{Effect, Effects};
 use crate::entity::EntityTypes;
@@ -494,7 +495,7 @@ impl<'a> Env<'a> {
     /// The block shapes an entity (`who`) may meet in `b`.
     fn collisions(&self, b: &Aabb, who: Option<Who>) -> Vec<Placed<'_>> {
         self.level
-            .block_collisions_for(self.blocks, b, false, who)
+            .block_collisions_for(self.blocks, b, None, who)
             .into_iter()
             .map(|(_, p)| p)
             .collect()
@@ -1602,7 +1603,7 @@ impl LocalPlayer {
         )
         .inflate([-EPSILON; 3]);
         !env.level
-            .block_collisions_for(env.blocks, &area, true, Some(self.who()))
+            .block_collisions_for(env.blocks, &area, Some(env.tags), Some(self.who()))
             .is_empty()
     }
 
@@ -1659,6 +1660,25 @@ impl LocalPlayer {
             self.fall_distance = 0.0;
         }
         self.travel(env);
+        self.apply_effects_from_blocks(env);
+    }
+
+    /// `Entity.applyEffectsFromBlocks`: the block stood on (`stepOn`). The effects of the
+    /// blocks the tick's movement passed through aren't ported yet.
+    fn apply_effects_from_blocks(&mut self, env: &Env<'_>) {
+        if self.no_physics || !self.on_ground {
+            return;
+        }
+        let state = env.state(self.on_pos(env, 0.2));
+        // SlimeBlock.stepOn: slow walking (not when stepping carefully). The other
+        // blocks' stepOn only does things on the server (or shows particles).
+        if env.blocks.is_class(state, Class::SlimeBlock) && !self.keys.shift {
+            let dy = self.delta[1].abs();
+            if dy < 0.1 {
+                let scale = 0.4 + dy * 0.2;
+                self.delta = [self.delta[0] * scale, self.delta[1], self.delta[2] * scale];
+            }
+        }
     }
 
     /// `Player.travel`: swimming follows the look, and flying damps the vertical
@@ -1963,10 +1983,17 @@ impl LocalPlayer {
                 if !(offset > 1.0E-5) {
                     return p;
                 }
-                // Fences, walls and fence gates keep the supporting block; their tags
-                // aren't read yet.
-                let _ = env;
-                [p[0], mth::floor(self.position[1] - f64::from(offset)), p[2]]
+                // Fences (for offsets up to half a block), walls and fence gates keep
+                // the supporting block: they stand taller than a block.
+                let below = env.state(p);
+                let tall = offset <= 0.5 && env.tags.is(below, "minecraft:fences")
+                    || env.tags.is(below, "minecraft:walls")
+                    || env.blocks.is_class(below, Class::FenceGateBlock);
+                if tall {
+                    p
+                } else {
+                    [p[0], mth::floor(self.position[1] - f64::from(offset)), p[2]]
+                }
             }
             None => [
                 mth::floor(self.position[0]),
@@ -2094,7 +2121,10 @@ impl LocalPlayer {
         if self.vertical_collision {
             let gravity = self.effective_gravity();
             if self.vertical_collision_below {
-                restitution = if !(-current[1] <= gravity) && !suppress {
+                restitution = if !(-current[1] <= gravity)
+                    && !suppress
+                    && !env.tags.is(effect_state, "minecraft:suppresses_bounce")
+                {
                     restitution.max(f64::from(env.blocks.bounce(effect_state)))
                 } else {
                     0.0
@@ -2160,7 +2190,7 @@ impl LocalPlayer {
         let mut best: Option<([i32; 3], f64)> = None;
         for (p, _) in env
             .level
-            .block_collisions_for(env.blocks, area, false, Some(self.who()))
+            .block_collisions_for(env.blocks, area, None, Some(self.who()))
         {
             let d = |i: usize| f64::from(p[i]) + 0.5 - self.position[i];
             let dist = d(0) * d(0) + d(1) * d(1) + d(2) * d(2);

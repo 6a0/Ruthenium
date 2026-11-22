@@ -916,7 +916,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 30] = [
+const EXACT: [&str; 44] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -947,6 +947,20 @@ const EXACT: [&str; 30] = [
     "using_blocks",
     "tools_on_blocks",
     "scaffolding",
+    "shallow_water",
+    "swim_under",
+    "crawl",
+    "fence_slime_water",
+    "ice_lanes",
+    "slime_lanes",
+    "soul_sand",
+    "climbing",
+    "stair_sneak",
+    "water_cube",
+    "block_shapes_a",
+    "block_shapes_b",
+    "bounce",
+    "speed_zero",
 ];
 
 #[test]
@@ -995,6 +1009,20 @@ fn golden_traces() {
         "using_blocks",
         "tools_on_blocks",
         "scaffolding",
+        "shallow_water",
+        "swim_under",
+        "crawl",
+        "fence_slime_water",
+        "ice_lanes",
+        "slime_lanes",
+        "soul_sand",
+        "climbing",
+        "stair_sneak",
+        "water_cube",
+        "block_shapes_a",
+        "block_shapes_b",
+        "bounce",
+        "speed_zero",
     ];
     let mut failed = Vec::new();
     for name in all {

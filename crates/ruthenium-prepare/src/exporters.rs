@@ -317,7 +317,8 @@ impl StatePhysics {
     /// pistons).
     pub const CONTEXT_SHAPE: u8 = 4;
     pub const OFFSET: u8 = 8;
-    /// `isSuffocating` at the origin.
+    /// `isSuffocating` at the origin, for blocks with a rule of their own (blocks on the
+    /// default rule are flagged `SUFFOCATES_BY_TAG` in `block_behaviour`).
     pub const SUFFOCATING: u8 = 16;
     /// The block is an `IceBlock` (ice, frosted ice).
     pub const ICE: u8 = 32;
@@ -532,7 +533,7 @@ impl BlockBehaviourData {
     }
 }
 
-/// A block state's flags and supporting faces (`block_behaviour` v1).
+/// A block state's flags and supporting faces (`block_behaviour` v3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StateBehaviour {
     /// [`Self::REPLACEABLE`] and the other flags.
@@ -567,6 +568,9 @@ impl StateBehaviour {
     pub const AIR: u32 = 2048;
     pub const RANDOMLY_TICKING: u32 = 4096;
     pub const ANALOG_OUTPUT: u32 = 8192;
+    /// Suffocates by the default rule: in the `causes_suffocation` tag with a full
+    /// collision shape (the tag is the server's, so it isn't known when exporting).
+    pub const SUFFOCATES_BY_TAG: u32 = 16384;
 
     /// `isFaceSturdy` for a direction's face (ordinal) and support type (0 full,
     /// 1 centre, 2 rigid).
@@ -590,7 +594,7 @@ pub struct BlockBehaviours {
 
 /// Parses `block_behaviour.bin`.
 pub fn read_block_behaviour(bytes: &[u8]) -> Result<BlockBehaviours, String> {
-    let mut r = Reader::open(bytes, "block_behaviour", 2)?;
+    let mut r = Reader::open(bytes, "block_behaviour", 3)?;
     let n = r.u8()?;
     let instruments = (0..n)
         .map(|_| Ok((r.string()?, r.u8()? != 0)))
@@ -706,7 +710,7 @@ mod tests {
     #[test]
     fn reads_block_behaviour() {
         let mut b = b"RTHX".to_vec();
-        b.extend(2u32.to_le_bytes());
+        b.extend(3u32.to_le_bytes());
         string(&mut b, "block_behaviour");
         b.push(2);
         string(&mut b, "harp");
