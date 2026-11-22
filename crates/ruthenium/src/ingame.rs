@@ -57,6 +57,7 @@ impl InGame {
         if let Some(s) = session {
             s.set_keys(Default::default());
             s.set_use(false);
+            s.set_attack(false);
         }
     }
 
@@ -65,7 +66,7 @@ impl InGame {
     pub fn mouse_button(&mut self, button: u8, down: bool, session: Option<&Session>) {
         let Some(s) = session else { return };
         match button {
-            1 if down => s.attack_key(),
+            1 => s.set_attack(down),
             3 => s.set_use(down),
             _ => {}
         }
@@ -262,6 +263,10 @@ pub fn draw_hud(
                     item.trim_start_matches("minecraft:")
                 ));
             }
+            hands.push_str(&format!(
+                "; attack {:.0}%",
+                f64::from(v.attack_strength) * 100.0
+            ));
             lines.push((hands, body));
             lines.push((format!("{} ({} chunks)", v.dimension, v.chunks), body));
         }

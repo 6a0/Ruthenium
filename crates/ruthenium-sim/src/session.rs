@@ -124,11 +124,14 @@ struct FrameInput {
     keys: Keys,
     /// Hotbar key presses, by slot (`KeyMapping.click`).
     hotbar_clicks: [u32; 9],
-    /// The use key held, and presses of the use, swap-hands and attack keys.
+    /// The use and attack keys held, and presses of the use, swap-hands and attack keys.
     use_down: bool,
     use_clicks: u32,
     swap_clicks: u32,
+    attack_down: bool,
     attack_clicks: u32,
+    /// A screen is open over the world (keys and clicks aren't read).
+    screen_open: bool,
     /// Scroll-wheel notches, in order.
     scrolls: Vec<i32>,
     /// The frame's turn of the camera (`Entity.turn`'s amounts), after its ticks.
@@ -157,6 +160,9 @@ pub struct PlayerView {
     pub off_hand: String,
     /// The item being used: the hand, the item and the ticks left.
     pub using: Option<(&'static str, String, i32)>,
+    /// The attack's charge (`getAttackStrengthScale(0)`, what the attack indicator
+    /// shows), 0 to 1.
+    pub attack_strength: f32,
     pub chunks: usize,
     /// Other entities the client tracks.
     pub entities: usize,
@@ -232,10 +238,17 @@ impl Session {
     /// for it.
     pub fn frame(&self) {
         let mut input = lock(&self.input);
-        let (keys, use_down) = (input.keys, input.use_down);
+        let (keys, use_down, attack_down, screen_open) = (
+            input.keys,
+            input.use_down,
+            input.attack_down,
+            input.screen_open,
+        );
         let frame = std::mem::take(&mut *input);
         input.keys = keys;
         input.use_down = use_down;
+        input.attack_down = attack_down;
+        input.screen_open = screen_open;
         drop(input);
         let _ = self.commands.send(Command::Frame(frame));
     }
@@ -273,10 +286,20 @@ impl Session {
         lock(&self.input).swap_clicks += 1;
     }
 
-    /// A press of the attack key (attacks aren't ported; the press is read and dropped,
-    /// as the use key's handling expects).
-    pub fn attack_key(&self) {
-        lock(&self.input).attack_clicks += 1;
+    /// The attack key (the left mouse button) pressed or let go: a press counts as a
+    /// click the next tick reads.
+    pub fn set_attack(&self, down: bool) {
+        let mut input = lock(&self.input);
+        if down && !input.attack_down {
+            input.attack_clicks += 1;
+        }
+        input.attack_down = down;
+    }
+
+    /// Whether a screen is open over the world this frame (`gui.screen() != null`):
+    /// the ticks then read no keys, and attacks wait for the attack key to be let go.
+    pub fn set_screen_open(&self, open: bool) {
+        lock(&self.input).screen_open = open;
     }
 
     /// Scroll-wheel notches (from [`crate::input::ScrollWheel`]): the selected slot moves
@@ -354,6 +377,8 @@ struct Game {
     hotbar_clicks: [u32; 9],
     /// The use-related keys not yet read.
     use_keys: UseKeys,
+    /// A screen is open over the world.
+    screen_open: bool,
     /// The profile name the server knows the player by (its scoreboard name), and its
     /// UUID (its player list entry).
     name: String,
@@ -456,6 +481,7 @@ impl Game {
             keys: Keys::default(),
             hotbar_clicks: [0; 9],
             use_keys: UseKeys::default(),
+            screen_open: false,
             name: String::new(),
             uuid: 0,
             players: PlayerInfos::default(),
@@ -538,7 +564,9 @@ impl Game {
         self.use_keys.use_down = input.use_down;
         self.use_keys.use_clicks += input.use_clicks;
         self.use_keys.swap_clicks += input.swap_clicks;
+        self.use_keys.attack_down = input.attack_down;
         self.use_keys.attack_clicks += input.attack_clicks;
+        self.screen_open = input.screen_open;
         // Without a player (`minecraft.player == null`) the input goes nowhere.
         let Some(w) = &mut self.world else {
             return;
@@ -584,6 +612,7 @@ impl Game {
                     w.player.use_remaining(),
                 )
             }),
+            attack_strength: w.player.attack_strength_scale(0.0),
             chunks: w.level.chunk_count(),
             entities: w.entities.len(),
             loaded: w.loaded,
@@ -741,6 +770,7 @@ impl Game {
         let Some(physics) = &self.physics else {
             self.use_keys = UseKeys {
                 use_down: self.use_keys.use_down,
+                attack_down: self.use_keys.attack_down,
                 ..UseKeys::default()
             };
             self.connection.send(play::client_tick_end());
@@ -752,10 +782,13 @@ impl Game {
             tags: &self.tags,
             colliders: &[],
         };
-        // `pick`, then `handleKeybinds` (not while the level-loading screen shows): one
-        // press per hotbar key per tick (spectators' hotbar keys open the spectator menu
-        // instead, which isn't there yet), then the hands.
-        if w.loaded {
+        // `pick`, then `handleKeybinds` unless a screen is open (the level-loading screen
+        // or another): one press per hotbar key per tick (spectators' hotbar keys open
+        // the spectator menu instead, which isn't there yet), then the hands. A screen
+        // makes attacks wait for the attack key to be let go.
+        if !w.loaded || self.screen_open {
+            w.game_mode.screen_open();
+        } else {
             let hit = pick_target(&env, &w.entities, &self.players, &w.player);
             for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
                 if *pending > 0 {
@@ -1181,6 +1214,7 @@ impl Game {
                     && let Some(info) = self.players.get(self.uuid)
                 {
                     w.player.spectator = info.game_mode == play::SPECTATOR;
+                    w.player.creative = info.game_mode == play::CREATIVE;
                 }
             }
             play::Clientbound::PlayerInfoRemove { ids } => self.players.remove(&ids),

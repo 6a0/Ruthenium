@@ -222,6 +222,13 @@ pub struct TypeInfo {
     /// `AbstractCubeMob.ID_SIZE`: slimes and magma cubes scale by it.
     cube_size_field: Option<u8>,
     pub pickable: Pickable,
+    /// A player's attack on it runs `causeExtraKnockback` on the client: it can be
+    /// attacked and its `hurtClient` takes the hit. Other players (`RemotePlayer`),
+    /// vehicles, shulker bullets and end crystals (whose invulnerability the client
+    /// doesn't know). Not living mobs (`hurtClient` is false), nor items and orbs
+    /// (`isAttackable` is false) or block-attached entities (`skipAttackInteraction`
+    /// is true on the client).
+    pub hurt_by_attack: bool,
     /// A `Projectile`: picked with a radius of 1 (`getPickRadius`).
     projectile: bool,
     /// `ArmorStand.DATA_CLIENT_FLAGS`.
@@ -345,6 +352,10 @@ impl EntityTypes {
                 age_scale,
                 cube_size_field: d.field("AbstractCubeMob.ID_SIZE"),
                 pickable: Pickable::new(d),
+                hurt_by_attack: d.key == "minecraft:player"
+                    || d.is("VehicleEntity")
+                    || d.is("ShulkerBullet")
+                    || d.is("EndCrystal"),
                 projectile: d.is("Projectile"),
                 armor_stand_flags_field: d.field("ArmorStand.DATA_CLIENT_FLAGS"),
                 in_ground_field: d.field("AbstractArrow.IN_GROUND"),

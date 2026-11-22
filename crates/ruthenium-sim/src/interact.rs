@@ -1,13 +1,16 @@
-//! Using items, as the client does it (`Minecraft.startUseItem`, the use part of
-//! `handleKeybinds`, and `MultiPlayerGameMode`'s `useItem`, `useItemOn`,
-//! `interact` and `releaseUsingItem`): the packets in vanilla's order, and the
-//! client's own prediction of what each item does (`Item.use` and its overrides on
-//! the client side), which starts and stops the use that slows the player.
+//! Using items and attacking, as the client does it (`Minecraft.startUseItem`,
+//! `startAttack`, `continueAttack`, the hands' part of `handleKeybinds`, and
+//! `MultiPlayerGameMode`'s `useItem`, `useItemOn`, `interact`, `releaseUsingItem`,
+//! `attack` and `piercingAttack`): the packets in vanilla's order, and the client's
+//! own prediction of what each item does (`Item.use` and its overrides on the client
+//! side), which starts and stops the use that slows the player, and of what an attack
+//! does to the attacker (see [`LocalPlayer::attack`]).
 //!
 //! Not predicted yet (the server's answer still arrives): what blocks and entities do
 //! when used (a block or item that has its own `useItemOn`, `useWithoutItem` or
 //! `useOn` is taken to have handled the click, which is what a placed block or an
-//! opened chest does), placing blocks and fluids, block breaking, riding.
+//! opened chest does), placing blocks and fluids, block breaking (an attack on a block
+//! is dropped: no packets), riding.
 
 use ruthenium_data::v26_3::registries::EntityType;
 use ruthenium_protocol::packets::play;
@@ -33,17 +36,22 @@ pub enum Outcome {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UseKeys {
     pub use_down: bool,
+    pub attack_down: bool,
     pub use_clicks: u32,
     pub swap_clicks: u32,
     pub attack_clicks: u32,
     pub pick_clicks: u32,
 }
 
-/// What the client's item use keeps between ticks: `Minecraft.rightClickDelay`,
-/// `MultiPlayerGameMode.carriedIndex` and the block prediction sequence.
+/// What the client's item use and attacks keep between ticks:
+/// `Minecraft.rightClickDelay` and `missTime`, `MultiPlayerGameMode.carriedIndex` and
+/// the block prediction sequence.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GameMode {
     pub right_click_delay: i32,
+    /// Ticks an attack click is ignored for after a miss (10; 10000 while a screen is
+    /// open, until the attack key is let go).
+    pub miss_time: i32,
     /// The hotbar slot last sent (0 for a new game mode).
     pub carried_index: i32,
     /// `BlockStatePredictionHandler.currentSequenceNr`.
@@ -67,6 +75,12 @@ impl GameMode {
         }
     }
 
+    /// A screen is open this tick (`Minecraft.tick`): attacks wait for the attack key
+    /// to be let go once it closes. `handleKeybinds` doesn't run.
+    pub fn screen_open(&mut self) {
+        self.miss_time = 10000;
+    }
+
     /// `ensureHasSentCarriedItem` (and `MultiPlayerGameMode.tick`).
     pub fn ensure_carried(&mut self, inventory: &Inventory, out: &mut Vec<Vec<u8>>) {
         if inventory.selected != self.carried_index {
@@ -80,8 +94,9 @@ impl GameMode {
         self.sequence
     }
 
-    /// `handleKeybinds` from the off-hand key to the held use key (the hotbar keys,
-    /// read before, are the caller's). `hit` is this tick's pick.
+    /// `handleKeybinds` from the off-hand key to `continueAttack` (the hotbar keys,
+    /// read before, are the caller's), then `missTime` counts down. `hit` is this
+    /// tick's pick.
     pub fn handle_keybinds(
         &mut self,
         p: &mut LocalPlayer,
@@ -101,6 +116,7 @@ impl GameMode {
                 ));
             }
         }
+        let mut instant_attack = false;
         if p.is_using_item() {
             if !keys.use_down {
                 self.release_using_item(p, out);
@@ -109,16 +125,108 @@ impl GameMode {
             keys.use_clicks = 0;
             keys.pick_clicks = 0;
         } else {
-            // Attacks and picking blocks aren't ported: their presses are dropped.
-            keys.attack_clicks = 0;
+            while keys.attack_clicks > 0 {
+                keys.attack_clicks -= 1;
+                instant_attack |= self.start_attack(p, w, hit, out);
+            }
             while keys.use_clicks > 0 {
                 keys.use_clicks -= 1;
                 self.start_use_item(p, w, hit, out);
             }
+            // Picking blocks isn't ported: its presses are dropped.
             keys.pick_clicks = 0;
         }
         if keys.use_down && self.right_click_delay == 0 && !p.is_using_item() {
             self.start_use_item(p, w, hit, out);
+        }
+        // No screen is open and the mouse is grabbed while this runs.
+        self.continue_attack(p, !instant_attack && keys.attack_down);
+        if self.miss_time > 0 {
+            self.miss_time -= 1;
+        }
+    }
+
+    /// `Minecraft.startAttack`: one attack click. True when it broke a block at once
+    /// (`instantAttack`), which keeps `continueAttack` from running this tick.
+    pub fn start_attack(
+        &mut self,
+        p: &mut LocalPlayer,
+        w: &World<'_, '_>,
+        hit: &HitResult,
+        out: &mut Vec<Vec<u8>>,
+    ) -> bool {
+        // A miss's penalty swallows the click. The hands are never busy (riding isn't
+        // ported).
+        if self.miss_time > 0 {
+            return false;
+        }
+        if p.game_type() == play::SPECTATOR {
+            let id = match *hit {
+                HitResult::Entity { id, .. } => Some(id),
+                HitResult::Block(_) => None,
+            };
+            out.push(play::spectator_action(id));
+            return true;
+        }
+        // Every item is enabled (no experimental features are tracked).
+        let held = p.hand(Hand::Main).clone();
+        if p.cannot_attack_with_item(&held, 0) {
+            return false;
+        }
+        if held.c.piercing_weapon {
+            // `piercingAttack`: a jab, without `Attack` or `Punch`.
+            self.ensure_carried(&p.inventory, out);
+            out.push(play::player_action(
+                play::ACTION_STAB,
+                [0; 3],
+                play::DOWN,
+                0,
+            ));
+            p.on_attack();
+            return true;
+        }
+        match *hit {
+            HitResult::Entity { id, location } => {
+                let in_range = held
+                    .c
+                    .attack_range
+                    .is_none_or(|r| r.is_in_range(p.eye_position(), location, p.creative));
+                if in_range && let Some(e) = w.entities.get(id) {
+                    self.attack(p, id, e.info().hurt_by_attack, out);
+                }
+            }
+            HitResult::Block(ref b) if !b.miss && !is_air(w, b.pos) => {
+                // `startDestroyBlock` isn't ported: the click is dropped whole (no
+                // digging packet, and so no `Punch`).
+                return false;
+            }
+            HitResult::Block(_) => {
+                if p.game_type() != play::CREATIVE {
+                    self.miss_time = 10;
+                }
+                p.reset_attack_strength_ticker();
+            }
+        }
+        out.push(play::punch());
+        false
+    }
+
+    /// `MultiPlayerGameMode.attack`: the packet, the client's side of the attack, and
+    /// the attack strength starting over. (`destroyDelay`, which creative players' hits
+    /// set, belongs to block breaking, which isn't ported.)
+    fn attack(&mut self, p: &mut LocalPlayer, id: i32, hurts: bool, out: &mut Vec<Vec<u8>>) {
+        self.ensure_carried(&p.inventory, out);
+        out.push(play::attack(id));
+        p.attack(hurts);
+        p.reset_attack_strength_ticker();
+    }
+
+    /// `Minecraft.continueAttack`: letting go of the attack key ends a miss's penalty.
+    /// Holding it on a block digs, which isn't ported (and `stopDestroyBlock` has
+    /// nothing to stop).
+    fn continue_attack(&mut self, _p: &LocalPlayer, down: bool) {
+        if !down {
+            self.miss_time = 0;
         }
     }
 
@@ -258,6 +366,12 @@ impl GameMode {
         out.push(play::use_item(hand.id(), sequence, y_rot, x_rot));
         result
     }
+}
+
+/// Whether the block at `pos` is air (`BlockState.isAir`).
+fn is_air(w: &World<'_, '_>, pos: [i32; 3]) -> bool {
+    let state = w.env.level.block(pos[0], pos[1], pos[2]);
+    w.env.blocks.is_air(state)
 }
 
 /// `Player.isWithinEntityInteractionRange(entity, 0)`: the box's nearest point to the

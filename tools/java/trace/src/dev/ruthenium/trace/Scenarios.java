@@ -237,6 +237,69 @@ public final class Scenarios {
                         ctx.getInput().pressKey(ATTACK);
                         ctx.waitTicks(20);
                     }),
+            new Scenario("attacking",
+                    "Sprinting hits that slow the attacker: a fist on a boat with sprint held (the sprint resumes) and a weaker hit after it; a sword on a minecart after a double-tapped sprint (the sprint ends); a sword on a zombie (the client doesn't slow; the server ends the sprint); two clicks at the sky in one tick and the attack key held there; a spear jab refused before it is charged, then made.",
+                    List.of("difficulty normal",
+                            "item replace entity @a hotbar.1 with minecraft:diamond_sword",
+                            "item replace entity @a hotbar.2 with minecraft:wooden_spear"),
+                    start(0.5, -60, 0.5, -90, 30), (ctx, server) -> {
+                        server.runCommand("summon minecraft:oak_boat 3.0 -60 0.5");
+                        ctx.waitTicks(10);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        ctx.waitTicks(2);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(3);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(6);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.waitTicks(10);
+                        server.runCommand("kill @e[type=minecraft:oak_boat]");
+                        server.runCommand("kill @e[type=minecraft:item]");
+                        server.runCommand("tp @p 0.5 -60 0.5 -90 30");
+                        ctx.getInput().pressKey(hotbar(1));
+                        server.runCommand("summon minecraft:minecart 3.0 -60 0.5");
+                        ctx.waitTicks(20);
+                        hold(ctx, 1, W);
+                        ctx.waitTicks(2);
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(3);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(8);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        server.runCommand("kill @e[type=minecraft:minecart]");
+                        server.runCommand("kill @e[type=minecraft:item]");
+                        server.runCommand("tp @p 0.5 -60 0.5 -90 30");
+                        server.runCommand("summon minecraft:zombie 3.0 -60 0.5 " + STILL);
+                        fireproof(server);
+                        ctx.waitTicks(15);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        ctx.waitTicks(2);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(8);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        // Dying mobs push for 20 ticks.
+                        server.runCommand("kill @e[type=minecraft:zombie]");
+                        ctx.waitTicks(30);
+                        server.runCommand("kill @e[type=minecraft:item]");
+                        ctx.getInput().lookAt(-90, -60);
+                        ctx.waitTicks(15);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(5);
+                        hold(ctx, 15, ATTACK);
+                        ctx.waitTicks(5);
+                        ctx.getInput().pressKey(hotbar(2));
+                        ctx.waitTicks(2);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(15);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(10);
+                    }),
             new Scenario("entity_push",
                     "Mobs push the player: a zombie summoned overlapping it, walking into it and standing in it; a baby zombie to the side; a size-2 slime behind.",
                     List.of("difficulty normal"), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {

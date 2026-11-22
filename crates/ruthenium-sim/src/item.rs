@@ -229,6 +229,50 @@ pub enum InstrumentRef {
     Inline,
 }
 
+/// `AttackRange`: how near and how far an item attacks from the eyes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttackRange {
+    pub min_reach: f32,
+    pub max_reach: f32,
+    pub min_creative_reach: f32,
+    pub max_creative_reach: f32,
+    pub hitbox_margin: f32,
+    pub mob_factor: f32,
+}
+
+impl AttackRange {
+    /// The codec's defaults.
+    pub const DEFAULT: AttackRange = AttackRange {
+        min_reach: 0.0,
+        max_reach: 3.0,
+        min_creative_reach: 0.0,
+        max_creative_reach: 5.0,
+        hitbox_margin: 0.3,
+        mob_factor: 1.0,
+    };
+
+    /// `isInRange(attacker, location)` for a player attacker (`isCreative` by its
+    /// player-list game mode): the distance from the eyes to `location` within the
+    /// reach, widened by the hitbox margin.
+    pub fn is_in_range(&self, eye: [f64; 3], location: [f64; 3], creative: bool) -> bool {
+        let d = [
+            eye[0] - location[0],
+            eye[1] - location[1],
+            eye[2] - location[2],
+        ];
+        let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        let (min, max) = if creative {
+            (self.min_creative_reach, self.max_creative_reach)
+        } else {
+            (self.min_reach, self.max_reach)
+        };
+        // Float sums, widened (the extra buffer is 0 here).
+        let min_reach = f64::from(min - self.hitbox_margin);
+        let max_reach = f64::from(max + self.hitbox_margin);
+        distance >= min_reach && distance <= max_reach
+    }
+}
+
 /// A stack's effective components, the ones item use reads, and its item's class.
 #[derive(Debug, Clone, Default)]
 pub struct Components {
@@ -250,7 +294,11 @@ pub struct Components {
     pub equippable: Option<Equippable>,
     pub blocks_attacks: bool,
     pub kinetic_weapon: bool,
-    pub attack_range: bool,
+    pub attack_range: Option<AttackRange>,
+    /// `minimum_attack_charge` (0 without it).
+    pub minimum_attack_charge: f32,
+    /// `piercing_weapon`: attacks are jabs (spears).
+    pub piercing_weapon: bool,
     pub block_transformer: bool,
     pub instrument: Option<InstrumentRef>,
     /// Charged projectiles, any.
@@ -325,7 +373,9 @@ impl Components {
                 Some(Kind::Equippable) => self.equippable = None,
                 Some(Kind::BlocksAttacks) => self.blocks_attacks = false,
                 Some(Kind::KineticWeapon) => self.kinetic_weapon = false,
-                Some(Kind::AttackRange) => self.attack_range = false,
+                Some(Kind::AttackRange) => self.attack_range = None,
+                Some(Kind::MinimumAttackCharge) => self.minimum_attack_charge = 0.0,
+                Some(Kind::PiercingWeapon) => self.piercing_weapon = false,
                 Some(Kind::BlockTransformer) => self.block_transformer = false,
                 Some(Kind::Instrument) => self.instrument = None,
                 Some(Kind::ChargedProjectiles) => self.charged = false,
@@ -390,7 +440,25 @@ impl Components {
                 }
                 Component::BlocksAttacks { .. } => self.blocks_attacks = true,
                 Component::KineticWeapon(_) => self.kinetic_weapon = true,
-                Component::AttackRange { .. } => self.attack_range = true,
+                Component::AttackRange {
+                    min_reach,
+                    max_reach,
+                    min_creative_reach,
+                    max_creative_reach,
+                    hitbox_margin,
+                    mob_factor,
+                } => {
+                    self.attack_range = Some(AttackRange {
+                        min_reach: *min_reach,
+                        max_reach: *max_reach,
+                        min_creative_reach: *min_creative_reach,
+                        max_creative_reach: *max_creative_reach,
+                        hitbox_margin: *hitbox_margin,
+                        mob_factor: *mob_factor,
+                    })
+                }
+                Component::MinimumAttackCharge(v) => self.minimum_attack_charge = *v,
+                Component::PiercingWeapon { .. } => self.piercing_weapon = true,
                 Component::Instrument(h) => {
                     self.instrument = Some(match h {
                         Holder::Id(id) => InstrumentRef::Id(*id),
@@ -480,6 +548,13 @@ impl Stack {
     /// `ItemStack.isSameItemSameComponents`.
     pub fn same_item_same_components(&self, other: &Stack) -> bool {
         self.same_item(other) && (self.is_empty() || self.patch == other.patch)
+    }
+
+    /// `ItemStack.matches`: the same object, or as many of the same item with the same
+    /// components.
+    pub fn matches(&self, other: &Stack) -> bool {
+        self.same_object(other)
+            || self.count == other.count && self.same_item_same_components(other)
     }
 
     /// The same object (Java's `==`).
@@ -730,7 +805,22 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
     }
     c.blocks_attacks = has("minecraft:blocks_attacks");
     c.kinetic_weapon = has("minecraft:kinetic_weapon");
-    c.attack_range = has("minecraft:attack_range");
+    c.attack_range = v.get("minecraft:attack_range").map(|o| {
+        let d = AttackRange::DEFAULT;
+        AttackRange {
+            min_reach: f32_or(o, "min_reach", d.min_reach),
+            max_reach: f32_or(o, "max_reach", d.max_reach),
+            min_creative_reach: f32_or(o, "min_creative_reach", d.min_creative_reach),
+            max_creative_reach: f32_or(o, "max_creative_reach", d.max_creative_reach),
+            hitbox_margin: f32_or(o, "hitbox_margin", d.hitbox_margin),
+            mob_factor: f32_or(o, "mob_factor", d.mob_factor),
+        }
+    });
+    c.minimum_attack_charge = v
+        .get("minecraft:minimum_attack_charge")
+        .and_then(serde_json::Value::as_f64)
+        .map_or(0.0, |f| f as f32);
+    c.piercing_weapon = has("minecraft:piercing_weapon");
     c.block_transformer = has("minecraft:block_transformer");
     c.instrument = v.get("minecraft:instrument").map(|i| match i.as_str() {
         Some(name) => InstrumentRef::Name(full_identifier(name)),
@@ -848,5 +938,30 @@ mod tests {
         assert!(a.is_empty() && a.same_object(&shield));
         assert!(!shield.copy().same_object(&shield));
         assert!(Stack::empty().same_item(&a));
+        // `matches`: a copy matches until its count changes.
+        let mut copy = shield.copy();
+        assert!(copy.matches(&shield));
+        copy.count = 2;
+        assert!(!copy.matches(&shield));
+    }
+
+    #[test]
+    fn attack_ranges_widen_by_the_margin() {
+        // A spear's range: 2 to 4.5 blocks, 0.125 either side.
+        let spear = AttackRange {
+            min_reach: 2.0,
+            max_reach: 4.5,
+            min_creative_reach: 2.0,
+            max_creative_reach: 6.5,
+            hitbox_margin: 0.125,
+            mob_factor: 0.5,
+        };
+        let eye = [0.0, 1.62, 0.0];
+        let at = |x: f64| [x, 1.62, 0.0];
+        assert!(!spear.is_in_range(eye, at(1.8), false));
+        assert!(spear.is_in_range(eye, at(1.875), false));
+        assert!(spear.is_in_range(eye, at(4.625), false));
+        assert!(!spear.is_in_range(eye, at(4.7), false));
+        assert!(spear.is_in_range(eye, at(6.0), true));
     }
 }

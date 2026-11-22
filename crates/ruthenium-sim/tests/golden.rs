@@ -149,11 +149,14 @@ fn keys(down: &serde_json::Value) -> Keys {
     }
 }
 
-/// The packets compared: the held slot (`gameMode.tick`), the hands' use
-/// (`handleKeybinds`), then the player's tick: abilities when flight toggles, then
+/// The packets compared: the held slot (`gameMode.tick`), the attacks and the hands'
+/// use (`handleKeybinds`), then the player's tick: abilities when flight toggles, then
 /// `sendChanges`'s.
-const SENT: [&str; 12] = [
+const SENT: [&str; 15] = [
     "minecraft:set_carried_item",
+    "minecraft:attack",
+    "minecraft:punch",
+    "minecraft:spectator_action",
     "minecraft:player_action",
     "minecraft:interact",
     "minecraft:use_item_on",
@@ -342,6 +345,7 @@ fn handle(bytes: &[u8], c: &mut Client, p: &mut LocalPlayer, types: &EntityTypes
             c.players.update(actions, &entries);
             if let Some(info) = c.uuid.and_then(|u| c.players.get(u)) {
                 p.spectator = info.game_mode == 3;
+                p.creative = info.game_mode == 1;
             }
         }
         Clientbound::SetPassengers {
@@ -543,6 +547,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         }
         let mut use_keys = UseKeys {
             use_down: down("key.use"),
+            attack_down: down("key.attack"),
             use_clicks: clicks("key.use"),
             swap_clicks: clicks("key.swapOffhand"),
             attack_clicks: clicks("key.attack"),
@@ -685,7 +690,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 24] = [
+const EXACT: [&str; 25] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -700,6 +705,7 @@ const EXACT: [&str; 24] = [
     "waterfall",
     "lava",
     "combat_basics",
+    "attacking",
     "entity_push",
     "entity_moving",
     "entity_rules",
@@ -740,6 +746,7 @@ fn golden_traces() {
         "waterfall",
         "lava",
         "combat_basics",
+        "attacking",
         "entity_push",
         "entity_moving",
         "entity_rules",

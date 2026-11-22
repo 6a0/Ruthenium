@@ -261,6 +261,10 @@ pub struct Attributes {
     pub bounciness: Attribute,
     pub block_interaction_range: Attribute,
     pub entity_interaction_range: Attribute,
+    /// Attacks per second at full strength (sent by the server, with the held item's
+    /// modifiers). The attack damage and knockback attributes aren't sent to clients,
+    /// so the client keeps the player's defaults (see [`LocalPlayer::attack`]).
+    pub attack_speed: Attribute,
 }
 
 impl Default for Attributes {
@@ -278,6 +282,7 @@ impl Default for Attributes {
             bounciness: Attribute::new(0.0, 0.0, 1.0),
             block_interaction_range: Attribute::new(4.5, 0.0, 64.0),
             entity_interaction_range: Attribute::new(3.0, 0.0, 64.0),
+            attack_speed: Attribute::new(4.0, 0.0, 1024.0),
         }
     }
 }
@@ -298,6 +303,7 @@ impl Attributes {
             "minecraft:bounciness" => &mut self.bounciness,
             "minecraft:block_interaction_range" => &mut self.block_interaction_range,
             "minecraft:entity_interaction_range" => &mut self.entity_interaction_range,
+            "minecraft:attack_speed" => &mut self.attack_speed,
             _ => return None,
         })
     }
@@ -318,6 +324,7 @@ impl Attributes {
             &mut a.bounciness,
             &mut a.block_interaction_range,
             &mut a.entity_interaction_range,
+            &mut a.attack_speed,
         ] {
             attribute.modifiers.clear();
         }
@@ -523,6 +530,8 @@ pub struct LocalPlayer {
     /// `isSpectator`: the player list's game mode for this player, which can lag
     /// behind [`Self::game_type`]. Spectators go through everything.
     pub spectator: bool,
+    /// `isCreative`: the player list's game mode for this player is creative.
+    pub creative: bool,
     pub abilities: Abilities,
     pub effects: Effects,
     pub data: PlayerData,
@@ -575,6 +584,12 @@ pub struct LocalPlayer {
     use_remaining: i32,
     started_using: bool,
     using_hand: Option<Hand>,
+    /// `attackStrengthTicker` and `itemSwapTicker`: ticks since the last attack and
+    /// since the main hand last changed item.
+    attack_strength_ticker: i32,
+    item_swap_ticker: i32,
+    /// `lastItemInMainHand`: a copy of the main hand as the last tick left it.
+    last_item_in_main_hand: Stack,
 }
 
 impl LocalPlayer {
@@ -600,6 +615,7 @@ impl LocalPlayer {
             health: 20.0,
             game_type: play::SURVIVAL,
             spectator: false,
+            creative: false,
             abilities: Abilities::default(),
             effects: Effects::default(),
             data: PlayerData::default(),
@@ -636,6 +652,9 @@ impl LocalPlayer {
             use_remaining: 0,
             started_using: false,
             using_hand: None,
+            attack_strength_ticker: 0,
+            item_swap_ticker: 0,
+            last_item_in_main_hand: Stack::empty(),
         }
     }
 
@@ -697,6 +716,7 @@ impl LocalPlayer {
             self.attributes.base_values()
         };
         p.spectator = self.spectator;
+        p.creative = self.creative;
         p.set_game_type(self.game_type);
         p
     }
@@ -1067,6 +1087,73 @@ impl LocalPlayer {
         self.attributes.set_sprinting(on);
     }
 
+    /// `getCurrentItemAttackStrengthDelay`: ticks from an attack to full strength.
+    pub fn attack_strength_delay(&self) -> f32 {
+        (1.0 / self.attributes.attack_speed.value() * 20.0) as f32
+    }
+
+    /// `getAttackStrengthScale`: how charged an attack would be, `a` ticks on.
+    pub fn attack_strength_scale(&self, a: f32) -> f32 {
+        mth_clamp(
+            (self.attack_strength_ticker as f32 + a) / self.attack_strength_delay(),
+            0.0,
+            1.0,
+        )
+    }
+
+    /// `cannotAttackWithItem`: the item needs more charge (`minimum_attack_charge`)
+    /// than the attack would have, `tolerance` ticks on.
+    pub fn cannot_attack_with_item(&self, stack: &Stack, tolerance: i32) -> bool {
+        let required = stack.c.minimum_attack_charge;
+        let optimistic =
+            (self.attack_strength_ticker + tolerance) as f32 / self.attack_strength_delay();
+        required > 0.0 && optimistic < required
+    }
+
+    /// `resetAttackStrengthTicker`.
+    pub fn reset_attack_strength_ticker(&mut self) {
+        self.attack_strength_ticker = 0;
+        self.item_swap_ticker = 0;
+    }
+
+    /// `onAttack` (a spear's jab): only the attack strength starts over.
+    pub fn on_attack(&mut self) {
+        self.attack_strength_ticker = 0;
+    }
+
+    /// `Player.attack` as it runs on the client, after `MultiPlayerGameMode.attack`
+    /// sent the packet. Damage, sounds, particles and the target's own knockback are
+    /// left to the server; what the client does to itself is `causeExtraKnockback`'s
+    /// slowdown.
+    ///
+    /// `hurts` is whether the target can be attacked (`cannotAttack` false) and its
+    /// `hurtClient` takes the hit: on the client that holds for other players,
+    /// vehicles, shulker bullets and end crystals, not for mobs. The client's attack
+    /// damage is the player's base of 1 and its attack knockback 0 (neither attribute
+    /// is sent to clients, and only the server applies equipment and effect
+    /// modifiers), so the damage is never zero and the knockback is the sprint's alone:
+    /// a sprinting hit at more than 0.9 strength slows the attacker to 0.6 across and
+    /// ends the sprint. `onAttack`'s reset is the caller's (`resetAttackStrengthTicker`
+    /// follows at once).
+    pub fn attack(&mut self, hurts: bool) {
+        let scale = self.attack_strength_scale(0.5);
+        if !hurts {
+            return;
+        }
+        let full_strength = scale > 0.9;
+        let knockback_attack = self.sprinting && full_strength;
+        // `getKnockback`: the attribute halved, on the client.
+        let knockback = 0.0f32 / 2.0 + if knockback_attack { 0.5 } else { 0.0 };
+        if knockback > 0.0 {
+            self.delta = [
+                self.delta[0] * 0.6,
+                self.delta[1] * 1.0,
+                self.delta[2] * 0.6,
+            ];
+            self.set_sprinting(false);
+        }
+    }
+
     /// `Player.hasEnoughFoodToDoExhaustiveManoeuvres`.
     fn enough_food(&self) -> bool {
         self.food > 6 || self.abilities.may_fly
@@ -1199,6 +1286,16 @@ impl LocalPlayer {
         let clamp = |v: f64| v.clamp(-2.9999999E7, 2.9999999E7);
         self.position[0] = clamp(self.position[0]);
         self.position[2] = clamp(self.position[2]);
+        // The attack strength builds up; a new item in the main hand starts it over.
+        self.attack_strength_ticker += 1;
+        self.item_swap_ticker += 1;
+        let main = self.inventory.hand(Hand::Main).clone();
+        if !self.last_item_in_main_hand.matches(&main) {
+            if !self.last_item_in_main_hand.same_item(&main) {
+                self.reset_attack_strength_ticker();
+            }
+            self.last_item_in_main_hand = main.copy();
+        }
         self.cooldowns.tick();
         self.update_pose(env);
     }
@@ -2681,5 +2778,33 @@ mod tests {
         );
         assert_eq!(modified_friction(0.6, 1.0), 0.6);
         assert_eq!(modified_friction(0.91, 1.0), 0.91);
+    }
+
+    #[test]
+    fn a_charged_sprinting_hit_slows_the_attacker() {
+        let mut p = LocalPlayer::new();
+        p.set_sprinting(true);
+        p.delta = [0.25, -0.08, -0.5];
+        // A fist charges in 5 ticks; more than 0.9 (half a tick added) needs all 5.
+        assert_eq!(p.attack_strength_delay(), 5.0);
+        p.attack_strength_ticker = 4;
+        p.attack(true);
+        assert!(p.sprinting);
+        assert_eq!(p.delta, [0.25, -0.08, -0.5]);
+        p.attack_strength_ticker = 5;
+        // A mob's `hurtClient` refuses the hit: nothing changes on the client.
+        p.attack(false);
+        assert!(p.sprinting);
+        p.attack(true);
+        assert!(!p.sprinting);
+        assert!(p.attributes.movement_speed.modifiers.is_empty());
+        assert_eq!(p.delta, [0.25 * 0.6, -0.08, -0.5 * 0.6]);
+        // Not sprinting any more: the next hit leaves the motion alone.
+        let before = p.delta;
+        p.attack(true);
+        assert_eq!(p.delta, before);
+        p.reset_attack_strength_ticker();
+        assert_eq!(p.attack_strength_scale(0.0), 0.0);
+        assert_eq!(p.attack_strength_scale(2.5), 0.5);
     }
 }

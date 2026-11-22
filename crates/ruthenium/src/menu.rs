@@ -525,6 +525,7 @@ impl Menu {
                 .frame(&self.settings.settings.mouse, self.session.as_ref());
         }
         if let Some(s) = &self.session {
+            s.set_screen_open(!matches!(self.screen, Screen::Game));
             s.frame();
         }
     }
@@ -1460,7 +1461,6 @@ impl Menu {
         let (ux, uy) = scale.from_window(x, y, window_size, pixel_size);
         let time = self.started.elapsed().as_secs_f64();
         let action = match &mut self.screen {
-            // Attacks aren't there yet; the press is read and dropped.
             Screen::Game => {
                 self.game.mouse_button(1, down, self.session.as_ref());
                 None

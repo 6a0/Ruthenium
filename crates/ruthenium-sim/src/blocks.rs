@@ -109,6 +109,14 @@ impl Blocks {
         BlockState::from_id(id).map_or("minecraft:air", |s| s.block().name())
     }
 
+    /// `isAir`: air, cave air and void air.
+    pub fn is_air(&self, id: u32) -> bool {
+        matches!(
+            self.name(id),
+            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+        )
+    }
+
     /// `hasLargeCollisionShape`.
     pub fn large_shape(&self, id: u32) -> bool {
         self.state(id).flags & StatePhysics::LARGE_SHAPE != 0

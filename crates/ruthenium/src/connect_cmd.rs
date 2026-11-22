@@ -3,9 +3,10 @@
 //!
 //! `--script` plays input once the player is in the world, through the same calls the
 //! window makes: steps separated by spaces, each `KEYS@MS` or `KEYS@MS:DX,DY`. KEYS are
-//! `+`-joined `w a s d jump sneak sprint use` (`use` holds the right button), hotbar
-//! digits `1`-`9`, `click` (one press of the right button) and `swap` (the swap-hands
-//! key), the last three pressed once at the step's start, or `-` for none; held for MS milliseconds while the mouse moves
+//! `+`-joined `w a s d jump sneak sprint use hit` (`use` holds the right button, `hit`
+//! the left), hotbar digits `1`-`9`, `click` (one press of the right button), `attack`
+//! (one press of the left) and `swap` (the swap-hands key), the last four pressed once
+//! at the step's start, or `-` for none; held for MS milliseconds while the mouse moves
 //! DX, DY counts every frame (60 a second, the rate frames run at here), turned as the window turns them with the
 //! saved mouse sensitivity. For example
 //! `w@2000 w+sprint+jump@3000 w@2000:12,0 sneak+w@1500 2@100 -@1000`.
@@ -32,7 +33,9 @@ struct Step {
     keys: Keys,
     hotbar: Vec<u8>,
     use_held: bool,
+    attack_held: bool,
     clicks: u32,
+    attacks: u32,
     swaps: u32,
     ms: u64,
     turn: (f32, f32),
@@ -60,7 +63,9 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                 keys: Keys::default(),
                 hotbar: Vec::new(),
                 use_held: false,
+                attack_held: false,
                 clicks: 0,
+                attacks: 0,
                 swaps: 0,
                 ms: ms.parse().map_err(|_| bad())?,
                 turn,
@@ -75,7 +80,9 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                     "sneak" => st.keys.shift = true,
                     "sprint" => st.keys.sprint = true,
                     "use" => st.use_held = true,
+                    "hit" => st.attack_held = true,
                     "click" => st.clicks += 1,
+                    "attack" => st.attacks += 1,
                     "swap" => st.swaps += 1,
                     d if d.len() == 1 && ("1"..="9").contains(&d) => {
                         st.hotbar.push(d.parse::<u8>().map_err(|_| bad())? - 1);
@@ -109,6 +116,7 @@ impl Player {
         let Some(st) = self.steps.get(self.at) else {
             session.set_keys(Keys::default());
             session.set_use(false);
+            session.set_attack(false);
             return;
         };
         println!(
@@ -128,6 +136,11 @@ impl Player {
             session.set_use(true);
         }
         session.set_use(st.use_held);
+        for _ in 0..st.attacks {
+            session.set_attack(false);
+            session.set_attack(true);
+        }
+        session.set_attack(st.attack_held);
     }
 
     /// False once the script has ended.

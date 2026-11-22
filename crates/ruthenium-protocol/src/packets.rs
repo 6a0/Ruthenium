@@ -1726,10 +1726,19 @@ pub mod play {
         })
     }
 
-    /// `ServerboundPunchPacket`: the main-hand swing of an attack that hit nothing
-    /// (26.3 has no hand-choosing swing packet; the server swings the main hand).
+    /// `ServerboundPunchPacket`: the main-hand swing that ends each attack click, after
+    /// the attack or digging packet, or alone on a miss (26.3 has no hand-choosing swing
+    /// packet; the server swings the main hand).
     pub fn punch() -> Vec<u8> {
         wire::packet(pl::Serverbound::Punch.id(), |_| {})
+    }
+
+    /// `ServerboundSpectatorActionPacket`: a spectator's attack, on an entity to watch
+    /// it (`Some(id)`) or on nothing (an optional varint: 0, or the id plus 1).
+    pub fn spectator_action(entity_id: Option<i32>) -> Vec<u8> {
+        wire::packet(pl::Serverbound::SpectatorAction.id(), |o| {
+            wire::write_varint(o, entity_id.map_or(0, |id| id + 1));
+        })
     }
 
     /// `ServerboundAttackPacket`: attacking an entity.
@@ -2274,6 +2283,14 @@ mod tests {
 
         assert_eq!(play::punch(), [id(pl::Serverbound::Punch)]);
         assert_eq!(play::attack(300), [id(pl::Serverbound::Attack), 0xAC, 0x02]);
+        assert_eq!(
+            play::spectator_action(None),
+            [id(pl::Serverbound::SpectatorAction), 0]
+        );
+        assert_eq!(
+            play::spectator_action(Some(4)),
+            [id(pl::Serverbound::SpectatorAction), 5]
+        );
         // Interacting at the entity's feet: a zero vector is one byte.
         assert_eq!(
             play::interact(7, play::MAIN_HAND, [0.0; 3], true),
