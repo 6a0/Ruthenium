@@ -10,6 +10,7 @@
 
 use std::time::{Duration, Instant};
 
+use ruthenium_data::v26_3::registries::MobEffect;
 use ruthenium_sim::input::{self, HeldKeys, KeyBinds, MouseMotion, MouseOptions, ScrollWheel};
 use ruthenium_sim::player::Pose;
 use ruthenium_sim::session::{PlayerView, Session};
@@ -191,12 +192,35 @@ pub fn draw_hud(
             if v.sprinting {
                 state.push("sprinting".into());
             }
-            match v.pose {
-                Pose::Crouching => state.push("crouching".into()),
-                Pose::Swimming => state.push("swimming".into()),
-                Pose::Standing => {}
+            if v.flying {
+                state.push("flying".into());
+            }
+            if v.pose != Pose::Standing {
+                state.push(format!("{:?}", v.pose).to_lowercase());
             }
             lines.push((state.join(", "), body));
+            let mode = match v.game_type {
+                0 => "Survival",
+                1 => "Creative",
+                2 => "Adventure",
+                _ => "Spectator",
+            };
+            let mut status = vec![mode.to_owned(), format!("health {:.1}", v.health)];
+            for &(id, amplifier, duration) in &v.effects {
+                let name = u32::try_from(id)
+                    .ok()
+                    .and_then(MobEffect::from_id)
+                    .map_or("unknown effect", |e| {
+                        e.name().trim_start_matches("minecraft:")
+                    });
+                let time = if duration < 0 {
+                    "∞".to_owned()
+                } else {
+                    format!("{}s", duration / 20)
+                };
+                status.push(format!("{name} {} ({time})", amplifier + 1));
+            }
+            lines.push((status.join(", "), body));
             lines.push((format!("{} ({} chunks)", v.dimension, v.chunks), body));
         }
         None => lines.push(("Joining...".into(), body)),

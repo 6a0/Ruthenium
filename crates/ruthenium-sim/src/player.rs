@@ -7,19 +7,27 @@
 //! the push out of suffocating blocks, poses, climbing, water and lava (depth, eyes
 //! under the surface, currents, swimming, swim sprinting, jumping and sinking in
 //! fluids), entities as solid as blocks (boats, shulkers; [`Env::colliders`]); other
-//! entities' pushes come from their ticks ([`crate::entity`]). Not yet: flying and
-//! elytra, effects (dolphin's grace among them), vehicles, the world border, and the
-//! fence, wall and bounce-suppression tags.
+//! entities' pushes come from their ticks ([`crate::entity`]). Flight: the abilities
+//! the game mode and the server give, double-tapping jump, flying speeds, landing, and
+//! spectators going through everything. The effects that move the player (jump boost,
+//! levitation, slow falling, dolphin's grace, blindness stopping a sprint), and the
+//! server's copy of the player's entity data, which overrides the client's own (its
+//! sprinting flag, pose, no-gravity). Not yet: elytra, riptide, using items, the scale
+//! attribute, vehicles, the world border, and the fence, wall and bounce-suppression
+//! tags.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
+use ruthenium_data::v26_3::registries::MobEffect;
 use ruthenium_javamath::mth;
-use ruthenium_protocol::packets::play::PlayerPosition;
+use ruthenium_protocol::packets::play::{self, DataValue, PlayerPosition};
 use ruthenium_protocol::wire;
 
 use crate::blocks::{BlockTags, Blocks};
+use crate::effect::{Effect, Effects};
+use crate::entity::EntityTypes;
 use crate::fluid::FluidInteraction;
 use crate::shape::{Aabb, Axis, EPSILON, Placed, Shape, collide_all};
 use crate::world::Level;
@@ -64,30 +72,110 @@ impl Keys {
     }
 }
 
+/// `Pose`, in network id order. The player itself takes standing, crouching and
+/// swimming; the others come from the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pose {
     Standing,
-    Crouching,
+    FallFlying,
+    Sleeping,
     Swimming,
+    SpinAttack,
+    Crouching,
+    LongJumping,
+    Dying,
+    Croaking,
+    UsingTongue,
+    Sitting,
+    Roaring,
+    Sniffing,
+    Emerging,
+    Digging,
+    Sliding,
+    Shooting,
+    Inhaling,
 }
 
 impl Pose {
-    /// Width and height (`Avatar.POSES`).
-    fn size(self) -> (f32, f32) {
+    const ALL: [Pose; 18] = [
+        Pose::Standing,
+        Pose::FallFlying,
+        Pose::Sleeping,
+        Pose::Swimming,
+        Pose::SpinAttack,
+        Pose::Crouching,
+        Pose::LongJumping,
+        Pose::Dying,
+        Pose::Croaking,
+        Pose::UsingTongue,
+        Pose::Sitting,
+        Pose::Roaring,
+        Pose::Sniffing,
+        Pose::Emerging,
+        Pose::Digging,
+        Pose::Sliding,
+        Pose::Shooting,
+        Pose::Inhaling,
+    ];
+
+    /// `Pose.BY_ID`: an id out of range is standing.
+    pub fn from_id(id: i32) -> Pose {
+        usize::try_from(id)
+            .ok()
+            .and_then(|i| Pose::ALL.get(i))
+            .copied()
+            .unwrap_or(Pose::Standing)
+    }
+
+    pub fn id(self) -> i32 {
+        self as i32
+    }
+
+    /// By the Java constant's name (`CROUCHING`), as traces record it.
+    pub fn from_name(name: &str) -> Option<Pose> {
+        const NAMES: [&str; 18] = [
+            "STANDING",
+            "FALL_FLYING",
+            "SLEEPING",
+            "SWIMMING",
+            "SPIN_ATTACK",
+            "CROUCHING",
+            "LONG_JUMPING",
+            "DYING",
+            "CROAKING",
+            "USING_TONGUE",
+            "SITTING",
+            "ROARING",
+            "SNIFFING",
+            "EMERGING",
+            "DIGGING",
+            "SLIDING",
+            "SHOOTING",
+            "INHALING",
+        ];
+        NAMES.iter().position(|n| *n == name).map(|i| Pose::ALL[i])
+    }
+
+    /// Width, height and eye height (`Avatar.POSES`; the poses it doesn't list stand).
+    fn dimensions(self) -> (f32, f32, f32) {
         match self {
-            Pose::Standing => (0.6, 1.8),
-            Pose::Crouching => (0.6, 1.5),
-            Pose::Swimming => (0.6, 0.6),
+            Pose::Sleeping => (0.2, 0.2, 0.2),
+            Pose::FallFlying | Pose::Swimming | Pose::SpinAttack => (0.6, 0.6, 0.4),
+            Pose::Crouching => (0.6, 1.5, 1.27),
+            Pose::Dying => (0.2, 0.2, 1.62),
+            _ => (0.6, 1.8, 1.62),
         }
     }
 
-    /// The eye height (`Avatar.POSES`).
+    /// Width and height.
+    fn size(self) -> (f32, f32) {
+        let (w, h, _) = self.dimensions();
+        (w, h)
+    }
+
+    /// The eye height.
     fn eye_height(self) -> f32 {
-        match self {
-            Pose::Standing => 1.62,
-            Pose::Crouching => 1.27,
-            Pose::Swimming => 0.4,
-        }
+        self.dimensions().2
     }
 
     /// `EntityDimensions.makeBoundingBox`: half the width in floats.
@@ -204,6 +292,26 @@ impl Attributes {
         })
     }
 
+    /// `assignBaseValues`: each attribute's base value, without modifiers.
+    fn base_values(&self) -> Attributes {
+        let mut a = self.clone();
+        for attribute in [
+            &mut a.movement_speed,
+            &mut a.jump_strength,
+            &mut a.gravity,
+            &mut a.step_height,
+            &mut a.sneaking_speed,
+            &mut a.friction_modifier,
+            &mut a.air_drag_modifier,
+            &mut a.movement_efficiency,
+            &mut a.water_movement_efficiency,
+            &mut a.bounciness,
+        ] {
+            attribute.modifiers.clear();
+        }
+        a
+    }
+
     /// `LivingEntity.setSprinting`: the sprint modifier off, then on if sprinting.
     fn set_sprinting(&mut self, on: bool) {
         self.movement_speed.remove(SPRINTING);
@@ -216,6 +324,118 @@ impl Attributes {
         }
     }
 }
+
+/// What the player may do (`Abilities`): set from the game mode, then by the server.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Abilities {
+    pub invulnerable: bool,
+    pub flying: bool,
+    pub may_fly: bool,
+    pub instabuild: bool,
+    pub may_build: bool,
+    pub flying_speed: f32,
+    /// What the server says the walking speed is (the field of view follows it; the
+    /// movement speed is an attribute).
+    pub walking_speed: f32,
+}
+
+impl Default for Abilities {
+    fn default() -> Abilities {
+        Abilities {
+            invulnerable: false,
+            flying: false,
+            may_fly: false,
+            instabuild: false,
+            may_build: true,
+            flying_speed: 0.05,
+            walking_speed: 0.1,
+        }
+    }
+}
+
+impl Abilities {
+    /// `GameType.updatePlayerAbilities`: creative may fly, a spectator flies, other
+    /// modes stop flying; adventure and spectator may not build.
+    pub fn set_game_type(&mut self, game_type: i32) {
+        match game_type {
+            play::CREATIVE => {
+                self.may_fly = true;
+                self.instabuild = true;
+                self.invulnerable = true;
+            }
+            play::SPECTATOR => {
+                self.may_fly = true;
+                self.instabuild = false;
+                self.invulnerable = true;
+                self.flying = true;
+            }
+            _ => {
+                self.may_fly = false;
+                self.instabuild = false;
+                self.invulnerable = false;
+                self.flying = false;
+            }
+        }
+        self.may_build = !matches!(game_type, play::ADVENTURE | play::SPECTATOR);
+    }
+
+    /// `handlePlayerAbilities`: everything but `may_build`.
+    pub fn apply(&mut self, flags: u8, flying_speed: f32, walking_speed: f32) {
+        self.invulnerable = flags & play::ABILITY_INVULNERABLE != 0;
+        self.flying = flags & play::ABILITY_FLYING != 0;
+        self.may_fly = flags & play::ABILITY_MAY_FLY != 0;
+        self.instabuild = flags & play::ABILITY_INSTABUILD != 0;
+        self.flying_speed = flying_speed;
+        self.walking_speed = walking_speed;
+    }
+}
+
+/// The shared flags' bits (`Entity.FLAG_*`).
+pub mod flag {
+    pub const ON_FIRE: u8 = 1;
+    pub const SHIFT_KEY_DOWN: u8 = 1 << 1;
+    pub const SPRINTING: u8 = 1 << 3;
+    pub const SWIMMING: u8 = 1 << 4;
+    pub const INVISIBLE: u8 = 1 << 5;
+    pub const GLOWING: u8 = 1 << 6;
+    pub const FALL_FLYING: u8 = 1 << 7;
+}
+
+/// The player's synched entity data besides its pose, health and the sprinting and
+/// swimming flags (which are [`LocalPlayer`]'s own fields): the values the server
+/// sends back in `set_entity_data`, which replace the client's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerData {
+    /// `DATA_SHARED_FLAGS_ID` without the sprinting and swimming bits ([`flag`]). The
+    /// shift bit is the server's: the local player reads its own keys.
+    pub flags: u8,
+    pub air_supply: i32,
+    pub no_gravity: bool,
+    pub ticks_frozen: i32,
+    /// `DATA_LIVING_ENTITY_FLAGS`: using an item (1), with the off hand (2), riptide
+    /// (4).
+    pub living_flags: u8,
+    pub absorption: f32,
+    pub score: i32,
+}
+
+impl Default for PlayerData {
+    fn default() -> PlayerData {
+        PlayerData {
+            flags: 0,
+            air_supply: 300,
+            no_gravity: false,
+            ticks_frozen: 0,
+            living_flags: 0,
+            absorption: 0.0,
+            score: 0,
+        }
+    }
+}
+
+/// `handleRespawn`'s `dataToKeep` bits.
+pub const KEEP_ATTRIBUTES: u8 = 1;
+pub const KEEP_ENTITY_DATA: u8 = 2;
 
 /// `LivingEntity.computeModifiedFriction`.
 fn modified_friction(friction: f32, modifier: f32) -> f32 {
@@ -274,12 +494,32 @@ pub struct LocalPlayer {
     pub vertical_collision: bool,
     pub vertical_collision_below: bool,
     pub fall_distance: f64,
+    /// The shared flags' sprinting bit (`isSprinting`): set by the client, and by the
+    /// server's echo, which leaves the sprint speed modifier as it is.
     pub sprinting: bool,
-    /// `isSwimming` (the shared flag the client sets itself).
+    /// The shared flags' swimming bit, as set (`isSwimming` also needs the player not
+    /// flying and not a spectator).
     pub swimming: bool,
     pub pose: Pose,
     pub attributes: Attributes,
     pub food: i32,
+    /// `getHealth` (`set_health` and the entity data).
+    pub health: f32,
+    /// The client's game mode (`MultiPlayerGameMode.localPlayerMode`): the abilities
+    /// follow it, and in spectator mode the player always flies.
+    game_type: i32,
+    /// `isSpectator`: the player list's game mode for this player, which can lag
+    /// behind [`Self::game_type`]. Spectators go through everything.
+    pub spectator: bool,
+    pub abilities: Abilities,
+    pub effects: Effects,
+    pub data: PlayerData,
+    /// Ticks left to double-tap jump (`jumpTriggerTime`).
+    jump_trigger_time: i32,
+    /// `noPhysics`: moves without collisions (spectators).
+    no_physics: bool,
+    /// Packets the tick sent before `sendChanges` (abilities), sent first.
+    outbox: Vec<Vec<u8>>,
     /// `LocalPlayer.crouching`.
     crouching: bool,
     /// The keys read this tick (`ClientInput.keyPresses`) and the move vector.
@@ -329,6 +569,15 @@ impl LocalPlayer {
             pose: Pose::Standing,
             attributes: Attributes::default(),
             food: 20,
+            health: 20.0,
+            game_type: play::SURVIVAL,
+            spectator: false,
+            abilities: Abilities::default(),
+            effects: Effects::default(),
+            data: PlayerData::default(),
+            jump_trigger_time: 0,
+            no_physics: false,
+            outbox: Vec::new(),
             crouching: false,
             keys: Keys::default(),
             move_vector: (0.0, 0.0),
@@ -382,6 +631,97 @@ impl LocalPlayer {
 
     pub fn bounding_box(&self) -> Aabb {
         self.pose.bounding_box(self.position)
+    }
+
+    /// `handleRespawn`'s new player. With [`KEEP_ENTITY_DATA`] it keeps the entity data,
+    /// the motion, the rotation, the last input sent and whether it was sprinting; else it
+    /// faces -180 (where it is doesn't matter: the server's teleport places it). With
+    /// [`KEEP_ATTRIBUTES`] the attributes and their modifiers, else their base values.
+    /// Effects and abilities start afresh; the game mode's are set next.
+    pub fn respawned(&self, keep: u8) -> LocalPlayer {
+        let mut p = LocalPlayer::new();
+        p.entity_id = self.entity_id;
+        if keep & KEEP_ENTITY_DATA != 0 {
+            p.last_sent_keys = self.last_sent_keys;
+            p.was_sprinting = self.sprinting;
+            // `getNonDefaultValues`, assigned.
+            p.sprinting = self.sprinting;
+            p.swimming = self.swimming;
+            p.pose = self.pose;
+            p.health = self.health;
+            p.data = self.data;
+            p.delta = self.delta;
+            p.y_rot = self.y_rot;
+            p.x_rot = self.x_rot;
+        }
+        p.attributes = if keep & KEEP_ATTRIBUTES != 0 {
+            self.attributes.clone()
+        } else {
+            self.attributes.base_values()
+        };
+        p.spectator = self.spectator;
+        p.set_game_type(self.game_type);
+        p
+    }
+
+    pub fn game_type(&self) -> i32 {
+        self.game_type
+    }
+
+    /// `setLocalMode` (and `adjustPlayer`): the game mode and its abilities.
+    pub fn set_game_type(&mut self, game_type: i32) {
+        self.game_type = game_type;
+        self.abilities.set_game_type(game_type);
+    }
+
+    /// `onGameModeChanged`: the player list says the player's game mode changed;
+    /// becoming a spectator stops it rising or falling.
+    pub fn on_game_mode_changed(&mut self, game_mode: i32) {
+        if game_mode == play::SPECTATOR {
+            self.delta[1] = 0.0;
+        }
+    }
+
+    /// `handleUpdateMobEffect`.
+    pub fn update_effect(&mut self, e: Effect) {
+        self.effects.update(e);
+    }
+
+    /// `handleRemoveMobEffect`.
+    pub fn remove_effect(&mut self, id: i32) {
+        self.effects.remove(id);
+    }
+
+    /// `handleSetEntityData` for the local player: the server's values replace the
+    /// client's, the sprinting flag without its speed modifier (`assignValues` doesn't go
+    /// through `setSprinting`), the pose with its box.
+    pub fn set_data(&mut self, values: &[(u8, DataValue)], types: &EntityTypes) {
+        let f = types.player_fields();
+        for (field, value) in values {
+            let field = Some(*field);
+            match *value {
+                DataValue::Byte(b) if field == f.shared_flags => {
+                    let b = b as u8;
+                    self.sprinting = b & flag::SPRINTING != 0;
+                    self.swimming = b & flag::SWIMMING != 0;
+                    self.data.flags = b & !(flag::SPRINTING | flag::SWIMMING);
+                }
+                DataValue::Int(n) if field == f.air_supply => self.data.air_supply = n,
+                DataValue::Boolean(b) if field == f.no_gravity => self.data.no_gravity = b,
+                DataValue::Pose(p) if field == f.pose => self.pose = Pose::from_id(p),
+                DataValue::Int(n) if field == f.ticks_frozen => self.data.ticks_frozen = n,
+                DataValue::Byte(b) if field == f.living_flags => self.data.living_flags = b as u8,
+                DataValue::Float(h) if field == f.health => self.health = h,
+                DataValue::Float(a) if field == f.absorption => self.data.absorption = a,
+                DataValue::Int(n) if field == f.score => self.data.score = n,
+                _ => {}
+            }
+        }
+    }
+
+    /// `isFallFlying`: the server's flag (elytra flight isn't ported).
+    pub fn fall_flying(&self) -> bool {
+        self.data.flags & flag::FALL_FLYING != 0
     }
 
     /// Applies a teleport (`PositionMoveRotation.calculateAbsolute`, then set without
@@ -473,9 +813,67 @@ impl LocalPlayer {
         self.attributes.set_sprinting(on);
     }
 
-    /// `Player.hasEnoughFoodToDoExhaustiveManoeuvres` without creative flight.
+    /// `Player.hasEnoughFoodToDoExhaustiveManoeuvres`.
     fn enough_food(&self) -> bool {
-        self.food > 6
+        self.food > 6 || self.abilities.may_fly
+    }
+
+    /// `Player.isSwimming`: the flag, unless flying or a spectator.
+    fn is_swimming(&self) -> bool {
+        !self.abilities.flying && !self.spectator && self.swimming
+    }
+
+    /// `Player.isAffectedByFluids` (and `isPushedByFluid`): not while flying.
+    fn affected_by_fluids(&self) -> bool {
+        !self.abilities.flying
+    }
+
+    /// `getGravity`: none with the no-gravity flag.
+    fn gravity(&self) -> f64 {
+        if self.data.no_gravity {
+            0.0
+        } else {
+            self.attributes.gravity.value()
+        }
+    }
+
+    /// `LivingEntity.getEffectiveGravity`: slow falling caps it at 0.01 while falling.
+    fn effective_gravity(&self) -> f64 {
+        let falling = self.delta[1] <= 0.0;
+        if falling && self.effects.has(MobEffect::SlowFalling) {
+            self.gravity().min(0.01)
+        } else {
+            self.gravity()
+        }
+    }
+
+    /// `Player.getFlyingSpeed`: the speed in the air, faster flying.
+    fn flying_speed(&self) -> f32 {
+        if self.abilities.flying {
+            if self.sprinting {
+                self.abilities.flying_speed * 2.0
+            } else {
+                self.abilities.flying_speed
+            }
+        } else if self.sprinting {
+            0.025999999
+        } else {
+            0.02
+        }
+    }
+
+    /// `LivingEntity.getJumpBoostPower`.
+    fn jump_boost_power(&self) -> f32 {
+        match self.effects.get(MobEffect::JumpBoost) {
+            Some(e) => 0.1 * (e.amplifier as f32 + 1.0),
+            None => 0.0,
+        }
+    }
+
+    /// `LocalPlayer.onUpdateAbilities`: tells the server whether the player flies.
+    fn on_update_abilities(&mut self) {
+        self.outbox
+            .push(play::player_abilities(self.abilities.flying));
     }
 
     fn can_fit(&self, env: &Env<'_>, pose: Pose) -> bool {
@@ -502,9 +900,12 @@ impl LocalPlayer {
         self.in_water && !self.was_underwater
     }
 
-    /// `LocalPlayer.isSprintingPossible` (not riding, no blindness yet).
+    /// `LocalPlayer.isSprintingPossible` (not riding): not blind (`isMobilityRestricted`),
+    /// fed enough, and not in shallow water unless allowed.
     fn sprinting_possible(&self, allowed_in_shallow_water: bool) -> bool {
-        self.enough_food() && (allowed_in_shallow_water || !self.in_shallow_water())
+        !self.effects.has(MobEffect::Blindness)
+            && self.enough_food()
+            && (allowed_in_shallow_water || !self.in_shallow_water())
     }
 
     fn eye_y(&self) -> f64 {
@@ -527,7 +928,12 @@ impl LocalPlayer {
     /// One client tick of the player (`LocalPlayer.tick`, only called once the player
     /// has loaded into the level). `keys` are the movement keys held.
     pub fn tick(&mut self, env: &Env<'_>, keys: Keys) {
-        // Player.tick: updateIsUnderwater, from the fluids as last updated.
+        // Player.tick: spectators go through everything and are never on the ground;
+        // updateIsUnderwater, from the fluids as last updated.
+        self.no_physics = self.spectator;
+        if self.spectator {
+            self.on_ground = false;
+        }
         self.was_underwater = self.fluids.eye_in(true);
         self.base_tick(env);
         self.ai_step(env, keys);
@@ -545,24 +951,30 @@ impl LocalPlayer {
             self.fall_distance *= 0.5;
         }
         self.first_tick = false;
+        // LivingEntity.baseTick: tickEffects.
+        self.effects.tick();
     }
 
     /// `Entity.updateFluidInteraction`: what the box is in, the fall reset in water,
     /// and the currents (players not flying are pushed by fluids).
     fn update_fluid_interaction(&mut self, env: &Env<'_>) {
+        let pushed = self.affected_by_fluids();
         let b = self.bounding_box();
         let eye = (
             mth::floor(self.position[0]),
             self.eye_y(),
             mth::floor(self.position[2]),
         );
-        self.fluids.update(env, &b, eye, false);
+        self.fluids.update(env, &b, eye, !pushed);
         let in_water = self.fluids.is_in(true);
         let in_lava = self.fluids.is_in(false);
         if in_water {
             self.fall_distance = 0.0;
         }
         self.in_water = in_water;
+        if !pushed {
+            return;
+        }
         if in_water {
             self.fluids.apply_current(true, &mut self.delta, 0.014);
         }
@@ -576,10 +988,15 @@ impl LocalPlayer {
         }
     }
 
-    /// `Entity.updateSwimming`: keeps swimming while sprinting in water; starts with
-    /// the eyes under water (as the tick began) in a water block.
+    /// `Player.updateSwimming`: never while flying; else `Entity.updateSwimming` keeps
+    /// swimming while sprinting in water and starts with the eyes under water (as the
+    /// tick began) in a water block.
     fn update_swimming(&mut self, env: &Env<'_>) {
-        self.swimming = if self.swimming {
+        if self.abilities.flying {
+            self.swimming = false;
+            return;
+        }
+        self.swimming = if self.is_swimming() {
             self.sprinting && self.in_water
         } else {
             self.sprinting
@@ -588,17 +1005,18 @@ impl LocalPlayer {
         };
     }
 
-    /// `Player.updatePlayerPose`.
+    /// `Player.updatePlayerPose` (sleeping, elytra and riptide poses aside): a
+    /// spectator takes the pose it wants.
     fn update_pose(&mut self, env: &Env<'_>) {
         if self.can_fit(env, Pose::Swimming) {
-            let desired = if self.swimming {
+            let desired = if self.is_swimming() {
                 Pose::Swimming
-            } else if self.keys.shift {
+            } else if self.keys.shift && !self.abilities.flying {
                 Pose::Crouching
             } else {
                 Pose::Standing
             };
-            self.pose = if self.can_fit(env, desired) {
+            self.pose = if self.spectator || self.can_fit(env, desired) {
                 desired
             } else if self.can_fit(env, Pose::Crouching) {
                 Pose::Crouching
@@ -608,14 +1026,16 @@ impl LocalPlayer {
         }
     }
 
-    /// `LocalPlayer.aiStep` for a survival player on land.
+    /// `LocalPlayer.aiStep` (not riding, no auto-jump, no elytra).
     fn ai_step(&mut self, env: &Env<'_>, keys: Keys) {
         if self.sprint_trigger_time > 0 {
             self.sprint_trigger_time -= 1;
         }
+        let was_jumping = self.keys.jump;
         let was_shift = self.keys.shift;
         let had_forward = self.has_forward_impulse();
-        self.crouching = !self.swimming
+        self.crouching = !self.abilities.flying
+            && !self.is_swimming()
             && self.can_fit(env, Pose::Crouching)
             && (self.keys.shift || !self.can_fit(env, Pose::Standing));
         // KeyboardInput.tick.
@@ -641,22 +1061,26 @@ impl LocalPlayer {
         };
 
         // Push out of blocks the player is stuck in.
-        let w = f64::from(0.6f32) * 0.35;
-        let (px, pz) = (self.position[0], self.position[2]);
-        for (x, z) in [
-            (px - w, pz + w),
-            (px - w, pz - w),
-            (px + w, pz - w),
-            (px + w, pz + w),
-        ] {
-            self.move_towards_closest_space(env, x, z);
+        if !self.no_physics {
+            let w = f64::from(self.pose.size().0) * 0.35;
+            let (px, pz) = (self.position[0], self.position[2]);
+            for (x, z) in [
+                (px - w, pz + w),
+                (px - w, pz - w),
+                (px + w, pz - w),
+                (px + w, pz + w),
+            ] {
+                self.move_towards_closest_space(env, x, z);
+            }
         }
         if was_shift || keys.backward {
             self.sprint_trigger_time = 0;
         }
+        let flying = self.abilities.flying;
         let can_start_sprinting = !self.sprinting
             && self.has_forward_impulse()
-            && self.sprinting_possible(false)
+            && self.sprinting_possible(flying)
+            && (!self.fall_flying() || self.was_underwater)
             && (!self.moving_slowly() || self.was_underwater);
         if can_start_sprinting {
             if !had_forward {
@@ -672,14 +1096,14 @@ impl LocalPlayer {
             }
         }
         if self.sprinting {
-            let stop = if self.swimming {
+            let stop = if self.is_swimming() {
                 // shouldStopSwimSprinting.
                 !self.sprinting_possible(true)
                     || !self.in_water
                     || !self.has_forward_impulse() && !self.on_ground && !keys.shift
             } else {
                 // shouldStopRunSprinting.
-                !self.sprinting_possible(false)
+                !self.sprinting_possible(self.abilities.flying)
                     || !self.has_forward_impulse()
                     || self.horizontal_collision && !self.minor_horizontal_collision
             };
@@ -687,12 +1111,51 @@ impl LocalPlayer {
                 self.set_sprinting(false);
             }
         }
+        // Creative flight: a spectator always flies; otherwise a second press of jump
+        // within 7 ticks of the first toggles it.
+        if self.abilities.may_fly {
+            if self.game_type == play::SPECTATOR {
+                if !self.abilities.flying {
+                    self.abilities.flying = true;
+                    self.on_update_abilities();
+                }
+            } else if !was_jumping && keys.jump {
+                if self.jump_trigger_time == 0 {
+                    self.jump_trigger_time = 7;
+                } else if !self.is_swimming() {
+                    self.abilities.flying = !self.abilities.flying;
+                    if self.abilities.flying && self.on_ground {
+                        self.jump_from_ground(env);
+                    }
+                    self.on_update_abilities();
+                    self.jump_trigger_time = 0;
+                }
+            }
+        }
         // goDownInWater.
-        if self.in_water && keys.shift {
+        if self.in_water && keys.shift && self.affected_by_fluids() {
             self.delta[1] += -0.03999999910593033;
         }
-        // Player.aiStep -> LivingEntity.aiStep.
+        // Flying up and down.
+        if self.abilities.flying {
+            let ya = i32::from(keys.jump) - i32::from(keys.shift);
+            if ya != 0 {
+                self.delta[1] += f64::from(ya as f32 * self.abilities.flying_speed * 3.0);
+            }
+        }
+        // Player.aiStep.
+        if self.jump_trigger_time > 0 {
+            self.jump_trigger_time -= 1;
+        }
+        if self.abilities.flying {
+            self.fall_distance = 0.0;
+        }
         self.living_ai_step(env);
+        // Landing ends creative flight.
+        if self.on_ground && self.abilities.flying && self.game_type != play::SPECTATOR {
+            self.abilities.flying = false;
+            self.on_update_abilities();
+        }
     }
 
     /// `LocalPlayer.moveTowardsClosestSpace`.
@@ -759,7 +1222,13 @@ impl LocalPlayer {
         self.xxa = mx;
         self.zza = my;
         self.jumping = self.keys.jump;
-        if self.jumping {
+        // isImmobile: dead (sleeping isn't ported).
+        if self.health <= 0.0 {
+            self.jumping = false;
+            self.xxa = 0.0;
+            self.zza = 0.0;
+        }
+        if self.jumping && self.affected_by_fluids() {
             let in_lava = self.in_lava();
             let height = self.fluids.height(!in_lava);
             let in_water_with_height = self.in_water && height > 0.0;
@@ -783,12 +1252,16 @@ impl LocalPlayer {
         } else {
             self.no_jump_delay = 0;
         }
+        if self.effects.has(MobEffect::SlowFalling) || self.effects.has(MobEffect::Levitation) {
+            self.fall_distance = 0.0;
+        }
         self.travel(env);
     }
 
-    /// `Player.travel` (swimming follows the look), then `LivingEntity.travel`.
+    /// `Player.travel`: swimming follows the look, and flying damps the vertical
+    /// motion; `LivingEntity.travel` in between.
     fn travel(&mut self, env: &Env<'_>) {
-        if self.swimming {
+        if self.is_swimming() {
             // getLookAngle().y.
             let look_y = f64::from(-mth::sin(f64::from(self.x_rot * DEG_TO_RAD_F)));
             let multiplier = if look_y < -0.2 { 0.085 } else { 0.06 };
@@ -801,8 +1274,19 @@ impl LocalPlayer {
                 self.delta[1] += (look_y - self.delta[1]) * multiplier;
             }
         }
+        if self.abilities.flying {
+            let original_y = self.delta[1];
+            self.living_travel(env);
+            self.delta[1] = original_y * 0.6;
+        } else {
+            self.living_travel(env);
+        }
+    }
+
+    /// `LivingEntity.travel` (elytra flight isn't ported).
+    fn living_travel(&mut self, env: &Env<'_>) {
         // shouldTravelInFluid: players never stand on fluids.
-        if self.in_water || self.in_lava() {
+        if (self.in_water || self.in_lava()) && self.affected_by_fluids() {
             self.travel_in_fluid(env);
         } else {
             self.travel_in_air(env);
@@ -813,7 +1297,7 @@ impl LocalPlayer {
     fn travel_in_fluid(&mut self, env: &Env<'_>) {
         let is_falling = self.delta[1] <= 0.0;
         let old_y = self.position[1];
-        let gravity = self.attributes.gravity.value();
+        let gravity = self.effective_gravity();
         if self.in_water {
             self.travel_in_water(env, gravity, is_falling, old_y);
         } else {
@@ -833,6 +1317,9 @@ impl LocalPlayer {
             slow_down += (0.54600006 - slow_down) * water_walker;
             let own = self.attributes.movement_speed.value() as f32;
             speed += (own - speed) * water_walker;
+        }
+        if self.effects.has(MobEffect::DolphinsGrace) {
+            slow_down = 0.96;
         }
         self.move_relative(speed);
         self.do_move(env, self.delta);
@@ -931,7 +1418,8 @@ impl LocalPlayer {
     /// `LivingEntity.jumpFromGround`.
     fn jump_from_ground(&mut self, env: &Env<'_>) {
         let power =
-            self.attributes.jump_strength.value() as f32 * 1.0 * self.block_jump_factor(env) + 0.0;
+            self.attributes.jump_strength.value() as f32 * 1.0 * self.block_jump_factor(env)
+                + self.jump_boost_power();
         if power > 1.0E-5 {
             self.delta[1] = f64::from(power).max(self.delta[1]);
             if self.sprinting {
@@ -962,10 +1450,8 @@ impl LocalPlayer {
             } else {
                 own
             }
-        } else if self.sprinting {
-            0.025999999
         } else {
-            0.02
+            self.flying_speed()
         };
         self.move_relative(speed);
         let climbing = self.on_climbable(env);
@@ -979,7 +1465,8 @@ impl LocalPlayer {
             d[1] = d[1].max(-max);
             let in_scaffolding =
                 env.blocks.name(env.state(self.block_position())) == "minecraft:scaffolding";
-            if d[1] < 0.0 && !in_scaffolding && self.keys.shift {
+            // LocalPlayer.isSuppressingSlidingDownLadder.
+            if d[1] < 0.0 && !in_scaffolding && !self.abilities.flying && self.keys.shift {
                 d[1] = 0.0;
             }
             self.delta = d;
@@ -991,8 +1478,10 @@ impl LocalPlayer {
         if (self.horizontal_collision || self.jumping) && self.on_climbable(env) {
             movement[1] = 0.2;
         }
-        let movement_y = if env.has_chunk_at(below) {
-            movement[1] - self.attributes.gravity.value()
+        let movement_y = if let Some(levitation) = self.effects.get(MobEffect::Levitation) {
+            movement[1] + (0.05 * f64::from(levitation.amplifier + 1) - movement[1]) * 0.2
+        } else if env.has_chunk_at(below) {
+            movement[1] - self.effective_gravity()
         } else if self.position[1] > f64::from(env.level.min_y()) {
             -0.1
         } else {
@@ -1009,8 +1498,12 @@ impl LocalPlayer {
     }
 
     /// `LivingEntity.onClimbable`: the block the player is in is climbable, or an open
-    /// trapdoor above a ladder facing the same way.
+    /// trapdoor above a ladder facing the same way; never while flying or for a
+    /// spectator.
     pub(crate) fn on_climbable(&self, env: &Env<'_>) -> bool {
+        if self.abilities.flying || self.spectator {
+            return false;
+        }
         let pos = self.block_position();
         let state = env.state(pos);
         if env.tags.climbable(state) {
@@ -1079,8 +1572,12 @@ impl LocalPlayer {
         self.on_pos(env, 0.500001)
     }
 
-    /// `Entity.getBlockSpeedFactor` (with `LivingEntity`'s movement efficiency lerp).
+    /// `Entity.getBlockSpeedFactor` (with `LivingEntity`'s movement efficiency lerp);
+    /// none while flying.
     fn block_speed_factor(&self, env: &Env<'_>) -> f32 {
+        if self.abilities.flying || self.fall_flying() {
+            return 1.0;
+        }
         let here_state = env.state(self.block_position());
         let here = env.blocks.speed_factor(here_state);
         let name = env.blocks.name(here_state);
@@ -1106,8 +1603,20 @@ impl LocalPlayer {
         if f64::from(here) == 1.0 { below } else { here }
     }
 
-    /// `Entity.move` for the player moving itself.
+    /// `Entity.move` for the player moving itself; a spectator just goes there.
     fn do_move(&mut self, env: &Env<'_>, delta: [f64; 3]) {
+        if self.no_physics {
+            self.position = [
+                self.position[0] + delta[0],
+                self.position[1] + delta[1],
+                self.position[2] + delta[2],
+            ];
+            self.horizontal_collision = false;
+            self.vertical_collision = false;
+            self.vertical_collision_below = false;
+            self.minor_horizontal_collision = false;
+            return;
+        }
         let delta = self.back_off_from_edge(env, delta);
         let movement = self.collide(env, delta);
         let len = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
@@ -1175,7 +1684,7 @@ impl LocalPlayer {
             after[2] = -current[2] * restitution;
         }
         if self.vertical_collision {
-            let gravity = self.attributes.gravity.value();
+            let gravity = self.effective_gravity();
             if self.vertical_collision_below {
                 restitution = if !(-current[1] <= gravity) && !suppress {
                     restitution.max(f64::from(env.blocks.bounce(effect_state)))
@@ -1260,7 +1769,11 @@ impl LocalPlayer {
     /// `Player.maybeBackOffFromEdge`: sneaking stops at edges.
     fn back_off_from_edge(&self, env: &Env<'_>, delta: [f64; 3]) -> [f64; 3] {
         let max_down = self.attributes.step_height.value() as f32;
-        if delta[1] > 0.0 || !self.keys.shift || !self.above_ground(env, max_down) {
+        if self.abilities.flying
+            || delta[1] > 0.0
+            || !self.keys.shift
+            || !self.above_ground(env, max_down)
+        {
             return delta;
         }
         let max_down = f64::from(max_down);
@@ -1367,7 +1880,7 @@ impl LocalPlayer {
     /// changed).
     pub fn send_changes(&mut self) -> Vec<Vec<u8>> {
         use ruthenium_data::v26_3::packets::play::Serverbound as S;
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.outbox);
         if self.keys != self.last_sent_keys {
             out.push(wire::packet(S::PlayerInput.id(), |o| {
                 o.push(self.keys.bits())
@@ -1605,6 +2118,284 @@ mod tests {
         assert_eq!(p.chunk(), (0, 0));
         p.teleport(&at([-0.5, 0.0, -16.0], 0));
         assert_eq!(p.chunk(), (-1, -1));
+    }
+
+    /// Air, and stone (state 1) where the tests put it, in one chunk at the origin.
+    fn world() -> (Level, Blocks, BlockTags) {
+        use ruthenium_prepare::exporters::{BlockPhysics, ShapeData, StatePhysics};
+        let state = |shape, flags| StatePhysics {
+            shape,
+            flags,
+            friction: 0.6,
+            speed_factor: 1.0,
+            jump_factor: 1.0,
+            bounce: 0.0,
+            fluid: 0,
+            sturdy: 0,
+            offset: None,
+        };
+        let blocks = Blocks::new(&BlockPhysics {
+            shapes: vec![
+                ShapeData {
+                    coords: [vec![0.0, 1.0], vec![0.0, 1.0], vec![0.0, 1.0]],
+                    full: vec![false],
+                },
+                ShapeData {
+                    coords: [vec![0.0, 1.0], vec![0.0, 1.0], vec![0.0, 1.0]],
+                    full: vec![true],
+                },
+            ],
+            states: vec![state(0, 0), state(1, 0)],
+        });
+        let mut level = Level::new(-64, 384);
+        level.add_empty_chunk(0, 0);
+        // A stone floor under y = -60.
+        for x in 0..16 {
+            for z in 0..16 {
+                level.set_block(x, -61, z, 1);
+            }
+        }
+        (level, blocks, BlockTags::new())
+    }
+
+    fn standing(env: &Env<'_>, game_type: i32) -> LocalPlayer {
+        let mut p = LocalPlayer::new();
+        p.position = [8.5, -60.0, 8.5];
+        p.set_game_type(game_type);
+        p.stand(env);
+        p
+    }
+
+    const JUMP: Keys = Keys {
+        forward: false,
+        backward: false,
+        left: false,
+        right: false,
+        jump: true,
+        shift: false,
+        sprint: false,
+    };
+    const SHIFT: Keys = Keys {
+        shift: true,
+        jump: false,
+        ..JUMP
+    };
+    const NONE: Keys = Keys {
+        jump: false,
+        ..JUMP
+    };
+
+    #[test]
+    fn creative_flight_starts_on_a_double_tap_and_ends_on_landing() {
+        let (level, blocks, tags) = world();
+        let env = Env {
+            level: &level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+        };
+        // Survival never flies.
+        let mut p = standing(&env, play::SURVIVAL);
+        for keys in [JUMP, NONE, JUMP] {
+            p.tick(&env, keys);
+        }
+        assert!(!p.abilities.flying);
+
+        let mut p = standing(&env, play::CREATIVE);
+        p.tick(&env, JUMP);
+        // The first press jumps as usual and opens the window.
+        assert!(!p.abilities.flying && !p.on_ground);
+        p.send_changes();
+        p.tick(&env, NONE);
+        p.tick(&env, JUMP);
+        assert!(p.abilities.flying);
+        let id = ruthenium_data::v26_3::packets::play::Serverbound::PlayerAbilities.id() as u8;
+        assert_eq!(p.send_changes()[0], [id, 2]);
+        // Holding jump rises by three times the flying speed a tick, damped.
+        let y = p.position[1];
+        p.tick(&env, JUMP);
+        assert!(p.position[1] > y);
+        // Sinking onto the floor ends the flight.
+        for _ in 0..60 {
+            p.tick(&env, SHIFT);
+            if !p.abilities.flying {
+                break;
+            }
+        }
+        assert!(p.on_ground && !p.abilities.flying);
+        assert_eq!(p.send_changes()[0], [id, 0]);
+    }
+
+    #[test]
+    fn spectators_fly_through_blocks() {
+        let (level, blocks, tags) = world();
+        let env = Env {
+            level: &level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+        };
+        let mut p = standing(&env, play::SPECTATOR);
+        p.spectator = true;
+        assert!(p.abilities.flying && !p.abilities.may_build);
+        for _ in 0..10 {
+            p.tick(&env, SHIFT);
+        }
+        // Down through the floor, standing up (no crouching while flying), never on
+        // the ground.
+        assert!(p.position[1] < -61.0, "{}", p.position[1]);
+        assert_eq!(p.pose, Pose::Standing);
+        assert!(!p.on_ground && !p.vertical_collision);
+    }
+
+    fn player_types() -> EntityTypes {
+        use ruthenium_prepare::exporters::EntityTypeData;
+        let fields = [
+            ("Entity.DATA_SHARED_FLAGS_ID", 0),
+            ("Entity.DATA_AIR_SUPPLY_ID", 1),
+            ("Entity.DATA_NO_GRAVITY", 5),
+            ("Entity.DATA_POSE", 6),
+            ("LivingEntity.DATA_HEALTH_ID", 9),
+            ("Player.DATA_SCORE_ID", 16),
+        ];
+        EntityTypes::new(&[EntityTypeData {
+            id: 155,
+            key: "minecraft:player".into(),
+            width: 0.6,
+            height: 1.8,
+            eye_height: 1.62,
+            fixed: false,
+            update_interval: 2,
+            classes: ["Player", "Avatar", "LivingEntity", "Entity"]
+                .map(str::to_owned)
+                .to_vec(),
+            fields: fields.map(|(n, i)| (n.to_owned(), i, 0)).to_vec(),
+            baby: None,
+        }])
+    }
+
+    #[test]
+    fn the_servers_entity_data_overrides_the_clients() {
+        let types = player_types();
+        let mut p = LocalPlayer::new();
+        p.set_sprinting(true);
+        // The echo of an old "not sprinting" clears the flag but not the speed boost.
+        p.set_data(&[(0, DataValue::Byte(flag::ON_FIRE as i8))], &types);
+        assert!(!p.sprinting);
+        assert_eq!(p.data.flags, flag::ON_FIRE);
+        assert_eq!(p.attributes.movement_speed.modifiers.len(), 1);
+        p.set_data(
+            &[
+                (6, DataValue::Pose(Pose::Crouching.id())),
+                (5, DataValue::Boolean(true)),
+                (1, DataValue::Int(120)),
+                (9, DataValue::Float(7.5)),
+                (16, DataValue::Int(3)),
+            ],
+            &types,
+        );
+        assert_eq!(p.pose, Pose::Crouching);
+        assert_eq!(p.bounding_box().max[1], 1.5);
+        assert_eq!(p.effective_gravity(), 0.0);
+        assert_eq!((p.data.air_supply, p.health, p.data.score), (120, 7.5, 3));
+        // An unknown field or a wrong kind changes nothing.
+        p.set_data(&[(6, DataValue::Int(3)), (40, DataValue::Int(1))], &types);
+        assert_eq!(p.pose, Pose::Crouching);
+    }
+
+    #[test]
+    fn effects_change_jumps_and_falls() {
+        let mut p = LocalPlayer::new();
+        assert_eq!(p.jump_boost_power(), 0.0);
+        p.update_effect(Effect {
+            id: MobEffect::JumpBoost.id() as i32,
+            amplifier: 1,
+            duration: 100,
+            flags: 0,
+        });
+        assert_eq!(p.jump_boost_power(), 0.2);
+        p.update_effect(Effect {
+            id: MobEffect::SlowFalling.id() as i32,
+            amplifier: 0,
+            duration: 100,
+            flags: 0,
+        });
+        // Slow falling caps gravity only while falling.
+        p.delta[1] = -0.5;
+        assert_eq!(p.effective_gravity(), 0.01);
+        p.delta[1] = 0.1;
+        assert_eq!(p.effective_gravity(), 0.08);
+        assert!(p.sprinting_possible(false));
+        p.update_effect(Effect {
+            id: MobEffect::Blindness.id() as i32,
+            amplifier: 0,
+            duration: 100,
+            flags: 0,
+        });
+        assert!(!p.sprinting_possible(true));
+        p.remove_effect(MobEffect::Blindness.id() as i32);
+        assert!(p.sprinting_possible(false));
+    }
+
+    #[test]
+    fn abilities_follow_the_game_mode_and_the_server() {
+        let mut a = Abilities::default();
+        a.set_game_type(play::CREATIVE);
+        assert!(a.may_fly && a.instabuild && a.invulnerable && !a.flying && a.may_build);
+        a.flying = true;
+        a.set_game_type(play::SURVIVAL);
+        assert!(!a.may_fly && !a.flying && a.may_build);
+        a.set_game_type(play::ADVENTURE);
+        assert!(!a.may_build);
+        a.set_game_type(play::SPECTATOR);
+        assert!(a.flying && a.may_fly && !a.instabuild && !a.may_build);
+        a.apply(play::ABILITY_MAY_FLY, 0.1, 0.2);
+        assert!(a.may_fly && !a.flying && !a.invulnerable && !a.may_build);
+        assert_eq!((a.flying_speed, a.walking_speed), (0.1, 0.2));
+    }
+
+    #[test]
+    fn a_respawn_keeps_what_the_server_says() {
+        let mut p = LocalPlayer::new();
+        p.entity_id = 7;
+        p.set_game_type(play::CREATIVE);
+        p.abilities.flying = true;
+        p.set_sprinting(true);
+        p.delta = [0.1, 0.2, 0.3];
+        p.y_rot = 45.0;
+        p.health = 6.0;
+        p.attributes.gravity.base = 0.05;
+        p.update_effect(Effect {
+            id: MobEffect::Speed.id() as i32,
+            amplifier: 0,
+            duration: 100,
+            flags: 0,
+        });
+        let fresh = p.respawned(0);
+        assert_eq!(fresh.entity_id, 7);
+        assert!(!fresh.sprinting && !fresh.was_sprinting && !fresh.abilities.flying);
+        assert!(fresh.abilities.may_fly);
+        assert_eq!(
+            (fresh.delta, fresh.y_rot, fresh.health),
+            ([0.0; 3], -180.0, 20.0)
+        );
+        assert_eq!(fresh.attributes.gravity.base, 0.05);
+        assert!(fresh.attributes.movement_speed.modifiers.is_empty());
+        assert!(fresh.effects.is_empty());
+        let kept = p.respawned(KEEP_ENTITY_DATA | KEEP_ATTRIBUTES);
+        assert!(kept.sprinting && kept.was_sprinting);
+        assert_eq!((kept.delta, kept.y_rot, kept.health), (p.delta, 45.0, 6.0));
+        assert_eq!(kept.attributes, p.attributes);
+        assert!(kept.effects.is_empty());
+    }
+
+    #[test]
+    fn poses_by_id_and_name() {
+        assert_eq!(Pose::from_id(5), Pose::Crouching);
+        assert_eq!(Pose::from_id(99), Pose::Standing);
+        assert_eq!(Pose::from_name("SPIN_ATTACK"), Some(Pose::SpinAttack));
+        assert_eq!(Pose::Dying.size(), (0.2, 0.2));
+        assert_eq!(Pose::FallFlying.eye_height(), 0.4);
     }
 
     #[test]

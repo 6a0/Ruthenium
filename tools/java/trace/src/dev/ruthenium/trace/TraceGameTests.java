@@ -105,6 +105,7 @@ public final class TraceGameTests implements FabricClientGameTest {
         if (mc.player != null) {
             o.addProperty("entityId", mc.player.getId());
             o.addProperty("playerName", mc.player.getGameProfile().name());
+            o.addProperty("playerUuid", mc.player.getUUID().toString());
         }
         o.addProperty("harness", "Fabric client gametest: one client tick per frame, one server tick per client tick");
         return o;

@@ -40,6 +40,7 @@ use ruthenium_protocol::packets::{Common, KnownPack, PackAction, play, read_bran
 
 use crate::blocks::{BlockTags, Blocks};
 use crate::clock::{self, TickClock};
+use crate::effect::Effect;
 use crate::entity::{Entities, EntityTypes, Local as LocalInfo, PlayerInfos, Teams, TickContext};
 use crate::input::next_scroll_selection;
 use crate::level_load::LevelLoad;
@@ -133,6 +134,11 @@ pub struct PlayerView {
     pub on_ground: bool,
     pub sprinting: bool,
     pub pose: Pose,
+    pub flying: bool,
+    pub game_type: i32,
+    /// The effects on the player: (registry id, amplifier, ticks left or -1).
+    pub effects: Vec<(i32, i32, i32)>,
+    pub health: f32,
     pub selected_slot: i32,
     pub chunks: usize,
     /// Other entities the client tracks.
@@ -307,8 +313,10 @@ struct Game {
     keys: Keys,
     /// Hotbar key presses not yet read (`KeyMapping.clickCount`).
     hotbar_clicks: [u32; 9],
-    /// The profile name the server knows the player by (its scoreboard name).
+    /// The profile name the server knows the player by (its scoreboard name), and its
+    /// UUID (its player list entry).
     name: String,
+    uuid: u128,
     /// The player list and the scoreboard's teams (the play listener's, gone with it
     /// on a reconfiguration).
     players: PlayerInfos,
@@ -327,13 +335,10 @@ const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
 #[derive(Debug)]
 struct World {
     dimension: String,
-    game_type: i32,
     player: LocalPlayer,
     level: Level,
     /// The other entities in the level.
     entities: Entities,
-    /// The player's health (`set_health`): a dead player isn't pushed.
-    health: f32,
     /// Bits of the biome palette (from the biome registry's size).
     biome_bits: u32,
     /// Until the player counts as loaded.
@@ -356,13 +361,14 @@ impl World {
         biome_bits: u32,
         entities: Entities,
     ) -> World {
+        // `handleLogin`: the game mode's abilities.
+        let mut player = LocalPlayer::new();
+        player.set_game_type(spawn.game_type);
         World {
             dimension: spawn.dimension.clone(),
-            game_type: spawn.game_type,
-            player: LocalPlayer::new(),
+            player,
             level,
             entities,
-            health: 20.0,
             biome_bits,
             load: Some(LevelLoad::start(now)),
             loaded: false,
@@ -404,6 +410,7 @@ impl Game {
             keys: Keys::default(),
             hotbar_clicks: [0; 9],
             name: String::new(),
+            uuid: 0,
             players: PlayerInfos::default(),
             teams: Teams::default(),
         }
@@ -485,7 +492,7 @@ impl Game {
         let Some(w) = &mut self.world else {
             return;
         };
-        if w.game_type != play::SPECTATOR {
+        if !w.player.spectator {
             for &wheel in &input.scrolls {
                 w.selected_slot = next_scroll_selection(f64::from(wheel), w.selected_slot, 9);
             }
@@ -505,6 +512,15 @@ impl Game {
             on_ground: w.player.on_ground,
             sprinting: w.player.sprinting,
             pose: w.player.pose,
+            flying: w.player.abilities.flying,
+            game_type: w.player.game_type(),
+            effects: w
+                .player
+                .effects
+                .iter()
+                .map(|e| (e.id, e.amplifier, e.duration))
+                .collect(),
+            health: w.player.health,
             selected_slot: w.selected_slot,
             chunks: w.level.chunk_count(),
             entities: w.entities.len(),
@@ -533,6 +549,7 @@ impl Game {
                 self.phase = Phase::Configuration;
                 eprintln!("[session] logged in as {}", profile.name);
                 self.name = profile.name.clone();
+                self.uuid = profile.id;
                 self.report(SessionEvent::LoggedIn { name: profile.name });
             }
             Event::Configuration(p) => {
@@ -642,7 +659,7 @@ impl Game {
         if let Some(load) = &mut w.load {
             let (cx, cz) = w.player.chunk();
             let chunk = w.level.has_chunk(cx, cz);
-            load.tick(now, chunk, w.game_type == play::SPECTATOR);
+            load.tick(now, chunk, w.player.spectator);
             if load.is_ready(now) {
                 w.load = None;
                 if !w.loaded {
@@ -662,7 +679,7 @@ impl Game {
         for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
             if *pending > 0 {
                 *pending -= 1;
-                if w.game_type != play::SPECTATOR {
+                if !w.player.spectator {
                     w.selected_slot = slot as i32;
                 }
             }
@@ -682,8 +699,8 @@ impl Game {
                 players: &self.players,
                 local: LocalInfo {
                     name: &self.name,
-                    spectator: w.game_type == play::SPECTATOR,
-                    health: w.health,
+                    spectator: w.player.spectator,
+                    health: w.player.health,
                 },
                 tick_rate: w.tick_rate,
                 runs_normally: !w.frozen,
@@ -849,7 +866,10 @@ impl Game {
                 world.player.entity_id = login.player_id;
                 self.world = Some(world);
             }
-            play::Clientbound::Respawn { spawn, .. } => {
+            play::Clientbound::Respawn {
+                spawn,
+                data_to_keep,
+            } => {
                 let (level, biome_bits) = self.new_level(&spawn);
                 let id = self
                     .world
@@ -867,12 +887,10 @@ impl Game {
                 } else {
                     w.entities.local_respawned();
                 }
-                w.health = 20.0;
-                w.game_type = spawn.game_type;
-                // `handleRespawn`: a new player, not loaded until the level is ready.
-                let old = std::mem::take(&mut w.player);
-                w.player.entity_id = old.entity_id;
-                (w.player.y_rot, w.player.x_rot) = (old.y_rot, old.x_rot);
+                // `handleRespawn`: a new player, with what the server says to keep, in
+                // the new game mode; not loaded until the level is ready.
+                w.player = w.player.respawned(data_to_keep);
+                w.player.set_game_type(spawn.game_type);
                 w.loaded = false;
                 w.load = Some(LevelLoad::start(now));
                 w.level_started = now;
@@ -892,7 +910,9 @@ impl Game {
             play::Clientbound::GameEvent { event, param } => {
                 if let Some(w) = &mut self.world {
                     match event {
-                        GAME_EVENT_CHANGE_GAME_MODE => w.game_type = param as i32,
+                        GAME_EVENT_CHANGE_GAME_MODE => {
+                            w.player.set_game_type((param + 0.5).floor() as i32)
+                        }
                         GAME_EVENT_LEVEL_CHUNKS_LOAD_START => {
                             if let Some(l) = &mut w.load {
                                 l.loading_packets_received();
@@ -1040,8 +1060,12 @@ impl Game {
                 if let Some(w) = &mut self.world
                     && let Some(physics) = &self.physics
                 {
-                    w.entities
-                        .set_data(entity_id, &values, &physics.entity_types);
+                    if entity_id == w.player.entity_id {
+                        w.player.set_data(&values, &physics.entity_types);
+                    } else {
+                        w.entities
+                            .set_data(entity_id, &values, &physics.entity_types);
+                    }
                 }
             }
             play::Clientbound::SetPassengers {
@@ -1061,14 +1085,61 @@ impl Game {
                 .teams
                 .apply(&name, method, parameters.as_ref(), &players),
             play::Clientbound::PlayerInfoUpdate { actions, entries } => {
+                if let Some(w) = &mut self.world
+                    && let Some(mode) = self.players.changed_game_mode(self.uuid, actions, &entries)
+                {
+                    w.player.on_game_mode_changed(mode);
+                }
                 self.players.update(actions, &entries);
+                // `isSpectator` reads the player's entry (kept once found, so a removal
+                // leaves it as it was).
+                if let Some(w) = &mut self.world
+                    && let Some(info) = self.players.get(self.uuid)
+                {
+                    w.player.spectator = info.game_mode == play::SPECTATOR;
+                }
             }
             play::Clientbound::PlayerInfoRemove { ids } => self.players.remove(&ids),
             play::Clientbound::SetHealth { health, food, .. } => {
                 // `hurtTo` and the food level.
                 if let Some(w) = &mut self.world {
-                    w.health = health;
+                    w.player.health = health;
                     w.player.food = food;
+                }
+            }
+            play::Clientbound::PlayerAbilities {
+                flags,
+                flying_speed,
+                walking_speed,
+            } => {
+                if let Some(w) = &mut self.world {
+                    w.player.abilities.apply(flags, flying_speed, walking_speed);
+                }
+            }
+            play::Clientbound::UpdateMobEffect {
+                entity_id,
+                effect,
+                amplifier,
+                duration,
+                flags,
+            } => {
+                // Other entities' effects don't move them on the client.
+                if let Some(w) = &mut self.world
+                    && entity_id == w.player.entity_id
+                {
+                    w.player.update_effect(Effect {
+                        id: effect,
+                        amplifier,
+                        duration,
+                        flags,
+                    });
+                }
+            }
+            play::Clientbound::RemoveMobEffect { entity_id, effect } => {
+                if let Some(w) = &mut self.world
+                    && entity_id == w.player.entity_id
+                {
+                    w.player.remove_effect(effect);
                 }
             }
             // The connection thread answers these.

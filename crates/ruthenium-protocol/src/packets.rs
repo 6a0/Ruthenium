@@ -675,8 +675,24 @@ pub mod play {
         }
     }
 
-    /// The game type id of spectator mode (`GameType.SPECTATOR`).
+    /// Game type ids (`GameType`).
+    pub const SURVIVAL: i32 = 0;
+    pub const CREATIVE: i32 = 1;
+    pub const ADVENTURE: i32 = 2;
     pub const SPECTATOR: i32 = 3;
+
+    /// `ClientboundPlayerAbilitiesPacket`'s flag bits (the serverbound packet carries
+    /// only `ABILITY_FLYING`).
+    pub const ABILITY_INVULNERABLE: u8 = 1;
+    pub const ABILITY_FLYING: u8 = 1 << 1;
+    pub const ABILITY_MAY_FLY: u8 = 1 << 2;
+    pub const ABILITY_INSTABUILD: u8 = 1 << 3;
+
+    /// `ClientboundUpdateMobEffectPacket`'s flag bits.
+    pub const EFFECT_AMBIENT: u8 = 1;
+    pub const EFFECT_VISIBLE: u8 = 1 << 1;
+    pub const EFFECT_SHOW_ICON: u8 = 1 << 2;
+    pub const EFFECT_BLEND: u8 = 1 << 3;
 
     /// Joining the world (`ClientboundLoginPacket`).
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1136,6 +1152,28 @@ pub mod play {
             food: i32,
             saturation: f32,
         },
+        /// `ClientboundPlayerAbilitiesPacket`: the flag bits (`ABILITY_*`) and the
+        /// speeds.
+        PlayerAbilities {
+            flags: u8,
+            flying_speed: f32,
+            walking_speed: f32,
+        },
+        /// `ClientboundUpdateMobEffectPacket`: an effect (`minecraft:mob_effect` id)
+        /// added to an entity or changed; the flag bits are `EFFECT_*`. A duration of
+        /// -1 is infinite.
+        UpdateMobEffect {
+            entity_id: i32,
+            effect: i32,
+            amplifier: i32,
+            duration: i32,
+            flags: u8,
+        },
+        /// `ClientboundRemoveMobEffectPacket`.
+        RemoveMobEffect {
+            entity_id: i32,
+            effect: i32,
+        },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
     }
@@ -1446,6 +1484,22 @@ pub mod play {
                     food: r.varint()?,
                     saturation: r.f32()?,
                 },
+                C::PlayerAbilities => Clientbound::PlayerAbilities {
+                    flags: r.u8()?,
+                    flying_speed: r.f32()?,
+                    walking_speed: r.f32()?,
+                },
+                C::UpdateMobEffect => Clientbound::UpdateMobEffect {
+                    entity_id: r.varint()?,
+                    effect: r.varint()?,
+                    amplifier: r.varint()?,
+                    duration: r.varint()?,
+                    flags: r.u8()?,
+                },
+                C::RemoveMobEffect => Clientbound::RemoveMobEffect {
+                    entity_id: r.varint()?,
+                    effect: r.varint()?,
+                },
                 other => {
                     r.rest();
                     Clientbound::Other(other)
@@ -1492,6 +1546,13 @@ pub mod play {
 
     pub fn player_loaded() -> Vec<u8> {
         wire::packet(pl::Serverbound::PlayerLoaded.id(), |_| {})
+    }
+
+    /// `ServerboundPlayerAbilitiesPacket`: only whether the player flies.
+    pub fn player_abilities(flying: bool) -> Vec<u8> {
+        wire::packet(pl::Serverbound::PlayerAbilities.id(), |o| {
+            o.push(if flying { ABILITY_FLYING } else { 0 })
+        })
     }
 
     pub fn set_carried_item(slot: i32) -> Vec<u8> {
@@ -1671,6 +1732,53 @@ mod tests {
             play::Clientbound::ForgetLevelChunk { x: 5, z: -2 }
         );
         assert_eq!(play::keep_alive(1)[0], 28);
+    }
+
+    #[test]
+    fn play_reads_abilities_and_effects() {
+        let decode =
+            |kind: pl::Clientbound, b: &[u8]| play::Clientbound::decode(kind.id(), b).unwrap();
+        // Creative: invulnerable, may fly, instabuild; vanilla's speeds.
+        let mut b = vec![0b1101];
+        wire::write_f32(&mut b, 0.05);
+        wire::write_f32(&mut b, 0.1);
+        assert_eq!(
+            decode(pl::Clientbound::PlayerAbilities, &b),
+            play::Clientbound::PlayerAbilities {
+                flags: play::ABILITY_INVULNERABLE
+                    | play::ABILITY_MAY_FLY
+                    | play::ABILITY_INSTABUILD,
+                flying_speed: 0.05,
+                walking_speed: 0.1,
+            }
+        );
+        // Jump boost II on entity 300 for 200 ticks, visible with an icon.
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 300);
+        wire::write_varint(&mut b, 7);
+        wire::write_varint(&mut b, 1);
+        wire::write_varint(&mut b, 200);
+        b.push(play::EFFECT_VISIBLE | play::EFFECT_SHOW_ICON);
+        assert_eq!(
+            decode(pl::Clientbound::UpdateMobEffect, &b),
+            play::Clientbound::UpdateMobEffect {
+                entity_id: 300,
+                effect: 7,
+                amplifier: 1,
+                duration: 200,
+                flags: 6,
+            }
+        );
+        assert_eq!(
+            decode(pl::Clientbound::RemoveMobEffect, &[0x2a, 27]),
+            play::Clientbound::RemoveMobEffect {
+                entity_id: 42,
+                effect: 27,
+            }
+        );
+        let id = pl::Serverbound::PlayerAbilities.id() as u8;
+        assert_eq!(play::player_abilities(true), [id, 2]);
+        assert_eq!(play::player_abilities(false), [id, 0]);
     }
 
     #[test]

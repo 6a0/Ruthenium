@@ -9,9 +9,10 @@
 use std::path::{Path, PathBuf};
 
 use ruthenium_data::v26_3::{Block, BlockState};
-use ruthenium_protocol::packets::play::Clientbound;
+use ruthenium_protocol::packets::play::{self, Clientbound};
 use ruthenium_protocol::wire::Reader;
 use ruthenium_sim::blocks::{BlockTags, Blocks};
+use ruthenium_sim::effect::Effect;
 use ruthenium_sim::entity::{Entities, EntityTypes, Local, PlayerInfos, Teams, TickContext};
 use ruthenium_sim::player::{Env, Keys, LocalPlayer, Pose};
 use ruthenium_sim::world::Level;
@@ -143,8 +144,10 @@ fn keys(down: &serde_json::Value) -> Keys {
     }
 }
 
-/// Movement packets `sendChanges` sends.
-const SENT: [&str; 6] = [
+/// The packets the player's tick sends: abilities when flight toggles, then
+/// `sendChanges`'s.
+const SENT: [&str; 7] = [
+    "minecraft:player_abilities",
     "minecraft:player_input",
     "minecraft:player_command",
     "minecraft:move_player_pos",
@@ -184,7 +187,9 @@ struct Client {
     entities: Entities,
     teams: Teams,
     players: PlayerInfos,
-    health: f32,
+    /// The local player's name, and its UUID once its player list entry is seen.
+    name: String,
+    uuid: Option<u128>,
 }
 
 /// A packet the client handled, as `Session` handles it (the parts that reach the
@@ -226,7 +231,53 @@ fn handle(bytes: &[u8], c: &mut Client, p: &mut LocalPlayer, types: &EntityTypes
             .position_sync(entity_id, &path, y_rot, x_rot, on_ground),
         Clientbound::SetEntityData {
             entity_id, values, ..
-        } => c.entities.set_data(entity_id, &values, types),
+        } => {
+            if entity_id == p.entity_id {
+                p.set_data(&values, types);
+            } else {
+                c.entities.set_data(entity_id, &values, types);
+            }
+        }
+        Clientbound::PlayerAbilities {
+            flags,
+            flying_speed,
+            walking_speed,
+        } => p.abilities.apply(flags, flying_speed, walking_speed),
+        Clientbound::UpdateMobEffect {
+            entity_id,
+            effect,
+            amplifier,
+            duration,
+            flags,
+        } if entity_id == p.entity_id => p.update_effect(Effect {
+            id: effect,
+            amplifier,
+            duration,
+            flags,
+        }),
+        Clientbound::RemoveMobEffect { entity_id, effect } if entity_id == p.entity_id => {
+            p.remove_effect(effect)
+        }
+        // CHANGE_GAME_MODE.
+        Clientbound::GameEvent { event: 3, param } => p.set_game_type((param + 0.5).floor() as i32),
+        Clientbound::PlayerInfoUpdate { actions, entries } => {
+            if let Some(e) = entries
+                .iter()
+                .find(|e| e.name.as_deref() == Some(c.name.as_str()))
+            {
+                c.uuid = Some(e.uuid);
+            }
+            if let Some(mode) = c
+                .uuid
+                .and_then(|u| c.players.changed_game_mode(u, actions, &entries))
+            {
+                p.on_game_mode_changed(mode);
+            }
+            c.players.update(actions, &entries);
+            if let Some(info) = c.uuid.and_then(|u| c.players.get(u)) {
+                p.spectator = info.game_mode == 3;
+            }
+        }
         Clientbound::SetPassengers {
             vehicle,
             passengers,
@@ -258,7 +309,7 @@ fn handle(bytes: &[u8], c: &mut Client, p: &mut LocalPlayer, types: &EntityTypes
             }
         }
         Clientbound::SetHealth { health, food, .. } => {
-            c.health = health;
+            p.health = health;
             p.food = food;
         }
         _ => {}
@@ -294,16 +345,32 @@ fn replay_from(
     p.x_rot = tp[4] as f32;
     p.stand(&env);
     p.set_position_reminder(reminder);
+    let name = t.header["playerName"].as_str().unwrap_or("").to_owned();
+    // The player's own list entry, added before the trace began (in survival).
+    let uuid = t.header["playerUuid"]
+        .as_str()
+        .map(|u| u128::from_str_radix(&u.replace('-', ""), 16).unwrap());
+    let mut players = PlayerInfos::default();
+    if let Some(uuid) = uuid {
+        players.update(
+            play::PLAYER_INFO_ADD | play::PLAYER_INFO_GAME_MODE,
+            &[play::PlayerInfoEntry {
+                uuid,
+                name: Some(name.clone()),
+                game_mode: Some(0),
+            }],
+        );
+    }
     let mut client = Client {
         entities: Entities::new(p.entity_id, false),
         teams: Teams::default(),
-        players: PlayerInfos::default(),
-        health: 20.0,
+        players,
+        name: name.clone(),
+        uuid,
     };
     for (cx, cz) in CHUNKS {
         client.entities.chunk_loaded(cx, cz);
     }
-    let name = t.header["playerName"].as_str().unwrap_or("").to_owned();
     let mut ticks = 0;
     let records = &t.records;
     // Packets handled after a tick began, applied before the next one (packets are
@@ -332,8 +399,8 @@ fn replay_from(
             players: &client.players,
             local: Local {
                 name: &name,
-                spectator: false,
-                health: client.health,
+                spectator: p.spectator,
+                health: p.health,
             },
             tick_rate: 20.0,
             runs_normally: true,
@@ -362,11 +429,7 @@ fn replay_from(
             i += 1;
         }
         let s = state.ok_or((n, format!("tick {n}: no state")))?;
-        let pose = match s.str("pose").unwrap() {
-            "STANDING" => Pose::Standing,
-            "CROUCHING" => Pose::Crouching,
-            _ => Pose::Swimming,
-        };
+        let pose = Pose::from_name(s.str("pose").unwrap()).unwrap();
         let got = (
             p.position,
             p.delta,
@@ -374,6 +437,7 @@ fn replay_from(
             p.horizontal_collision,
             p.sprinting,
             p.pose,
+            p.abilities.flying,
         );
         let exp = (
             s.vec3("pos").unwrap(),
@@ -382,24 +446,27 @@ fn replay_from(
             s.bool("hColl").unwrap(),
             s.bool("sprinting").unwrap(),
             pose,
+            s.bool("flying").unwrap(),
         );
         if got != exp || sent != want {
             return Err((
                 n,
                 format!(
-                    "tick {n} (heartbeat count {reminder}):\n  got  pos {:?} vel {:?} ground {} hcoll {} sprint {} pose {:?}\n  want pos {:?} vel {:?} ground {} hcoll {} sprint {} pose {:?}\n  sent {:02x?}\n  want {:02x?}",
+                    "tick {n} (heartbeat count {reminder}):\n  got  pos {:?} vel {:?} ground {} hcoll {} sprint {} pose {:?} flying {}\n  want pos {:?} vel {:?} ground {} hcoll {} sprint {} pose {:?} flying {}\n  sent {:02x?}\n  want {:02x?}",
                     got.0,
                     got.1,
                     got.2,
                     got.3,
                     got.4,
                     got.5,
+                    got.6,
                     exp.0,
                     exp.1,
                     exp.2,
                     exp.3,
                     exp.4,
                     exp.5,
+                    exp.6,
                     sent,
                     want
                 ),
@@ -414,7 +481,7 @@ fn replay_from(
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 17] = [
+const EXACT: [&str; 20] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -432,6 +499,9 @@ const EXACT: [&str; 17] = [
     "entity_push",
     "entity_moving",
     "entity_rules",
+    "flying",
+    "spectator",
+    "effects",
 ];
 
 #[test]
@@ -461,6 +531,9 @@ fn golden_traces() {
         "entity_push",
         "entity_moving",
         "entity_rules",
+        "flying",
+        "spectator",
+        "effects",
     ];
     let mut failed = Vec::new();
     for name in all {

@@ -159,6 +159,37 @@ pub struct TypeInfo {
     cube_size_field: Option<u8>,
 }
 
+/// The ids of the player's synched-data fields the client reads (from the export, so
+/// a field the export lacks is never matched).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerFields {
+    pub shared_flags: Option<u8>,
+    pub air_supply: Option<u8>,
+    pub no_gravity: Option<u8>,
+    pub pose: Option<u8>,
+    pub ticks_frozen: Option<u8>,
+    pub living_flags: Option<u8>,
+    pub health: Option<u8>,
+    pub absorption: Option<u8>,
+    pub score: Option<u8>,
+}
+
+impl PlayerFields {
+    fn new(d: &EntityTypeData) -> PlayerFields {
+        PlayerFields {
+            shared_flags: d.field("Entity.DATA_SHARED_FLAGS_ID"),
+            air_supply: d.field("Entity.DATA_AIR_SUPPLY_ID"),
+            no_gravity: d.field("Entity.DATA_NO_GRAVITY"),
+            pose: d.field("Entity.DATA_POSE"),
+            ticks_frozen: d.field("Entity.DATA_TICKS_FROZEN"),
+            living_flags: d.field("LivingEntity.DATA_LIVING_ENTITY_FLAGS"),
+            health: d.field("LivingEntity.DATA_HEALTH_ID"),
+            absorption: d.field("Player.DATA_PLAYER_ABSORPTION_ID"),
+            score: d.field("Player.DATA_SCORE_ID"),
+        }
+    }
+}
+
 /// Every entity type, by network id.
 #[derive(Debug, Clone, Default)]
 pub struct EntityTypes {
@@ -167,6 +198,7 @@ pub struct EntityTypes {
     pose_field: Option<u8>,
     /// `LivingEntity.DATA_HEALTH_ID`.
     health_field: Option<u8>,
+    player: PlayerFields,
 }
 
 impl EntityTypes {
@@ -174,7 +206,11 @@ impl EntityTypes {
         let mut types = Vec::new();
         let mut pose_field = None;
         let mut health_field = None;
+        let mut player = PlayerFields::default();
         for d in data {
+            if d.key == "minecraft:player" {
+                player = PlayerFields::new(d);
+            }
             let living = d.is("LivingEntity");
             let follow = if living {
                 if d.is("Shulker") {
@@ -248,7 +284,13 @@ impl EntityTypes {
             types,
             pose_field,
             health_field,
+            player,
         }
+    }
+
+    /// The local player's synched-data fields.
+    pub fn player_fields(&self) -> &PlayerFields {
+        &self.player
     }
 
     /// Reads the prepared game's export (`entity_dimensions.bin`).
@@ -992,6 +1034,24 @@ impl PlayerInfos {
         for id in ids {
             self.players.remove(id);
         }
+    }
+
+    /// The game mode an update gives `uuid`'s entry, if it changes it (a new entry
+    /// starts in survival). Ask before applying the update.
+    pub fn changed_game_mode(
+        &self,
+        uuid: u128,
+        actions: u8,
+        entries: &[play::PlayerInfoEntry],
+    ) -> Option<i32> {
+        let e = entries.iter().find(|e| e.uuid == uuid)?;
+        let new = e.game_mode?;
+        let old = match self.players.get(&uuid) {
+            Some(p) => p.game_mode,
+            None if actions & play::PLAYER_INFO_ADD != 0 && e.name.is_some() => 0,
+            None => return None,
+        };
+        (old != new).then_some(new)
     }
 
     pub fn get(&self, uuid: u128) -> Option<&PlayerInfo> {

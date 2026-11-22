@@ -61,6 +61,13 @@ public final class Scenarios {
         server.runCommand("effect give @e[type=!minecraft:player] minecraft:fire_resistance infinite 0 true");
     }
 
+    /** Presses jump twice within the 7-tick window, the second press held for {@code ticks}. */
+    private static void doubleTapJump(ClientGameTestContext ctx, int ticks) {
+        hold(ctx, 1, JUMP);
+        ctx.waitTicks(2);
+        hold(ctx, ticks, JUMP);
+    }
+
     private static double[] start(double x, double y, double z, double yaw, double pitch) {
         return new double[] {x, y, z, yaw, pitch};
     }
@@ -299,6 +306,78 @@ public final class Scenarios {
                         hold(ctx, 15, W);
                         ctx.waitTicks(20);
                         server.runCommand("kill @e[type=minecraft:oak_boat]");
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("flying",
+                    "Creative flight: double-tap jump to take off and rise, fly forward, sprint-fly, strafe, sink with sneak, hover; double-tap to drop, take off again and land, which ends the flight.",
+                    List.of(), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("gamemode creative @a");
+                        ctx.waitTicks(5);
+                        doubleTapJump(ctx, 10);
+                        hold(ctx, 10, W);
+                        hold(ctx, 10, W, SPRINT);
+                        ctx.waitTicks(5);
+                        hold(ctx, 10, A);
+                        hold(ctx, 6, SNEAK);
+                        ctx.waitTicks(10);
+                        doubleTapJump(ctx, 1);
+                        ctx.waitTicks(30);
+                        doubleTapJump(ctx, 6);
+                        hold(ctx, 30, SNEAK);
+                        ctx.waitTicks(10);
+                        server.runCommand("gamemode survival @a");
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("spectator",
+                    "Spectator mode: sink through the floor and come back up, fly through a wall, sprint-fly, rise, then back to survival in the air and fall.",
+                    List.of("fill 4 -60 -3 4 -57 3 minecraft:stone"), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("gamemode spectator @a");
+                        ctx.waitTicks(5);
+                        hold(ctx, 8, SNEAK);
+                        hold(ctx, 12, JUMP);
+                        hold(ctx, 15, W);
+                        hold(ctx, 10, W, SPRINT);
+                        ctx.waitTicks(10);
+                        hold(ctx, 8, JUMP);
+                        server.runCommand("gamemode survival @a");
+                        ctx.waitTicks(30);
+                    }),
+            new Scenario("effects",
+                    "Effects that move the player: jumps with jump boost II, levitation V, slow falling back down while walking, speed III, blindness ending a sprint and stopping a new one, then dolphin's grace sprint-swimming across a pool.",
+                    List.of("fill 22 -62 -3 30 -61 3 minecraft:water"), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("effect give @a minecraft:jump_boost 60 1");
+                        ctx.waitTicks(3);
+                        hold(ctx, 25, JUMP);
+                        ctx.waitTicks(15);
+                        server.runCommand("effect clear @a minecraft:jump_boost");
+                        server.runCommand("effect give @a minecraft:levitation 60 4");
+                        ctx.waitTicks(30);
+                        server.runCommand("effect clear @a minecraft:levitation");
+                        server.runCommand("effect give @a minecraft:slow_falling 60 0");
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(35);
+                        server.runCommand("effect clear @a minecraft:slow_falling");
+                        server.runCommand("effect give @a minecraft:speed 60 2");
+                        ctx.waitTicks(3);
+                        hold(ctx, 15, W);
+                        hold(ctx, 10, W, SPRINT);
+                        server.runCommand("effect clear @a minecraft:speed");
+                        ctx.waitTicks(10);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        ctx.waitTicks(10);
+                        server.runCommand("effect give @a minecraft:blindness 60 0");
+                        ctx.waitTicks(10);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.waitTicks(5);
+                        hold(ctx, 10, W, SPRINT);
+                        server.runCommand("effect clear @a minecraft:blindness");
+                        server.runCommand("effect give @a minecraft:dolphins_grace 60 0");
+                        ctx.waitTicks(5);
+                        hold(ctx, 30, W, SPRINT);
+                        ctx.waitTicks(10);
+                        server.runCommand("effect clear @a");
                         ctx.waitTicks(5);
                     }));
 }
