@@ -318,7 +318,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut failed = false;
     if let Some((c, deferred, transferred)) = renderer.upload_check() {
         eprintln!(
-            "[ruthenium] upload check: {} chunks ({:.1} MiB) compared, {} mismatched; ready after {:.2} frames on average; {} texture read-backs ({} rectangles written, {} destroyed before arriving), {} mismatched; {} retries when full, {} deferred transfer submits, {} images on the transfer queue",
+            "[ruthenium] upload check: {} chunks ({:.1} MiB) compared, {} mismatched; ready after {:.2} frames on average; {} texture read-backs ({} rectangles written, {} destroyed before arriving), {} mismatched, {} late; {} retries when full, {} deferred transfer submits, {} images on the transfer queue",
             c.chunks,
             c.bytes as f64 / f64::from(1 << 20),
             c.mismatches,
@@ -327,11 +327,16 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             c.texture_rects,
             c.orphans,
             c.texture_mismatches,
+            c.late_textures,
             c.retries,
             deferred,
             transferred
         );
-        failed |= c.mismatches > 0 || c.chunks == 0 || c.texture_mismatches > 0 || c.textures == 0;
+        failed |= c.mismatches > 0
+            || c.chunks == 0
+            || c.texture_mismatches > 0
+            || c.late_textures > 0
+            || c.textures == 0;
     }
     let validation = ruthenium_gpu::validation_messages();
     if validation > 0 {

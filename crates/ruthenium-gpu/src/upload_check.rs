@@ -57,8 +57,8 @@ const TEX_BYTES: usize = tex_layout().1;
 enum TexState {
     /// No texture: create one next.
     None,
-    /// Its first upload is staged.
-    Arriving(TextureId),
+    /// Its first upload is staged; for `Arrival::NextFrame`, the frame that must show it.
+    Arriving(TextureId, Option<u64>),
     /// The frame copying it to the readback buffer.
     Reading(TextureId, u64),
     /// Compared: stage updates next.
@@ -102,6 +102,8 @@ pub struct UploadCheckReport {
     pub texture_rects: u64,
     /// Textures destroyed before their first upload arrived.
     pub orphans: u64,
+    /// `Arrival::NextFrame` textures that were not ready in the next frame.
+    pub late_textures: u64,
 }
 
 impl UploadCheckReport {
@@ -364,6 +366,8 @@ impl UploadCheck {
                 }
                 // Now and then, a texture destroyed before its upload arrives.
                 let orphan = self.next().is_multiple_of(4);
+                // Half of them must show in the next frame.
+                let next_frame = self.next().is_multiple_of(2);
                 let mips: [&[u8]; TEX_MIPS as usize] = std::array::from_fn(|m| {
                     let end = TEX_OFFSETS.get(m + 1).copied().unwrap_or(TEX_BYTES);
                     &self.tex_mirror[TEX_OFFSETS[m]..end]
@@ -372,21 +376,36 @@ impl UploadCheck {
                     mip_levels: TEX_MIPS,
                     ..TextureDesc::rgba8(TEX_WIDTH, TEX_HEIGHT)
                 };
-                match table.create_with(ring, desc, &mips, Arrival::Background) {
+                let arrival = if next_frame {
+                    Arrival::NextFrame
+                } else {
+                    Arrival::Background
+                };
+                match table.create_with(ring, desc, &mips, arrival) {
                     Ok(id) if orphan => {
                         table.destroy(id);
                         self.report.orphans += 1;
                     }
-                    Ok(id) => self.tex = TexState::Arriving(id),
+                    Ok(id) => {
+                        self.tex = TexState::Arriving(id, next_frame.then_some(ctx.number + 1))
+                    }
                     Err(Error::Upload(UploadError::Full)) => self.report.retries += 1,
                     Err(e) => return Err(e),
                 }
             }
-            TexState::Arriving(id) => {
+            TexState::Arriving(id, due) => {
                 if table.is_ready(id) {
                     // SAFETY: forwarded from the caller.
                     unsafe { self.read_texture(table, id, ctx) };
                     self.tex = TexState::Reading(id, ctx.number);
+                } else if due == Some(ctx.number) {
+                    if self.report.late_textures < PRINTED {
+                        eprintln!(
+                            "[upload-check] texture {id:?} uploaded for the next frame is not ready in frame {}",
+                            ctx.number
+                        );
+                    }
+                    self.report.late_textures += 1;
                 }
             }
             TexState::Staged(id) => {

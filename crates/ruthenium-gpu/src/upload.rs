@@ -78,9 +78,15 @@ impl fmt::Display for UploadError {
 
 impl std::error::Error for UploadError {}
 
-/// When a buffer upload can be used: pass it to [`UploadRing::is_ready`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UploadTicket(u64);
+/// When an upload can be used: pass it to [`UploadRing::is_ready`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UploadTicket {
+    /// The first frame number that may record (or submit) the copy.
+    frame: u64,
+    /// The copy goes on the transfer queue: ready once its timeline reaches `frame`.
+    /// Otherwise it is recorded into frame `frame` (or later) and ready in it.
+    transfer: bool,
+}
 
 /// An image the ring writes to, as the copies and barriers need it.
 #[derive(Clone, Copy, Debug)]
@@ -535,8 +541,12 @@ pub struct UploadRing {
     /// The ticket of uploads staged now: the number the next recorded frame will have, at
     /// the least.
     next_frame: u64,
-    /// Tickets up to this are usable by the frame last recorded.
-    ready: u64,
+    /// Graphics-queue copies of tickets up to this are recorded (by the frame last
+    /// recorded or earlier).
+    recorded: u64,
+    /// Transfer-queue copies of tickets up to this are done and visible to the frame last
+    /// recorded.
+    transferred: u64,
     /// Buffer copies, for the transfer queue if there is one, else the graphics queue.
     buffers: BufferCopies,
     /// Image copies recorded into the frame.
@@ -612,7 +622,8 @@ impl UploadRing {
             staged: 0,
             transfer,
             next_frame: 1,
-            ready: 0,
+            recorded: 0,
+            transferred: 0,
             buffers: BufferCopies::new(),
             graphics_images: ImageCopies::new(),
             transfer_images: ImageCopies::new(),
@@ -669,7 +680,11 @@ impl UploadRing {
     /// Whether the frame last passed to [`Self::record`] (and every later one) may read
     /// what the upload with this ticket wrote.
     pub fn is_ready(&self, ticket: UploadTicket) -> bool {
-        ticket.0 <= self.ready
+        if ticket.transfer {
+            ticket.frame <= self.transferred
+        } else {
+            ticket.frame <= self.recorded
+        }
     }
 
     /// Whether `bytes` more fit in this frame's budget. Anything fits in an empty frame, so
@@ -708,9 +723,15 @@ impl UploadRing {
         dst_offset: u64,
         data: &[u8],
     ) -> Result<UploadTicket, UploadError> {
-        let ticket = UploadTicket(self.next_frame);
+        let ticket = UploadTicket {
+            frame: self.next_frame,
+            transfer: self.transfer.is_some(),
+        };
         if data.is_empty() {
-            return Ok(ticket);
+            return Ok(UploadTicket {
+                transfer: false,
+                ..ticket
+            });
         }
         if self.buffers.regions.len() == MAX_BUFFER_COPIES || !self.within_budget(data.len() as u64)
         {
@@ -743,7 +764,10 @@ impl UploadRing {
         dst: &ImageDst,
         regions: &[(ImageRegion, &[u8])],
     ) -> Result<UploadTicket, UploadError> {
-        let ticket = UploadTicket(self.next_frame);
+        let mut ticket = UploadTicket {
+            frame: self.next_frame,
+            transfer: false,
+        };
         if regions.is_empty() {
             return Ok(ticket);
         }
@@ -843,6 +867,7 @@ impl UploadRing {
             Some(i) => copies.images[i].fresh |= dst.fresh,
             None => copies.images.push(*dst),
         }
+        ticket.transfer = to_transfer;
         Ok(ticket)
     }
 
@@ -924,7 +949,7 @@ impl UploadRing {
                 }
                 // Copies up to the completed value are done: this frame may use them. The
                 // wait is already satisfied; it makes their writes visible to the frame.
-                self.ready = transfer_completed;
+                self.transferred = transfer_completed;
                 if transfer_completed > 0 {
                     ctx.wait_timeline(
                         t.timeline,
@@ -933,11 +958,9 @@ impl UploadRing {
                     );
                 }
             }
-            None => {
-                self.ring.retire(completed, 0);
-                self.ready = frame;
-            }
+            None => self.ring.retire(completed, 0),
         }
+        self.recorded = frame;
         self.next_frame = frame + 1;
         // On the transfer path the buffer list holds only deferred copies here.
         let graphics_buffers = self.transfer.is_none() && !self.buffers.is_empty();
