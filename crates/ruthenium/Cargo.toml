@@ -27,3 +27,4 @@ ruthenium-prepare = { path = "../ruthenium-prepare" }
 ruthenium-protocol = { path = "../ruthenium-protocol" }
 ruthenium-render = { path = "../ruthenium-render" }
 ruthenium-ui = { path = "../ruthenium-ui" }
+toml = "1.2.1"

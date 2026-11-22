@@ -9,11 +9,13 @@ pub mod accounts;
 pub mod form;
 pub mod list;
 pub mod servers;
+pub mod settings;
 
 pub use accounts::{AccountView, AccountsScreen};
 pub use form::{Field, FormButton, FormScreen, FormSpec, TextField};
 pub use list::ScrollList;
 pub use servers::{Ping, RowView, ServerListScreen};
+pub use settings::{ControlSpec, SectionSpec, SettingSpec, SettingsEvent, SettingsScreen};
 
 /// Window pixels per UI unit: the layout is designed for a window 900 units tall, so it
 /// keeps its proportions at any size (never below 0.75 px per unit, so text stays
@@ -31,7 +33,13 @@ impl UiScale {
     const MIN: f32 = 0.75;
 
     pub fn new(pixel_width: u32, pixel_height: u32) -> UiScale {
-        let px = (pixel_height as f32 / Self::DESIGN_HEIGHT).max(Self::MIN);
+        Self::sized(pixel_width, pixel_height, 1.0)
+    }
+
+    /// Like [`Self::new`], with everything `factor` times as large (the Menu Size
+    /// setting).
+    pub fn sized(pixel_width: u32, pixel_height: u32, factor: f32) -> UiScale {
+        let px = (pixel_height as f32 / Self::DESIGN_HEIGHT).max(Self::MIN) * factor;
         UiScale {
             px,
             width: pixel_width as f32 / px,
@@ -351,6 +359,19 @@ pub struct ButtonLook {
     pub hover: f32,
     pub press: f32,
     pub focus: f32,
+    /// Reduced motion: the button lights up but keeps its size.
+    pub still: bool,
+}
+
+impl ButtonLook {
+    /// How much larger (or, pressed, smaller) the button is drawn.
+    pub fn size(&self) -> f32 {
+        if self.still {
+            1.0
+        } else {
+            1.0 + HOVER_GROW * self.hover - PRESS_SHRINK * self.press
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -378,6 +399,7 @@ pub struct ButtonStates {
     key_down: Option<usize>,
     motion: Vec<Motion>,
     enabled: Vec<bool>,
+    still: bool,
 }
 
 impl ButtonStates {
@@ -512,6 +534,11 @@ impl ButtonStates {
         }
     }
 
+    /// Reduced motion: buttons light up and fade as usual, but no longer grow or shrink.
+    pub fn set_reduce_motion(&mut self, on: bool) {
+        self.still = on;
+    }
+
     /// Drops any press without acting (the window lost focus).
     pub fn cancel(&mut self) {
         self.mouse_down = None;
@@ -546,6 +573,7 @@ impl ButtonStates {
                 hover: m.hover.value,
                 press: m.press.value,
                 focus: m.focus.value,
+                still: self.still,
             })
     }
 }
@@ -572,7 +600,7 @@ pub(crate) fn draw_button(
     }
     // Focus lights a pill half as much as the pointer; the ring says the rest.
     let lit = look.hover.max(0.5 * look.focus);
-    let k = 1.0 + HOVER_GROW * look.hover - PRESS_SHRINK * look.press;
+    let k = look.size();
     let r = rect.scaled(k);
     let mut tint = mix(TINT, TINT_HOVER, lit);
     tint[3] += PRESS_TINT * look.press;
@@ -908,9 +936,11 @@ impl TitleScreen {
         let chip = &self.chip;
         let look = states.look(self.buttons.len());
         let lit = look.hover.max(0.5 * look.focus);
-        let r = chip
-            .rect
-            .scaled(1.0 + 0.5 * HOVER_GROW * look.hover - PRESS_SHRINK * look.press);
+        let r = chip.rect.scaled(if look.still {
+            1.0
+        } else {
+            1.0 + 0.5 * HOVER_GROW * look.hover - PRESS_SHRINK * look.press
+        });
         let mut tint = mix(TINT, TINT_HOVER, lit);
         tint[3] += PRESS_TINT * look.press;
         shapes.glass_pill(s, r, tint, 0.6 + 0.3 * lit);

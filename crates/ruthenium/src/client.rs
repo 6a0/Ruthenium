@@ -16,11 +16,15 @@ use ruthenium_render::{Background, FrameTimes, OverlayStats, Renderer, Summary, 
 use ruthenium_ui::modern::Action;
 
 use crate::menu::Menu;
+use crate::settings::{Settings, SettingsFile};
 
-/// SDL scancode of the V key: toggles VSync (development aid until options exist).
-const SCANCODE_V: u32 = 25;
 /// SDL scancode of F3: shows or hides the frame-stats overlay.
 const SCANCODE_F3: u32 = 60;
+/// SDL scancode of F11: fullscreen on or off, as in vanilla.
+const SCANCODE_F11: u32 = 68;
+/// How long a fullscreen request waits for the window manager to confirm it; events
+/// meanwhile are the window catching up with earlier requests.
+const FULLSCREEN_PENDING: Duration = Duration::from_secs(2);
 /// Vanilla throttles a minimised window to 10 FPS (`FramerateLimitTracker.java:30`).
 const HIDDEN_FRAME: Duration = Duration::from_millis(100);
 /// Frames before this are start-up noise and left out of the run summary.
@@ -33,13 +37,15 @@ const BACKGROUND: Background = Background {
 
 #[derive(Debug)]
 pub struct Options {
-    pub policy: PresentPolicy,
+    /// VSync on or off for this run, over the saved setting.
+    pub vsync: Option<bool>,
+    /// A frame limiter for this run, over the saved setting (until it changes).
     pub fps_cap: Option<f64>,
     pub gpu: Option<String>,
     pub validation: Validation,
     pub quit_after: Option<Duration>,
     pub stats: bool,
-    /// Start with the frame-stats overlay shown (F3 toggles it).
+    /// Start with the frame-stats overlay shown, over the saved setting (F3 toggles it).
     pub overlay: bool,
     /// Development: resize the window and toggle VSync every few frames, to exercise
     /// swapchain recreation (run it under validation).
@@ -63,9 +69,9 @@ pub struct Options {
     /// The server list file (default: `servers.dat` in Ruthenium's data folder).
     pub servers_file: Option<std::path::PathBuf>,
     /// Development: start on this menu screen (`servers`, `add`, `direct`, `delete`,
-    /// `accounts`, `sign-in`, `code`, `sign-in-failed`, `sign-out`).
+    /// `accounts`, `sign-in`, `code`, `sign-in-failed`, `sign-out`, `settings`).
     pub screen: Option<String>,
-    /// Development: select this server (or account) in the list.
+    /// Development: select this server (or account) in the list, or focus this setting.
     pub select: Option<usize>,
     /// The window's starting size in points.
     pub window_size: (u32, u32),
@@ -74,7 +80,7 @@ pub struct Options {
 impl Options {
     pub fn parse(args: &[String]) -> Result<Options, String> {
         let mut o = Options {
-            policy: PresentPolicy::VSync,
+            vsync: None,
             fps_cap: None,
             gpu: std::env::var("RUTHENIUM_GPU").ok(),
             validation: match std::env::var("RUTHENIUM_VALIDATION").as_deref() {
@@ -103,8 +109,8 @@ impl Options {
         while let Some(a) = it.next() {
             let mut value = |what: &str| it.next().cloned().ok_or(format!("{a} needs {what}"));
             match a.as_str() {
-                "--vsync" => o.policy = PresentPolicy::VSync,
-                "--no-vsync" => o.policy = PresentPolicy::NoVSync,
+                "--vsync" => o.vsync = Some(true),
+                "--no-vsync" => o.vsync = Some(false),
                 "--fps-cap" => {
                     let v = value("a frame rate")?;
                     let fps: f64 = v
@@ -175,6 +181,14 @@ pub fn run(opts: &Options, started: Instant) -> ExitCode {
     }
 }
 
+fn policy(vsync: bool) -> PresentPolicy {
+    if vsync {
+        PresentPolicy::VSync
+    } else {
+        PresentPolicy::NoVSync
+    }
+}
+
 /// How many frames the GPU may still be working on when the next frame samples input.
 fn frames_ahead(policy: PresentPolicy) -> u64 {
     match policy {
@@ -200,12 +214,37 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         .or_else(|| data_dir.as_ref().map(|d| d.join("servers.dat")));
     // The account in use signs in again on the accounts thread meanwhile.
     let accounts = crate::account::Accounts::start(
-        data_dir,
+        data_dir.clone(),
         ruthenium_prepare::default_cache_dir(&env).as_deref(),
     );
-    let mut menu = Menu::new(servers_file, accounts);
+    // Benchmarks run on the defaults, and so do screenshots unless given a data folder.
+    let mut settings = match &data_dir {
+        Some(d)
+            if opts.bench_out.is_none()
+                && (opts.screenshot.is_none() || opts.data_dir.is_some()) =>
+        {
+            SettingsFile::load(SettingsFile::path_in(d))
+        }
+        _ => SettingsFile::transient(),
+    };
+    // Command-line options override the saved settings for this run (and are saved
+    // with them if a setting changes).
+    if let Some(v) = opts.vsync {
+        settings.settings.vsync = v;
+    }
+    if opts.overlay {
+        settings.settings.frame_stats = true;
+    }
+    let mut menu = Menu::new(servers_file, accounts, settings);
+    let mut applied: Settings = menu.settings().clone();
     let mut platform = Platform::init(env!("CARGO_PKG_VERSION"))?;
     let window = platform.create_window("Ruthenium", opts.window_size.0, opts.window_size.1)?;
+    // A fullscreen request waiting for the window manager: what was asked, and when.
+    let mut fullscreen_pending: Option<(bool, Instant)> = None;
+    if applied.fullscreen {
+        window.set_fullscreen(true);
+        fullscreen_pending = Some((true, Instant::now()));
+    }
     let t_window = started.elapsed();
     let gpu = create_gpu(
         &platform,
@@ -240,8 +279,13 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         .flatten();
     let gpu_display = gpu.caps().name.clone();
     let gpu_name = gpu_display.to_uppercase();
-    let mut renderer = Renderer::new(gpu, window.pixel_size(), opts.policy, cache_dir.as_deref())?;
-    renderer.overlay_mut().set_visible(opts.overlay);
+    let mut renderer = Renderer::new(
+        gpu,
+        window.pixel_size(),
+        policy(applied.vsync),
+        cache_dir.as_deref(),
+    )?;
+    renderer.overlay_mut().set_visible(applied.frame_stats);
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
         renderer.enable_upload_check()?;
@@ -249,7 +293,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
 
     let mut sleeper = Sleeper::new();
     let mut deadline = Instant::now();
-    let period = opts.fps_cap.map(|f| Duration::from_secs_f64(1.0 / f));
+    // The command line's cap holds until the Max Frame Rate setting changes.
+    let cap = |s: &Settings| s.max_fps.map(f64::from);
+    let mut period = opts
+        .fps_cap
+        .or(cap(&applied))
+        .map(|f| Duration::from_secs_f64(1.0 / f));
 
     let mut interval = FrameTimes::new(1 << 13);
     let mut cpu = FrameTimes::new(1 << 13);
@@ -265,8 +314,11 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut visible = true;
     let mut occluded = false;
     let mut resized = None;
+    // Development: --exercise-swapchain flips VSync (without touching the setting).
     let mut toggle_vsync = false;
     let mut toggle_overlay = false;
+    let mut toggle_fullscreen = false;
+    let mut fullscreen_event: Option<bool> = None;
     // Left mouse button changes (down, x, y, shift) and keys (scancode, down, repeat,
     // shift, shortcut), handed to the menu after the events are drained, and typed text.
     let mut clicks: Vec<(bool, f32, f32, bool)> = Vec::with_capacity(4);
@@ -292,8 +344,6 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
 
         // 2. Input.
         let t_input = Instant::now();
-        // While a text field has focus, V is a letter, not the VSync toggle.
-        let typing = menu.wants_text_input();
         platform.poll_events(|e| match e {
             Event::Quit | Event::CloseRequested => quit = true,
             Event::PixelSizeChanged { width, height } => resized = Some((width, height)),
@@ -305,12 +355,13 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             Event::Occluded => occluded = true,
             Event::Exposed | Event::FocusGained => occluded = false,
             Event::FocusLost => menu.cancel(),
+            Event::Fullscreen(on) => fullscreen_event = Some(on),
             Event::Key {
-                scancode: SCANCODE_V,
+                scancode: SCANCODE_F11,
                 down: true,
                 repeat: false,
                 ..
-            } if !typing => toggle_vsync = true,
+            } => toggle_fullscreen = true,
             Event::Key {
                 scancode: SCANCODE_F3,
                 down: true,
@@ -384,8 +435,43 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             renderer.frames_mut().resize(size);
         }
         if std::mem::take(&mut toggle_overlay) {
-            let o = renderer.overlay_mut();
-            o.set_visible(!o.visible());
+            menu.toggle_frame_stats();
+        }
+        if std::mem::take(&mut toggle_fullscreen) {
+            menu.toggle_fullscreen();
+        }
+        if let Some(on) = fullscreen_event.take() {
+            // The window confirming a request (or catching up with an earlier one) changes
+            // nothing; a change of its own (the window manager's) is the new setting.
+            match fullscreen_pending {
+                Some((asked, at)) if at.elapsed() < FULLSCREEN_PENDING => {
+                    if asked == on {
+                        fullscreen_pending = None;
+                    }
+                }
+                _ => {
+                    fullscreen_pending = None;
+                    applied.fullscreen = on;
+                    menu.set_fullscreen(on);
+                }
+            }
+        }
+        let wanted = menu.settings();
+        if *wanted != applied {
+            if wanted.vsync != applied.vsync {
+                renderer.frames_mut().set_policy(policy(wanted.vsync));
+            }
+            if wanted.max_fps != applied.max_fps {
+                period = cap(wanted).map(|f| Duration::from_secs_f64(1.0 / f));
+            }
+            if wanted.fullscreen != applied.fullscreen {
+                window.set_fullscreen(wanted.fullscreen);
+                fullscreen_pending = Some((wanted.fullscreen, Instant::now()));
+            }
+            if wanted.frame_stats != applied.frame_stats {
+                renderer.overlay_mut().set_visible(wanted.frame_stats);
+            }
+            applied = wanted.clone();
         }
         if std::mem::take(&mut toggle_vsync) {
             let next = match renderer.frames().policy() {
@@ -418,7 +504,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
 
         // 4. Render.
         if let Some(name) = start_screen.take() {
-            if matches!(
+            if name == "settings" {
+                menu.open_settings_named(window.pixel_size(), opts.select);
+            } else if matches!(
                 name.as_str(),
                 "accounts" | "sign-in" | "code" | "sign-in-failed" | "sign-out"
             ) {
@@ -549,6 +637,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         }
     }
 
+    menu.save_settings();
     let run = run_interval.summary();
     if run.samples > 0 {
         eprintln!(

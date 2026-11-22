@@ -9,6 +9,7 @@ mod client;
 mod menu;
 mod prepare_cmd;
 mod servers;
+mod settings;
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -22,26 +23,30 @@ const USAGE: &str = "\
 usage: ruthenium [command]
 
 With no command, opens the game window. Options:
-  --vsync | --no-vsync   VSync on (default) or off (tearing, else mailbox)
-  --fps-cap <fps>        frame limiter (sleep, then spin, to exact deadlines)
+  --vsync | --no-vsync   VSync on or off (tearing, else mailbox) for this run
+  --fps-cap <fps>        frame limiter (sleep, then spin, to exact deadlines) for
+                         this run, until Max Frame Rate changes
   --gpu <name>           prefer a GPU whose name contains <name> (or RUTHENIUM_GPU)
   --validation | --no-validation
                          Vulkan validation layer (default: on in debug builds if
                          installed; RUTHENIUM_VALIDATION=1 requires it)
   --stats                print frame-time statistics every second
   --overlay              start with the frame-stats overlay shown (F3 toggles it)
-  --bench-out <file>     write a JSON summary of the run at exit (cargo xtask bench ab)
+  --bench-out <file>     write a JSON summary of the run at exit (cargo xtask bench ab);
+                         runs on the default settings
   --quit-after <s>       close after <s> seconds (for benchmarks and tests)
   --exercise-swapchain   resize and toggle VSync every few frames (development)
   --no-pipeline-cache    don't load or save the pipeline cache
   --no-transfer-queue    upload on the graphics queue even if there is a copy queue
   --exercise-uploads     check data pushed through the upload ring every frame
                          (development; a mismatch fails the run)
-  --screenshot <file>    write the window to a PNG, then quit
-                         (development)
-  --data-dir <folder>    Ruthenium's data folder (accounts, servers); default:
-                         the per-user one
-In the window, V toggles VSync and F3 the frame-stats overlay.
+  --screenshot <file>    write the window to a PNG, then quit (development); runs
+                         on the default settings unless --data-dir is given
+  --data-dir <folder>    Ruthenium's data folder (accounts, servers, settings in
+                         config/client.toml); default: the per-user one
+The options above that change a setting override it for the run; it is saved with
+them if a setting changes. In the window, F3 toggles the frame-stats overlay and F11
+fullscreen.
 
 commands:
   version

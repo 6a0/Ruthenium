@@ -28,6 +28,8 @@ pub struct ScrollList {
     scroll_target: f32,
     /// The last click on a row: which and when (seconds).
     last_click: Option<(usize, f64)>,
+    /// Reduced motion: scrolling jumps instead of gliding.
+    still: bool,
 }
 
 impl ScrollList {
@@ -47,7 +49,13 @@ impl ScrollList {
             scroll: 0.0,
             scroll_target: 0.0,
             last_click: None,
+            still: false,
         }
+    }
+
+    /// Reduced motion: scrolling jumps instead of gliding.
+    pub fn set_reduce_motion(&mut self, on: bool) {
+        self.still = on;
     }
 
     /// Moves the list to `area` (a new layout), keeping selection and scrolling.
@@ -172,7 +180,7 @@ impl ScrollList {
     pub fn update(&mut self, dt: f32) {
         let k = 1.0 - (-dt.max(0.0) / SCROLL_TAU).exp();
         self.scroll += (self.scroll_target - self.scroll) * k;
-        if (self.scroll - self.scroll_target).abs() < 0.05 {
+        if self.still || (self.scroll - self.scroll_target).abs() < 0.05 {
             self.scroll = self.scroll_target;
         }
     }

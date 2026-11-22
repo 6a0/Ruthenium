@@ -30,6 +30,8 @@ pub enum Event {
     Exposed,
     FocusGained,
     FocusLost,
+    /// The window entered (true) or left (false) fullscreen, asked for or not.
+    Fullscreen(bool),
     /// The mouse moved to `(x, y)`, in window coordinates (points, not pixels).
     MouseMotion {
         x: f32,
@@ -121,6 +123,8 @@ impl Event {
                 SDL_EVENT_WINDOW_EXPOSED => Event::Exposed,
                 SDL_EVENT_WINDOW_FOCUS_GAINED => Event::FocusGained,
                 SDL_EVENT_WINDOW_FOCUS_LOST => Event::FocusLost,
+                SDL_EVENT_WINDOW_ENTER_FULLSCREEN => Event::Fullscreen(true),
+                SDL_EVENT_WINDOW_LEAVE_FULLSCREEN => Event::Fullscreen(false),
                 SDL_EVENT_WINDOW_MOUSE_LEAVE => Event::MouseLeft,
                 SDL_EVENT_MOUSE_MOTION => Event::MouseMotion {
                     x: e.motion.x,

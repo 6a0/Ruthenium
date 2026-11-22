@@ -1,5 +1,5 @@
 //! Ruthenium's out-of-game menus: the title screen, the server list and its forms, the
-//! accounts and signing in. Lays them out for the window, prepares the glyph atlas and the logo in the background and
+//! accounts and signing in, and the settings. Lays them out for the window, prepares the glyph atlas and the logo in the background and
 //! uploads them, routes input to the screen showing, and builds each frame's shapes and
 //! text.
 
@@ -30,7 +30,8 @@ use ruthenium_render::{GuiFrame, Renderer};
 use ruthenium_ui::logo::Logo;
 use ruthenium_ui::modern::{
     AccountView, AccountsScreen, Action, ButtonStates, Ease, Field, FormButton, FormScreen,
-    FormSpec, Key, Presence, ShapeList, TitleScreen, UiScale, WEIGHTS,
+    FormSpec, Key, Presence, SettingsEvent, SettingsScreen, ShapeList, TitleScreen, UiScale,
+    WEIGHTS,
 };
 use ruthenium_ui::text::{ATLAS_SIZE, Fonts, GlyphAtlas, TextList, TextStyle, Weight};
 
@@ -38,6 +39,7 @@ use ruthenium_ui::face::Face;
 
 use crate::account::{AccountStatus, Accounts, Stage, failure_lines};
 use crate::servers::{Servers, valid_address};
+use crate::settings::{FRAME_STATS, FULLSCREEN, Settings, SettingsFile};
 
 /// Side of the logo texture's top level.
 const LOGO_SIZE: u32 = 512;
@@ -67,6 +69,9 @@ const SCANCODE_KP_ENTER: u32 = 88;
 const MAX_STEP: f32 = 0.1;
 /// Time constant of the menus' fade-in once their text and logo are on the GPU.
 const APPEAR_TAU: f32 = 0.09;
+/// Settings are saved once they have stayed put this long (a slider being dragged
+/// changes many times), on leaving the Settings screen, and at exit.
+const SAVE_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Letter pairs Nunito joins into one glyph (its `liga` feature), which the characters
 /// one by one never produce.
@@ -245,6 +250,7 @@ enum Screen {
     Title,
     Servers,
     Accounts,
+    Settings,
     Form(FormKind, Box<FormScreen>, PackStatus),
 }
 
@@ -260,8 +266,12 @@ pub struct Menu {
     /// The server list, while it or one of its forms shows.
     servers: Option<Servers>,
     servers_path: Option<PathBuf>,
-    /// The last address typed into Direct Connect (vanilla keeps it in options.txt).
-    last_direct: String,
+    /// The settings, and the file they're kept in.
+    settings: SettingsFile,
+    /// When a setting last changed, while that change isn't saved.
+    settings_changed: Option<Instant>,
+    /// The Settings screen, while it shows.
+    settings_screen: Option<SettingsScreen>,
     accounts: Accounts,
     /// The Accounts screen, while it or one of its forms shows.
     accounts_screen: Option<AccountsScreen>,
@@ -351,7 +361,7 @@ fn button(label: &str, action: Action) -> FormButton {
 impl Menu {
     /// Starts building the glyph atlas on another thread. The server list lives in
     /// `servers_path` (none: not saved).
-    pub fn new(servers_path: Option<PathBuf>, accounts: Accounts) -> Menu {
+    pub fn new(servers_path: Option<PathBuf>, accounts: Accounts, settings: SettingsFile) -> Menu {
         let handle = std::thread::Builder::new()
             .name("menu-assets".into())
             .spawn(prepare)
@@ -365,7 +375,9 @@ impl Menu {
             screen: Screen::Title,
             servers: None,
             servers_path,
-            last_direct: String::new(),
+            settings,
+            settings_changed: None,
+            settings_screen: None,
             accounts,
             accounts_screen: None,
             accounts_seen: None,
@@ -399,8 +411,96 @@ impl Menu {
         if let Some(a) = &mut self.accounts_screen {
             a.states.cancel();
         }
+        if let Some(s) = &mut self.settings_screen {
+            s.cancel();
+        }
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.states.cancel();
+        }
+    }
+
+    /// The settings as they are now (the client applies them).
+    pub fn settings(&self) -> &Settings {
+        &self.settings.settings
+    }
+
+    /// Changes setting `i` (a Settings screen row) from outside the screen, which shows
+    /// it.
+    fn set_setting(&mut self, i: usize, value: usize) {
+        let before = self.settings.settings.clone();
+        self.settings.settings.set(i, value);
+        if self.settings.settings != before {
+            self.settings_changed = Some(Instant::now());
+        }
+        if let Some(s) = &mut self.settings_screen {
+            s.set_value(i, self.settings.settings.get(i));
+        }
+    }
+
+    /// F3: shows or hides the frame stats.
+    pub fn toggle_frame_stats(&mut self) {
+        self.set_setting(
+            FRAME_STATS,
+            usize::from(!self.settings.settings.frame_stats),
+        );
+    }
+
+    /// F11: fullscreen on or off.
+    pub fn toggle_fullscreen(&mut self) {
+        self.set_fullscreen(!self.settings.settings.fullscreen);
+    }
+
+    /// The window went in or out of fullscreen (F11, or the window manager).
+    pub fn set_fullscreen(&mut self, on: bool) {
+        self.set_setting(FULLSCREEN, usize::from(on));
+    }
+
+    /// Saves the settings if they changed.
+    pub fn save_settings(&mut self) {
+        self.settings.save();
+        self.settings_changed = None;
+    }
+
+    /// A change on the Settings screen, or leaving it.
+    fn settings_event(&mut self, e: SettingsEvent) {
+        match e {
+            SettingsEvent::Changed { setting, value } => {
+                self.settings.settings.set(setting, value);
+                self.settings_changed = Some(Instant::now());
+            }
+            SettingsEvent::Done => {
+                self.settings_screen = None;
+                self.screen = Screen::Title;
+                self.save_settings();
+            }
+        }
+    }
+
+    /// Opens the Settings screen.
+    fn open_settings(&mut self, scale: UiScale) {
+        let mut screen = SettingsScreen::new(scale, &self.fonts, self.settings.settings.sections());
+        screen.set_reduce_motion(self.settings.settings.reduce_motion);
+        self.settings_screen = Some(screen);
+        self.screen = Screen::Settings;
+    }
+
+    /// Reduced motion for every screen alive.
+    fn apply_motion(&mut self) {
+        let still = self.settings.settings.reduce_motion;
+        self.title_states.set_reduce_motion(still);
+        if let Some(s) = &mut self.servers {
+            s.screen.states.set_reduce_motion(still);
+            s.screen.list.set_reduce_motion(still);
+        }
+        if let Some(a) = &mut self.accounts_screen {
+            a.states.set_reduce_motion(still);
+            a.list.set_reduce_motion(still);
+        }
+        if let Some(s) = &mut self.settings_screen {
+            s.set_reduce_motion(still);
+        }
+        if let Screen::Form(_, form, _) = &mut self.screen {
+            form.states.set_reduce_motion(still);
         }
     }
 
@@ -411,7 +511,8 @@ impl Menu {
 
     /// Lays every live screen out for the window, if its size changed.
     fn layout(&mut self, pixel_size: (u32, u32)) -> UiScale {
-        let scale = UiScale::new(pixel_size.0, pixel_size.1);
+        let factor = self.settings.settings.menu_size.factor();
+        let scale = UiScale::sized(pixel_size.0, pixel_size.1, factor);
         if self.scale == Some(scale) {
             return scale;
         }
@@ -427,6 +528,9 @@ impl Menu {
         }
         if let Some(a) = &mut self.accounts_screen {
             a.layout(scale, &self.fonts);
+        }
+        if let Some(s) = &mut self.settings_screen {
+            s.layout(scale, &self.fonts);
         }
         self.accounts_seen = None;
         self.sync_accounts();
@@ -588,7 +692,7 @@ impl Menu {
                     title: "Direct Connect".into(),
                     message: Vec::new(),
                     code: None,
-                    fields: vec![addr_field(&self.last_direct)],
+                    fields: vec![addr_field(&self.settings.settings.last_server)],
                     buttons: vec![
                         button("Join Server", Action::Confirm),
                         button("Cancel", Action::Cancel),
@@ -680,6 +784,7 @@ impl Menu {
             }
             (Screen::Title, Action::Quit) => return Some(Action::Quit),
             (Screen::Title, Action::Accounts) => self.open_accounts(scale),
+            (Screen::Title, Action::Settings) => self.open_settings(scale),
             (Screen::Title, other) => eprintln!("[ruthenium] {other:?}: not there yet"),
             (Screen::Servers, Action::Back) => {
                 // Without a renderer at hand (a key), the next frame frees the icons.
@@ -787,7 +892,8 @@ impl Menu {
                     }
                     FormKind::Direct => {
                         let ip = value(0);
-                        self.last_direct = ip.clone();
+                        self.settings.settings.last_server = ip.clone();
+                        self.settings_changed = Some(Instant::now());
                         if let Some(s) = &mut self.servers {
                             let e = s.direct(&ip);
                             eprintln!("[ruthenium] join {} ({}): not there yet", e.name, e.ip);
@@ -822,7 +928,8 @@ impl Menu {
             (Screen::Form(kind, form, _), Action::Cancel | Action::Back) => {
                 let kind = *kind;
                 if kind == FormKind::Direct {
-                    self.last_direct = form.field(0).value().to_owned();
+                    self.settings.settings.last_server = form.field(0).value().to_owned();
+                    self.settings_changed = Some(Instant::now());
                 }
                 if kind == FormKind::SignIn {
                     self.accounts.cancel_sign_in();
@@ -854,6 +961,23 @@ impl Menu {
         };
         let enter = matches!(scancode, SCANCODE_RETURN | SCANCODE_KP_ENTER);
         let action = match &mut self.screen {
+            Screen::Settings => {
+                let screen = self.settings_screen.as_mut()?;
+                let e = match scancode {
+                    SCANCODE_ESCAPE if down && !repeat => Some(SettingsEvent::Done),
+                    SCANCODE_DOWN => screen.key(Key::Next, down),
+                    SCANCODE_UP => screen.key(Key::Previous, down),
+                    SCANCODE_LEFT | SCANCODE_RIGHT if down => {
+                        screen.adjust(if scancode == SCANCODE_LEFT { -1 } else { 1 })
+                    }
+                    SCANCODE_RETURN | SCANCODE_KP_ENTER | SCANCODE_SPACE if !repeat => {
+                        screen.key(Key::Activate, down)
+                    }
+                    _ => screen.key(nav?, down),
+                };
+                self.settings_event(e?);
+                return None;
+            }
             Screen::Title => {
                 let key = match scancode {
                     SCANCODE_DOWN => Some(Key::Next),
@@ -1008,6 +1132,11 @@ impl Menu {
         match (&self.screen, &mut self.servers, &mut self.accounts_screen) {
             (Screen::Servers, Some(s), _) => s.screen.wheel(notches),
             (Screen::Accounts, _, Some(a)) => a.list.wheel(notches),
+            (Screen::Settings, ..) => {
+                if let Some(s) = &mut self.settings_screen {
+                    s.wheel(notches);
+                }
+            }
             _ => {}
         }
     }
@@ -1031,6 +1160,16 @@ impl Menu {
         let (ux, uy) = scale.from_window(x, y, window_size, pixel_size);
         let time = self.started.elapsed().as_secs_f64();
         let action = match &mut self.screen {
+            Screen::Settings => {
+                let screen = self.settings_screen.as_mut()?;
+                let e = if down {
+                    screen.mouse_down(ux, uy)
+                } else {
+                    screen.mouse_up(ux, uy)
+                };
+                self.settings_event(e?);
+                return None;
+            }
             Screen::Title => {
                 let title = self.title.as_ref()?;
                 let hit = title.hit(ux, uy);
@@ -1231,6 +1370,18 @@ impl Menu {
         }
         self.sync_accounts();
         self.upload_faces(renderer);
+        self.apply_motion();
+        let dragging = self
+            .settings_screen
+            .as_ref()
+            .is_some_and(SettingsScreen::dragging);
+        if !dragging
+            && self
+                .settings_changed
+                .is_some_and(|t| t.elapsed() >= SAVE_AFTER)
+        {
+            self.save_settings();
+        }
         let face_of = |skin: Option<&String>| {
             self.faces
                 .iter()
@@ -1261,6 +1412,7 @@ impl Menu {
         }
         self.appear.step(1.0, dt, APPEAR_TAU, APPEAR_TAU);
         let time = self.started.elapsed().as_secs_f64();
+        let mut settings_ev = None;
         match &mut self.screen {
             Screen::Title => {
                 let title = self.title.as_ref().unwrap();
@@ -1283,6 +1435,13 @@ impl Menu {
                     s.screen.draw(&mut self.shapes, &mut self.text, atlas, time);
                 }
             }
+            Screen::Settings => {
+                if let Some(s) = &mut self.settings_screen {
+                    settings_ev = s.pointer(pointer);
+                    s.update(dt);
+                    s.draw(&mut self.shapes, &mut self.text, atlas);
+                }
+            }
             Screen::Accounts => {
                 if let Some(a) = &mut self.accounts_screen {
                     a.set_faces(row_faces);
@@ -1297,6 +1456,9 @@ impl Menu {
                 form.update(dt);
                 form.draw(&mut self.shapes, &mut self.text, atlas);
             }
+        }
+        if let Some(e) = settings_ev {
+            self.settings_event(e);
         }
         if self.appear.value < 1.0 {
             self.shapes.fade_all(self.appear.value);
@@ -1362,6 +1524,16 @@ impl Menu {
         };
         if self.preview_stage.is_some() {
             self.open_sign_in();
+        }
+    }
+
+    /// Development: opens the Settings screen (for screenshots), with setting `focus`
+    /// focused.
+    pub fn open_settings_named(&mut self, pixel_size: (u32, u32), focus: Option<usize>) {
+        let scale = self.layout(pixel_size);
+        self.open_settings(scale);
+        if let Some(s) = &mut self.settings_screen {
+            s.focus(focus);
         }
     }
 
@@ -1443,7 +1615,7 @@ mod tests {
     fn privileges_can_turn_multiplayer_off() {
         let dir = temp("privileges");
         let (accounts, _) = accounts_in(&dir, &["Child", "Alex"], None);
-        let mut m = Menu::new(None, accounts);
+        let mut m = Menu::new(None, accounts, SettingsFile::transient());
         m.layout((1600, 900));
         until(&mut m, |m| {
             matches!(m.accounts.status(), AccountStatus::SignedIn { .. })
@@ -1466,7 +1638,7 @@ mod tests {
         let dir = temp("accounts");
         let (accounts, pages) = accounts_in(&dir, &["Alex"], Some(Ok("Notch")));
         let clip = FakeClipboard::default();
-        let mut m = Menu::new(None, accounts);
+        let mut m = Menu::new(None, accounts, SettingsFile::transient());
         m.layout((1600, 900));
         // The account chip is the last control on the title: Tab reaches it.
         let chip = m.title.as_ref().unwrap().controls() - 1;
@@ -1514,7 +1686,7 @@ mod tests {
         let dir = temp("code");
         let (accounts, _) = accounts_in(&dir, &[], None);
         let clip = FakeClipboard::default();
-        let mut m = Menu::new(None, accounts);
+        let mut m = Menu::new(None, accounts, SettingsFile::transient());
         m.layout((1600, 900));
         m.act(Action::Accounts, None, &clip);
         m.act(Action::AddAccount, None, &clip);
@@ -1538,7 +1710,7 @@ mod tests {
         let (accounts, _) =
             accounts_in(&dir, &[], Some(Err(ruthenium_auth::AuthError::NotApproved)));
         let clip = FakeClipboard::default();
-        let mut m = Menu::new(None, accounts);
+        let mut m = Menu::new(None, accounts, SettingsFile::transient());
         m.layout((1600, 900));
         m.act(Action::Accounts, None, &clip);
         m.act(Action::AddAccount, None, &clip);
@@ -1561,6 +1733,46 @@ mod tests {
     }
 
     #[test]
+    fn settings_from_the_keyboard_apply_and_save() {
+        let dir = temp("settings");
+        let (accounts, _) = accounts_in(&dir, &[], None);
+        let clip = FakeClipboard::default();
+        let path = SettingsFile::path_in(&dir);
+        let mut m = Menu::new(None, accounts, SettingsFile::load(path.clone()));
+        let before = m.layout((1600, 900));
+        // Down twice reaches Settings on the title.
+        press(&mut m, SCANCODE_DOWN, false, false, &clip);
+        press(&mut m, SCANCODE_DOWN, false, false, &clip);
+        press(&mut m, SCANCODE_RETURN, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Settings));
+        // VSync off with Left, then the frame rate one step down from Unlimited.
+        press(&mut m, SCANCODE_DOWN, false, false, &clip);
+        press(&mut m, SCANCODE_LEFT, false, false, &clip);
+        assert!(!m.settings().vsync);
+        press(&mut m, SCANCODE_DOWN, false, false, &clip);
+        press(&mut m, SCANCODE_LEFT, false, false, &clip);
+        assert_eq!(m.settings().max_fps, Some(crate::settings::FPS_MAX));
+        // Menu Size: the next layout is larger.
+        for _ in 0..3 {
+            press(&mut m, SCANCODE_DOWN, false, false, &clip);
+        }
+        press(&mut m, SCANCODE_RIGHT, false, false, &clip);
+        let after = m.layout((1600, 900));
+        assert!(after.px > before.px, "{} -> {}", before.px, after.px);
+        // F3 from anywhere shows on the screen too.
+        m.toggle_frame_stats();
+        let s = m.settings_screen.as_ref().unwrap();
+        assert_eq!(s.value(crate::settings::FRAME_STATS), Some(1));
+        assert!(!path.exists(), "saved only after a pause or on leaving");
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Title));
+        let saved = SettingsFile::load(path).settings;
+        assert_eq!(&saved, m.settings());
+        assert!(saved.frame_stats && !saved.vsync);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn device_page_addresses_read_short() {
         assert_eq!(
             short_url("https://www.microsoft.com/link"),
@@ -1579,7 +1791,11 @@ mod tests {
         list.save(&path).unwrap();
         let clip = FakeClipboard::default();
 
-        let mut m = Menu::new(Some(path.clone()), Accounts::disabled());
+        let mut m = Menu::new(
+            Some(path.clone()),
+            Accounts::disabled(),
+            SettingsFile::transient(),
+        );
         m.layout((1600, 900));
         assert_eq!(m.act(Action::Multiplayer, None, &clip), None);
         assert!(matches!(m.screen, Screen::Servers));
@@ -1635,7 +1851,7 @@ mod tests {
         m.text_input("direct.example");
         press(&mut m, SCANCODE_RETURN, false, false, &clip);
         assert_eq!(ServerList::load(&path).hidden[0].ip, "direct.example");
-        assert_eq!(m.last_direct, "direct.example");
+        assert_eq!(m.settings().last_server, "direct.example");
         press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
         assert!(matches!(m.screen, Screen::Title));
         let _ = std::fs::remove_dir_all(&dir);

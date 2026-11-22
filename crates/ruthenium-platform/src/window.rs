@@ -12,8 +12,8 @@ use sdl3_sys::hints::SDL_SetHint;
 use sdl3_sys::init::{SDL_INIT_VIDEO, SDL_Init, SDL_Quit, SDL_SetAppMetadata};
 use sdl3_sys::video::{
     SDL_CreateWindow, SDL_DestroyWindow, SDL_GetWindowSize, SDL_GetWindowSizeInPixels,
-    SDL_SetWindowSize, SDL_WINDOW_HIGH_PIXEL_DENSITY, SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN,
-    SDL_Window,
+    SDL_SetWindowFullscreen, SDL_SetWindowSize, SDL_WINDOW_HIGH_PIXEL_DENSITY,
+    SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN, SDL_Window,
 };
 use sdl3_sys::vulkan::{
     SDL_Vulkan_CreateSurface, SDL_Vulkan_GetInstanceExtensions,
@@ -273,6 +273,15 @@ impl Window {
         );
         // SAFETY: raw is a live window.
         unsafe { SDL_SetWindowSize(self.raw, w, h) };
+    }
+
+    /// Asks for borderless fullscreen on the window's display (on) or the window back
+    /// (off). The window manager confirms with [`Event::Fullscreen`]; the new size
+    /// arrives as [`Event::PixelSizeChanged`].
+    pub fn set_fullscreen(&self, on: bool) {
+        // SAFETY: raw is a live window. With no fullscreen mode set, SDL uses the
+        // desktop's (borderless fullscreen, no mode switch).
+        unsafe { SDL_SetWindowFullscreen(self.raw, on) };
     }
 
     /// Creates a Vulkan surface for this window.
