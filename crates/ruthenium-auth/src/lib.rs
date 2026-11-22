@@ -17,6 +17,7 @@ pub mod http;
 pub mod minecraft;
 pub mod msa;
 pub mod pkce;
+pub mod skin;
 pub mod store;
 pub mod xbox;
 

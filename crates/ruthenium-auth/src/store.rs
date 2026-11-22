@@ -1,5 +1,5 @@
 //! Signed-in accounts: a list in `accounts.json` in Ruthenium's data folder (profile id,
-//! name, when last used; nothing secret) and each account's Microsoft refresh token in the
+//! name, skin address, when last used; nothing secret) and each account's Microsoft refresh token in the
 //! operating system's credential store (Keychain, Credential Manager, Secret Service).
 //! Minecraft access tokens and chat certificates are never stored.
 
@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::AuthError;
+use crate::minecraft::Profile;
 
 const SERVICE: &str = "Ruthenium";
 
@@ -57,6 +58,8 @@ pub struct Account {
     /// The Java profile id (no dashes).
     pub id: String,
     pub name: String,
+    /// The active skin's texture address, if the player has one.
+    pub skin: Option<String>,
     /// Unix seconds.
     pub last_used: u64,
 }
@@ -107,6 +110,7 @@ impl AccountStore {
                             Some(Account {
                                 id: a.get("id")?.as_str()?.to_owned(),
                                 name: a.get("name")?.as_str()?.to_owned(),
+                                skin: a.get("skin").and_then(Value::as_str).map(str::to_owned),
                                 last_used: a.get("lastUsed").and_then(Value::as_u64).unwrap_or(0),
                             })
                         })
@@ -155,7 +159,13 @@ impl AccountStore {
         let list: Vec<Value> = self
             .accounts
             .iter()
-            .map(|a| json!({ "id": a.id, "name": a.name, "lastUsed": a.last_used }))
+            .map(|a| {
+                let mut v = json!({ "id": a.id, "name": a.name, "lastUsed": a.last_used });
+                if let Some(s) = &a.skin {
+                    v["skin"] = json!(s);
+                }
+                v
+            })
             .collect();
         let text = serde_json::to_string_pretty(&json!({ "accounts": list })).expect("JSON");
         let io = |e: std::io::Error| AuthError::Keystore(format!("{}: {e}", self.path.display()));
@@ -169,38 +179,31 @@ impl AccountStore {
 
     /// Records a sign-in: the account becomes the current one and its refresh token is
     /// replaced.
-    pub fn signed_in(
-        &mut self,
-        id: &str,
-        name: &str,
-        refresh_token: &str,
-    ) -> Result<(), AuthError> {
-        self.secrets.set(&secret_key(id), refresh_token)?;
+    pub fn signed_in(&mut self, profile: &Profile, refresh_token: &str) -> Result<(), AuthError> {
+        self.secrets.set(&secret_key(&profile.id), refresh_token)?;
         self.put_first(Account {
-            id: id.to_owned(),
-            name: name.to_owned(),
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            skin: profile.skin.clone(),
             last_used: 0,
         });
         self.save()
     }
 
-    /// Records a refresh: the account's new refresh token and its name as the services
-    /// now give it, without changing which account is current.
-    pub fn refreshed(
-        &mut self,
-        id: &str,
-        name: &str,
-        refresh_token: &str,
-    ) -> Result<(), AuthError> {
-        self.secrets.set(&secret_key(id), refresh_token)?;
-        match self.accounts.iter_mut().find(|a| a.id == id) {
-            Some(a) if a.name != name => {
-                a.name = name.to_owned();
+    /// Records a refresh: the account's new refresh token, and its name and skin as the
+    /// services now give them, without changing which account is current.
+    pub fn refreshed(&mut self, profile: &Profile, refresh_token: &str) -> Result<(), AuthError> {
+        let key = secret_key(&profile.id);
+        self.secrets.set(&key, refresh_token)?;
+        match self.accounts.iter_mut().find(|a| a.id == profile.id) {
+            Some(a) if a.name != profile.name || a.skin != profile.skin => {
+                a.name = profile.name.clone();
+                a.skin = profile.skin.clone();
                 self.save()
             }
             Some(_) => Ok(()),
             // Signed out meanwhile: keep it signed out.
-            None => self.secrets.delete(&secret_key(id)),
+            None => self.secrets.delete(&key),
         }
     }
 
@@ -251,21 +254,34 @@ pub(crate) mod tests {
         }
     }
 
+    fn profile(id: &str, name: &str) -> Profile {
+        Profile {
+            id: id.into(),
+            name: name.into(),
+            skin: (name == "Steve").then(|| "https://textures.minecraft.net/texture/abc".into()),
+        }
+    }
+
     #[test]
     fn remembers_accounts_without_their_secrets() {
         let dir = std::env::temp_dir().join(format!("ruthenium-accounts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut s = AccountStore::with_secrets(&dir, Box::new(MemorySecrets::default()));
-        s.signed_in("aaa", "Alex", "r1").unwrap();
+        s.signed_in(&profile("aaa", "Alex"), "r1").unwrap();
         // Within the same second: the order still holds, here and after a reload.
-        s.signed_in("bbb", "Steve", "r2").unwrap();
+        s.signed_in(&profile("bbb", "Steve"), "r2").unwrap();
         assert_eq!(s.current().unwrap().name, "Steve");
         assert_eq!(s.find("alex").unwrap().id, "aaa");
         assert_eq!(s.refresh_token("aaa").unwrap().as_deref(), Some("r1"));
         let file = std::fs::read_to_string(dir.join("accounts.json")).unwrap();
         assert!(file.contains("Steve") && !file.contains("r2"));
-        // Reopened from disk, newest first.
+        // Reopened from disk, newest first, with the skin.
         let again = AccountStore::with_secrets(&dir, Box::new(MemorySecrets::default()));
+        assert_eq!(
+            again.current().unwrap().skin.as_deref(),
+            Some("https://textures.minecraft.net/texture/abc")
+        );
+        assert_eq!(again.find("alex").unwrap().skin, None);
         assert_eq!(
             again
                 .accounts()
@@ -275,7 +291,7 @@ pub(crate) mod tests {
             ["Steve", "Alex"]
         );
         // A refresh renames but doesn't switch; selecting switches.
-        s.refreshed("aaa", "Alex2", "r3").unwrap();
+        s.refreshed(&profile("aaa", "Alex2"), "r3").unwrap();
         assert_eq!(s.current().unwrap().name, "Steve");
         assert_eq!(s.refresh_token("aaa").unwrap().as_deref(), Some("r3"));
         assert!(s.select("aaa").unwrap());
@@ -286,7 +302,7 @@ pub(crate) mod tests {
         assert_eq!(s.current().unwrap().name, "Alex2");
         assert_eq!(s.refresh_token("bbb").unwrap(), None);
         // A refresh that lands after a sign-out doesn't bring the secret back.
-        s.refreshed("bbb", "Steve", "late").unwrap();
+        s.refreshed(&profile("bbb", "Steve"), "late").unwrap();
         assert_eq!(s.refresh_token("bbb").unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }

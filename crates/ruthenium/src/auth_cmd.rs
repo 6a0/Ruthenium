@@ -83,7 +83,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
             let p = &signed.session.profile;
             store
-                .signed_in(&p.id, &p.name, &signed.refresh_token)
+                .signed_in(p, &signed.refresh_token)
                 .map_err(|e| e.to_string())?;
             report(&signed);
             Ok(())
@@ -112,7 +112,7 @@ fn run_inner(args: &[String]) -> Result<(), String> {
             let mut auth = Auth::new();
             let signed = auth.resume(&token).map_err(|e| e.to_string())?;
             store
-                .signed_in(&account.id, &signed.session.profile.name, &signed.refresh_token)
+                .signed_in(&signed.session.profile, &signed.refresh_token)
                 .map_err(|e| e.to_string())?;
             report(&signed);
             if args.iter().any(|a| a == "--certificates") {

@@ -34,6 +34,8 @@ use ruthenium_ui::modern::{
 };
 use ruthenium_ui::text::{ATLAS_SIZE, Fonts, GlyphAtlas, TextList, TextStyle, Weight};
 
+use ruthenium_ui::face::Face;
+
 use crate::account::{AccountStatus, Accounts, Stage, failure_lines};
 use crate::servers::{Servers, valid_address};
 
@@ -102,19 +104,27 @@ enum Atlas {
 }
 
 /// The title's account chip for `status`.
-fn chip(status: &AccountStatus) -> (String, Presence) {
+fn chip(status: &AccountStatus) -> String {
     match status {
-        AccountStatus::None => ("Sign in".into(), Presence::SignedOut),
-        AccountStatus::Checking(n) => (format!("Signing in as {n}..."), Presence::Checking),
+        AccountStatus::None => "Sign in".into(),
+        AccountStatus::Checking(n) => format!("Signing in as {n}..."),
         AccountStatus::SignedIn {
             name,
             may_play_online: true,
-        } => (name.clone(), Presence::SignedIn),
-        AccountStatus::SignedIn { name, .. } => {
-            (format!("{name}: multiplayer is off"), Presence::Problem)
-        }
-        AccountStatus::Failed { name, reason } => (format!("{name}: {reason}"), Presence::Problem),
+        } => name.clone(),
+        AccountStatus::SignedIn { name, .. } => format!("{name}: multiplayer is off"),
+        AccountStatus::Failed { name, reason } => format!("{name}: {reason}"),
     }
+}
+
+/// The face of the account in use, on its way to the GPU.
+#[derive(Debug, Default)]
+enum FaceTexture {
+    #[default]
+    None,
+    /// Waiting for room in the upload ring.
+    Pending(Face),
+    Ready(TextureId),
 }
 
 /// The Accounts screen's line under the account in use.
@@ -261,6 +271,8 @@ pub struct Menu {
     stage_shown: Option<Stage>,
     /// Development: a sign-in stage to show without signing in (screenshots).
     preview_stage: Option<Stage>,
+    /// The face in the title's account chip.
+    face: FaceTexture,
     shapes: ShapeList,
     text: TextList,
     /// Mouse position in window coordinates.
@@ -359,6 +371,7 @@ impl Menu {
             accounts_seen: None,
             stage_shown: None,
             preview_stage: None,
+            face: FaceTexture::None,
             shapes: ShapeList::new(),
             text: TextList::new(),
             mouse: None,
@@ -507,9 +520,9 @@ impl Menu {
 
     fn apply_account(&mut self) {
         let status = self.accounts.status();
-        let (line, presence) = chip(status);
+        let line = chip(status);
         if let Some(t) = &mut self.title {
-            t.set_account(&self.fonts, &line, presence);
+            t.set_account(&self.fonts, &line);
         }
         // Parental controls or a multiplayer ban turn Multiplayer off, as in vanilla.
         let allowed = !matches!(
@@ -1066,6 +1079,33 @@ impl Menu {
         self.act(action?, Some(renderer), clipboard)
     }
 
+    /// Takes a newly loaded face for the account in use, and uploads the waiting one; a
+    /// replaced texture is destroyed.
+    fn upload_face(&mut self, renderer: &mut Renderer) {
+        if let Some(face) = self.accounts.take_face() {
+            if let FaceTexture::Ready(t) = std::mem::take(&mut self.face) {
+                renderer.destroy_texture(t);
+            }
+            self.face = face.map_or(FaceTexture::None, FaceTexture::Pending);
+        }
+        let FaceTexture::Pending(face) = &self.face else {
+            return;
+        };
+        let desc = TextureDesc {
+            mip_levels: face.levels.len() as u32,
+            ..TextureDesc::rgba8(face.size, face.size)
+        };
+        let levels: Vec<&[u8]> = face.levels.iter().map(Vec::as_slice).collect();
+        match renderer.create_texture(desc, &levels, Arrival::NextFrame) {
+            Ok(t) => self.face = FaceTexture::Ready(t),
+            Err(ruthenium_gpu::Error::Upload(UploadError::Full)) => {}
+            Err(e) => {
+                eprintln!("[ruthenium] no player face: upload: {e}");
+                self.face = FaceTexture::None;
+            }
+        }
+    }
+
     /// Moves the menus' textures along: picks them up when prepared, then uploads them.
     /// Returns the window icon once, when it is ready.
     fn advance(&mut self, renderer: &mut Renderer) -> Option<Vec<u8>> {
@@ -1177,6 +1217,11 @@ impl Menu {
             s.prepare(renderer, &self.fonts);
         }
         self.sync_accounts();
+        self.upload_face(renderer);
+        let face = match self.face {
+            FaceTexture::Ready(t) if renderer.texture_ready(t) => Some(t.index()),
+            _ => None,
+        };
         let (atlas, texture, logo) = match &self.atlas {
             Atlas::Ready {
                 atlas,
@@ -1206,6 +1251,7 @@ impl Menu {
                     &mut self.text,
                     atlas,
                     logo,
+                    face,
                     &self.title_states,
                 );
             }

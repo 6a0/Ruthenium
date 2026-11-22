@@ -12,6 +12,7 @@
 
 mod clip;
 pub mod draw;
+pub mod face;
 pub mod logo;
 pub mod modern;
 pub mod scale;

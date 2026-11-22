@@ -3,13 +3,72 @@
 //! from a saved sign-in (at launch, and on switching), signing in a new account in the
 //! browser or with a device code, switching and signing out. The menus read the list,
 //! the current account's status and any sign-in in progress from [`Accounts`].
+//!
+//! The account in use also has a face for the menus, loaded on a thread of its own: its
+//! skin from the skin cache or the texture server, or Steve's from the imported game
+//! files when it has none (or it can't be had).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use ruthenium_auth::{Account, AccountStore, Auth, AuthError, DeviceCode, SignedIn};
+use ruthenium_assets::zip::Zip;
+use ruthenium_auth::{Account, AccountStore, Auth, AuthError, DeviceCode, SignedIn, skin};
+use ruthenium_ui::face::Face;
+
+/// Steve's skin in the client jar.
+const STEVE: &str = "assets/minecraft/textures/entity/player/wide/steve.png";
+
+/// Where faces come from.
+#[derive(Debug, Clone, Default)]
+pub struct FaceSource {
+    /// The imported game files (`<data>/game`), for Steve.
+    pub game: Option<PathBuf>,
+    /// The cache folder; skins are kept in `skins/` there.
+    pub cache: Option<PathBuf>,
+}
+
+/// The face for a skin address (none: Steve). Blocks on the disk and the network.
+pub fn load_face(skin_url: Option<&str>, from: &FaceSource) -> Option<Face> {
+    if let Some(url) = skin_url {
+        let kept = from.cache.as_deref().and_then(|c| skin::cache_path(c, url));
+        if let Some(face) = kept
+            .as_deref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|png| Face::from_skin(&png))
+        {
+            return Some(face);
+        }
+        match skin::download(url) {
+            Ok(png) => match Face::from_skin(&png) {
+                Some(face) => {
+                    if let Some(p) = kept {
+                        let saved = p
+                            .parent()
+                            .map_or(Ok(()), std::fs::create_dir_all)
+                            .and_then(|()| std::fs::write(&p, &png));
+                        if let Err(e) = saved {
+                            eprintln!("[ruthenium] couldn't keep the skin: {e}");
+                        }
+                    }
+                    return Some(face);
+                }
+                None => eprintln!("[ruthenium] the skin at {url} isn't a skin; showing Steve"),
+            },
+            Err(e) => eprintln!("[ruthenium] couldn't fetch the skin ({e}); showing Steve"),
+        }
+    }
+    steve(from.game.as_deref()?)
+}
+
+/// Steve's face from the imported client jar.
+fn steve(game: &Path) -> Option<Face> {
+    let imported = ruthenium_prepare::import::open(ruthenium_prepare::supported_version(), game)?;
+    let jar = Zip::open(&imported.client_jar).ok()?;
+    let png = jar.read(jar.find(STEVE)?).ok()?;
+    Face::from_skin(&png)
+}
 
 /// The account in use, as the menus show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,9 +258,17 @@ pub struct Accounts {
     generation: u64,
     flow: Option<Flow>,
     next_flow: u64,
-    /// Bumped whenever the list, the status or the sign-in changes.
+    /// Bumped whenever the list, the status, the sign-in or the face changes.
     revision: u64,
     open_page: Box<dyn Fn(&str)>,
+    /// Where faces come from (none: no faces).
+    faces: Option<FaceSource>,
+    /// The skin address of the face asked for last (`Some(None)`: Steve).
+    face_wanted: Option<Option<String>>,
+    face_tx: Sender<(Option<String>, Option<Face>)>,
+    face_rx: Receiver<(Option<String>, Option<Face>)>,
+    /// A face loaded for the account in use, not yet taken (`Some(None)`: none at all).
+    face_ready: Option<Option<Face>>,
 }
 
 impl std::fmt::Debug for Accounts {
@@ -240,7 +307,12 @@ impl Accounts {
         // Reading the list is a small file read; the credential store and the network wait
         // for the worker.
         let list = AccountStore::open(&dir).accounts().to_vec();
-        Accounts::with_worker(list, open, Box::new(open_in_browser))
+        let mut accounts = Accounts::with_worker(list, open, Box::new(open_in_browser));
+        accounts.faces = Some(FaceSource {
+            game: Some(dir.join("game")),
+            cache: cache_dir.map(Path::to_owned),
+        });
+        accounts
     }
 
     /// No data folder: nothing to show, and signing in fails.
@@ -254,7 +326,13 @@ impl Accounts {
         list: Vec<Account>,
         open_page: Box<dyn Fn(&str)>,
     ) -> Accounts {
+        let (face_tx, face_rx) = channel();
         Accounts {
+            faces: None,
+            face_wanted: None,
+            face_tx,
+            face_rx,
+            face_ready: None,
             jobs,
             updates,
             list,
@@ -314,9 +392,48 @@ impl Accounts {
         self.revision
     }
 
+    /// Takes faces from `from`.
+    #[cfg(test)]
+    pub fn set_face_source(&mut self, from: FaceSource) {
+        self.faces = Some(from);
+        self.face_wanted = None;
+    }
+
+    /// A face newly loaded for the account in use (`Some(None)`: it has none to show).
+    pub fn take_face(&mut self) -> Option<Option<Face>> {
+        self.face_ready.take()
+    }
+
+    /// Asks for the face of the account in use if it isn't the one asked for last, and
+    /// takes in loaded faces.
+    fn follow_face(&mut self) {
+        let Some(from) = &self.faces else { return };
+        let skin = self.list.first().and_then(|a| a.skin.clone());
+        if self.face_wanted.as_ref() != Some(&skin) {
+            self.face_wanted = Some(skin.clone());
+            let (from, tx) = (from.clone(), self.face_tx.clone());
+            let spawned = std::thread::Builder::new()
+                .name("face".into())
+                .spawn(move || {
+                    let face = load_face(skin.as_deref(), &from);
+                    let _ = tx.send((skin, face));
+                });
+            if let Err(e) = spawned {
+                eprintln!("[ruthenium] no player face: {e}");
+            }
+        }
+        while let Ok((skin, face)) = self.face_rx.try_recv() {
+            if self.face_wanted.as_ref() == Some(&skin) {
+                self.face_ready = Some(face);
+                self.revision += 1;
+            }
+        }
+    }
+
     /// Takes in the worker's reports; true if anything changed.
     pub fn poll(&mut self) -> bool {
         let before = self.revision;
+        self.follow_face();
         while let Ok(u) = self.updates.try_recv() {
             let flow = self.flow.as_ref().map(|f| f.id);
             match u {
@@ -361,6 +478,7 @@ impl Accounts {
             }
             self.revision += 1;
         }
+        self.follow_face();
         self.revision != before
     }
 
@@ -481,7 +599,7 @@ fn work(open: Open, jobs: &Receiver<Job>, updates: &Sender<Update>) {
         match backend.resume(&token) {
             Ok(s) => {
                 let p = &s.session.profile;
-                if let Err(e) = store.refreshed(&account.id, &p.name, &s.refresh_token) {
+                if let Err(e) = store.refreshed(p, &s.refresh_token) {
                     eprintln!("[ruthenium] couldn't save the renewed sign-in: {e}");
                 }
                 AccountStatus::signed_in(&s)
@@ -548,7 +666,7 @@ fn work(open: Open, jobs: &Receiver<Job>, updates: &Sender<Update>) {
                 };
                 let saved = result.and_then(|s| {
                     let p = &s.session.profile;
-                    store.signed_in(&p.id, &p.name, &s.refresh_token)?;
+                    store.signed_in(p, &s.refresh_token)?;
                     Ok(s)
                 });
                 match saved {
@@ -684,7 +802,7 @@ pub(crate) mod tests {
         for n in names.iter().rev() {
             let s = signed(n);
             store
-                .signed_in(&s.session.profile.id, n, &s.refresh_token)
+                .signed_in(&s.session.profile, &s.refresh_token)
                 .unwrap();
         }
         let list = store.accounts().to_vec();
@@ -821,6 +939,39 @@ pub(crate) mod tests {
             })
         );
         assert!(a.list().is_empty(), "no profile, no account");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn faces_come_from_the_skin_cache_or_not_at_all() {
+        let dir = temp("faces");
+        let _ = std::fs::remove_dir_all(&dir);
+        let url = "http://textures.minecraft.net/texture/0123abcd";
+        let mut skin = ruthenium_assets::Image::new(64, 64);
+        for y in 8..16 {
+            for x in 8..16 {
+                skin.set(x, y, ruthenium_assets::image::argb(255, 10, 20, 30));
+            }
+        }
+        let png = skin.encode_png();
+        let kept = skin::cache_path(&dir, url).unwrap();
+        std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+        std::fs::write(&kept, &png).unwrap();
+        let from = FaceSource {
+            game: None,
+            cache: Some(dir.clone()),
+        };
+        let face = load_face(Some(url), &from).unwrap();
+        assert_eq!(&face.levels[0][..4], &[10, 20, 30, 255]);
+        // No skin and no game files: no Steve either.
+        assert_eq!(load_face(None, &from), None);
+
+        // The account in use's face arrives through `take_face`.
+        let (mut a, _) = accounts_in(&dir.join("data"), &["Alex"], None);
+        a.set_face_source(from);
+        wait(&mut a, |a| a.face_ready.is_some());
+        assert_eq!(a.take_face(), Some(None));
+        assert_eq!(a.take_face(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -751,21 +751,26 @@ impl Presence {
     }
 }
 
-/// The title's account chip: a small glass pill, bottom right, with a dot and a line.
+/// The title's account chip: a small glass pill, top left, with the player's face and a
+/// line.
 #[derive(Debug, Clone)]
 struct Chip {
     rect: Rect,
     text: Text,
-    presence: Presence,
 }
 
 const CHIP_H: f32 = 36.0;
-const CHIP_DOT: f32 = 8.0;
+const CHIP_FACE: f32 = 24.0;
+const CHIP_FACE_RADIUS: f32 = 6.0;
 const CHIP_MARGIN: f32 = 16.0;
+/// Where the face sits from the chip's left edge (it is inset as far as from the top).
+const CHIP_INSET: f32 = 0.5 * (CHIP_H - CHIP_FACE);
+/// Shown instead of a face until one is ready.
+const FACE_PLACEHOLDER: [f32; 4] = [0.75, 0.8, 1.0, 0.14];
 
-/// The title screen: the logo above a centred column of glass pills, the version in the
-/// bottom left and the account chip in the bottom right. The logo is the brand: no name
-/// beside it.
+/// The title screen: the logo above a centred column of glass pills, the account chip in
+/// the top left and the version in the bottom left. The logo is the brand: no name beside
+/// it.
 #[derive(Debug, Clone)]
 pub struct TitleScreen {
     pub scale: UiScale,
@@ -837,10 +842,9 @@ impl TitleScreen {
                     h: 0.0,
                 },
                 text: Text::new(fonts, "", &scale, CHIP_SIZE, Weight::MEDIUM, 0.0),
-                presence: Presence::SignedOut,
             },
         };
-        title.set_account(fonts, "Not signed in", Presence::SignedOut);
+        title.set_account(fonts, "Sign in");
         title
     }
 
@@ -857,31 +861,32 @@ impl TitleScreen {
         }
     }
 
-    /// Sets the account chip's line and dot.
-    pub fn set_account(&mut self, fonts: &Fonts, line: &str, presence: Presence) {
+    /// Sets the account chip's line.
+    pub fn set_account(&mut self, fonts: &Fonts, line: &str) {
         let s = self.scale;
         let text = Text::new(fonts, line, &s, CHIP_SIZE, Weight::MEDIUM, 0.0);
-        let w = 16.0 + CHIP_DOT + 10.0 + text.width(&s) + 18.0;
+        let w = CHIP_INSET + CHIP_FACE + 10.0 + text.width(&s) + 16.0;
         self.chip = Chip {
             rect: Rect {
-                x: s.width - CHIP_MARGIN - w,
-                y: s.height - CHIP_MARGIN - CHIP_H,
+                x: CHIP_MARGIN,
+                y: CHIP_MARGIN,
                 w,
                 h: CHIP_H,
             },
             text,
-            presence,
         };
     }
 
-    /// Adds the screen's shapes and, once they are on the GPU, its text (`atlas`) and
-    /// logo (`logo`, a texture index); `states` says how lit each button is.
+    /// Adds the screen's shapes and, once they are on the GPU, its text (`atlas`), logo
+    /// and the player's face (`logo`, `face`: texture indices); `states` says how lit
+    /// each button is.
     pub fn draw(
         &self,
         shapes: &mut ShapeList,
         text: &mut TextList,
         atlas: Option<&GlyphAtlas>,
         logo: Option<u32>,
+        face: Option<u32>,
         states: &ButtonStates,
     ) {
         let s = &self.scale;
@@ -914,13 +919,18 @@ impl TitleScreen {
             ring[3] *= look.focus;
             shapes.pill_ring(s, r.outset(FOCUS_GAP + FOCUS_WIDTH), FOCUS_WIDTH, ring);
         }
-        let dot = Rect {
-            x: r.x + 16.0,
-            y: r.y + 0.5 * (r.h - CHIP_DOT),
-            w: CHIP_DOT,
-            h: CHIP_DOT,
+        // The face shrinks and grows with the pill, keeping its inset.
+        let k = r.h / CHIP_H;
+        let head = Rect {
+            x: r.x + CHIP_INSET * k,
+            y: r.y + CHIP_INSET * k,
+            w: CHIP_FACE * k,
+            h: CHIP_FACE * k,
         };
-        shapes.rounded(s, dot, 0.5 * CHIP_DOT, chip.presence.color());
+        match face {
+            Some(t) => shapes.image_rounded(s, head, CHIP_FACE_RADIUS * k, t),
+            None => shapes.rounded(s, head, CHIP_FACE_RADIUS * k, FACE_PLACEHOLDER),
+        }
         let Some(atlas) = atlas else { return };
         text.line(
             atlas,
@@ -930,7 +940,7 @@ impl TitleScreen {
             FAINT,
         );
         let line = Rect {
-            x: dot.x + CHIP_DOT + 10.0,
+            x: head.x + head.w + 10.0,
             ..r
         };
         chip.text
@@ -985,7 +995,7 @@ mod tests {
         let mut shapes = ShapeList::new();
         let mut text = TextList::new();
         let rest = ButtonStates::new(3);
-        t.draw(&mut shapes, &mut text, None, None, &rest);
+        t.draw(&mut shapes, &mut text, None, None, None, &rest);
         let p = shapes.shapes()[0];
         assert_eq!(p.radius, 0.5 * (p.rect[3] - p.rect[1]));
         assert!(p.glass);
@@ -993,7 +1003,7 @@ mod tests {
         // With an atlas, labels are centred in their pills.
         let mut atlas = GlyphAtlas::new(1024);
         atlas.add_text(&fonts, Weight::SEMIBOLD, "Multiplayer");
-        t.draw(&mut shapes, &mut text, Some(&atlas), None, &rest);
+        t.draw(&mut shapes, &mut text, Some(&atlas), None, None, &rest);
         // The first label's glyphs come first (other labels share some of its letters).
         let q = &text.quads()[.."Multiplayer".len()];
         let (left, right) = (q.first().unwrap().rect[0], q.last().unwrap().rect[2]);
@@ -1120,11 +1130,21 @@ mod tests {
         run(&mut st, 1.0);
         let mut shapes = ShapeList::new();
         let mut text = TextList::new();
-        t.draw(&mut shapes, &mut text, None, None, &st);
-        let sh = shapes.shapes();
-        // Pill 0 (hovered), pill 1 (focused) and its ring, pill 2, the chip and its dot.
+        t.draw(&mut shapes, &mut text, None, None, None, &st);
+        let sh = shapes.shapes().to_vec();
+        // Pill 0 (hovered), pill 1 (focused) and its ring, pill 2, the chip and the
+        // placeholder for its face.
         assert_eq!(sh.len(), 6);
-        assert!(sh[4].glass && !sh[5].glass);
+        assert!(sh[4].glass && !sh[5].glass && sh[5].image.is_none());
+        // The chip is top left; with a face, the face is an image inside it.
+        assert_eq!((sh[4].rect[0], sh[4].rect[1]), (16.0 * s.px, 16.0 * s.px));
+        shapes.clear();
+        t.draw(&mut shapes, &mut text, None, None, Some(9), &st);
+        let face = shapes.shapes()[5];
+        assert_eq!(face.image.map(|i| i.texture), Some(9));
+        assert!(face.rect[0] > sh[4].rect[0] && face.rect[3] < sh[4].rect[3]);
+        assert_eq!(t.hit(20.0, 20.0), Some(3));
+        assert_eq!(t.action(3), Some(Action::Accounts));
         let width = |s: &Shape| s.rect[2] - s.rect[0];
         assert!(width(&sh[0]) > width(&sh[3]));
         assert!(sh[2].ring > 0.0 && !sh[2].glass);

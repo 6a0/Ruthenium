@@ -47,20 +47,23 @@ impl std::fmt::Debug for UreqHttp {
 
 const USER_AGENT: &str = concat!("Ruthenium/", env!("CARGO_PKG_VERSION"));
 
+/// An HTTPS agent: the platform's certificate verifier, 30 s timeouts, statuses as answers.
+pub(crate) fn agent() -> ureq::Agent {
+    let tls = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
+    let config = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(30)))
+        .user_agent(USER_AGENT)
+        .tls_config(tls)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
 impl UreqHttp {
     pub fn new() -> UreqHttp {
-        let tls = ureq::tls::TlsConfig::builder()
-            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
-            .build();
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .user_agent(USER_AGENT)
-            .tls_config(tls)
-            .build();
-        UreqHttp {
-            agent: ureq::Agent::new_with_config(config),
-        }
+        UreqHttp { agent: agent() }
     }
 
     fn finish(
