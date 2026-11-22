@@ -189,6 +189,10 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             .map(|d| d.join("servers.dat"))
     });
     let mut menu = Menu::new(servers_file);
+    let (status, mut sign_in) = crate::account::check_at_launch(
+        ruthenium_prepare::default_data_dir(&ruthenium_prepare::discover::Env::from_process()),
+    );
+    menu.set_account(status);
     let mut platform = Platform::init(env!("CARGO_PKG_VERSION"))?;
     let window = platform.create_window("Ruthenium", opts.window_size.0, opts.window_size.1)?;
     let t_window = started.elapsed();
@@ -396,6 +400,13 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 let (w, h) = if big { (1100, 620) } else { DEFAULT_SIZE };
                 window.request_size(w, h);
             }
+        }
+
+        if let Some(rx) = &sign_in
+            && let Ok(status) = rx.try_recv()
+        {
+            menu.set_account(status);
+            sign_in = None;
         }
 
         // 3. Simulation: nothing yet.

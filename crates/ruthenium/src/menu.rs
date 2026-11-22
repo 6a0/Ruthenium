@@ -96,6 +96,39 @@ enum Atlas {
     Failed,
 }
 
+/// The account the menus show, as the launch-time sign-in check found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountStatus {
+    /// No account signed in.
+    None,
+    Checking(String),
+    SignedIn {
+        name: String,
+        may_play_online: bool,
+    },
+    Failed {
+        name: String,
+        reason: String,
+    },
+}
+
+impl AccountStatus {
+    fn line(&self) -> String {
+        match self {
+            AccountStatus::None => "Not signed in".into(),
+            AccountStatus::Checking(n) => format!("Signing in as {n}..."),
+            AccountStatus::SignedIn {
+                name,
+                may_play_online: true,
+            } => format!("Signed in as {name}"),
+            AccountStatus::SignedIn { name, .. } => {
+                format!("{name}: multiplayer is turned off for this account")
+            }
+            AccountStatus::Failed { name, reason } => format!("{name}: {reason}"),
+        }
+    }
+}
+
 /// Which form is showing, and what it is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormKind {
@@ -129,6 +162,7 @@ pub struct Menu {
     servers_path: Option<PathBuf>,
     /// The last address typed into Direct Connect (vanilla keeps it in options.txt).
     last_direct: String,
+    account: AccountStatus,
     shapes: ShapeList,
     text: TextList,
     /// Mouse position in window coordinates.
@@ -221,6 +255,7 @@ impl Menu {
             servers: None,
             servers_path,
             last_direct: String::new(),
+            account: AccountStatus::None,
             shapes: ShapeList::new(),
             text: TextList::new(),
             mouse: None,
@@ -268,6 +303,7 @@ impl Menu {
             self.title_states = ButtonStates::new(title.buttons.len());
         }
         self.title = Some(title);
+        self.apply_account();
         if let Some(s) = &mut self.servers {
             s.screen.layout(scale, &self.fonts);
         }
@@ -275,6 +311,34 @@ impl Menu {
             form.layout(scale, &self.fonts);
         }
         scale
+    }
+
+    /// The account to show, and whether Multiplayer is allowed for it.
+    pub fn set_account(&mut self, status: AccountStatus) {
+        self.account = status;
+        self.apply_account();
+    }
+
+    fn apply_account(&mut self) {
+        let line = self.account.line();
+        if let Some(t) = &mut self.title {
+            t.set_account(&self.fonts, Some(&line));
+        }
+        // Parental controls or a multiplayer ban turn Multiplayer off, as in vanilla.
+        let allowed = !matches!(
+            self.account,
+            AccountStatus::SignedIn {
+                may_play_online: false,
+                ..
+            }
+        );
+        if let Some(i) = self.title.as_ref().and_then(|t| {
+            t.buttons
+                .iter()
+                .position(|b| b.action == Action::Multiplayer)
+        }) {
+            self.title_states.set_enabled(i, allowed);
+        }
     }
 
     fn open_form(&mut self, kind: FormKind, scale: UiScale) {
@@ -900,6 +964,26 @@ mod tests {
         let a = m.key(code, true, false, shift, shortcut, clip);
         let b = m.key(code, false, false, shift, shortcut, clip);
         a.or(b)
+    }
+
+    #[test]
+    fn privileges_can_turn_multiplayer_off() {
+        let mut m = Menu::new(None);
+        m.layout((1600, 900));
+        assert!(m.title_states.enabled(0));
+        m.set_account(AccountStatus::SignedIn {
+            name: "Alex".into(),
+            may_play_online: false,
+        });
+        assert!(!m.title_states.enabled(0));
+        // A new layout (window resize) keeps it off.
+        m.layout((1280, 720));
+        assert!(!m.title_states.enabled(0));
+        m.set_account(AccountStatus::SignedIn {
+            name: "Alex".into(),
+            may_play_online: true,
+        });
+        assert!(m.title_states.enabled(0));
     }
 
     #[test]

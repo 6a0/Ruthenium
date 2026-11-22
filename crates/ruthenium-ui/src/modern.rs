@@ -603,9 +603,7 @@ pub const WEIGHTS: [Weight; 4] = [
 
 pub(crate) const WHITE_TEXT: [f32; 4] = WHITE;
 
-const NAME: &str = "RUTHENIUM";
-const NAME_SIZE: f32 = 34.0;
-const LOGO: f32 = 112.0;
+const LOGO: f32 = 136.0;
 const LABEL_SIZE: f32 = 19.0;
 const SMALL_SIZE: f32 = 11.5;
 const WHITE: [f32; 4] = [0.95, 0.96, 1.0, 1.0];
@@ -717,18 +715,17 @@ impl Text {
     }
 }
 
-/// The title screen: the logo and name above a centred column of glass pills, and the
-/// version in the bottom left.
+/// The title screen: the logo above a centred column of glass pills, and the version in
+/// the bottom left. The logo is the brand: no name beside it.
 #[derive(Debug, Clone)]
 pub struct TitleScreen {
     pub scale: UiScale,
     pub logo: Rect,
-    /// The box the name is centred in.
-    pub name: Rect,
     pub buttons: Vec<Button>,
-    name_text: Text,
     labels: Vec<Text>,
     version: Text,
+    /// The signed-in account (or why not), bottom right.
+    account: Option<Text>,
 }
 
 impl TitleScreen {
@@ -745,11 +742,9 @@ impl TitleScreen {
         ];
         let n = entries.len() as f32;
         let column = n * Self::BUTTON_HEIGHT + (n - 1.0) * Self::GAP;
-        let name_h = 44.0;
-        let header = LOGO + 14.0 + name_h;
-        let space = 44.0;
-        // The header and the column together sit a little above the middle.
-        let top = ((scale.height - (header + space + column)) * 0.45).max(24.0);
+        let space = 48.0;
+        // The logo and the column together sit a little above the middle.
+        let top = ((scale.height - (LOGO + space + column)) * 0.45).max(24.0);
         let cx = scale.width * 0.5;
         let logo = Rect {
             x: cx - 0.5 * LOGO,
@@ -757,13 +752,7 @@ impl TitleScreen {
             w: LOGO,
             h: LOGO,
         };
-        let name = Rect {
-            x: cx - 260.0,
-            y: top + LOGO + 14.0,
-            w: 520.0,
-            h: name_h,
-        };
-        let mut y = top + header + space;
+        let mut y = top + LOGO + space;
         let buttons: Vec<Button> = entries
             .into_iter()
             .map(|(label, action)| {
@@ -786,14 +775,19 @@ impl TitleScreen {
             .map(|b| Text::new(fonts, b.label, &scale, LABEL_SIZE, Weight::SEMIBOLD, 0.01))
             .collect();
         TitleScreen {
-            name_text: Text::new(fonts, NAME, &scale, NAME_SIZE, Weight::EXTRABOLD, 0.22),
             version: Text::new(fonts, version, &scale, SMALL_SIZE, Weight::MEDIUM, 0.02),
             labels,
             scale,
             logo,
-            name,
             buttons,
+            account: None,
         }
+    }
+
+    /// Sets the bottom-right account line (none: nothing there).
+    pub fn set_account(&mut self, fonts: &Fonts, line: Option<&str>) {
+        self.account =
+            line.map(|l| Text::new(fonts, l, &self.scale, SMALL_SIZE, Weight::MEDIUM, 0.02));
     }
 
     /// Adds the screen's shapes and, once they are on the GPU, its text (`atlas`) and
@@ -811,10 +805,18 @@ impl TitleScreen {
             shapes.image(s, self.logo, logo);
         }
         for (i, (b, label)) in self.buttons.iter().zip(&self.labels).enumerate() {
-            draw_button(shapes, text, atlas, s, b.rect, label, states.look(i), true);
+            draw_button(
+                shapes,
+                text,
+                atlas,
+                s,
+                b.rect,
+                label,
+                states.look(i),
+                states.enabled(i),
+            );
         }
         let Some(atlas) = atlas else { return };
-        self.name_text.centred(text, atlas, s, self.name, WHITE);
         text.line(
             atlas,
             &self.version.line,
@@ -822,6 +824,10 @@ impl TitleScreen {
             (s.height - 16.0) * s.px,
             FAINT,
         );
+        if let Some(a) = &self.account {
+            let x = s.width - 16.0 - a.width(s);
+            a.draw_at(text, atlas, s, x, s.height - 16.0, FAINT);
+        }
     }
 
     /// The index of the button at `(x, y)` (UI units).
@@ -857,7 +863,7 @@ mod tests {
             assert_eq!(b.rect.x + b.rect.w * 0.5, 800.0);
         }
         let first = t.buttons[0].rect;
-        assert!(t.logo.y + t.logo.h < t.name.y && t.name.y + t.name.h < first.y);
+        assert!(t.logo.y + t.logo.h < first.y);
         assert_eq!(t.logo.x + 0.5 * t.logo.w, 800.0);
         assert_eq!(t.hit(800.0, first.y + 1.0), Some(0));
         assert_eq!(t.buttons[0].action, Action::Multiplayer);

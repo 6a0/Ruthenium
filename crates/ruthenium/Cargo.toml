@@ -19,6 +19,7 @@ sdl-static = ["ruthenium-platform/sdl-static"]
 [dependencies]
 profiling = "1.0.18"
 ruthenium-assets = { path = "../ruthenium-assets" }
+ruthenium-auth = { path = "../ruthenium-auth" }
 ruthenium-gpu = { path = "../ruthenium-gpu" }
 ruthenium-net = { path = "../ruthenium-net" }
 ruthenium-platform = { path = "../ruthenium-platform" }

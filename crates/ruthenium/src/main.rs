@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+mod account;
 mod assets_cmd;
+mod auth_cmd;
 mod client;
 mod menu;
 mod prepare_cmd;
@@ -52,7 +54,12 @@ commands:
           [--dump <folder>]
       Build the sprite atlases from the imported game files and the given
       resource packs (lowest first), print their sizes, and optionally write
-      every atlas level as PNG with a sprite index.";
+      every atlas level as PNG with a sprite index.
+  auth login [--device] | list | check [<name>] [--certificates] | logout <name>
+      Sign in with a Microsoft account (in the browser, or with a code to enter
+      on another device), list the accounts signed in, check one by signing in
+      again from its saved sign-in, or sign one out. Saved sign-ins live in the
+      system's credential store.";
 
 fn main() -> ExitCode {
     let started = Instant::now();
@@ -66,6 +73,7 @@ fn main() -> ExitCode {
         Some("locate") => prepare_cmd::locate(&args[1..]),
         Some("prepare") => prepare_cmd::prepare(&args[1..]),
         Some("assets") => assets_cmd::run(&args[1..]),
+        Some("auth") => auth_cmd::run(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             ExitCode::SUCCESS
