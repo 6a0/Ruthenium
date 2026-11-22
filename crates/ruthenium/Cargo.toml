@@ -18,6 +18,7 @@ sdl-static = ["ruthenium-platform/sdl-static"]
 
 [dependencies]
 profiling = "1.0.18"
+ruthenium-assets = { path = "../ruthenium-assets" }
 ruthenium-gpu = { path = "../ruthenium-gpu" }
 ruthenium-platform = { path = "../ruthenium-platform" }
 ruthenium-prepare = { path = "../ruthenium-prepare" }

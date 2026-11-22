@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod assets_cmd;
 mod client;
 mod prepare_cmd;
 
@@ -41,7 +42,12 @@ commands:
   prepare [--from <folder>] [--data-dir <folder>] [--java <java>] [--exporters <jar>]
       Import the game files from your launcher into Ruthenium's data folder,
       then run Mojang's data generator and Ruthenium's exporters on them. Runs
-      only what is out of date.";
+      only what is out of date.
+  assets  [--data-dir <folder>] [--pack <zip or folder>]... [--mip-levels <0-4>]
+          [--dump <folder>]
+      Build the sprite atlases from the imported game files and the given
+      resource packs (lowest first), print their sizes, and optionally write
+      every atlas level as PNG with a sprite index.";
 
 fn main() -> ExitCode {
     let started = Instant::now();
@@ -54,6 +60,7 @@ fn main() -> ExitCode {
         }
         Some("locate") => prepare_cmd::locate(&args[1..]),
         Some("prepare") => prepare_cmd::prepare(&args[1..]),
+        Some("assets") => assets_cmd::run(&args[1..]),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             ExitCode::SUCCESS

@@ -1,0 +1,20 @@
+[package]
+name = "ruthenium-assets"
+description = "Reads the imported game files and resource packs in place: pack stack, PNGs, sprite metadata, atlas stitching and mipmaps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+memmap2 = "0.9.12"
+# 0.8, the version png already pulls in.
+miniz_oxide = "0.8.9"
+png = "0.18.1"
+rayon = "1.12.0"
+regex = "1.13.2"
+serde_json = "1.0.154"

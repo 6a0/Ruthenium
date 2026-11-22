@@ -1,0 +1,25 @@
+//! Game assets, read in place from the imported install and resource packs.
+//!
+//! - [`zip`]: the client jar and zipped packs, memory-mapped.
+//! - [`pack`] + [`resources`]: the pack stack (vanilla at the bottom) with
+//!   vanilla's lookup, metadata and filter rules.
+//! - [`image`]: PNG decoding to RGBA, as vanilla's loader does it.
+//! - [`meta`]: `.mcmeta` sections for sprites.
+//! - [`atlas`], [`stitch`], [`mipmap`]: the 12 sprite atlases, laid out
+//!   and mip-mapped exactly as 26.3 does, composed on the CPU.
+
+pub mod atlas;
+pub mod id;
+pub mod image;
+pub mod meta;
+pub mod mipmap;
+pub mod pack;
+pub mod resources;
+pub mod stitch;
+pub mod zip;
+
+pub use atlas::{ATLASES, Atlas, AtlasDef, AtlasOptions};
+pub use id::Id;
+pub use image::Image;
+pub use pack::Pack;
+pub use resources::{Resource, Resources};

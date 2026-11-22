@@ -59,6 +59,8 @@ To also run Ruthenium's exporters (original Java code that reads data such as en
 
 `prepare` accepts a client jar only if its SHA-1 matches the official 26.3 release. It checks the asset index and every library and asset file the same way. Verified files are hard-linked (or copied) into Ruthenium's data folder. Pass `--from <folder>` for a launcher folder that isn't found automatically.
 
+After `prepare`, `cargo run -p ruthenium -- assets` builds the game's sprite atlases from those files, read in place (add `--pack <zip or folder>` for resource packs, `--dump <folder>` to write them out as PNGs). The atlas tests in `crates/ruthenium-assets/tests/vanilla.rs` run against your import when `RUTHENIUM_GAME_DIR` points at it.
+
 ## Measuring vanilla
 
 Two development tools run the vanilla 26.3 client from your own install (offline developer mode, singleplayer only; your account is never used):
