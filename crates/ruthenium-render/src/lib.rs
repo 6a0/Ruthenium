@@ -182,9 +182,10 @@ impl Renderer {
 
     /// Rebuilds the pipelines if the swapchain's format changed (rare: a different monitor
     /// or surface). Waits for earlier frames, which may still use the old pipelines.
-    fn ensure_format(&mut self, format: vk::Format) -> Result<(), ruthenium_gpu::Error> {
+    /// Returns whether the pipelines were rebuilt.
+    fn ensure_format(&mut self, format: vk::Format) -> Result<bool, ruthenium_gpu::Error> {
         if format == self.pipelines.format() {
-            return Ok(());
+            return Ok(false);
         }
         self.frames.wait_for_gpu(1)?;
         let gpu = self.frames.gpu().clone();
@@ -195,7 +196,7 @@ impl Renderer {
             &pipelines::descs(),
             format,
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// Records, submits and presents one frame showing `background`.
@@ -214,11 +215,16 @@ impl Renderer {
                 c.step(&mut self.uploads, &mut self.textures, &ctx, completed)?;
             }
             self.textures.bind(ctx.cmd, ctx.slot(), self.layout.raw());
+            // First frame (and after a rebuild): draw once with every pipeline.
+            self.pipelines.record_warm_up(ctx.cmd, &self.layout)?;
         }
         // Off-screen passes will be recorded here, before the late acquire.
         let target = self.frames.acquire(&ctx)?;
         if let Some(t) = target {
-            self.ensure_format(t.format)?;
+            if self.ensure_format(t.format)? {
+                // SAFETY: as above; outside a render pass.
+                unsafe { self.pipelines.record_warm_up(ctx.cmd, &self.layout)? };
+            }
             let gpu = self.frames.gpu();
             let cmd = ctx.cmd;
             let to_attachment = [vk::ImageMemoryBarrier2::default()

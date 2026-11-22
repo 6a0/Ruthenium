@@ -12,6 +12,7 @@ use ash::vk;
 use ash::vk::TaggedStructure;
 
 use crate::device::Gpu;
+use crate::memory::Image;
 use crate::{Error, VkContext};
 
 /// Bytes in the single push-constant range of the shared layout: the minimum every Vulkan
@@ -215,6 +216,9 @@ pub struct Pipelines {
     gpu: Arc<Gpu>,
     pipelines: Vec<vk::Pipeline>,
     format: vk::Format,
+    /// The 1×1 target of the warm-up draws, until they are recorded.
+    warm_up: Option<Image>,
+    warmed: bool,
 }
 
 impl std::fmt::Debug for Pipelines {
@@ -242,6 +246,8 @@ impl Pipelines {
             gpu,
             pipelines: Vec::with_capacity(descs.len()),
             format,
+            warm_up: None,
+            warmed: false,
         };
 
         let cache_raw = cache.raw();
@@ -290,6 +296,102 @@ impl Pipelines {
     pub fn format(&self) -> vk::Format {
         self.format
     }
+
+    /// Whether [`Self::record_warm_up`] has run for these pipelines.
+    pub fn warmed_up(&self) -> bool {
+        self.warmed
+    }
+
+    /// Records one draw with every pipeline into a 1×1 scratch target, with zeroed push
+    /// constants (texture 0: the missing texture). Some drivers finish compiling, or upload
+    /// shader code, only at a pipeline's first draw; this moves that to the first frame
+    /// instead of the frame that first needs the pipeline (a HUD element, the world).
+    /// Call it once, outside a render pass, before the frame's passes; later calls do
+    /// nothing.
+    ///
+    /// # Safety
+    /// `cmd` is recording a frame on the graphics queue, outside a render pass, with the
+    /// texture table bound at set 0 of `layout` (the layout these pipelines were built
+    /// with) and its missing texture ready.
+    pub unsafe fn record_warm_up(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        layout: &PipelineLayout,
+    ) -> Result<(), Error> {
+        if self.warmed {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let one = vk::Extent2D {
+            width: 1,
+            height: 1,
+        };
+        let target = Image::new_2d(
+            &self.gpu,
+            self.format,
+            one,
+            1,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT,
+        )?;
+        let gpu = &*self.gpu;
+        let d = &gpu.device;
+        let to_attachment = [vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(target.raw)
+            .subresource_range(crate::swapchain::COLOR_RANGE)];
+        let attachments = [vk::RenderingAttachmentInfo::default()
+            .image_view(target.view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .store_op(vk::AttachmentStoreOp::DONT_CARE)];
+        let area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: one,
+        };
+        let rendering = vk::RenderingInfo::default()
+            .render_area(area)
+            .layer_count(1)
+            .color_attachments(&attachments);
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let push = [0u8; PUSH_CONSTANT_BYTES as usize];
+        // SAFETY: guaranteed by the caller; the target is alive until these pipelines are
+        // dropped, which happens only once no submitted frame uses them.
+        unsafe {
+            gpu.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_attachment),
+            );
+            gpu.cmd_begin_rendering(cmd, &rendering);
+            d.cmd_set_viewport(cmd, 0, &[viewport]);
+            d.cmd_set_scissor(cmd, 0, &[area]);
+            d.cmd_push_constants(cmd, layout.raw, PUSH_CONSTANT_STAGES, 0, &push);
+            for &p in &self.pipelines {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, p);
+                d.cmd_draw(cmd, 3, 1, 0, 0);
+            }
+            gpu.cmd_end_rendering(cmd);
+        }
+        self.warm_up = Some(target);
+        self.warmed = true;
+        eprintln!(
+            "[gpu] warm-up draws for {} pipeline(s) recorded in {:.2} ms",
+            self.pipelines.len(),
+            started.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(())
+    }
 }
 
 impl Drop for Pipelines {
@@ -302,6 +404,9 @@ impl Drop for Pipelines {
                 if p != vk::Pipeline::null() {
                     d.destroy_pipeline(p, None);
                 }
+            }
+            if let Some(t) = self.warm_up.take() {
+                t.destroy(&self.gpu);
             }
         }
     }

@@ -266,7 +266,7 @@ impl Buffer {
     }
 }
 
-/// A sampled 2D image with its own memory and a view of every mip level.
+/// A 2D image with its own memory and a view of every mip level.
 #[derive(Debug)]
 pub(crate) struct Image {
     pub raw: vk::Image,
@@ -282,6 +282,21 @@ impl Image {
         extent: vk::Extent2D,
         mip_levels: u32,
     ) -> Result<Image, Error> {
+        // TRANSFER_SRC for reading textures back (checks, atlas dumps).
+        let usage = vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::TRANSFER_SRC;
+        Image::new_2d(gpu, format, extent, mip_levels, usage)
+    }
+
+    /// A 2D image with `usage`, in GPU-only memory, with a view of every mip level.
+    pub(crate) fn new_2d(
+        gpu: &Gpu,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        mip_levels: u32,
+        usage: vk::ImageUsageFlags,
+    ) -> Result<Image, Error> {
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -290,12 +305,7 @@ impl Image {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            // TRANSFER_SRC for reading textures back (checks, atlas dumps).
-            .usage(
-                vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::TRANSFER_SRC,
-            )
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let d = &gpu.device;
