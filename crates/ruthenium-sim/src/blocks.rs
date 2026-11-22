@@ -26,15 +26,22 @@ pub struct Blocks {
     /// Scaffolding's thin floor (`SHAPE_UNSTABLE_BOTTOM`: the bottom eighth), which
     /// a player just above unsupported scaffolding stands on.
     scaffolding_bottom: Shape,
+    /// Powder snow under an entity falling into it
+    /// (`PowderSnowBlock.FALLING_COLLISION_SHAPE`: up to 0.9).
+    powder_snow_falling: Shape,
 }
 
 /// The entity a collision query is made for (`EntityCollisionContext`): the bottom
-/// of its box when the query began, and whether it is descending (the local player:
-/// sneak held). Scaffolding's collision depends on it.
+/// of its box when the query began, whether it is descending (the local player:
+/// sneak held), how far it has fallen, and whether it can walk on powder snow
+/// (`canEntityWalkOnPowderSnow`: leather boots on). Scaffolding's and powder snow's
+/// collisions depend on it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Who {
     pub bottom: f64,
     pub descending: bool,
+    pub fall_distance: f64,
+    pub walks_on_powder_snow: bool,
 }
 
 impl Who {
@@ -71,6 +78,14 @@ impl Blocks {
             kinds: crate::block::SharedKinds::default(),
             scaffolding_bottom: Shape::new(&ruthenium_prepare::exporters::ShapeData {
                 coords: [vec![0.0, 1.0], vec![0.0, 0.125], vec![0.0, 1.0]],
+                full: vec![true],
+            }),
+            powder_snow_falling: Shape::new(&ruthenium_prepare::exporters::ShapeData {
+                coords: [
+                    vec![0.0, 1.0],
+                    vec![0.0, 0.8999999761581421],
+                    vec![0.0, 1.0],
+                ],
                 full: vec![true],
             }),
         }
@@ -308,9 +323,8 @@ impl Blocks {
     ///
     /// Context: a player never stands on fluids (`LiquidBlock`: only the empty shape
     /// unless the entity can stand on the fluid), and moving pistons need their block
-    /// entity, which isn't tracked yet. Powder snow and scaffolding use the shape the
-    /// empty context gives until their rules (boots and falling, standing above and
-    /// sneaking) are ported.
+    /// entity, which isn't tracked yet. Powder snow and scaffolding have the shape the
+    /// empty context gives; [`Blocks::collision_for`] has an entity's.
     pub fn collision(&self, id: u32, pos: [i32; 3]) -> Option<Placed<'_>> {
         let s = self.state(id);
         let shape = &self.shapes[s.shape as usize];
@@ -329,16 +343,32 @@ impl Blocks {
     }
 
     /// The collision shape an entity meets (`getCollisionShape` with its context).
-    /// Only scaffolding depends on who it is: solid (its top) for an entity standing
-    /// above it that isn't descending; its thin floor for one above the block below
-    /// it when the scaffolding is unsupported at the bottom of a column; else nothing.
-    /// Without an entity (`None`) every block has its exported shape.
+    /// Scaffolding is solid (its top) for an entity standing above it that isn't
+    /// descending; its thin floor for one above the block below it when the
+    /// scaffolding is unsupported at the bottom of a column; else nothing. Powder snow
+    /// catches an entity that has fallen more than 2.5 blocks (up to 0.9), carries one
+    /// in leather boots standing above it and not descending, and lets anything else
+    /// sink in. Without an entity (`None`) every block has its exported shape.
     pub fn collision_for(&self, id: u32, pos: [i32; 3], who: Option<Who>) -> Option<Placed<'_>> {
         let Some(who) = who else {
             return self.collision(id, pos);
         };
-        if self.name(id) != "minecraft:scaffolding" {
-            return self.collision(id, pos);
+        let place = |shape| Placed {
+            shape,
+            offset: None,
+            pos: [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
+        };
+        match self.name(id) {
+            "minecraft:scaffolding" => {}
+            "minecraft:powder_snow" => {
+                if who.fall_distance > 2.5 {
+                    return Some(place(&self.powder_snow_falling));
+                }
+                let carried =
+                    who.walks_on_powder_snow && who.is_above(pos[1], 1.0) && !who.descending;
+                return carried.then(|| place(&self.block));
+            }
+            _ => return self.collision(id, pos),
         }
         if who.is_above(pos[1], 1.0) && !who.descending {
             return self.collision(id, pos);
@@ -346,11 +376,7 @@ impl Blocks {
         let s = ruthenium_data::v26_3::blocks::BlockState::from_id(id)?;
         let unsupported =
             s.value("distance").is_some_and(|d| d != "0") && s.value("bottom") == Some("true");
-        (unsupported && who.is_above(pos[1], 0.0)).then(|| Placed {
-            shape: &self.scaffolding_bottom,
-            offset: None,
-            pos: [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
-        })
+        (unsupported && who.is_above(pos[1], 0.0)).then(|| place(&self.scaffolding_bottom))
     }
 
     /// The outline shape (`getShape` with the picking entity's context), placed in the

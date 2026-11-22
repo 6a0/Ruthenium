@@ -14,15 +14,17 @@
 //! server's copy of the player's entity data, which overrides the client's own (its
 //! sprinting flag, pose, no-gravity). Using items: the hands, the use the client
 //! predicts and the server's living flags start and stop, the slowdown and the sprint
-//! it blocks, food, cooldowns ([`crate::interact`] starts and releases uses). Not yet:
-//! elytra, riptide, the scale attribute, vehicles, the world border, and the effects of
-//! the blocks the player moves through (cobwebs, bubble columns).
+//! it blocks, food, cooldowns ([`crate::interact`] starts and releases uses). The
+//! blocks the player moves through: cobwebs, berry bushes and powder snow holding it,
+//! bubble columns pushing and pulling, sliding down honey. Not yet: elytra, riptide,
+//! the scale attribute, vehicles and the world border.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 
-use ruthenium_data::v26_3::registries::MobEffect;
+use ruthenium_data::v26_3::blocks::BlockState;
+use ruthenium_data::v26_3::registries::{Item, MobEffect};
 use ruthenium_javamath::mth;
 use ruthenium_protocol::packets::play::{self, DataValue, PlayerPosition};
 use ruthenium_protocol::wire;
@@ -33,7 +35,7 @@ use crate::effect::{Effect, Effects};
 use crate::entity::EntityTypes;
 use crate::fluid::FluidInteraction;
 use crate::inventory::{Cooldowns, Hand, Inventory};
-use crate::item::{Food, Stack};
+use crate::item::{EquipmentSlot, Food, Stack};
 use crate::shape::{Aabb, Axis, EPSILON, Placed, Shape, collide_all};
 use crate::world::Level;
 
@@ -617,6 +619,35 @@ pub struct LocalPlayer {
     item_swap_ticker: i32,
     /// `lastItemInMainHand`: a copy of the main hand as the last tick left it.
     last_item_in_main_hand: Stack,
+    /// `stuckSpeedMultiplier`: set by a cobweb, a berry bush or powder snow the
+    /// player moved through, it scales the next move, which then starts from rest.
+    stuck_speed_multiplier: [f64; 3],
+    /// `movementThisTick`: each move of the tick, for the blocks it passed through.
+    movement_this_tick: Vec<Movement>,
+    /// `isInPowderSnow` (set by the blocks moved through) and `wasInPowderSnow` (as
+    /// the tick began).
+    in_powder_snow: bool,
+    was_in_powder_snow: bool,
+}
+
+/// `Entity.Movement`: a move from one place to another, with the movement asked for
+/// (when it came from `move`), whose axes order the walk through the blocks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Movement {
+    from: [f64; 3],
+    to: [f64; 3],
+    asked: Option<[f64; 3]>,
+}
+
+/// What a block the player moves through does to it (`entityInside`), for the
+/// blocks whose effect moves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inside {
+    Cobweb,
+    BerryBush,
+    PowderSnow,
+    BubbleColumn,
+    Honey,
 }
 
 impl LocalPlayer {
@@ -683,6 +714,10 @@ impl LocalPlayer {
             attack_strength_ticker: 0,
             item_swap_ticker: 0,
             last_item_in_main_hand: Stack::empty(),
+            stuck_speed_multiplier: [0.0; 3],
+            movement_this_tick: Vec::new(),
+            in_powder_snow: false,
+            was_in_powder_snow: false,
         }
     }
 
@@ -1054,6 +1089,7 @@ impl LocalPlayer {
         );
         self.old_position = old;
         self.old_rot = (old_y, old_x);
+        self.movement_this_tick.clear();
     }
 
     /// `handleUpdateAttributes`: each attribute's base, and its modifiers replaced by
@@ -1347,6 +1383,8 @@ impl LocalPlayer {
 
     /// `Entity.baseTick`'s movement parts: the fluids, swimming, lava halving the fall.
     fn base_tick(&mut self, env: &Env<'_>) {
+        self.was_in_powder_snow = self.in_powder_snow;
+        self.in_powder_snow = false;
         self.update_fluid_interaction(env);
         self.update_swimming(env);
         if self.in_lava() {
@@ -1663,22 +1701,243 @@ impl LocalPlayer {
         self.apply_effects_from_blocks(env);
     }
 
-    /// `Entity.applyEffectsFromBlocks`: the block stood on (`stepOn`). The effects of the
-    /// blocks the tick's movement passed through aren't ported yet.
+    /// `Entity.applyEffectsFromBlocks`: the block stood on (`stepOn`), then the blocks
+    /// the tick's moves passed through (`checkInsideBlocks`); a last move to where the
+    /// player is now when the moves don't end there (or there were none).
     fn apply_effects_from_blocks(&mut self, env: &Env<'_>) {
-        if self.no_physics || !self.on_ground {
+        let mut movements = std::mem::take(&mut self.movement_this_tick);
+        match movements.last() {
+            None => movements.push(Movement {
+                from: self.old_position,
+                to: self.position,
+                asked: None,
+            }),
+            Some(last) if distance_sqr(last.to, self.position) > 9.999999439624929E-11 => movements
+                .push(Movement {
+                    from: last.to,
+                    to: self.position,
+                    asked: None,
+                }),
+            Some(_) => {}
+        }
+        // isAffectedByBlocks.
+        if self.no_physics {
             return;
         }
-        let state = env.state(self.on_pos(env, 0.2));
-        // SlimeBlock.stepOn: slow walking (not when stepping carefully). The other
-        // blocks' stepOn only does things on the server (or shows particles).
-        if env.blocks.is_class(state, Class::SlimeBlock) && !self.keys.shift {
-            let dy = self.delta[1].abs();
-            if dy < 0.1 {
-                let scale = 0.4 + dy * 0.2;
-                self.delta = [self.delta[0] * scale, self.delta[1], self.delta[2] * scale];
+        if self.on_ground {
+            let state = env.state(self.on_pos(env, 0.2));
+            // SlimeBlock.stepOn: slow walking (not when stepping carefully). The other
+            // blocks' stepOn only does things on the server (or shows particles).
+            if env.blocks.is_class(state, Class::SlimeBlock) && !self.keys.shift {
+                let dy = self.delta[1].abs();
+                if dy < 0.1 {
+                    let scale = 0.4 + dy * 0.2;
+                    self.delta = [self.delta[0] * scale, self.delta[1], self.delta[2] * scale];
+                }
             }
         }
+        self.check_inside_blocks(env, &movements);
+    }
+
+    /// `Entity.checkInsideBlocks`: walks each move through the blocks, axis by axis
+    /// for a move that asked for one (at most 16 steps a move, then where it ended),
+    /// each block's effect at most once a tick. Only the effects that move the
+    /// player are ported (fire, freezing damage and the rest are the server's), and
+    /// powder snow's freezing only as far as `isInPowderSnow`.
+    fn check_inside_blocks(&mut self, env: &Env<'_>, movements: &[Movement]) {
+        let mut visited = std::collections::HashSet::new();
+        let mut froze = false;
+        for m in movements {
+            let delta = sub(m.to, m.from);
+            let mut steps = 16;
+            match m.asked {
+                Some(asked) if dot(delta, delta) > 0.0 => {
+                    let mut pos = m.from;
+                    for axis in crate::inside::axis_step_order(asked) {
+                        if delta[axis] != 0.0 {
+                            let mut to = pos;
+                            to[axis] += delta[axis];
+                            steps -=
+                                self.check_inside(env, pos, to, &mut visited, &mut froze, steps);
+                            pos = to;
+                        }
+                    }
+                }
+                _ => steps -= self.check_inside(env, m.from, m.to, &mut visited, &mut froze, 16),
+            }
+            if steps <= 0 {
+                self.check_inside(env, m.to, m.to, &mut visited, &mut froze, 1);
+            }
+        }
+        // InsideBlockEffectType.FREEZE, applied once the walk is done (if alive).
+        if froze && self.health > 0.0 {
+            self.in_powder_snow = true;
+        }
+    }
+
+    /// One leg of [`Self::check_inside_blocks`]: the steps it took.
+    fn check_inside(
+        &mut self,
+        env: &Env<'_>,
+        from: [f64; 3],
+        to: [f64; 3],
+        visited: &mut std::collections::HashSet<[i32; 3]>,
+        froze: &mut bool,
+        max_steps: i32,
+    ) -> i32 {
+        let target = self
+            .pose
+            .bounding_box(to)
+            .inflate([-9.999999747378752E-6; 3]);
+        let moved_far = distance_sqr(from, to) > 0.9999900000002526 * 0.9999900000002526;
+        let mut last = 0;
+        crate::inside::for_each_block_intersected_between(from, to, &target, &mut |pos, step| {
+            if self.health <= 0.0 || step >= max_steps {
+                return false;
+            }
+            last = step;
+            let state = env.state(pos);
+            let Some(kind) = inside_kind(env, state) else {
+                return true;
+            };
+            // getEntityInsideCollisionShape: the whole block, but for powder snow the
+            // shape the player collides with, if any.
+            let inside_block = kind != Inside::PowderSnow
+                || match env.blocks.collision_for(state, pos, Some(self.who())) {
+                    Some(p) if !p.shape.is_block() => {
+                        let shape = Aabb {
+                            min: [p.pos[0], p.pos[1], p.pos[2]],
+                            max: [
+                                p.pos[0] + 1.0,
+                                p.pos[1] + 0.8999999761581421,
+                                p.pos[2] + 1.0,
+                            ],
+                        };
+                        crate::inside::collided_along_vector(
+                            &self.pose.bounding_box(from),
+                            sub(to, from),
+                            &[shape],
+                        )
+                    }
+                    _ => true,
+                };
+            if inside_block && visited.insert(pos) {
+                let cell = Aabb {
+                    min: pos.map(f64::from),
+                    max: pos.map(|c| f64::from(c) + 1.0),
+                };
+                let precise = moved_far || target.intersects(&cell);
+                self.entity_inside(env, pos, state, kind, precise, froze);
+            }
+            true
+        });
+        last + 1
+    }
+
+    /// `entityInside` of the blocks whose effects move the player.
+    fn entity_inside(
+        &mut self,
+        env: &Env<'_>,
+        pos: [i32; 3],
+        state: u32,
+        kind: Inside,
+        precise: bool,
+        froze: &mut bool,
+    ) {
+        match kind {
+            Inside::Cobweb => {
+                let m = if self.effects.has(MobEffect::Weaving) {
+                    [0.5, 0.25, 0.5]
+                } else {
+                    [0.25, 0.05000000074505806, 0.25]
+                };
+                self.make_stuck_in_block(m);
+            }
+            Inside::BerryBush => {
+                self.make_stuck_in_block([0.800000011920929, 0.75, 0.800000011920929]);
+            }
+            Inside::PowderSnow => {
+                // Living entities only sink in while their feet are in it.
+                if env
+                    .blocks
+                    .is_class(env.state(self.block_position()), Class::PowderSnowBlock)
+                {
+                    self.make_stuck_in_block([0.8999999761581421, 1.5, 0.8999999761581421]);
+                }
+                *froze = true;
+            }
+            Inside::BubbleColumn => {
+                if !precise || self.abilities.flying {
+                    return;
+                }
+                let drag = BlockState::from_id(state).and_then(|s| s.value("drag")) == Some("true");
+                let above_pos = [pos[0], pos[1] + 1, pos[2]];
+                let above = env.state(above_pos);
+                // The shape above, from the empty context, at the column's position.
+                let nothing_above =
+                    env.blocks.collision(above, pos).is_none() && env.fluid(above_pos).is_empty();
+                let dy = self.delta[1];
+                self.delta[1] = if nothing_above {
+                    // onAboveBubbleColumn.
+                    if drag {
+                        (dy - 0.03).max(-0.9)
+                    } else {
+                        (dy + 0.1).min(1.8)
+                    }
+                } else {
+                    // onInsideBubbleColumn.
+                    self.fall_distance = 0.0;
+                    if drag {
+                        (dy - 0.03).max(-0.3)
+                    } else {
+                        (dy + 0.06).min(0.7)
+                    }
+                };
+            }
+            Inside::Honey => {
+                if self.sliding_down_honey(pos) {
+                    // doSlideMovement.
+                    let old_dy = self.delta[1] / 0.9800000190734863 + 0.08;
+                    let new_dy = (-0.05 - 0.08) * 0.9800000190734863;
+                    if old_dy < -0.13 {
+                        let reduce = -0.05 / old_dy;
+                        self.delta = [self.delta[0] * reduce, new_dy, self.delta[2] * reduce];
+                    } else {
+                        self.delta[1] = new_dy;
+                    }
+                    self.fall_distance = 0.0;
+                }
+            }
+        }
+    }
+
+    /// `HoneyBlock.isSlidingDown`: falling (faster than gravity alone from rest) past
+    /// the honey's side, below its top.
+    fn sliding_down_honey(&self, pos: [i32; 3]) -> bool {
+        if self.on_ground
+            || self.position[1] > f64::from(pos[1]) + 0.9375 - 1.0E-7
+            || self.delta[1] / 0.9800000190734863 + 0.08 >= -0.08
+        {
+            return false;
+        }
+        let dx = (f64::from(pos[0]) + 0.5 - self.position[0]).abs();
+        let dz = (f64::from(pos[2]) + 0.5 - self.position[2]).abs();
+        let overlap = 0.4375 + f64::from(self.pose.size().0 / 2.0);
+        dx + 1.0E-7 > overlap || dz + 1.0E-7 > overlap
+    }
+
+    /// `Player.makeStuckInBlock`: not while flying.
+    fn make_stuck_in_block(&mut self, multiplier: [f64; 3]) {
+        if !self.abilities.flying {
+            self.fall_distance = 0.0;
+            self.stuck_speed_multiplier = multiplier;
+        }
+    }
+
+    /// `PowderSnowBlock.canEntityWalkOnPowderSnow`: leather boots on.
+    fn walks_on_powder_snow(&self) -> bool {
+        let feet = self.inventory.slot_of(EquipmentSlot::Feet);
+        self.inventory.get(feet).item == Item::LeatherBoots.id() as i32
     }
 
     /// `Player.travel`: swimming follows the look, and flying damps the vertical
@@ -1901,9 +2160,11 @@ impl LocalPlayer {
         }
         self.do_move(env, self.delta);
         let mut movement = self.delta;
-        // Pushing against the ladder or jumping climbs (powder snow walking isn't
-        // ported).
-        if (self.horizontal_collision || self.jumping) && self.on_climbable(env) {
+        // Pushing against the ladder or jumping climbs, as it does in powder snow for
+        // a player in leather boots.
+        if (self.horizontal_collision || self.jumping)
+            && (self.on_climbable(env) || self.was_in_powder_snow && self.walks_on_powder_snow())
+        {
             movement[1] = 0.2;
         }
         let movement_y = if let Some(levitation) = self.effects.get(MobEffect::Levitation) {
@@ -2052,16 +2313,43 @@ impl LocalPlayer {
             self.minor_horizontal_collision = false;
             return;
         }
+        let mut delta = delta;
+        let stuck = self.stuck_speed_multiplier;
+        if stuck[0] * stuck[0] + stuck[1] * stuck[1] + stuck[2] * stuck[2] > 1.0E-7 {
+            delta = [
+                delta[0] * stuck[0],
+                delta[1] * stuck[1],
+                delta[2] * stuck[2],
+            ];
+            self.stuck_speed_multiplier = [0.0; 3];
+            self.delta = [0.0; 3];
+        }
         let delta = self.back_off_from_edge(env, delta);
         let movement = self.collide(env, delta);
         let len = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
         let dlen = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
         if len > 1.0E-7 || dlen - len < 1.0E-7 {
+            let from = self.position;
             self.position = [
                 self.position[0] + movement[0],
                 self.position[1] + movement[1],
                 self.position[2] + movement[2],
             ];
+            // addMovementThisTick: at most 100, the first two merged to make room.
+            if self.movement_this_tick.len() >= 100 {
+                let second = self.movement_this_tick.remove(1);
+                let first = &mut self.movement_this_tick[0];
+                *first = Movement {
+                    from: first.from,
+                    to: second.to,
+                    asked: None,
+                };
+            }
+            self.movement_this_tick.push(Movement {
+                from,
+                to: self.position,
+                asked: Some(delta),
+            });
         }
         let equal = |a: f64, b: f64| (b - a).abs() < 9.999999747378752E-6;
         let x_collision = !equal(delta[0], movement[0]);
@@ -2269,6 +2557,8 @@ impl LocalPlayer {
         Who {
             bottom: self.position[1],
             descending: self.keys.shift,
+            fall_distance: self.fall_distance,
+            walks_on_powder_snow: self.walks_on_powder_snow(),
         }
     }
 
@@ -2455,6 +2745,38 @@ pub(crate) fn calculate_absolute(
 }
 
 /// The entity shapes, then the block shapes (`collideBoundingBox`'s order).
+/// The kind of effect a block has on a player moving through it, if it moves it.
+fn inside_kind(env: &Env<'_>, state: u32) -> Option<Inside> {
+    let is = |class| env.blocks.is_class(state, class);
+    if is(Class::WebBlock) {
+        Some(Inside::Cobweb)
+    } else if is(Class::SweetBerryBushBlock) {
+        Some(Inside::BerryBush)
+    } else if is(Class::PowderSnowBlock) {
+        Some(Inside::PowderSnow)
+    } else if is(Class::BubbleColumnBlock) {
+        Some(Inside::BubbleColumn)
+    } else if is(Class::HoneyBlock) {
+        Some(Inside::Honey)
+    } else {
+        None
+    }
+}
+
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// `Vec3.distanceToSqr`.
+fn distance_sqr(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = sub(b, a);
+    dot(d, d)
+}
+
 fn entities_then<'s>(entities: &'s [Shape], blocks: Vec<Placed<'s>>) -> Vec<Placed<'s>> {
     let mut all: Vec<Placed<'s>> = entities
         .iter()

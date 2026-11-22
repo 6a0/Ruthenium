@@ -120,7 +120,19 @@ public final class Scenarios {
 
     /** Waits until the client's player has passed x = {@code x} going east (at most 100 ticks). */
     private static void waitUntilEastOf(ClientGameTestContext ctx, double x) {
-        for (int i = 0; i < 100 && ctx.computeOnClient(mc -> mc.player.getX()) < x; i++) {
+        waitUntilEastOf(ctx, x, 100);
+    }
+
+    /** Waits until the client's player has passed x = {@code x} going east (at most {@code max} ticks). */
+    private static void waitUntilEastOf(ClientGameTestContext ctx, double x, int max) {
+        for (int i = 0; i < max && ctx.computeOnClient(mc -> mc.player.getX()) < x; i++) {
+            ctx.waitTick();
+        }
+    }
+
+    /** Waits until the client's player has passed x = {@code x} going west (at most 100 ticks). */
+    private static void waitUntilWestOf(ClientGameTestContext ctx, double x) {
+        for (int i = 0; i < 100 && ctx.computeOnClient(mc -> mc.player.getX()) > x; i++) {
             ctx.waitTick();
         }
     }
@@ -874,6 +886,142 @@ public final class Scenarios {
                         ctx.getInput().releaseKey(W);
                         server.runCommand("attribute @p minecraft:movement_speed base reset");
                         ctx.waitTicks(10);
+                    }),
+            new Scenario("bubble_columns",
+                    "A walled tank 5 deep (water x 2 to 14), with a soul sand bubble column at x = 2 and a magma one at x = 6, both up to the surface: jump off the west wall into the up column's edge; drop into the middle of the up column from 3 blocks above it and bob over it; drop into the down column and get dragged to the bottom; sprint-swim east along the bottom, swim up, dive, swim up to the surface; sprint-swim west back through both columns (dragged down, then pushed up against the wall); hold jump in the up column.",
+                    List.of("effect give @a minecraft:fire_resistance 300 0 true", "effect give @a minecraft:water_breathing 300 0 true",
+                            "fill 1 -61 -2 15 -56 2 minecraft:stone", "fill 2 -60 -1 14 -56 1 minecraft:water",
+                            "setblock 2 -61 0 minecraft:soul_sand", "fill 2 -60 0 2 -56 0 minecraft:bubble_column[drag=false]",
+                            "setblock 6 -61 0 minecraft:magma_block", "fill 6 -60 0 6 -56 0 minecraft:bubble_column[drag=true]"),
+                    start(1.5, -55, 0.5, -90, 0), (ctx, server) -> {
+                        hold(ctx, 3, W, JUMP);
+                        ctx.waitTicks(30);
+                        tp(ctx, server, 2.5, -52, 0.5, -90, 0);
+                        ctx.waitTicks(40);
+                        tp(ctx, server, 6.5, -52, 0.5, -90, 0);
+                        ctx.waitTicks(40);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        waitUntilEastOf(ctx, 9.0);
+                        ctx.getInput().lookAt(-90, -45);
+                        ctx.waitTicks(8);
+                        ctx.getInput().lookAt(-90, 45);
+                        ctx.waitTicks(6);
+                        ctx.getInput().lookAt(-90, -45);
+                        ctx.waitTicks(20);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        waitUntilWestOf(ctx, 2.5);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        hold(ctx, 30, JUMP);
+                        ctx.waitTicks(20);
+                    }),
+            new Scenario("cobwebs",
+                    "Three lanes with a cobweb at x = 4: on the floor over soul sand, sprint into it and on through (sinking into the soul sand); at head height, walk into it and on through, then sprint-jump into it and on through; 2 blocks up, sprint-jump into it once and keep sprinting until out of it. Then with weaving, walk through the first again.",
+                    List.of("setblock 4 -61 0 minecraft:soul_sand", "setblock 4 -60 0 minecraft:cobweb",
+                            "setblock 4 -59 4 minecraft:cobweb", "setblock 4 -58 8 minecraft:cobweb"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        waitUntilEastOf(ctx, 5.4, 300);
+                        ctx.waitTicks(5);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.waitTicks(5);
+                        tp(ctx, server, 0.5, -60, 4.5, -90, 0);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 5.4, 150);
+                        ctx.waitTicks(5);
+                        ctx.getInput().releaseKey(W);
+                        tp(ctx, server, 0.5, -60, 4.5, -90, 0);
+                        hold(ctx, 5, W, SPRINT);
+                        hold(ctx, 2, W, SPRINT, JUMP);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        waitUntilEastOf(ctx, 5.4, 300);
+                        ctx.waitTicks(5);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        tp(ctx, server, 0.5, -60, 8.5, -90, 0);
+                        hold(ctx, 5, W, SPRINT);
+                        hold(ctx, 2, W, SPRINT, JUMP);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        waitUntilEastOf(ctx, 5.4, 300);
+                        ctx.waitTicks(10);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.waitTicks(5);
+                        server.runCommand("effect give @a minecraft:weaving 60 0");
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        hold(ctx, 50, W);
+                        server.runCommand("effect clear @a");
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("berry_bushes",
+                    "Sweet berry bushes aged 0 to 3 at x = 3 to 6: walk east through them, sprint-jump back west through them, then walk into the oldest and stand in it.",
+                    List.of("fill 2 -61 -1 7 -61 1 minecraft:grass_block", "setblock 3 -60 0 minecraft:sweet_berry_bush[age=0]",
+                            "setblock 4 -60 0 minecraft:sweet_berry_bush[age=1]", "setblock 5 -60 0 minecraft:sweet_berry_bush[age=2]",
+                            "setblock 6 -60 0 minecraft:sweet_berry_bush[age=3]"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 7.4, 150);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        ctx.getInput().holdKey(JUMP);
+                        waitUntilWestOf(ctx, 2.6);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.getInput().releaseKey(JUMP);
+                        ctx.waitTicks(10);
+                        tp(ctx, server, 8.5, -60, 0.5, 90, 0);
+                        hold(ctx, 15, W);
+                        ctx.waitTicks(20);
+                    }),
+            new Scenario("powder_snow",
+                    "A 1-deep pit of powder snow (x 4 to 8): walk in (sinking and slowed) and on against its far side, then hold jump there (no way out without boots); fall into it from 6 blocks up (caught by the falling shape, then sinking); in leather boots walk onto its top and along it, sneak to sink in, then walk against the far side and climb out onto the ground beyond.",
+                    List.of("fill 4 -61 -1 8 -61 1 minecraft:powder_snow"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 8.6);
+                        ctx.waitTicks(5);
+                        ctx.getInput().releaseKey(W);
+                        hold(ctx, 20, W, JUMP);
+                        ctx.waitTicks(10);
+                        tp(ctx, server, 6.5, -54, 0.5, -90, 0);
+                        ctx.waitTicks(40);
+                        server.runCommand("item replace entity @p armor.feet with minecraft:leather_boots");
+                        tp(ctx, server, 2.5, -60, 0.5, -90, 0);
+                        hold(ctx, 15, W);
+                        hold(ctx, 10, SNEAK);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 9.5);
+                        ctx.waitTicks(10);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        server.runCommand("clear @p");
+                        ctx.waitTicks(3);
+                    }),
+            new Scenario("honey_slide",
+                    "On top of an 8-high honey pillar: jump on it, walk west off its edge and hold back against its side to slide down; again from the top without holding back (falling past it).",
+                    List.of("fill 4 -60 0 4 -53 0 minecraft:honey_block"),
+                    start(4.5, -52.0625, 0.5, 90, 0), (ctx, server) -> {
+                        hold(ctx, 10, JUMP);
+                        ctx.waitTicks(10);
+                        hold(ctx, 8, W);
+                        hold(ctx, 40, S);
+                        ctx.waitTicks(10);
+                        tp(ctx, server, 4.5, -52.0625, 0.5, 90, 0);
+                        hold(ctx, 8, W);
+                        ctx.waitTicks(30);
                     }),
             new Scenario("mouse_turn",
                     "Walk forward while the mouse turns the camera every tick (turns are applied per frame).",

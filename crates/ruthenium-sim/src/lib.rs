@@ -16,7 +16,8 @@
 //! - [`predict`]: block changes the client predicts until the server confirms them.
 //! - [`pick`]: what the crosshair is on, and the raycasts items make.
 //! - [`input`]: the mouse's turn, the scroll wheel and the movement keys.
-//! - [`blocks`], [`shape`], [`world`], [`fluid`]: the level the player moves in.
+//! - [`blocks`], [`shape`], [`world`], [`fluid`]: the level the player moves in;
+//!   [`inside`]: the blocks a movement passes through.
 //! - [`pick`]: what the crosshair points at (block and entity raycasts).
 
 #![forbid(unsafe_code)]
@@ -29,6 +30,7 @@ pub mod effect;
 pub mod entity;
 pub mod fluid;
 pub mod input;
+pub mod inside;
 pub mod interact;
 pub mod inventory;
 pub mod item;

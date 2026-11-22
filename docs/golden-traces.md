@@ -92,6 +92,11 @@ Each scenario first clears a 41 × 25 area around the origin of a flat world and
 | `block_shapes_b` | the same for stairs, a slab, an enchanting table, a hopper, a fence gate, a retracted piston, an extended piston and its head (standing on the arm), a bed, a daylight detector, a wall, a trapdoor and an unlit campfire |
 | `bounce` | drop onto a bed and jump on it; with a bounciness attribute of 0.5, drop onto stone, onto honey (which suppresses bouncing) and onto stone sneaking |
 | `speed_zero` | a movement speed attribute of 0: walking, jumping and sprint-jumping; then set to 0 mid-walk with forward still held |
+| `bubble_columns` | a tank with a soul sand (up) and a magma (down) bubble column: jumping off the wall into the up column, dropping in and bobbing over it, dropping into the down column and being dragged to the bottom, sprint-swimming along the bottom, swimming up, diving, surfacing, sprint-swimming back through both columns, holding jump in the up column |
+| `cobwebs` | cobwebs on the floor over soul sand (sinking into the sand), at head height (walked into, then sprint-jumped into) and 2 blocks up (sprint-jumped into once, then held running until out), each crossed; the first again with weaving |
+| `berry_bushes` | sweet berry bushes aged 0 to 3: walking through, sprint-jumping back, standing in the oldest (the server's thorn damage included) |
+| `powder_snow` | a 1-deep powder snow pit: walking in and across, jumping at the far side with no way out; falling in from 6 blocks (caught at 0.9, then sinking); in leather boots walking on its top, sneaking to sink in, climbing out at the far side |
+| `honey_slide` | jumping on an 8-high honey pillar, walking off it and holding back against its side to slide down, then falling past it without touching |
 
 They are defined in `tools/java/trace/src/dev/ruthenium/trace/Scenarios.java`. To add one, add an entry there and record again. Scripts can run server commands while the trace records, so entities a scenario needs are summoned inside its script: their packets are then in the trace. A scenario that leaves mobs behind must remove them and wait until they are gone (dying mobs push for 20 ticks, and a large slime splits), or they push the player before the next trace starts.
 
