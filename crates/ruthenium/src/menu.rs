@@ -42,6 +42,7 @@ use ruthenium_net::connection::Stage as NetStage;
 use ruthenium_sim::session::{Session, SessionEvent};
 
 use crate::account::{AccountStatus, Accounts, Stage, failure_lines};
+use crate::ingame::InGame;
 use crate::join::Joiner;
 use crate::servers::{Servers, valid_address};
 use crate::settings::{FRAME_STATS, FULLSCREEN, Settings, SettingsFile};
@@ -241,8 +242,10 @@ enum FormKind {
     Connecting,
     /// The server's code of conduct, to accept or decline.
     CodeOfConduct,
-    /// In play (the world doesn't show yet), and Disconnect.
+    /// Configured, the level loading, and Disconnect.
     Playing,
+    /// The Game Menu over the world: Back to Game and Disconnect.
+    Paused,
     /// Why the session ended.
     Disconnected,
 }
@@ -267,6 +270,8 @@ enum Screen {
     Accounts,
     Settings,
     Form(FormKind, Box<FormScreen>, PackStatus),
+    /// In the world, no screen open: the mouse turns the camera.
+    Game,
 }
 
 /// See the module docs.
@@ -315,6 +320,8 @@ pub struct Menu {
     server_name: String,
     /// The player left the session (Cancel, Disconnect): its end needs no screen.
     leaving: bool,
+    /// Input in the world.
+    game: InGame,
 }
 
 impl std::fmt::Debug for Menu {
@@ -417,6 +424,7 @@ impl Menu {
             session: None,
             server_name: String::new(),
             leaving: false,
+            game: InGame::default(),
         }
     }
 
@@ -487,6 +495,40 @@ impl Menu {
         }
     }
 
+    /// Into the world, no screen open (`setScreen(null)`, which grabs the mouse).
+    fn enter_game(&mut self) {
+        self.game.enter(self.session.as_ref());
+        self.screen = Screen::Game;
+    }
+
+    /// The Game Menu (`pauseGame`): keys let go, the mouse freed.
+    fn pause(&mut self) {
+        self.game.release(self.session.as_ref());
+        let title = self.server_name.clone();
+        self.session_form(
+            FormKind::Paused,
+            "Game Menu",
+            &[&title],
+            vec![
+                button("Back to Game", Action::Confirm),
+                button("Disconnect", Action::Cancel),
+            ],
+        );
+    }
+
+    /// Whether the mouse should be grabbed: in the world, the window focused.
+    pub fn wants_mouse_grab(&self) -> bool {
+        matches!(self.screen, Screen::Game) && self.game.focused()
+    }
+
+    /// The window gained or lost focus.
+    pub fn focus(&mut self, on: bool) {
+        if !on {
+            self.cancel();
+        }
+        self.game.set_focus(on, self.session.as_ref());
+    }
+
     /// Leaves the session (Cancel, Disconnect, declining the code of conduct).
     fn leave(&mut self) {
         if let Some(s) = &self.session {
@@ -505,7 +547,10 @@ impl Menu {
         let ours = matches!(
             self.screen,
             Screen::Form(
-                FormKind::Connecting | FormKind::CodeOfConduct | FormKind::Playing,
+                FormKind::Connecting
+                    | FormKind::CodeOfConduct
+                    | FormKind::Playing
+                    | FormKind::Paused,
                 ..
             )
         );
@@ -528,19 +573,11 @@ impl Menu {
                     self.session_form(
                         FormKind::Playing,
                         &title,
-                        &["Connected. Ruthenium can't show the world yet."],
+                        &["Loading the world..."],
                         vec![button("Disconnect", Action::Cancel)],
                     );
                 }
-                SessionEvent::Loaded if !self.leaving => {
-                    let title = self.server_name.clone();
-                    self.session_form(
-                        FormKind::Playing,
-                        &title,
-                        &["In the world. Ruthenium can't show it yet."],
-                        vec![button("Disconnect", Action::Cancel)],
-                    );
-                }
+                SessionEvent::Loaded if !self.leaving => self.enter_game(),
                 SessionEvent::Reconfiguring if !self.leaving => {
                     self.connecting_form(NetStage::Joining);
                 }
@@ -567,8 +604,12 @@ impl Menu {
         }
     }
 
-    pub fn mouse_moved(&mut self, x: f32, y: f32) {
+    /// The mouse moved to `(x, y)` (window coordinates), by `(dx, dy)`.
+    pub fn mouse_moved(&mut self, x: f32, y: f32, dx: f32, dy: f32) {
         self.mouse = Some((x, y));
+        if matches!(self.screen, Screen::Game) {
+            self.game.mouse_moved(dx, dy);
+        }
     }
 
     /// The mouse left the window.
@@ -919,6 +960,7 @@ impl Menu {
             FormKind::Connecting
             | FormKind::CodeOfConduct
             | FormKind::Playing
+            | FormKind::Paused
             | FormKind::Disconnected => return,
         };
         let form = FormScreen::new(scale, &self.fonts, spec);
@@ -940,6 +982,7 @@ impl Menu {
             | FormKind::Connecting
             | FormKind::CodeOfConduct
             | FormKind::Playing
+            | FormKind::Paused
             | FormKind::Disconnected => None,
         };
         if let Some(f) = addr {
@@ -990,6 +1033,10 @@ impl Menu {
                 Screen::Form(FormKind::Connecting | FormKind::Playing, ..),
                 Action::Cancel | Action::Back,
             ) => self.leave(),
+            (Screen::Form(FormKind::Paused, ..), Action::Confirm | Action::Back) => {
+                self.enter_game();
+            }
+            (Screen::Form(FormKind::Paused, ..), Action::Cancel) => self.leave(),
             (Screen::Form(FormKind::CodeOfConduct, ..), Action::Confirm) => {
                 if let Some(s) = &self.session {
                     s.answer_code_of_conduct(true);
@@ -1124,6 +1171,7 @@ impl Menu {
                     FormKind::Connecting
                     | FormKind::CodeOfConduct
                     | FormKind::Playing
+                    | FormKind::Paused
                     | FormKind::Disconnected => {}
                     // Try Again, the same way as before.
                     FormKind::SignIn => {
@@ -1172,7 +1220,25 @@ impl Menu {
             _ => None,
         };
         let enter = matches!(scancode, SCANCODE_RETURN | SCANCODE_KP_ENTER);
+        let escape = scancode == SCANCODE_ESCAPE && down && !repeat;
+        match &self.screen {
+            // Escape pauses (`pauseGame`) and closes the Game Menu again.
+            Screen::Game if escape => {
+                self.pause();
+                return None;
+            }
+            Screen::Game => {
+                self.game.key(scancode, down, self.session.as_ref());
+                return None;
+            }
+            Screen::Form(FormKind::Paused, ..) if escape => {
+                return self.act(Action::Back, None, clipboard);
+            }
+            _ => {}
+        }
         let action = match &mut self.screen {
+            // Handled above.
+            Screen::Game => None,
             Screen::Settings => {
                 let screen = self.settings_screen.as_mut()?;
                 let e = match scancode {
@@ -1339,9 +1405,10 @@ impl Menu {
         self.validate_form();
     }
 
-    /// The wheel turned `notches` (positive: up).
-    pub fn wheel(&mut self, notches: f32) {
+    /// The wheel turned `notches` (positive: up); `raw` is SDL's `(x, y)` as it came.
+    pub fn wheel(&mut self, notches: f32, raw: (f32, f32)) {
         match (&self.screen, &mut self.servers, &mut self.accounts_screen) {
+            (Screen::Game, ..) => self.game.wheel(raw.0, raw.1, self.session.as_ref()),
             (Screen::Servers, Some(s), _) => s.screen.wheel(notches),
             (Screen::Accounts, _, Some(a)) => a.list.wheel(notches),
             (Screen::Settings, ..) => {
@@ -1372,6 +1439,8 @@ impl Menu {
         let (ux, uy) = scale.from_window(x, y, window_size, pixel_size);
         let time = self.started.elapsed().as_secs_f64();
         let action = match &mut self.screen {
+            // Attacking and using items aren't there yet.
+            Screen::Game => None,
             Screen::Settings => {
                 let screen = self.settings_screen.as_mut()?;
                 let e = if down {
@@ -1568,6 +1637,9 @@ impl Menu {
         self.last_frame = Some(now);
         let scale = self.layout(pixel_size);
         self.poll_session();
+        if matches!(self.screen, Screen::Game) && self.game.should_pause() {
+            self.pause();
+        }
         let pointer = self
             .mouse
             .map(|(x, y)| scale.from_window(x, y, window_size, pixel_size));
@@ -1627,6 +1699,20 @@ impl Menu {
         let time = self.started.elapsed().as_secs_f64();
         let mut settings_ev = None;
         match &mut self.screen {
+            Screen::Game => {
+                self.game
+                    .frame(&self.settings.settings.mouse, self.session.as_ref());
+                let view = self.session.as_ref().and_then(Session::view);
+                crate::ingame::draw_hud(
+                    view.as_ref(),
+                    &self.server_name,
+                    &scale,
+                    &self.fonts,
+                    atlas,
+                    &mut self.shapes,
+                    &mut self.text,
+                );
+            }
             Screen::Title => {
                 let title = self.title.as_ref().unwrap();
                 let hit = pointer.and_then(|(x, y)| title.hit(x, y));

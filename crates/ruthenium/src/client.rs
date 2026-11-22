@@ -227,7 +227,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             if opts.bench_out.is_none()
                 && (opts.screenshot.is_none() || opts.data_dir.is_some()) =>
         {
-            SettingsFile::load(SettingsFile::path_in(d))
+            let mut f = SettingsFile::load(SettingsFile::path_in(d));
+            f.import_mouse(crate::controls::vanilla_mouse);
+            f
         }
         _ => SettingsFile::transient(),
     };
@@ -334,6 +336,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut typed = String::new();
     let mut shift_held = false;
     let mut text_input = false;
+    let mut mouse_grabbed = false;
     let mut screenshot_requested = false;
     let mut text_shown: Option<Instant> = None;
     let mut start_screen = opts.screen.clone();
@@ -362,8 +365,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 occluded = false;
             }
             Event::Occluded => occluded = true,
-            Event::Exposed | Event::FocusGained => occluded = false,
-            Event::FocusLost => menu.cancel(),
+            Event::Exposed => occluded = false,
+            Event::FocusGained => {
+                occluded = false;
+                menu.focus(true);
+            }
+            Event::FocusLost => menu.focus(false),
             Event::Fullscreen(on) => fullscreen_event = Some(on),
             Event::Key {
                 scancode: SCANCODE_F11,
@@ -389,9 +396,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 keys.push((scancode, down, repeat, shift, shortcut));
             }
             Event::TextInput { .. } => typed.push_str(e.text()),
-            Event::MouseMotion { x, y } => menu.mouse_moved(x, y),
+            Event::MouseMotion { x, y, dx, dy } => menu.mouse_moved(x, y, dx, dy),
             Event::MouseLeft => menu.mouse_left(),
-            Event::MouseWheel { y } => menu.wheel(y),
+            Event::MouseWheel { y, raw_x, raw_y } => menu.wheel(y, (raw_x, raw_y)),
             Event::MouseButton {
                 button: 1,
                 down,
@@ -422,6 +429,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         if !typed.is_empty() {
             menu.text_input(&typed);
             typed.clear();
+        }
+        if menu.wants_mouse_grab() != mouse_grabbed {
+            mouse_grabbed = !mouse_grabbed;
+            if !window.set_mouse_grabbed(mouse_grabbed) {
+                eprintln!("[ruthenium] the mouse couldn't be grabbed or freed");
+            }
         }
         if menu.wants_text_input() != text_input {
             text_input = !text_input;

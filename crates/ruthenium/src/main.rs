@@ -7,6 +7,8 @@ mod assets_cmd;
 mod auth_cmd;
 mod client;
 mod connect_cmd;
+mod controls;
+mod ingame;
 mod join;
 mod menu;
 mod prepare_cmd;

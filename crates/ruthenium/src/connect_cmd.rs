@@ -1,15 +1,153 @@
 //! `ruthenium connect`: joins a server without a window and prints what happens, to
 //! try the connection path from a shell (development).
+//!
+//! `--script` plays input once the player is in the world, through the same calls the
+//! window makes: steps separated by spaces, each `KEYS@MS` or `KEYS@MS:DX,DY`. KEYS are
+//! `+`-joined `w a s d jump sneak sprint` and hotbar digits `1`-`9` (pressed once at
+//! the step's start), or `-` for none; held for MS milliseconds while the mouse moves
+//! DX, DY counts every frame (60 a second), turned as the window turns them with the
+//! saved mouse sensitivity. For example
+//! `w@2000 w+sprint+jump@3000 w@2000:12,0 sneak+w@1500 2@100 -@1000`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use ruthenium_prepare::discover::Env;
-use ruthenium_sim::session::SessionEvent;
+use ruthenium_sim::input::{self, MouseOptions};
+use ruthenium_sim::player::Keys;
+use ruthenium_sim::session::{Session, SessionEvent};
 
 use crate::account::{AccountStatus, Accounts};
 use crate::join::{Joiner, closed_text, stage_text};
+use crate::settings::SettingsFile;
+
+/// One step of a `--script`.
+#[derive(Debug, Clone, PartialEq)]
+struct Step {
+    keys: Keys,
+    hotbar: Vec<u8>,
+    ms: u64,
+    turn: (f32, f32),
+}
+
+fn parse_script(s: &str) -> Result<Vec<Step>, String> {
+    s.split_whitespace()
+        .map(|step| {
+            let bad = || format!("--script: can't read the step {step:?}");
+            let (keys, rest) = step.split_once('@').ok_or_else(bad)?;
+            let (ms, turn) = match rest.split_once(':') {
+                Some((ms, t)) => {
+                    let (dx, dy) = t.split_once(',').ok_or_else(bad)?;
+                    (
+                        ms,
+                        (
+                            dx.parse().map_err(|_| bad())?,
+                            dy.parse().map_err(|_| bad())?,
+                        ),
+                    )
+                }
+                None => (rest, (0.0, 0.0)),
+            };
+            let mut st = Step {
+                keys: Keys::default(),
+                hotbar: Vec::new(),
+                ms: ms.parse().map_err(|_| bad())?,
+                turn,
+            };
+            for k in keys.split('+').filter(|k| *k != "-") {
+                match k {
+                    "w" => st.keys.forward = true,
+                    "s" => st.keys.backward = true,
+                    "a" => st.keys.left = true,
+                    "d" => st.keys.right = true,
+                    "jump" => st.keys.jump = true,
+                    "sneak" => st.keys.shift = true,
+                    "sprint" => st.keys.sprint = true,
+                    d if d.len() == 1 && ("1"..="9").contains(&d) => {
+                        st.hotbar.push(d.parse::<u8>().map_err(|_| bad())? - 1);
+                    }
+                    _ => return Err(format!("--script: unknown key {k:?} in {step:?}")),
+                }
+            }
+            Ok(st)
+        })
+        .collect()
+}
+
+/// Plays a script, one frame at a time.
+struct Player {
+    steps: Vec<Step>,
+    at: usize,
+    step_started: Instant,
+    last_frame: Instant,
+    last_report: Instant,
+    mouse: MouseOptions,
+    motion: input::MouseMotion,
+}
+
+impl Player {
+    fn start(&mut self, session: &Session) {
+        self.at = 0;
+        self.step_started = Instant::now();
+        self.begin(session);
+    }
+
+    fn begin(&mut self, session: &Session) {
+        let Some(st) = self.steps.get(self.at) else {
+            session.set_keys(Keys::default());
+            return;
+        };
+        println!(
+            "          script: {:?}, {} ms, turning {:?}",
+            st.keys, st.ms, st.turn
+        );
+        session.set_keys(st.keys);
+        for &slot in &st.hotbar {
+            session.hotbar_key(slot);
+        }
+    }
+
+    /// False once the script has ended.
+    fn frame(&mut self, session: &Session) -> bool {
+        let Some(st) = self.steps.get(self.at) else {
+            return false;
+        };
+        let now = Instant::now();
+        if now - self.last_frame >= Duration::from_micros(16_667) {
+            self.last_frame = now;
+            self.motion.moved(st.turn.0, st.turn.1, true);
+            let (dx, dy) = self.motion.take();
+            if (dx, dy) != (0.0, 0.0) {
+                let (xo, yo) = input::turn_amount(dx, dy, &self.mouse);
+                session.turn(xo, yo);
+            }
+        }
+        if now - self.last_report >= Duration::from_secs(1) {
+            self.last_report = now;
+            if let Some(v) = session.view() {
+                let p = v.position;
+                println!(
+                    "          at {:.3} {:.3} {:.3}, facing {:.2} {:.2}, slot {}{}{}",
+                    p[0],
+                    p[1],
+                    p[2],
+                    v.y_rot,
+                    v.x_rot,
+                    v.selected_slot + 1,
+                    if v.on_ground { ", on the ground" } else { "" },
+                    if v.sprinting { ", sprinting" } else { "" },
+                );
+            }
+        }
+        if now - self.step_started >= Duration::from_millis(st.ms) {
+            self.at += 1;
+            self.step_started = now;
+            self.begin(session);
+        }
+        true
+    }
+}
 
 pub fn run(args: &[String]) -> ExitCode {
     match run_inner(args) {
@@ -25,6 +163,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut address = None;
     let mut seconds = 10.0;
     let mut data_dir = None;
+    let mut script = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -35,6 +174,9 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                     .ok()
                     .filter(|s| (0.0..=86_400.0).contains(s))
                     .ok_or(format!("--seconds: not a number of seconds: {v}"))?;
+            }
+            "--script" => {
+                script = Some(parse_script(it.next().ok_or("--script needs steps")?)?);
             }
             "--data-dir" => {
                 data_dir = Some(PathBuf::from(it.next().ok_or("--data-dir needs a folder")?));
@@ -61,6 +203,20 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    let mut settings = SettingsFile::load(SettingsFile::path_in(&data_dir));
+    settings.import_mouse(crate::controls::vanilla_mouse);
+    let now = Instant::now();
+    let mut player = script.map(|steps| Player {
+        steps,
+        at: 0,
+        step_started: now,
+        last_frame: now,
+        last_report: now,
+        mouse: settings.settings.mouse,
+        // In the world, the mouse has been grabbed: the first motion is dropped.
+        motion: input::MouseMotion::new(),
+    });
+    let mut scripting = false;
     let mut joiner = Joiner::new(Some(data_dir.join("game")), cache_dir);
     let data = joiner.data();
     let session = joiner.join(&address, &accounts)?;
@@ -86,7 +242,13 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                     println!("{t:7.3}s  playing");
                 }
                 SessionEvent::Reconfiguring => println!("{t:7.3}s  reconfiguring"),
-                SessionEvent::Loaded => println!("{t:7.3}s  in the world"),
+                SessionEvent::Loaded => {
+                    println!("{t:7.3}s  in the world");
+                    if let Some(p) = &mut player {
+                        p.start(&session);
+                        scripting = true;
+                    }
+                }
                 SessionEvent::Closed(c) => {
                     let (title, reason) = closed_text(c, &data.lang);
                     println!("{t:7.3}s  closed: {title}: {reason}");
@@ -102,10 +264,30 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                 ExitCode::FAILURE
             });
         }
+        if scripting && let Some(p) = &mut player {
+            scripting = p.frame(&session);
+        }
         if !leaving && started.elapsed() >= stay {
             leaving = true;
             session.disconnect();
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_scripts() {
+        let s = parse_script("w+sprint@2000 -@500:12,-3.5 2@100").unwrap();
+        assert_eq!(s.len(), 3);
+        assert!(s[0].keys.forward && s[0].keys.sprint && !s[0].keys.jump);
+        assert_eq!((s[0].ms, s[0].turn), (2000, (0.0, 0.0)));
+        assert_eq!((s[1].keys, s[1].turn), (Keys::default(), (12.0, -3.5)));
+        assert_eq!(s[2].hotbar, vec![1]);
+        assert!(parse_script("w@").is_err());
+        assert!(parse_script("fly@100").is_err());
     }
 }

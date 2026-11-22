@@ -40,7 +40,7 @@ Things this harness changes compared with normal play, which replay tests must a
 RUTHENIUM_GAME_DIR=~/.local/share/ruthenium/game cargo test -p ruthenium-sim --test golden -- --nocapture
 ```
 
-Without `RUTHENIUM_GAME_DIR` it is skipped. The scenarios listed in `EXACT` must match every tick; the others are reported. The trace doesn't record how many ticks had passed since the last position packet when it starts, so the replay tries each count until the first heartbeat lines up.
+Without `RUTHENIUM_GAME_DIR` it is skipped. `crates/ruthenium-sim/tests/mouse.rs` needs nothing but the committed trace and runs everywhere: it feeds `mouse_turn`'s cursor moves through the client's own mouse path (the first motion after a grab dropped, motion summed per frame, vanilla's sensitivity curve, `Entity.turn` in floats) and checks every recorded yaw and pitch bit for bit. The scenarios listed in `EXACT` must match every tick; the others are reported. The trace doesn't record how many ticks had passed since the last position packet when it starts, so the replay tries each count until the first heartbeat lines up.
 
 ## Scenarios
 

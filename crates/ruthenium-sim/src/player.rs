@@ -89,7 +89,7 @@ impl Pose {
     }
 }
 
-/// An attribute modifier (\`AttributeModifier\`): operation 0 adds, 1 adds a multiple of
+/// An attribute modifier (`AttributeModifier`): operation 0 adds, 1 adds a multiple of
 /// the base, 2 multiplies the total.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Modifier {
@@ -98,7 +98,7 @@ pub struct Modifier {
     pub operation: u8,
 }
 
-/// One attribute's base and modifiers (\`AttributeInstance\`), clamped to its range.
+/// One attribute's base and modifiers (`AttributeInstance`), clamped to its range.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Attribute {
     pub base: f64,
@@ -117,7 +117,7 @@ impl Attribute {
         }
     }
 
-    /// \`AttributeInstance.calculateValue\`.
+    /// `AttributeInstance.calculateValue`.
     pub fn value(&self) -> f64 {
         let mut base = self.base;
         for m in self.modifiers.iter().filter(|m| m.operation == 0) {
@@ -138,7 +138,7 @@ impl Attribute {
     }
 }
 
-/// The sprinting modifier's id (\`LivingEntity.SPRINTING_MODIFIER_ID\`).
+/// The sprinting modifier's id (`LivingEntity.SPRINTING_MODIFIER_ID`).
 const SPRINTING: &str = "minecraft:sprinting";
 
 /// The player's movement attributes, with the player's defaults and vanilla's ranges.
@@ -188,7 +188,7 @@ impl Attributes {
         })
     }
 
-    /// \`LivingEntity.setSprinting\`: the sprint modifier off, then on if sprinting.
+    /// `LivingEntity.setSprinting`: the sprint modifier off, then on if sprinting.
     fn set_sprinting(&mut self, on: bool) {
         self.movement_speed.remove(SPRINTING);
         if on {
@@ -369,6 +369,30 @@ impl LocalPlayer {
         self.position = position;
         self.y_rot = y_rot;
         self.x_rot = x_rot;
+    }
+
+    /// `Entity.turn`: the mouse's turn for one frame (from [`crate::input::turn_amount`]),
+    /// in floats.
+    pub fn turn(&mut self, xo: f64, yo: f64) {
+        let x_delta = yo as f32 * 0.15;
+        let y_delta = xo as f32 * 0.15;
+        self.set_x_rot(self.x_rot + x_delta);
+        self.set_y_rot(self.y_rot + y_delta);
+        self.set_x_rot(mth_clamp(self.x_rot, -90.0, 90.0));
+    }
+
+    /// `Entity.setXRot`: a value that isn't finite is dropped.
+    fn set_x_rot(&mut self, x_rot: f32) {
+        if x_rot.is_finite() {
+            self.x_rot = (x_rot % 360.0).clamp(-90.0, 90.0);
+        }
+    }
+
+    /// `Entity.setYRot`.
+    fn set_y_rot(&mut self, y_rot: f32) {
+        if y_rot.is_finite() {
+            self.y_rot = y_rot;
+        }
     }
 
     /// The chunk the camera (the player's block position) is in.
@@ -1169,6 +1193,17 @@ fn rotate_y(v: [f64; 3], radians: f32) -> [f64; 3] {
     let cos = f64::from(mth::cos(f64::from(radians)));
     let sin = f64::from(mth::sin(f64::from(radians)));
     [v[0] * cos + v[2] * sin, v[1], v[2] * cos - v[0] * sin]
+}
+
+/// `Mth.clamp` for floats.
+fn mth_clamp(v: f32, min: f32, max: f32) -> f32 {
+    if v < min {
+        min
+    } else if v > max {
+        max
+    } else {
+        v
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! \`cargo xtask javamath-dump\`: record vanilla's \`Mth\` table and sin/cos
+//! `cargo xtask javamath-dump`: record vanilla's `Mth` table and sin/cos
 //! results from a real JVM, for ruthenium-javamath's bit-exact tests.
 
 use std::ffi::OsString;

@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,8 +31,9 @@ use ruthenium_protocol::packets::{Common, KnownPack, PackAction, play, read_bran
 
 use crate::blocks::{BlockTags, Blocks};
 use crate::clock::{self, TickClock};
+use crate::input::next_scroll_selection;
 use crate::level_load::LevelLoad;
-use crate::player::{Env, Keys, LocalPlayer};
+use crate::player::{Env, Keys, LocalPlayer, Pose};
 use crate::world::{Level, global_bits};
 
 /// How often the thread looks for commands while no packet arrives.
@@ -82,11 +84,47 @@ enum Command {
     Disconnect,
 }
 
+/// What the player does on the main thread, for the game thread to take in before it
+/// handles packets or ticks.
+#[derive(Debug, Default)]
+struct Controls {
+    /// The movement keys held (none while a screen is open).
+    keys: Keys,
+    /// `Entity.turn` amounts, one per frame, in order.
+    turns: Vec<(f64, f64)>,
+    /// Hotbar key presses, by slot (`KeyMapping.clickCount`).
+    hotbar_clicks: [u32; 9],
+    /// Scroll-wheel notches, in order.
+    scrolls: Vec<i32>,
+}
+
+/// The local player as of the last tick, for the screen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerView {
+    pub dimension: String,
+    pub position: [f64; 3],
+    pub y_rot: f32,
+    pub x_rot: f32,
+    pub on_ground: bool,
+    pub sprinting: bool,
+    pub pose: Pose,
+    pub selected_slot: i32,
+    pub chunks: usize,
+    /// Whether the player has loaded into the level.
+    pub loaded: bool,
+}
+
 /// A session on the game thread. Dropping it disconnects.
 pub struct Session {
     commands: Sender<Command>,
     events: Receiver<SessionEvent>,
+    controls: Arc<Mutex<Controls>>,
+    view: Arc<Mutex<Option<PlayerView>>>,
     thread: Option<JoinHandle<()>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl std::fmt::Debug for Session {
@@ -105,15 +143,22 @@ impl Session {
         if physics.is_none() {
             eprintln!("[session] no prepared game: the player won't move or send movement");
         }
+        let controls = Arc::new(Mutex::new(Controls::default()));
+        let view = Arc::new(Mutex::new(None));
+        let (game_controls, game_view) = (controls.clone(), view.clone());
         let thread = std::thread::Builder::new()
             .name("game".into())
             .spawn(move || {
                 let mut game = Game::new(connection, known_packs, physics, tx);
+                game.controls = game_controls;
+                game.view = game_view;
                 game.run(&command_rx);
             })?;
         Ok(Session {
             commands,
             events,
+            controls,
+            view,
             thread: Some(thread),
         })
     }
@@ -130,6 +175,39 @@ impl Session {
     /// Disconnects; a [`SessionEvent::Closed`] follows.
     pub fn disconnect(&self) {
         let _ = self.commands.send(Command::Disconnect);
+    }
+
+    /// The movement keys held from now on (`Keys::default()` while a screen is open).
+    pub fn set_keys(&self, keys: Keys) {
+        lock(&self.controls).keys = keys;
+    }
+
+    /// One frame's turn of the camera (`Entity.turn`'s amounts, from
+    /// [`crate::input::turn_amount`]). Turns apply in order, before the next packets
+    /// and ticks.
+    pub fn turn(&self, xo: f64, yo: f64) {
+        lock(&self.controls).turns.push((xo, yo));
+    }
+
+    /// A press of the hotbar key for `slot` (0 to 8), read by the next tick.
+    pub fn hotbar_key(&self, slot: u8) {
+        if let Some(c) = lock(&self.controls)
+            .hotbar_clicks
+            .get_mut(usize::from(slot))
+        {
+            *c += 1;
+        }
+    }
+
+    /// Scroll-wheel notches (from [`crate::input::ScrollWheel`]): the selected slot moves
+    /// before the next tick.
+    pub fn scroll(&self, wheel: i32) {
+        lock(&self.controls).scrolls.push(wheel);
+    }
+
+    /// The local player as of the last tick (`None` outside a level).
+    pub fn view(&self) -> Option<PlayerView> {
+        lock(&self.view).clone()
     }
 }
 
@@ -189,6 +267,12 @@ struct Game {
     tags: BlockTags,
     clock: TickClock,
     started: Instant,
+    controls: Arc<Mutex<Controls>>,
+    view: Arc<Mutex<Option<PlayerView>>>,
+    /// The keys the next ticks read.
+    keys: Keys,
+    /// Hotbar key presses not yet read (`KeyMapping.clickCount`).
+    hotbar_clicks: [u32; 9],
 }
 
 /// `ClientboundGameEventPacket` events the session acts on.
@@ -260,6 +344,10 @@ impl Game {
             tags: BlockTags::new(),
             clock: TickClock::new(0),
             started: Instant::now(),
+            controls: Arc::default(),
+            view: Arc::default(),
+            keys: Keys::default(),
+            hotbar_clicks: [0; 9],
         }
     }
 
@@ -302,7 +390,10 @@ impl Game {
                     return;
                 }
             };
-            // Packets first, then the ticks due (`Minecraft.runTick`).
+            // The frames' input so far, then packets, then the ticks due
+            // (`Minecraft.runTick`; a frame turns the camera after its ticks, so every
+            // turn sent before now comes before these packets).
+            self.take_controls();
             let mut next = first;
             while let Some(e) = next {
                 if !self.handle(e) {
@@ -311,10 +402,57 @@ impl Game {
                 next = self.connection.events().try_recv().ok();
             }
             let ticks = self.clock.advance(self.millis(), self.ms_per_tick());
+            if ticks > 0 {
+                self.take_controls();
+            }
             for _ in 0..ticks {
                 self.tick();
             }
+            self.update_view();
         }
+    }
+
+    /// Takes in what the player did on the main thread: the camera's turns and scrolls
+    /// apply now, keys and hotbar presses wait for the ticks.
+    fn take_controls(&mut self) {
+        let mut c = lock(&self.controls);
+        self.keys = c.keys;
+        let turns = std::mem::take(&mut c.turns);
+        let scrolls = std::mem::take(&mut c.scrolls);
+        let clicks = std::mem::take(&mut c.hotbar_clicks);
+        drop(c);
+        // Without a player (`minecraft.player == null`) the input goes nowhere.
+        let Some(w) = &mut self.world else {
+            return;
+        };
+        for (xo, yo) in turns {
+            w.player.turn(xo, yo);
+        }
+        if w.game_type != play::SPECTATOR {
+            for wheel in scrolls {
+                w.selected_slot = next_scroll_selection(f64::from(wheel), w.selected_slot, 9);
+            }
+        }
+        for (pending, new) in self.hotbar_clicks.iter_mut().zip(clicks) {
+            *pending += new;
+        }
+    }
+
+    /// Publishes the player's state for the screen.
+    fn update_view(&self) {
+        let view = self.world.as_ref().map(|w| PlayerView {
+            dimension: w.dimension.clone(),
+            position: w.player.position,
+            y_rot: w.player.y_rot,
+            x_rot: w.player.x_rot,
+            on_ground: w.player.on_ground,
+            sprinting: w.player.sprinting,
+            pose: w.player.pose,
+            selected_slot: w.selected_slot,
+            chunks: w.level.chunk_count(),
+            loaded: w.loaded,
+        });
+        *lock(&self.view) = view;
     }
 
     /// Vanilla's millisecond clock (`Util.getMillis`).
@@ -436,8 +574,18 @@ impl Game {
                 }
             }
         }
+        // `handleKeybinds`: one press per hotbar key per tick (spectators' hotbar keys
+        // open the spectator menu instead, which isn't there yet).
+        for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
+            if *pending > 0 {
+                *pending -= 1;
+                if w.game_type != play::SPECTATOR {
+                    w.selected_slot = slot as i32;
+                }
+            }
+        }
         // `level.tickEntities` ticks the player, then `player.sendChanges`; both only
-        // once it has loaded. No keys are held yet: the world isn't shown.
+        // once it has loaded.
         if w.loaded
             && let Some(physics) = &self.physics
         {
@@ -446,7 +594,7 @@ impl Game {
                 blocks: &physics.blocks,
                 tags: &self.tags,
             };
-            w.player.tick(&env, Keys::default());
+            w.player.tick(&env, self.keys);
             for p in w.player.send_changes() {
                 self.connection.send(p);
             }

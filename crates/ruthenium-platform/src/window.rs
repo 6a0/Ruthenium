@@ -264,6 +264,18 @@ impl Window {
         unsafe { sdl3_sys::clipboard::SDL_SetClipboardText(c.as_ptr()) };
     }
 
+    /// Grabs the mouse for turning the camera (on: relative mode, the pointer hidden and
+    /// held in the window) or lets it go, warping it to the window's centre first, as
+    /// vanilla does (`InputConstants.grabMouse`, `releaseMouse`). False if SDL refused.
+    pub fn set_mouse_grabbed(&self, on: bool) -> bool {
+        let (w, h) = self.size();
+        // SAFETY: raw is a live window.
+        unsafe {
+            sdl3_sys::mouse::SDL_WarpMouseInWindow(self.raw, w as f32 / 2.0, h as f32 / 2.0);
+            sdl3_sys::mouse::SDL_SetWindowRelativeMouseMode(self.raw, on)
+        }
+    }
+
     /// Asks the window manager for a new window size in points (it may refuse or adjust;
     /// the result arrives as [`Event::PixelSizeChanged`]).
     pub fn request_size(&self, width: u32, height: u32) {

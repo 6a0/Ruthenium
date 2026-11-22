@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ruthenium_sim::input::MouseOptions;
 use ruthenium_ui::modern::{ControlSpec, SectionSpec, SettingSpec};
 
 /// Vanilla's frame-rate slider: 10 to 250 FPS in steps of 10, then Unlimited
@@ -63,7 +64,7 @@ impl MenuSize {
 }
 
 /// See the module docs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     /// Present in step with the display (FIFO); off: as soon as a frame is ready.
     pub vsync: bool,
@@ -79,6 +80,9 @@ pub struct Settings {
     pub reduce_motion: bool,
     /// The last address typed into Direct Connect (vanilla's `lastServer`).
     pub last_server: String,
+    /// The mouse's sensitivity (0 to 1, exactly as vanilla's `mouseSensitivity`) and
+    /// inversion. Imported from vanilla's `options.txt` when the file has none.
+    pub mouse: MouseOptions,
 }
 
 impl Default for Settings {
@@ -91,6 +95,7 @@ impl Default for Settings {
             menu_size: MenuSize::Default,
             reduce_motion: false,
             last_server: String::new(),
+            mouse: MouseOptions::DEFAULT,
         }
     }
 }
@@ -115,10 +120,11 @@ impl Settings {
         let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
         let d = Settings::default();
         let section = |name: &str| table.get(name).and_then(toml::Value::as_table);
-        let (display, interface, multiplayer) = (
+        let (display, interface, multiplayer, controls) = (
             section("display"),
             section("interface"),
             section("multiplayer"),
+            section("controls"),
         );
         fn get<'a>(t: Option<&'a toml::Table>, key: &str) -> Option<&'a toml::Value> {
             t.and_then(|t| t.get(key))
@@ -143,6 +149,18 @@ impl Settings {
             .and_then(toml::Value::as_str)
             .filter(|s| s.encode_utf16().count() <= MAX_SERVER)
             .map_or(d.last_server, str::to_owned);
+        let sensitivity = match get(controls, "mouse_sensitivity") {
+            Some(toml::Value::Float(v)) => Some(*v),
+            Some(toml::Value::Integer(n)) => Some(*n as f64),
+            _ => None,
+        }
+        .filter(|v| (0.0..=1.0).contains(v))
+        .unwrap_or(d.mouse.sensitivity);
+        let mouse = MouseOptions {
+            sensitivity,
+            invert_x: flag(controls, "invert_mouse_x", d.mouse.invert_x),
+            invert_y: flag(controls, "invert_mouse_y", d.mouse.invert_y),
+        };
         Ok(Settings {
             vsync: flag(display, "vsync", d.vsync),
             max_fps,
@@ -151,6 +169,16 @@ impl Settings {
             menu_size,
             reduce_motion: flag(interface, "reduce_motion", d.reduce_motion),
             last_server,
+            mouse,
+        })
+    }
+
+    /// Whether `text` sets the mouse's sensitivity (else it's imported from vanilla).
+    pub fn has_mouse(text: &str) -> bool {
+        text.parse::<toml::Table>().is_ok_and(|t| {
+            t.get("controls")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|c| c.contains_key("mouse_sensitivity"))
         })
     }
 
@@ -277,12 +305,22 @@ impl Settings {
              reduce_motion = {}\n\
              \n\
              [multiplayer]\n\
-             last_server = {last_server}\n",
+             last_server = {last_server}\n\
+             \n\
+             [controls]\n\
+             # Vanilla's mouseSensitivity (0 to 1; 0.5 is vanilla's 100%), exactly: the\n\
+             # camera turns as vanilla's would at the same value.\n\
+             mouse_sensitivity = {:?}\n\
+             invert_mouse_x = {}\n\
+             invert_mouse_y = {}\n",
             self.vsync,
             self.fullscreen,
             self.frame_stats,
             self.menu_size.key(),
             self.reduce_motion,
+            self.mouse.sensitivity,
+            self.mouse.invert_x,
+            self.mouse.invert_y,
         )
     }
 }
@@ -295,6 +333,8 @@ pub struct SettingsFile {
     path: Option<PathBuf>,
     /// What the file holds (or would hold): saving is skipped when nothing changed.
     saved: Settings,
+    /// Whether the file set the mouse's sensitivity.
+    has_mouse: bool,
 }
 
 impl SettingsFile {
@@ -309,6 +349,7 @@ impl SettingsFile {
             settings: Settings::default(),
             path: None,
             saved: Settings::default(),
+            has_mouse: true,
         }
     }
 
@@ -331,11 +372,39 @@ impl SettingsFile {
                 Settings::default()
             }
         };
+        let has_mouse = std::fs::read_to_string(&path).is_ok_and(|t| Settings::has_mouse(&t));
         SettingsFile {
             saved: settings.clone(),
             settings,
             path: Some(path),
+            has_mouse,
         }
+    }
+
+    /// Takes the mouse options from `import` (vanilla's) if the file didn't set them;
+    /// they are saved with the next change, or on quitting.
+    pub fn import_mouse(&mut self, import: impl FnOnce() -> Option<(MouseOptions, PathBuf)>) {
+        if self.has_mouse {
+            return;
+        }
+        self.has_mouse = true;
+        match import() {
+            Some((mouse, from)) => {
+                eprintln!(
+                    "[ruthenium] mouse sensitivity {:?}{}{} from {}",
+                    mouse.sensitivity,
+                    if mouse.invert_x { ", X inverted" } else { "" },
+                    if mouse.invert_y { ", Y inverted" } else { "" },
+                    from.display()
+                );
+                self.settings.mouse = mouse;
+            }
+            None => eprintln!(
+                "[ruthenium] no vanilla options.txt found; mouse sensitivity at vanilla's default"
+            ),
+        }
+        // Written even when it's the default, so the import happens once.
+        self.saved.mouse.sensitivity = f64::NAN;
     }
 
     /// Writes the settings if they changed since they were read or last saved.
@@ -391,8 +460,26 @@ mod tests {
             menu_size: MenuSize::Larger,
             reduce_motion: true,
             last_server: "play.example.com:25566 \"quoted\"".into(),
+            mouse: MouseOptions {
+                sensitivity: 0.27464788732394363,
+                invert_x: false,
+                invert_y: true,
+            },
         };
-        assert_eq!(Settings::parse(&s.to_toml()), Ok(s));
+        assert_eq!(Settings::parse(&s.to_toml()), Ok(s.clone()));
+        assert!(Settings::has_mouse(&s.to_toml()));
+        assert!(!Settings::has_mouse(
+            "[display]
+vsync = true
+"
+        ));
+        // Every double comes back bit for bit, however it prints.
+        for v in [0.0, 1.0, 1.0e-5, 0.1 + 0.2, 0.5000000000000001, 5e-324] {
+            let mut t = s.clone();
+            t.mouse.sensitivity = v;
+            let back = Settings::parse(&t.to_toml()).unwrap().mouse.sensitivity;
+            assert_eq!(back.to_bits(), v.to_bits(), "{v:?}");
+        }
         let d = Settings::default();
         assert_eq!(Settings::parse(&d.to_toml()), Ok(d));
     }

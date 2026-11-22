@@ -32,10 +32,14 @@ pub enum Event {
     FocusLost,
     /// The window entered (true) or left (false) fullscreen, asked for or not.
     Fullscreen(bool),
-    /// The mouse moved to `(x, y)`, in window coordinates (points, not pixels).
+    /// The mouse moved to `(x, y)`, in window coordinates (points, not pixels), by
+    /// `(dx, dy)` (SDL's `xrel`, `yrel`: what turns the camera while the mouse is
+    /// grabbed, as vanilla reads it).
     MouseMotion {
         x: f32,
         y: f32,
+        dx: f32,
+        dy: f32,
     },
     /// A mouse button (1 left, 2 middle, 3 right, as SDL numbers them) went down or up at
     /// `(x, y)` in window coordinates.
@@ -49,9 +53,13 @@ pub enum Event {
     /// The mouse left the window.
     MouseLeft,
     /// The wheel turned: `y` notches, positive away from the user (scroll up), with the
-    /// system's natural-scrolling setting already applied.
+    /// system's natural-scrolling setting already applied (for the menus). `raw_x` and
+    /// `raw_y` are SDL's values as they come, which is what vanilla scrolls the hotbar
+    /// by.
     MouseWheel {
         y: f32,
+        raw_x: f32,
+        raw_y: f32,
     },
     /// A key went down or up. `scancode` is the SDL scancode, the value vanilla stores in
     /// options.txt. `shift` is whether a Shift key was held; `shortcut` whether the
@@ -129,6 +137,8 @@ impl Event {
                 SDL_EVENT_MOUSE_MOTION => Event::MouseMotion {
                     x: e.motion.x,
                     y: e.motion.y,
+                    dx: e.motion.xrel,
+                    dy: e.motion.yrel,
                 },
                 SDL_EVENT_MOUSE_BUTTON_DOWN | SDL_EVENT_MOUSE_BUTTON_UP => Event::MouseButton {
                     button: e.button.button,
@@ -157,6 +167,8 @@ impl Event {
                     } else {
                         e.wheel.y
                     },
+                    raw_x: e.wheel.x,
+                    raw_y: e.wheel.y,
                 },
                 _ => return None,
             })

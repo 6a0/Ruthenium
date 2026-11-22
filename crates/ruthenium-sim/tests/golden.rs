@@ -261,8 +261,8 @@ fn replay_from(
 }
 
 /// Scenarios the movement code must reproduce exactly. The rest need what isn't
-/// ported yet (fluids, climbing, the server's attribute and entity data echoes).
-const EXACT: [&str; 9] = [
+/// ported yet (fluids).
+const EXACT: [&str; 10] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -271,6 +271,7 @@ const EXACT: [&str; 9] = [
     "sprint_jump",
     "ice",
     "slime_bounce",
+    "ladder",
     "combat_basics",
 ];
 
