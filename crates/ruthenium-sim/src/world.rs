@@ -296,7 +296,10 @@ impl Level {
                         },
                         Some((_, BlockEntityShape::Empty))
                         | Some((Kind::MovingPiston, BlockEntityShape::Missing)) => continue,
-                        _ => match blocks.collision_for(state, [x, y, z], who) {
+                        _ => match blocks
+                            .collision_for(state, [x, y, z], who)
+                            .or_else(|| self.lava_surface(blocks, state, [x, y, z], who))
+                        {
                             Some(p) => p,
                             None => continue,
                         },
@@ -322,6 +325,32 @@ impl Level {
             }
         }
         out
+    }
+
+    /// `LiquidBlock.getCollisionShape` for an entity that stands on lava (a strider):
+    /// a lava source with no lava above is solid to its lower half for one above that.
+    fn lava_surface<'a>(
+        &self,
+        blocks: &'a Blocks,
+        state: u32,
+        pos: [i32; 3],
+        who: Option<crate::blocks::Who>,
+    ) -> Option<Placed<'a>> {
+        let who = who.filter(|w| w.stands_on_lava)?;
+        if blocks.name(state) != "minecraft:lava" {
+            return None;
+        }
+        let source =
+            ruthenium_data::v26_3::blocks::BlockState::from_id(state)?.value("level") == Some("0");
+        let above = self.block(pos[0], pos[1] + 1, pos[2]);
+        if !source || blocks.name(above) == "minecraft:lava" || !who.is_above(pos[1], 0.5) {
+            return None;
+        }
+        Some(Placed {
+            shape: blocks.lava_surface(),
+            offset: None,
+            pos: [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])],
+        })
     }
 }
 

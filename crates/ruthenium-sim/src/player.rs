@@ -689,8 +689,12 @@ pub struct Riding {
     /// `getControlledVehicle`: the player is the vehicle's controlling passenger.
     pub controls: bool,
     /// `jumpableVehicle`: a vehicle the player controls that jumps when told
-    /// (`PlayerRideableJumping.canJump`: a saddled horse), with no jump cooldown.
+    /// (`PlayerRideableJumping.canJump`: a saddled horse, camel or nautilus; a camel
+    /// not sitting down or getting up).
     pub jumpable: bool,
+    /// The vehicle's `getJumpCooldown`: a camel's or nautilus's dash recharging; no
+    /// jump charges meanwhile.
+    pub jump_cooldown: i32,
     /// `vehicleCanSprint`: the vehicle can sprint and the player controls it.
     pub can_sprint: bool,
     /// `modifyPassengerFluidInteractionBox` of a boat not under water: the box the
@@ -1842,7 +1846,10 @@ impl LocalPlayer {
         }
         // A horse's jump charges while jump is held and goes when it is let go.
         self.riding_jump = None;
-        if self.riding.is_some_and(|r| r.jumpable) {
+        if self
+            .riding
+            .is_some_and(|r| r.jumpable && r.jump_cooldown == 0)
+        {
             if self.jump_riding_ticks < 0 {
                 self.jump_riding_ticks += 1;
                 if self.jump_riding_ticks == 0 {
@@ -2534,6 +2541,8 @@ impl LocalPlayer {
         let input = [f64::from(self.xxa), 0.0, f64::from(self.zza)];
         let length = input[0] * input[0] + input[1] * input[1] + input[2] * input[2];
         if length < 1.0E-7 {
+            // `getInputVector` gives `Vec3.ZERO`, still added: -0.0 becomes 0.0.
+            self.delta = self.delta.map(|v| v + 0.0);
             return;
         }
         let v = if length > 1.0 {
@@ -2808,6 +2817,11 @@ impl LocalPlayer {
         (self.xxa, self.zza, self.jumping)
     }
 
+    /// The items in the main and off hands (`isHolding`), 0 for an empty hand.
+    pub(crate) fn holding(&self) -> [i32; 2] {
+        [Hand::Main, Hand::Off].map(|h| self.inventory.hand(h).item())
+    }
+
     /// A packet sent during the tick before `sendChanges`'s (a boat's paddles).
     pub(crate) fn queue(&mut self, packet: Vec<u8>) {
         self.outbox.push(packet);
@@ -2931,6 +2945,7 @@ impl LocalPlayer {
             descending: self.keys.shift,
             fall_distance: self.fall_distance,
             walks_on_powder_snow: self.walks_on_powder_snow(),
+            stands_on_lava: false,
         }
     }
 

@@ -1258,6 +1258,11 @@ pub mod play {
             entity_id: i32,
             slots: Vec<(u8, ItemStack)>,
         },
+        /// `ClientboundSetTimePacket`: the level's game time (the clocks' updates that
+        /// follow aren't read).
+        SetTime {
+            game_time: i64,
+        },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
     }
@@ -1664,6 +1669,11 @@ pub mod play {
                         }
                     }
                     Clientbound::SetEquipment { entity_id, slots }
+                }
+                C::SetTime => {
+                    let game_time = r.i64()?;
+                    r.rest();
+                    Clientbound::SetTime { game_time }
                 }
                 other => {
                     r.rest();

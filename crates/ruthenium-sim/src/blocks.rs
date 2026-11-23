@@ -29,6 +29,8 @@ pub struct Blocks {
     /// Powder snow under an entity falling into it
     /// (`PowderSnowBlock.FALLING_COLLISION_SHAPE`: up to 0.9).
     powder_snow_falling: Shape,
+    /// `Strider.getLiquidCollisionShape`: the lower half of the block.
+    lava_surface: Shape,
 }
 
 /// The entity a collision query is made for (`EntityCollisionContext`): the bottom
@@ -42,12 +44,14 @@ pub struct Who {
     pub descending: bool,
     pub fall_distance: f64,
     pub walks_on_powder_snow: bool,
+    /// `canStandOnFluid` of lava: a strider walks on a lava source's surface.
+    pub stands_on_lava: bool,
 }
 
 impl Who {
     /// `isAbove`: the entity's bottom is above the top of a shape whose highest
     /// point is `max_y` within the block at `y` (less a float's hundred-thousandth).
-    fn is_above(&self, y: i32, max_y: f64) -> bool {
+    pub(crate) fn is_above(&self, y: i32, max_y: f64) -> bool {
         self.bottom > f64::from(y) + max_y - 9.999999747378752E-6
     }
 }
@@ -88,7 +92,16 @@ impl Blocks {
                 ],
                 full: vec![true],
             }),
+            lava_surface: Shape::new(&ruthenium_prepare::exporters::ShapeData {
+                coords: [vec![0.0, 1.0], vec![0.0, 0.5], vec![0.0, 1.0]],
+                full: vec![true],
+            }),
         }
+    }
+
+    /// The shape a lava source has for an entity that stands on it (a strider).
+    pub(crate) fn lava_surface(&self) -> &Shape {
+        &self.lava_surface
     }
 
     /// The blocks with what placing and using them needs.

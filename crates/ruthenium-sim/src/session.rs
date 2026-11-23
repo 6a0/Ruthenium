@@ -475,8 +475,8 @@ struct World {
     fluid_shapes: pick::FluidShapes,
     tick_rate: f32,
     frozen: bool,
-    /// The level's game time, counted by the ticks (`tickTime`; the server's
-    /// `set_time` isn't read yet). Pistons use it to tell ticks apart.
+    /// The level's game time: the server's (`set_time`), counted on by the ticks
+    /// (`tickTime`). Pistons tell ticks apart by it; camels time sitting and getting up.
     game_time: i64,
 }
 
@@ -1013,6 +1013,7 @@ impl Game {
             },
             tick_rate: w.tick_rate,
             runs_normally: !w.frozen,
+            game_time: w.game_time,
         };
         let (loaded, keys) = (w.loaded, self.keys);
         w.entities.tick(&cx, &mut w.player, |player, colliders| {
@@ -1673,6 +1674,12 @@ impl Game {
             play::Clientbound::SetEquipment { entity_id, slots } => {
                 if let Some(w) = &mut self.world {
                     w.entities.set_equipment(entity_id, &slots);
+                }
+            }
+            // `handleSetTime` (`setTimeFromServer`; the clocks aren't kept).
+            play::Clientbound::SetTime { game_time } => {
+                if let Some(w) = &mut self.world {
+                    w.game_time = game_time;
                 }
             }
             play::Clientbound::Other(kind) => {

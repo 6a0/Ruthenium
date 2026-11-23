@@ -942,6 +942,14 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             tags,
             colliders: &[],
         };
+        // The level's game time as the tick runs (the trace has it after `level.tick`
+        // added one).
+        let game_time = records[i..]
+            .iter()
+            .take_while(|q| q.kind != "tick")
+            .find(|q| q.kind == "state")
+            .and_then(|q| q.value["gameTime"].as_i64())
+            .map_or(n, |g| g - 1);
         let cx = TickContext {
             env: &env,
             teams: &client.teams,
@@ -953,17 +961,10 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             },
             tick_rate: 20.0,
             runs_normally: true,
+            game_time,
         };
         let held = if keys_released { Keys::default() } else { held };
         let loaded = client.loaded;
-        // The level's game time as the tick runs (the trace has it after `level.tick`
-        // added one).
-        let game_time = records[i..]
-            .iter()
-            .take_while(|q| q.kind != "tick")
-            .find(|q| q.kind == "state")
-            .and_then(|q| q.value["gameTime"].as_i64())
-            .map_or(n, |g| g - 1);
         // The player ticks once loaded and while still in the level; then the block
         // entities (pistons push it, shulker boxes' lids lift it); `sendChanges` only for
         // a player still in it after the tick.
@@ -1323,7 +1324,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 73] = [
+const EXACT: [&str; 78] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1397,6 +1398,11 @@ const EXACT: [&str; 73] = [
     "riding_death",
     "horse_promoted",
     "happy_ghast_ai",
+    "camel_ride",
+    "pig_ride",
+    "strider_ride",
+    "nautilus_ride",
+    "minecart_ride",
 ];
 
 #[test]
@@ -1493,6 +1499,11 @@ fn golden_traces() {
         "riding_death",
         "horse_promoted",
         "happy_ghast_ai",
+        "camel_ride",
+        "pig_ride",
+        "strider_ride",
+        "nautilus_ride",
+        "minecart_ride",
     ];
     // RUTHENIUM_TRACES=a,b replays only those.
     let only = std::env::var("RUTHENIUM_TRACES").ok();

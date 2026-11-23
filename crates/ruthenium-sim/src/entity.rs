@@ -22,11 +22,12 @@
 //!
 //! Not yet: other passengers are ticked after their vehicle but not moved with it, so
 //! they don't push; sizes that depend on more than the pose, youth, a slime's size and
-//! the scale attribute (a sitting camel, a peeking shulker, a puffed pufferfish, a
-//! phantom's size) are the type's default.
+//! the scale attribute (a peeking shulker, a puffed pufferfish, a phantom's size) are
+//! the type's default. A sitting camel has its sitting size.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use ruthenium_data::v26_3::registries::Item;
 use ruthenium_javamath::mth;
 use ruthenium_prepare::exporters::EntityTypeData;
 use ruthenium_protocol::packets::play::{self, DataValue, PositionPath, VecDelta};
@@ -46,6 +47,7 @@ pub mod pose {
     pub const SPIN_ATTACK: i32 = 4;
     pub const CROUCHING: i32 = 5;
     pub const DYING: i32 = 7;
+    pub const SITTING: i32 = 10;
 }
 
 /// `Team.CollisionRule` ids.
@@ -262,6 +264,34 @@ pub struct TypeInfo {
     default_attributes: Vec<(String, f64)>,
     /// `Mob.DATA_MOB_FLAGS_ID`.
     mob_flags_field: Option<u8>,
+    /// `AbstractHorse.addPassenger`: a new rider is turned to face as it does.
+    snaps_rider: bool,
+    /// When a saddle in its saddle slot counts (`isSaddled`: `canUseSlot` and the
+    /// saddle's allowed entities).
+    pub(crate) saddle_rule: SaddleRule,
+    /// `Camel.DASH` and `AbstractNautilus.DASH`.
+    dash_field: Option<u8>,
+    /// `Camel.LAST_POSE_CHANGE_TICK`.
+    pose_tick_field: Option<u8>,
+    /// `DATA_BOOST_TIME` of pigs and striders (`ItemBasedSteering`).
+    boost_field: Option<u8>,
+    /// `Strider.DATA_SUFFOCATING`.
+    suffocating_field: Option<u8>,
+    /// `TamableAnimal.DATA_FLAGS_ID`.
+    tame_flags_field: Option<u8>,
+}
+
+/// When a saddle counts (`canUseSlot(SADDLE)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaddleRule {
+    /// Llamas: a saddle is never for them.
+    Never,
+    /// Skeleton and zombie horses.
+    Always,
+    /// Alive and grown: camels, pigs, striders.
+    Grown,
+    /// Alive, grown and tame: horses, donkeys, mules, nautiluses.
+    GrownTamed,
 }
 
 /// `#minecraft:can_float_while_ridden` as vanilla's data pack has it.
@@ -438,10 +468,21 @@ impl EntityTypes {
                         x_offset: if chest { 0.15 } else { 0.0 },
                         max_passengers: if chest { 1 } else { 2 },
                     }
-                } else if d.is("AbstractHorse") && !d.is("Camel") && !d.is("Llama") {
-                    RideKind::Horse { rearing: true }
+                } else if d.is("Camel") {
+                    RideKind::Camel
+                } else if d.is("AbstractHorse") {
+                    // Llamas take no saddle, so no one steers them; they don't rear.
+                    RideKind::Horse {
+                        rearing: !d.is("Llama"),
+                    }
                 } else if d.is("HappyGhast") {
                     RideKind::HappyGhast
+                } else if d.is("Pig") {
+                    RideKind::Pig
+                } else if d.is("Strider") {
+                    RideKind::Strider
+                } else if d.is("AbstractNautilus") {
+                    RideKind::Nautilus
                 } else {
                     RideKind::None
                 },
@@ -450,6 +491,25 @@ impl EntityTypes {
                 float_while_ridden: FLOAT_WHILE_RIDDEN.contains(&d.key.as_str()),
                 default_attributes: d.attributes.clone(),
                 mob_flags_field: d.field("Mob.DATA_MOB_FLAGS_ID"),
+                snaps_rider: d.is("AbstractHorse"),
+                saddle_rule: if d.is("Llama") {
+                    SaddleRule::Never
+                } else if d.is("SkeletonHorse") || d.is("ZombieHorse") {
+                    SaddleRule::Always
+                } else if d.is("AbstractHorse") && !d.is("Camel") || d.is("AbstractNautilus") {
+                    SaddleRule::GrownTamed
+                } else {
+                    SaddleRule::Grown
+                },
+                dash_field: d
+                    .field("Camel.DASH")
+                    .or_else(|| d.field("AbstractNautilus.DASH")),
+                pose_tick_field: d.field("Camel.LAST_POSE_CHANGE_TICK"),
+                boost_field: d
+                    .field("Pig.DATA_BOOST_TIME")
+                    .or_else(|| d.field("Strider.DATA_BOOST_TIME")),
+                suffocating_field: d.field("Strider.DATA_SUFFOCATING"),
+                tame_flags_field: d.field("TamableAnimal.DATA_FLAGS_ID"),
             };
             let i = d.id as usize;
             if types.len() <= i {
@@ -724,6 +784,17 @@ pub struct Entity {
     pub(crate) stays_still: bool,
     /// `Mob.isNoAi`: its own AI is off (it doesn't rear on the client).
     pub(crate) no_ai: bool,
+    /// A camel's or nautilus's `DASH`.
+    pub(crate) dashing: bool,
+    /// A camel's `LAST_POSE_CHANGE_TICK`: the game time it last stood up, negated
+    /// when it sat down.
+    pub(crate) last_pose_change_tick: i64,
+    /// A pig's or strider's `DATA_BOOST_TIME`: how long a boost lasts.
+    pub(crate) boost_time_total: i32,
+    /// A strider's `DATA_SUFFOCATING` (out of the warm).
+    pub(crate) suffocating: bool,
+    /// `TamableAnimal.isTame`.
+    pub(crate) tame: bool,
 }
 
 const ATTRIBUTE_SCALE: &str = "minecraft:scale";
@@ -809,6 +880,11 @@ impl Entity {
             horse_flags: 0,
             stays_still: false,
             no_ai: false,
+            dashing: false,
+            last_pose_change_tick: 0,
+            boost_time_total: 0,
+            suffocating: false,
+            tame: false,
         };
         if let Some(b) = e.body.as_deref_mut() {
             for (name, base) in &info.default_attributes {
@@ -884,6 +960,12 @@ impl Entity {
         }
         let default = if t.avatar {
             avatar_size(self.pose)
+        } else if t.ride == RideKind::Camel && self.pose == pose::SITTING {
+            if self.baby {
+                Size::scalable(0.95, 0.425)
+            } else {
+                Size::scalable(t.size.width, t.size.height - 1.43)
+            }
         } else if t.cube_size_field.is_some() {
             t.size.scale(self.cube_size as f32)
         } else if self.baby {
@@ -895,7 +977,7 @@ impl Entity {
     }
 
     /// `refreshDimensions` (the client never nudges the entity to fit).
-    fn refresh_dimensions(&mut self) {
+    pub(crate) fn refresh_dimensions(&mut self) {
         self.size = self.dimensions();
         self.set_pos(self.position);
     }
@@ -1168,6 +1250,28 @@ impl Entity {
             && let DataValue::Byte(b) = value
         {
             self.no_ai = b & 1 != 0;
+        } else if Some(field) == t.dash_field
+            && let DataValue::Boolean(b) = value
+        {
+            self.dashing = *b;
+            self.dash_synced();
+        } else if Some(field) == t.pose_tick_field
+            && let DataValue::Long(n) = value
+        {
+            self.last_pose_change_tick = *n;
+        } else if Some(field) == t.boost_field
+            && let DataValue::Int(n) = value
+        {
+            self.boost_time_total = *n;
+            self.boost_synced();
+        } else if Some(field) == t.suffocating_field
+            && let DataValue::Boolean(b) = value
+        {
+            self.suffocating = *b;
+        } else if Some(field) == t.tame_flags_field
+            && let DataValue::Byte(b) = value
+        {
+            self.tame = b & 4 != 0;
         }
     }
 }
@@ -1343,6 +1447,8 @@ pub struct TickContext<'a, 'e> {
     pub local: Local<'a>,
     /// The server's tick rate.
     pub tick_rate: f32,
+    /// The level's game time (`getGameTime`).
+    pub game_time: i64,
     /// `TickRateManager.runsNormally`: false while the game is frozen.
     pub runs_normally: bool,
 }
@@ -1361,6 +1467,12 @@ pub struct Entities {
     local_vehicle: Option<i32>,
     local_passengers: Vec<i32>,
     minecart_improvements: bool,
+    /// The level's game time as the entities tick (`getGameTime`): a camel's pose
+    /// changes are timed by it.
+    game_time: i64,
+    /// The items in the local player's hands (`isHolding`): a pig or strider follows
+    /// a rider holding its item on a stick.
+    local_holding: [i32; 2],
 }
 
 impl Entities {
@@ -1673,7 +1785,7 @@ impl Entities {
         }
         let v = self.entities.get(&vehicle)?;
         match v.info.ride {
-            RideKind::Horse { .. } => Some((v.y_rot, Some(v.x_rot))),
+            _ if v.info.snaps_rider => Some((v.y_rot, Some(v.x_rot))),
             RideKind::Boat { .. } if !was_mounted => Some((v.y_rot, None)),
             _ => None,
         }
@@ -1864,9 +1976,16 @@ impl Entities {
         } = *change;
         let e = self.entities.get_mut(&id)?;
         let current = e.client_pos_rot();
+        // `PositionMoveRotation.of` takes `getKnownMovement`: the controlling
+        // player's movement for a vehicle it steers.
+        let known = if controlled && e.alive() {
+            player.delta
+        } else {
+            e.delta
+        };
         let (pos, new_delta, y, x) = crate::player::calculate_absolute(
             current.position,
-            e.delta,
+            known,
             current.y_rot,
             current.x_rot,
             position,
@@ -1995,6 +2114,8 @@ impl Entities {
         // The list as it was when the iteration began (`EntityTickList` copies it if
         // it changes meanwhile).
         let order = self.ticking.clone();
+        self.game_time = cx.game_time;
+        self.local_holding = player.holding();
         let speed = if cx.tick_rate > 20.0 {
             cx.tick_rate / 20.0
         } else {
@@ -2041,8 +2162,9 @@ impl Entities {
     }
 
     /// Whether the local player controls `id` (`isLocalInstanceAuthoritative`): it
-    /// is the first passenger of a vehicle a player steers: a boat, a saddled horse, a
-    /// harnessed happy ghast that isn't holding still.
+    /// is the first passenger of a vehicle a player steers: a boat; a saddled horse,
+    /// camel or nautilus; a harnessed happy ghast that isn't holding still; a saddled
+    /// pig or strider while the player holds its item on a stick.
     pub fn controlled_by_local(&self, id: i32) -> bool {
         let (Some(local), Some(e)) = (self.local_id, self.entities.get(&id)) else {
             return false;
@@ -2050,17 +2172,21 @@ impl Entities {
         if e.passengers.first() != Some(&local) {
             return false;
         }
+        let holding = |item: Item| self.local_holding.contains(&(item.id() as i32));
         match e.info.ride {
             RideKind::Boat { .. } => true,
-            RideKind::Horse { .. } => e.saddled,
+            RideKind::Horse { .. } | RideKind::Camel | RideKind::Nautilus => e.is_saddled(),
             RideKind::HappyGhast => e.body_armor && !e.stays_still,
+            RideKind::Pig => e.is_saddled() && holding(Item::CarrotOnAStick),
+            RideKind::Strider => e.is_saddled() && holding(Item::WarpedFungusOnAStick),
             RideKind::None => false,
         }
     }
 
     /// Tells the player what it rides ([`LocalPlayer::riding`]); getting off frees its
     /// hands (`LocalPlayer.removeVehicle`).
-    pub fn sync_riding(&self, player: &mut LocalPlayer) {
+    pub fn sync_riding(&mut self, player: &mut LocalPlayer) {
+        self.local_holding = player.holding();
         let riding = self
             .local_vehicle
             .and_then(|v| self.entities.get(&v))
@@ -2069,10 +2195,9 @@ impl Entities {
                 Riding {
                     vehicle: e.id,
                     controls,
-                    jumpable: controls
-                        && matches!(e.info.ride, RideKind::Horse { .. })
-                        && e.saddled,
-                    can_sprint: false,
+                    jumpable: controls && e.can_jump(self.game_time),
+                    jump_cooldown: e.jump_cooldown(),
+                    can_sprint: controls && e.info.ride == RideKind::Camel,
                     fluids_above: match (&e.info.ride, &e.body) {
                         (RideKind::Boat { .. }, Some(b)) if !b.is_under_water() => {
                             Some(e.bounding_box.max[1])
@@ -2194,6 +2319,7 @@ impl Entities {
                 };
                 rotate_y([0.0, f64::from(ride_height), f64::from(offset)], turn)
             }
+            RideKind::Camel => v.camel_passenger_point(index, self.game_time),
             _ => {
                 let points = &v.info.passenger_points;
                 let scale = f64::from(v.size.height / v.info.size.height);
@@ -2205,6 +2331,9 @@ impl Entities {
                     let s = f64::from(b.stand_anim_o);
                     let stand = rotate_y([0.0, 0.15 * s, -0.7 * s], turn);
                     a = [a[0] + stand[0], a[1] + stand[1], a[2] + stand[2]];
+                }
+                if v.info.ride == RideKind::Strider {
+                    a[1] += v.strider_bob();
                 }
                 a
             }
@@ -2350,6 +2479,7 @@ impl Entities {
                     xxa,
                     zza,
                     jumping,
+                    sprinting: player.sprinting,
                     y_rot: player.y_rot,
                     x_rot: player.x_rot,
                 }
@@ -2361,7 +2491,7 @@ impl Entities {
             };
             let mut out = Vec::new();
             if let Some(e) = self.entities.get_mut(&id) {
-                e.vehicle_tick(&env, controller, &mut out);
+                e.vehicle_tick(&env, controller, cx.game_time, &mut out);
             }
             for p in out {
                 player.queue(p);
@@ -2621,6 +2751,13 @@ mod tests {
                     "Entity",
                 ],
                 (1.3964844, 1.6),
+                &[("AbstractHorse.DATA_ID_FLAGS", 17)],
+            ),
+            data(
+                4,
+                "minecraft:pig",
+                &["Pig", "Animal", "Mob", "LivingEntity", "Entity"],
+                (0.9, 0.9),
                 &[],
             ),
         ])
@@ -2697,6 +2834,7 @@ mod tests {
             },
             tick_rate: 20.0,
             runs_normally: true,
+            game_time: 0,
         };
         e.tick(&cx, player, |_, _| {});
     }
@@ -2944,6 +3082,10 @@ mod tests {
             patch: Default::default(),
         };
         e.set_equipment(7, &[(play::EQUIPMENT_SADDLE, saddle)]);
+        // Only a tame horse can wear it.
+        e.sync_riding(&mut player);
+        assert!(!e.controlled_by_local(7));
+        e.set_data(7, &[(17, DataValue::Byte(2))], &types());
         e.sync_riding(&mut player);
         assert!(e.controlled_by_local(7));
         assert!(player.riding.is_some_and(|r| r.controls && r.jumpable));
@@ -2952,5 +3094,38 @@ mod tests {
         e.set_passengers(7, &[]);
         e.sync_riding(&mut player);
         assert!(player.riding.is_none() && !player.hands_busy);
+    }
+
+    #[test]
+    fn a_pig_follows_a_rider_holding_a_carrot_on_a_stick() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        e.chunk_loaded(0, 0);
+        add(&mut e, 8, 4, [0.5, 0.0, 0.5]);
+        let mut player = player_at([0.5, 0.0, 0.5]);
+        e.set_passengers(8, &[PLAYER_ID]);
+        let saddle = ruthenium_protocol::item::ItemStack {
+            item: Item::Saddle.id() as i32,
+            count: 1,
+            patch: Default::default(),
+        };
+        e.set_equipment(8, &[(play::EQUIPMENT_SADDLE, saddle)]);
+        e.sync_riding(&mut player);
+        assert!(!e.controlled_by_local(8), "not without the stick");
+        let selected = player.inventory.selected as usize;
+        let stick = crate::item::Items::default().new_stack(Item::CarrotOnAStick.id() as i32, 1);
+        player.inventory.set(selected, stick);
+        e.sync_riding(&mut player);
+        assert!(e.controlled_by_local(8));
+        assert!(
+            player
+                .riding
+                .is_some_and(|r| r.controls && !r.jumpable && !r.can_sprint)
+        );
+        // It walks forward along the rider's look (south at yaw 0), with no keys held.
+        player.y_rot = 0.0;
+        tick(&mut e, &Teams::default(), &mut player);
+        let pig = e.get(8).unwrap();
+        assert!(pig.position[2] > 0.5);
+        assert_eq!(pig.position[0], 0.5);
     }
 }

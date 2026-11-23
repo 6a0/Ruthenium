@@ -342,6 +342,31 @@ public final class Scenarios {
     private static final String GHAST_AI = "{PersistenceRequired:1b,Silent:1b,Rotation:[-90f,0f],"
             + "equipment:{body:{id:\"minecraft:white_harness\",count:1}}}";
 
+    /** A tame, saddled, still camel, sitting (it sat down at game tick 1). */
+    private static final String CAMEL = "{Tame:1b,NoAI:1b,PersistenceRequired:1b,Silent:1b,LastPoseTick:-1L,Rotation:[-90f,0f],"
+            + "equipment:{saddle:{id:\"minecraft:saddle\",count:1}}}";
+
+    /** A saddled, still mob (a pig or a nautilus). */
+    private static final String SADDLED = "{NoAI:1b,PersistenceRequired:1b,Silent:1b,Rotation:[-90f,0f],"
+            + "equipment:{saddle:{id:\"minecraft:saddle\",count:1}}}";
+
+    /** A saddled strider with its AI on (it gets cold out of the warm only then). */
+    private static final String STRIDER = "{PersistenceRequired:1b,Silent:1b,Rotation:[-90f,0f],"
+            + "equipment:{saddle:{id:\"minecraft:saddle\",count:1}}}";
+
+    /** The player as an owner reference (`Owner`: its UUID as an int array), to tame a mob. */
+    private static String owner(ClientGameTestContext ctx) {
+        java.util.UUID u = ctx.computeOnClient(mc -> mc.player.getUUID());
+        long m = u.getMostSignificantBits();
+        long l = u.getLeastSignificantBits();
+        return String.format(java.util.Locale.ROOT, "Owner:[I;%d,%d,%d,%d]", (int) (m >> 32), (int) m, (int) (l >> 32),
+                (int) l);
+    }
+
+    /** Sits a camel down now (its last pose change, negated, is this game tick). */
+    private static final String SIT_CAMEL = "execute as @e[type=minecraft:camel] store result entity @s LastPoseTick long -1 "
+            + "run time query gametime";
+
     /** Mounts the player on the nearest entity of the type with /ride and waits for it to land. */
     private static void ride(ClientGameTestContext ctx, TestServerContext server, String type) {
         server.runCommand("ride @p mount @e[type=" + type + ",limit=1,sort=nearest]");
@@ -2198,6 +2223,213 @@ public final class Scenarios {
                         ctx.getInput().releaseKey(W);
                         respawn(ctx);
                         gone(ctx, server, "minecraft:horse");
+                    }),
+            new Scenario("camel_ride",
+                    "A tame saddled camel (speed 0.09, jump strength 0.42), sitting when mounted: the player looks aside (it keeps its heading) and presses jump (no charge while it sits); forward held gets it up (52 ticks, the rider rising with it) and walking; sprinting; a dash charged for 10 ticks, jump held again early and late in the cooldown; turning back, a sprinting dash charged for 6 ticks; sat down while walking (40 ticks, forward held meanwhile) and got up again with forward; a charged jump let go while it falls from 3 blocks up; in a 1-deep pool, made to sit there (it gets up at once), out over the edge; sneaking off.",
+                    List.of("fill 4 -61 6 14 -61 10 minecraft:water"),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:camel -5.5 -60 -6.5 " + CAMEL);
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:camel");
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(-60, 0);
+                        ctx.waitTicks(5);
+                        hold(ctx, 5, JUMP);
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(-90, 0);
+                        ctx.waitTicks(3);
+                        hold(ctx, 70, W);
+                        hold(ctx, 20, W, SPRINT);
+                        ctx.waitTicks(10);
+                        hold(ctx, 10, JUMP);
+                        ctx.waitTicks(10);
+                        hold(ctx, 5, JUMP);
+                        ctx.waitTicks(25);
+                        hold(ctx, 4, JUMP);
+                        ctx.waitTicks(20);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        ctx.waitTicks(15);
+                        hold(ctx, 6, JUMP);
+                        ctx.waitTicks(10);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(20);
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(10);
+                        server.runCommand(SIT_CAMEL);
+                        ctx.waitTicks(40);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        hold(ctx, 70, W);
+                        ctx.getInput().holdKey(JUMP);
+                        ctx.waitTicks(4);
+                        server.runCommand("execute as @e[type=minecraft:camel] at @s run tp @s ~ ~3 ~");
+                        ctx.waitTicks(3);
+                        ctx.getInput().releaseKey(JUMP);
+                        ctx.waitTicks(30);
+                        server.runCommand("tp @e[type=minecraft:camel] 6.5 -60 8 -90 0");
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(-90, 0);
+                        hold(ctx, 10, W);
+                        server.runCommand(SIT_CAMEL);
+                        ctx.waitTicks(10);
+                        hold(ctx, 45, W);
+                        ctx.waitTicks(10);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:camel");
+                    }),
+            new Scenario("pig_ride",
+                    "A saddled pig ridden with a carrot on a stick held: it walks where the player looks, up a 1-block step and down again; boosted by using the stick, turning south, then north; the stick put away (it is the server's again) and taken out; sneaking off, mounted again by clicking it with an empty hand, the stick taken out; sneaking off.",
+                    List.of("item replace entity @a hotbar.0 with minecraft:carrot_on_a_stick",
+                            "fill 6 -60 -9 6 -60 -4 minecraft:stone"),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        slot(ctx, 0);
+                        server.runCommand("summon minecraft:pig 0.5 -60 -6.5 " + SADDLED);
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:pig");
+                        ctx.waitTicks(60);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.waitTicks(40);
+                        ctx.getInput().lookAt(0, 0);
+                        ctx.waitTicks(4);
+                        use(ctx);
+                        ctx.waitTicks(25);
+                        ctx.getInput().lookAt(180, 20);
+                        ctx.waitTicks(20);
+                        ctx.getInput().lookAt(-90, 0);
+                        ctx.waitTicks(15);
+                        slot(ctx, 1);
+                        ctx.waitTicks(20);
+                        slot(ctx, 0);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.waitTicks(20);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(10);
+                        slot(ctx, 1);
+                        server.runCommand("tp @e[type=minecraft:pig] 2.5 -60 0.5 -90 0");
+                        aim(ctx, server, 2.5, -60, 3.5, 2.5, -59.6, 0.5);
+                        ctx.waitTicks(6);
+                        use(ctx);
+                        ctx.waitTicks(10);
+                        slot(ctx, 0);
+                        ctx.getInput().lookAt(-90, 0);
+                        ctx.waitTicks(30);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:pig");
+                    }),
+            new Scenario("strider_ride",
+                    "A saddled strider (its AI on) ridden with a warped fungus on a stick held: cold and slow on stone, onto a 2-deep lava pool's surface (warm), boosted by using the stick, turning about on the lava; pushed under the surface (it rises), back west onto the stone; sneaking off.",
+                    List.of("item replace entity @a hotbar.0 with minecraft:warped_fungus_on_a_stick",
+                            "fill 6 -62 -5 16 -61 5 minecraft:lava", UNHURT,
+                            "effect give @a minecraft:fire_resistance infinite 0 true"),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        slot(ctx, 0);
+                        server.runCommand("summon minecraft:strider 1.5 -60 0.5 " + STRIDER);
+                        ctx.waitTicks(1);
+                        ride(ctx, server, "minecraft:strider");
+                        ctx.getInput().lookAt(-90, 0);
+                        waitUntilEastOf(ctx, 8.5, 120);
+                        ctx.waitTicks(10);
+                        use(ctx);
+                        ctx.getInput().lookAt(0, 0);
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.waitTicks(15);
+                        ctx.getInput().lookAt(180, 0);
+                        ctx.waitTicks(15);
+                        ctx.getInput().lookAt(-90, 0);
+                        ctx.waitTicks(10);
+                        server.runCommand("tp @e[type=minecraft:strider] 11.5 -62 0.5 90 0");
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(90, 0);
+                        waitUntilWestOf(ctx, 3.5);
+                        ctx.waitTicks(10);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:strider");
+                    }),
+            new Scenario("nautilus_ride",
+                    "An untamed saddled nautilus ridden with forward held (it isn't the player's to steer); then a tame saddled nautilus in a glass tank of water: swimming forward level, up and down along the look, backward, strafing; a dash charged for 10 ticks into the wall, jump held during the cooldown, a short dash; left in a channel of flowing water (the current doesn't push it); on land: walking and a dash; sneaking off.",
+                    List.of("fill 2 -60 -6 22 -53 -6 minecraft:glass", "fill 2 -60 6 22 -53 6 minecraft:glass",
+                            "fill 2 -60 -5 2 -53 5 minecraft:glass", "fill 22 -60 -5 22 -53 5 minecraft:glass",
+                            "fill 3 -60 -5 21 -54 5 minecraft:water",
+                            "fill 23 -60 8 31 -60 8 minecraft:stone", "fill 23 -60 10 31 -60 10 minecraft:stone",
+                            "setblock 22 -60 9 minecraft:stone",
+                            "effect give @a minecraft:water_breathing infinite 0 true"),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("setblock 31 -60 9 minecraft:water");
+                        server.runCommand("summon minecraft:nautilus 6.5 -57 0.5 " + SADDLED);
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:nautilus");
+                        hold(ctx, 20, W);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(10);
+                        gone(ctx, server, "minecraft:nautilus");
+                        server.runCommand("summon minecraft:nautilus 6.5 -57 0.5 {" + owner(ctx) + "," + SADDLED.substring(1));
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:nautilus");
+                        ctx.waitTicks(10);
+                        hold(ctx, 15, W);
+                        ctx.getInput().lookAt(-90, -40);
+                        hold(ctx, 10, W);
+                        ctx.getInput().lookAt(-90, 40);
+                        hold(ctx, 10, W);
+                        ctx.getInput().lookAt(90, 0);
+                        hold(ctx, 10, S);
+                        hold(ctx, 10, A);
+                        hold(ctx, 10, D);
+                        ctx.waitTicks(10);
+                        hold(ctx, 10, JUMP);
+                        ctx.waitTicks(10);
+                        hold(ctx, 3, JUMP);
+                        ctx.waitTicks(40);
+                        ctx.getInput().lookAt(-90, -10);
+                        hold(ctx, 4, JUMP);
+                        ctx.waitTicks(30);
+                        server.runCommand("tp @e[type=minecraft:nautilus] 27.5 -60 9.5 90 0");
+                        ctx.waitTicks(30);
+                        server.runCommand("tp @e[type=minecraft:nautilus] 26.5 -60 0.5 90 0");
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(90, 0);
+                        hold(ctx, 20, W);
+                        ctx.waitTicks(40);
+                        hold(ctx, 10, JUMP);
+                        ctx.waitTicks(30);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:nautilus");
+                    }),
+            new Scenario("minecart_ride",
+                    "A minecart on a straight rail with three powered rails: pushed along by holding forward (the server moves it), up to a stone block at the end, back with forward held facing west; sneaking off; then a llama mounted with /ride (the rider turned to face as it does); sneaking off.",
+                    List.of("fill 0 -60 0 20 -60 0 minecraft:rail[shape=east_west]",
+                            "fill 8 -61 0 10 -61 0 minecraft:redstone_block",
+                            "fill 8 -60 0 10 -60 0 minecraft:powered_rail[shape=east_west,powered=true]",
+                            "setblock 21 -60 0 minecraft:stone", "setblock -1 -60 0 minecraft:stone"),
+                    start(0.5, -60, -2.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:minecart 1.5 -60 0.5");
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:minecart");
+                        ctx.getInput().lookAt(-90, 0);
+                        ctx.waitTicks(5);
+                        hold(ctx, 30, W);
+                        ctx.waitTicks(60);
+                        ctx.getInput().lookAt(90, 0);
+                        hold(ctx, 40, W);
+                        ctx.waitTicks(40);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(10);
+                        gone(ctx, server, "minecraft:minecart");
+                        server.runCommand("summon minecraft:llama 2.5 -60 -6.5 {NoAI:1b,PersistenceRequired:1b,Silent:1b,Rotation:[45f,10f]}");
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:llama");
+                        ctx.waitTicks(10);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:llama");
                     }),
             new Scenario("horse_promoted",
                     "Riding a tame horse with no saddle (a passenger, not its rider) with forward held; the horse is saddled while forward is still held, and the player takes control; sneaking off.",
