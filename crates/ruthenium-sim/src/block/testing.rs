@@ -207,6 +207,7 @@ impl Fixture {
             pos,
             inside: false,
             miss: false,
+            world_border: false,
         });
         let mut out = Vec::new();
         let game = self.game;

@@ -580,7 +580,11 @@ fn handle(
             passengers,
         } => {
             // The turn a mount gives the player shows in the next tick's rotation.
-            c.entities.set_passengers(vehicle, &passengers);
+            // The turn a mount gives the player shows in the next tick's rotation, but
+            // a boat turns the head too.
+            if let Some((y, None)) = c.entities.set_passengers(vehicle, &passengers) {
+                p.head_y_rot = y;
+            }
             c.entities.sync_riding(p);
         }
         Clientbound::MoveVehicle {
@@ -786,6 +790,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
     p.entity_id = t.header["entityId"].as_i64().unwrap_or(0) as i32;
     p.position = [tp[0], tp[1], tp[2]];
     p.y_rot = tp[3] as f32;
+    p.head_y_rot = p.y_rot;
     p.x_rot = tp[4] as f32;
     p.stand(&env);
     p.set_position_reminder(reminder);
@@ -1242,6 +1247,59 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 ));
             }
         }
+        // The head's yaw, where the trace records it.
+        if s.value.get("yHeadRot").is_some() {
+            let want = s.f32("yHeadRot").unwrap();
+            if p.head_y_rot.to_bits() != want.to_bits() {
+                return Err((
+                    n,
+                    format!(
+                        "tick {n} (heartbeat count {reminder}): the head differs\n  got  {}\n  want {want}",
+                        p.head_y_rot
+                    ),
+                ));
+            }
+        }
+        // What exactly the crosshair is on, to the bit.
+        if let Some(kind) = s.str("hit")
+            && kind != "NONE"
+            && s.value.get("using").is_some()
+            && !LOOSE_CROSSHAIR.contains(&t.header["scenario"].as_str().unwrap())
+        {
+            let at = |v: [f64; 3]| v.map(f64::to_bits);
+            let want_at = s.value.get("hitAt").map(|v| {
+                at([0, 1, 2].map(|k| serde_json::from_value::<f64>(v[k].clone()).unwrap()))
+            });
+            let got = match hit {
+                HitResult::Entity { id, location } => {
+                    (Some(i64::from(id)), None, None, Some(at(location)))
+                }
+                HitResult::Block(ref b) if !b.miss => (
+                    None,
+                    Some(b.pos.map(i64::from)),
+                    Some(format!("{:?}", b.direction).to_lowercase()),
+                    Some(at(b.location)),
+                ),
+                HitResult::Block(_) => (None, None, None, None),
+            };
+            let want = (
+                s.value.get("hitEntity").and_then(|v| v.as_i64()),
+                s.value
+                    .get("hitBlock")
+                    .map(|v| [0, 1, 2].map(|k| v[k].as_i64().unwrap())),
+                s.str("hitFace").map(str::to_owned),
+                want_at,
+            );
+            if got != want {
+                return Err((
+                    n,
+                    format!(
+                        "tick {n} (heartbeat count {reminder}): the crosshair differs\n  got  {got:?} {hit:?}\n  want {want:?} {:?}",
+                        s.value.get("hitAt")
+                    ),
+                ));
+            }
+        }
         // The block being broken, where the trace records it.
         if let Some(exp) = s.value.get("destroying") {
             let got = serde_json::json!({
@@ -1439,8 +1497,12 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
     Ok(ticks)
 }
 
+/// Scenarios whose crosshair rests on something the client doesn't simulate yet, so only
+/// its kind is compared: a wind charge in flight, an opening shulker box's outline.
+const LOOSE_CROSSHAIR: [&str; 2] = ["wind_charge", "shulker_box"];
+
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 85] = [
+const EXACT: [&str; 87] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1526,6 +1588,8 @@ const EXACT: [&str; 85] = [
     "sleeping",
     "rain",
     "riptide_hit",
+    "attack_range",
+    "sulfur_cube",
 ];
 
 #[test]
@@ -1635,6 +1699,8 @@ fn golden_traces() {
         "sleeping",
         "rain",
         "riptide_hit",
+        "attack_range",
+        "sulfur_cube",
     ];
     // RUTHENIUM_TRACES=a,b replays only those.
     let only = std::env::var("RUTHENIUM_TRACES").ok();

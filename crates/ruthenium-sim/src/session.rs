@@ -1595,6 +1595,10 @@ impl Game {
                 if let Some(w) = &mut self.world {
                     if let Some((y, x)) = w.entities.set_passengers(vehicle, &passengers) {
                         w.player.y_rot = y % 360.0;
+                        // A boat turns the head too.
+                        if x.is_none() {
+                            w.player.head_y_rot = y;
+                        }
                         if let Some(x) = x {
                             w.player.x_rot = x.clamp(-90.0, 90.0) % 360.0;
                         }
@@ -1835,11 +1839,23 @@ pub fn pick_target(
         view: pick::view_vector(player.x_rot, player.y_rot),
         bounding_box: player.bounding_box(),
     };
-    pick::pick(
+    let attacker = player
+        .active_item()
+        .c
+        .attack_range
+        .map(|range| pick::Attacker {
+            range,
+            creative: player.creative,
+            eye: player.eye_position(),
+            head_look: pick::view_vector(player.x_rot, player.head_y_rot),
+            movement: player.delta,
+        });
+    pick::raycast(
         env,
         entities,
         players,
         &camera,
+        attacker.as_ref(),
         player.hand(Hand::Main).c.name,
         player.attributes.block_interaction_range.value(),
         player.attributes.entity_interaction_range.value(),

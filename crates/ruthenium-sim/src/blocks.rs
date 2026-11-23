@@ -354,8 +354,9 @@ impl Blocks {
     /// `None` when it has none.
     ///
     /// Context: a player never stands on fluids (`LiquidBlock`: only the empty shape
-    /// unless the entity can stand on the fluid), and moving pistons need their block
-    /// entity, which isn't tracked yet. Powder snow and scaffolding have the shape the
+    /// unless the entity can stand on the fluid). A moving piston's shape and an open
+    /// shulker box's are their block entity's, which the level has
+    /// ([`crate::world::Level`]). Powder snow and scaffolding have the shape the
     /// empty context gives; [`Blocks::collision_for`] has an entity's.
     pub fn collision(&self, id: u32, pos: [i32; 3]) -> Option<Placed<'_>> {
         let s = self.state(id);

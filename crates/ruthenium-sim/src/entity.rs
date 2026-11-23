@@ -216,6 +216,8 @@ pub struct TypeInfo {
     avatar: bool,
     player: bool,
     boat: bool,
+    /// A sulfur cube.
+    sulfur_cube: bool,
     minecart: bool,
     /// Living entities that never push players (`pushEntities` or `doPush` overridden:
     /// bats, armor stands, parrots; the ender dragon goes through everything).
@@ -432,6 +434,7 @@ impl EntityTypes {
                 avatar: d.is("Avatar"),
                 player: d.key == "minecraft:player",
                 boat: d.is("AbstractBoat"),
+                sulfur_cube: d.is("SulfurCube"),
                 minecart: d.is("AbstractMinecart"),
                 no_push: d.is("Bat") || d.is("ArmorStand") || d.is("Parrot") || d.is("EnderDragon"),
                 vex: d.is("Vex"),
@@ -811,7 +814,8 @@ pub struct Entity {
     pub(crate) info: TypeInfo,
     /// The physics of a vehicle the client can move.
     pub(crate) body: Option<Box<Body>>,
-    /// `isSaddled` and `isWearingBodyArmor`: what its saddle and body slots hold.
+    /// `isSaddled` and `isWearingBodyArmor` (a sulfur cube's `hasBodyItem`): what its
+    /// saddle and body slots hold.
     pub saddled: bool,
     pub body_armor: bool,
     /// `AbstractHorse`'s flags (tame, eating, standing...).
@@ -985,10 +989,10 @@ impl Entity {
         if self.info.projectile { 1.0 } else { 0.0 }
     }
 
-    /// `canBePickedFromInside`. Sulfur cubes wearing a body item can't be, but
-    /// equipment isn't tracked, so this is always true.
+    /// `canBePickedFromInside`: not a sulfur cube that has swallowed a block
+    /// (`hasBodyItem`).
     pub fn can_be_picked_from_inside(&self) -> bool {
-        true
+        !(self.info.sulfur_cube && self.body_armor)
     }
 
     /// `getDimensions(getPose())`.
@@ -2034,7 +2038,7 @@ impl Entities {
     }
 
     /// `handleSetEquipment`: what the saddle and body slots hold (`isSaddled`,
-    /// `isWearingBodyArmor`: a saddle, a harness).
+    /// `isWearingBodyArmor`: a saddle, a harness, a block a sulfur cube swallowed).
     pub fn set_equipment(&mut self, id: i32, slots: &[(u8, ruthenium_protocol::item::ItemStack)]) {
         let Some(e) = self.entities.get_mut(&id) else {
             return;
@@ -2426,6 +2430,7 @@ impl Entities {
             if y.is_finite() {
                 player.y_rot = y;
             }
+            player.head_y_rot += b.delta_rotation;
             let delta = mth::wrap_degrees(player.y_rot - v.y_rot);
             let target = delta.clamp(-105.0, 105.0);
             let y = player.y_rot + target - delta;

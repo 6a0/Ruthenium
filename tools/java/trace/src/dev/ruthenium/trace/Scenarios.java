@@ -93,6 +93,22 @@ public final class Scenarios {
         ctx.waitTicks(5);
     }
 
+    /** Moves the only husk and waits for the client to have it there. */
+    private static void husk(ClientGameTestContext ctx, TestServerContext server, double x, double y, double z) {
+        server.runCommand(String.format(java.util.Locale.ROOT, "tp @e[type=minecraft:husk] %.4f %.4f %.4f", x, y, z));
+        ctx.waitTicks(8);
+    }
+
+    /** An attack with each of the first four hotbar slots, charged. */
+    private static void allSlots(ClientGameTestContext ctx) {
+        for (int i = 0; i < 4; i++) {
+            slot(ctx, i);
+            ctx.waitTicks(15);
+            ctx.getInput().pressKey(ATTACK);
+            ctx.waitTicks(2);
+        }
+    }
+
     /** Selects a hotbar slot and waits for it to be sent. */
     private static void slot(ClientGameTestContext ctx, int slot) {
         ctx.getInput().pressKey(hotbar(slot));
@@ -1880,6 +1896,200 @@ public final class Scenarios {
                         ctx.waitTicks(20);
                         server.runCommand("ride @p dismount");
                         ctx.waitTicks(10);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(25);
+                    }),
+            new Scenario("attack_range",
+                    "Aiming items with an attack range: a spear (2 to 4.5, margin 0.125), a stick (2 to 6, creative 0 to 4, margin 0.5) and another (0 to 3, no margin). A still husk past the fist's reach (attacked with the stick); too near (picked as a fist would, the stick's attack refused); around the range's start; looked past within each margin, and with glass around it; hidden by blocks nearer and farther than the range's start; a block past the block reach; two husks in a row; sprinting up to one, backing off; the camera swept across it (the head's yaw is a tick late); a spear used in the main hand, and from the off hand with the main hand empty; a spectator; creative reaches; the player's own horse; turning in a boat; the world border, hit with a use (a block is placed against it) and an attack, and from outside; reset.",
+                    List.of(UNHURT, "item replace entity @a hotbar.0 with minecraft:wooden_spear"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("item replace entity @a hotbar.1 with minecraft:stick[attack_range={min_reach:2.0,max_reach:6.0,min_creative_reach:0.0,max_creative_reach:4.0,hitbox_margin:0.5}]");
+                        server.runCommand("item replace entity @a hotbar.2 with minecraft:stick[attack_range={min_reach:0.0,max_reach:3.0,hitbox_margin:0.0}]");
+                        // Past the fist's reach, within the items'.
+                        server.runCommand("summon minecraft:husk 4.5 -60 0.5 " + STILL);
+                        server.runCommand("effect give @e[type=minecraft:husk] minecraft:resistance infinite 4 true");
+                        ctx.waitTicks(5);
+                        allSlots(ctx);
+                        // Too near, then the range's start inside the husk.
+                        husk(ctx, server, 1.5, -60, 0.5);
+                        allSlots(ctx);
+                        husk(ctx, server, 2.7, -60, 0.5);
+                        allSlots(ctx);
+                        husk(ctx, server, 4.5, -60, 0.5);
+                        // Past its side, within the spear's margin, then only the stick's, then no one's.
+                        aim(ctx, server, 0.5, -60, 0.5, 4.5, -59, 0.88);
+                        allSlots(ctx);
+                        aim(ctx, server, 0.5, -60, 0.5, 4.5, -59, 1.2);
+                        allSlots(ctx);
+                        aim(ctx, server, 0.5, -60, 0.5, 4.5, -59, 1.5);
+                        allSlots(ctx);
+                        // Glass around it stops the margin, not the look.
+                        husk(ctx, server, 4.5, -60, 0.65);
+                        tp(ctx, server, 0.5, -60, 1.2, -90, 0);
+                        slot(ctx, 1);
+                        server.runCommand("setblock 4 -59 0 minecraft:glass");
+                        ctx.waitTicks(4);
+                        server.runCommand("setblock 4 -59 0 minecraft:air");
+                        ctx.waitTicks(4);
+                        // Blocks before it: nearer than the range's start, past it, behind the husk.
+                        husk(ctx, server, 4.5, -60, 0.5);
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        for (int x : new int[] {2, 3, 5}) {
+                            server.runCommand("setblock " + x + " -59 0 minecraft:glass");
+                            ctx.waitTicks(3);
+                            allSlots(ctx);
+                            server.runCommand("setblock " + x + " -59 0 minecraft:air");
+                            ctx.waitTicks(3);
+                        }
+                        husk(ctx, server, 4.5, -60, 8.5);
+                        server.runCommand("setblock 6 -59 0 minecraft:glass");
+                        ctx.waitTicks(3);
+                        allSlots(ctx);
+                        server.runCommand("setblock 6 -59 0 minecraft:air");
+                        // Two in a row, each the nearer in turn.
+                        server.runCommand("summon minecraft:husk 3.6 -60 0.5 " + STILL);
+                        server.runCommand("effect give @e[type=minecraft:husk] minecraft:resistance infinite 4 true");
+                        server.runCommand("tp @e[type=minecraft:husk,z=8,dz=1,x=4,dx=1,y=-60,dy=2] 4.6 -60 0.5");
+                        ctx.waitTicks(8);
+                        allSlots(ctx);
+                        server.runCommand("tp @e[type=minecraft:husk,x=3,dx=0,y=-60,dy=2,z=0,dz=0] 5.4 -60 0.5");
+                        ctx.waitTicks(8);
+                        allSlots(ctx);
+                        server.runCommand("kill @e[type=minecraft:husk]");
+                        ctx.waitTicks(25);
+                        // Moving towards it reaches further, moving away doesn't reach less.
+                        server.runCommand("summon minecraft:husk 12.5 -60 0.5 " + STILL);
+                        server.runCommand("effect give @e[type=minecraft:husk] minecraft:resistance infinite 4 true");
+                        slot(ctx, 0);
+                        hold(ctx, 34, W, SPRINT);
+                        ctx.waitTicks(8);
+                        hold(ctx, 16, S);
+                        ctx.waitTicks(8);
+                        // The head's yaw is a tick behind the camera's.
+                        tp(ctx, server, 8.5, -60, 0.5, -90, 0);
+                        for (int i = 0; i < 24; i++) {
+                            ctx.getInput().lookAt(-150 + i * 5, i % 3);
+                            ctx.waitTick();
+                        }
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.waitTicks(3);
+                        ctx.getInput().lookAt(-90, 0);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(3);
+                        slot(ctx, 1);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.waitTicks(15);
+                        ctx.getInput().lookAt(-90, 0);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(15);
+                        // In use: the item used counts, not the main hand's.
+                        slot(ctx, 0);
+                        hold(ctx, 12, USE);
+                        ctx.waitTicks(5);
+                        ctx.getInput().pressKey(SWAP);
+                        ctx.waitTicks(5);
+                        hold(ctx, 12, USE);
+                        ctx.waitTicks(5);
+                        ctx.getInput().pressKey(SWAP);
+                        ctx.waitTicks(5);
+                        // A spectator has no active item; creative has its own reaches.
+                        server.runCommand("gamemode spectator @a");
+                        ctx.waitTicks(6);
+                        server.runCommand("gamemode creative @a");
+                        tp(ctx, server, 8.5, -60, 0.5, -90, 0);
+                        allSlots(ctx);
+                        tp(ctx, server, 6.5, -60, 0.5, -90, 0);
+                        allSlots(ctx);
+                        tp(ctx, server, 11.5, -60, 0.5, -90, 0);
+                        allSlots(ctx);
+                        server.runCommand("gamemode survival @a");
+                        server.runCommand("kill @e[type=minecraft:husk]");
+                        ctx.waitTicks(25);
+                        // The player's own horse, which a fist passes over.
+                        server.runCommand("summon minecraft:horse 12.5 -60 6.5 {NoAI:1b,Silent:1b,Tame:1b}");
+                        server.runCommand("effect give @e[type=minecraft:horse] minecraft:resistance infinite 4 true");
+                        ctx.waitTicks(5);
+                        server.runCommand("ride @p mount @e[type=minecraft:horse,limit=1]");
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(-90, 80);
+                        ctx.waitTicks(3);
+                        allSlots(ctx);
+                        server.runCommand("ride @p dismount");
+                        ctx.waitTicks(5);
+                        server.runCommand("kill @e[type=minecraft:horse]");
+                        ctx.waitTicks(25);
+                        // A boat turns the head: on mounting, then as it turns past husks.
+                        tp(ctx, server, 12.5, -60, -3.5, 0, 0);
+                        server.runCommand("summon minecraft:oak_boat 12.5 -60 0.5 {Rotation:[-90f,0f]}");
+                        server.runCommand("summon minecraft:husk 16.5 -60 0.5 " + STILL);
+                        server.runCommand("summon minecraft:husk 15.3 -60 -2.3 " + STILL);
+                        server.runCommand("summon minecraft:husk 15.3 -60 3.3 " + STILL);
+                        ctx.waitTicks(10);
+                        slot(ctx, 0);
+                        ride(ctx, server, "minecraft:oak_boat");
+                        ctx.waitTicks(3);
+                        hold(ctx, 15, A);
+                        hold(ctx, 30, D);
+                        hold(ctx, 15, A);
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(150, 0);
+                        ctx.waitTicks(5);
+                        server.runCommand("ride @p dismount");
+                        ctx.waitTicks(5);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(25);
+                        // The world border, 4 east.
+                        server.runCommand("worldborder set 8");
+                        server.runCommand("item replace entity @a weapon.offhand with minecraft:stone 8");
+                        server.runCommand("summon minecraft:husk 4.6 -60 0.5 " + STILL);
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        ctx.waitTicks(5);
+                        hold(ctx, 8, USE);
+                        ctx.waitTicks(5);
+                        slot(ctx, 1);
+                        hold(ctx, 4, ATTACK);
+                        ctx.waitTicks(15);
+                        use(ctx);
+                        server.runCommand("fill 2 -60 -2 4 -57 2 minecraft:air");
+                        ctx.waitTicks(5);
+                        // Past the border at an angle, and within the stick's margin of the husk.
+                        ctx.getInput().lookAt(-75, 0);
+                        ctx.waitTicks(5);
+                        tp(ctx, server, 5.6, -60, -3.5, 45, 0);
+                        ctx.waitTicks(5);
+                        tp(ctx, server, 5.6, -60, -2.5, 13, 0);
+                        allSlots(ctx);
+                        server.runCommand("worldborder set 59999968");
+                        server.runCommand("kill @e[type=minecraft:husk]");
+                        ctx.waitTicks(25);
+                    }),
+            new Scenario("sulfur_cube",
+                    "The player's eyes inside a still sulfur cube, a husk before it: the cube is picked and attacked; with a block in its body slot it isn't from inside (the husk is) and is from outside; emptied, it is again.",
+                    List.of(UNHURT),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        // The husk first: something met after what's around the eyes wins over it.
+                        server.runCommand("summon minecraft:husk 2.6 -60 0.5 " + STILL);
+                        ctx.waitTicks(2);
+                        server.runCommand("summon minecraft:sulfur_cube 0.5 -58.6 0.5 {Size:1,NoAI:1b,NoGravity:1b,Silent:1b,PersistenceRequired:1b}");
+                        server.runCommand("effect give @e[type=!minecraft:player] minecraft:resistance infinite 4 true");
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        ctx.waitTicks(6);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(15);
+                        server.runCommand("item replace entity @e[type=minecraft:sulfur_cube] armor.body with minecraft:stone");
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        ctx.waitTicks(6);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(15);
+                        tp(ctx, server, -1.5, -60, 0.5, -90, 0);
+                        ctx.waitTicks(6);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(15);
+                        server.runCommand("item replace entity @e[type=minecraft:sulfur_cube] armor.body with minecraft:air");
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        ctx.waitTicks(6);
+                        ctx.getInput().pressKey(ATTACK);
+                        ctx.waitTicks(15);
                         server.runCommand("kill @e[type=!minecraft:player]");
                         ctx.waitTicks(25);
                     }),

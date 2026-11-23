@@ -8,10 +8,11 @@
 //! shape splits into (`forAllBoxes`) and the order they are tried in (it decides
 //! ties), the float direction guess of misses.
 //!
-//! Not here: the attack-range branch of `LocalPlayer.raycastHitResult` (items with an
-//! `attack_range` component, e.g. spears), the ender dragon's parts (the dragon itself is never picked; its parts aren't
-//! tracked), a sulfur cube wearing a body item (not pickable from inside; equipment
-//! isn't tracked).
+//! An item with an `attack_range` (a spear) aims first with its own reach
+//! ([`closest_hit`]), as `LocalPlayer.raycastHitResult` does ([`raycast`]).
+//!
+//! Not here: the ender dragon's parts (the dragon itself is never picked; its parts
+//! aren't tracked).
 
 use std::cell::Cell;
 
@@ -20,6 +21,7 @@ use ruthenium_prepare::exporters::ShapeData;
 
 use crate::entity::{Entities, PlayerInfos};
 use crate::fluid::FluidState;
+use crate::item::AttackRange;
 use crate::player::Env;
 use crate::shape::{Aabb, Axis, Placed, Shape};
 
@@ -36,6 +38,8 @@ pub struct BlockHit {
     pub inside: bool,
     /// Nothing was hit (`HitResult.Type.MISS`): `location` is where the ray ended.
     pub miss: bool,
+    /// The world border stopped the ray (`isWorldBorderHit`).
+    pub world_border: bool,
 }
 
 impl BlockHit {
@@ -47,6 +51,7 @@ impl BlockHit {
             pos,
             inside: false,
             miss: true,
+            world_border: false,
         }
     }
 }
@@ -406,6 +411,7 @@ fn clip_shape(shape: &Placed<'_>, from: [f64; 3], to: [f64; 3], pos: [i32; 3]) -
             pos,
             inside: true,
             miss: false,
+            world_border: false,
         });
     }
     // `AABB.clip(toAabbs(), from, to, pos)`.
@@ -437,6 +443,7 @@ fn clip_shape(shape: &Placed<'_>, from: [f64; 3], to: [f64; 3], pos: [i32; 3]) -
         pos,
         inside: false,
         miss: false,
+        world_border: false,
     })
 }
 
@@ -671,8 +678,160 @@ pub fn filter_hit_result(hit: HitResult, from: [f64; 3], range: f64) -> HitResul
     HitResult::Block(BlockHit::miss(location, direction, containing(location)))
 }
 
-/// `LocalPlayer.pick` (from `raycastHitResult`, without the attack-range branch):
-/// the block outline the camera looks at within the longer of the two ranges, and an
+/// What an item's attack range is aimed from (`AttackRange.getClosesetHit`'s attacker):
+/// unlike the rest of the pick, the eyes as they are and the head's rotation, which for
+/// the local player has the yaw of its last tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Attacker {
+    pub range: AttackRange,
+    /// `isCreative`.
+    pub creative: bool,
+    /// `getEyePosition()`, not interpolated.
+    pub eye: [f64; 3],
+    /// `getHeadLookAngle`.
+    pub head_look: [f64; 3],
+    /// `getKnownMovement`: moving along the look reaches that much further.
+    pub movement: [f64; 3],
+}
+
+/// `CollisionGetter.clipIncludingBorder` (outlines, no fluids): a ray from inside the
+/// world border that ends outside it hits the border.
+fn clip_including_border(env: &Env<'_>, from: [f64; 3], to: [f64; 3], held_item: &str) -> BlockHit {
+    let hit = clip_blocks(env, from, to, FluidMode::None, held_item, None);
+    let border = &env.level.border;
+    let end = hit.location;
+    if !border.is_within_bounds(from[0], from[2]) || border.is_within_bounds(end[0], end[2]) {
+        return hit;
+    }
+    let location = border.clamp_to_bounds(end);
+    BlockHit {
+        location,
+        direction: Direction::approximate_nearest(sub(end, from)),
+        pos: containing(location),
+        inside: false,
+        miss: false,
+        world_border: true,
+    }
+}
+
+/// `AttackRange.getClosesetHit` (`ProjectileUtil.getHitEntitiesAlong` with
+/// `CAN_BE_PICKED` and outlines): of the entities along the head's look between the
+/// range's ends, the one hit nearest to `camera.eye`; with none, the block the look
+/// hits from the eyes (a miss without one). A block nearer than the range's start hides
+/// everything.
+pub fn closest_hit(
+    env: &Env<'_>,
+    entities: &Entities,
+    players: &PlayerInfos,
+    camera: &Camera,
+    attacker: &Attacker,
+    held_item: &str,
+) -> HitResult {
+    let (eye, look, m) = (attacker.eye, attacker.head_look, attacker.movement);
+    let along = |d: f64| [0, 1, 2].map(|i| eye[i] + look[i] * d);
+    let from = along(f64::from(attacker.range.min_range(attacker.creative)));
+    let moving = m[0] * look[0] + m[1] * look[1] + m[2] * look[2];
+    let mut to = along(f64::from(attacker.range.max_range(attacker.creative)) + moving.max(0.0));
+    let block = clip_including_border(env, eye, to, held_item);
+    if !block.miss {
+        to = block.location;
+        if distance_sqr(eye, to) < distance_sqr(eye, from) {
+            return HitResult::Block(block);
+        }
+    }
+    // `AABB.ofSize` around the start.
+    let margin = f64::from(attacker.range.hitbox_margin);
+    let half = margin / 2.0;
+    let search = Aabb::new(from.map(|v| v - half), from.map(|v| v + half))
+        .expand_towards(sub(to, from))
+        .inflate([1.0; 3]);
+    let mut closest: Option<(i32, [f64; 3])> = None;
+    let mut closest_distance = f64::MAX;
+    for e in entities.in_box(&search) {
+        if e.id == camera.id || !e.is_pickable(players) {
+            continue;
+        }
+        let b = &e.bounding_box;
+        let Some(location) = hit_with_margin(env, b, from, to, margin, held_item) else {
+            continue;
+        };
+        let distance = distance_sqr(camera.eye, location);
+        if distance < closest_distance {
+            closest_distance = distance;
+            closest = Some((e.id, location));
+        }
+    }
+    match closest {
+        Some((id, location)) => HitResult::Entity { id, location },
+        None => HitResult::Block(block),
+    }
+}
+
+/// `ProjectileUtil.getManyEntityHitResult` for one entity's box (`includeFromEntity`,
+/// `projectSurfaceHitLocation`): hit at `from` when that is inside it, else where the
+/// segment enters it; else, when the segment only enters the box grown by the margin,
+/// where the line from there to the box's middle enters the box, unless a block is in
+/// the way.
+fn hit_with_margin(
+    env: &Env<'_>,
+    b: &Aabb,
+    from: [f64; 3],
+    to: [f64; 3],
+    margin: f64,
+    held_item: &str,
+) -> Option<[f64; 3]> {
+    if (0..3).all(|i| from[i] >= b.min[i] && from[i] < b.max[i]) {
+        return Some(from);
+    }
+    if let Some(exact) = clip_box(b, from, to) {
+        return Some(exact);
+    }
+    if margin <= 0.0 {
+        return None;
+    }
+    let outside = clip_box(&b.inflate([margin; 3]), from, to)?;
+    let mut towards = [0, 1, 2].map(|i| mth::lerp_f64(0.5, b.min[i], b.max[i]));
+    let block = clip_including_border(env, outside, towards, held_item);
+    if !block.miss {
+        towards = block.location;
+    }
+    clip_box(b, outside, towards)
+}
+
+/// `LocalPlayer.raycastHitResult`: what the active item's attack range hits, if it has
+/// one (a block only within the block range), else `LocalPlayer.pick`.
+#[allow(clippy::too_many_arguments)]
+pub fn raycast(
+    env: &Env<'_>,
+    entities: &Entities,
+    players: &PlayerInfos,
+    camera: &Camera,
+    attacker: Option<&Attacker>,
+    held_item: &str,
+    block_range: f64,
+    entity_range: f64,
+) -> HitResult {
+    if let Some(attacker) = attacker {
+        let mut hit = closest_hit(env, entities, players, camera, attacker, held_item);
+        if matches!(hit, HitResult::Block(_)) {
+            hit = filter_hit_result(hit, camera.eye, block_range);
+        }
+        if !hit.is_miss() {
+            return hit;
+        }
+    }
+    pick(
+        env,
+        entities,
+        players,
+        camera,
+        held_item,
+        block_range,
+        entity_range,
+    )
+}
+
+/// `LocalPlayer.pick`: the block outline the camera looks at within the longer of the two ranges, and an
 /// entity before it if there is one; the result is a miss past its own range.
 /// `held_item` is the camera entity's main-hand item (`minecraft:air` for none).
 #[allow(clippy::too_many_arguments)]
@@ -862,6 +1021,7 @@ mod tests {
                     pos: BLOCK,
                     inside: false,
                     miss: false,
+                    world_border: false,
                 },
                 "{d:?}"
             );
@@ -911,6 +1071,7 @@ mod tests {
                 pos: BLOCK,
                 inside: true,
                 miss: false,
+                world_border: false,
             }
         );
     }
@@ -1321,6 +1482,89 @@ mod tests {
 
     fn level_behind() -> Level {
         level(&[([3, -59, 0], FULL)])
+    }
+
+    /// [`closest_hit`] with a spear-like range of 2 to 6 and a margin of 0.5.
+    fn closest_in(level: &Level, entities: &Entities, camera: &Camera, eye: [f64; 3]) -> HitResult {
+        let blocks = blocks();
+        let tags = BlockTags::new();
+        let env = Env {
+            level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+            others: None,
+        };
+        let attacker = Attacker {
+            range: AttackRange {
+                min_reach: 2.0,
+                max_reach: 6.0,
+                hitbox_margin: 0.5,
+                ..AttackRange::DEFAULT
+            },
+            creative: false,
+            eye,
+            head_look: [1.0, 0.0, 0.0],
+            movement: [0.0; 3],
+        };
+        closest_hit(
+            &env,
+            entities,
+            &PlayerInfos::default(),
+            camera,
+            &attacker,
+            "minecraft:air",
+        )
+    }
+
+    #[test]
+    fn a_block_nearer_than_the_attack_range_hides_everything() {
+        let level = level(&[([1, -59, 0], FULL)]);
+        let mut e = entities();
+        // Between the block and the range's start, 2 out from the eyes at x 0.5.
+        add(&mut e, 5, ZOMBIE, [2.5, -60.0, 0.5]);
+        let eye = camera().eye;
+        let HitResult::Block(hit) = closest_in(&level, &e, &camera(), eye) else {
+            panic!("the block is nearer");
+        };
+        assert_eq!((hit.pos, hit.miss), ([1, -59, 0], false));
+    }
+
+    #[test]
+    fn attack_ranges_pass_over_what_cant_be_picked() {
+        let level = level(&[]);
+        let mut e = entities();
+        add(&mut e, 5, ITEM, [3.5, -58.5, 0.5]);
+        let eye = camera().eye;
+        assert!(closest_in(&level, &e, &camera(), eye).is_miss());
+        add(&mut e, 6, ZOMBIE, [5.0, -60.0, 0.5]);
+        assert_entity(
+            closest_in(&level, &e, &camera(), eye),
+            6,
+            [4.7, eye[1], 0.5],
+        );
+    }
+
+    #[test]
+    fn the_nearest_to_the_eyes_is_attacked() {
+        let level = level(&[]);
+        let mut e = entities();
+        let eye = camera().eye;
+        // One straight ahead, and one a little nearer to the eyes off to the side, met
+        // by the margin (but farther from the range's start).
+        add(&mut e, 5, ZOMBIE, [3.45, -60.0, 0.5]);
+        add(&mut e, 6, ZOMBIE, [3.35, -60.0, 1.25]);
+        assert!(matches!(
+            closest_in(&level, &e, &camera(), eye),
+            HitResult::Entity { id: 6, .. }
+        ));
+        // It's the interpolated eyes the distance is from.
+        let far = Camera {
+            eye: [6.0, eye[1], 0.5],
+            ..camera()
+        };
+        add(&mut e, 7, ZOMBIE, [5.5, -60.0, 0.5]);
+        assert_entity(closest_in(&level, &e, &far, eye), 7, [5.2, eye[1], 0.5]);
     }
 
     #[test]

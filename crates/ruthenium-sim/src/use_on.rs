@@ -971,6 +971,7 @@ fn clip_shape(s: &Placed<'_>, from: [f64; 3], to: [f64; 3], pos: Pos) -> Option<
             pos,
             inside: true,
             miss: false,
+            world_border: false,
         });
     }
     let mut best: Option<(f64, BlockHit)> = None;
@@ -1005,6 +1006,7 @@ fn clip_shape(s: &Placed<'_>, from: [f64; 3], to: [f64; 3], pos: Pos) -> Option<
                     pos,
                     inside: false,
                     miss: false,
+                    world_border: false,
                 },
             ));
         }
@@ -1045,6 +1047,7 @@ mod tests {
             pos,
             inside: false,
             miss: false,
+            world_border: false,
         }
     }
 

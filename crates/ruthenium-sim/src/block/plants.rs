@@ -1340,6 +1340,7 @@ mod tests {
             pos,
             inside: false,
             miss: false,
+            world_border: false,
         };
         let cases = [
             ("minecraft:sweet_berry_bush[age=3]", Outcome::Success),

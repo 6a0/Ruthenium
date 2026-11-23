@@ -637,6 +637,9 @@ pub struct LocalPlayer {
     pub delta: [f64; 3],
     pub y_rot: f32,
     pub x_rot: f32,
+    /// `yHeadRot`: the yaw as the last tick left it, turned with a boat; an item's
+    /// attack range is aimed along it.
+    pub head_y_rot: f32,
     pub on_ground: bool,
     pub horizontal_collision: bool,
     pub minor_horizontal_collision: bool,
@@ -843,6 +846,7 @@ impl LocalPlayer {
             delta: [0.0; 3],
             y_rot: -180.0,
             x_rot: 0.0,
+            head_y_rot: -180.0,
             on_ground: false,
             horizontal_collision: false,
             minor_horizontal_collision: false,
@@ -1276,6 +1280,18 @@ impl LocalPlayer {
         self.using_hand.unwrap_or(Hand::Main)
     }
 
+    /// `getActiveItem`: the item in use, else the main hand's; a spectator has none.
+    pub fn active_item(&self) -> &Stack {
+        static NONE: std::sync::LazyLock<Stack> = std::sync::LazyLock::new(Stack::empty);
+        if self.spectator {
+            &NONE
+        } else if self.started_using {
+            &self.use_item
+        } else {
+            self.hand(Hand::Main)
+        }
+    }
+
     /// `getUseItem`.
     pub fn use_item(&self) -> &Stack {
         &self.use_item
@@ -1310,7 +1326,8 @@ impl LocalPlayer {
         self.saturation = if s < 0.0 { 0.0 } else { s.min(max) };
     }
 
-    /// `isSlowDueToUsingItem` (riding isn't ported).
+    /// `isSlowDueToUsingItem`, riding or not: only forgetting a double tap
+    /// (`aiStep`) leaves out a passenger.
     fn slow_due_to_using_item(&self) -> bool {
         self.started_using && !self.use_item.c.use_effects().can_sprint
     }
@@ -1945,7 +1962,7 @@ impl LocalPlayer {
         }
     }
 
-    /// `LocalPlayer.aiStep` (not riding, no auto-jump, no elytra).
+    /// `LocalPlayer.aiStep` (no auto-jump).
     fn ai_step(&mut self, env: &Env<'_>, keys: Keys) {
         if self.sprint_trigger_time > 0 {
             self.sprint_trigger_time -= 1;
@@ -2121,6 +2138,7 @@ impl LocalPlayer {
             self.fall_distance = 0.0;
         }
         self.living_ai_step(env);
+        self.head_y_rot = self.y_rot;
         // Landing ends creative flight.
         if self.on_ground && self.abilities.flying && self.game_type != play::SPECTATOR {
             self.abilities.flying = false;

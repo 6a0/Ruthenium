@@ -1262,6 +1262,7 @@ mod tests {
             pos: [1, -60, 0],
             inside: false,
             miss: false,
+            world_border: false,
         };
         let u = Use {
             hand: Hand::Main,
@@ -1339,6 +1340,7 @@ mod tests {
                 pos: [0, 0, 0],
                 inside: false,
                 miss: false,
+                world_border: false,
             };
             hit_slot(
                 &Use {

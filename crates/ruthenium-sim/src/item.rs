@@ -277,15 +277,28 @@ impl AttackRange {
             eye[2] - location[2],
         ];
         let distance = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let (min, max) = if creative {
-            (self.min_creative_reach, self.max_creative_reach)
-        } else {
-            (self.min_reach, self.max_reach)
-        };
         // Float sums, widened (the extra buffer is 0 here).
-        let min_reach = f64::from(min - self.hitbox_margin);
-        let max_reach = f64::from(max + self.hitbox_margin);
+        let min_reach = f64::from(self.min_range(creative) - self.hitbox_margin);
+        let max_reach = f64::from(self.max_range(creative) + self.hitbox_margin);
         distance >= min_reach && distance <= max_reach
+    }
+
+    /// `effectiveMinRange` for a player.
+    pub fn min_range(&self, creative: bool) -> f32 {
+        if creative {
+            self.min_creative_reach
+        } else {
+            self.min_reach
+        }
+    }
+
+    /// `effectiveMaxRange` for a player.
+    pub fn max_range(&self, creative: bool) -> f32 {
+        if creative {
+            self.max_creative_reach
+        } else {
+            self.max_reach
+        }
     }
 }
 

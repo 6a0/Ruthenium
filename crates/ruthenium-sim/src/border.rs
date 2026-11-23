@@ -295,6 +295,16 @@ impl WorldBorder {
         self.is_within_bounds(f64::from(pos[0]), f64::from(pos[2]))
     }
 
+    /// `clampVec3ToBound`: the nearest point inside (a hair inside the far edges).
+    pub fn clamp_to_bounds(&self, p: [f64; 3]) -> [f64; 3] {
+        const EDGE: f64 = 9.999999747378752E-6;
+        [
+            clamp(p[0], self.min_x(), self.max_x() - EDGE),
+            p[1],
+            clamp(p[2], self.min_z(), self.max_z() - EDGE),
+        ]
+    }
+
     /// `isWithinBounds(AABB)`: both corners (the far one a hair inside).
     pub fn box_within_bounds(&self, b: &Aabb) -> bool {
         self.is_within_bounds(b.min[0], b.min[2])

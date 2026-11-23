@@ -751,7 +751,7 @@ impl GameMode {
             i32::from(b.direction.id()),
             cursor,
             b.inside,
-            false,
+            b.world_border,
             sequence,
         ));
         result

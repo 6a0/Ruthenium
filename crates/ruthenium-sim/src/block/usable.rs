@@ -1011,6 +1011,7 @@ mod tests {
             pos,
             inside: false,
             miss: false,
+            world_border: false,
         };
         let mut p = f.player.clone();
         let state = Fixture::state(&f.get(pos));
@@ -1275,6 +1276,7 @@ mod tests {
                 pos: [0, -61, 0],
                 inside: false,
                 miss: false,
+                world_border: false,
             };
             let ctx = PlaceContext::new(&w, crate::place::UseOnContext::new(&p, Hand::Main, hit));
             jigsaw_placement(&ctx, jigsaw)
@@ -1301,6 +1303,7 @@ mod tests {
             pos: [2, -60, 0],
             inside: false,
             miss: false,
+            world_border: false,
         };
         let s = Fixture::state("minecraft:structure_block");
         let r = crate::block::use_without_item(&mut f.world(), &mut p, s, [2, -60, 0], &hit);

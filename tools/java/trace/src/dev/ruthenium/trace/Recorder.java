@@ -259,6 +259,7 @@ public final class Recorder {
             o.add("vel", vec(p.getDeltaMovement()));
             o.addProperty("yRot", p.getYRot());
             o.addProperty("xRot", p.getXRot());
+            o.addProperty("yHeadRot", p.getYHeadRot());
             o.addProperty("onGround", p.onGround());
             o.addProperty("hColl", p.horizontalCollision);
             o.addProperty("minorHColl", p.minorHorizontalCollision);
