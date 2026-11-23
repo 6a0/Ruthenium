@@ -72,7 +72,7 @@ public final class Recorder {
             "minecraft:move_entity_pos_rot", "minecraft:move_entity_rot", "minecraft:rotate_head",
             "minecraft:swing_animation", "minecraft:set_equipment", "minecraft:sound",
             "minecraft:set_passengers", "minecraft:set_player_team", "minecraft:player_info_update",
-            "minecraft:cooldown", "minecraft:player_combat_kill", "minecraft:respawn");
+            "minecraft:cooldown", "minecraft:player_combat_kill", "minecraft:respawn", "minecraft:move_vehicle");
 
     private static final Gson GSON = new GsonBuilder().serializeSpecialFloatingPointValues().disableHtmlEscaping().create();
     private static final Object LOCK = new Object();
@@ -273,6 +273,24 @@ public final class Recorder {
             o.addProperty("fallFlying", p.isFallFlying());
             o.addProperty("autoSpin", p.isAutoSpinAttack());
             o.addProperty("spinTicks", ((LivingEntityAccessor) p).ruthenium$autoSpinAttackTicks());
+            // Riding: the vehicle, and the root vehicle's state (what the client moves
+            // itself when the player controls it); the horse jump's charge.
+            net.minecraft.world.entity.Entity vehicle = p.getVehicle();
+            if (vehicle != null) {
+                net.minecraft.world.entity.Entity root = p.getRootVehicle();
+                o.addProperty("vehicle", vehicle.getId());
+                o.addProperty("vRoot", root.getId());
+                o.add("vPos", vec(root.position()));
+                o.add("vVel", vec(root.getDeltaMovement()));
+                o.addProperty("vYRot", root.getYRot());
+                o.addProperty("vXRot", root.getXRot());
+                o.addProperty("vOnGround", root.onGround());
+                o.addProperty("vHColl", root.horizontalCollision);
+                o.addProperty("vVColl", root.verticalCollision);
+                o.addProperty("vControlled", root.isLocalInstanceAuthoritative());
+            }
+            o.addProperty("jumpScale", p.getJumpRidingScale());
+            o.addProperty("handsBusy", p.isHandsBusy());
             Input in = p.input.keyPresses;
             JsonArray input = new JsonArray();
             for (var e : List.of(

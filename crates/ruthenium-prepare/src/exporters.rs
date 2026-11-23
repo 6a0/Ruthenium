@@ -89,7 +89,7 @@ pub fn run(java: &Java, imported: &Imported, bundle: &Path) -> Result<(PathBuf, 
     Ok((out, ran))
 }
 
-/// What the exporter knows of an entity type (`entity_dimensions` v2).
+/// What the exporter knows of an entity type (`entity_dimensions` v3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityTypeData {
     /// Network (registry) id.
@@ -113,6 +113,13 @@ pub struct EntityTypeData {
     pub fields: Vec<(String, u8, u8)>,
     /// The nearest static `BABY_DIMENSIONS` of those classes: width, height, fixed.
     pub baby: Option<(f32, f32, bool)>,
+    /// The default size's passenger attachment points (where the n-th passenger sits),
+    /// unrotated.
+    pub passenger_points: Vec<[f64; 3]>,
+    /// Its vehicle attachment points (where it sits on what it rides).
+    pub vehicle_points: Vec<[f64; 3]>,
+    /// A living type's default attributes (`DefaultAttributes`): key and base value.
+    pub attributes: Vec<(String, f64)>,
 }
 
 impl EntityTypeData {
@@ -213,7 +220,7 @@ impl<'a> Reader<'a> {
 
 /// Parses `entity_dimensions.bin`.
 pub fn read_entity_types(bytes: &[u8]) -> Result<Vec<EntityTypeData>, String> {
-    let mut r = Reader::open(bytes, "entity_dimensions", 2)?;
+    let mut r = Reader::open(bytes, "entity_dimensions", 3)?;
     let count = r.u32()?;
     let mut out = Vec::with_capacity(count.min(4096) as usize);
     for _ in 0..count {
@@ -236,6 +243,21 @@ pub fn read_entity_types(bytes: &[u8]) -> Result<Vec<EntityTypeData>, String> {
             0 => None,
             _ => Some((r.f32()?, r.f32()?, r.u8()? != 0)),
         };
+        let mut points = || -> Result<Vec<[f64; 3]>, String> {
+            let n = r.u8()?;
+            (0..n).map(|_| Ok([r.f64()?, r.f64()?, r.f64()?])).collect()
+        };
+        let passenger_points = points()?;
+        let vehicle_points = points()?;
+        let attributes = match r.u8()? {
+            0 => Vec::new(),
+            _ => {
+                let n = r.u32()?;
+                (0..n)
+                    .map(|_| Ok((r.string()?, r.f64()?)))
+                    .collect::<Result<_, String>>()?
+            }
+        };
         out.push(EntityTypeData {
             id,
             key,
@@ -247,6 +269,9 @@ pub fn read_entity_types(bytes: &[u8]) -> Result<Vec<EntityTypeData>, String> {
             classes,
             fields,
             baby,
+            passenger_points,
+            vehicle_points,
+            attributes,
         });
     }
     r.finish()?;
@@ -775,7 +800,7 @@ mod tests {
     #[test]
     fn reads_entity_types() {
         let mut b = b"RTHX".to_vec();
-        b.extend(2u32.to_le_bytes());
+        b.extend(3u32.to_le_bytes());
         string(&mut b, "entity_dimensions");
         b.extend(1u32.to_le_bytes());
         b.extend(7u32.to_le_bytes());
@@ -796,6 +821,17 @@ mod tests {
             b.extend(f.to_bits().to_le_bytes());
         }
         b.push(0);
+        // One passenger point, no vehicle point.
+        b.push(1);
+        for v in [0.0f64, 1.5, -0.25] {
+            b.extend(v.to_bits().to_le_bytes());
+        }
+        b.push(0);
+        // Default attributes: one.
+        b.push(1);
+        b.extend(1u32.to_le_bytes());
+        string(&mut b, "minecraft:step_height");
+        b.extend(1.0f64.to_bits().to_le_bytes());
         let types = read_entity_types(&b).unwrap();
         assert_eq!(
             types,
@@ -810,6 +846,9 @@ mod tests {
                 classes: vec!["Thing".into(), "Entity".into()],
                 fields: vec![("Entity.DATA_POSE".into(), 6, 20)],
                 baby: Some((0.25, 0.5, false)),
+                passenger_points: vec![[0.0, 1.5, -0.25]],
+                vehicle_points: Vec::new(),
+                attributes: vec![("minecraft:step_height".into(), 1.0)],
             }]
         );
         assert!(types[0].is("Entity") && !types[0].is("LivingEntity"));

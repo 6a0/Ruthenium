@@ -283,6 +283,26 @@ impl FluidInteraction {
         eye: (i32, f64, i32),
         ignore_current: bool,
     ) -> bool {
+        self.update_box(
+            env,
+            Some(entity.inflate([-0.001; 3])),
+            entity.min[1],
+            eye,
+            ignore_current,
+        )
+    }
+
+    /// `update` with the box `getFluidInteractionBox` gives (the entity's, shrunk by
+    /// 0.001 and cut by the vehicle it rides; none when the vehicle covers it) and the
+    /// bottom of the entity's own box.
+    pub fn update_box(
+        &mut self,
+        env: &Env<'_>,
+        fluid_box: Option<Aabb>,
+        entity_y: f64,
+        eye: (i32, f64, i32),
+        ignore_current: bool,
+    ) -> bool {
         self.trackers.retain_mut(|t| {
             if t.height == 0.0 && !t.eyes_inside {
                 return false;
@@ -293,7 +313,9 @@ impl FluidInteraction {
         });
         self.water = Current::default();
         self.lava = Current::default();
-        let b = entity.inflate([-0.001; 3]);
+        let Some(b) = fluid_box else {
+            return false;
+        };
         let (x0, y0, z0) = (
             mth::floor(b.min[0]),
             mth::floor(b.min[1]),
@@ -313,7 +335,6 @@ impl FluidInteraction {
                 }
             }
         }
-        let entity_y = entity.min[1];
         let (eye_x, eye_y, eye_z) = eye;
         let mut last: Option<Fluid> = None;
         let mut tracker = 0usize;

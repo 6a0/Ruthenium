@@ -16,11 +16,14 @@
 //! (`TransientEntitySectionManager`); a chunk that loads starts its entities section by
 //! section in vanilla's order.
 //!
-//! Not yet: passengers are ticked after their vehicle but not moved with it
-//! (`positionRider`), so they don't push; sizes that depend on more than the pose,
-//! youth, a slime's size and the scale attribute (a sitting camel, a peeking shulker, a
-//! puffed pufferfish, a phantom's size) are the type's default; the local player riding
-//! anything.
+//! Riding: the local player ticks after its vehicle (`tickPassenger`) and sits where
+//! it seats it (`positionRider`); a vehicle it controls moves on the client
+//! ([`crate::vehicle`]) and sends where it is with the player's changes.
+//!
+//! Not yet: other passengers are ticked after their vehicle but not moved with it, so
+//! they don't push; sizes that depend on more than the pose, youth, a slime's size and
+//! the scale attribute (a sitting camel, a peeking shulker, a puffed pufferfish, a
+//! phantom's size) are the type's default.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -28,8 +31,11 @@ use ruthenium_javamath::mth;
 use ruthenium_prepare::exporters::EntityTypeData;
 use ruthenium_protocol::packets::play::{self, DataValue, PositionPath, VecDelta};
 
-use crate::player::{Attribute, Env, LocalPlayer, Modifier};
+use crate::player::{
+    Attribute, DEG_TO_RAD_F, Env, LocalPlayer, Modifier, Riding, VehicleMove, rotate_y,
+};
 use crate::shape::Aabb;
+use crate::vehicle::{Body, Controller, RideKind};
 
 /// `Pose` ordinals.
 pub mod pose {
@@ -200,8 +206,8 @@ impl Pickable {
 #[derive(Debug, Clone)]
 pub struct TypeInfo {
     pub key: String,
-    size: Size,
-    living: bool,
+    pub(crate) size: Size,
+    pub(crate) living: bool,
     /// Players and mannequins (`Avatar`): sized by pose.
     avatar: bool,
     player: bool,
@@ -239,7 +245,34 @@ pub struct TypeInfo {
     attached_to_field: Option<u8>,
     /// `blocksBuilding`: whether it stops blocks being placed where it is.
     pub blocks_building: BlocksBuilding,
+    /// The default size's eye height.
+    pub(crate) eye_height: f32,
+    /// Where its passengers sit (the n-th at the n-th point, the last for more),
+    /// unrotated.
+    pub(crate) passenger_points: Vec<[f64; 3]>,
+    /// The kind of vehicle the client moves.
+    pub(crate) ride: RideKind,
+    /// `AbstractHorse.DATA_ID_FLAGS` and `HappyGhast.STAYS_STILL`.
+    horse_flags_field: Option<u8>,
+    stays_still_field: Option<u8>,
+    /// `#can_float_while_ridden` (vanilla's list).
+    pub(crate) float_while_ridden: bool,
+    /// The type's default attributes, which the client uses until the server sends
+    /// them (it sends only those its own copy has used).
+    default_attributes: Vec<(String, f64)>,
+    /// `Mob.DATA_MOB_FLAGS_ID`.
+    mob_flags_field: Option<u8>,
 }
+
+/// `#minecraft:can_float_while_ridden` as vanilla's data pack has it.
+const FLOAT_WHILE_RIDDEN: [&str; 6] = [
+    "minecraft:horse",
+    "minecraft:zombie_horse",
+    "minecraft:mule",
+    "minecraft:donkey",
+    "minecraft:camel",
+    "minecraft:camel_husk",
+];
 
 /// `Entity.blocksBuilding` by type: living entities (players included), end crystals,
 /// falling blocks, primed TNT, minecarts and boats do; armor stands unless they are
@@ -387,6 +420,36 @@ impl EntityTypes {
                 } else {
                     BlocksBuilding::No
                 },
+                eye_height: d.eye_height,
+                passenger_points: if d.passenger_points.is_empty() {
+                    vec![[0.0, f64::from(d.height), 0.0]]
+                } else {
+                    d.passenger_points.clone()
+                },
+                ride: if d.is("AbstractBoat") {
+                    let raft = d.is("Raft") || d.is("ChestRaft");
+                    let chest = d.is("AbstractChestBoat");
+                    RideKind::Boat {
+                        ride_height: if raft {
+                            d.height * 0.8888889
+                        } else {
+                            d.height / 3.0
+                        },
+                        x_offset: if chest { 0.15 } else { 0.0 },
+                        max_passengers: if chest { 1 } else { 2 },
+                    }
+                } else if d.is("AbstractHorse") && !d.is("Camel") && !d.is("Llama") {
+                    RideKind::Horse { rearing: true }
+                } else if d.is("HappyGhast") {
+                    RideKind::HappyGhast
+                } else {
+                    RideKind::None
+                },
+                horse_flags_field: d.field("AbstractHorse.DATA_ID_FLAGS"),
+                stays_still_field: d.field("HappyGhast.STAYS_STILL"),
+                float_while_ridden: FLOAT_WHILE_RIDDEN.contains(&d.key.as_str()),
+                default_attributes: d.attributes.clone(),
+                mob_flags_field: d.field("Mob.DATA_MOB_FLAGS_ID"),
             };
             let i = d.id as usize;
             if types.len() <= i {
@@ -649,7 +712,18 @@ pub struct Entity {
     /// The name scoreboard teams know it by: a player's name, else its UUID.
     scoreboard_name: String,
     section: i64,
-    info: TypeInfo,
+    pub(crate) info: TypeInfo,
+    /// The physics of a vehicle the client can move.
+    pub(crate) body: Option<Box<Body>>,
+    /// `isSaddled` and `isWearingBodyArmor`: what its saddle and body slots hold.
+    pub saddled: bool,
+    pub body_armor: bool,
+    /// `AbstractHorse`'s flags (tame, eating, standing...).
+    pub(crate) horse_flags: u8,
+    /// `HappyGhast.staysStill`.
+    pub(crate) stays_still: bool,
+    /// `Mob.isNoAi`: its own AI is off (it doesn't rear on the client).
+    pub(crate) no_ai: bool,
 }
 
 const ATTRIBUTE_SCALE: &str = "minecraft:scale";
@@ -729,7 +803,20 @@ impl Entity {
             scoreboard_name: name.map_or_else(|| uuid_string(p.uuid), str::to_owned),
             section: 0,
             info: info.clone(),
+            body: (info.ride != RideKind::None).then(|| Box::new(Body::new(info.ride))),
+            saddled: false,
+            body_armor: false,
+            horse_flags: 0,
+            stays_still: false,
+            no_ai: false,
         };
+        if let Some(b) = e.body.as_deref_mut() {
+            for (name, base) in &info.default_attributes {
+                if let Some(a) = b.attributes.get_mut(name) {
+                    a.base = *base;
+                }
+            }
+        }
         e.size = e.dimensions();
         // `recreateFromPacket`.
         let (x, y, z) = (p.position[0], p.position[1], p.position[2]);
@@ -814,12 +901,12 @@ impl Entity {
     }
 
     /// `setPos`: the position and the box.
-    fn set_pos(&mut self, p: [f64; 3]) {
+    pub(crate) fn set_pos(&mut self, p: [f64; 3]) {
         self.position = p;
         self.bounding_box = self.size.bounding_box(p);
     }
 
-    fn set_y_rot(&mut self, y: f32) {
+    pub(crate) fn set_y_rot(&mut self, y: f32) {
         if y.is_finite() {
             self.y_rot = y;
         }
@@ -832,7 +919,7 @@ impl Entity {
     }
 
     /// `setRot`.
-    fn set_rot(&mut self, y: f32, x: f32) {
+    pub(crate) fn set_rot(&mut self, y: f32, x: f32) {
         self.set_y_rot(y % 360.0);
         self.set_x_rot(x % 360.0);
     }
@@ -1069,6 +1156,18 @@ impl Entity {
             && let DataValue::OptionalUnsignedInt(id) = value
         {
             self.attached_to = *id;
+        } else if Some(field) == t.horse_flags_field
+            && let DataValue::Byte(b) = value
+        {
+            self.horse_flags = *b as u8;
+        } else if Some(field) == t.stays_still_field
+            && let DataValue::Boolean(b) = value
+        {
+            self.stays_still = *b;
+        } else if Some(field) == t.mob_flags_field
+            && let DataValue::Byte(b) = value
+        {
+            self.no_ai = b & 1 != 0;
         }
     }
 }
@@ -1526,11 +1625,18 @@ impl Entities {
         Some(id) == self.local_id || self.entities.contains_key(&id)
     }
 
-    /// `handleSetEntityPassengersPacket`: the vehicle's passengers replaced.
-    pub fn set_passengers(&mut self, vehicle: i32, passengers: &[i32]) {
+    /// `handleSetEntityPassengersPacket`: the vehicle's passengers replaced. When this
+    /// mounts the local player, the turn it takes: a boat's heading (when it wasn't on
+    /// it already), or a horse's view (`AbstractHorse.addPassenger`, each time).
+    pub fn set_passengers(
+        &mut self,
+        vehicle: i32,
+        passengers: &[i32],
+    ) -> Option<(f32, Option<f32>)> {
         if !self.exists(vehicle) {
-            return;
+            return None;
         }
+        let was_mounted = self.carries_local(vehicle);
         // `ejectPassengers`.
         let old = self
             .passengers_of(vehicle)
@@ -1562,6 +1668,15 @@ impl Entities {
                 ps.push(p);
             }
         }
+        if self.local_id.is_none() || self.local_vehicle != Some(vehicle) {
+            return None;
+        }
+        let v = self.entities.get(&vehicle)?;
+        match v.info.ride {
+            RideKind::Horse { .. } => Some((v.y_rot, Some(v.x_rot))),
+            RideKind::Boat { .. } if !was_mounted => Some((v.y_rot, None)),
+            _ => None,
+        }
     }
 
     /// `getRootVehicle`: the bottom of the stack `id` rides in (itself when it
@@ -1586,10 +1701,20 @@ impl Entities {
         rotation: Option<(i8, i8)>,
         on_ground: bool,
     ) {
-        let Some(e) = self.entities.get_mut(&id) else {
+        if !self.entities.contains_key(&id) {
             return;
-        };
+        }
         let rot = rotation.map(|(y, x)| (mth::unpack_degrees(y), mth::unpack_degrees(x)));
+        if self.controlled_by_local(id) {
+            // The client moves it: only the codec's base follows.
+            let e = self.entities.get_mut(&id).expect("entity");
+            if let Some(d) = delta {
+                let path = decode_delta(&mut e.codec_base, d);
+                e.codec_base = path.end();
+            }
+            return;
+        }
+        let e = self.entities.get_mut(&id).expect("entity");
         if let Some(d) = delta {
             let path = decode_delta(&mut e.codec_base, d);
             e.codec_base = path.end();
@@ -1612,26 +1737,124 @@ impl Entities {
         y_rot: f32,
         x_rot: f32,
         on_ground: bool,
+        player: &mut LocalPlayer,
     ) {
         let ticking = self.ticking.contains(&id);
+        let controlled = self.controlled_by_local(id);
         let Some(e) = self.entities.get_mut(&id) else {
             return;
         };
         let end = path.end();
         e.codec_base = end;
+        if controlled {
+            return;
+        }
         let too_far = length_sqr(sub(e.position, end)) > 4096.0;
         if ticking && !too_far {
             e.move_or_interpolate_to(Some(path), y_rot, x_rot, true);
         } else {
             e.snap_to(end, y_rot, x_rot);
         }
-        e.on_ground = on_ground;
+        let interpolating = e.is_interpolating();
+        // Its rider put where it now is.
+        if !interpolating && self.carries_local(id) {
+            self.position_riders_of(id, player);
+            player.old_position = player.position;
+            player.old_rot = (player.y_rot, player.x_rot);
+        }
+        if let Some(e) = self.entities.get_mut(&id) {
+            e.on_ground = on_ground;
+        }
         self.moved(id);
+    }
+
+    /// `positionRider` of the local player by `id` when it rides it, directly or on
+    /// something that does.
+    fn position_riders_of(&self, id: i32, player: &mut LocalPlayer) {
+        if let Some(v) = self.local_vehicle
+            && (v == id || self.carries_local(id))
+        {
+            self.position_local_rider(v, player);
+        }
+    }
+
+    /// `handleMoveVehicle`: where the server has the vehicle the player controls. A
+    /// difference beyond 1e-5 snaps it there; either way the client answers with
+    /// where it now has it.
+    pub fn move_vehicle(&mut self, position: [f64; 3], y_rot: f32, x_rot: f32) -> Option<Vec<u8>> {
+        let local = self.local_id?;
+        let root = self.root_vehicle(local);
+        if root == local || !self.controlled_by_local(root) {
+            return None;
+        }
+        let e = self.entities.get_mut(&root)?;
+        let current = e.client_pos_rot().position;
+        if length_sqr(sub(position, current)).sqrt() > 9.999999747378752E-6 {
+            e.cancel();
+            // absSnapTo.
+            let p = [
+                position[0].clamp(-3.0E7, 3.0E7),
+                position[1],
+                position[2].clamp(-3.0E7, 3.0E7),
+            ];
+            e.set_pos(p);
+            e.set_y_rot(y_rot % 360.0);
+            e.set_x_rot(x_rot.clamp(-90.0, 90.0) % 360.0);
+            e.old_position = p;
+        }
+        let at = e.client_pos_rot();
+        let packet = play::move_vehicle(at.position, at.y_rot, at.x_rot, e.on_ground);
+        self.moved(root);
+        Some(packet)
+    }
+
+    /// `handleEntityEvent` for another entity: a boat's bubble column events.
+    pub fn entity_event(&mut self, id: i32, event: u8) {
+        let controlled = self.controlled_by_local(id);
+        if let Some(e) = self.entities.get_mut(&id)
+            && e.info.boat
+            && e.body.is_some()
+        {
+            e.boat_event(event, controlled);
+        }
+    }
+
+    /// `handleSetEquipment`: what the saddle and body slots hold (`isSaddled`,
+    /// `isWearingBodyArmor`: a saddle, a harness).
+    pub fn set_equipment(&mut self, id: i32, slots: &[(u8, ruthenium_protocol::item::ItemStack)]) {
+        let Some(e) = self.entities.get_mut(&id) else {
+            return;
+        };
+        for (slot, stack) in slots {
+            let name = (stack.count > 0)
+                .then(|| u32::try_from(stack.item).ok())
+                .flatten()
+                .and_then(ruthenium_data::v26_3::registries::Item::from_id)
+                .map(|i| i.name());
+            match *slot {
+                play::EQUIPMENT_SADDLE => e.saddled = name == Some("minecraft:saddle"),
+                play::EQUIPMENT_BODY => {
+                    e.body_armor = name.is_some_and(|n| n.ends_with("_harness"))
+                        || name.is_some() && !matches!(e.info.ride, RideKind::HappyGhast)
+                }
+                _ => {}
+            }
+        }
     }
 
     /// `handleTeleportEntity` (`setValuesFromPositionPacket`, interpolating unless it
     /// is too far).
-    pub fn teleport(&mut self, id: i32, change: &play::PositionChange, on_ground: bool) {
+    pub fn teleport(
+        &mut self,
+        id: i32,
+        change: &play::PositionChange,
+        on_ground: bool,
+        player: &mut LocalPlayer,
+    ) -> Option<Vec<u8>> {
+        let ticking = self.ticking.contains(&id);
+        let controlled = self.controlled_by_local(id);
+        let relative = change.relatives & 7 != 0;
+        let interpolate = ticking || !controlled || relative;
         let play::PositionChange {
             position,
             delta,
@@ -1639,9 +1862,7 @@ impl Entities {
             x_rot,
             relatives,
         } = *change;
-        let Some(e) = self.entities.get_mut(&id) else {
-            return;
-        };
+        let e = self.entities.get_mut(&id)?;
         let current = e.client_pos_rot();
         let (pos, new_delta, y, x) = crate::player::calculate_absolute(
             current.position,
@@ -1654,7 +1875,8 @@ impl Entities {
             x_rot,
             relatives,
         );
-        if length_sqr(sub(current.position, pos)) <= 4096.0 {
+        let interpolated = interpolate && length_sqr(sub(current.position, pos)) <= 4096.0;
+        if interpolated {
             e.move_or_interpolate_to(Some(&PositionPath::Linear(pos)), y, x, true);
             e.delta = new_delta;
         } else {
@@ -1677,6 +1899,24 @@ impl Entities {
         }
         e.on_ground = on_ground;
         self.moved(id);
+        // Not interpolated: its rider follows at once, and a vehicle the player
+        // controls says where it now is.
+        if !interpolated && self.carries_local(id) {
+            self.position_riders_of(id, player);
+            player.old_position = player.position;
+            player.old_rot = (player.y_rot, player.x_rot);
+            if controlled {
+                let e = self.entities.get(&id)?;
+                let at = e.client_pos_rot();
+                return Some(play::move_vehicle(
+                    at.position,
+                    at.y_rot,
+                    at.x_rot,
+                    e.on_ground,
+                ));
+            }
+        }
+        None
     }
 
     /// `handleSetEntityMotion` for another entity (`lerpMotion`; remote players ease
@@ -1713,6 +1953,20 @@ impl Entities {
                 .ok()
                 .and_then(ruthenium_data::v26_3::registries::Attribute::from_id)
                 .map(|a| a.name());
+            if let (Some(n), Some(b)) = (name, e.body.as_deref_mut())
+                && let Some(attr) = b.attributes.get_mut(n)
+            {
+                attr.base = a.base;
+                attr.modifiers = a
+                    .modifiers
+                    .iter()
+                    .map(|(id, amount, operation)| Modifier {
+                        id: id.clone(),
+                        amount: *amount,
+                        operation: *operation,
+                    })
+                    .collect();
+            }
             if name == Some(ATTRIBUTE_SCALE) {
                 e.scale.base = a.base;
                 e.scale.modifiers = a
@@ -1748,8 +2002,11 @@ impl Entities {
         };
         for id in order {
             if Some(id) == self.local_id {
-                // Riding isn't simulated yet: the player ticks in its place as if on
-                // foot, where vanilla ticks it after its vehicle.
+                // A passenger ticks after its vehicle (`tickPassenger`).
+                if self.local_vehicle.is_some() {
+                    continue;
+                }
+                self.sync_riding(player);
                 let colliders = self.colliders(player);
                 tick_player(player, &colliders);
                 continue;
@@ -1758,12 +2015,268 @@ impl Entities {
                 continue;
             };
             // Frozen: only players (and what carries one) tick.
-            let frozen = !cx.runs_normally && !e.info.player;
+            let frozen = !cx.runs_normally && !e.info.player && !self.carries_local(id);
             if e.removed || e.vehicle.is_some() || frozen {
                 continue;
             }
-            self.tick_one(id, cx, player, speed, false);
+            self.tick_one(id, cx, player, speed, false, &mut tick_player);
         }
+    }
+
+    /// Whether the local player rides `id`, directly or not.
+    fn carries_local(&self, id: i32) -> bool {
+        let mut v = self.local_vehicle;
+        while let Some(x) = v {
+            if x == id {
+                return true;
+            }
+            v = self.vehicle_of(x);
+        }
+        false
+    }
+
+    /// The local player's vehicle (`getVehicle`).
+    pub fn local_vehicle(&self) -> Option<i32> {
+        self.local_vehicle
+    }
+
+    /// Whether the local player controls `id` (`isLocalInstanceAuthoritative`): it
+    /// is the first passenger of a vehicle a player steers: a boat, a saddled horse, a
+    /// harnessed happy ghast that isn't holding still.
+    pub fn controlled_by_local(&self, id: i32) -> bool {
+        let (Some(local), Some(e)) = (self.local_id, self.entities.get(&id)) else {
+            return false;
+        };
+        if e.passengers.first() != Some(&local) {
+            return false;
+        }
+        match e.info.ride {
+            RideKind::Boat { .. } => true,
+            RideKind::Horse { .. } => e.saddled,
+            RideKind::HappyGhast => e.body_armor && !e.stays_still,
+            RideKind::None => false,
+        }
+    }
+
+    /// Tells the player what it rides ([`LocalPlayer::riding`]); getting off frees its
+    /// hands (`LocalPlayer.removeVehicle`).
+    pub fn sync_riding(&self, player: &mut LocalPlayer) {
+        let riding = self
+            .local_vehicle
+            .and_then(|v| self.entities.get(&v))
+            .map(|e| {
+                let controls = self.controlled_by_local(e.id);
+                Riding {
+                    vehicle: e.id,
+                    controls,
+                    jumpable: controls
+                        && matches!(e.info.ride, RideKind::Horse { .. })
+                        && e.saddled,
+                    can_sprint: false,
+                    fluids_above: match (&e.info.ride, &e.body) {
+                        (RideKind::Boat { .. }, Some(b)) if !b.is_under_water() => {
+                            Some(e.bounding_box.max[1])
+                        }
+                        _ => None,
+                    },
+                }
+            });
+        if riding.is_none() && player.riding.is_some() {
+            player.hands_busy = false;
+        }
+        player.riding = riding;
+    }
+
+    /// Where the vehicle the player controls is, for `sendChanges` (none unless the
+    /// player controls the bottom of what it rides).
+    pub fn vehicle_move(&self) -> Option<VehicleMove> {
+        let local = self.local_id?;
+        let root = self.root_vehicle(local);
+        if root == local || !self.controlled_by_local(root) {
+            return None;
+        }
+        let e = self.entities.get(&root)?;
+        let at = e.client_pos_rot();
+        Some(VehicleMove {
+            position: at.position,
+            y_rot: at.y_rot,
+            x_rot: at.x_rot,
+            on_ground: e.on_ground,
+        })
+    }
+
+    /// The vehicle the player controls (the bottom of what it rides) taken out to be
+    /// pushed by pistons, with the boxes it collides with; give it back with
+    /// [`Self::put_back`].
+    pub fn take_controlled_vehicle(&mut self, player: &LocalPlayer) -> Option<(Entity, Vec<Aabb>)> {
+        let local = self.local_id?;
+        let root = self.root_vehicle(local);
+        if root == local || !self.controlled_by_local(root) {
+            return None;
+        }
+        let colliders = self.vehicle_colliders(root, player);
+        let e = self.entities.get(&root)?.clone();
+        Some((e, colliders))
+    }
+
+    /// Puts back a vehicle [`Self::take_controlled_vehicle`] gave.
+    pub fn put_back(&mut self, e: Entity) {
+        let id = e.id;
+        if let Some(slot) = self.entities.get_mut(&id) {
+            *slot = e;
+        }
+        self.moved(id);
+    }
+
+    /// `tickPassenger` for the local player: `rideTick` (at rest, its tick, then put
+    /// where the vehicle seats it), then `LocalPlayer.rideTick` (a boat takes its keys,
+    /// which busy its hands) and a horse's charged jump let go.
+    fn ride_tick_local(
+        &mut self,
+        vehicle: i32,
+        player: &mut LocalPlayer,
+        tick_player: &mut dyn FnMut(&mut LocalPlayer, &[Aabb]),
+    ) {
+        if !player.is_alive() {
+            // `isRemoved`: off the vehicle.
+            if let Some(local) = self.local_id {
+                self.stop_riding(local, Some(vehicle));
+            }
+            self.sync_riding(player);
+            return;
+        }
+        self.sync_riding(player);
+        player.delta = [0.0; 3];
+        let colliders = self.colliders(player);
+        tick_player(player, &colliders);
+        self.position_local_rider(vehicle, player);
+        player.fall_distance = 0.0;
+        player.hands_busy = false;
+        let controls = self.controlled_by_local(vehicle);
+        if let Some(e) = self.entities.get_mut(&vehicle) {
+            let keys = player.keys();
+            if controls
+                && let Some(b) = e.body.as_deref_mut()
+                && matches!(b.kind, RideKind::Boat { .. })
+            {
+                b.input = [keys.left, keys.right, keys.forward, keys.backward];
+                player.hands_busy = keys.left || keys.right || keys.forward || keys.backward;
+            }
+            if let Some(amount) = player.riding_jump.take()
+                && controls
+            {
+                e.on_player_jump(amount);
+            }
+        }
+    }
+
+    /// `positionRider`: the local player where its vehicle seats it (its passenger
+    /// point, less the player's own vehicle point); a boat turns the player with it and
+    /// keeps it facing within 105 degrees of its heading.
+    pub fn position_local_rider(&self, vehicle: i32, player: &mut LocalPlayer) {
+        let (Some(local), Some(v)) = (self.local_id, self.entities.get(&vehicle)) else {
+            return;
+        };
+        let Some(index) = v.passengers.iter().position(|&p| p == local) else {
+            return;
+        };
+        let turn = -v.y_rot * DEG_TO_RAD_F;
+        let attach = match v.info.ride {
+            RideKind::Boat {
+                ride_height,
+                x_offset,
+                ..
+            } => {
+                let offset = if v.passengers.len() > 1 {
+                    if index == 0 { 0.2 } else { -0.6 }
+                } else {
+                    x_offset
+                };
+                rotate_y([0.0, f64::from(ride_height), f64::from(offset)], turn)
+            }
+            _ => {
+                let points = &v.info.passenger_points;
+                let scale = f64::from(v.size.height / v.info.size.height);
+                let p = points[index.min(points.len() - 1)].map(|c| c * scale);
+                let mut a = rotate_y(p, turn);
+                if let Some(b) = v.body.as_deref()
+                    && matches!(b.kind, RideKind::Horse { .. })
+                {
+                    let s = f64::from(b.stand_anim_o);
+                    let stand = rotate_y([0.0, 0.15 * s, -0.7 * s], turn);
+                    a = [a[0] + stand[0], a[1] + stand[1], a[2] + stand[2]];
+                }
+                a
+            }
+        };
+        let own = rotate_y(player.vehicle_attachment(), -player.y_rot * DEG_TO_RAD_F);
+        player.position = [
+            v.position[0] + attach[0] - own[0],
+            v.position[1] + attach[1] - own[1],
+            v.position[2] + attach[2] - own[2],
+        ];
+        if let Some(b) = v.body.as_deref()
+            && matches!(b.kind, RideKind::Boat { .. })
+        {
+            let y = player.y_rot + b.delta_rotation;
+            if y.is_finite() {
+                player.y_rot = y;
+            }
+            let delta = mth::wrap_degrees(player.y_rot - v.y_rot);
+            let target = delta.clamp(-105.0, 105.0);
+            let y = player.y_rot + target - delta;
+            if y.is_finite() {
+                player.y_rot = y;
+            }
+        }
+    }
+
+    /// The boxes a vehicle collides with as it moves (`getEntityCollisions`): a boat
+    /// with what can be collided with or pushed, a living one with what can be collided
+    /// with; not what rides with it.
+    fn vehicle_colliders(&self, id: i32, player: &LocalPlayer) -> Vec<Aabb> {
+        let Some(v) = self.entities.get(&id) else {
+            return Vec::new();
+        };
+        let boat = matches!(v.info.ride, RideKind::Boat { .. });
+        let root = self.root_vehicle(id);
+        let mut out = Vec::new();
+        for e in self.entities.values() {
+            if e.id == id || e.removed || self.root_vehicle(e.id) == root {
+                continue;
+            }
+            let collided = match e.info.collider {
+                Collider::No => false,
+                Collider::Always => true,
+                Collider::Alive => e.health > 0.0,
+                Collider::HappyGhast => {
+                    !e.baby
+                        && e.health > 0.0
+                        && (e.stays_still
+                            || !e.passengers.is_empty() && v.info.ride == RideKind::HappyGhast)
+                }
+            };
+            // `isPushable`: living things alive (not spectators), boats and minecarts.
+            let pushable = boat
+                && if e.info.living {
+                    e.health > 0.0 && !e.no_physics && !e.info.key.ends_with("armor_stand")
+                } else {
+                    e.info.boat || e.info.minecart
+                };
+            if collided || pushable {
+                out.push(e.bounding_box);
+            }
+        }
+        // The local player, when it doesn't ride with it.
+        if boat
+            && let Some(local) = self.local_id
+            && self.root_vehicle(local) != root
+            && player.is_alive()
+            && !player.spectator
+        {
+            out.push(player.bounding_box());
+        }
+        out
     }
 
     /// `tickNonPassenger` / `tickPassenger`: the entity's tick, then its passengers'.
@@ -1774,6 +2287,7 @@ impl Entities {
         player: &mut LocalPlayer,
         speed: f32,
         riding: bool,
+        tick_player: &mut dyn FnMut(&mut LocalPlayer, &[Aabb]),
     ) {
         let free = |b: &Aabb| cx.env.no_collision(b);
         let Some(e) = self.entities.get_mut(&id) else {
@@ -1794,12 +2308,18 @@ impl Entities {
             .map(|e| e.passengers.clone())
             .unwrap_or_default();
         for p in passengers {
+            if Some(p) == self.local_id {
+                if self.local_vehicle == Some(id) {
+                    self.ride_tick_local(id, player, tick_player);
+                }
+                continue;
+            }
             let ok = self
                 .entities
                 .get(&p)
                 .is_some_and(|e| !e.removed && e.vehicle == Some(id));
             if ok && self.ticking.contains(&p) {
-                self.tick_one(p, cx, player, speed, true);
+                self.tick_one(p, cx, player, speed, true, tick_player);
             }
         }
     }
@@ -1821,6 +2341,32 @@ impl Entities {
                 .players
                 .get(e.uuid)
                 .is_some_and(|i| i.game_mode == play::SPECTATOR);
+        }
+        // A vehicle's own tick: the one the local player controls moves.
+        if self.entities[&id].body.is_some() {
+            let controller = self.controlled_by_local(id).then(|| {
+                let (xxa, zza, jumping) = player.controller_input();
+                Controller {
+                    xxa,
+                    zza,
+                    jumping,
+                    y_rot: player.y_rot,
+                    x_rot: player.x_rot,
+                }
+            });
+            let colliders = self.vehicle_colliders(id, player);
+            let env = Env {
+                colliders: &colliders,
+                ..*cx.env
+            };
+            let mut out = Vec::new();
+            if let Some(e) = self.entities.get_mut(&id) {
+                e.vehicle_tick(&env, controller, &mut out);
+            }
+            for p in out {
+                player.queue(p);
+            }
+            self.moved(id);
         }
         let e = &self.entities[&id];
         // `FireworkRocketEntity.tick`: a rocket attached to the local player boosts it
@@ -2033,6 +2579,9 @@ mod tests {
                 .map(|(n, i)| ((*n).to_owned(), *i, 0))
                 .collect(),
             baby: (key == "minecraft:zombie").then_some((0.49, 0.98, false)),
+            passenger_points: vec![[0.0, f64::from(size.1), 0.0]],
+            vehicle_points: vec![[0.0; 3]],
+            attributes: Vec::new(),
         }
     }
 
@@ -2060,6 +2609,20 @@ mod tests {
                 &[],
             ),
             data(2, "minecraft:bat", &bat, (0.5, 0.9), &[]),
+            data(
+                3,
+                "minecraft:horse",
+                &[
+                    "Horse",
+                    "AbstractHorse",
+                    "Animal",
+                    "Mob",
+                    "LivingEntity",
+                    "Entity",
+                ],
+                (1.3964844, 1.6),
+                &[],
+            ),
         ])
     }
 
@@ -2250,7 +2813,7 @@ mod tests {
             x_rot: 0.0,
             relatives: 0,
         };
-        e.teleport(5, &away, true);
+        e.teleport(5, &away, true, &mut LocalPlayer::new());
         assert_eq!(e.tick_order(), [PLAYER_ID, 6]);
         e.chunk_loaded(5, 0);
         assert_eq!(e.tick_order(), [PLAYER_ID, 6, 5]);
@@ -2307,5 +2870,87 @@ mod tests {
         );
         assert_eq!(path.end(), [2.0, 0.0, 0.0]);
         assert_eq!(b, [0.0; 3], "the base is the caller's to move");
+    }
+    #[test]
+    fn a_boat_seats_its_rider_and_holds_its_look_within_105_degrees() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        e.chunk_loaded(0, 0);
+        add(&mut e, 5, BOAT, [0.5, 0.0, 0.5]);
+        let mut player = player_at([3.0, 0.0, 0.5]);
+        assert_eq!(e.set_passengers(5, &[PLAYER_ID]), Some((0.0, None)));
+        e.sync_riding(&mut player);
+        assert!(e.controlled_by_local(5));
+        assert!(player.riding.is_some_and(|r| r.controls && !r.jumpable));
+        player.y_rot = 150.0;
+        tick(&mut e, &Teams::default(), &mut player);
+        let boat = e.get(5).unwrap();
+        // In the air it falls by its gravity, and the rider sits a third of its height
+        // up, less the player's own 0.6.
+        assert_eq!(boat.delta[1], -0.04);
+        assert_eq!(
+            player.position,
+            [
+                0.5,
+                boat.position[1] + f64::from(0.5625f32 / 3.0) - 0.6,
+                0.5
+            ]
+        );
+        assert_eq!(player.y_rot, 105.0);
+        // It sends where it is after the rider's rotation.
+        let sent = player.send_changes_riding(e.vehicle_move());
+        assert_eq!(
+            sent.last(),
+            Some(&play::move_vehicle(boat.position, 0.0, 0.0, false))
+        );
+    }
+
+    #[test]
+    fn paddling_pushes_the_boat_along_its_heading() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        e.chunk_loaded(0, 0);
+        add(&mut e, 5, BOAT, [0.5, 0.0, 0.5]);
+        let mut player = player_at([0.5, 0.0, 0.5]);
+        e.set_passengers(5, &[PLAYER_ID]);
+        e.entities
+            .get_mut(&5)
+            .unwrap()
+            .body
+            .as_deref_mut()
+            .unwrap()
+            .input = [false, false, true, false];
+        tick(&mut e, &Teams::default(), &mut player);
+        let boat = e.get(5).unwrap();
+        // Facing south (yaw 0): 0.04 forward, then the air's 0.9 a tick.
+        assert!(boat.delta[0].abs() < 1e-9);
+        assert!(boat.position[2] > 0.5);
+        // Both paddles go, and the packet goes before the rider's.
+        let sent = player.send_changes_riding(e.vehicle_move());
+        assert_eq!(sent[0], play::paddle_boat(true, true));
+    }
+
+    #[test]
+    fn a_horse_is_steered_only_with_a_saddle() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        add(&mut e, 7, 3, [0.5, 0.0, 0.5]);
+        let mut player = player_at([0.5, 0.0, 0.5]);
+        e.set_passengers(7, &[PLAYER_ID]);
+        e.sync_riding(&mut player);
+        assert!(!e.controlled_by_local(7));
+        assert!(e.vehicle_move().is_none());
+        assert!(player.riding.is_some_and(|r| !r.controls));
+        let saddle = ruthenium_protocol::item::ItemStack {
+            item: ruthenium_data::v26_3::registries::Item::Saddle.id() as i32,
+            count: 1,
+            patch: Default::default(),
+        };
+        e.set_equipment(7, &[(play::EQUIPMENT_SADDLE, saddle)]);
+        e.sync_riding(&mut player);
+        assert!(e.controlled_by_local(7));
+        assert!(player.riding.is_some_and(|r| r.controls && r.jumpable));
+        // Off it, the hands are free again.
+        player.hands_busy = true;
+        e.set_passengers(7, &[]);
+        e.sync_riding(&mut player);
+        assert!(player.riding.is_none() && !player.hands_busy);
     }
 }

@@ -1094,6 +1094,9 @@ mod tests {
                         .map(|(n, i)| ((*n).to_owned(), *i, 0))
                         .collect(),
                     baby: None,
+                    passenger_points: vec![[0.0, f64::from(size.1), 0.0]],
+                    vehicle_points: vec![[0.0; 3]],
+                    attributes: Vec::new(),
                 }
             };
         EntityTypes::new(&[

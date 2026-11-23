@@ -48,4 +48,5 @@ pub mod session;
 pub mod shape;
 pub mod transform;
 pub mod use_on;
+pub mod vehicle;
 pub mod world;

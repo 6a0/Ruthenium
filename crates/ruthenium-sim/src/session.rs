@@ -1025,6 +1025,7 @@ impl Game {
         // `tickBlockEntities`: moving pistons and shulker boxes' lids, which push the
         // player; then `sendChanges`, for a player still in the level.
         if !w.frozen {
+            let mut vehicle = w.entities.take_controlled_vehicle(&w.player);
             interact::World::new(
                 &mut w.level,
                 &mut w.predictions,
@@ -1033,10 +1034,19 @@ impl Game {
                 &w.entities,
                 &w.fluid_shapes,
             )
-            .tick_block_entities(&mut w.player, w.game_time);
+            .tick_block_entities_riding(
+                &mut w.player,
+                vehicle.as_mut().map(|(e, c)| (e, c.as_slice())),
+                w.game_time,
+            );
+            if let Some((e, _)) = vehicle {
+                w.entities.put_back(e);
+            }
         }
         if loaded && w.player.is_alive() {
-            for p in w.player.send_changes() {
+            w.entities.sync_riding(&mut w.player);
+            let vehicle = w.entities.vehicle_move();
+            for p in w.player.send_changes_riding(vehicle) {
                 self.connection.send(p);
             }
         }
@@ -1421,8 +1431,12 @@ impl Game {
                 change,
                 on_ground,
             } => {
-                if let Some(w) = &mut self.world {
-                    w.entities.teleport(entity_id, &change, on_ground);
+                if let Some(w) = &mut self.world
+                    && let Some(p) =
+                        w.entities
+                            .teleport(entity_id, &change, on_ground, &mut w.player)
+                {
+                    self.connection.send(p);
                 }
             }
             play::Clientbound::EntityPositionSync {
@@ -1433,8 +1447,14 @@ impl Game {
                 on_ground,
             } => {
                 if let Some(w) = &mut self.world {
-                    w.entities
-                        .position_sync(entity_id, &path, y_rot, x_rot, on_ground);
+                    w.entities.position_sync(
+                        entity_id,
+                        &path,
+                        y_rot,
+                        x_rot,
+                        on_ground,
+                        &mut w.player,
+                    );
                 }
             }
             play::Clientbound::SetEntityData {
@@ -1456,7 +1476,14 @@ impl Game {
                 passengers,
             } => {
                 if let Some(w) = &mut self.world {
-                    w.entities.set_passengers(vehicle, &passengers);
+                    if let Some((y, x)) = w.entities.set_passengers(vehicle, &passengers) {
+                        w.player.y_rot = y % 360.0;
+                        if let Some(x) = x {
+                            w.player.x_rot = x.clamp(-90.0, 90.0) % 360.0;
+                        }
+                        w.player.old_rot = (w.player.y_rot, w.player.x_rot);
+                    }
+                    w.entities.sync_riding(&mut w.player);
                 }
             }
             play::Clientbound::SetPlayerTeam {
@@ -1591,6 +1618,8 @@ impl Game {
                         24..=28 => w.player.permission_level = i32::from(event) - 24,
                         _ => {}
                     }
+                } else if let Some(w) = &mut self.world {
+                    w.entities.entity_event(entity_id, event);
                 }
             }
             play::Clientbound::PlayerAbilities {
@@ -1630,6 +1659,22 @@ impl Game {
             }
             // The connection thread answers these.
             play::Clientbound::ChunkBatchStart | play::Clientbound::ChunkBatchFinished { .. } => {}
+            play::Clientbound::MoveVehicle {
+                position,
+                y_rot,
+                x_rot,
+            } => {
+                if let Some(w) = &mut self.world
+                    && let Some(p) = w.entities.move_vehicle(position, y_rot, x_rot)
+                {
+                    self.connection.send(p);
+                }
+            }
+            play::Clientbound::SetEquipment { entity_id, slots } => {
+                if let Some(w) = &mut self.world {
+                    w.entities.set_equipment(entity_id, &slots);
+                }
+            }
             play::Clientbound::Other(kind) => {
                 self.play_packets += 1;
                 if self.play_packets <= 3 {

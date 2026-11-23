@@ -13,27 +13,39 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 
+import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.syncher.EntityDataAccessor;
 import net.minecraft.network.syncher.EntityDataSerializers;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityAttachment;
+import net.minecraft.world.entity.EntityAttachments;
 import net.minecraft.world.entity.EntityDimensions;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.EntityTypes;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.ai.attributes.Attribute;
+import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
+import net.minecraft.world.entity.ai.attributes.DefaultAttributes;
+import net.minecraft.world.phys.Vec3;
 
 /**
  * What the client needs to know of every entity type to track it: its default size,
  * how often the server sends its position, which classes it is, the ids of its
  * synched-data fields and the size of its young.
  *
- * <p>Format {@code entity_dimensions} v2, after the header: u32 count, then per type
+ * <p>Format {@code entity_dimensions} v3, after the header: u32 count, then per type
  * in registry order: u32 network id, string key, f32 width, f32 height, f32 eye
  * height, u8 fixed (1 if the size ignores scale), u32 update interval
  * ({@code Integer.MAX_VALUE} for none); u8 count and the simple names of the type's
  * class and its superclasses up to {@code Entity}, nearest first; u32 count and, for
  * each synched-data field those classes declare, string {@code Class.FIELD}, u8 id,
  * u8 serializer id; then u8 1, f32 width, f32 height, u8 fixed if one of the classes
- * declares a static {@code BABY_DIMENSIONS} (the nearest), else u8 0.
+ * declares a static {@code BABY_DIMENSIONS} (the nearest), else u8 0; then the default
+ * size's attachment points: u8 count and f64 x, y, z of each passenger point (where the
+ * n-th passenger sits), then the same for the vehicle point (where it sits on what it
+ * rides), unrotated; then, for a type with default attributes (living ones), u8 1, u32
+ * count and each attribute's string key and f64 default base value, else u8 0.
  *
  * <p>A type's class is the type argument of its {@code EntityTypes} constant; a type
  * without one gets no classes, fields or baby size.
@@ -45,7 +57,7 @@ final class EntityDimensionsExporter {
 
     static void export(Path file) throws IOException, ReflectiveOperationException {
         Map<EntityType<?>, Class<?>> classes = typeClasses();
-        ExportWriter w = new ExportWriter("entity_dimensions", 2);
+        ExportWriter w = new ExportWriter("entity_dimensions", 3);
         w.u32(BuiltInRegistries.ENTITY_TYPE.size());
         for (EntityType<?> type : BuiltInRegistries.ENTITY_TYPE) {
             EntityDimensions d = type.getDimensions();
@@ -98,8 +110,47 @@ final class EntityDimensionsExporter {
             } else {
                 w.u8(0);
             }
+            points(w, d.attachments(), EntityAttachment.PASSENGER);
+            points(w, d.attachments(), EntityAttachment.VEHICLE);
+            defaultAttributes(w, type);
         }
         w.writeTo(file);
+    }
+
+    /** The type's default attributes (the ones a client has before the server says). */
+    @SuppressWarnings("unchecked")
+    private static void defaultAttributes(ExportWriter w, EntityType<?> type) {
+        if (!DefaultAttributes.hasSupplier(type)) {
+            w.u8(0);
+            return;
+        }
+        AttributeSupplier supplier = DefaultAttributes.getSupplier((EntityType<? extends LivingEntity>) type);
+        List<Holder.Reference<Attribute>> present = new ArrayList<>();
+        BuiltInRegistries.ATTRIBUTE.listElements().forEach(h -> {
+            if (supplier.hasAttribute(h)) {
+                present.add(h);
+            }
+        });
+        w.u8(1);
+        w.u32(present.size());
+        for (Holder.Reference<Attribute> h : present) {
+            w.string(h.key().identifier().toString());
+            w.f64(supplier.getBaseValue(h));
+        }
+    }
+
+    /** An attachment's points at no rotation: u8 count, then f64 x, y, z each. */
+    private static void points(ExportWriter w, EntityAttachments a, EntityAttachment kind) {
+        List<Vec3> points = new ArrayList<>();
+        for (int i = 0; a.getNullable(kind, i, 0.0F) != null; i++) {
+            points.add(a.getNullable(kind, i, 0.0F));
+        }
+        w.u8(points.size());
+        for (Vec3 p : points) {
+            w.f64(p.x);
+            w.f64(p.y);
+            w.f64(p.z);
+        }
     }
 
     /** Each type's class, from the type argument of its constant in EntityTypes. */

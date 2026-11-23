@@ -221,7 +221,7 @@ fn keys(down: &serde_json::Value) -> Keys {
 /// The packets compared: the held slot and `player_loaded` (`gameMode.tick`), a
 /// respawn request (`Gui.tick`), the attacks and the hands' use (`handleKeybinds`), then
 /// the player's tick: abilities when flight toggles, then `sendChanges`'s.
-const SENT: [&str; 17] = [
+const SENT: [&str; 19] = [
     "minecraft:set_carried_item",
     "minecraft:player_loaded",
     "minecraft:client_command",
@@ -239,6 +239,8 @@ const SENT: [&str; 17] = [
     "minecraft:move_player_pos_rot",
     "minecraft:move_player_rot",
     "minecraft:move_player_status_only",
+    "minecraft:paddle_boat",
+    "minecraft:move_vehicle",
 ];
 
 /// Replays a scenario; the first tick that differs from vanilla, described.
@@ -260,6 +262,9 @@ fn replay(name: &str, d: &Data) -> Result<usize, String> {
         match replay_from(name, d, reminder) {
             Ok(n) => return Ok(n),
             Err((tick, e)) => {
+                if std::env::var_os("RUTHENIUM_TRACE_DEBUG").is_some() {
+                    eprintln!("[heartbeat {reminder}] {e}");
+                }
                 if first.is_none() {
                     first = Some(e.clone());
                 }
@@ -323,11 +328,15 @@ fn sent_outside(c: &mut Client, vanilla: &[u8], n: i64) -> Result<(), (i64, Stri
     Ok(())
 }
 
-/// Whether an `out` record is a respawn request sent outside a tick.
+/// Whether an `out` record is one the replay compares that was sent outside a tick: a
+/// respawn request, or a controlled vehicle's position answering the server.
 fn outside_tick_request(q: &ruthenium_trace::Record) -> bool {
     q.kind == "out"
         && q.bool("inTick") == Some(false)
-        && q.str("name") == Some("minecraft:client_command")
+        && matches!(
+            q.str("name"),
+            Some("minecraft:client_command" | "minecraft:move_vehicle")
+        )
 }
 
 /// `Inventory` slot names of `/item replace` (`hotbar.0`, `weapon.offhand`...).
@@ -436,7 +445,11 @@ fn handle(
             entity_id,
             change,
             on_ground,
-        } => c.entities.teleport(entity_id, &change, on_ground),
+        } => {
+            if let Some(sent) = c.entities.teleport(entity_id, &change, on_ground, p) {
+                c.sent_outside.push_back(sent);
+            }
+        }
         Clientbound::EntityPositionSync {
             entity_id,
             path,
@@ -445,7 +458,7 @@ fn handle(
             on_ground,
         } => c
             .entities
-            .position_sync(entity_id, &path, y_rot, x_rot, on_ground),
+            .position_sync(entity_id, &path, y_rot, x_rot, on_ground, p),
         Clientbound::SetEntityData {
             entity_id, values, ..
         } => {
@@ -499,7 +512,26 @@ fn handle(
         Clientbound::SetPassengers {
             vehicle,
             passengers,
-        } => c.entities.set_passengers(vehicle, &passengers),
+        } => {
+            // The turn a mount gives the player shows in the next tick's rotation.
+            c.entities.set_passengers(vehicle, &passengers);
+            c.entities.sync_riding(p);
+        }
+        Clientbound::MoveVehicle {
+            position,
+            y_rot,
+            x_rot,
+        } => {
+            if let Some(sent) = c.entities.move_vehicle(position, y_rot, x_rot) {
+                c.sent_outside.push_back(sent);
+            }
+        }
+        Clientbound::SetEquipment { entity_id, slots } => {
+            c.entities.set_equipment(entity_id, &slots)
+        }
+        Clientbound::EntityEvent { entity_id, event } if entity_id != p.entity_id => {
+            c.entities.entity_event(entity_id, event)
+        }
         Clientbound::SetPlayerTeam {
             name,
             method,
@@ -940,6 +972,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 p.tick(&Env { colliders, ..env }, held);
             }
         });
+        let mut vehicle = client.entities.take_controlled_vehicle(&p);
         interact::World::new(
             &mut cl.level,
             &mut cl.predictions,
@@ -948,9 +981,18 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             &client.entities,
             &fluid_shapes,
         )
-        .tick_block_entities(&mut p, game_time);
+        .tick_block_entities_riding(
+            &mut p,
+            vehicle.as_mut().map(|(e, c)| (e, c.as_slice())),
+            game_time,
+        );
+        if let Some((e, _)) = vehicle {
+            client.entities.put_back(e);
+        }
         if loaded && p.is_alive() {
-            sent.extend(p.send_changes());
+            client.entities.sync_riding(&mut p);
+            let vehicle = client.entities.vehicle_move();
+            sent.extend(p.send_changes_riding(vehicle));
         }
         // Vanilla's packets and state for this tick.
         let mut want = Vec::new();
@@ -1001,6 +1043,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             i += 1;
         }
         let s = state.ok_or((n, format!("tick {n}: no state")))?;
+        let want_packets = want.clone();
         // Every block set outside a prediction so far.
         if let Some(got) = &cl.level.set_log
             && *got != unpredicted_want
@@ -1164,6 +1207,60 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 ));
             }
         }
+        // Riding, where the trace records it: the vehicle, and the bottom vehicle's
+        // place, motion, heading and ground; the horse jump's charge.
+        if s.value.get("jumpScale").is_some() {
+            let root = client
+                .entities
+                .local_vehicle()
+                .map(|_| client.entities.root_vehicle(p.entity_id));
+            let got = serde_json::json!({
+                "vehicle": client.entities.local_vehicle(),
+                "pos": root.and_then(|r| client.entities.get(r)).map(|e| e.position.map(f64::to_bits)),
+                "vel": root.and_then(|r| client.entities.get(r)).map(|e| e.delta.map(f64::to_bits)),
+                "yRot": root.and_then(|r| client.entities.get(r)).map(|e| e.y_rot.to_bits()),
+                "onGround": root.and_then(|r| client.entities.get(r)).map(|e| e.on_ground),
+                "jumpScale": p.jump_riding_scale.to_bits(),
+            });
+            let vec_bits = |k: &str| s.vec3(k).map(|v| v.map(f64::to_bits));
+            let want = serde_json::json!({
+                "vehicle": s.value.get("vehicle").and_then(serde_json::Value::as_i64),
+                "pos": vec_bits("vPos"),
+                "vel": vec_bits("vVel"),
+                "yRot": s.f32("vYRot").map(f32::to_bits),
+                "onGround": s.bool("vOnGround"),
+                "jumpScale": s.f32("jumpScale").unwrap().to_bits(),
+            });
+            if got != want {
+                let show = |v: &serde_json::Value| {
+                    let f = |k: &str| {
+                        v[k].as_array().map(|a| {
+                            a.iter()
+                                .map(|b| f64::from_bits(b.as_u64().unwrap()))
+                                .collect::<Vec<_>>()
+                        })
+                    };
+                    format!(
+                        "vehicle {} pos {:?} vel {:?} yRot {:?} ground {} jump {:?}",
+                        v["vehicle"],
+                        f("pos"),
+                        f("vel"),
+                        v["yRot"].as_u64().map(|b| f32::from_bits(b as u32)),
+                        v["onGround"],
+                        v["jumpScale"].as_u64().map(|b| f32::from_bits(b as u32)),
+                    )
+                };
+                return Err((
+                    n,
+                    format!(
+                        "tick {n} (heartbeat count {reminder}): riding differs\n  got  {}\n  want {}\n  sent {sent:02x?}\n  want {want_sent:02x?}",
+                        show(&got),
+                        show(&want),
+                        want_sent = want_packets,
+                    ),
+                ));
+            }
+        }
         let pose = Pose::from_name(s.str("pose").unwrap()).unwrap();
         let got = (
             p.position,
@@ -1226,7 +1323,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 63] = [
+const EXACT: [&str; 73] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1290,6 +1387,16 @@ const EXACT: [&str; 63] = [
     "piston_jump",
     "sticky_slime",
     "shulker_box",
+    "boat_paddle",
+    "boat_land",
+    "boat_bubbles",
+    "boat_blocks",
+    "horse_ride",
+    "donkey_ride",
+    "happy_ghast",
+    "riding_death",
+    "horse_promoted",
+    "happy_ghast_ai",
 ];
 
 #[test]
@@ -1376,9 +1483,27 @@ fn golden_traces() {
         "piston_jump",
         "sticky_slime",
         "shulker_box",
+        "boat_paddle",
+        "boat_land",
+        "boat_bubbles",
+        "boat_blocks",
+        "horse_ride",
+        "donkey_ride",
+        "happy_ghast",
+        "riding_death",
+        "horse_promoted",
+        "happy_ghast_ai",
     ];
+    // RUTHENIUM_TRACES=a,b replays only those.
+    let only = std::env::var("RUTHENIUM_TRACES").ok();
     let mut failed = Vec::new();
     for name in all {
+        if only
+            .as_deref()
+            .is_some_and(|o| !o.split(',').any(|n| n == name))
+        {
+            continue;
+        }
         match replay(name, &d) {
             Ok(n) => eprintln!("{name}: all {n} ticks match"),
             Err(e) => {

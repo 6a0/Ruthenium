@@ -1245,6 +1245,19 @@ pub mod play {
             entity_id: i32,
             event: u8,
         },
+        /// `ClientboundMoveVehiclePacket`: where the server has the vehicle the player
+        /// controls.
+        MoveVehicle {
+            position: [f64; 3],
+            y_rot: f32,
+            x_rot: f32,
+        },
+        /// `ClientboundSetEquipmentPacket`: an entity's equipment, by
+        /// `EquipmentSlot` ordinal (`EQUIPMENT_*`).
+        SetEquipment {
+            entity_id: i32,
+            slots: Vec<(u8, ItemStack)>,
+        },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
     }
@@ -1635,6 +1648,23 @@ pub mod play {
                     entity_id: r.i32()?,
                     event: r.u8()?,
                 },
+                C::MoveVehicle => Clientbound::MoveVehicle {
+                    position: vec3(&mut r)?,
+                    y_rot: r.f32()?,
+                    x_rot: r.f32()?,
+                },
+                C::SetEquipment => {
+                    let entity_id = r.varint()?;
+                    let mut slots = Vec::new();
+                    loop {
+                        let slot = r.u8()?;
+                        slots.push((slot & 127, ItemStack::read_optional(&mut r)?));
+                        if slot & 128 == 0 {
+                            break;
+                        }
+                    }
+                    Clientbound::SetEquipment { entity_id, slots }
+                }
                 other => {
                     r.rest();
                     Clientbound::Other(other)
@@ -1810,6 +1840,47 @@ pub mod play {
     pub fn attack(entity_id: i32) -> Vec<u8> {
         wire::packet(pl::Serverbound::Attack.id(), |o| {
             wire::write_varint(o, entity_id)
+        })
+    }
+
+    /// `EquipmentSlot` ordinals.
+    pub const EQUIPMENT_MAINHAND: u8 = 0;
+    pub const EQUIPMENT_OFFHAND: u8 = 1;
+    pub const EQUIPMENT_BODY: u8 = 6;
+    pub const EQUIPMENT_SADDLE: u8 = 7;
+
+    /// `ServerboundMoveVehiclePacket`: where the client has the vehicle it controls.
+    pub fn move_vehicle(position: [f64; 3], y_rot: f32, x_rot: f32, on_ground: bool) -> Vec<u8> {
+        wire::packet(pl::Serverbound::MoveVehicle.id(), |o| {
+            for v in position {
+                o.extend(v.to_be_bytes());
+            }
+            o.extend(y_rot.to_be_bytes());
+            o.extend(x_rot.to_be_bytes());
+            wire::write_bool(o, on_ground);
+        })
+    }
+
+    /// `ServerboundPaddleBoatPacket`: which paddles the boat's rider works.
+    pub fn paddle_boat(left: bool, right: bool) -> Vec<u8> {
+        wire::packet(pl::Serverbound::PaddleBoat.id(), |o| {
+            wire::write_bool(o, left);
+            wire::write_bool(o, right);
+        })
+    }
+
+    /// `ServerboundPlayerCommandPacket.Action` ordinals.
+    pub const PLAYER_COMMAND_START_RIDING_JUMP: i32 = 3;
+    pub const PLAYER_COMMAND_STOP_RIDING_JUMP: i32 = 4;
+    pub const PLAYER_COMMAND_OPEN_INVENTORY: i32 = 5;
+
+    /// `ServerboundPlayerCommandPacket`: an action of an entity (the player), with its
+    /// data (a riding jump's strength).
+    pub fn player_command(entity_id: i32, action: i32, data: i32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::PlayerCommand.id(), |o| {
+            wire::write_varint(o, entity_id);
+            wire::write_varint(o, action);
+            wire::write_varint(o, data);
         })
     }
 

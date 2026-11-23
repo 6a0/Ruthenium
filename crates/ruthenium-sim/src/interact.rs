@@ -326,9 +326,8 @@ impl GameMode {
         hit: &HitResult,
         out: &mut Vec<Vec<u8>>,
     ) -> bool {
-        // A miss's penalty swallows the click. The hands are never busy (riding isn't
-        // ported).
-        if self.miss_time > 0 {
+        // A miss's penalty swallows the click, as do hands busy paddling a boat.
+        if self.miss_time > 0 || p.hands_busy {
             return false;
         }
         if p.game_type() == play::SPECTATOR {
@@ -640,22 +639,27 @@ impl GameMode {
         hit: &HitResult,
         out: &mut Vec<Vec<u8>>,
     ) {
-        // Nothing is used while a block is being broken; the hands are never busy
-        // (riding isn't ported).
+        // Nothing is used while a block is being broken, nor while paddling a boat.
         if self.is_destroying {
             return;
         }
         self.right_click_delay = 4;
+        if p.hands_busy {
+            return;
+        }
         for hand in Hand::BOTH {
             let held = p.hand(hand).clone();
             match *hit {
                 HitResult::Entity { id, location } => {
                     if let Some(e) = w.entities.get(id)
                         && within_entity_range(p, &e.bounding_box)
-                        && self.interact(p, id, e.entity_type, e.position, location, hand, out)
-                            == Outcome::Success
                     {
-                        return;
+                        let rideable = e.rideable_interaction(p.secondary_use());
+                        let outcome =
+                            self.interact(p, id, e.entity_type, e.position, location, hand, out);
+                        if outcome == Outcome::Success || rideable == Some(true) && !p.spectator {
+                            return;
+                        }
                     }
                 }
                 HitResult::Block(ref b) if !b.miss => match self.use_item_on(p, w, hand, b, out) {

@@ -19,8 +19,11 @@
 //! bubble columns pushing and pulling, sliding down honey. Dying: no input, then out
 //! of the level 20 ticks later; a respawn is a new player ([`LocalPlayer::respawned`]).
 //! Elytra flight (starting it, the glide, a rocket's boost from [`crate::entity`]) and a
-//! riptide trident's launch and spin. Not yet: a spin hitting an entity, the scale
-//! attribute, vehicles and the world border.
+//! riptide trident's launch and spin. Riding ([`Riding`]): a passenger's tick (no
+//! crouching, sprinting only on a vehicle that can, the fluids a boat leaves it in), a
+//! horse's charged jump, and `sendChanges` sending the rotation and the vehicle's place
+//! instead of the position. Not yet: a spin hitting an entity, the scale attribute and
+//! the world border.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
@@ -55,7 +58,7 @@ const ROTATE_DELTA: u32 = 1 << 8;
 
 /// Java's `Math.toRadians` constant, and the game's float degrees-to-radians.
 const DEGREES_TO_RADIANS: f64 = 0.017453292519943295;
-const DEG_TO_RAD_F: f32 = 0.017453292;
+pub(crate) const DEG_TO_RAD_F: f32 = 0.017453292;
 
 /// The keys the game reads for movement (`Input`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -265,6 +268,8 @@ pub struct Attributes {
     pub movement_efficiency: Attribute,
     pub water_movement_efficiency: Attribute,
     pub bounciness: Attribute,
+    /// A flying mob's speed (a happy ghast's).
+    pub flying_speed: Attribute,
     pub block_interaction_range: Attribute,
     pub entity_interaction_range: Attribute,
     /// Attacks per second at full strength (sent by the server, with the held item's
@@ -291,6 +296,7 @@ impl Default for Attributes {
             movement_efficiency: Attribute::new(0.0, 0.0, 1.0),
             water_movement_efficiency: Attribute::new(0.0, 0.0, 1.0),
             bounciness: Attribute::new(0.0, 0.0, 1.0),
+            flying_speed: Attribute::new(0.4, 0.0, 1024.0),
             block_interaction_range: Attribute::new(4.5, 0.0, 64.0),
             entity_interaction_range: Attribute::new(3.0, 0.0, 64.0),
             attack_speed: Attribute::new(4.0, 0.0, 1024.0),
@@ -315,6 +321,7 @@ impl Attributes {
             "minecraft:movement_efficiency" => &mut self.movement_efficiency,
             "minecraft:water_movement_efficiency" => &mut self.water_movement_efficiency,
             "minecraft:bounciness" => &mut self.bounciness,
+            "minecraft:flying_speed" => &mut self.flying_speed,
             "minecraft:block_interaction_range" => &mut self.block_interaction_range,
             "minecraft:entity_interaction_range" => &mut self.entity_interaction_range,
             "minecraft:attack_speed" => &mut self.attack_speed,
@@ -339,6 +346,7 @@ impl Attributes {
             &mut a.movement_efficiency,
             &mut a.water_movement_efficiency,
             &mut a.bounciness,
+            &mut a.flying_speed,
             &mut a.block_interaction_range,
             &mut a.entity_interaction_range,
             &mut a.attack_speed,
@@ -480,7 +488,7 @@ pub const KEEP_ATTRIBUTES: u8 = 1;
 pub const KEEP_ENTITY_DATA: u8 = 2;
 
 /// `LivingEntity.computeModifiedFriction`.
-fn modified_friction(friction: f32, modifier: f32) -> f32 {
+pub(crate) fn modified_friction(friction: f32, modifier: f32) -> f32 {
     (1.0 - (1.0 - friction) * modifier).clamp(0.0, 1.0)
 }
 
@@ -496,12 +504,12 @@ pub struct Env<'a> {
 }
 
 impl<'a> Env<'a> {
-    fn state(&self, p: [i32; 3]) -> u32 {
+    pub(crate) fn state(&self, p: [i32; 3]) -> u32 {
         self.level.block(p[0], p[1], p[2])
     }
 
     /// The block shapes an entity (`who`) may meet in `b`.
-    fn collisions(&self, b: &Aabb, who: Option<Who>) -> Vec<Placed<'_>> {
+    pub(crate) fn collisions(&self, b: &Aabb, who: Option<Who>) -> Vec<Placed<'_>> {
         self.level
             .block_collisions_for(self.blocks, b, None, who)
             .into_iter()
@@ -528,7 +536,7 @@ impl<'a> Env<'a> {
         colliders.iter().filter(move |c| c.intersects(&grown))
     }
 
-    fn has_chunk_at(&self, p: [i32; 3]) -> bool {
+    pub(crate) fn has_chunk_at(&self, p: [i32; 3]) -> bool {
         self.level.has_chunk(p[0] >> 4, p[2] >> 4)
     }
 }
@@ -650,6 +658,45 @@ pub struct LocalPlayer {
     was_in_powder_snow: bool,
     /// `autoSpinAttackTicks`: a riptide spin's ticks left.
     pub auto_spin_attack_ticks: i32,
+    /// The vehicle the player rides (`isPassenger`).
+    pub riding: Option<Riding>,
+    /// `LocalPlayer.handsBusy`: paddling a boat keeps the hands from using or
+    /// attacking.
+    pub hands_busy: bool,
+    /// `jumpRidingTicks` and `jumpRidingScale`: the charge of a horse's jump.
+    jump_riding_ticks: i32,
+    pub jump_riding_scale: f32,
+    /// A riding jump let go this tick: the strength the vehicle's `onPlayerJump` gets.
+    pub(crate) riding_jump: Option<i32>,
+}
+
+/// Where the vehicle the player controls is, for `ServerboundMoveVehiclePacket`
+/// (`getClientPositionAndRotation`: where it is heading while it interpolates).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VehicleMove {
+    pub position: [f64; 3],
+    pub y_rot: f32,
+    pub x_rot: f32,
+    pub on_ground: bool,
+}
+
+/// What the player's tick needs of the vehicle it rides (`getVehicle`), as the
+/// entities see it when the player ticks ([`crate::entity::Entities::sync_riding`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Riding {
+    /// The vehicle's entity id.
+    pub vehicle: i32,
+    /// `getControlledVehicle`: the player is the vehicle's controlling passenger.
+    pub controls: bool,
+    /// `jumpableVehicle`: a vehicle the player controls that jumps when told
+    /// (`PlayerRideableJumping.canJump`: a saddled horse), with no jump cooldown.
+    pub jumpable: bool,
+    /// `vehicleCanSprint`: the vehicle can sprint and the player controls it.
+    pub can_sprint: bool,
+    /// `modifyPassengerFluidInteractionBox` of a boat not under water: the box the
+    /// fluids are looked for in starts at the boat's top (none when it is above the
+    /// player's).
+    pub fluids_above: Option<f64>,
 }
 
 /// `Entity.Movement`: a move from one place to another, with the movement asked for
@@ -667,16 +714,16 @@ pub enum MoverType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Movement {
-    from: [f64; 3],
-    to: [f64; 3],
-    asked: Option<[f64; 3]>,
+pub(crate) struct Movement {
+    pub(crate) from: [f64; 3],
+    pub(crate) to: [f64; 3],
+    pub(crate) asked: Option<[f64; 3]>,
 }
 
 /// What a block the player moves through does to it (`entityInside`), for the
 /// blocks whose effect moves it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Inside {
+pub(crate) enum Inside {
     Cobweb,
     BerryBush,
     PowderSnow,
@@ -758,6 +805,11 @@ impl LocalPlayer {
             in_powder_snow: false,
             was_in_powder_snow: false,
             auto_spin_attack_ticks: 0,
+            riding: None,
+            hands_busy: false,
+            jump_riding_ticks: 0,
+            jump_riding_scale: 0.0,
+            riding_jump: None,
         }
     }
 
@@ -926,10 +978,14 @@ impl LocalPlayer {
         self.data.living_flags & 4 != 0
     }
 
-    /// `Player.canGlide`: not flying, in the air (riding isn't simulated), without
+    /// `Player.canGlide`: not flying, in the air, not riding, without
     /// levitation, with a glider worn where it is equipped that won't break.
     fn can_glide(&self) -> bool {
-        if self.abilities.flying || self.on_ground || self.effects.has(MobEffect::Levitation) {
+        if self.abilities.flying
+            || self.on_ground
+            || self.riding.is_some()
+            || self.effects.has(MobEffect::Levitation)
+        {
             return false;
         }
         EquipmentSlot::VALUES.iter().any(|&slot| {
@@ -1216,6 +1272,10 @@ impl LocalPlayer {
     /// Applies a teleport (`PositionMoveRotation.calculateAbsolute`, then set without
     /// interpolation).
     pub fn teleport(&mut self, t: &PlayerPosition) {
+        // A passenger stays where its vehicle seats it (`handleMovePlayer`).
+        if self.riding.is_some() {
+            return;
+        }
         (self.position, self.delta, self.y_rot, self.x_rot) = calculate_absolute(
             self.position,
             self.delta,
@@ -1420,7 +1480,7 @@ impl LocalPlayer {
 
     /// `Player.getFlyingSpeed`: the speed in the air, faster flying.
     fn flying_speed(&self) -> f32 {
-        if self.abilities.flying {
+        if self.abilities.flying && self.riding.is_none() {
             if self.sprinting {
                 self.abilities.flying_speed * 2.0
             } else {
@@ -1474,11 +1534,14 @@ impl LocalPlayer {
         self.in_water && !self.was_underwater
     }
 
-    /// `LocalPlayer.isSprintingPossible` (not riding): not blind (`isMobilityRestricted`),
-    /// fed enough, and not in shallow water unless allowed.
+    /// `LocalPlayer.isSprintingPossible`: not blind (`isMobilityRestricted`), fed enough
+    /// (riding: on a vehicle that can sprint and that the player controls), and not in
+    /// shallow water unless allowed.
     fn sprinting_possible(&self, allowed_in_shallow_water: bool) -> bool {
         !self.effects.has(MobEffect::Blindness)
-            && self.enough_food()
+            && self
+                .riding
+                .map_or_else(|| self.enough_food(), |r| r.can_sprint)
             && (allowed_in_shallow_water || !self.in_shallow_water())
     }
 
@@ -1508,7 +1571,7 @@ impl LocalPlayer {
         // Player.tick: spectators go through everything and are never on the ground;
         // updateIsUnderwater, from the fluids as last updated.
         self.no_physics = self.spectator;
-        if self.spectator {
+        if self.spectator || self.riding.is_some() {
             self.on_ground = false;
         }
         self.was_underwater = self.fluids.eye_in(true);
@@ -1568,7 +1631,16 @@ impl LocalPlayer {
             self.eye_y(),
             mth::floor(self.position[2]),
         );
-        self.fluids.update(env, &b, eye, !pushed);
+        // getFluidInteractionBox: a boat cuts the passenger's box at its top.
+        let mut fluid_box = Some(b.inflate([-0.001; 3]));
+        if let Some(top) = self.riding.and_then(|r| r.fluids_above) {
+            fluid_box = fluid_box.filter(|f| top < f.max[1]).map(|mut f| {
+                f.min[1] = f.min[1].max(top);
+                f
+            });
+        }
+        self.fluids
+            .update_box(env, fluid_box, b.min[1], eye, !pushed);
         let in_water = self.fluids.is_in(true);
         let in_lava = self.fluids.is_in(false);
         if in_water {
@@ -1599,11 +1671,13 @@ impl LocalPlayer {
             self.swimming = false;
             return;
         }
+        let riding = self.riding.is_some();
         self.swimming = if self.is_swimming() {
-            self.sprinting && self.in_water
+            self.sprinting && self.in_water && !riding
         } else {
             self.sprinting
                 && self.was_underwater
+                && !riding
                 && env.fluid(self.block_position()).fluid.is_water()
         };
     }
@@ -1623,7 +1697,7 @@ impl LocalPlayer {
             } else {
                 Pose::Standing
             };
-            self.pose = if self.spectator || self.can_fit(env, desired) {
+            self.pose = if self.spectator || self.riding.is_some() || self.can_fit(env, desired) {
                 desired
             } else if self.can_fit(env, Pose::Crouching) {
                 Pose::Crouching
@@ -1643,6 +1717,7 @@ impl LocalPlayer {
         let had_forward = self.has_forward_impulse();
         self.crouching = !self.abilities.flying
             && !self.is_swimming()
+            && self.riding.is_none()
             && self.can_fit(env, Pose::Crouching)
             && (self.keys.shift || !self.can_fit(env, Pose::Standing));
         // KeyboardInput.tick.
@@ -1668,7 +1743,7 @@ impl LocalPlayer {
         };
 
         // Push out of blocks the player is stuck in.
-        if !self.no_physics {
+        if !self.no_physics && self.riding.is_none() {
             let w = f64::from(self.pose.size().0) * 0.35;
             let (px, pz) = (self.position[0], self.position[2]);
             for (x, z) in [
@@ -1681,7 +1756,7 @@ impl LocalPlayer {
             }
         }
         let slow_using = self.slow_due_to_using_item();
-        if was_shift || slow_using || keys.backward {
+        if was_shift || slow_using && self.riding.is_none() || keys.backward {
             self.sprint_trigger_time = 0;
         }
         let flying = self.abilities.flying;
@@ -1733,7 +1808,7 @@ impl LocalPlayer {
             } else if !was_jumping && keys.jump {
                 if self.jump_trigger_time == 0 {
                     self.jump_trigger_time = 7;
-                } else if !self.is_swimming() {
+                } else if !self.is_swimming() && self.riding.is_none_or(|r| r.jumpable) {
                     self.abilities.flying = !self.abilities.flying;
                     if self.abilities.flying && self.on_ground {
                         self.jump_from_ground(env);
@@ -1765,11 +1840,43 @@ impl LocalPlayer {
                 self.delta[1] += f64::from(ya as f32 * self.abilities.flying_speed * 3.0);
             }
         }
+        // A horse's jump charges while jump is held and goes when it is let go.
+        self.riding_jump = None;
+        if self.riding.is_some_and(|r| r.jumpable) {
+            if self.jump_riding_ticks < 0 {
+                self.jump_riding_ticks += 1;
+                if self.jump_riding_ticks == 0 {
+                    self.jump_riding_scale = 0.0;
+                }
+            }
+            if was_jumping && !keys.jump {
+                self.jump_riding_ticks = -10;
+                let strength = mth::floor(f64::from(self.jump_riding_scale * 100.0));
+                self.riding_jump = Some(strength);
+                self.outbox.push(play::player_command(
+                    self.entity_id,
+                    play::PLAYER_COMMAND_START_RIDING_JUMP,
+                    strength,
+                ));
+            } else if !was_jumping && keys.jump {
+                self.jump_riding_ticks = 0;
+                self.jump_riding_scale = 0.0;
+            } else if was_jumping {
+                self.jump_riding_ticks += 1;
+                self.jump_riding_scale = if self.jump_riding_ticks < 10 {
+                    self.jump_riding_ticks as f32 * 0.1
+                } else {
+                    0.8 + 2.0 / (self.jump_riding_ticks - 9) as f32 * 0.1
+                };
+            }
+        } else {
+            self.jump_riding_scale = 0.0;
+        }
         // Player.aiStep.
         if self.jump_trigger_time > 0 {
             self.jump_trigger_time -= 1;
         }
-        if self.abilities.flying {
+        if self.abilities.flying && self.riding.is_none() {
             self.fall_distance = 0.0;
         }
         self.living_ai_step(env);
@@ -1980,93 +2087,10 @@ impl LocalPlayer {
     /// player are ported (fire, freezing damage and the rest are the server's), and
     /// powder snow's freezing only as far as `isInPowderSnow`.
     fn check_inside_blocks(&mut self, env: &Env<'_>, movements: &[Movement]) {
-        let mut visited = std::collections::HashSet::new();
-        let mut froze = false;
-        for m in movements {
-            let delta = sub(m.to, m.from);
-            let mut steps = 16;
-            match m.asked {
-                Some(asked) if dot(delta, delta) > 0.0 => {
-                    let mut pos = m.from;
-                    for axis in crate::inside::axis_step_order(asked) {
-                        if delta[axis] != 0.0 {
-                            let mut to = pos;
-                            to[axis] += delta[axis];
-                            steps -=
-                                self.check_inside(env, pos, to, &mut visited, &mut froze, steps);
-                            pos = to;
-                        }
-                    }
-                }
-                _ => steps -= self.check_inside(env, m.from, m.to, &mut visited, &mut froze, 16),
-            }
-            if steps <= 0 {
-                self.check_inside(env, m.to, m.to, &mut visited, &mut froze, 1);
-            }
-        }
         // InsideBlockEffectType.FREEZE, applied once the walk is done (if alive).
-        if froze && self.health > 0.0 {
+        if check_inside_blocks(self, env, movements) && self.health > 0.0 {
             self.in_powder_snow = true;
         }
-    }
-
-    /// One leg of [`Self::check_inside_blocks`]: the steps it took.
-    fn check_inside(
-        &mut self,
-        env: &Env<'_>,
-        from: [f64; 3],
-        to: [f64; 3],
-        visited: &mut std::collections::HashSet<[i32; 3]>,
-        froze: &mut bool,
-        max_steps: i32,
-    ) -> i32 {
-        let target = self
-            .pose
-            .bounding_box(to)
-            .inflate([-9.999999747378752E-6; 3]);
-        let moved_far = distance_sqr(from, to) > 0.9999900000002526 * 0.9999900000002526;
-        let mut last = 0;
-        crate::inside::for_each_block_intersected_between(from, to, &target, &mut |pos, step| {
-            if self.health <= 0.0 || step >= max_steps {
-                return false;
-            }
-            last = step;
-            let state = env.state(pos);
-            let Some(kind) = inside_kind(env, state) else {
-                return true;
-            };
-            // getEntityInsideCollisionShape: the whole block, but for powder snow the
-            // shape the player collides with, if any.
-            let inside_block = kind != Inside::PowderSnow
-                || match env.blocks.collision_for(state, pos, Some(self.who())) {
-                    Some(p) if !p.shape.is_block() => {
-                        let shape = Aabb {
-                            min: [p.pos[0], p.pos[1], p.pos[2]],
-                            max: [
-                                p.pos[0] + 1.0,
-                                p.pos[1] + 0.8999999761581421,
-                                p.pos[2] + 1.0,
-                            ],
-                        };
-                        crate::inside::collided_along_vector(
-                            &self.pose.bounding_box(from),
-                            sub(to, from),
-                            &[shape],
-                        )
-                    }
-                    _ => true,
-                };
-            if inside_block && visited.insert(pos) {
-                let cell = Aabb {
-                    min: pos.map(f64::from),
-                    max: pos.map(|c| f64::from(c) + 1.0),
-                };
-                let precise = moved_far || target.intersects(&cell);
-                self.entity_inside(env, pos, state, kind, precise, froze);
-            }
-            true
-        });
-        last + 1
     }
 
     /// `entityInside` of the blocks whose effects move the player.
@@ -2178,6 +2202,10 @@ impl LocalPlayer {
     /// `Player.travel`: swimming follows the look, and flying damps the vertical
     /// motion; `LivingEntity.travel` in between.
     fn travel(&mut self, env: &Env<'_>) {
+        if self.riding.is_some() {
+            self.living_travel(env);
+            return;
+        }
         if self.is_swimming() {
             // getLookAngle().y.
             let look_y = f64::from(-mth::sin(f64::from(self.x_rot * DEG_TO_RAD_F)));
@@ -2365,7 +2393,7 @@ impl LocalPlayer {
             return (x, y);
         }
         let (mut x, mut y) = (x * 0.98, y * 0.98);
-        if self.started_using {
+        if self.started_using && self.riding.is_none() {
             let f = self.use_item.c.use_effects().speed_multiplier;
             x *= f;
             y *= f;
@@ -2769,6 +2797,31 @@ impl LocalPlayer {
         self.delta = after;
     }
 
+    /// The keys the player's last tick read.
+    pub fn keys(&self) -> Keys {
+        self.keys
+    }
+
+    /// The input its last tick applied (`xxa`, `zza`, `jumping`), which the vehicle it
+    /// controls steers by.
+    pub(crate) fn controller_input(&self) -> (f32, f32, bool) {
+        (self.xxa, self.zza, self.jumping)
+    }
+
+    /// A packet sent during the tick before `sendChanges`'s (a boat's paddles).
+    pub(crate) fn queue(&mut self, packet: Vec<u8>) {
+        self.outbox.push(packet);
+    }
+
+    /// The player's vehicle attachment point (`EntityAttachment.VEHICLE`): 0.6 up
+    /// standing or crouching, at the feet in the other poses.
+    pub(crate) fn vehicle_attachment(&self) -> [f64; 3] {
+        match self.pose {
+            Pose::Standing | Pose::Crouching => [0.0, 0.6, 0.0],
+            _ => [0.0; 3],
+        }
+    }
+
     /// `LocalPlayer.isHorizontalCollisionMinor`.
     fn horizontal_collision_minor(&self, movement: [f64; 3]) -> bool {
         let r = self.y_rot * DEG_TO_RAD_F;
@@ -2811,24 +2864,7 @@ impl LocalPlayer {
     /// `CollisionGetter.findSupportingBlock`: the closest block, ties to the greatest
     /// by y, then z, then x.
     fn find_supporting_block(&self, env: &Env<'_>, area: &Aabb) -> Option<[i32; 3]> {
-        let mut best: Option<([i32; 3], f64)> = None;
-        for (p, _) in env
-            .level
-            .block_collisions_for(env.blocks, area, None, Some(self.who()))
-        {
-            let d = |i: usize| f64::from(p[i]) + 0.5 - self.position[i];
-            let dist = d(0) * d(0) + d(1) * d(1) + d(2) * d(2);
-            let better = match best {
-                None => true,
-                Some((bp, bd)) => {
-                    dist < bd || dist == bd && (bp[1], bp[2], bp[0]) < (p[1], p[2], p[0])
-                }
-            };
-            if better {
-                best = Some((p, dist));
-            }
-        }
-        best.map(|(p, _)| p)
+        find_supporting_block(env, area, self.position, self.who())
     }
 
     /// `Player.maybeBackOffFromEdge`: sneaking stops at edges.
@@ -2898,60 +2934,16 @@ impl LocalPlayer {
         }
     }
 
-    /// `Entity.collide`: block collisions, then stepping up.
+    /// `Entity.collide` for the player.
     fn collide(&self, env: &Env<'_>, movement: [f64; 3]) -> [f64; 3] {
-        let b = self.bounding_box();
-        let step = self.attributes.step_height.value() as f32;
-        // Entities first, found once for the move and the step up (`Shapes.create` of
-        // each box).
-        let entity_shapes: Vec<Shape> = env
-            .entity_colliders(&b.expand_towards(movement).expand_towards([
-                0.0,
-                f64::from(step),
-                0.0,
-            ]))
-            .map(box_shape)
-            .collect();
-        let with_entities = |blocks| entities_then(&entity_shapes, blocks);
-        let len = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
-        let result = if len == 0.0 {
-            movement
-        } else {
-            let shapes =
-                with_entities(env.collisions(&b.expand_towards(movement), Some(self.who())));
-            collide_with_shapes(movement, &b, &shapes)
-        };
-        let x_c = movement[0] != result[0];
-        let y_c = movement[1] != result[1];
-        let z_c = movement[2] != result[2];
-        let grounded_after = y_c && movement[1] < 0.0;
-        if step > 0.0 && (grounded_after || self.on_ground) && (x_c || z_c) {
-            let grounded = if grounded_after {
-                b.moved([0.0, result[1], 0.0])
-            } else {
-                b
-            };
-            let mut area = grounded.expand_towards([movement[0], f64::from(step), movement[2]]);
-            if !grounded_after {
-                area = area.expand_towards([0.0, -9.999999747378752E-6, 0.0]);
-            }
-            let shapes = with_entities(env.collisions(&area, Some(self.who())));
-            let skip = result[1] as f32;
-            for h in candidate_step_heights(&grounded, &shapes, step, skip) {
-                let stepped = collide_with_shapes(
-                    [movement[0], f64::from(h), movement[2]],
-                    &grounded,
-                    &shapes,
-                );
-                if stepped[0] * stepped[0] + stepped[2] * stepped[2]
-                    > result[0] * result[0] + result[2] * result[2]
-                {
-                    let to_ground = b.min[1] - grounded.min[1];
-                    return [stepped[0], stepped[1] - to_ground, stepped[2]];
-                }
-            }
-        }
-        result
+        collide(
+            env,
+            &self.bounding_box(),
+            movement,
+            self.attributes.step_height.value() as f32,
+            self.on_ground,
+            self.who(),
+        )
     }
 
     /// The packets `LocalPlayer.sendChanges` sends this tick, in order: the keys if
@@ -2959,6 +2951,14 @@ impl LocalPlayer {
     /// is due (moved more than 2e-4, turned, every 20 ticks, or ground or collision
     /// changed).
     pub fn send_changes(&mut self) -> Vec<Vec<u8>> {
+        self.send_changes_riding(None)
+    }
+
+    /// `sendChanges` for a player that may ride: a passenger sends its rotation
+    /// (with its ground and collision flags) every tick instead of its position and,
+    /// when it controls the bottom vehicle, where that is (`vehicle`), then its sprint
+    /// command if that changed.
+    pub fn send_changes_riding(&mut self, vehicle: Option<VehicleMove>) -> Vec<Vec<u8>> {
         use ruthenium_data::v26_3::packets::play::Serverbound as S;
         let mut out = std::mem::take(&mut self.outbox);
         if self.keys != self.last_sent_keys {
@@ -2967,6 +2967,31 @@ impl LocalPlayer {
             }));
             self.last_sent_keys = self.keys;
         }
+        if self.riding.is_some() {
+            let flags = u8::from(self.on_ground) | u8::from(self.horizontal_collision) << 1;
+            out.push(wire::packet(S::MovePlayerRot.id(), |o| {
+                wire::write_f32(o, self.y_rot);
+                wire::write_f32(o, self.x_rot);
+                o.push(flags);
+            }));
+            if let Some(v) = vehicle {
+                out.push(play::move_vehicle(
+                    v.position,
+                    v.y_rot,
+                    v.x_rot,
+                    v.on_ground,
+                ));
+                self.send_sprinting_if_needed(&mut out);
+            }
+            return out;
+        }
+        self.send_sprinting_if_needed(&mut out);
+        self.send_position(out)
+    }
+
+    /// `sendIsSprintingIfNeeded`.
+    fn send_sprinting_if_needed(&mut self, out: &mut Vec<Vec<u8>>) {
+        use ruthenium_data::v26_3::packets::play::Serverbound as S;
         if self.sprinting != self.was_sprinting {
             let action = if self.sprinting { 1 } else { 2 };
             out.push(wire::packet(S::PlayerCommand.id(), |o| {
@@ -2976,6 +3001,11 @@ impl LocalPlayer {
             }));
             self.was_sprinting = self.sprinting;
         }
+    }
+
+    /// `sendPosition`'s movement packet, if one is due.
+    fn send_position(&mut self, mut out: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        use ruthenium_data::v26_3::packets::play::Serverbound as S;
         let d = [
             self.position[0] - self.last_sent[0],
             self.position[1] - self.last_sent[1],
@@ -3033,6 +3063,228 @@ impl LocalPlayer {
     }
 }
 
+/// `Entity.collide`: an entity's box `b` moving by `movement`: block collisions, then
+/// stepping up (`step`, from the ground or landing).
+pub(crate) fn collide(
+    env: &Env<'_>,
+    b: &Aabb,
+    movement: [f64; 3],
+    step: f32,
+    on_ground: bool,
+    who: Who,
+) -> [f64; 3] {
+    let b = *b;
+    // Entities first, found once for the move and the step up (`Shapes.create` of
+    // each box).
+    let entity_shapes: Vec<Shape> = env
+        .entity_colliders(
+            &b.expand_towards(movement)
+                .expand_towards([0.0, f64::from(step), 0.0]),
+        )
+        .map(box_shape)
+        .collect();
+    let with_entities = |blocks| entities_then(&entity_shapes, blocks);
+    let len = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
+    let result = if len == 0.0 {
+        movement
+    } else {
+        let shapes = with_entities(env.collisions(&b.expand_towards(movement), Some(who)));
+        collide_with_shapes(movement, &b, &shapes)
+    };
+    let x_c = movement[0] != result[0];
+    let y_c = movement[1] != result[1];
+    let z_c = movement[2] != result[2];
+    let grounded_after = y_c && movement[1] < 0.0;
+    if step > 0.0 && (grounded_after || on_ground) && (x_c || z_c) {
+        let grounded = if grounded_after {
+            b.moved([0.0, result[1], 0.0])
+        } else {
+            b
+        };
+        let mut area = grounded.expand_towards([movement[0], f64::from(step), movement[2]]);
+        if !grounded_after {
+            area = area.expand_towards([0.0, -9.999999747378752E-6, 0.0]);
+        }
+        let shapes = with_entities(env.collisions(&area, Some(who)));
+        let skip = result[1] as f32;
+        for h in candidate_step_heights(&grounded, &shapes, step, skip) {
+            let stepped =
+                collide_with_shapes([movement[0], f64::from(h), movement[2]], &grounded, &shapes);
+            if stepped[0] * stepped[0] + stepped[2] * stepped[2]
+                > result[0] * result[0] + result[2] * result[2]
+            {
+                let to_ground = b.min[1] - grounded.min[1];
+                return [stepped[0], stepped[1] - to_ground, stepped[2]];
+            }
+        }
+    }
+    result
+}
+
+/// `CollisionGetter.findSupportingBlock`: of the blocks an entity at `position` collides
+/// with in `area`, the closest, ties to the greatest by y, then z, then x.
+pub(crate) fn find_supporting_block(
+    env: &Env<'_>,
+    area: &Aabb,
+    position: [f64; 3],
+    who: Who,
+) -> Option<[i32; 3]> {
+    let mut best: Option<([i32; 3], f64)> = None;
+    for (p, _) in env
+        .level
+        .block_collisions_for(env.blocks, area, None, Some(who))
+    {
+        let d = |i: usize| f64::from(p[i]) + 0.5 - position[i];
+        let dist = d(0) * d(0) + d(1) * d(1) + d(2) * d(2);
+        let better = match best {
+            None => true,
+            Some((bp, bd)) => dist < bd || dist == bd && (bp[1], bp[2], bp[0]) < (p[1], p[2], p[0]),
+        };
+        if better {
+            best = Some((p, dist));
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// Something moving through blocks whose effects ([`Inside`]) it takes.
+pub(crate) trait InsideMover {
+    /// Alive (`checkInsideBlocks` stops for the dead).
+    fn inside_alive(&self) -> bool;
+    /// The box at a position.
+    fn inside_box(&self, at: [f64; 3]) -> Aabb;
+    /// Who it is to the blocks' shapes (powder snow's).
+    fn inside_who(&self) -> Who;
+    /// `entityInside` of a block with an effect; `froze` is set by powder snow.
+    fn entity_inside(
+        &mut self,
+        env: &Env<'_>,
+        pos: [i32; 3],
+        state: u32,
+        kind: Inside,
+        precise: bool,
+        froze: &mut bool,
+    );
+}
+
+/// `Entity.checkInsideBlocks`: walks each move through the blocks, axis by axis for
+/// a move that asked for one (at most 16 steps a move, then where it ended), each
+/// block's effect at most once a tick. Only the effects that move an entity are ported
+/// (fire, freezing damage and the rest are the server's), and powder snow's freezing
+/// only as far as whether it froze (returned).
+pub(crate) fn check_inside_blocks<M: InsideMover>(
+    m: &mut M,
+    env: &Env<'_>,
+    movements: &[Movement],
+) -> bool {
+    let mut visited = std::collections::HashSet::new();
+    let mut froze = false;
+    for mv in movements {
+        let delta = sub(mv.to, mv.from);
+        let mut steps = 16;
+        match mv.asked {
+            Some(asked) if dot(delta, delta) > 0.0 => {
+                let mut pos = mv.from;
+                for axis in crate::inside::axis_step_order(asked) {
+                    if delta[axis] != 0.0 {
+                        let mut to = pos;
+                        to[axis] += delta[axis];
+                        steps -= check_inside(m, env, pos, to, &mut visited, &mut froze, steps);
+                        pos = to;
+                    }
+                }
+            }
+            _ => steps -= check_inside(m, env, mv.from, mv.to, &mut visited, &mut froze, 16),
+        }
+        if steps <= 0 {
+            check_inside(m, env, mv.to, mv.to, &mut visited, &mut froze, 1);
+        }
+    }
+    froze
+}
+
+/// One leg of [`check_inside_blocks`]: the steps it took.
+fn check_inside<M: InsideMover>(
+    m: &mut M,
+    env: &Env<'_>,
+    from: [f64; 3],
+    to: [f64; 3],
+    visited: &mut std::collections::HashSet<[i32; 3]>,
+    froze: &mut bool,
+    max_steps: i32,
+) -> i32 {
+    let target = m.inside_box(to).inflate([-9.999999747378752E-6; 3]);
+    let moved_far = distance_sqr(from, to) > 0.9999900000002526 * 0.9999900000002526;
+    let mut last = 0;
+    crate::inside::for_each_block_intersected_between(from, to, &target, &mut |pos, step| {
+        if !m.inside_alive() || step >= max_steps {
+            return false;
+        }
+        last = step;
+        let state = env.state(pos);
+        let Some(kind) = inside_kind(env, state) else {
+            return true;
+        };
+        // getEntityInsideCollisionShape: the whole block, but for powder snow the shape
+        // the entity collides with, if any.
+        let inside_block = kind != Inside::PowderSnow
+            || match env.blocks.collision_for(state, pos, Some(m.inside_who())) {
+                Some(p) if !p.shape.is_block() => {
+                    let shape = Aabb {
+                        min: [p.pos[0], p.pos[1], p.pos[2]],
+                        max: [
+                            p.pos[0] + 1.0,
+                            p.pos[1] + 0.8999999761581421,
+                            p.pos[2] + 1.0,
+                        ],
+                    };
+                    crate::inside::collided_along_vector(
+                        &m.inside_box(from),
+                        sub(to, from),
+                        &[shape],
+                    )
+                }
+                _ => true,
+            };
+        if inside_block && visited.insert(pos) {
+            let cell = Aabb {
+                min: pos.map(f64::from),
+                max: pos.map(|c| f64::from(c) + 1.0),
+            };
+            let precise = moved_far || target.intersects(&cell);
+            m.entity_inside(env, pos, state, kind, precise, froze);
+        }
+        true
+    });
+    last + 1
+}
+
+impl InsideMover for LocalPlayer {
+    fn inside_alive(&self) -> bool {
+        self.health > 0.0
+    }
+
+    fn inside_box(&self, at: [f64; 3]) -> Aabb {
+        self.pose.bounding_box(at)
+    }
+
+    fn inside_who(&self) -> Who {
+        self.who()
+    }
+
+    fn entity_inside(
+        &mut self,
+        env: &Env<'_>,
+        pos: [i32; 3],
+        state: u32,
+        kind: Inside,
+        precise: bool,
+        froze: &mut bool,
+    ) {
+        LocalPlayer::entity_inside(self, env, pos, state, kind, precise, froze);
+    }
+}
+
 impl Default for LocalPlayer {
     fn default() -> LocalPlayer {
         LocalPlayer::new()
@@ -3082,7 +3334,7 @@ pub(crate) fn calculate_absolute(
 
 /// The entity shapes, then the block shapes (`collideBoundingBox`'s order).
 /// The kind of effect a block has on a player moving through it, if it moves it.
-fn inside_kind(env: &Env<'_>, state: u32) -> Option<Inside> {
+pub(crate) fn inside_kind(env: &Env<'_>, state: u32) -> Option<Inside> {
     let is = |class| env.blocks.is_class(state, class);
     if is(Class::WebBlock) {
         Some(Inside::Cobweb)
@@ -3099,16 +3351,16 @@ fn inside_kind(env: &Env<'_>, state: u32) -> Option<Inside> {
     }
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+pub(crate) fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(crate) fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 /// `Vec3.distanceToSqr`.
-fn distance_sqr(a: [f64; 3], b: [f64; 3]) -> f64 {
+pub(crate) fn distance_sqr(a: [f64; 3], b: [f64; 3]) -> f64 {
     let d = sub(b, a);
     dot(d, d)
 }
@@ -3186,7 +3438,7 @@ fn rotate_x(v: [f64; 3], radians: f32) -> [f64; 3] {
 }
 
 /// `Vec3.yRot`.
-fn rotate_y(v: [f64; 3], radians: f32) -> [f64; 3] {
+pub(crate) fn rotate_y(v: [f64; 3], radians: f32) -> [f64; 3] {
     let cos = f64::from(mth::cos(f64::from(radians)));
     let sin = f64::from(mth::sin(f64::from(radians)));
     [v[0] * cos + v[2] * sin, v[1], v[2] * cos - v[0] * sin]
@@ -3487,6 +3739,9 @@ mod tests {
                 .to_vec(),
             fields: fields.map(|(n, i)| (n.to_owned(), i, 0)).to_vec(),
             baby: None,
+            passenger_points: vec![[0.0, 1.8, 0.0]],
+            vehicle_points: vec![[0.0, 0.6, 0.0]],
+            attributes: Vec::new(),
         }])
     }
 

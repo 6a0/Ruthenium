@@ -319,6 +319,41 @@ public final class Scenarios {
         return new double[] {x, y, z, yaw, pitch};
     }
 
+
+    /** A tame, saddled, still horse with fixed attributes (no random speed or jump). */
+    private static final String HORSE = "{Tame:1b,NoAI:1b,PersistenceRequired:1b,Silent:1b,Variant:0,Rotation:[-90f,0f],"
+            + "equipment:{saddle:{id:\"minecraft:saddle\",count:1}},attributes:[{id:\"minecraft:movement_speed\",base:0.3d},"
+            + "{id:\"minecraft:jump_strength\",base:0.8d}]}";
+
+    /** The same horse without its saddle. */
+    private static final String BARE_HORSE = "{Tame:1b,NoAI:1b,PersistenceRequired:1b,Silent:1b,Variant:0,Rotation:[-90f,0f],"
+            + "attributes:[{id:\"minecraft:movement_speed\",base:0.3d},{id:\"minecraft:jump_strength\",base:0.8d}]}";
+
+    /** A tame, saddled donkey carrying a chest. */
+    private static final String DONKEY = "{Tame:1b,ChestedHorse:1b,NoAI:1b,PersistenceRequired:1b,Silent:1b,Rotation:[-90f,0f],"
+            + "equipment:{saddle:{id:\"minecraft:saddle\",count:1}},attributes:[{id:\"minecraft:movement_speed\",base:0.175d},"
+            + "{id:\"minecraft:jump_strength\",base:0.5d}]}";
+
+    /** A grown happy ghast in a harness. */
+    private static final String GHAST = "{NoAI:1b,PersistenceRequired:1b,Silent:1b,Rotation:[-90f,0f],"
+            + "equipment:{body:{id:\"minecraft:white_harness\",count:1}}}";
+
+    /** The same ghast with its AI on (it drifts about). */
+    private static final String GHAST_AI = "{PersistenceRequired:1b,Silent:1b,Rotation:[-90f,0f],"
+            + "equipment:{body:{id:\"minecraft:white_harness\",count:1}}}";
+
+    /** Mounts the player on the nearest entity of the type with /ride and waits for it to land. */
+    private static void ride(ClientGameTestContext ctx, TestServerContext server, String type) {
+        server.runCommand("ride @p mount @e[type=" + type + ",limit=1,sort=nearest]");
+        ctx.waitTicks(5);
+    }
+
+    /** Kills the scenario's vehicles (which drops the player) and waits until they are gone (the dying push for 20 ticks). */
+    private static void gone(ClientGameTestContext ctx, TestServerContext server, String type) {
+        server.runCommand("kill @e[type=" + type + "]");
+        ctx.waitTicks(30);
+    }
+
     public static final List<Scenario> ALL = List.of(
             new Scenario("placing",
                     "Placing blocks: sneak-bridging backwards off a platform with use held, then walking off its end without sneaking; one click into the player (refused) and towering with jump and use held; stairs at the bottom and top of a face and two at a corner; a bottom slab doubled, a top slab; two fences that join and a stone that joins them; a torch on the floor and one on a wall; a door and its top half; snow on snow; stone over short grass; scaffolding climbing; a ladder; a block from the off hand past a stick; a block in creative (kept).",
@@ -1911,5 +1946,274 @@ public final class Scenarios {
                         ctx.waitTicks(20);
                         ctx.runOnClient(mc -> mc.player.closeContainer());
                         ctx.waitTicks(15);
+                    }),
+            new Scenario("boat_paddle",
+                    "An oak boat in a 2-deep pool, mounted with /ride: paddling forward, then with the camera turned 150 degrees off its heading (held to 105), forward turning left and right, turning on the spot both ways, backward, forward and back together, left and right together, drifting; sneaking out (onto the boat's top), in again and paddling, then quick in and out twice.",
+                    List.of("fill 0 -62 -6 30 -61 6 minecraft:water"),
+                    start(1.5, -60, -8.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:oak_boat 3.5 -60.4 0.5 {Rotation:[-90f,0f]}");
+                        ctx.waitTicks(20);
+                        ride(ctx, server, "minecraft:oak_boat");
+                        hold(ctx, 40, W);
+                        // Looking 150 degrees off the boat's heading: held to 105.
+                        ctx.getInput().lookAt(60, 0);
+                        hold(ctx, 10, W);
+                        ctx.getInput().lookAt(-90, 0);
+                        hold(ctx, 20, W, A);
+                        hold(ctx, 20, W, D);
+                        hold(ctx, 15, A);
+                        hold(ctx, 15, D);
+                        hold(ctx, 20, S);
+                        hold(ctx, 15, W, S);
+                        hold(ctx, 15, A, D);
+                        ctx.waitTicks(30);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        ride(ctx, server, "minecraft:oak_boat");
+                        hold(ctx, 20, W);
+                        ctx.waitTicks(10);
+                        hold(ctx, 1, SNEAK);
+                        ctx.waitTicks(5);
+                        ride(ctx, server, "minecraft:oak_boat");
+                        ctx.waitTicks(2);
+                        hold(ctx, 1, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:oak_boat");
+                    }),
+            new Scenario("boat_land",
+                    "A boat on land, mounted by clicking it with nothing in hand: paddling across stone, ice and blue ice into a wall, backing and turning; teleported (with the player in it) to soul sand and paddled across it; teleported near the edge of a 4-high ledge and driven off onto slime (bouncing); sneaking out.",
+                    List.of("fill 2 -61 -1 12 -61 1 minecraft:ice", "fill 13 -61 -1 24 -61 1 minecraft:blue_ice",
+                            "fill 26 -60 -2 26 -58 2 minecraft:stone", "fill 2 -61 5 20 -61 7 minecraft:soul_sand",
+                            "fill 0 -57 -9 4 -57 -7 minecraft:stone", "fill 5 -61 -10 12 -61 -6 minecraft:slime_block"),
+                    start(0.5, -60, 3.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:oak_boat 0.6 -60 0.5 {Rotation:[-90f,0f]}");
+                        ctx.waitTicks(10);
+                        aim(ctx, server, 0.5, -60, 3.5, 0.6, -59.8, 0.5);
+                        use(ctx);
+                        ctx.waitTicks(10);
+                        hold(ctx, 80, W);
+                        ctx.waitTicks(20);
+                        hold(ctx, 20, S);
+                        hold(ctx, 20, A);
+                        hold(ctx, 15, W, D);
+                        ctx.waitTicks(10);
+                        server.runCommand("tp @e[type=minecraft:oak_boat] 0.6 -60 6.5 -90 0");
+                        ctx.waitTicks(10);
+                        hold(ctx, 50, W);
+                        ctx.waitTicks(10);
+                        server.runCommand("tp @e[type=minecraft:oak_boat] 4.0 -56 -8 -90 0");
+                        ctx.waitTicks(10);
+                        hold(ctx, 45, W);
+                        ctx.waitTicks(40);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(10);
+                        gone(ctx, server, "minecraft:oak_boat");
+                    }),
+            new Scenario("boat_bubbles",
+                    "A boat paddled over an upward bubble column (soul sand) in a 2-deep pool and left there until the column launches it, then over a downward one (magma) until it drags the boat down and the player is thrown out.",
+                    List.of("fill 0 -62 -4 20 -61 4 minecraft:water", "setblock 6 -63 0 minecraft:soul_sand",
+                            "fill 6 -62 0 6 -61 0 minecraft:bubble_column[drag=false]",
+                            "setblock 14 -63 0 minecraft:magma_block",
+                            "fill 14 -62 0 14 -61 0 minecraft:bubble_column[drag=true]"),
+                    start(1.5, -60, -6.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:oak_boat 2.5 -60.4 0.5 {Rotation:[-90f,0f]}");
+                        ctx.waitTicks(20);
+                        ride(ctx, server, "minecraft:oak_boat");
+                        hold(ctx, 9, W);
+                        ctx.waitTicks(90);
+                        hold(ctx, 20, W);
+                        ctx.waitTicks(90);
+                        ctx.waitTicks(10);
+                        gone(ctx, server, "minecraft:oak_boat");
+                    }),
+            new Scenario("boat_blocks",
+                    "A boat on stone: paddled into cobwebs with forward held through them, then backed out; coasting into them with nothing held; paddled onto a pit of powder snow; pushed sideways by a piston.",
+                    List.of("fill 6 -60 -1 6 -60 1 minecraft:cobweb", "fill 3 -61 5 10 -61 7 minecraft:powder_snow",
+                            "setblock 2 -60 -6 minecraft:piston[facing=east]"),
+                    start(0.5, -60, 3.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:oak_boat 0.8 -60 0.5 {Rotation:[-90f,0f]}");
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:oak_boat");
+                        hold(ctx, 60, W);
+                        hold(ctx, 40, S);
+                        ctx.waitTicks(10);
+                        server.runCommand("tp @e[type=minecraft:oak_boat] 0.8 -60 0.5 -90 0");
+                        ctx.waitTicks(5);
+                        hold(ctx, 25, W);
+                        ctx.waitTicks(40);
+                        server.runCommand("tp @e[type=minecraft:oak_boat] 0.8 -60 6.5 -90 0");
+                        ctx.waitTicks(5);
+                        hold(ctx, 40, W);
+                        ctx.waitTicks(20);
+                        hold(ctx, 20, S);
+                        server.runCommand("tp @e[type=minecraft:oak_boat] 4.2 -60 -5.5 -90 0");
+                        ctx.waitTicks(10);
+                        power(ctx, server, 2, -61, -6, true, 20);
+                        power(ctx, server, 2, -61, -6, false, 10);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(10);
+                        gone(ctx, server, "minecraft:oak_boat");
+                    }),
+            new Scenario("horse_ride",
+                    "A tame saddled horse (speed 0.3, jump strength 0.8): walking up a 1-block step, sprint held (horses can't sprint), jumps charged for 1, 5, 9, 10 and 20 ticks, a charged jump while walking, forward and back together, left and right together, strafing, turning and walking; through cobwebs and across soul sand; sneaking off, mounted again by clicking it, quick in and out.",
+                    List.of("fill 8 -60 -2 9 -60 2 minecraft:stone", "fill 14 -60 5 14 -59 7 minecraft:cobweb",
+                            "fill 4 -61 -7 20 -61 -5 minecraft:soul_sand"),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:horse 2.5 -60 0.5 " + HORSE);
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:horse");
+                        hold(ctx, 30, W);
+                        hold(ctx, 20, W, SPRINT);
+                        ctx.waitTicks(20);
+                        for (int charge : new int[] {1, 5, 9, 10, 20}) {
+                            hold(ctx, charge, JUMP);
+                            ctx.waitTicks(30);
+                        }
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(5);
+                        hold(ctx, 8, JUMP);
+                        ctx.waitTicks(20);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        hold(ctx, 15, W, S);
+                        hold(ctx, 15, A, D);
+                        hold(ctx, 20, A);
+                        ctx.getInput().lookAt(180, 0);
+                        hold(ctx, 25, W);
+                        ctx.waitTicks(10);
+                        server.runCommand("tp @e[type=minecraft:horse] 10.5 -60 6.5 -90 0");
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(-90, 0);
+                        hold(ctx, 40, W);
+                        ctx.waitTicks(10);
+                        server.runCommand("tp @e[type=minecraft:horse] 2.5 -60 -6 -90 0");
+                        ctx.waitTicks(10);
+                        hold(ctx, 40, W);
+                        ctx.waitTicks(10);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        server.runCommand("tp @e[type=minecraft:horse] 2.5 -60 0.5 -90 0");
+                        aim(ctx, server, 2.5, -60, 3.5, 2.5, -59.0, 0.5);
+                        ctx.waitTicks(6);
+                        use(ctx);
+                        ctx.waitTicks(10);
+                        hold(ctx, 10, W);
+                        hold(ctx, 1, SNEAK);
+                        ctx.waitTicks(5);
+                        ride(ctx, server, "minecraft:horse");
+                        hold(ctx, 1, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:horse");
+                    }),
+            new Scenario("donkey_ride",
+                    "A tame saddled donkey with a chest (speed 0.175, jump strength 0.5): walking, jumps charged for 3 and 12 ticks, a jump while walking up onto a block, into a 1-deep pool and out; sneaking off.",
+                    List.of("fill 10 -60 -2 11 -60 2 minecraft:stone", "fill 4 -61 5 12 -61 8 minecraft:water"),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:donkey 2.5 -60 0.5 " + DONKEY);
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:donkey");
+                        hold(ctx, 20, W);
+                        hold(ctx, 3, JUMP);
+                        ctx.waitTicks(25);
+                        hold(ctx, 12, JUMP);
+                        ctx.waitTicks(30);
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(15);
+                        hold(ctx, 6, JUMP);
+                        ctx.waitTicks(20);
+                        ctx.getInput().releaseKey(W);
+                        server.runCommand("tp @e[type=minecraft:donkey] 2.5 -60 6.5 -90 0");
+                        ctx.waitTicks(10);
+                        hold(ctx, 60, W);
+                        ctx.waitTicks(10);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:donkey");
+                    }),
+            new Scenario("happy_ghast",
+                    "A harnessed happy ghast: rising with jump, flying forward looking level, up and down, backward, strafing, forward and back together, rising while flying forward, turning to look south and flying on (the ghast turns a little each tick), drifting to a stop; sneaking off onto its top.",
+                    List.of(),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:happy_ghast 4 -59 0.5 " + GHAST);
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:happy_ghast");
+                        ctx.waitTicks(10);
+                        hold(ctx, 20, JUMP);
+                        hold(ctx, 30, W);
+                        ctx.getInput().lookAt(-90, -30);
+                        hold(ctx, 20, W);
+                        ctx.getInput().lookAt(-90, 40);
+                        hold(ctx, 20, W);
+                        ctx.getInput().lookAt(-90, 0);
+                        hold(ctx, 15, S);
+                        hold(ctx, 15, A);
+                        hold(ctx, 15, D);
+                        hold(ctx, 10, W, S);
+                        hold(ctx, 10, W, JUMP);
+                        // Turning: the ghast follows the look a little each tick.
+                        ctx.getInput().lookAt(0, 0);
+                        hold(ctx, 25, W);
+                        ctx.waitTicks(40);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:happy_ghast");
+                    }),
+            new Scenario("happy_ghast_ai",
+                    "A harnessed happy ghast with its AI on, left to drift for 3 seconds, then mounted: rising, flying forward, sneaking off.",
+                    List.of(),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:happy_ghast 4 -59 0.5 " + GHAST_AI);
+                        ctx.waitTicks(60);
+                        ride(ctx, server, "minecraft:happy_ghast");
+                        hold(ctx, 15, JUMP);
+                        hold(ctx, 30, W);
+                        ctx.waitTicks(20);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:happy_ghast");
+                    }),
+            new Scenario("riding_death",
+                    "Dying while paddling a boat with forward held, respawning; dying while riding a horse forward, respawning.",
+                    List.of(),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:oak_boat 2.5 -60 0.5 {Rotation:[-90f,0f]}");
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:oak_boat");
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(15);
+                        server.runCommand("kill @p");
+                        ctx.waitTicks(5);
+                        ctx.getInput().releaseKey(W);
+                        respawn(ctx);
+                        gone(ctx, server, "minecraft:oak_boat");
+                        server.runCommand("tp @p 0.5 -60 -9.5 -90 0");
+                        ctx.waitTicks(4);
+                        server.runCommand("summon minecraft:horse 2.5 -60 0.5 " + HORSE);
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:horse");
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(15);
+                        server.runCommand("kill @p");
+                        ctx.waitTicks(5);
+                        ctx.getInput().releaseKey(W);
+                        respawn(ctx);
+                        gone(ctx, server, "minecraft:horse");
+                    }),
+            new Scenario("horse_promoted",
+                    "Riding a tame horse with no saddle (a passenger, not its rider) with forward held; the horse is saddled while forward is still held, and the player takes control; sneaking off.",
+                    List.of(),
+                    start(0.5, -60, -9.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:horse 2.5 -60 0.5 " + BARE_HORSE);
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:horse");
+                        ctx.getInput().holdKey(W);
+                        ctx.waitTicks(20);
+                        server.runCommand("item replace entity @e[type=minecraft:horse] saddle with minecraft:saddle");
+                        ctx.waitTicks(30);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(20);
+                        gone(ctx, server, "minecraft:horse");
                     }));
 }

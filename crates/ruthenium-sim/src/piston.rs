@@ -5,8 +5,8 @@
 //! carried by honey, the block put down at the end), and a shulker box's lid
 //! (`ShulkerBoxBlockEntity`), which lifts or pushes the player as it opens.
 //!
-//! Only the local player is moved: other entities follow the server's moves (a boat a
-//! piston pushes, say, isn't moved ahead of the server here).
+//! Only the local player and the vehicle it controls are moved: other entities follow
+//! the server's moves.
 
 // `!(a <= b)` keeps Java's comparisons as written (NaN included).
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
@@ -16,6 +16,7 @@ use crate::block::{Class, Pos};
 use crate::block_entity::{Data, Lid, MovingPiston, progress_delta_aabb, shape_max};
 use crate::blocks::AIR;
 use crate::direction::Direction;
+use crate::entity::Entity;
 use crate::interact::World;
 use crate::player::{Env, LocalPlayer, MoverType};
 use crate::shape::{Aabb, Axis, Shape};
@@ -28,6 +29,82 @@ const PUSH_PULL: u8 = 0;
 const PUSH_ONLY: u8 = 1;
 const POPPED: u8 = 2;
 const IMMOVEABLE: u8 = 3;
+
+/// What a piston or a shulker box's lid moves on the client: the local player, and the
+/// vehicle it controls (`canSimulateMovement`; the rest follow the server).
+#[derive(Debug)]
+pub enum Pushed<'p> {
+    Player(&'p mut LocalPlayer),
+    Vehicle(&'p mut Entity),
+}
+
+impl Pushed<'_> {
+    fn bounding_box(&self) -> Aabb {
+        match self {
+            Pushed::Player(p) => p.bounding_box(),
+            Pushed::Vehicle(e) => e.bounding_box,
+        }
+    }
+
+    /// Whether `getEntities` in `area` finds it: in the level (the player not a
+    /// spectator), its box in the area.
+    fn found_in(&self, area: &Aabb) -> bool {
+        let present = match self {
+            Pushed::Player(p) => !p.removed && !p.spectator,
+            Pushed::Vehicle(e) => !e.removed,
+        };
+        present && self.bounding_box().intersects(area)
+    }
+
+    fn delta(&mut self) -> &mut [f64; 3] {
+        match self {
+            Pushed::Player(p) => &mut p.delta,
+            Pushed::Vehicle(e) => &mut e.delta,
+        }
+    }
+
+    fn position(&self) -> [f64; 3] {
+        match self {
+            Pushed::Player(p) => p.position,
+            Pushed::Vehicle(e) => e.position,
+        }
+    }
+
+    fn on_ground(&self) -> bool {
+        match self {
+            Pushed::Player(p) => p.on_ground,
+            Pushed::Vehicle(e) => e.on_ground,
+        }
+    }
+
+    fn supporting_block(&self) -> Option<[i32; 3]> {
+        match self {
+            Pushed::Player(p) => p.supporting_block(),
+            Pushed::Vehicle(e) => e.supporting_block(),
+        }
+    }
+
+    fn push(&mut self, env: &Env<'_>, kind: MoverType, v: [f64; 3], game_time: i64) {
+        match self {
+            Pushed::Player(p) => p.move_by(env, kind, v, game_time),
+            Pushed::Vehicle(e) => e.entity_move(env, kind, v, game_time, true),
+        }
+    }
+
+    fn effects_between(&mut self, env: &Env<'_>, from: [f64; 3], to: [f64; 3]) {
+        match self {
+            Pushed::Player(p) => p.apply_effects_between(env, from, to),
+            Pushed::Vehicle(e) => e.apply_effects_between(env, from, to),
+        }
+    }
+
+    fn remove_latest_movement_recording(&mut self) {
+        match self {
+            Pushed::Player(p) => p.remove_latest_movement_recording(),
+            Pushed::Vehicle(e) => e.remove_latest_movement_recording(),
+        }
+    }
+}
 
 impl World<'_> {
     /// `ClientLevel.blockEvent`: the event goes to whatever block is at `pos` now
@@ -51,7 +128,23 @@ impl World<'_> {
     /// whose block entity is gone taken out. `game_time` is the level's (pistons
     /// move an entity at most 0.51 an axis in one).
     pub fn tick_block_entities(&mut self, player: &mut LocalPlayer, game_time: i64) {
+        self.tick_block_entities_riding(player, None, game_time);
+    }
+
+    /// [`Self::tick_block_entities`] also pushing the vehicle the player controls
+    /// (`vehicle`, with the boxes it collides with), which the client moves too.
+    pub fn tick_block_entities_riding(
+        &mut self,
+        player: &mut LocalPlayer,
+        vehicle: Option<(&mut Entity, &[Aabb])>,
+        game_time: i64,
+    ) {
         let colliders = self.entities.colliders(player);
+        let mut targets: Vec<(Pushed<'_>, &[Aabb])> = Vec::with_capacity(2);
+        if let Some((v, c)) = vehicle {
+            targets.push((Pushed::Vehicle(v), c));
+        }
+        targets.push((Pushed::Player(player), &colliders));
         self.level.block_entities.begin_ticking();
         let mut i = 0;
         while let Some(at) = self.level.block_entities.ticker(i) {
@@ -63,10 +156,10 @@ impl World<'_> {
             let s = self.get(pos);
             match self.level.block_entities.get(pos) {
                 Some(Data::Piston(_)) if state::is(s, "minecraft:moving_piston") => {
-                    self.tick_moving_piston(pos, player, &colliders, game_time)
+                    self.tick_moving_piston(pos, &mut targets, game_time)
                 }
                 Some(Data::Shulker(_)) if self.blocks.is_class(s, Class::ShulkerBoxBlock) => {
-                    self.tick_shulker_box(pos, s, player, &colliders, game_time)
+                    self.tick_shulker_box(pos, s, &mut targets, game_time)
                 }
                 _ => {}
             }
@@ -291,8 +384,7 @@ impl World<'_> {
     fn tick_moving_piston(
         &mut self,
         pos: Pos,
-        player: &mut LocalPlayer,
-        colliders: &[Aabb],
+        targets: &mut [(Pushed<'_>, &[Aabb])],
         game_time: i64,
     ) {
         let Some(be) = self.level.block_entities.piston_mut(pos) else {
@@ -325,8 +417,12 @@ impl World<'_> {
         }
         let new_progress = be.progress + 0.5;
         let be = be.clone();
-        self.move_collided_entities(pos, new_progress, &be, player, colliders, game_time);
-        self.move_stuck_entities(pos, new_progress, &be, player, colliders, game_time);
+        for (target, colliders) in targets.iter_mut() {
+            self.move_collided_entities(pos, new_progress, &be, target, colliders, game_time);
+        }
+        for (target, colliders) in targets.iter_mut() {
+            self.move_stuck_entities(pos, new_progress, &be, target, colliders, game_time);
+        }
         if let Some(be) = self.level.block_entities.piston_mut(pos) {
             be.progress = new_progress.min(1.0);
             refresh_piston_shapes(self.blocks, be);
@@ -342,7 +438,7 @@ impl World<'_> {
         pos: Pos,
         new_progress: f32,
         be: &MovingPiston,
-        player: &mut LocalPlayer,
+        target: &mut Pushed<'_>,
         colliders: &[Aabb],
         game_time: i64,
     ) {
@@ -355,23 +451,20 @@ impl World<'_> {
         };
         let aabb = move_by_progress(pos, &bounds, be);
         let area = movement_area(&aabb, movement, delta_progress).minmax(&aabb);
-        if !self.pushes_player(player, &area) {
+        if !target.found_in(&area) {
             return;
         }
         let boxes = shape.aabbs();
         if state::is(be.moved, "minecraft:slime_block") {
-            // `canSimulateMovement`: the local player is the client's to move.
+            // `canSimulateMovement`: the client moves these.
             let n = movement.normal();
-            match movement.axis() {
-                Axis::X => player.delta[0] = f64::from(n[0]),
-                Axis::Y => player.delta[1] = f64::from(n[1]),
-                Axis::Z => player.delta[2] = f64::from(n[2]),
-            }
+            let axis = movement.axis() as usize;
+            target.delta()[axis] = f64::from(n[axis]);
         }
         let mut delta: f64 = 0.0;
         for b in &boxes {
             let moving = movement_area(&move_by_progress(pos, b, be), movement, delta_progress);
-            let entity = player.bounding_box();
+            let entity = target.bounding_box();
             if moving.intersects(&entity) {
                 delta = delta.max(get_movement(&moving, movement, &entity));
                 if delta >= delta_progress {
@@ -381,11 +474,11 @@ impl World<'_> {
         }
         if !(delta <= 0.0) {
             let delta = delta.min(delta_progress) + 0.01;
-            self.move_by_piston(movement, player, delta, movement, colliders, game_time);
+            self.move_by_piston(movement, target, delta, movement, colliders, game_time);
             if !be.extending && be.source {
                 self.fix_within_piston_base(
                     pos,
-                    player,
+                    target,
                     movement,
                     delta_progress,
                     colliders,
@@ -400,13 +493,13 @@ impl World<'_> {
     fn fix_within_piston_base(
         &mut self,
         pos: Pos,
-        player: &mut LocalPlayer,
+        target: &mut Pushed<'_>,
         direction: Direction,
         delta_progress: f64,
         colliders: &[Aabb],
         game_time: i64,
     ) {
-        let entity = player.bounding_box();
+        let entity = target.bounding_box();
         let at = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
         let block = Aabb {
             min: [0.0; 3],
@@ -421,7 +514,7 @@ impl World<'_> {
         let intersected = get_movement(&block, opposite, &entity.intersect(&block)) + 0.01;
         if (delta - intersected).abs() < 0.01 {
             let delta = delta.min(delta_progress) + 0.01;
-            self.move_by_piston(direction, player, delta, opposite, colliders, game_time);
+            self.move_by_piston(direction, target, delta, opposite, colliders, game_time);
         }
     }
 
@@ -431,7 +524,7 @@ impl World<'_> {
         pos: Pos,
         new_progress: f32,
         be: &MovingPiston,
-        player: &mut LocalPlayer,
+        target: &mut Pushed<'_>,
         colliders: &[Aabb],
         game_time: i64,
     ) {
@@ -447,17 +540,18 @@ impl World<'_> {
         let aabb = move_by_progress(pos, &area, be);
         let delta_progress = f64::from(new_progress - be.progress);
         // `matchesStickyCritera`: on the ground, on this block or over the area.
-        let over = player.position[0] >= aabb.min[0]
-            && player.position[0] <= aabb.max[0]
-            && player.position[2] >= aabb.min[2]
-            && player.position[2] <= aabb.max[2];
-        if self.pushes_player(player, &aabb)
-            && player.on_ground
-            && (player.supporting_block() == Some(pos) || over)
+        let at = target.position();
+        let over = at[0] >= aabb.min[0]
+            && at[0] <= aabb.max[0]
+            && at[2] >= aabb.min[2]
+            && at[2] <= aabb.max[2];
+        if target.found_in(&aabb)
+            && target.on_ground()
+            && (target.supporting_block() == Some(pos) || over)
         {
             self.move_by_piston(
                 movement,
-                player,
+                target,
                 delta_progress,
                 movement,
                 colliders,
@@ -466,25 +560,19 @@ impl World<'_> {
         }
     }
 
-    /// Whether `getEntities` in `area` finds the player: in the level, not a
-    /// spectator, its box in the area.
-    fn pushes_player(&self, player: &LocalPlayer, area: &Aabb) -> bool {
-        !player.removed && !player.spectator && player.bounding_box().intersects(area)
-    }
-
     /// `moveEntityByPiston`: the entity moved by a piston going `piston`'s way
     /// (blocks moving that way don't stop it), then the blocks it went through.
     fn move_by_piston(
         &mut self,
         piston: Direction,
-        player: &mut LocalPlayer,
+        target: &mut Pushed<'_>,
         delta: f64,
         movement: Direction,
         colliders: &[Aabb],
         game_time: i64,
     ) {
         self.level.noclip = Some(piston);
-        let from = player.position;
+        let from = target.position();
         let n = movement.normal();
         let v = [
             delta * f64::from(n[0]),
@@ -497,9 +585,10 @@ impl World<'_> {
             tags: self.tags,
             colliders,
         };
-        player.move_by(&env, MoverType::Piston, v, game_time);
-        player.apply_effects_between(&env, from, player.position);
-        player.remove_latest_movement_recording();
+        target.push(&env, MoverType::Piston, v, game_time);
+        let to = target.position();
+        target.effects_between(&env, from, to);
+        target.remove_latest_movement_recording();
         self.level.noclip = None;
     }
 
@@ -511,8 +600,7 @@ impl World<'_> {
         &mut self,
         pos: Pos,
         s: u32,
-        player: &mut LocalPlayer,
-        colliders: &[Aabb],
+        targets: &mut [(Pushed<'_>, &[Aabb])],
         game_time: i64,
     ) {
         let facing = state::get_dir(s, "facing").unwrap_or(Direction::Up);
@@ -563,22 +651,24 @@ impl World<'_> {
             f64::from(pos[2]) + 0.5,
         ];
         let aabb = progress_delta_aabb(1.0, facing, old, new, bottom);
-        if !self.pushes_player(player, &aabb) {
-            return;
+        for (target, colliders) in targets.iter_mut() {
+            if !target.found_in(&aabb) {
+                continue;
+            }
+            let n = facing.normal();
+            let v = [
+                (aabb.size(Axis::X) + 0.01) * f64::from(n[0]),
+                (aabb.size(Axis::Y) + 0.01) * f64::from(n[1]),
+                (aabb.size(Axis::Z) + 0.01) * f64::from(n[2]),
+            ];
+            let env = Env {
+                level: &*self.level,
+                blocks: self.blocks,
+                tags: self.tags,
+                colliders,
+            };
+            target.push(&env, MoverType::ShulkerBox, v, game_time);
         }
-        let n = facing.normal();
-        let v = [
-            (aabb.size(Axis::X) + 0.01) * f64::from(n[0]),
-            (aabb.size(Axis::Y) + 0.01) * f64::from(n[1]),
-            (aabb.size(Axis::Z) + 0.01) * f64::from(n[2]),
-        ];
-        let env = Env {
-            level: &*self.level,
-            blocks: self.blocks,
-            tags: self.tags,
-            colliders,
-        };
-        player.move_by(&env, MoverType::ShulkerBox, v, game_time);
     }
 
     // --- The structure a piston moves ------------------------------------------------
