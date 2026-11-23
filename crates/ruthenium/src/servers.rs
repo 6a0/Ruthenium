@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use ruthenium_assets::image::{Image, alpha, blue, green, red};
-use ruthenium_gpu::{Arrival, TextureDesc, TextureId, UploadError};
+use ruthenium_gpu::{Arrival, TextureDesc, TextureId};
 use ruthenium_net::ping::{PingError, PingEvent, Pinger};
 use ruthenium_net::server_list::{ServerEntry, ServerList};
 use ruthenium_net::{PROTOCOL_VERSION, ServerAddress};
@@ -287,7 +287,7 @@ impl Servers {
                         e.icon = Icon::Ready(t);
                         self.dirty = true;
                     }
-                    Err(ruthenium_gpu::Error::Upload(UploadError::Full)) => {}
+                    Err(e) if e.try_again() => {}
                     Err(err) => {
                         eprintln!("[ruthenium] server icon upload: {err}");
                         e.icon = Icon::None;

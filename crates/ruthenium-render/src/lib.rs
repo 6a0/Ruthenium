@@ -8,11 +8,13 @@ mod overlay;
 mod pipelines;
 mod starfield;
 mod stats;
+mod table_check;
 
 pub use gui::GuiFrame;
 pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
 pub use stats::{FrameTimes, Summary};
+pub use table_check::TableCheckReport;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -20,8 +22,8 @@ use std::sync::Arc;
 use ruthenium_gpu::{
     Arrival, COLOR_RANGE, FrameData, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
     PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented,
-    Screenshot, SwapchainInfo, TextureDesc, TextureId, TextureTable, UploadCheck,
-    UploadCheckReport, UploadRing, Validation, vk,
+    Screenshot, SwapchainInfo, TextureDesc, TextureId, TextureTable, TextureTableStats,
+    UploadCheck, UploadCheckReport, UploadRing, Validation, vk,
 };
 use ruthenium_platform::{Platform, Window};
 
@@ -101,6 +103,10 @@ pub struct Renderer {
     stars: TextureId,
     /// `--exercise-uploads`.
     check: Option<UploadCheck>,
+    /// `--exercise-textures`.
+    table_check: Option<table_check::TableCheck>,
+    /// The backdrop could not be made in the last frame that wanted it.
+    backdrop_failed: bool,
     /// The next presented frame is copied for a screenshot.
     screenshot_requested: bool,
     screenshot: Option<Screenshot>,
@@ -131,7 +137,9 @@ impl Renderer {
             UPLOAD_BUDGET_DISCRETE
         };
         let mut uploads = UploadRing::new(gpu.clone(), UPLOAD_RING_BYTES, budget)?;
+        let table_started = std::time::Instant::now();
         let mut textures = TextureTable::new(gpu.clone(), &mut uploads)?;
+        let table_ms = table_started.elapsed().as_secs_f64() * 1e3;
         let stars = textures.create_with(
             &mut uploads,
             TextureDesc::rgba8(starfield::SIZE, starfield::SIZE),
@@ -139,9 +147,19 @@ impl Renderer {
             // The first frame draws it.
             Arrival::NextFrame,
         )?;
+        let limits = gpu.caps().texture_table_limits;
         eprintln!(
-            "[render] texture table: {} slots; upload ring {} MiB, {:.1} MiB per frame, buffer copies and background textures on the {}",
+            "[render] texture table: {} slots in {} descriptor sets, made in {table_ms:.2} ms (this GPU: up to {} ordinary, {} update-after-bind)",
             textures.capacity(),
+            textures.path().name(),
+            limits.ordinary,
+            match limits.update_after_bind {
+                Some(n) => n.to_string(),
+                None => "no".to_owned(),
+            }
+        );
+        eprintln!(
+            "[render] upload ring {} MiB, {:.1} MiB per frame, buffer copies and background textures on the {}",
             uploads.capacity() >> 20,
             uploads.budget() as f64 / f64::from(1 << 20),
             match gpu.transfer_family() {
@@ -170,6 +188,8 @@ impl Renderer {
             cache,
             stars,
             check: None,
+            table_check: None,
+            backdrop_failed: false,
             screenshot_requested: false,
             screenshot: None,
             screenshot_of: None,
@@ -201,8 +221,34 @@ impl Renderer {
         })
     }
 
+    /// Starts filling, reloading and reading back the texture table every frame (see
+    /// [`TableCheckReport`]).
+    pub fn enable_table_check(&mut self) -> Result<(), ruthenium_gpu::Error> {
+        if self.table_check.is_none() {
+            self.table_check = Some(table_check::TableCheck::new(
+                self.frames.gpu().clone(),
+                self.pipelines.format(),
+                self.textures.capacity(),
+            )?);
+        }
+        Ok(())
+    }
+
+    /// What the texture table check has seen, if it is on.
+    pub fn table_check(&self) -> Option<TableCheckReport> {
+        self.table_check
+            .as_ref()
+            .map(table_check::TableCheck::report)
+    }
+
+    /// How full the texture table is and has been.
+    pub fn texture_stats(&self) -> TextureTableStats {
+        self.textures.stats()
+    }
+
     /// Creates a texture and stages its levels (see [`TextureTable::create_with`]). A
-    /// full upload ring is an error the caller retries next frame.
+    /// full upload ring or texture table ([`ruthenium_gpu::Error::try_again`]) is an error
+    /// the caller retries in a later frame.
     pub fn create_texture(
         &mut self,
         desc: TextureDesc,
@@ -301,9 +347,16 @@ impl Renderer {
             old.destroy(&mut self.textures);
         }
         match backdrop::Backdrop::new(&mut self.textures, s.format, s.extent) {
-            Ok(b) => self.backdrop = Some(b),
-            // Glass falls back to a flat tint.
-            Err(e) => eprintln!("[render] no glass backdrop: {e}"),
+            Ok(b) => {
+                self.backdrop = Some(b);
+                self.backdrop_failed = false;
+            }
+            // Glass falls back to a flat tint, and the next frame tries again: said once.
+            Err(e) => {
+                if !std::mem::replace(&mut self.backdrop_failed, true) {
+                    eprintln!("[render] no glass backdrop: {e}");
+                }
+            }
         }
     }
 
@@ -394,6 +447,23 @@ impl Renderer {
             }
             _ => None,
         };
+        if let Some(c) = &mut self.table_check {
+            let zone = self.frames.zone_begin(&ctx, "table check");
+            // SAFETY: outside a render pass, after begin_frame, sets bound; the pipelines
+            // were built with the layout.
+            unsafe {
+                c.step(
+                    &ctx,
+                    completed,
+                    &mut self.textures,
+                    &mut self.uploads,
+                    &mut self.frame_data,
+                    &self.pipelines,
+                    &self.layout,
+                )?
+            };
+            self.frames.zone_end(&ctx, zone);
+        }
         let target = self.frames.acquire(&ctx)?;
         if let Some(t) = target {
             // The image is from the swapchain prepared above.

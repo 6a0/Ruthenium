@@ -10,14 +10,119 @@ use crate::{Error, VkContext};
 /// Provisional in the registry, so ash only has it behind a feature; it is just a name here.
 const PORTABILITY_SUBSET: &CStr = c"VK_KHR_portability_subset";
 
-/// Texture-table slots Ruthenium asks for; fewer if the device's descriptor limits are lower.
-const WANTED_TEXTURE_SLOTS: u32 = 16_384;
-/// Below this many bindless textures a GPU is rejected. Every descriptor-indexing driver
-/// we know of reports far more (hundreds of thousands).
-const MIN_TEXTURE_SLOTS: u32 = 1_024;
-/// Descriptors of the texture table's set that are not sampled images (its samplers), kept
-/// out of the per-stage resource limit.
+/// Texture-table slots Ruthenium asks for unless told otherwise
+/// ([`GpuOptions::texture_slots`]); fewer if the device's descriptor limits are lower.
+pub const DEFAULT_TEXTURE_SLOTS: u32 = 1_024;
+/// The smallest table Ruthenium runs with: a GPU that cannot hold it is rejected.
+pub const MIN_TEXTURE_SLOTS: u32 = 256;
+/// The largest table that can be asked for.
+pub const MAX_TEXTURE_SLOTS: u32 = 65_536;
+/// Per-stage resources kept for everything that is not a texture of the table: its
+/// samplers, the frame's data, later sets and the colour attachments, which count against
+/// `maxPerStageResources` in the fragment stage.
 const NON_TEXTURE_DESCRIPTORS: u32 = 16;
+
+/// The kind of descriptor set the texture table is made of.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextureTablePath {
+    /// Plain descriptor sets, within the device's ordinary sampled-image limits. A frame's
+    /// copy of the set is only written before anything of that frame binds it, which is
+    /// all the table does.
+    #[default]
+    Ordinary,
+    /// Update-after-bind sets, for their (often far) higher limits; needs
+    /// `descriptorBindingSampledImageUpdateAfterBind`.
+    UpdateAfterBind,
+}
+
+impl TextureTablePath {
+    /// A short name for logs and options.
+    pub fn name(self) -> &'static str {
+        match self {
+            TextureTablePath::Ordinary => "ordinary",
+            TextureTablePath::UpdateAfterBind => "update-after-bind",
+        }
+    }
+}
+
+/// How many textures the table could have on each path, under every limit that applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextureTableLimits {
+    pub ordinary: u32,
+    /// `None` without `descriptorBindingSampledImageUpdateAfterBind`.
+    pub update_after_bind: Option<u32>,
+}
+
+impl TextureTableLimits {
+    fn of(
+        limits: &vk::PhysicalDeviceLimits,
+        indexing: &vk::PhysicalDeviceDescriptorIndexingProperties<'_>,
+        update_after_bind: bool,
+    ) -> TextureTableLimits {
+        let ordinary = limits
+            .max_per_stage_descriptor_sampled_images
+            .min(limits.max_descriptor_set_sampled_images)
+            .min(
+                limits
+                    .max_per_stage_resources
+                    .saturating_sub(NON_TEXTURE_DESCRIPTORS),
+            );
+        // Every frame in flight has its own copy of the set, all from one pool, and the
+        // budget of update-after-bind pools counts every descriptor in them.
+        let copies = crate::frame::MAX_FRAMES_IN_FLIGHT as u32;
+        let update_after_bind = update_after_bind.then(|| {
+            indexing
+                .max_per_stage_descriptor_update_after_bind_sampled_images
+                .min(indexing.max_descriptor_set_update_after_bind_sampled_images)
+                .min(
+                    indexing
+                        .max_per_stage_update_after_bind_resources
+                        .saturating_sub(NON_TEXTURE_DESCRIPTORS),
+                )
+                .min(
+                    (indexing.max_update_after_bind_descriptors_in_all_pools / copies)
+                        .saturating_sub(crate::textures::SAMPLER_COUNT),
+                )
+        });
+        TextureTableLimits {
+            ordinary,
+            update_after_bind,
+        }
+    }
+
+    /// The path and size of a table of `wanted` slots. Ordinary sets when they hold it;
+    /// update-after-bind only when that gives a larger table than they can; a smaller
+    /// ordinary table, down to [`MIN_TEXTURE_SLOTS`], when neither holds `wanted`.
+    /// `only` allows one path. `Err` says why the device can't hold a table.
+    fn choose(
+        self,
+        wanted: u32,
+        only: Option<TextureTablePath>,
+    ) -> Result<(TextureTablePath, u32), String> {
+        let ordinary = self.ordinary.min(wanted);
+        let uab = self.update_after_bind.map(|n| n.min(wanted));
+        let (path, slots) = match (only, uab) {
+            (Some(TextureTablePath::Ordinary), _) | (None, None) => {
+                (TextureTablePath::Ordinary, ordinary)
+            }
+            (Some(TextureTablePath::UpdateAfterBind), None) => {
+                return Err("no descriptorBindingSampledImageUpdateAfterBind".into());
+            }
+            (Some(TextureTablePath::UpdateAfterBind), Some(n)) => {
+                (TextureTablePath::UpdateAfterBind, n)
+            }
+            (None, Some(n)) if n > ordinary => (TextureTablePath::UpdateAfterBind, n),
+            (None, Some(_)) => (TextureTablePath::Ordinary, ordinary),
+        };
+        if slots < MIN_TEXTURE_SLOTS {
+            return Err(format!(
+                "only {slots} textures in one {} descriptor set (needs {MIN_TEXTURE_SLOTS})",
+                path.name()
+            ));
+        }
+        Ok((path, slots))
+    }
+}
 
 /// How to pick among several GPUs.
 #[derive(Clone, Debug, Default)]
@@ -33,6 +138,12 @@ pub struct GpuOptions {
     pub swapchain_maintenance: Option<SwapchainMaintenance>,
     /// Development: treat the window's surface as offering only sRGB formats.
     pub pretend_srgb: PretendSrgb,
+    /// Texture-table slots to ask for (`None`: [`DEFAULT_TEXTURE_SLOTS`]), between
+    /// [`MIN_TEXTURE_SLOTS`] and [`MAX_TEXTURE_SLOTS`]. The device's limits may give fewer.
+    pub texture_slots: Option<u32>,
+    /// Make the texture table of this kind of descriptor set only (`None`: ordinary sets,
+    /// update-after-bind when that gives a larger table). For testing each path.
+    pub texture_table: Option<TextureTablePath>,
 }
 
 /// The swapchain maintenance extension a device was created with. With one, every present
@@ -110,9 +221,13 @@ pub struct DeviceCaps {
     pub timestamp_bits: u32,
     /// All device-local memory is also host-visible (integrated GPUs, Apple, ARM).
     pub unified_memory: bool,
-    /// Slots in the shared texture table: what Ruthenium wants, capped by the
-    /// update-after-bind descriptor limits.
+    /// Slots in the shared texture table: what was asked for, capped by the descriptor
+    /// limits of the path it is on.
     pub texture_slots: u32,
+    /// The kind of descriptor set the table is made of.
+    pub texture_table: TextureTablePath,
+    /// What each path could hold on this device.
+    pub texture_table_limits: TextureTableLimits,
     pub max_image_dimension_2d: u32,
     /// `maxMemoryAllocationCount` (often 4096 on Windows).
     pub max_memory_allocations: u32,
@@ -260,9 +375,6 @@ const REQUIRED_FEATURES: &[FeatureCheck] = &[
     }),
     ("descriptorBindingPartiallyBound", |f| {
         f.descriptor_binding_partially_bound
-    }),
-    ("descriptorBindingSampledImageUpdateAfterBind", |f| {
-        f.descriptor_binding_sampled_image_update_after_bind
     }),
 ];
 
@@ -621,12 +733,23 @@ fn evaluate(
             reasons.push(format!("no {feature}"));
         }
     }
-    let texture_slots = texture_slots(&indexing);
-    if texture_slots < MIN_TEXTURE_SLOTS {
-        reasons.push(format!(
-            "only {texture_slots} bindless textures (needs {MIN_TEXTURE_SLOTS})"
-        ));
-    }
+    let texture_table_limits = TextureTableLimits::of(
+        &props.limits,
+        &indexing,
+        features.descriptor_binding_sampled_image_update_after_bind,
+    );
+    let wanted_slots = options
+        .texture_slots
+        .unwrap_or(DEFAULT_TEXTURE_SLOTS)
+        .clamp(MIN_TEXTURE_SLOTS, MAX_TEXTURE_SLOTS);
+    let (texture_table, texture_slots) =
+        match texture_table_limits.choose(wanted_slots, options.texture_table) {
+            Ok(chosen) => chosen,
+            Err(why) => {
+                reasons.push(why);
+                (TextureTablePath::Ordinary, 0)
+            }
+        };
 
     // A queue family that does graphics and compute and can present to our surface.
     // SAFETY: plain queries.
@@ -706,6 +829,8 @@ fn evaluate(
         timestamp_bits: families[queue_family as usize].timestamp_valid_bits,
         unified_memory,
         texture_slots,
+        texture_table,
+        texture_table_limits,
         max_image_dimension_2d: props.limits.max_image_dimension2_d,
         max_memory_allocations: props.limits.max_memory_allocation_count,
         copy_offset_alignment: props.limits.optimal_buffer_copy_offset_alignment,
@@ -757,17 +882,6 @@ fn transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
                 && !f.queue_flags.intersects(not)
         })
         .map(|i| i as u32)
-}
-
-/// Slots the texture table can have under the device's update-after-bind limits.
-fn texture_slots(p: &vk::PhysicalDeviceDescriptorIndexingProperties<'_>) -> u32 {
-    WANTED_TEXTURE_SLOTS
-        .min(p.max_per_stage_descriptor_update_after_bind_sampled_images)
-        .min(p.max_descriptor_set_update_after_bind_sampled_images)
-        .min(
-            p.max_per_stage_update_after_bind_resources
-                .saturating_sub(NON_TEXTURE_DESCRIPTORS),
-        )
 }
 
 fn query_features(
@@ -840,7 +954,10 @@ fn create_device(instance: &Instance, c: &Candidate) -> Result<ash::Device, Erro
         .runtime_descriptor_array(true)
         .shader_sampled_image_array_non_uniform_indexing(true)
         .descriptor_binding_partially_bound(true)
-        .descriptor_binding_sampled_image_update_after_bind(true);
+        // Only for a table that is made of update-after-bind sets.
+        .descriptor_binding_sampled_image_update_after_bind(
+            c.caps.texture_table == TextureTablePath::UpdateAfterBind,
+        );
     let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
         .synchronization2(true);
@@ -978,6 +1095,86 @@ mod tests {
         // An override never falls back to the other chain.
         assert_eq!(choose(false, true, Some(Khr)), Neither);
         assert_eq!(choose(true, false, Some(Ext)), Neither);
+    }
+
+    #[test]
+    fn the_table_is_ordinary_unless_only_update_after_bind_holds_it() {
+        use TextureTablePath::{Ordinary, UpdateAfterBind};
+        let limits = |ordinary, update_after_bind| TextureTableLimits {
+            ordinary,
+            update_after_bind,
+        };
+        // Both hold it: ordinary sets.
+        let roomy = limits(1 << 20, Some(1 << 20));
+        assert_eq!(roomy.choose(1024, None), Ok((Ordinary, 1024)));
+        assert_eq!(roomy.choose(16_384, None), Ok((Ordinary, 16_384)));
+        // Ordinary sets are too small for what is wanted: update-after-bind, if there.
+        let tight = limits(512, Some(500_000));
+        assert_eq!(tight.choose(1024, None), Ok((UpdateAfterBind, 1024)));
+        assert_eq!(tight.choose(512, None), Ok((Ordinary, 512)));
+        assert_eq!(limits(512, None).choose(1024, None), Ok((Ordinary, 512)));
+        // Update-after-bind that is no larger gains nothing.
+        assert_eq!(
+            limits(512, Some(512)).choose(1024, None),
+            Ok((Ordinary, 512))
+        );
+        assert_eq!(
+            limits(512, Some(800)).choose(1024, None),
+            Ok((UpdateAfterBind, 800))
+        );
+        // Below the floor on every path allowed: no table.
+        assert!(limits(128, None).choose(1024, None).is_err());
+        assert!(limits(128, Some(200)).choose(1024, None).is_err());
+        assert_eq!(
+            limits(128, Some(500_000)).choose(1024, None),
+            Ok((UpdateAfterBind, 1024))
+        );
+        // An override never falls back to the other path.
+        assert_eq!(tight.choose(1024, Some(Ordinary)), Ok((Ordinary, 512)));
+        assert_eq!(
+            roomy.choose(1024, Some(UpdateAfterBind)),
+            Ok((UpdateAfterBind, 1024))
+        );
+        assert!(
+            limits(1 << 20, None)
+                .choose(1024, Some(UpdateAfterBind))
+                .is_err()
+        );
+        assert!(
+            limits(128, Some(500_000))
+                .choose(1024, Some(Ordinary))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn table_limits_count_every_copy_of_the_set() {
+        let core = vk::PhysicalDeviceLimits {
+            max_per_stage_descriptor_sampled_images: 4000,
+            max_descriptor_set_sampled_images: 3000,
+            max_per_stage_resources: 2000,
+            ..Default::default()
+        };
+        let indexing = vk::PhysicalDeviceDescriptorIndexingProperties {
+            max_per_stage_descriptor_update_after_bind_sampled_images: 1 << 20,
+            max_descriptor_set_update_after_bind_sampled_images: 1 << 20,
+            max_per_stage_update_after_bind_resources: 1 << 20,
+            max_update_after_bind_descriptors_in_all_pools: 10_000,
+            ..Default::default()
+        };
+        let l = TextureTableLimits::of(&core, &indexing, true);
+        assert_eq!(l.ordinary, 2000 - NON_TEXTURE_DESCRIPTORS);
+        // Two copies of the set, samplers included, share the pools' budget.
+        assert_eq!(
+            l.update_after_bind,
+            Some(
+                10_000 / crate::frame::MAX_FRAMES_IN_FLIGHT as u32 - crate::textures::SAMPLER_COUNT
+            )
+        );
+        assert_eq!(
+            TextureTableLimits::of(&core, &indexing, false).update_after_bind,
+            None
+        );
     }
 
     #[test]

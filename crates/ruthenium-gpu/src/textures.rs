@@ -4,8 +4,15 @@
 //! passed in push constants, so a draw never writes or binds a descriptor.
 //!
 //! - There is one copy of the set per frame in flight. A copy is written only at the start
-//!   of its slot's frame, when the frame that last used it has finished, so no feature
-//!   beyond the baseline (`descriptorBindingUpdateUnusedWhilePending`) is needed.
+//!   of its slot's frame, when the frame that last used it has finished and before
+//!   anything of the new frame binds it. Ordinary descriptor sets allow exactly that, so
+//!   the table is made of them wherever their limits hold it, and of update-after-bind
+//!   sets only for a table larger than those limits ([`TextureTablePath`]). Shaders and
+//!   contents are the same on both.
+//! - The table has a fixed number of slots (`DeviceCaps::texture_slots`). When all are
+//!   taken, creating a texture fails with [`Error::TextureTableFull`], which says whether
+//!   destroyed textures are still on their way out: their slots come back once the
+//!   frames that may sample them have finished, so the caller tries again later.
 //! - Every slot not holding a ready texture shows [`TextureId::MISSING`], a magenta and
 //!   black checkerboard, so a stale or unknown index never reads a dead descriptor.
 //! - A texture becomes visible once its first upload is ready ([`Arrival`]): in the frame
@@ -22,7 +29,7 @@ use std::sync::Arc;
 use ash::vk;
 use ash::vk::TaggedStructure;
 
-use crate::device::Gpu;
+use crate::device::{Gpu, TextureTablePath};
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::memory::{Image, texel_bytes};
 use crate::upload::{ImageDst, ImageRegion, UploadError, UploadRing, UploadTicket};
@@ -42,6 +49,9 @@ const STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
         | vk::ShaderStageFlags::FRAGMENT.as_raw()
         | vk::ShaderStageFlags::COMPUTE.as_raw(),
 );
+
+/// Descriptor writes made by one `vkUpdateDescriptorSets` call; longer lists go in several.
+const WRITE_BATCH: usize = 256;
 
 /// Side of the missing texture, in texels, and its two colours (RGBA8).
 const MISSING_SIZE: u32 = 16;
@@ -242,6 +252,33 @@ impl Slots {
     }
 }
 
+/// How full the table is and has been.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextureTableStats {
+    /// Slots, including the missing texture's.
+    pub capacity: u32,
+    /// Textures that exist now, the missing texture included.
+    pub live: u32,
+    /// Destroyed textures whose slots are not free yet.
+    pub retiring: u32,
+    /// The most there have been of each, and of both together (slots taken at once).
+    pub peak_live: u32,
+    pub peak_retiring: u32,
+    pub peak_taken: u32,
+    /// Textures that could not be created because every slot was taken.
+    pub refused: u64,
+}
+
+impl TextureTableStats {
+    fn count(&mut self, live: i32, retiring: i32) {
+        self.live = self.live.saturating_add_signed(live);
+        self.retiring = self.retiring.saturating_add_signed(retiring);
+        self.peak_live = self.peak_live.max(self.live);
+        self.peak_retiring = self.peak_retiring.max(self.retiring);
+        self.peak_taken = self.peak_taken.max(self.live + self.retiring);
+    }
+}
+
 /// The shared texture table. See the module docs.
 pub struct TextureTable {
     gpu: Arc<Gpu>,
@@ -259,31 +296,43 @@ pub struct TextureTable {
     orphans: Vec<(UploadTicket, u32, Texture)>,
     /// Per set: (index, view) writes to make at the start of that set's next frame.
     pending: [Vec<(u32, vk::ImageView)>; MAX_FRAMES_IN_FLIGHT],
-    /// Number of the last frame begun.
+    /// Scratch for those writes, [`WRITE_BATCH`] at a time: the image infos, then the
+    /// writes that point at them. Both are empty between calls.
+    write_infos: Vec<vk::DescriptorImageInfo>,
+    writes: Vec<vk::WriteDescriptorSet<'static>>,
+    /// Per set: whether each slot shows a texture of its own (not the missing texture),
+    /// as last written.
+    shown: [Vec<bool>; MAX_FRAMES_IN_FLIGHT],
+    /// Number of the last frame begun, and its set.
     frame: u64,
+    set: usize,
+    path: TextureTablePath,
+    stats: TextureTableStats,
 }
 
 impl fmt::Debug for TextureTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TextureTable")
-            .field("capacity", &self.slots.capacity)
-            .field(
-                "live",
-                &self.textures.iter().filter(|t| t.is_some()).count(),
-            )
-            .field("retiring", &self.retiring.len())
+            .field("path", &self.path)
+            .field("stats", &self.stats)
             .finish_non_exhaustive()
     }
 }
 
 // SAFETY: Vulkan handles may be used from any thread; all mutation goes through &mut self.
+// The pointers in `writes` are only alive inside `flush_writes`, which empties it.
 unsafe impl Send for TextureTable {}
 
 impl TextureTable {
-    /// Creates the table with as many slots as the device allows (`DeviceCaps::texture_slots`)
-    /// and stages the missing texture into `upload`, so it is ready in the first frame.
+    /// The two colours of the missing texture's checkerboard (RGBA), top left first.
+    pub const MISSING_COLORS: [[u8; 4]; 2] = MISSING_COLORS;
+
+    /// Creates the table with the slots and the kind of descriptor set chosen for the
+    /// device (`DeviceCaps::texture_slots`, `DeviceCaps::texture_table`) and stages the
+    /// missing texture into `upload`, so it is ready in the first frame.
     pub fn new(gpu: Arc<Gpu>, upload: &mut UploadRing) -> Result<TextureTable, Error> {
         let capacity = gpu.caps().texture_slots;
+        let path = gpu.caps().texture_table;
         let mut t = TextureTable {
             samplers: [vk::Sampler::null(); SAMPLER_COUNT as usize],
             layout: vk::DescriptorSetLayout::null(),
@@ -295,13 +344,23 @@ impl TextureTable {
             arriving: Vec::new(),
             orphans: Vec::new(),
             pending: std::array::from_fn(|_| Vec::new()),
+            write_infos: Vec::with_capacity(WRITE_BATCH),
+            writes: Vec::with_capacity(WRITE_BATCH),
+            shown: std::array::from_fn(|_| vec![false; capacity as usize]),
             frame: 0,
+            set: 0,
+            path,
+            stats: TextureTableStats {
+                capacity,
+                ..TextureTableStats::default()
+            },
             gpu,
         };
         // Drop destroys whatever was created if a step fails.
         t.create_descriptors(capacity)?;
         let missing = t.create_texture(TextureDesc::rgba8(MISSING_SIZE, MISSING_SIZE))?;
         t.textures.push(Some(missing));
+        t.stats.count(1, 0);
         let pixels = missing_pixels();
         t.upload(upload, TextureId::MISSING, &[&pixels], Arrival::NextFrame)?;
         // Every slot starts on the missing texture (written directly: no set is in use).
@@ -350,17 +409,27 @@ impl TextureTable {
                 .descriptor_count(capacity)
                 .stage_flags(STAGES),
         ];
-        // Update-after-bind for its far higher descriptor limits; partially bound so the
-        // driver doesn't validate slots a draw doesn't touch.
-        let flags = [
-            vk::DescriptorBindingFlags::empty(),
-            vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
-                | vk::DescriptorBindingFlags::PARTIALLY_BOUND,
-        ];
+        // Partially bound, so the driver doesn't validate slots a draw doesn't touch.
+        // Update-after-bind only for its higher descriptor limits: the binding, the layout
+        // and the pool carry it together, or none of them does.
+        let (texture_flags, layout_flags, pool_flags) = match self.path {
+            TextureTablePath::Ordinary => (
+                vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+                vk::DescriptorSetLayoutCreateFlags::empty(),
+                vk::DescriptorPoolCreateFlags::empty(),
+            ),
+            TextureTablePath::UpdateAfterBind => (
+                vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL,
+                vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND,
+            ),
+        };
+        let flags = [vk::DescriptorBindingFlags::empty(), texture_flags];
         let mut binding_flags =
             vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
         let info = vk::DescriptorSetLayoutCreateInfo::default()
-            .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
+            .flags(layout_flags)
             .bindings(&bindings)
             .push(&mut binding_flags);
         // SAFETY: plain object creation; destroyed in Drop.
@@ -379,7 +448,7 @@ impl TextureTable {
             },
         ];
         let info = vk::DescriptorPoolCreateInfo::default()
-            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
+            .flags(pool_flags)
             .max_sets(sets)
             .pool_sizes(&sizes);
         // SAFETY: plain object creation; destroyed in Drop.
@@ -405,6 +474,53 @@ impl TextureTable {
         self.slots.capacity
     }
 
+    /// The kind of descriptor set the table is made of.
+    pub fn path(&self) -> TextureTablePath {
+        self.path
+    }
+
+    /// How full the table is and has been.
+    pub fn stats(&self) -> TextureTableStats {
+        self.stats
+    }
+
+    /// Whether slot `index` shows a texture of its own in the frame last begun, as that
+    /// frame's copy of the set was written; if not (a free slot, a texture still arriving
+    /// or created since, an index outside the table) it shows the missing texture. A
+    /// texture destroyed during the frame is still shown in it.
+    pub fn shows(&self, index: u32) -> bool {
+        self.shown[self.set]
+            .get(index as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// A free slot, or why there is none.
+    fn take_slot(&mut self) -> Result<u32, Error> {
+        match self.slots.take() {
+            Some(i) => {
+                if self.textures.len() <= i as usize {
+                    self.textures.resize_with(i as usize + 1, || None);
+                }
+                self.stats.count(1, 0);
+                Ok(i)
+            }
+            None => {
+                if self.stats.refused == 0 {
+                    eprintln!(
+                        "[gpu] the texture table is full ({} slots, {} of them being freed): new textures wait for a slot",
+                        self.slots.capacity, self.stats.retiring
+                    );
+                }
+                self.stats.refused += 1;
+                Err(Error::TextureTableFull {
+                    capacity: self.slots.capacity,
+                    retiring: self.stats.retiring,
+                })
+            }
+        }
+    }
+
     fn create_texture(&self, desc: TextureDesc) -> Result<Texture, Error> {
         desc.check(self.gpu.caps().max_image_dimension_2d)
             .map_err(Error::Unsupported)?;
@@ -418,22 +534,24 @@ impl TextureTable {
 
     /// Creates a texture. Until its contents are uploaded (`upload`), its slot shows the
     /// missing texture.
+    ///
+    /// With every slot taken this is [`Error::TextureTableFull`], and nothing was created.
     pub fn create(&mut self, desc: TextureDesc) -> Result<TextureId, Error> {
-        let texture = self.create_texture(desc)?;
-        let Some(i) = self.slots.take() else {
-            // SAFETY: never used.
-            unsafe { texture.image.destroy(&self.gpu) };
-            return Err(Error::Unsupported(format!(
-                "the texture table is full ({} textures)",
-                self.slots.capacity
-            )));
-        };
-        let i = i as usize;
-        if self.textures.len() <= i {
-            self.textures.resize_with(i + 1, || None);
+        desc.check(self.gpu.caps().max_image_dimension_2d)
+            .map_err(Error::Unsupported)?;
+        // The slot first: a full table costs no image.
+        let i = self.take_slot()?;
+        match self.create_texture(desc) {
+            Ok(texture) => {
+                self.textures[i as usize] = Some(texture);
+                Ok(TextureId(i))
+            }
+            Err(e) => {
+                self.slots.give_back(i);
+                self.stats.count(-1, 0);
+                Err(e)
+            }
         }
-        self.textures[i] = Some(texture);
-        Ok(TextureId(i as u32))
     }
 
     /// Creates a texture the renderer draws into (a render target) instead of uploading
@@ -457,19 +575,16 @@ impl TextureTable {
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
             | vk::ImageUsageFlags::SAMPLED
             | vk::ImageUsageFlags::TRANSFER_SRC;
-        let image = Image::new_2d(&self.gpu, format, extent, 1, usage)?;
-        let (raw, view) = (image.raw, image.view);
-        let Some(i) = self.slots.take() else {
-            // SAFETY: never used.
-            unsafe { image.destroy(&self.gpu) };
-            return Err(Error::Unsupported(format!(
-                "the texture table is full ({} textures)",
-                self.slots.capacity
-            )));
+        let i = self.take_slot()?;
+        let image = match Image::new_2d(&self.gpu, format, extent, 1, usage) {
+            Ok(image) => image,
+            Err(e) => {
+                self.slots.give_back(i);
+                self.stats.count(-1, 0);
+                return Err(e);
+            }
         };
-        if self.textures.len() <= i as usize {
-            self.textures.resize_with(i as usize + 1, || None);
-        }
+        let (raw, view) = (image.raw, image.view);
         self.textures[i as usize] = Some(Texture {
             image,
             desc,
@@ -624,10 +739,12 @@ impl TextureTable {
                 // Its copies may not even be submitted yet: it retires once they are done.
                 self.arriving.retain(|&i| i != id.0);
                 self.orphans.push((ticket, id.0, t));
+                self.stats.count(-1, 1);
                 return;
             }
             State::Empty => {}
         }
+        self.stats.count(-1, 1);
         // Frames up to self.frame may sample it or record its staged copies, and each set
         // drops it at its own next frame: after self.frame + MAX_FRAMES_IN_FLIGHT, all have.
         self.retiring
@@ -641,6 +758,7 @@ impl TextureTable {
     pub fn begin_frame(&mut self, slot: usize, frame: u64, completed: u64, upload: &UploadRing) {
         profiling::scope!("texture_table");
         self.frame = frame;
+        self.set = slot;
         let mut i = 0;
         while i < self.arriving.len() {
             let index = self.arriving[i];
@@ -670,35 +788,7 @@ impl TextureTable {
                 i += 1;
             }
         }
-        let pending = &mut self.pending[slot];
-        if !pending.is_empty() {
-            // Only when textures change (loading), never in a steady frame.
-            let infos: Vec<[vk::DescriptorImageInfo; 1]> = pending
-                .iter()
-                .map(|&(_, view)| {
-                    [vk::DescriptorImageInfo::default()
-                        .image_view(view)
-                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]
-                })
-                .collect();
-            let writes: Vec<vk::WriteDescriptorSet<'_>> = pending
-                .iter()
-                .zip(&infos)
-                .map(|(&(index, _), info)| {
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.sets[slot])
-                        .dst_binding(TEXTURE_BINDING)
-                        .dst_array_element(index)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(info)
-                })
-                .collect();
-            // SAFETY: the slot's previous frame has finished (FrameLoop::begin waited), so
-            // no pending command buffer uses this set; writes apply in order, and every view
-            // is alive (destroyed textures outlive their pending writes, see destroy()).
-            unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
-            pending.clear();
-        }
+        self.flush_writes(slot);
         let mut i = 0;
         while i < self.retiring.len() {
             if self.retiring[i].0 <= completed {
@@ -707,10 +797,56 @@ impl TextureTable {
                 // were rewritten to the missing texture in frames that came before.
                 unsafe { t.image.destroy(&self.gpu) };
                 self.slots.give_back(index);
+                self.stats.count(0, -1);
             } else {
                 i += 1;
             }
         }
+    }
+
+    /// Makes the writes pending for `slot`'s copy of the set, in order (a slot may be
+    /// written twice: shown, then back to the missing texture), [`WRITE_BATCH`] at a time
+    /// through the table's scratch. Nothing to do in a steady frame: writes are pending
+    /// only when textures come or go.
+    fn flush_writes(&mut self, slot: usize) {
+        let set = self.sets[slot];
+        let missing = self.textures[0].as_ref().map(|m| m.image.view);
+        for batch in self.pending[slot].chunks(WRITE_BATCH) {
+            for &(index, view) in batch {
+                self.shown[slot][index as usize] = Some(view) != missing;
+            }
+            // Every info first: the writes point into this storage, which must not move
+            // (it never grows past the capacity it was created with).
+            self.write_infos.extend(batch.iter().map(|&(_, view)| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            }));
+            self.writes.extend(
+                batch
+                    .iter()
+                    .zip(&self.write_infos)
+                    .map(|(&(index, _), info)| {
+                        let mut write = vk::WriteDescriptorSet::default()
+                            .dst_set(set)
+                            .dst_binding(TEXTURE_BINDING)
+                            .dst_array_element(index)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE);
+                        write.descriptor_count = 1;
+                        write.p_image_info = info;
+                        write
+                    }),
+            );
+            // SAFETY: the slot's previous frame has finished (FrameLoop::begin waited) and
+            // nothing of the new one has bound this set, so no command buffer uses it;
+            // writes apply in order; each points at one info in write_infos, which is not
+            // touched until after the call; every view is alive (destroyed textures
+            // outlive their pending writes, see destroy()).
+            unsafe { self.gpu.device.update_descriptor_sets(&self.writes, &[]) };
+            self.writes.clear();
+            self.write_infos.clear();
+        }
+        self.pending[slot].clear();
     }
 
     /// Binds this frame's set at set 0 for graphics and compute.

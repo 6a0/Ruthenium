@@ -389,7 +389,8 @@ impl UploadCheck {
                     Ok(id) => {
                         self.tex = TexState::Arriving(id, next_frame.then_some(ctx.number + 1))
                     }
-                    Err(Error::Upload(UploadError::Full)) => self.report.retries += 1,
+                    // The ring is full for this frame, or the texture table is.
+                    Err(e) if e.try_again() => self.report.retries += 1,
                     Err(e) => return Err(e),
                 }
             }

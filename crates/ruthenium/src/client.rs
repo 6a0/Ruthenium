@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use ruthenium_gpu::{
     ACQUIRE_TIMEOUT, GpuOptions, PresentPolicy, Presented, PretendSrgb, SwapchainMaintenance,
-    Validation,
+    TextureTablePath, Validation,
 };
 use ruthenium_platform::{DEFAULT_SIZE, Event, Platform, Sleeper, next_deadline};
 use ruthenium_render::{Background, FrameTimes, OverlayStats, Renderer, Summary, create_gpu};
@@ -118,6 +118,14 @@ pub struct Options {
     /// Development: with `--screenshot`, resize the window to this size in points once
     /// the menus show, and take the screenshot of the first frame at the new size.
     pub screenshot_resize: Option<(u32, u32)>,
+    /// Texture-table slots to ask the GPU for (default: the GPU crate's).
+    pub texture_slots: Option<u32>,
+    /// Make the texture table of this kind of descriptor set only (default: ordinary
+    /// sets, update-after-bind when that gives a larger table).
+    pub texture_table: Option<TextureTablePath>,
+    /// Development: fill, reload and read back the texture table every frame (run it
+    /// under validation); a wrong slot fails the run.
+    pub exercise_textures: bool,
 }
 
 impl Options {
@@ -156,6 +164,9 @@ impl Options {
             acquire_wait: AcquireWait::Pace,
             pretend_srgb: PretendSrgb::Never,
             screenshot_resize: None,
+            texture_slots: None,
+            texture_table: None,
+            exercise_textures: false,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -259,6 +270,30 @@ impl Options {
                         }
                     };
                 }
+                "--texture-slots" => {
+                    let v = value("a number of slots")?;
+                    let range = ruthenium_gpu::MIN_TEXTURE_SLOTS..=ruthenium_gpu::MAX_TEXTURE_SLOTS;
+                    o.texture_slots =
+                        Some(v.parse().ok().filter(|n| range.contains(n)).ok_or(format!(
+                            "--texture-slots: not {} to {}: {v}",
+                            range.start(),
+                            range.end()
+                        ))?);
+                }
+                "--texture-table" => {
+                    let v = value("auto, ordinary or update-after-bind")?;
+                    o.texture_table = match v.as_str() {
+                        "auto" => None,
+                        "ordinary" => Some(TextureTablePath::Ordinary),
+                        "update-after-bind" => Some(TextureTablePath::UpdateAfterBind),
+                        _ => {
+                            return Err(format!(
+                                "--texture-table: not auto, ordinary or update-after-bind: {v}"
+                            ));
+                        }
+                    };
+                }
+                "--exercise-textures" => o.exercise_textures = true,
                 "--data-dir" => o.data_dir = Some(value("a folder")?.into()),
                 "--join" => o.join = Some(value("a server address")?),
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
@@ -388,6 +423,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             no_transfer_queue: opts.no_transfer_queue,
             swapchain_maintenance: opts.swapchain_maintenance,
             pretend_srgb: opts.pretend_srgb,
+            texture_slots: opts.texture_slots,
+            texture_table: opts.texture_table,
         },
     )?;
     {
@@ -449,6 +486,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
         renderer.enable_upload_check()?;
+    }
+    if opts.exercise_textures {
+        renderer.enable_table_check()?;
     }
     if opts.exercise_swapchain {
         renderer.exercise_recreation();
@@ -957,6 +997,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             startup,
             counters,
             memory: renderer.gpu().memory_report(),
+            textures: renderer.texture_stats(),
         });
         if let Err(e) = std::fs::write(path, json) {
             eprintln!("[ruthenium] could not write {}: {e}", path.display());
@@ -986,6 +1027,39 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             || c.late_textures > 0
             || c.textures == 0;
     }
+    let table = renderer.texture_stats();
+    eprintln!(
+        "[ruthenium] texture table: at most {} of {} slots taken ({} live, {} being freed){}",
+        table.peak_taken,
+        table.capacity,
+        table.peak_live,
+        table.peak_retiring,
+        match table.refused {
+            0 => String::new(),
+            n => format!("; {n} creations refused when full"),
+        }
+    );
+    if let Some(c) = renderer.table_check() {
+        eprintln!(
+            "[ruthenium] texture table check ({} slots, {} sets): {} grids, {} slots compared, {} wrong; {} textures created, table full {} times{}, {} reloads, {} creations deferred while slots were freed, {} stuck",
+            table.capacity,
+            renderer.gpu().caps().texture_table.name(),
+            c.grids,
+            c.slots,
+            c.mismatches,
+            c.created,
+            c.exhausted,
+            if c.capped {
+                " (larger than the check fills)"
+            } else {
+                ""
+            },
+            c.reloads,
+            c.deferred,
+            c.stuck
+        );
+        failed |= !c.passed();
+    }
     if opts.exercise_swapchain {
         let fallbacks = renderer.glass_fallbacks();
         eprintln!(
@@ -999,7 +1073,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         );
         // Each replaced swapchain must go while the client runs, and the backdrop must be
         // there in a swapchain's first frame.
-        failed |= fallbacks > 0
+        // (With --exercise-textures the table is full on purpose, and a backdrop remade
+        // for a new size waits for a slot like any other texture.)
+        failed |= (fallbacks > 0 && !opts.exercise_textures)
             || captures.0 == 0
             || counters.swapchains_destroyed + 8 < counters.swapchains;
     }

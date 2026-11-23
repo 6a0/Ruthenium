@@ -175,6 +175,39 @@ The firmware platform profile `performance` (the vanilla baseline's), variable r
 - **The change costs nothing measurable here either:** the A/B against the baseline's build has a frame time median of 0.058 against 0.059 ms, within the spread, and the same memory.
 - The 34.5 ms acquire bursts did not come back in any run of the day after the baseline's, at either setting, so what caused them is still open.
 
+## Packaging the menu
+
+Recorded on 2026-11-23 from the working tree on top of `92ab409`, in release, at the `performance` profile with variable refresh rate set to Never and Sunshine capturing the desktop.
+
+### The texture table
+
+The table had 16,384 slots in update-after-bind descriptor sets. It now asks for 1,024 in ordinary sets, takes update-after-bind sets only when they hold a larger table than ordinary ones can, and needs at least 256 (`--texture-slots`, `--texture-table`). Both GPUs here allow about a million textures either way, so both get ordinary sets.
+
+| Slots, sets | Table made in (ms), RTX 4060 | llvmpipe |
+|---|---:|---:|
+| 16,384, update-after-bind (before) | 0.31 | 0.84 |
+| 16,384, ordinary | 0.29 | 0.90 |
+| 2,048, ordinary | 0.16 | 0.12 |
+| 1,024, ordinary (default) | 0.14 | 0.07 |
+| 256, ordinary | 0.13 | 0.04 |
+
+Medians of seven launches on the RTX 4060 and three on llvmpipe, taken in turns.
+
+- **The smaller table saves a fraction of a millisecond at start-up and no memory that shows:** resident memory was 190.3 to 190.6 MiB at every size on the RTX 4060, and 220 to 225 MiB with no order on llvmpipe.
+- **A frame costs the same.** An A/B of the default against the old table (`--b-args '--texture-slots 16384 --texture-table update-after-bind'`, six rounds of 5 s) has a frame time median of 0.058 ms on both sides and every metric inside the spread.
+- **The menus of a profile with no account or server take 8 slots at most** (7 textures and one on its way out). The client prints the peak at exit, and `--bench-out` records it, for the working sets to come: resource packs, skins, maps.
+- 1,024 is kept as the default and 2,048 is not needed yet. A table that is full refuses new textures and says whether slots are on their way back; the menus' own uploads then wait for a slot instead of giving up.
+
+`--exercise-textures` fills the table until a texture is refused, holds it, destroys half of the textures (every third time, all) and fills up again, while one pixel per slot is drawn with the GUI pipeline each frame and read back. In 6 s at 256 slots under the validation layer:
+
+| | RTX 4060, ordinary | update-after-bind | llvmpipe, ordinary | update-after-bind |
+|---|---:|---:|---:|---:|
+| Slots compared, wrong | 232,522, 0 | 233,519, 0 | 270,378, 0 | 272,878, 0 |
+| Times the table was full | 91 | 90 | 75 | 75 |
+| Creations that waited for a freed slot | 242 | 239 | 148 | 150 |
+
+It also passes at 1,024 and 2,048 slots, with `--exercise-uploads`, and at 16,384 slots, where the check stops at 2,048 textures of its own and the table is never full. With `--exercise-swapchain` the glass backdrop of a resized window sometimes waits for a slot (77 frames in 8 s drew the flat tint instead), which that exercise would count as a failure and does not when the table is being filled on purpose.
+
 ## Against the targets
 
 | Target | At `balanced` | At `performance` |
@@ -192,6 +225,7 @@ The firmware platform profile `performance` (the vanilla baseline's), variable r
 - **A cold start** with the files out of the page cache.
 - **Occlusion, moving between displays and a stalled compositor**, which need a person at the machine. They are also where the shorter acquire wait has yet to be measured, together with the CPU an idle, covered window takes with it.
 - **A surface that really offers only sRGB formats.** `--pretend-srgb-surface` hides the others to show that it is refused; presenting to one through UNORM views of a mutable-format swapchain is not built.
+- **A GPU whose ordinary descriptor limits are below the table.** Both GPUs here allow a million sampled images in ordinary sets, so the update-after-bind path was only run forced.
 
 ## Reproducing
 
@@ -213,5 +247,12 @@ ruthenium --screenshot steady.png --window-size 1100x620 --screenshot-after 0.5 
 ```
 
 `--exercise-swapchain` fails the run if a replaced swapchain is not destroyed while the client runs, if a frame draws glass without its backdrop, or on any validation message.
+
+The renderer's checks:
+
+```sh
+ruthenium --validation --exercise-textures --texture-slots 256 --texture-table update-after-bind --quit-after 6
+cargo xtask bench ab --a work --b work --b-args '--texture-slots 16384 --texture-table update-after-bind'
+```
 
 Each line has the frame's number, when its input was sampled, the time in each part of the main thread's frame (limiter, governor, events, game, GUI, recording, and the acquire, submit and present calls), how the acquire ended, and the frame's GPU time.

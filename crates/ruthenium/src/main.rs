@@ -64,6 +64,14 @@ With no command, opens the game window. Options:
   --no-transfer-queue    upload on the graphics queue even if there is a copy queue
   --exercise-uploads     check data pushed through the upload ring every frame
                          (development; a mismatch fails the run)
+  --texture-slots <n>    slots of the texture table to ask the GPU for (default 1024,
+                         at least 256)
+  --texture-table <auto|ordinary|update-after-bind>
+                         make the texture table of this kind of descriptor set only
+                         (default auto: ordinary, update-after-bind for a larger table)
+  --exercise-textures    fill and reload the texture table and read every slot back
+                         through the GUI pipeline (development; a wrong slot fails the
+                         run)
   --screenshot <file>    write the window to a PNG, then quit (development); runs
                          on the default settings unless --data-dir is given
   --screenshot-resize <WxH>

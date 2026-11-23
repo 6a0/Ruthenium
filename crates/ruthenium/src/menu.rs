@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use ruthenium_gpu::{Arrival, TextureDesc, TextureId, UploadError};
+use ruthenium_gpu::{Arrival, TextureDesc, TextureId};
 use ruthenium_net::server_list::{MAX_ADDRESS, MAX_NAME, PackStatus, ServerEntry};
 use ruthenium_platform::Window;
 
@@ -1719,7 +1719,7 @@ impl Menu {
             match renderer.create_texture(desc, &levels, Arrival::NextFrame) {
                 Ok(t) => *f = FaceTexture::Ready(t),
                 // No room this frame: the rest wait too.
-                Err(ruthenium_gpu::Error::Upload(UploadError::Full)) => break,
+                Err(e) if e.try_again() => break,
                 Err(e) => {
                     eprintln!("[ruthenium] no player face: upload: {e}");
                     *f = FaceTexture::None;
@@ -1765,7 +1765,7 @@ impl Menu {
                     let desc = TextureDesc::rgba8(atlas.size, atlas.size);
                     match renderer.create_texture(desc, &[&atlas.pixels], Arrival::Background) {
                         Ok(t) => atlas_texture = Some(t),
-                        Err(ruthenium_gpu::Error::Upload(UploadError::Full)) => {}
+                        Err(e) if e.try_again() => {}
                         Err(e) => {
                             eprintln!("[ruthenium] no menu text: glyph atlas upload: {e}");
                             failed = true;
@@ -1780,7 +1780,7 @@ impl Menu {
                     let levels: Vec<&[u8]> = logo.levels.iter().map(Vec::as_slice).collect();
                     match renderer.create_texture(desc, &levels, Arrival::Background) {
                         Ok(t) => logo_texture = Some(t),
-                        Err(ruthenium_gpu::Error::Upload(UploadError::Full)) => {}
+                        Err(e) if e.try_again() => {}
                         Err(e) => {
                             eprintln!("[ruthenium] no logo: upload: {e}");
                             failed = true;

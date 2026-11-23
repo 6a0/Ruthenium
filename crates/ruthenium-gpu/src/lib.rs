@@ -16,6 +16,7 @@ mod frame_data;
 mod instance;
 mod memory;
 mod pipeline;
+mod readback;
 mod screenshot;
 mod swapchain;
 mod textures;
@@ -24,7 +25,9 @@ mod upload_check;
 
 pub use ash::vk;
 pub use device::{
-    DeviceCaps, Gpu, GpuOptions, OptionalFeatures, PretendSrgb, Rejected, SwapchainMaintenance,
+    DEFAULT_TEXTURE_SLOTS, DeviceCaps, Gpu, GpuOptions, MAX_TEXTURE_SLOTS, MIN_TEXTURE_SLOTS,
+    OptionalFeatures, PretendSrgb, Rejected, SwapchainMaintenance, TextureTableLimits,
+    TextureTablePath,
 };
 pub use frame::{
     ACQUIRE_TIMEOUT, Acquired, FrameCounters, FrameCtx, FrameLoop, FrameTimings, GpuTime, GpuZone,
@@ -37,10 +40,12 @@ pub use pipeline::{
     Blend, GraphicsDesc, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout,
     Pipelines,
 };
+pub use readback::Readback;
 pub use screenshot::Screenshot;
 pub use swapchain::{COLOR_RANGE, PresentPolicy};
 pub use textures::{
     Arrival, MAX_MIP_LEVELS, SAMPLER_COUNT, SamplerId, TextureDesc, TextureId, TextureTable,
+    TextureTableStats,
 };
 pub use upload::{ImageDst, ImageRegion, UploadError, UploadRing, UploadTicket};
 pub use upload_check::{UploadCheck, UploadCheckReport};
@@ -61,6 +66,10 @@ pub enum Error {
     NoSuitableDevice(Vec<Rejected>),
     /// Data could not be staged for upload.
     Upload(UploadError),
+    /// Every slot of the texture table is taken, so no texture was created. `retiring` of
+    /// them hold destroyed textures and come back once the frames that may still sample
+    /// those have finished: with any, the caller can try again in a later frame.
+    TextureTableFull { capacity: u32, retiring: u32 },
 }
 
 impl fmt::Display for Error {
@@ -69,6 +78,10 @@ impl fmt::Display for Error {
             Error::Vk { call, result } => write!(f, "{call} failed: {result}"),
             Error::Unsupported(why) => f.write_str(why),
             Error::Upload(e) => e.fmt(f),
+            Error::TextureTableFull { capacity, retiring } => write!(
+                f,
+                "the texture table is full ({capacity} slots, {retiring} of them being freed)"
+            ),
             Error::NoSuitableDevice(rejected) if rejected.is_empty() => {
                 f.write_str("no Vulkan GPU found; update your graphics driver")
             }
@@ -87,6 +100,18 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl Error {
+    /// Whether the same call can succeed in a later frame with nothing else changed: the
+    /// upload ring was full for this frame, or the texture table has no free slot now
+    /// (slots come back as destroyed textures retire, or as the owner of others lets go).
+    pub fn try_again(&self) -> bool {
+        matches!(
+            self,
+            Error::Upload(UploadError::Full) | Error::TextureTableFull { .. }
+        )
+    }
+}
 
 impl From<UploadError> for Error {
     fn from(e: UploadError) -> Error {

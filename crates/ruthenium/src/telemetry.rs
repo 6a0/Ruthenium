@@ -303,6 +303,17 @@ impl Telemetry {
                 "api": ruthenium_gpu::version_string(run.caps.api_version),
                 "unified_memory": run.caps.unified_memory,
                 "texture_slots": run.caps.texture_slots,
+                "texture_table": run.caps.texture_table.name(),
+                "texture_table_limits": {
+                    "ordinary": run.caps.texture_table_limits.ordinary,
+                    "update_after_bind": run.caps.texture_table_limits.update_after_bind,
+                },
+                "texture_slots_peak": {
+                    "taken": run.textures.peak_taken,
+                    "live": run.textures.peak_live,
+                    "retiring": run.textures.peak_retiring,
+                    "refused": run.textures.refused,
+                },
                 "optional_features": run.caps.optional.named().iter()
                     .filter(|(_, on)| *on)
                     .map(|(name, _)| *name)
@@ -399,6 +410,7 @@ pub struct RunInfo<'a> {
     pub startup: Startup,
     pub counters: FrameCounters,
     pub memory: MemoryReport,
+    pub textures: ruthenium_gpu::TextureTableStats,
 }
 
 /// Milliseconds from the process's start to each start-up milestone.
@@ -553,8 +565,10 @@ mod tests {
             startup: Startup::default(),
             counters: FrameCounters::default(),
             memory: MemoryReport::default(),
+            textures: ruthenium_gpu::TextureTableStats::default(),
         });
         let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["device"]["texture_table"], "ordinary");
         assert_eq!(v["gpu"], "A \"quoted\" GPU");
         assert_eq!(v["frames_ahead"], 1);
         assert_eq!(v["frame"]["samples"], 1);
