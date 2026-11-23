@@ -8,7 +8,7 @@ use ruthenium_ui::text::GlyphQuad;
 pub const QUAD_BYTES: u32 = 48;
 
 /// Bytes per shape in the frame's data (std430: four vec4s, a uvec4, the clip vec4 and
-/// a vec4 whose x is the opacity).
+/// a vec4 of the opacity and the bevel's width).
 pub const SHAPE_BYTES: u32 = 112;
 
 /// One frame's GUI: vanilla-style quads (with the GUI scale they were laid out for) and
@@ -70,7 +70,7 @@ pub fn write_shapes(shapes: &[Shape], out: &mut [u8]) {
             *w = v.to_ne_bytes();
         }
         words[24] = s.clip.opacity.to_ne_bytes();
-        words[25] = [0; 4];
+        words[25] = s.bevel.to_ne_bytes();
         words[26] = [0; 4];
         words[27] = [0; 4];
     }

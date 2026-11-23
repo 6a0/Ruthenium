@@ -11,7 +11,7 @@ struct Shape {
     vec4 uv;     // image: u0, v0, u1, v1
     uvec4 tex;   // x: image texture index; y: ring width (float bits); z, w: clip fades (float bits)
     vec4 clip;   // x0, y0, x1, y1 in pixels
-    vec4 extra;  // x: opacity
+    vec4 extra;  // x: opacity; y: glass bevel width (px)
 };
 #define FRAME_ELEMENT Shape
 #include "frame.glsl"

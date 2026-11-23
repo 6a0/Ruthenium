@@ -113,6 +113,8 @@ pub struct Shape {
     pub highlight: f32,
     /// How far, in pixels, the glass bends the backdrop at its rim.
     pub refraction: f32,
+    /// Width in pixels of the glass's bevelled edge; the face inside it is flat.
+    pub bevel: f32,
     /// Draw this texture (premultiplied alpha) instead of a fill, tinted by `fill`.
     pub image: Option<ShapeImage>,
     /// Flat shapes: keep only a band this many pixels wide inside the edge (0 fills).
@@ -184,13 +186,15 @@ impl ShapeList {
         highlight: f32,
     ) {
         let px = scale.px;
+        let bevel = GLASS_BEVEL.min(radius).min(0.5 * r.h) * px;
         self.push(Shape {
             rect: px_rect(scale, r),
             fill: tint,
             radius: radius * px,
             glass: true,
             highlight,
-            refraction: 0.44 * radius.min(0.5 * r.h) * px,
+            refraction: GLASS_REFRACTION * bevel,
+            bevel,
             image: None,
             ring: 0.0,
             clip: Clip::NONE,
@@ -217,6 +221,7 @@ impl ShapeList {
             glass: false,
             highlight: 0.0,
             refraction: 0.0,
+            bevel: 0.0,
             image: None,
             ring: width * px,
             clip: Clip::NONE,
@@ -242,6 +247,7 @@ impl ShapeList {
             glass: false,
             highlight: 0.0,
             refraction: 0.0,
+            bevel: 0.0,
             image: Some(ShapeImage {
                 texture,
                 uv: [0.0, 0.0, 1.0, 1.0],
@@ -298,6 +304,11 @@ pub struct Button {
     pub label: &'static str,
     pub action: Action,
 }
+
+/// Glass is a flat slab with a bevelled edge: the edge's width (UI units), the same
+/// whatever the corner radius, and how far it bends the backdrop (fraction of the width).
+const GLASS_BEVEL: f32 = 4.0;
+const GLASS_REFRACTION: f32 = 0.6;
 
 /// Glass tint at rest and lit (hovered or focused); a press adds `PRESS_TINT` alpha.
 const TINT: [f32; 4] = [0.85, 0.88, 1.0, 0.04];

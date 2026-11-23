@@ -1,7 +1,7 @@
 #version 460
 // Ruthenium: rounded shapes with anti-aliased edges. Flat shapes are filled; glass
 // shapes (the "Liquid Glass" pills) show the blurred backdrop through a tint, bent
-// inwards near the rim like a thick lens, with a light rim from the top left; image
+// inwards at a narrow bevelled edge lit from the top left, flat inside it (a slab); image
 // shapes show a texture (the logo). A shape with a ring width keeps only a band that wide
 // inside its edge (the focus ring). Every shape is clipped to its clip rectangle.
 
@@ -85,8 +85,8 @@ void main() {
         rounded_rect(p - centre + e.yx, half_size, radius) - rounded_rect(p - centre - e.yx, half_size, radius)
     ) + 1e-6);
     float inside = max(-d, 0.0);
-    // 1 at the rim, falling to 0 a bevel's width in.
-    float bevel = max(radius, 1.0);
+    // 1 at the rim, falling to 0 a bevel's width in; the face beyond is flat.
+    float bevel = max(s.extra.y, 1.0);
     float rim = 1.0 - smoothstep(0.0, bevel, inside);
 
     // Lensing: near the rim the backdrop is pulled from further inside the shape.
@@ -103,9 +103,12 @@ void main() {
     // Light from the top left: a bright rim facing it, a dimmer one opposite.
     vec2 light = normalize(vec2(-0.55, -0.85));
     float facing = dot(n, light);
-    float edge = 1.0 - smoothstep(0.0, 2.5, inside);
-    float sheen = rim * rim * (max(facing, 0.0) * 0.55 + max(-facing, 0.0) * 0.2);
-    c += s.params.z * (sheen * 0.6 + edge * (0.18 + 0.32 * max(facing, 0.0)));
+    // The bevel is one facet, evenly lit up to where it meets the face, so that nothing
+    // shades the face; the rim itself catches a crisp line.
+    float facet = 1.0 - smoothstep(0.7 * bevel, bevel, inside);
+    float edge = 1.0 - smoothstep(0.0, max(0.35 * bevel, 1.5), inside);
+    float sheen = facet * (max(facing, 0.0) * 0.14 + max(-facing, 0.0) * 0.07);
+    c += s.params.z * (sheen + edge * (0.20 + 0.45 * max(facing, 0.0)));
 
     o_color = vec4(min(c, vec3(1.0)), coverage);
 }
