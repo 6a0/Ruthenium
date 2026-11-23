@@ -216,6 +216,18 @@ It also passes at 1,024 and 2,048 slots, with `--exercise-uploads`, and at 16,38
 
 The cache file is named after the GPU, the driver's cache id and a hash of the compiled SPIR-V, each pipeline's state and the interface the pipelines share with the renderer (push-constant range, the texture table's bindings, size and samplers, the frame data's binding). A build with other shaders starts cold in a file of its own and the same build always finds its own: six launches with a new hash each built the six pipelines in 35 to 46 ms, every launch of a build that had run before in 0.8 to 0.9 ms. The current file and the three other ones used last are kept (an A/B of two builds stays warm on both sides); older ones are deleted. `--bench-out` records `cold`, `warm` or `off`.
 
+### The Vulkan loader
+
+During enumeration the loader maps every installed driver, among them Mesa's software drivers and `libLLVM`. With `VK_LOADER_DRIVERS_SELECT='*nvidia*'` in the environment, five launches each, in turns:
+
+| | All drivers | NVIDIA's only |
+|---|---:|---:|
+| Resident memory, menus (MiB) | 189.3 (189.0 to 189.4) | 157.3 (156.9 to 157.6) |
+| Device creation after the window (ms) | 92 (84 to 112) | 103 (84 to 115) |
+
+- **Restricting the loader takes 32 MiB off resident memory:** `libLLVM` (23.8 MiB resident), `libvulkan_lvp` (2.6), `libvulkan_dzn` (1.3), `libstdc++` (1.6) and smaller ones are never mapped. Start-up time does not change.
+- **It only works if the other drivers are never loaded.** Enumerating with all drivers, destroying that instance and creating a second one restricted to the chosen driver left `libLLVM` mapped (185.3 MiB) and added about 40 ms. So the client would have to know its driver before it creates an instance, from an earlier launch or from a process of its own, which is not built.
+
 ### Recording through the encoder
 
 The renderer no longer issues Vulkan commands: the window pass, the backdrop's passes and the checks record through an encoder in the GPU crate, which keeps the image layouts, barriers and attachments. Screenshots of the main menu and of the settings screen (1708 × 960) are byte for byte those of `92ab409`. Two A/Bs against it (five and six rounds of 5 s) have frame time medians of 0.058 against 0.058 and 0.059 ms and main-thread work of 0.012 ms on both sides. The first marked the CPU time's P99 as worse (0.185 against 0.394 ms, with spreads of 113% and 94%); the second did not (0.303 against 0.390 ms), and it follows the acquire's P99, which the working tree had at 0.142 ms in the table A/B.
@@ -265,6 +277,7 @@ The renderer's checks:
 ```sh
 ruthenium --validation --exercise-textures --texture-slots 256 --texture-table update-after-bind --quit-after 6
 ruthenium --validation --exercise-colour --quit-after 5
+VK_LOADER_DRIVERS_SELECT='*nvidia*' ruthenium --quit-after 2 --bench-out restricted.json
 cargo xtask bench ab --a work --b work --b-args '--texture-slots 16384 --texture-table update-after-bind'
 ```
 
