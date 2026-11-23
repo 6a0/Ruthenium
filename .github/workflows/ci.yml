@@ -136,7 +136,7 @@ jobs:
     env:
       # SDL3 is built from source and linked statically: always on Windows and
       # macOS, and on Linux through this feature (Ubuntu 24.04 has no libsdl3-dev).
-      FEATURES: ${{ runner.os == 'Linux' && '--features ruthenium/sdl-static' || '' }}
+      FEATURES: ${{ startsWith(matrix.os, 'ubuntu') && '--features ruthenium/sdl-static' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
