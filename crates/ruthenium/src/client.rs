@@ -126,6 +126,9 @@ pub struct Options {
     /// Development: fill, reload and read back the texture table every frame (run it
     /// under validation); a wrong slot fails the run.
     pub exercise_textures: bool,
+    /// Development: draw a known grey and a translucent swatch over it every frame, off
+    /// screen and into the window, and read the bytes back; a wrong byte fails the run.
+    pub exercise_colour: bool,
 }
 
 impl Options {
@@ -167,6 +170,7 @@ impl Options {
             texture_slots: None,
             texture_table: None,
             exercise_textures: false,
+            exercise_colour: false,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -294,6 +298,7 @@ impl Options {
                     };
                 }
                 "--exercise-textures" => o.exercise_textures = true,
+                "--exercise-colour" => o.exercise_colour = true,
                 "--data-dir" => o.data_dir = Some(value("a folder")?.into()),
                 "--join" => o.join = Some(value("a server address")?),
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
@@ -486,6 +491,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
         renderer.enable_upload_check()?;
+    }
+    if opts.exercise_colour {
+        renderer.enable_colour_check()?;
     }
     if opts.exercise_textures {
         renderer.enable_table_check()?;
@@ -1058,6 +1066,24 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             c.reloads,
             c.deferred,
             c.stuck
+        );
+        failed |= !c.passed();
+    }
+    if let Some(c) = renderer.colour_check() {
+        eprintln!(
+            "[ruthenium] colour check ({:?}): grey and a swatch blended over it read back {} times off screen and {} times from the window, {} wrong{}",
+            renderer
+                .frames()
+                .swapchain_info()
+                .map(|s| s.format)
+                .unwrap_or_default(),
+            c.offscreen,
+            c.window,
+            c.mismatches,
+            match c.window_unreadable {
+                0 => String::new(),
+                n => format!("; the window could not be read in {n} frames"),
+            }
         );
         failed |= !c.passed();
     }

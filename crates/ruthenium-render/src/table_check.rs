@@ -17,13 +17,12 @@
 use std::sync::Arc;
 
 use ruthenium_gpu::{
-    Arrival, COLOR_RANGE, Error, FrameCtx, FrameData, Gpu, PUSH_CONSTANT_STAGES, PipelineLayout,
-    Pipelines, Readback, TextureDesc, TextureId, TextureTable, UploadError, UploadRing, vk,
+    Arrival, Error, FrameCtx, FrameData, Gpu, PipelineLayout, Pipelines, Readback, TextureDesc,
+    TextureId, TextureTable, UploadError, UploadRing, vk,
 };
 use ruthenium_ui::Quad;
 
-use crate::gui;
-use crate::pipelines::PipelineId;
+use crate::check_pass;
 
 /// Side of the target, in pixels: one grid shows this many slots squared.
 const GRID: u32 = 64;
@@ -221,10 +220,6 @@ impl TableCheck {
         layout: &PipelineLayout,
     ) {
         let count = WINDOW.min(textures.capacity() - self.window_first);
-        let Some((first, bytes)) = frame_data.alloc(count, gui::QUAD_BYTES) else {
-            // The GUI took the frame's data: the next frame draws the grid.
-            return;
-        };
         let missing = u32::from_le_bytes(TextureTable::MISSING_COLORS[0]);
         self.quads.clear();
         self.expected.clear();
@@ -245,70 +240,20 @@ impl TableCheck {
                 (true, colour) => colour,
             });
         }
-        gui::write_quads(&self.quads, bytes);
-
-        let (image, view) = self.target.image();
-        let extent = grid_extent();
-        // After the copy that read the last grid; that grid is not needed any more.
-        let to_attachment = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(image)
-            .subresource_range(COLOR_RANGE)];
-        let attachments = [vk::RenderingAttachmentInfo::default()
-            .image_view(view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
-            .store_op(vk::AttachmentStoreOp::STORE)];
-        let area = vk::Rect2D {
-            offset: vk::Offset2D::default(),
-            extent,
-        };
-        let rendering = vk::RenderingInfo::default()
-            .render_area(area)
-            .layer_count(1)
-            .color_attachments(&attachments);
-        let viewport = vk::Viewport {
-            x: 0.0,
-            y: 0.0,
-            width: GRID as f32,
-            height: GRID as f32,
-            min_depth: 0.0,
-            max_depth: 1.0,
-        };
-        // gui.vert's push constants: the target's size, the GUI scale, the first quad.
-        let mut push = [0u8; 16];
-        push[0..4].copy_from_slice(&(GRID as f32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(GRID as f32).to_ne_bytes());
-        push[8..12].copy_from_slice(&1.0f32.to_ne_bytes());
-        push[12..16].copy_from_slice(&first.to_ne_bytes());
-        let gpu = &*self.gpu;
-        let d = gpu.device();
-        let cmd = ctx.cmd;
-        // SAFETY: guaranteed by the caller; the target is alive and no copy of it is
-        // pending; the GUI pipeline was built for its format.
+        // Without room in the frame's data (the GUI took it), the next frame draws the grid.
+        // SAFETY: forwarded from the caller; the GUI pipeline was built for the target's
+        // format (checked in step).
         unsafe {
-            gpu.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_attachment),
-            );
-            gpu.cmd_begin_rendering(cmd, &rendering);
-            d.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipelines.get(PipelineId::Gui.index()),
-            );
-            d.cmd_set_viewport(cmd, 0, &[viewport]);
-            d.cmd_set_scissor(cmd, 0, &[area]);
-            d.cmd_push_constants(cmd, layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
-            d.cmd_draw(cmd, 6, count, 0, 0);
-            gpu.cmd_end_rendering(cmd);
-            self.target.record_copy(ctx);
-        }
+            check_pass::gui_quads_into(
+                &self.gpu,
+                ctx,
+                &mut self.target,
+                frame_data,
+                pipelines,
+                layout,
+                &self.quads,
+            )
+        };
     }
 
     fn fill(&mut self, textures: &mut TextureTable, uploads: &mut UploadRing) -> Result<(), Error> {

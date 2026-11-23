@@ -3,6 +3,8 @@
 //! list, recorded and presented through [`ruthenium_gpu::FrameLoop`].
 
 mod backdrop;
+mod check_pass;
+mod colour_check;
 mod gui;
 mod overlay;
 mod pipelines;
@@ -10,6 +12,7 @@ mod starfield;
 mod stats;
 mod table_check;
 
+pub use colour_check::ColourCheckReport;
 pub use gui::GuiFrame;
 pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
@@ -105,6 +108,8 @@ pub struct Renderer {
     check: Option<UploadCheck>,
     /// `--exercise-textures`.
     table_check: Option<table_check::TableCheck>,
+    /// `--exercise-colour`.
+    colour_check: Option<colour_check::ColourCheck>,
     /// The backdrop could not be made in the last frame that wanted it.
     backdrop_failed: bool,
     /// The next presented frame is copied for a screenshot.
@@ -185,6 +190,7 @@ impl Renderer {
             stars,
             check: None,
             table_check: None,
+            colour_check: None,
             backdrop_failed: false,
             screenshot_requested: false,
             screenshot: None,
@@ -228,6 +234,27 @@ impl Renderer {
             )?);
         }
         Ok(())
+    }
+
+    /// Starts drawing and reading back the colour fixture every frame (see
+    /// [`ColourCheckReport`]).
+    pub fn enable_colour_check(&mut self) -> Result<(), ruthenium_gpu::Error> {
+        if self.colour_check.is_none() {
+            self.colour_check = Some(colour_check::ColourCheck::new(
+                self.frames.gpu().clone(),
+                self.pipelines.format(),
+                &mut self.textures,
+                &mut self.uploads,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// What the colour check has seen, if it is on.
+    pub fn colour_check(&self) -> Option<ColourCheckReport> {
+        self.colour_check
+            .as_ref()
+            .map(colour_check::ColourCheck::report)
     }
 
     /// What the texture table check has seen, if it is on.
@@ -453,6 +480,21 @@ impl Renderer {
             }
             _ => None,
         };
+        if let Some(c) = &mut self.colour_check {
+            let zone = self.frames.zone_begin(&ctx, "colour check");
+            // SAFETY: as for the table check below.
+            unsafe {
+                c.step(
+                    &ctx,
+                    completed,
+                    &self.textures,
+                    &mut self.frame_data,
+                    &self.pipelines,
+                    &self.layout,
+                )?
+            };
+            self.frames.zone_end(&ctx, zone);
+        }
         if let Some(c) = &mut self.table_check {
             let zone = self.frames.zone_begin(&ctx, "table check");
             // SAFETY: outside a render pass, after begin_frame, sets bound; the pipelines
@@ -627,22 +669,51 @@ impl Renderer {
                     d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
                     d.cmd_draw(cmd, 6, rects.len() as u32, 0, 0);
                 }
+                // The colour check's patches, over everything else in the window's top
+                // left corner, in frames whose copy is not a screenshot someone asked for.
+                let wanted_shot = self.screenshot_requested && self.screenshot.is_none();
+                let mut checked = false;
+                if let Some(c) = &self.colour_check
+                    && !wanted_shot
+                    && c.wants_window(&self.textures, ctx.number)
+                    && t.extent.width >= colour_check::WIDTH
+                    && t.extent.height >= colour_check::HEIGHT
+                    && let Some((first, bytes)) = self.frame_data.alloc(2, gui::QUAD_BYTES)
+                {
+                    gui::write_quads(&c.quads(), bytes);
+                    let push = check_pass::pixel_quads_push(t.extent.width, t.extent.height, first);
+                    d.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.pipelines.get(PipelineId::Gui.index()),
+                    );
+                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
+                    d.cmd_draw(cmd, 6, 2, 0, 0);
+                    checked = true;
+                }
                 gpu.cmd_end_rendering(cmd);
-                let shot = if self.screenshot_requested && self.screenshot.is_none() {
+                let shot = if wanted_shot || checked {
                     Screenshot::record(&gpu, &ctx, &t)?
                 } else {
                     None
                 };
-                if let Some(s) = shot {
-                    // It made the transition to PRESENT_SRC itself.
-                    self.screenshot_of = Some((ctx.number, t.generation, t.first));
-                    self.screenshot = Some(s);
-                    self.screenshot_requested = false;
-                } else {
-                    gpu.cmd_pipeline_barrier2(
-                        cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&to_present),
-                    );
+                match (shot, &mut self.colour_check) {
+                    // A copy made the transition to PRESENT_SRC itself.
+                    (Some(s), Some(c)) if checked => c.window_recorded(s),
+                    (Some(s), _) => {
+                        self.screenshot_of = Some((ctx.number, t.generation, t.first));
+                        self.screenshot = Some(s);
+                        self.screenshot_requested = false;
+                    }
+                    (None, c) => {
+                        if let Some(c) = c.as_mut().filter(|_| checked) {
+                            c.window_unreadable();
+                        }
+                        gpu.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().image_memory_barriers(&to_present),
+                        );
+                    }
                 }
             }
             self.frames.zone_end(&ctx, zone);

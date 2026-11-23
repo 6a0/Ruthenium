@@ -208,6 +208,10 @@ Medians of seven launches on the RTX 4060 and three on llvmpipe, taken in turns.
 
 It also passes at 1,024 and 2,048 slots, with `--exercise-uploads`, and at 16,384 slots, where the check stops at 2,048 textures of its own and the table is never full. With `--exercise-swapchain` the glass backdrop of a resized window sometimes waits for a slot (77 frames in 8 s drew the flat tint instead), which that exercise would count as a failure and does not when the table is being filled on purpose.
 
+### The colour fixture
+
+`--exercise-colour` uploads a texture of the byte `0x80`, draws it unlit and, beside it, with a half-transparent swatch (`FF 40 00`, alpha `80`) blended over it, and reads both patches back: every frame from an off-screen target of the window's format, every sixteenth from a corner of the swapchain image itself. The grey must read `80 80 80` exactly and the blend `C0 60 40` within one step. On the RTX 4060 (Wayland and XWayland) and on llvmpipe, in `B8G8R8A8_UNORM`, every read-back was right. With the texture made `R8G8B8A8_SRGB` as a test of the test, the grey read `37` and the blend `9B 3C 1B`, and the run failed. A presentation path for an sRGB-only surface has to pass the same run.
+
 ### The pipeline cache
 
 The cache file is named after the GPU, the driver's cache id and a hash of the compiled SPIR-V, each pipeline's state and the interface the pipelines share with the renderer (push-constant range, the texture table's bindings, size and samplers, the frame data's binding). A build with other shaders starts cold in a file of its own and the same build always finds its own: six launches with a new hash each built the six pipelines in 35 to 46 ms, every launch of a build that had run before in 0.8 to 0.9 ms. The current file and the three other ones used last are kept (an A/B of two builds stays warm on both sides); older ones are deleted. `--bench-out` records `cold`, `warm` or `off`.
@@ -228,7 +232,7 @@ The cache file is named after the GPU, the driver's cache id and a hash of the c
 - **The same runs with no capture running.** The desktop was streamed by Sunshine in every run here, also those at the `performance` profile, so the lows and the VSync pacing may still carry its cost.
 - **A cold start** with the files out of the page cache.
 - **Occlusion, moving between displays and a stalled compositor**, which need a person at the machine. They are also where the shorter acquire wait has yet to be measured, together with the CPU an idle, covered window takes with it.
-- **A surface that really offers only sRGB formats.** `--pretend-srgb-surface` hides the others to show that it is refused; presenting to one through UNORM views of a mutable-format swapchain is not built.
+- **A surface that really offers only sRGB formats.** `--pretend-srgb-surface` hides the others to show that it is refused; presenting to one through UNORM views of a mutable-format swapchain is not built. `--exercise-colour` is the run such a path has to pass.
 - **A GPU whose ordinary descriptor limits are below the table.** Both GPUs here allow a million sampled images in ordinary sets, so the update-after-bind path was only run forced.
 
 ## Reproducing
@@ -256,6 +260,7 @@ The renderer's checks:
 
 ```sh
 ruthenium --validation --exercise-textures --texture-slots 256 --texture-table update-after-bind --quit-after 6
+ruthenium --validation --exercise-colour --quit-after 5
 cargo xtask bench ab --a work --b work --b-args '--texture-slots 16384 --texture-table update-after-bind'
 ```
 

@@ -108,6 +108,11 @@ impl Screenshot {
         }))
     }
 
+    /// The frame that copied it.
+    pub fn frame(&self) -> u64 {
+        self.frame
+    }
+
     /// Whether the frame that copied it has finished.
     pub fn done(&self, frames: &FrameLoop) -> Result<bool, Error> {
         Ok(frames.completed()? >= self.frame)
