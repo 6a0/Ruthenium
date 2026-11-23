@@ -129,6 +129,9 @@ pub struct Options {
     /// Development: draw a known grey and a translucent swatch over it every frame, off
     /// screen and into the window, and read the bytes back; a wrong byte fails the run.
     pub exercise_colour: bool,
+    /// Write what the GPU reported and what was chosen from it to this JSON file, once the
+    /// renderer exists.
+    pub adapter_report: Option<std::path::PathBuf>,
 }
 
 impl Options {
@@ -171,6 +174,7 @@ impl Options {
             texture_table: None,
             exercise_textures: false,
             exercise_colour: false,
+            adapter_report: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -299,6 +303,7 @@ impl Options {
                 }
                 "--exercise-textures" => o.exercise_textures = true,
                 "--exercise-colour" => o.exercise_colour = true,
+                "--adapter-report" => o.adapter_report = Some(value("a file")?.into()),
                 "--data-dir" => o.data_dir = Some(value("a folder")?.into()),
                 "--join" => o.join = Some(value("a server address")?),
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
@@ -487,6 +492,41 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         cache_dir.as_deref(),
     )?;
     startup.renderer_ms = started.elapsed().as_secs_f64() * 1e3;
+    {
+        let layouts = renderer.vertex_layout_checks();
+        for (name, c) in &layouts {
+            // Worth a line only where the device changes or refuses a layout.
+            if c.stride != c.bytes || !c.usable() {
+                eprintln!(
+                    "[ruthenium] vertex layout {name}: stride {} for {} bytes{}{}",
+                    c.stride,
+                    c.bytes,
+                    if c.unsupported.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", cannot read {:?}", c.unsupported)
+                    },
+                    if c.beyond_stride {
+                        ", an attribute reaches past the vertex"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        if let Some(path) = &opts.adapter_report {
+            let report = crate::telemetry::adapter_report(
+                renderer.gpu().caps(),
+                renderer.gpu().transfer_family().is_some(),
+                renderer.frames().swapchain_info(),
+                &layouts,
+            );
+            if let Err(e) = std::fs::write(path, report) {
+                eprintln!("[ruthenium] could not write {}: {e}", path.display());
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    }
     renderer.overlay_mut().set_visible(applied.frame_stats);
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {

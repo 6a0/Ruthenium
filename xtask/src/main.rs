@@ -10,12 +10,14 @@ mod codegen;
 mod exporters;
 mod fabric;
 mod fetch_compile_deps;
+mod fixtures;
 mod game;
 mod gpu;
 mod javamath_dump;
 mod jvm;
 mod launch_pins;
 mod mods;
+mod moltenvk;
 mod pin_version;
 mod shaders;
 mod trace;
@@ -85,6 +87,21 @@ tasks:
       Runs Mojang's data generator from the jar (cached in cache/codegen) unless
       --reports names a folder of its reports. The jar is found like for
       exporters. With --check, write nothing and fail if any file is stale.
+  fixtures [--bin <ruthenium>] [--features <cargo features>] [--gpu <name>]
+           [--seconds S] [--out <folder>] [-- <ruthenium options>]
+      Run the client's renderer checks, one short run each (needs a display): the
+      colour fixture and the upload check, the texture table filled and reloaded
+      at 256 slots on ordinary and on update-after-bind descriptor sets, and a
+      second launch finding the pipeline cache of the first. Builds the debug
+      client unless --bin names one. Output and the adapter report go to
+      target/fixtures.
+  moltenvk
+      Download the pinned MoltenVK release (checked by SHA-256) and unpack its
+      library and licence into cache/moltenvk.
+  bundle [--binary <executable>] [--out <folder>]
+      Assemble target/bundle/Ruthenium.app with the pinned MoltenVK in
+      Contents/Frameworks, and sign it ad hoc. On macOS the release client is
+      built first; elsewhere --binary wraps an executable to check the layout.
   shaders [--glslc <glslc>] [--check]
       Compile crates/ruthenium-shaders/glsl to the committed SPIR-V with the
       glslc of the pinned Vulkan SDK (downloaded once into cache/glslc on Linux
@@ -127,6 +144,9 @@ fn main() -> ExitCode {
         }
         Some("codegen") => codegen::run(workspace_root(), &args[1..]),
         Some("shaders") => shaders::run(workspace_root(), &args[1..]),
+        Some("fixtures") => fixtures::run(workspace_root(), &args[1..]),
+        Some("moltenvk") => moltenvk::run_fetch(workspace_root(), &args[1..]),
+        Some("bundle") => moltenvk::run_bundle(workspace_root(), &args[1..]),
         _ => {
             eprintln!("{USAGE}");
             ExitCode::FAILURE

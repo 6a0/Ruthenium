@@ -15,6 +15,7 @@ workspace = true
 tracy = ["dep:tracy-client"]
 
 [dependencies]
-ash = { version = "0.38.0", default-features = false, features = ["std", "debug"] }
+# "provisional" for the portability subset's feature and property structures (MoltenVK).
+ash = { version = "0.38.0", default-features = false, features = ["std", "debug", "provisional"] }
 profiling = "1.0.18"
 tracy-client = { version = "0.18.5", optional = true }

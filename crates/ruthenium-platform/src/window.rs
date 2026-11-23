@@ -37,6 +37,14 @@ const VANILLA_HINTS: [(&CStr, &CStr); 6] = [
     (c"SDL_IME_IMPLEMENTED_UI", c"composition"),
 ];
 
+/// The MoltenVK an application bundle carries for the executable `exe`
+/// (`Ruthenium.app/Contents/MacOS/ruthenium`): `Contents/Frameworks/libMoltenVK.dylib`, if
+/// it is there (`cargo xtask bundle` puts it there).
+fn bundled_vulkan_library(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let library = exe.parent()?.parent()?.join("Frameworks/libMoltenVK.dylib");
+    library.is_file().then_some(library)
+}
+
 /// Quits SDL when the last `Platform` or `Window` handle is dropped.
 struct SdlGuard;
 
@@ -64,10 +72,19 @@ impl std::fmt::Debug for Platform {
 }
 
 impl Platform {
-    /// Initialises SDL's video subsystem and loads the Vulkan loader through SDL (on macOS
-    /// this finds the MoltenVK bundled in the app).
+    /// Initialises SDL's video subsystem and loads Vulkan through SDL: the system's
+    /// loader, or on macOS the MoltenVK bundled in the app, if the executable runs from
+    /// a bundle that has one and `SDL_VULKAN_LIBRARY` doesn't name another.
     pub fn init(version: &str) -> Result<Platform, Error> {
         let version = CString::new(version).unwrap_or_default();
+        let bundled = (cfg!(target_os = "macos")
+            && std::env::var_os("SDL_VULKAN_LIBRARY").is_none())
+        .then(|| bundled_vulkan_library(&std::env::current_exe().ok()?))
+        .flatten()
+        .and_then(|p| CString::new(p.into_os_string().into_encoded_bytes()).ok());
+        if let Some(path) = &bundled {
+            eprintln!("[platform] Vulkan: bundled {}", path.to_string_lossy());
+        }
         // SAFETY: plain SDL setup calls with valid NUL-terminated strings, made before any
         // other SDL use, on the thread that will own SDL.
         unsafe {
@@ -82,7 +99,8 @@ impl Platform {
             if !SDL_Init(SDL_INIT_VIDEO) {
                 return Err(Error::sdl("SDL_Init(VIDEO)"));
             }
-            if !SDL_Vulkan_LoadLibrary(ptr::null()) {
+            // A null path leaves the choice to SDL (its hint, then the system's loader).
+            if !SDL_Vulkan_LoadLibrary(bundled.as_ref().map_or(ptr::null(), |p| p.as_ptr())) {
                 let e = Error::sdl("SDL_Vulkan_LoadLibrary");
                 SDL_Quit();
                 return Err(e);
@@ -346,5 +364,31 @@ impl Drop for Window {
     fn drop(&mut self) {
         // SAFETY: raw is a live window owned by this handle.
         unsafe { SDL_DestroyWindow(self.raw) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bundle_carries_its_vulkan_library_in_frameworks() {
+        let root = std::env::temp_dir().join(format!("ruthenium-bundle-{}", std::process::id()));
+        let contents = root.join("Ruthenium.app/Contents");
+        let exe = contents.join("MacOS/ruthenium");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::create_dir_all(contents.join("Frameworks")).unwrap();
+        // No library yet: the system's loader is used.
+        assert_eq!(bundled_vulkan_library(&exe), None);
+        let library = contents.join("Frameworks/libMoltenVK.dylib");
+        std::fs::write(&library, b"").unwrap();
+        assert_eq!(bundled_vulkan_library(&exe), Some(library));
+        // An executable outside a bundle (target/release/ruthenium) has none.
+        assert_eq!(bundled_vulkan_library(&root.join("ruthenium")), None);
+        assert_eq!(
+            bundled_vulkan_library(std::path::Path::new("ruthenium")),
+            None
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -101,6 +101,19 @@ mod tests {
     }
 
     #[test]
+    fn pipelines_stay_inside_the_portability_subset() {
+        // Triangle lists only: fans are optional in the subset (triangleFans).
+        for d in descs() {
+            assert_eq!(
+                d.topology,
+                vk::PrimitiveTopology::TRIANGLE_LIST,
+                "{}",
+                d.name
+            );
+        }
+    }
+
+    #[test]
     fn push_constant_budgets_agree() {
         assert_eq!(
             ruthenium_gpu::PUSH_CONSTANT_BYTES,

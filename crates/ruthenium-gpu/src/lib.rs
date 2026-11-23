@@ -26,9 +26,9 @@ mod upload_check;
 
 pub use ash::vk;
 pub use device::{
-    DEFAULT_TEXTURE_SLOTS, DeviceCaps, Gpu, GpuOptions, MAX_TEXTURE_SLOTS, MIN_TEXTURE_SLOTS,
-    OptionalFeatures, PretendSrgb, Rejected, SwapchainMaintenance, TextureTableLimits,
-    TextureTablePath,
+    DEFAULT_TEXTURE_SLOTS, DescriptorLimits, DeviceCaps, Gpu, GpuOptions, MAX_TEXTURE_SLOTS,
+    MIN_TEXTURE_SLOTS, OptionalFeatures, PortabilitySubset, PretendSrgb, Rejected,
+    SwapchainMaintenance, TextureTableLimits, TextureTablePath, VertexAttribute, VertexLayoutCheck,
 };
 pub use encoder::{Encoder, Pass};
 pub use frame::{

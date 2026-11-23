@@ -72,6 +72,9 @@ With no command, opens the game window. Options:
   --exercise-textures    fill and reload the texture table and read every slot back
                          through the GUI pipeline (development; a wrong slot fails the
                          run)
+  --adapter-report <file>
+                         write what the GPU reported (limits, optional features, the
+                         portability subset, vertex layouts) and what was chosen as JSON
   --exercise-colour      draw a known grey and a translucent swatch over it, off
                          screen and in the window's corner, and read the bytes back
                          (development; an sRGB decode or encode fails the run)

@@ -318,6 +318,7 @@ impl Telemetry {
                     .filter(|(_, on)| *on)
                     .map(|(name, _)| *name)
                     .collect::<Vec<_>>(),
+                "portability_subset": run.caps.portability_subset,
                 "transfer_queue": run.transfer_queue,
                 "swapchain_maintenance": run.caps.swapchain_maintenance.name(),
                 "swapchain_maintenance_khr": run.caps.swapchain_maintenance_khr,
@@ -422,6 +423,105 @@ pub struct RunInfo<'a> {
     pub textures: ruthenium_gpu::TextureTableStats,
     /// The pipeline cache: its interface hash, bytes loaded at start-up, kept in a file.
     pub pipeline_cache: (u64, usize, bool),
+}
+
+/// What `--adapter-report` writes: everything Ruthenium asked the GPU and what it chose
+/// from the answers, for comparing devices and drivers. `vertex_layouts` are the terrain
+/// vertex candidates as this device can draw them.
+pub fn adapter_report(
+    caps: &DeviceCaps,
+    transfer_queue: bool,
+    swapchain: Option<SwapchainInfo>,
+    vertex_layouts: &[(&str, ruthenium_gpu::VertexLayoutCheck)],
+) -> String {
+    let named = |features: &[(&'static str, bool)]| -> serde_json::Map<String, Value> {
+        features
+            .iter()
+            .map(|(name, on)| ((*name).to_owned(), json!(on)))
+            .collect()
+    };
+    let l = &caps.descriptor_limits;
+    let env = |name: &str| std::env::var(name).ok();
+    let v = json!({
+        "version": 1,
+        "gpu": caps.name,
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "device": {
+            "type": format!("{:?}", caps.device_type),
+            "vendor_id": caps.vendor_id,
+            "device_id": caps.device_id,
+            "driver_id": format!("{:?}", caps.driver_id),
+            "driver": caps.driver,
+            "api": ruthenium_gpu::version_string(caps.api_version),
+            "unified_memory": caps.unified_memory,
+            "max_image_dimension_2d": caps.max_image_dimension_2d,
+            "max_memory_allocations": caps.max_memory_allocations,
+            "timestamp_bits": caps.timestamp_bits,
+            "transfer_family": caps.transfer_family,
+            "transfer_queue": transfer_queue,
+        },
+        "texture_table": {
+            "slots": caps.texture_slots,
+            "path": caps.texture_table.name(),
+            "ordinary_limit": caps.texture_table_limits.ordinary,
+            "update_after_bind_limit": caps.texture_table_limits.update_after_bind,
+            "maxPerStageDescriptorSampledImages": l.per_stage_sampled_images,
+            "maxDescriptorSetSampledImages": l.set_sampled_images,
+            "maxPerStageResources": l.per_stage_resources,
+            "maxPerStageDescriptorUpdateAfterBindSampledImages":
+                l.update_after_bind_per_stage_sampled_images,
+            "maxDescriptorSetUpdateAfterBindSampledImages":
+                l.update_after_bind_set_sampled_images,
+            "maxPerStageUpdateAfterBindResources": l.update_after_bind_per_stage_resources,
+            "maxUpdateAfterBindDescriptorsInAllPools":
+                l.update_after_bind_descriptors_in_all_pools,
+        },
+        "optional_features": named(&caps.optional.named()),
+        "max_sampler_anisotropy": caps.max_sampler_anisotropy,
+        "portability_subset": caps.portability.map(|p| json!({
+            "features": named(&p.named()),
+            "minVertexInputBindingStrideAlignment": p.min_vertex_stride_alignment,
+        })),
+        "vertex_layouts": vertex_layouts.iter().map(|(name, c)| json!({
+            "name": name,
+            "bytes": c.bytes,
+            "stride": c.stride,
+            "usable": c.usable(),
+            "unsupported_formats": c.unsupported.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>(),
+            "beyond_stride": c.beyond_stride,
+        })).collect::<Vec<_>>(),
+        "extensions": {
+            "swapchain_maintenance": caps.swapchain_maintenance.name(),
+            "swapchain_maintenance_khr": caps.swapchain_maintenance_khr,
+            "swapchain_maintenance_ext": caps.swapchain_maintenance_ext,
+            "present_id": caps.present_id,
+            "present_wait": caps.present_wait,
+            "present_id2": caps.present_id2,
+            "present_wait2": caps.present_wait2,
+            "present_timing": caps.present_timing,
+            "memory_budget": caps.memory_budget,
+            "calibrated_timestamps": caps.calibrated_timestamps,
+            "low_latency2": caps.low_latency2,
+            "anti_lag": caps.anti_lag,
+        },
+        "swapchain": swapchain.map(|s| json!({
+            "width": s.extent.width,
+            "height": s.extent.height,
+            "format": format!("{:?}", s.format),
+            "present_mode": format!("{:?}", s.present_mode),
+            "images": s.images,
+        })),
+        // What shapes the answers from outside: a driver filter for the Vulkan loader,
+        // and whether MoltenVK was told to use Metal argument buffers (which is what
+        // raises its sampled-image limits).
+        "environment": {
+            "VK_LOADER_DRIVERS_SELECT": env("VK_LOADER_DRIVERS_SELECT"),
+            "VK_DRIVER_FILES": env("VK_DRIVER_FILES"),
+            "MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS": env("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS"),
+        },
+    });
+    serde_json::to_string_pretty(&v).expect("a JSON value serialises")
 }
 
 /// Milliseconds from the process's start to each start-up milestone.
@@ -582,6 +682,27 @@ mod tests {
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["device"]["texture_table"], "ordinary");
         assert_eq!(v["pipeline_cache"]["state"], "cold");
+        let report = adapter_report(
+            &caps,
+            false,
+            None,
+            &[(
+                "terrain 16 B",
+                ruthenium_gpu::VertexLayoutCheck {
+                    bytes: 16,
+                    stride: 16,
+                    unsupported: Vec::new(),
+                    beyond_stride: false,
+                },
+            )],
+        );
+        let r: Value = serde_json::from_str(&report).unwrap();
+        assert_eq!(r["gpu"], "A \"quoted\" GPU");
+        assert_eq!(r["texture_table"]["path"], "ordinary");
+        assert_eq!(r["optional_features"]["multiDrawIndirect"], false);
+        assert_eq!(r["portability_subset"], Value::Null);
+        assert_eq!(r["vertex_layouts"][0]["stride"], 16);
+        assert_eq!(r["vertex_layouts"][0]["usable"], true);
         assert_eq!(v["pipeline_cache"]["interface"], "000000000000abcd");
         assert_eq!(v["gpu"], "A \"quoted\" GPU");
         assert_eq!(v["frames_ahead"], 1);

@@ -36,7 +36,10 @@ cargo run -p ruthenium -- --stats             # open the window; print frame-tim
 cargo run -p ruthenium -- --no-vsync --stats  # uncapped; --fps-cap 240 adds the frame limiter
 cargo run -p ruthenium -- --help              # F3 in the window shows the frame-stats overlay
 cargo xtask bench ab                          # compare HEAD with the working tree (release, A B B A)
+cargo xtask fixtures                          # the renderer's own checks, one short run each (needs a display)
 ```
+
+On macOS, `cargo xtask bundle` builds `target/bundle/Ruthenium.app` with a pinned MoltenVK inside (downloaded once into the git-ignored `cache/`, checked by SHA-256), so the app needs no Vulkan SDK.
 
 Shaders are GLSL in `crates/ruthenium-shaders/glsl`, compiled to SPIR-V that is committed, so building needs no shader compiler. After editing a shader, run `cargo xtask shaders`. It uses the `glslc` of a pinned Vulkan SDK release: on Linux x86-64 it is downloaded once into the git-ignored `cache/`; elsewhere, install that SDK and pass `--glslc <path>`. CI fails if the committed SPIR-V differs from what that compiler produces.
 

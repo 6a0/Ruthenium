@@ -11,6 +11,7 @@ mod pipelines;
 mod starfield;
 mod stats;
 mod table_check;
+mod terrain_vertex;
 
 pub use colour_check::ColourCheckReport;
 pub use gui::GuiFrame;
@@ -18,6 +19,7 @@ pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
 pub use stats::{FrameTimes, Summary};
 pub use table_check::TableCheckReport;
+pub use terrain_vertex::{TERRAIN_VERTEX_CANDIDATES, VertexCandidate};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -272,6 +274,19 @@ impl Renderer {
             self.cache.loaded_bytes(),
             self.cache.on_disk(),
         )
+    }
+
+    /// The terrain vertex candidates as this GPU can draw them: its name and the check.
+    pub fn vertex_layout_checks(&self) -> Vec<(&'static str, ruthenium_gpu::VertexLayoutCheck)> {
+        TERRAIN_VERTEX_CANDIDATES
+            .iter()
+            .map(|c| {
+                (
+                    c.name,
+                    self.gpu().check_vertex_layout(c.bytes, c.attributes),
+                )
+            })
+            .collect()
     }
 
     /// How full the texture table is and has been.

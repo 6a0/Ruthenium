@@ -45,6 +45,40 @@ impl TextureTablePath {
     }
 }
 
+/// The device's descriptor limits that bound the texture table, as it reports them (the
+/// update-after-bind ones are only meaningful with that feature).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DescriptorLimits {
+    pub per_stage_sampled_images: u32,
+    pub set_sampled_images: u32,
+    pub per_stage_resources: u32,
+    pub update_after_bind_per_stage_sampled_images: u32,
+    pub update_after_bind_set_sampled_images: u32,
+    pub update_after_bind_per_stage_resources: u32,
+    pub update_after_bind_descriptors_in_all_pools: u32,
+}
+
+impl DescriptorLimits {
+    fn of(
+        limits: &vk::PhysicalDeviceLimits,
+        indexing: &vk::PhysicalDeviceDescriptorIndexingProperties<'_>,
+    ) -> DescriptorLimits {
+        DescriptorLimits {
+            per_stage_sampled_images: limits.max_per_stage_descriptor_sampled_images,
+            set_sampled_images: limits.max_descriptor_set_sampled_images,
+            per_stage_resources: limits.max_per_stage_resources,
+            update_after_bind_per_stage_sampled_images: indexing
+                .max_per_stage_descriptor_update_after_bind_sampled_images,
+            update_after_bind_set_sampled_images: indexing
+                .max_descriptor_set_update_after_bind_sampled_images,
+            update_after_bind_per_stage_resources: indexing
+                .max_per_stage_update_after_bind_resources,
+            update_after_bind_descriptors_in_all_pools: indexing
+                .max_update_after_bind_descriptors_in_all_pools,
+        }
+    }
+}
+
 /// How many textures the table could have on each path, under every limit that applies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TextureTableLimits {
@@ -228,6 +262,8 @@ pub struct DeviceCaps {
     pub texture_table: TextureTablePath,
     /// What each path could hold on this device.
     pub texture_table_limits: TextureTableLimits,
+    /// The limits that follows from.
+    pub descriptor_limits: DescriptorLimits,
     pub max_image_dimension_2d: u32,
     /// `maxMemoryAllocationCount` (often 4096 on Windows).
     pub max_memory_allocations: u32,
@@ -239,6 +275,8 @@ pub struct DeviceCaps {
     /// uploads (whether it is used: [`Gpu::transfer_family`]).
     pub transfer_family: Option<u32>,
     pub portability_subset: bool,
+    /// What a portability-subset device reports about itself.
+    pub portability: Option<PortabilitySubset>,
     pub present_id: bool,
     pub present_wait: bool,
     pub present_id2: bool,
@@ -325,6 +363,18 @@ pub struct OptionalFeatures {
     pub sampler_anisotropy: bool,
 }
 
+impl DeviceCaps {
+    /// The stride a vertex binding of `bytes` bytes per vertex has to have on this
+    /// device: `bytes`, or on a portability-subset device the next multiple of its
+    /// stride alignment.
+    pub fn vertex_stride(&self, bytes: u32) -> u32 {
+        let align = self
+            .portability
+            .map_or(1, |p| p.min_vertex_stride_alignment.max(1));
+        bytes.next_multiple_of(align)
+    }
+}
+
 impl OptionalFeatures {
     fn of(f: &Features) -> OptionalFeatures {
         OptionalFeatures {
@@ -347,6 +397,178 @@ impl OptionalFeatures {
             ("samplerAnisotropy", self.sampler_anisotropy),
         ]
     }
+}
+
+/// What a device of the Vulkan portability subset (MoltenVK over Metal) has of the things
+/// the subset makes optional, and the one limit it adds. Ruthenium's pipelines stay
+/// inside the subset (triangle lists, no constant blend factors, samplers without LOD
+/// bias or comparison, views in the image's own format and component order), so none of
+/// these is required; a pipeline that needs one has to check it here first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PortabilitySubset {
+    pub constant_alpha_color_blend_factors: bool,
+    pub events: bool,
+    pub image_view_format_reinterpretation: bool,
+    pub image_view_format_swizzle: bool,
+    pub image_view_2d_on_3d_image: bool,
+    pub multisample_array_image: bool,
+    pub mutable_comparison_samplers: bool,
+    pub point_polygons: bool,
+    pub sampler_mip_lod_bias: bool,
+    pub separate_stencil_mask_ref: bool,
+    pub shader_sample_rate_interpolation_functions: bool,
+    pub tessellation_isolines: bool,
+    pub tessellation_point_mode: bool,
+    pub triangle_fans: bool,
+    pub vertex_attribute_access_beyond_stride: bool,
+    /// `minVertexInputBindingStrideAlignment`: a vertex binding's stride must be a
+    /// multiple of it ([`DeviceCaps::vertex_stride`]).
+    pub min_vertex_stride_alignment: u32,
+}
+
+impl PortabilitySubset {
+    /// Asks a device that has `VK_KHR_portability_subset`.
+    fn query(raw: &ash::Instance, pd: vk::PhysicalDevice) -> PortabilitySubset {
+        let mut f = vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
+        let mut p = vk::PhysicalDevicePortabilitySubsetPropertiesKHR::default();
+        let mut features = vk::PhysicalDeviceFeatures2::default().push(&mut f);
+        let mut props = vk::PhysicalDeviceProperties2::default().push(&mut p);
+        // SAFETY: the device has the extension that defines both chained structures.
+        unsafe {
+            raw.get_physical_device_features2(pd, &mut features);
+            raw.get_physical_device_properties2(pd, &mut props);
+        }
+        let t = |b: vk::Bool32| b == vk::TRUE;
+        PortabilitySubset {
+            constant_alpha_color_blend_factors: t(f.constant_alpha_color_blend_factors),
+            events: t(f.events),
+            image_view_format_reinterpretation: t(f.image_view_format_reinterpretation),
+            image_view_format_swizzle: t(f.image_view_format_swizzle),
+            image_view_2d_on_3d_image: t(f.image_view2_d_on3_d_image),
+            multisample_array_image: t(f.multisample_array_image),
+            mutable_comparison_samplers: t(f.mutable_comparison_samplers),
+            point_polygons: t(f.point_polygons),
+            sampler_mip_lod_bias: t(f.sampler_mip_lod_bias),
+            separate_stencil_mask_ref: t(f.separate_stencil_mask_ref),
+            shader_sample_rate_interpolation_functions: t(
+                f.shader_sample_rate_interpolation_functions
+            ),
+            tessellation_isolines: t(f.tessellation_isolines),
+            tessellation_point_mode: t(f.tessellation_point_mode),
+            triangle_fans: t(f.triangle_fans),
+            vertex_attribute_access_beyond_stride: t(f.vertex_attribute_access_beyond_stride),
+            min_vertex_stride_alignment: p.min_vertex_input_binding_stride_alignment,
+        }
+    }
+
+    /// Each feature's Vulkan name and whether the device has it.
+    pub fn named(&self) -> [(&'static str, bool); 15] {
+        [
+            (
+                "constantAlphaColorBlendFactors",
+                self.constant_alpha_color_blend_factors,
+            ),
+            ("events", self.events),
+            (
+                "imageViewFormatReinterpretation",
+                self.image_view_format_reinterpretation,
+            ),
+            ("imageViewFormatSwizzle", self.image_view_format_swizzle),
+            ("imageView2DOn3DImage", self.image_view_2d_on_3d_image),
+            ("multisampleArrayImage", self.multisample_array_image),
+            (
+                "mutableComparisonSamplers",
+                self.mutable_comparison_samplers,
+            ),
+            ("pointPolygons", self.point_polygons),
+            ("samplerMipLodBias", self.sampler_mip_lod_bias),
+            ("separateStencilMaskRef", self.separate_stencil_mask_ref),
+            (
+                "shaderSampleRateInterpolationFunctions",
+                self.shader_sample_rate_interpolation_functions,
+            ),
+            ("tessellationIsolines", self.tessellation_isolines),
+            ("tessellationPointMode", self.tessellation_point_mode),
+            ("triangleFans", self.triangle_fans),
+            (
+                "vertexAttributeAccessBeyondStride",
+                self.vertex_attribute_access_beyond_stride,
+            ),
+        ]
+    }
+}
+
+/// One attribute of a vertex layout: where it starts in the vertex and how it is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VertexAttribute {
+    pub offset: u32,
+    pub format: vk::Format,
+}
+
+/// Whether a device can draw from a vertex layout, and with which stride
+/// ([`Gpu::check_vertex_layout`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VertexLayoutCheck {
+    /// Bytes per vertex as packed.
+    pub bytes: u32,
+    /// The stride its binding gets on this device: `bytes`, or more where a
+    /// portability-subset device wants strides aligned. Packing, pipeline keys and
+    /// memory figures have to use this one.
+    pub stride: u32,
+    /// Attribute formats the device cannot read from a vertex buffer.
+    pub unsupported: Vec<vk::Format>,
+    /// An attribute reaches past the vertex's bytes, which this device does not allow.
+    pub beyond_stride: bool,
+}
+
+impl VertexLayoutCheck {
+    pub fn usable(&self) -> bool {
+        self.unsupported.is_empty() && !self.beyond_stride
+    }
+
+    fn of(
+        bytes: u32,
+        attributes: &[VertexAttribute],
+        portability: Option<&PortabilitySubset>,
+        reads: impl Fn(vk::Format) -> bool,
+    ) -> VertexLayoutCheck {
+        let align = portability.map_or(1, |p| p.min_vertex_stride_alignment.max(1));
+        let mut unsupported: Vec<vk::Format> = Vec::new();
+        let mut beyond = false;
+        for a in attributes {
+            match vertex_format_bytes(a.format) {
+                Some(size) if reads(a.format) => beyond |= a.offset + size > bytes,
+                _ if !unsupported.contains(&a.format) => unsupported.push(a.format),
+                _ => {}
+            }
+        }
+        VertexLayoutCheck {
+            bytes,
+            stride: bytes.next_multiple_of(align),
+            unsupported,
+            beyond_stride: beyond
+                && portability.is_some_and(|p| !p.vertex_attribute_access_beyond_stride),
+        }
+    }
+}
+
+/// Bytes of the formats vertex attributes are packed in; `None` for any other.
+fn vertex_format_bytes(format: vk::Format) -> Option<u32> {
+    use vk::Format as F;
+    Some(match format {
+        F::R8G8_UNORM | F::R8G8_SNORM | F::R8G8_UINT | F::R8G8_SINT => 2,
+        F::R8G8B8A8_UNORM | F::R8G8B8A8_SNORM | F::R8G8B8A8_UINT | F::R8G8B8A8_SINT => 4,
+        F::R16G16_UNORM | F::R16G16_SNORM | F::R16G16_UINT | F::R16G16_SINT => 4,
+        F::R16G16B16A16_UNORM
+        | F::R16G16B16A16_SNORM
+        | F::R16G16B16A16_UINT
+        | F::R16G16B16A16_SINT => 8,
+        F::R32_UINT | F::R32_SINT | F::R32_SFLOAT => 4,
+        F::R32G32_SFLOAT => 8,
+        F::R32G32B32_SFLOAT => 12,
+        F::R32G32B32A32_SFLOAT => 16,
+        _ => return None,
+    })
 }
 
 /// A baseline feature: its name for diagnostics and how to read it from the query.
@@ -507,6 +729,32 @@ impl Gpu {
 
     pub fn caps(&self) -> &DeviceCaps {
         &self.caps
+    }
+
+    /// Whether this device can draw from vertices of `bytes` bytes with `attributes`:
+    /// every format readable from a vertex buffer, no attribute past the vertex where
+    /// that is not allowed, and the stride the binding has to have here.
+    pub fn check_vertex_layout(
+        &self,
+        bytes: u32,
+        attributes: &[VertexAttribute],
+    ) -> VertexLayoutCheck {
+        VertexLayoutCheck::of(
+            bytes,
+            attributes,
+            self.caps.portability.as_ref(),
+            |format| {
+                // SAFETY: plain query on the device this Gpu was created from.
+                let props = unsafe {
+                    self.instance
+                        .raw
+                        .get_physical_device_format_properties(self.physical, format)
+                };
+                props
+                    .buffer_features
+                    .contains(vk::FormatFeatureFlags::VERTEX_BUFFER)
+            },
+        )
     }
 
     pub fn device(&self) -> &ash::Device {
@@ -831,12 +1079,14 @@ fn evaluate(
         texture_slots,
         texture_table,
         texture_table_limits,
+        descriptor_limits: DescriptorLimits::of(&props.limits, &indexing),
         max_image_dimension_2d: props.limits.max_image_dimension2_d,
         max_memory_allocations: props.limits.max_memory_allocation_count,
         copy_offset_alignment: props.limits.optimal_buffer_copy_offset_alignment,
         storage_offset_alignment: props.limits.min_storage_buffer_offset_alignment,
         transfer_family,
         portability_subset,
+        portability: portability_subset.then(|| PortabilitySubset::query(raw, pd)),
         present_id: has(ash::khr::present_id::NAME),
         present_wait: has(ash::khr::present_wait::NAME),
         present_id2: has(ash::khr::present_id2::NAME),
@@ -1175,6 +1425,62 @@ mod tests {
             TextureTableLimits::of(&core, &indexing, false).update_after_bind,
             None
         );
+    }
+
+    #[test]
+    fn vertex_strides_are_padded_to_the_portability_alignment() {
+        // Eight bytes at the start and four that end at `end`.
+        let layout = |end: u32| {
+            [
+                VertexAttribute {
+                    offset: 0,
+                    format: vk::Format::R16G16B16A16_UINT,
+                },
+                VertexAttribute {
+                    offset: end - 4,
+                    format: vk::Format::R16G16_UINT,
+                },
+            ]
+        };
+        let every = |_| true;
+        // No portability subset: any stride, attributes may reach past it.
+        let c = VertexLayoutCheck::of(16, &layout(16), None, every);
+        assert_eq!((c.stride, c.usable()), (16, true));
+        assert!(VertexLayoutCheck::of(18, &layout(20), None, every).usable());
+        // Metal's alignment of four: 16 and 20 bytes stay, 18 is padded to 20.
+        let metal = PortabilitySubset {
+            min_vertex_stride_alignment: 4,
+            ..PortabilitySubset::default()
+        };
+        for (bytes, stride) in [(16, 16), (20, 20), (18, 20)] {
+            let c = VertexLayoutCheck::of(bytes, &layout(bytes), Some(&metal), every);
+            assert_eq!((c.stride, c.usable()), (stride, true), "{bytes} bytes");
+        }
+        // A coarser alignment pads the 20-byte layout too.
+        let coarse = PortabilitySubset {
+            min_vertex_stride_alignment: 8,
+            ..metal
+        };
+        assert_eq!(
+            VertexLayoutCheck::of(20, &layout(20), Some(&coarse), every).stride,
+            24
+        );
+        // An attribute past the vertex needs the subset's feature.
+        let c = VertexLayoutCheck::of(16, &layout(20), Some(&metal), every);
+        assert!(c.beyond_stride && !c.usable());
+        let lenient = PortabilitySubset {
+            vertex_attribute_access_beyond_stride: true,
+            ..metal
+        };
+        assert!(VertexLayoutCheck::of(16, &layout(20), Some(&lenient), every).usable());
+        // A format the device cannot read, or that is no vertex format at all.
+        let c = VertexLayoutCheck::of(16, &layout(16), None, |f| f != vk::Format::R16G16_UINT);
+        assert_eq!(c.unsupported, vec![vk::Format::R16G16_UINT]);
+        let odd = [VertexAttribute {
+            offset: 0,
+            format: vk::Format::D32_SFLOAT,
+        }];
+        assert!(!VertexLayoutCheck::of(4, &odd, None, every).usable());
     }
 
     #[test]

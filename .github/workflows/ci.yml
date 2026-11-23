@@ -157,6 +157,53 @@ jobs:
       - run: cargo clippy -p ruthenium --all-targets $FEATURES --features ruthenium/dev-offline
       - run: cargo test -p ruthenium $FEATURES --features ruthenium/dev-offline
 
+  fixtures:
+    # The renderer's own checks (cargo xtask fixtures) on Mesa's software Vulkan driver,
+    # in a virtual X display: the colour fixture, the upload check, the texture table
+    # filled and reloaded on both kinds of descriptor set, and the pipeline cache.
+    name: Renderer fixtures (lavapipe)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: SDL3 build dependencies, lavapipe and a virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
+            libxss-dev libxtst-dev libxkbcommon-dev libwayland-dev wayland-protocols \
+            libegl1-mesa-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libibus-1.0-dev \
+            mesa-vulkan-drivers libvulkan1 xvfb xauth
+      - run: >
+          xvfb-run -a -s "-screen 0 1920x1080x24"
+          cargo xtask fixtures --features ruthenium/sdl-static --gpu llvmpipe
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fixtures-lavapipe
+          path: target/fixtures
+
+  macos-bundle:
+    # The application bundle with the pinned MoltenVK, and the same checks run from it
+    # on the runner's GPU. Not a gate yet (continue-on-error): until the bundle has run
+    # on a Mac, a failure here says something about the bundle or the runner, and the
+    # uploaded logs and adapter report say which.
+    name: macOS bundle with MoltenVK
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask bundle
+      - run: cargo xtask fixtures --bin target/bundle/Ruthenium.app/Contents/MacOS/ruthenium
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fixtures-macos
+          path: target/fixtures
+
   release-binary:
     # ...and never reaches a release build: its marker string must be absent.
     name: No dev-offline in release builds

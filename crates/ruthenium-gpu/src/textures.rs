@@ -1028,6 +1028,18 @@ mod tests {
     }
 
     #[test]
+    fn samplers_stay_inside_the_portability_subset() {
+        // No LOD bias (samplerMipLodBias) and no comparison (mutableComparisonSamplers):
+        // a sampler that needs one has to check the device's PortabilitySubset first.
+        for s in SamplerId::ALL {
+            let i = s.info();
+            assert_eq!(i.mip_lod_bias, 0.0, "{s:?}");
+            assert_eq!(i.compare_enable, vk::FALSE, "{s:?}");
+            assert_eq!(i.anisotropy_enable, vk::FALSE, "{s:?}");
+        }
+    }
+
+    #[test]
     fn sampler_ids_are_dense() {
         for (i, s) in SamplerId::ALL.iter().enumerate() {
             assert_eq!(s.index(), i as u32);

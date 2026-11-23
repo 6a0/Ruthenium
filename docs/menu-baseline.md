@@ -232,6 +232,10 @@ During enumeration the loader maps every installed driver, among them Mesa's sof
 
 The renderer no longer issues Vulkan commands: the window pass, the backdrop's passes and the checks record through an encoder in the GPU crate, which keeps the image layouts, barriers and attachments. Screenshots of the main menu and of the settings screen (1708 × 960) are byte for byte those of `92ab409`. Two A/Bs against it (five and six rounds of 5 s) have frame time medians of 0.058 against 0.058 and 0.059 ms and main-thread work of 0.012 ms on both sides. The first marked the CPU time's P99 as worse (0.185 against 0.394 ms, with spreads of 113% and 94%); the second did not (0.303 against 0.390 ms), and it follows the acquire's P99, which the working tree had at 0.142 ms in the table A/B.
 
+### The adapter report, and Macs
+
+`--adapter-report <file>` writes what the GPU reported and what was chosen from it: descriptor limits and the table's path, optional features, the portability subset's features and `minVertexInputBindingStrideAlignment` where a device has them, and whether the two candidate terrain vertex layouts (16 and 20 bytes, in formats every Vulkan device reads from vertex buffers) can be drawn and with which stride. Both GPUs here take both at their own size. `cargo xtask bundle` assembles `Ruthenium.app` with MoltenVK 1.4.2 (pinned by the release archive's SHA-256) in `Contents/Frameworks`, which the client loads through SDL when it runs from the bundle. **None of this has run on a Mac yet:** the bundle's layout was checked on Linux, and the CI job that builds it and runs the fixtures from it on a macOS runner has not run.
+
 ## Against the targets
 
 | Target | At `balanced` | At `performance` |
@@ -249,6 +253,7 @@ The renderer no longer issues Vulkan commands: the window pass, the backdrop's p
 - **A cold start** with the files out of the page cache.
 - **Occlusion, moving between displays and a stalled compositor**, which need a person at the machine. They are also where the shorter acquire wait has yet to be measured, together with the CPU an idle, covered window takes with it.
 - **A surface that really offers only sRGB formats.** `--pretend-srgb-surface` hides the others to show that it is refused; presenting to one through UNORM views of a mutable-format swapchain is not built. `--exercise-colour` is the run such a path has to pass.
+- **Macs.** The bundle with MoltenVK, the portability subset's answers and the texture table's limits there (with and without Metal argument buffers) wait for a Mac or for the CI job's first run.
 - **A GPU whose ordinary descriptor limits are below the table.** Both GPUs here allow a million sampled images in ordinary sets, so the update-after-bind path was only run forced.
 
 ## Reproducing
@@ -272,11 +277,13 @@ ruthenium --screenshot steady.png --window-size 1100x620 --screenshot-after 0.5 
 
 `--exercise-swapchain` fails the run if a replaced swapchain is not destroyed while the client runs, if a frame draws glass without its backdrop, or on any validation message.
 
-The renderer's checks:
+The renderer's checks, one short run each (the colour fixture and the upload check, the texture table at 256 slots on both kinds of descriptor set, the pipeline cache warm on a second launch), and single ones:
 
 ```sh
+cargo xtask fixtures -- --validation            # all of them; --gpu llvmpipe for Mesa's software driver
 ruthenium --validation --exercise-textures --texture-slots 256 --texture-table update-after-bind --quit-after 6
 ruthenium --validation --exercise-colour --quit-after 5
+ruthenium --adapter-report adapter.json --quit-after 1
 VK_LOADER_DRIVERS_SELECT='*nvidia*' ruthenium --quit-after 2 --bench-out restricted.json
 cargo xtask bench ab --a work --b work --b-args '--texture-slots 16384 --texture-table update-after-bind'
 ```
