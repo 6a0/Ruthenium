@@ -330,6 +330,12 @@ pub struct StatePhysics {
     /// How hard the block is to break (`getDestroySpeed`); -1 for blocks that can't be
     /// broken.
     pub destroy_time: f32,
+    /// How much sky and block light the state takes away (`getLightDampening`).
+    pub light_dampening: u8,
+    /// Indices into [`BlockPhysics::shapes`] of the state's light occlusion faces
+    /// downwards and upwards (`LightEngine.getOcclusionShape`): empty unless it occludes
+    /// and uses its shape for light.
+    pub occlusion: [u32; 2],
 }
 
 impl StatePhysics {
@@ -368,7 +374,7 @@ pub struct BlockPhysics {
 
 /// Parses `block_physics.bin`.
 pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
-    let mut r = Reader::open(bytes, "block_physics", 6)?;
+    let mut r = Reader::open(bytes, "block_physics", 7)?;
     let n = r.u32()? as usize;
     let mut shapes = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
@@ -427,6 +433,14 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
         }
         let interaction = r.u8()?;
         let destroy_time = r.f32()?;
+        let light_dampening = r.u8()?;
+        let mut occlusion = [0; 2];
+        for face in &mut occlusion {
+            *face = r.u32()?;
+            if *face as usize >= shapes.len() {
+                return Err(format!("occlusion shape {face} out of range"));
+            }
+        }
         states.push(StatePhysics {
             shape,
             flags,
@@ -441,6 +455,8 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
             interaction_shape,
             interaction,
             destroy_time,
+            light_dampening,
+            occlusion,
         });
     }
     r.finish()?;

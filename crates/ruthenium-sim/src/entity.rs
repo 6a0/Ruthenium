@@ -342,6 +342,7 @@ pub struct PlayerFields {
     pub health: Option<u8>,
     pub absorption: Option<u8>,
     pub score: Option<u8>,
+    pub sleeping_pos: Option<u8>,
 }
 
 impl PlayerFields {
@@ -356,6 +357,7 @@ impl PlayerFields {
             health: d.field("LivingEntity.DATA_HEALTH_ID"),
             absorption: d.field("Player.DATA_PLAYER_ABSORPTION_ID"),
             score: d.field("Player.DATA_SCORE_ID"),
+            sleeping_pos: d.field("LivingEntity.SLEEPING_POS_ID"),
         }
     }
 }
@@ -2724,8 +2726,11 @@ impl Entities {
             player.rocket_boost();
         }
         if e.info.living && !e.info.no_push {
-            // `pushEntities` → `getPushableEntities` → `doPush` → `LocalPlayer.push`.
-            if player.bounding_box().intersects(&e.bounding_box) && self.pushable_by(e, cx, player)
+            // `pushEntities` → `getPushableEntities` → `doPush` → `LocalPlayer.push`,
+            // which a sleeping player ignores.
+            if player.bounding_box().intersects(&e.bounding_box)
+                && self.pushable_by(e, cx, player)
+                && !player.is_sleeping()
             {
                 let no_physics = e.no_physics || e.info.vex;
                 self.push_player(player, cx, e.position, no_physics, id, -1.0);
@@ -3013,6 +3018,8 @@ mod tests {
                 interaction_shape: 0,
                 interaction: 0,
                 destroy_time: 0.0,
+                light_dampening: 0,
+                occlusion: [0, 0],
             }],
         });
         let mut level = Level::new(-64, 384);

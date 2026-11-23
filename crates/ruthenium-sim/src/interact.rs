@@ -888,8 +888,14 @@ fn item_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> (Outcome, Opt
             }
         }
         Class::Trident => {
-            // Rain isn't tracked: only water lets a riptide trident start.
-            if stack.next_damage_will_break() || stack.c.spin_attack_strength > 0.0 && !p.in_water()
+            let env = Env {
+                level: w.level,
+                blocks: w.blocks,
+                tags: w.tags,
+                colliders: &[],
+            };
+            if stack.next_damage_will_break()
+                || stack.c.spin_attack_strength > 0.0 && !p.is_in_water_or_rain(&env)
             {
                 return (Outcome::Fail, None);
             }

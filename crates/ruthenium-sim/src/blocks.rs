@@ -328,6 +328,23 @@ impl Blocks {
         )
     }
 
+    /// `getLightDampening`: how much light the state takes away.
+    pub fn light_dampening(&self, id: u32) -> u8 {
+        self.state(id).light_dampening
+    }
+
+    /// `ChunkSkyLightSources.isEdgeOccluded`: sky light can't come down from `above`
+    /// into `below` (the lower block dampens light, or the two blocks' light occlusion
+    /// faces between them cover the whole face).
+    pub fn sky_edge_occluded(&self, above: u32, below: u32) -> bool {
+        if self.light_dampening(below) != 0 {
+            return true;
+        }
+        let down = &self.shapes[self.state(above).occlusion[0] as usize];
+        let up = &self.shapes[self.state(below).occlusion[1] as usize];
+        Shape::faces_occlude(down, up)
+    }
+
     /// `hasLargeCollisionShape`.
     pub fn large_shape(&self, id: u32) -> bool {
         self.state(id).flags & StatePhysics::LARGE_SHAPE != 0

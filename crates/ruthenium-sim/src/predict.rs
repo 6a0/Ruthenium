@@ -188,6 +188,8 @@ mod tests {
             interaction_shape: 0,
             interaction: 0,
             destroy_time: 1.5,
+            light_dampening: 0,
+            occlusion: [0, 0],
         };
         let cube = |full| ShapeData {
             coords: [vec![0.0, 1.0], vec![0.0, 1.0], vec![0.0, 1.0]],

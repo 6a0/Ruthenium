@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use ruthenium_protocol::wire::{Reader, WireError};
 
+use crate::biome::Climate;
 use crate::block_entity::{BlockEntities, BlockEntityShape, Kind, kind_of};
 use crate::blocks::Blocks;
 use crate::direction::Direction;
@@ -43,9 +44,61 @@ impl Section {
     }
 }
 
+/// A section's biomes: one per 4×4×4 cell (`PalettedContainer` for biomes, x fastest,
+/// then z, then y).
+#[derive(Debug, Clone)]
+enum BiomeSection {
+    Single(u16),
+    Mixed(Box<[u16; 64]>),
+}
+
+impl BiomeSection {
+    fn get(&self, x: i32, y: i32, z: i32) -> u16 {
+        match self {
+            BiomeSection::Single(b) => *b,
+            BiomeSection::Mixed(a) => a[((y << 4) | (z << 2) | x) as usize],
+        }
+    }
+
+    fn set(&mut self, x: i32, y: i32, z: i32, biome: u16) {
+        if let BiomeSection::Single(b) = *self {
+            if b == biome {
+                return;
+            }
+            *self = BiomeSection::Mixed(Box::new([b; 64]));
+        }
+        if let BiomeSection::Mixed(a) = self {
+            a[((y << 4) | (z << 2) | x) as usize] = biome;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Chunk {
     sections: Vec<Section>,
+    biomes: Vec<BiomeSection>,
+}
+
+/// What the level knows of biomes: the climate of each biome by network id, the
+/// hashed seed that jitters which biome a block is in, the sea level (the snow line is
+/// 17 above it), and the biome empty chunks are made of.
+#[derive(Debug, Clone)]
+pub struct BiomeInfo {
+    pub climates: std::sync::Arc<Vec<Climate>>,
+    pub seed: i64,
+    pub sea_level: i32,
+    pub empty_chunk_biome: u16,
+}
+
+impl Default for BiomeInfo {
+    fn default() -> BiomeInfo {
+        BiomeInfo {
+            climates: std::sync::Arc::new(Vec::new()),
+            seed: 0,
+            sea_level: 63,
+            empty_chunk_biome: 0,
+        }
+    }
 }
 
 /// The level's blocks.
@@ -68,6 +121,9 @@ pub struct Level {
     pub set_log: Option<Vec<crate::block::level::SetCall>>,
     /// The level's world border (`ClientLevel.getWorldBorder`).
     pub border: crate::border::WorldBorder,
+    /// The rain and thunder the server says there are.
+    pub weather: crate::weather::Weather,
+    pub biomes: BiomeInfo,
 }
 
 impl Level {
@@ -81,6 +137,8 @@ impl Level {
             noclip: None,
             set_log: None,
             border: crate::border::WorldBorder::default(),
+            weather: crate::weather::Weather::default(),
+            biomes: BiomeInfo::default(),
         }
     }
 
@@ -120,6 +178,7 @@ impl Level {
             (x, z),
             Chunk {
                 sections: vec![Section::Single(0); n],
+                biomes: vec![BiomeSection::Single(self.biomes.empty_chunk_biome); n],
             },
         );
     }
@@ -138,12 +197,13 @@ impl Level {
         let state_bits = global_bits(ruthenium_data::v26_3::blocks::STATE_COUNT);
         let mut r = Reader::new(data);
         let mut sections = Vec::with_capacity(n);
+        let mut biomes = Vec::with_capacity(n);
         for _ in 0..n {
             r.bytes(4)?; // non-empty block count, fluid count
             sections.push(read_states(&mut r, state_bits)?);
-            skip_biomes(&mut r, biome_bits)?;
+            biomes.push(read_biomes(&mut r, biome_bits)?);
         }
-        self.chunks.insert((x, z), Chunk { sections });
+        self.chunks.insert((x, z), Chunk { sections, biomes });
         // `replaceWithPacketData`: the chunk's block entities go, and the ones the
         // packet lists are made again (`getBlockEntity` with IMMEDIATE). The server lists
         // every shulker box's, so a box is all it takes.
@@ -174,6 +234,81 @@ impl Level {
             }
         }
         Ok(())
+    }
+
+    /// `handleChunksBiomes`: a loaded chunk's biomes replaced (its sections' biome
+    /// containers in order); chunks not loaded are left alone.
+    pub fn load_biomes(
+        &mut self,
+        x: i32,
+        z: i32,
+        data: &[u8],
+        biome_bits: u32,
+    ) -> Result<(), WireError> {
+        let Some(c) = self.chunks.get_mut(&(x, z)) else {
+            return Ok(());
+        };
+        let mut r = Reader::new(data);
+        for b in &mut c.biomes {
+            *b = read_biomes(&mut r, biome_bits)?;
+        }
+        Ok(())
+    }
+
+    /// Sets the biome of every cell whose corner lies between two blocks (`fillbiome`,
+    /// in loaded chunks).
+    pub fn fill_biome(&mut self, from: [i32; 3], to: [i32; 3], biome: u16) {
+        let lo: [i32; 3] = std::array::from_fn(|a| from[a].min(to[a]) >> 2);
+        let hi: [i32; 3] = std::array::from_fn(|a| from[a].max(to[a]) >> 2);
+        let (min_q, max_q) = (self.min_y >> 2, (self.min_y >> 2) + (self.height >> 2) - 1);
+        for qx in lo[0]..=hi[0] {
+            for qz in lo[2]..=hi[2] {
+                let Some(c) = self.chunks.get_mut(&(qx >> 2, qz >> 2)) else {
+                    continue;
+                };
+                for qy in lo[1].max(min_q)..=hi[1].min(max_q) {
+                    let s = (((qy << 2) >> 4) - (self.min_y >> 4)) as usize;
+                    c.biomes[s].set(qx & 3, qy & 3, qz & 3, biome);
+                }
+            }
+        }
+    }
+
+    /// `getNoiseBiome`: the biome of a quarter-chunk cell (its y clamped into the
+    /// level); plains where no chunk is.
+    pub fn noise_biome(&self, cell: [i32; 3]) -> Climate {
+        let Some(c) = self.chunks.get(&(cell[0] >> 2, cell[2] >> 2)) else {
+            return Climate::PLAINS;
+        };
+        let min_q = self.min_y >> 2;
+        let qy = cell[1].clamp(min_q, min_q + (self.height >> 2) - 1);
+        let s = (((qy << 2) >> 4) - (self.min_y >> 4)) as usize;
+        let id = c.biomes[s].get(cell[0] & 3, qy & 3, cell[2] & 3);
+        self.biomes
+            .climates
+            .get(usize::from(id))
+            .copied()
+            .unwrap_or(Climate::PLAINS)
+    }
+
+    /// `getBiome`: the biome a block is in.
+    pub fn biome(&self, pos: [i32; 3]) -> Climate {
+        self.noise_biome(crate::biome::zoomed_cell(self.biomes.seed, pos))
+    }
+
+    /// The highest of a column's loaded sections that isn't all air, as the index of
+    /// its section; `None` where no chunk is or all is air.
+    pub(crate) fn top_filled_section(
+        &self,
+        x: i32,
+        z: i32,
+        is_air: impl Fn(u32) -> bool,
+    ) -> Option<Option<usize>> {
+        let c = self.chunks.get(&(x >> 4, z >> 4))?;
+        Some(c.sections.iter().rposition(|s| match s {
+            Section::Single(s) => !is_air(u32::from(*s)),
+            Section::Mixed(_) => true,
+        }))
     }
 
     /// The state at a block position: air outside the level or where no chunk is.
@@ -414,27 +549,43 @@ fn read_states(r: &mut Reader<'_>, global: u32) -> Result<Section, WireError> {
     Ok(Section::Mixed(out))
 }
 
-/// Skips a biome paletted container (`Strategy.createForBiomes`: 0 single, 1-3
+/// Reads a biome paletted container (`Strategy.createForBiomes`: 0 single, 1-3
 /// linear, more: global).
-fn skip_biomes(r: &mut Reader<'_>, global: u32) -> Result<(), WireError> {
+fn read_biomes(r: &mut Reader<'_>, global: u32) -> Result<BiomeSection, WireError> {
     let bits = u32::from(r.u8()?);
-    let stored = match bits {
+    let (stored, palette) = match bits {
         0 => {
-            r.varint()?;
-            return Ok(());
+            let id = r.varint()?;
+            return Ok(BiomeSection::Single(
+                u16::try_from(id).map_err(|_| WireError::Invalid("biome id"))?,
+            ));
         }
         1..=3 => {
             let n = r.count(64)?;
+            let mut p = Vec::with_capacity(n);
             for _ in 0..n {
-                r.varint()?;
+                p.push(u16::try_from(r.varint()?).map_err(|_| WireError::Invalid("biome id"))?);
             }
-            bits
+            (bits, Some(p))
         }
-        _ => global,
+        _ => (global.max(1), None),
     };
     let per_long = 64 / stored;
-    r.bytes(64_u32.div_ceil(per_long) as usize * 8)?;
-    Ok(())
+    let raw = r.bytes(64_u32.div_ceil(per_long) as usize * 8)?;
+    let mask = (1u64 << stored) - 1;
+    let mut out = Box::new([0u16; 64]);
+    for (i, v) in out.iter_mut().enumerate() {
+        let cell = i / per_long as usize;
+        let word = u64::from_be_bytes(raw[cell * 8..cell * 8 + 8].try_into().unwrap());
+        let index = (word >> ((i - cell * per_long as usize) as u32 * stored) & mask) as usize;
+        *v = match &palette {
+            Some(p) => *p
+                .get(index)
+                .ok_or(WireError::Invalid("biome palette index"))?,
+            None => index as u16,
+        };
+    }
+    Ok(BiomeSection::Mixed(out))
 }
 
 #[cfg(test)]

@@ -5,7 +5,8 @@
 //! window makes: steps separated by spaces, each `KEYS@MS` or `KEYS@MS:DX,DY`. KEYS are
 //! `+`-joined `w a s d jump sneak sprint use hit` (`use` holds the right button, `hit`
 //! the left), hotbar digits `1`-`9`, `click` (one press of the right button), `attack`
-//! (one press of the left) and `swap` (the swap-hands key), the last four pressed once
+//! (one press of the left), `swap` (the swap-hands key) and `wake` (the bed screen's
+//! Leave Bed), the last five pressed once
 //! at the step's start, or `-` for none; held for MS milliseconds while the mouse moves
 //! DX, DY counts every frame (60 a second, the rate frames run at here), turned as the window turns them with the
 //! saved mouse sensitivity. For example
@@ -40,6 +41,8 @@ struct Step {
     clicks: u32,
     attacks: u32,
     swaps: u32,
+    /// Leave Bed pressed at the step's start (`wake`).
+    wake: bool,
     ms: u64,
     turn: (f32, f32),
 }
@@ -70,6 +73,7 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                 clicks: 0,
                 attacks: 0,
                 swaps: 0,
+                wake: false,
                 ms: ms.parse().map_err(|_| bad())?,
                 turn,
             };
@@ -87,6 +91,7 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                     "click" => st.clicks += 1,
                     "attack" => st.attacks += 1,
                     "swap" => st.swaps += 1,
+                    "wake" => st.wake = true,
                     d if d.len() == 1 && ("1"..="9").contains(&d) => {
                         st.hotbar.push(d.parse::<u8>().map_err(|_| bad())? - 1);
                     }
@@ -129,6 +134,9 @@ impl Player {
         session.set_keys(st.keys);
         for &slot in &st.hotbar {
             session.hotbar_key(slot);
+        }
+        if st.wake {
+            session.leave_bed();
         }
         for _ in 0..st.swaps {
             session.swap_hands_key();
@@ -316,6 +324,8 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                     session.respawn();
                 }
                 SessionEvent::Respawned => println!("{t:7.3}s  respawned"),
+                SessionEvent::InBed => println!("{t:7.3}s  in bed"),
+                SessionEvent::WokeUp => println!("{t:7.3}s  woke up"),
                 SessionEvent::Closed(c) => {
                     let (title, reason) = closed_text(c, &data.lang);
                     println!("{t:7.3}s  closed: {title}: {reason}");

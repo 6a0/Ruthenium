@@ -508,6 +508,8 @@ pub struct PlayerData {
     pub living_flags: u8,
     pub absorption: f32,
     pub score: i32,
+    /// `SLEEPING_POS_ID`: the bed the player sleeps in (`isSleeping` while set).
+    pub sleeping_pos: Option<[i32; 3]>,
 }
 
 impl Default for PlayerData {
@@ -520,9 +522,13 @@ impl Default for PlayerData {
             living_flags: 0,
             absorption: 0.0,
             score: 0,
+            sleeping_pos: None,
         }
     }
 }
+
+/// `ServerboundPlayerCommandPacket.Action.STOP_SLEEPING`: the bed screen's Leave Bed.
+pub const PLAYER_COMMAND_STOP_SLEEPING: i32 = 0;
 
 /// `ServerboundPlayerCommandPacket.Action.START_FALL_FLYING`.
 const PLAYER_COMMAND_START_FALL_FLYING: i32 = 6;
@@ -1052,9 +1058,11 @@ impl LocalPlayer {
 
     /// `handleSetEntityData` for the local player: the server's values replace the
     /// client's, the sprinting flag without its speed modifier (`assignValues` doesn't go
-    /// through `setSprinting`), the pose with its box.
-    pub fn set_data(&mut self, values: &[(u8, DataValue)], types: &EntityTypes) {
+    /// through `setSprinting`), the pose with its box. Returns whether a bed was set
+    /// to sleep in: the caller then lays the player in it ([`LocalPlayer::move_to_bed`]).
+    pub fn set_data(&mut self, values: &[(u8, DataValue)], types: &EntityTypes) -> bool {
         let f = types.player_fields();
+        let mut to_bed = false;
         for (field, value) in values {
             let field = Some(*field);
             match *value {
@@ -1080,9 +1088,71 @@ impl LocalPlayer {
                 DataValue::Float(h) if field == f.health => self.health = h,
                 DataValue::Float(a) if field == f.absorption => self.data.absorption = a,
                 DataValue::Int(n) if field == f.score => self.data.score = n,
+                DataValue::OptionalBlockPos(p) if field == f.sleeping_pos => {
+                    self.data.sleeping_pos = p;
+                    to_bed |= p.is_some();
+                }
                 _ => {}
             }
         }
+        to_bed
+    }
+
+    /// The bed screen's Leave Bed (and Escape): `STOP_SLEEPING`, sent outside a tick.
+    pub fn stop_sleeping_packet(&self) -> Vec<u8> {
+        self.player_command(PLAYER_COMMAND_STOP_SLEEPING)
+    }
+
+    /// `isSleeping`: the server has put the player in a bed.
+    pub fn is_sleeping(&self) -> bool {
+        self.data.sleeping_pos.is_some()
+    }
+
+    /// `LivingEntity.setPosToBed` (on the client, as the bed is set): the player lies
+    /// at the middle of the bed, an eighth above its top, if a bed is there.
+    pub fn move_to_bed(&mut self, env: &Env<'_>) {
+        let Some(pos) = self.data.sleeping_pos else {
+            return;
+        };
+        let state = env.state(pos);
+        if !env
+            .blocks
+            .is_class(state, crate::block::Class::AbstractBedBlock)
+        {
+            return;
+        }
+        // `getSleepHeight`: the top of the bed's shape (none when it has no shape).
+        let Some(b) = env.blocks.outline_shape(state).bounds() else {
+            return;
+        };
+        self.position = [
+            f64::from(pos[0]) + 0.5,
+            f64::from(pos[1]) + b.max[1] + 0.125,
+            f64::from(pos[2]) + 0.5,
+        ];
+    }
+
+    /// `isImmobile`: dying or asleep, the player takes no input.
+    fn is_immobile(&self) -> bool {
+        self.is_dead_or_dying() || self.is_sleeping()
+    }
+
+    /// `Entity.isInRain`: rain falls where the player's feet are or at the top of its
+    /// box.
+    pub fn is_in_rain(&self, env: &Env<'_>) -> bool {
+        let sky = crate::weather::Sky {
+            level: env.level,
+            blocks: env.blocks,
+            tags: env.tags,
+        };
+        let feet = self.block_position();
+        let top = [feet[0], mth::floor(self.bounding_box().max[1]), feet[2]];
+        sky.is_raining_at(feet) || sky.is_raining_at(top)
+    }
+
+    /// `isInWaterOrRain`.
+    pub fn is_in_water_or_rain(&self, env: &Env<'_>) -> bool {
+        self.in_water || self.is_in_rain(env)
     }
 
     /// `isFallFlying`: the shared flag, which the client sets as it starts gliding
@@ -1266,7 +1336,7 @@ impl LocalPlayer {
 
     /// `Item.releaseUsing` for the item in use, as the client runs it: only a riptide
     /// trident (`TridentItem.releaseUsing`) does anything here. Held 10 ticks or more,
-    /// in water (rain isn't tracked; riding isn't simulated) and not about to break, it
+    /// in water or rain, not riding and not about to break, it
     /// pushes the player along the look by its spin strength and starts a 20-tick spin,
     /// lifting a player on the ground by 1.2 first.
     fn release_using(&mut self, env: &Env<'_>) {
@@ -1277,7 +1347,10 @@ impl LocalPlayer {
             return;
         }
         let strength = item.c.spin_attack_strength;
-        if !(strength > 0.0) || !self.in_water || item.next_damage_will_break() {
+        if !(strength > 0.0)
+            || !(self.is_in_water_or_rain(env) && self.riding.is_none())
+            || item.next_damage_will_break()
+        {
             return;
         }
         let (y, x) = (self.y_rot * DEG_TO_RAD_F, self.x_rot * DEG_TO_RAD_F);
@@ -1719,6 +1792,10 @@ impl LocalPlayer {
         if !self.removed {
             self.ai_step(env, keys);
         }
+        // A sleeper looks straight ahead.
+        if self.is_sleeping() {
+            self.x_rot = 0.0;
+        }
         // `refreshDirtyAttributes`: a new scale reaches the box and the eyes.
         if std::mem::take(&mut self.scale_dirty) {
             self.refresh_dimensions();
@@ -1823,11 +1900,12 @@ impl LocalPlayer {
         };
     }
 
-    /// `Player.updatePlayerPose` (sleeping aside): a spectator takes the pose it
-    /// wants.
+    /// `Player.updatePlayerPose`: a spectator takes the pose it wants.
     fn update_pose(&mut self, env: &Env<'_>) {
         if self.can_fit(env, Pose::Swimming) {
-            let desired = if self.is_swimming() {
+            let desired = if self.is_sleeping() {
+                Pose::Sleeping
+            } else if self.is_swimming() {
                 Pose::Swimming
             } else if self.fall_flying() {
                 Pose::FallFlying
@@ -1861,7 +1939,7 @@ impl LocalPlayer {
             && !self.is_swimming()
             && self.riding.is_none()
             && self.can_fit(env, Pose::Crouching)
-            && (self.keys.shift || !self.can_fit(env, Pose::Standing));
+            && (self.keys.shift || !self.is_sleeping() && !self.can_fit(env, Pose::Standing));
         // KeyboardInput.tick.
         self.keys = keys;
         let impulse = |pos: bool, neg: bool| {
@@ -2106,8 +2184,7 @@ impl LocalPlayer {
         self.xxa = mx;
         self.zza = my;
         self.jumping = self.keys.jump;
-        // isImmobile: dead (sleeping isn't ported).
-        if self.is_dead_or_dying() {
+        if self.is_immobile() {
             self.jumping = false;
             self.xxa = 0.0;
             self.zza = 0.0;
@@ -3682,6 +3759,8 @@ mod tests {
             interaction_shape: 0,
             interaction: 0,
             destroy_time: 0.0,
+            light_dampening: 0,
+            occlusion: [0, 0],
         };
         let blocks = Blocks::new(&BlockPhysics {
             shapes: vec![
@@ -3873,6 +3952,69 @@ mod tests {
         // A respawn brings a new player.
         let q = p.respawned(0);
         assert!(q.is_alive() && !q.is_dead_or_dying() && q.death_time == 0);
+    }
+
+    #[test]
+    fn the_sleeping_lie_still_and_look_ahead() {
+        let (mut level, blocks, tags) = world();
+        // A low ceiling: standing wouldn't fit.
+        level.set_block(0, -59, 0, 1);
+        let env = Env {
+            level: &level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+        };
+        let mut p = standing(&env, 0);
+        p.y_rot = -90.0;
+        p.x_rot = 40.0;
+        p.data.sleeping_pos = Some([0, -60, 0]);
+        let held = Keys {
+            forward: true,
+            jump: true,
+            ..Keys::default()
+        };
+        let (x, z) = (p.position[0], p.position[2]);
+        for _ in 0..10 {
+            p.tick(&env, held);
+        }
+        assert_eq!((p.position[0], p.position[2], p.on_ground), (x, z, true));
+        assert_eq!(p.x_rot, 0.0);
+        assert_eq!(p.pose, Pose::Sleeping);
+        assert!(
+            !p.crouching,
+            "a sleeper isn't crouching under a low ceiling"
+        );
+        // Where crouching fits but standing doesn't (a ceiling 1.7 up), a sleeper still
+        // isn't crouching; awake, it is.
+        let mut low = Level::new(-64, 384);
+        low.add_empty_chunk(0, 0);
+        low.set_block(0, -58, 0, 1);
+        let low_env = Env {
+            level: &low,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+        };
+        for (asleep, crouching) in [(true, false), (false, true)] {
+            p.data.sleeping_pos = asleep.then_some([0, -60, 0]);
+            p.position = [0.5, -59.7, 0.5];
+            p.delta = [0.0; 3];
+            p.pose = Pose::Standing;
+            p.refresh_dimensions();
+            p.tick(&low_env, Keys::default());
+            assert_eq!(p.crouching, crouching, "asleep {asleep}");
+        }
+        // Awake, the input works again.
+        p.data.sleeping_pos = None;
+        p.position = [x, -60.0, z];
+        p.delta = [0.0; 3];
+        p.on_ground = true;
+        p.x_rot = 40.0;
+        p.tick(&env, held);
+        p.tick(&env, held);
+        assert!(p.position[0] > x, "walked east");
+        assert_eq!(p.x_rot, 40.0);
     }
 
     #[test]

@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod biome;
 pub mod block;
 pub mod block_entity;
 pub mod blocks;
@@ -50,4 +51,5 @@ pub mod shape;
 pub mod transform;
 pub mod use_on;
 pub mod vehicle;
+pub mod weather;
 pub mod world;

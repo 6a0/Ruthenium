@@ -236,6 +236,50 @@ impl Shape {
         self.empty
     }
 
+    /// Whether a point lies in a full cell (cells include their low faces).
+    pub fn contains(&self, p: [f64; 3]) -> bool {
+        let mut at = [0isize; 3];
+        for (axis, v) in p.into_iter().enumerate() {
+            let c = &self.coords[axis];
+            match (0..self.sizes[axis]).find(|&i| c[i] <= v && v < c[i + 1]) {
+                Some(i) => at[axis] = i as isize,
+                None => return false,
+            }
+        }
+        self.is_full_wide(at[0], at[1], at[2])
+    }
+
+    /// `Shapes.faceShapeOccludes`: two face shapes (slices through a whole block)
+    /// together cover the block, so nothing passes between them.
+    pub fn faces_occlude(a: &Shape, b: &Shape) -> bool {
+        if a.is_block() || b.is_block() {
+            return true;
+        }
+        if a.empty && b.empty {
+            return false;
+        }
+        let grid: [Vec<f64>; 3] = std::array::from_fn(|axis| {
+            let mut c: Vec<f64> = [0.0, 1.0]
+                .into_iter()
+                .chain(a.coords[axis].iter().copied())
+                .chain(b.coords[axis].iter().copied())
+                .filter(|v| (0.0..=1.0).contains(v))
+                .collect();
+            c.sort_by(f64::total_cmp);
+            c.dedup();
+            c
+        });
+        let mid = |axis: usize, i: usize| (grid[axis][i] + grid[axis][i + 1]) / 2.0;
+        (0..grid[0].len() - 1).all(|x| {
+            (0..grid[1].len() - 1).all(|y| {
+                (0..grid[2].len() - 1).all(|z| {
+                    let p = [mid(0, x), mid(1, y), mid(2, z)];
+                    a.contains(p) || b.contains(p)
+                })
+            })
+        })
+    }
+
     /// Whether this is the shape of a full block (the game's `Shapes.block()`).
     pub fn is_block(&self) -> bool {
         self.sizes == [1, 1, 1]

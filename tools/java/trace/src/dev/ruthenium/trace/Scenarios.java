@@ -2682,5 +2682,121 @@ public final class Scenarios {
                         hold(ctx, 3, SNEAK);
                         ctx.waitTicks(20);
                         gone(ctx, server, "minecraft:horse");
+                    }),
+            new Scenario("sleeping",
+                    "At midnight, a red bed facing east (foot at 3 -60 0, head at 4 -60 0) with a still pig standing on its head. Looking down at the foot, a click puts the player to sleep in the head (the server's teleport and entity data: the sleeping pose and the bed, which lay the player an eighth above the bed's top): the bed screen opens and lets go of the keys, the pitch goes to 0, and the pig doesn't push the sleeper. W is pressed while in bed (the screen takes it). After 100 ticks the server wakes the player beside the bed: the screen closes and reads the held W, and the player walks at once. Asleep again, Leave Bed is clicked after 20 ticks (STOP_SLEEPING, sent outside a tick): the server wakes the player.",
+                    List.of("time set midnight",
+                            "setblock 3 -60 0 minecraft:red_bed[facing=east,part=foot]",
+                            "setblock 4 -60 0 minecraft:red_bed[facing=east,part=head]"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("summon minecraft:pig 4.8 -59.4375 0.5 " + STILL);
+                        ctx.waitTicks(5);
+                        aim(ctx, server, 1.5, -60, 0.5, 3.5, -59.4375, 0.5);
+                        use(ctx);
+                        ctx.waitTicks(10);
+                        ctx.getInput().holdKey(W);
+                        for (int i = 0; i < 160 && ctx.computeOnClient(mc -> mc.player.isSleeping()); i++) {
+                            ctx.waitTick();
+                        }
+                        ctx.waitTicks(15);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        aim(ctx, server, 1.5, -60, 0.5, 3.5, -59.4375, 0.5);
+                        use(ctx);
+                        ctx.waitTicks(20);
+                        ctx.clickScreenButton("multiplayer.stopSleeping");
+                        ctx.waitTicks(20);
+                        hold(ctx, 10, S);
+                        ctx.waitTicks(5);
+                        server.runCommand("time set noon");
+                        server.runCommand("kill @e[type=minecraft:pig]");
+                        ctx.waitTicks(5);
+                    }),
+            new Scenario("rain",
+                    "A riptide III trident: clicked every tick before and while /weather rain raises the rain level 0.01 a tick: it starts on the tick the level passes 0.2 (the click is let go, which is too brief to launch); then held 15 ticks and let go looking straight down, it launches the player (lifted 1.2 off the ground first). Then tried looking down under roofs 3 above the floor: glass (in the motion-blocking heightmap: no rain), cobweb (dampens sky light: no rain), a layer of snow (its full bottom face shuts the sky light out: no rain), white carpet (none of these: rain, a launch); on the ground of a desert (no precipitation) and of snowy plains (snow); on a pillar in a taiga at y 40 (rain, a launch) and at y 41 (the height and the temperature noise make it snow); on a pillar whose feet are in a desert and head in plains (the head's rain: a launch), and on one that only the biome jitter puts in the desert, feet and head (no launch). Started in the open and walked under the glass roof while held: let go there, no launch. /weather clear: started while the level is still above 0.2, let go once it is below: no launch.",
+                    List.of(UNHURT,
+                            "fill 4 -57 -1 6 -57 1 minecraft:glass",
+                            "fill 8 -57 -1 10 -57 1 minecraft:cobweb",
+                            "fill 12 -57 -1 14 -57 1 minecraft:snow strict",
+                            "fill 16 -57 -1 18 -57 1 minecraft:white_carpet strict",
+                            "fillbiome 16 -64 4 23 -40 11 minecraft:desert",
+                            "fillbiome 24 -64 4 31 -40 11 minecraft:snowy_plains",
+                            "fillbiome 12 30 -12 23 50 4 minecraft:taiga",
+                            "fillbiome 26 4 -8 31 35 -1 minecraft:desert",
+                            "setblock 20 39 -4 minecraft:stone",
+                            "setblock 28 35 -5 minecraft:stone",
+                            "setblock 29 36 -6 minecraft:stone"),
+                    start(1.5, -60, 0.5, -90, 90), (ctx, server) -> {
+                        server.runCommand("item replace entity @a hotbar.0 with minecraft:trident[enchantments={riptide:3}]");
+                        ctx.waitTicks(5);
+                        // Clicks, one a tick, through the rain level's rise: the first one
+                        // after it passes 0.2 starts the trident (let go at once).
+                        for (int i = 0; i < 4; i++) {
+                            ctx.getInput().pressKey(USE);
+                        }
+                        server.runCommand("weather rain");
+                        for (int i = 0; i < 60 && !ctx.computeOnClient(mc -> mc.player.isUsingItem()); i++) {
+                            ctx.getInput().pressKey(USE);
+                        }
+                        ctx.waitTicks(3);
+                        ctx.getInput().holdKey(USE);
+                        ctx.waitTicks(15);
+                        ctx.getInput().releaseKey(USE);
+                        ctx.waitTicks(30);
+                        riptideTry(ctx, server, 5.5, -60, 0.5);
+                        riptideTry(ctx, server, 9.5, -60, 0.5);
+                        riptideTry(ctx, server, 13.5, -60, 0.5);
+                        riptideTry(ctx, server, 17.5, -60, 0.5);
+                        riptideTry(ctx, server, 19.5, -60, 7.5);
+                        riptideTry(ctx, server, 27.5, -60, 7.5);
+                        riptideTry(ctx, server, 20.5, 40, -3.5);
+                        server.runCommand("setblock 20 40 -4 minecraft:stone");
+                        riptideTry(ctx, server, 20.5, 41, -3.5);
+                        riptideTry(ctx, server, 29.5, 37, -5.5);
+                        riptideTry(ctx, server, 28.5, 36, -4.5);
+                        // Walking under the glass while the trident is held.
+                        tp(ctx, server, 2.5, -60, 0.5, -90, 90);
+                        ctx.getInput().holdKey(USE);
+                        ctx.waitTicks(3);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 4.8, 150);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(3);
+                        ctx.getInput().releaseKey(USE);
+                        ctx.waitTicks(10);
+                        // The rain ending while the trident is held: it must be held 10
+                        // ticks or more to launch at all, so this starts well above 0.2.
+                        tp(ctx, server, 1.5, -60, 0.5, -90, 90);
+                        server.runCommand("weather clear");
+                        for (int i = 0; i < 100 && ctx.computeOnClient(mc -> mc.level.getRainLevel(1.0F)) > 0.34F; i++) {
+                            ctx.waitTick();
+                        }
+                        ctx.getInput().holdKey(USE);
+                        for (int i = 0; i < 100 && ctx.computeOnClient(mc -> mc.level.getRainLevel(1.0F)) > 0.12F; i++) {
+                            ctx.waitTick();
+                        }
+                        ctx.getInput().releaseKey(USE);
+                        for (int i = 0; i < 100 && ctx.computeOnClient(mc -> mc.level.getRainLevel(1.0F)) > 0.0F; i++) {
+                            ctx.waitTick();
+                        }
+                        ctx.waitTicks(5);
+                        server.runCommand("fill 20 39 -4 20 40 -4 minecraft:air");
+                        server.runCommand("setblock 28 35 -5 minecraft:air");
+                        server.runCommand("setblock 29 36 -6 minecraft:air");
+                        server.runCommand("fillbiome 16 -64 4 31 -40 11 minecraft:plains");
+                        server.runCommand("fillbiome 12 30 -12 23 50 4 minecraft:plains");
+                        server.runCommand("fillbiome 26 4 -8 31 35 -1 minecraft:plains");
+                        ctx.waitTicks(5);
                     }));
+
+    /**
+     * Teleports the player to (x, y, z) looking straight down, holds the use key 15 ticks
+     * (a riptide trident, if it starts, launches when let go), and waits for the spin to end.
+     */
+    private static void riptideTry(ClientGameTestContext ctx, TestServerContext server, double x, double y, double z) {
+        tp(ctx, server, x, y, z, -90, 90);
+        ctx.waitTicks(3);
+        hold(ctx, 15, USE);
+        ctx.waitTicks(30);
+    }
 }

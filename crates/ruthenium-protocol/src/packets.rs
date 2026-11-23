@@ -1072,6 +1072,11 @@ pub mod play {
             pos: [i32; 3],
             state: u32,
         },
+        /// `ClientboundChunksBiomesPacket`: chunks' new biomes, each as its sections'
+        /// biome containers in order (`fillbiome`).
+        ChunksBiomes {
+            chunks: Vec<(i32, i32, Vec<u8>)>,
+        },
         /// A block's event (`ClientboundBlockEventPacket`): a piston moving, a chest or
         /// shulker box opening, a note block playing. `block` is the block registry id
         /// the server sent it for (the client runs it for whatever block is there).
@@ -1375,6 +1380,17 @@ pub mod play {
                     let data = r.byte_array(2 << 20)?.to_vec();
                     r.rest();
                     Clientbound::LevelChunk { x, z, data }
+                }
+                C::ChunksBiomes => {
+                    let n = r.count(1 << 16)?;
+                    let mut chunks = Vec::with_capacity(n.min(1024));
+                    for _ in 0..n {
+                        // `ChunkPos.pack`: x in the low half, z in the high.
+                        let packed = r.i64()?;
+                        let data = r.byte_array(2 << 20)?.to_vec();
+                        chunks.push((packed as i32, (packed >> 32) as i32, data));
+                    }
+                    Clientbound::ChunksBiomes { chunks }
                 }
                 C::BlockChangedAck => Clientbound::BlockChangedAck {
                     sequence: r.varint()?,

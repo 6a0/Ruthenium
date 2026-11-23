@@ -38,6 +38,7 @@ use ruthenium_net::connection::{
 use ruthenium_protocol::packets::configuration::{self as cfg, RegistryEntry, RegistryTags};
 use ruthenium_protocol::packets::{Common, KnownPack, PackAction, play, read_brand};
 
+use crate::biome::Climate;
 use crate::blocks::{BlockTags, Blocks};
 use crate::clock::{self, TickClock};
 use crate::effect::Effect;
@@ -50,7 +51,8 @@ use crate::level_load::LevelLoad;
 use crate::pick;
 use crate::player::{Env, Keys, LocalPlayer, Pose};
 use crate::predict::Predictions;
-use crate::world::{Level, global_bits};
+use crate::weather::Weather;
+use crate::world::{BiomeInfo, Level, global_bits};
 
 #[derive(Debug)]
 pub struct SessionOptions {
@@ -80,6 +82,9 @@ pub struct Physics {
     /// Vanilla's enchantments by name, for servers that send them as known-pack
     /// entries without data.
     pub enchantments: std::sync::Arc<crate::enchantment::Enchantments>,
+    /// Vanilla's biomes' climates by name, for servers that send them as known-pack
+    /// entries without data.
+    pub biomes: HashMap<String, crate::biome::Climate>,
 }
 
 /// What movement needs from a dimension type.
@@ -89,6 +94,9 @@ pub struct DimensionType {
     pub height: i32,
     /// The `minecraft:gameplay/fast_lava` environment attribute.
     pub fast_lava: bool,
+    /// `has_skylight` and `has_ceiling`: whether it can rain there.
+    pub has_skylight: bool,
+    pub has_ceiling: bool,
 }
 
 impl DimensionType {
@@ -123,6 +131,11 @@ pub enum SessionEvent {
     },
     /// The death screen's buttons work now, 20 ticks after it opened.
     RespawnReady,
+    /// The player lies in a bed and the bed screen opened (`InBedChatScreen`): Leave
+    /// Bed is [`Session::leave_bed`].
+    InBed,
+    /// The player is out of bed and the bed screen closed.
+    WokeUp,
     /// The server brought the player back (`handleRespawn`): the death screen closes and
     /// the level loads; [`SessionEvent::Loaded`] follows.
     Respawned,
@@ -135,6 +148,8 @@ enum Command {
     Disconnect,
     /// The death screen's Respawn (or Spectate World) button.
     Respawn,
+    /// The bed screen's Leave Bed button.
+    LeaveBed,
     /// One frame of the main thread, with its input.
     Frame(FrameInput),
 }
@@ -263,6 +278,12 @@ impl Session {
     /// screen's Respawn button); [`SessionEvent::Respawned`] follows.
     pub fn respawn(&self) {
         let _ = self.commands.send(Command::Respawn);
+    }
+
+    /// Asks the server to wake the player (the bed screen's Leave Bed);
+    /// [`SessionEvent::WokeUp`] follows once it does.
+    pub fn leave_bed(&self) {
+        let _ = self.commands.send(Command::LeaveBed);
     }
 
     /// Ends the main thread's frame: the game thread runs it (`Minecraft.runTick`) with
@@ -427,6 +448,10 @@ struct Game {
     /// The session opens it itself, as vanilla's packet listener and `Gui.tick` do,
     /// so it counts as a screen from that tick on.
     death_screen: Option<u32>,
+    /// The bed screen is open (`InBedChatScreen`).
+    bed_screen: bool,
+    /// The movement keys the frame's input held, whatever screen took them.
+    held_keys: Keys,
     /// The world is hardcore (the login says).
     hardcore: bool,
     /// The profile name the server knows the player by (its scoreboard name), and its
@@ -544,6 +569,8 @@ impl Game {
             use_keys: UseKeys::default(),
             screen_open: false,
             death_screen: None,
+            bed_screen: false,
+            held_keys: Keys::default(),
             hardcore: false,
             name: String::new(),
             uuid: 0,
@@ -574,6 +601,15 @@ impl Game {
                     if self.world.is_some() {
                         self.connection
                             .send(play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN));
+                    }
+                }
+                // `InBedChatScreen.sendWakeUp`: only while the screen is open; it stays
+                // open until the server wakes the player.
+                Command::LeaveBed => {
+                    if self.bed_screen
+                        && let Some(w) = &self.world
+                    {
+                        self.connection.send(w.player.stop_sleeping_packet());
                     }
                 }
                 Command::CodeOfConduct(accept) if self.waiting_for_code_of_conduct => {
@@ -630,14 +666,16 @@ impl Game {
     /// now, hotbar presses wait for the ticks.
     fn take_input(&mut self, input: &FrameInput) {
         self.keys = input.keys;
+        self.held_keys = input.keys;
         self.use_keys.use_down = input.use_down;
         self.use_keys.use_clicks += input.use_clicks;
         self.use_keys.swap_clicks += input.swap_clicks;
         self.use_keys.attack_down = input.attack_down;
         self.use_keys.attack_clicks += input.attack_clicks;
         self.screen_open = input.screen_open;
-        // The death screen took the keys (`KeyMapping.releaseAll`) and keeps them.
-        if self.death_screen.is_some() {
+        // The death screen or the bed screen took the keys (`KeyMapping.releaseAll`)
+        // and keeps them.
+        if self.death_screen.is_some() || self.bed_screen {
             self.release_keys();
         }
         // Without a player (`minecraft.player == null`) the input goes nowhere.
@@ -672,6 +710,8 @@ impl Game {
     /// Opens the death screen (`new DeathScreen`): the keys are let go.
     fn open_death_screen(&mut self, cause: Option<ruthenium_protocol::nbt::Tag>) {
         self.death_screen = Some(0);
+        // It takes the bed screen's place.
+        self.bed_screen = false;
         self.release_keys();
         let score = self.world.as_ref().map_or(0, |w| w.player.data.score);
         self.report(SessionEvent::Died {
@@ -793,6 +833,8 @@ impl Game {
                 min_y: c.int("min_y")?,
                 height: c.int("height")?,
                 fast_lava,
+                has_skylight: c.boolean("has_skylight")?,
+                has_ceiling: c.boolean("has_ceiling")?,
             })
         });
         let vanilla =
@@ -806,12 +848,38 @@ impl Game {
                 min_y: -64,
                 height: 384,
                 fast_lava: false,
+                has_skylight: true,
+                has_ceiling: false,
             }
         });
-        let biomes = registry("minecraft:worldgen/biome").len();
+        // The biomes' climates by network id: the data the server sent, else vanilla's
+        // of that name.
+        let biomes = registry("minecraft:worldgen/biome");
+        let climates = biomes
+            .iter()
+            .map(|e| {
+                let sent = e.data.as_ref().and_then(|d| {
+                    let c = d.as_compound()?;
+                    Some(Climate::new(
+                        c.boolean("has_precipitation")?,
+                        c.float("temperature")?,
+                        c.string("temperature_modifier"),
+                    ))
+                });
+                sent.or_else(|| self.physics.as_ref()?.biomes.get(&e.id).copied())
+                    .unwrap_or(Climate::PLAINS)
+            })
+            .collect();
         let mut level = Level::new(t.min_y, t.height);
         level.set_fast_lava(t.fast_lava);
-        (level, global_bits(biomes))
+        level.weather = Weather::new(t.has_skylight, t.has_ceiling, &spawn.dimension);
+        level.biomes = BiomeInfo {
+            climates: Arc::new(climates),
+            seed: spawn.seed,
+            sea_level: spawn.sea_level,
+            empty_chunk_biome: 0,
+        };
+        (level, global_bits(biomes.len()))
     }
 
     /// The block transformers the configuration's registry lists: each entry's own
@@ -919,9 +987,26 @@ impl Game {
         // `Gui.tick`: with no screen open, a dead player gets the death screen, or asks
         // to respawn at once (every tick, until the server answers); then the death
         // screen ticks, its buttons working from its 20th tick.
-        let found_dead =
-            !self.screen_open && self.death_screen.is_none() && w.player.is_dead_or_dying();
+        // With the bed screen open, it closes once the player is out of bed; with no
+        // screen open, a sleeping player gets it.
+        let no_screen = !self.screen_open && self.death_screen.is_none() && !self.bed_screen;
+        let found_dead = no_screen && w.player.is_dead_or_dying();
         let show_death_screen = w.player.show_death_screen;
+        if self.bed_screen && !w.player.is_sleeping() {
+            self.bed_screen = false;
+            // Grabbing the mouse reads the keys physically held (`KeyMapping.setAll`,
+            // except on macOS).
+            if !cfg!(target_os = "macos") {
+                self.keys = self.held_keys;
+            }
+            let _ = self.events.send(SessionEvent::WokeUp);
+        } else if no_screen && !found_dead && w.player.is_sleeping() {
+            self.bed_screen = true;
+            self.keys = Keys::default();
+            self.use_keys.use_down = false;
+            self.use_keys.attack_down = false;
+            let _ = self.events.send(SessionEvent::InBed);
+        }
         if found_dead {
             if show_death_screen {
                 self.open_death_screen(None);
@@ -952,7 +1037,7 @@ impl Game {
         // or another): one press per hotbar key per tick (spectators' hotbar keys open
         // the spectator menu instead, which isn't there yet), then the hands. A screen
         // makes attacks wait for the attack key to be let go.
-        if !w.loaded || self.screen_open || self.death_screen.is_some() {
+        if !w.loaded || self.screen_open || self.death_screen.is_some() || self.bed_screen {
             w.game_mode.screen_open();
         } else {
             let env = Env {
@@ -1240,8 +1325,9 @@ impl Game {
                 w.loaded = false;
                 w.load = Some(LevelLoad::start(now));
                 w.level_started = now;
-                // The death screen closes for the level loading screen.
+                // The death screen (or the bed screen) closes for the level loading screen.
                 self.death_screen = None;
+                self.bed_screen = false;
                 self.release_keys();
                 self.report(SessionEvent::Respawned);
             }
@@ -1277,7 +1363,9 @@ impl Game {
                                 l.loading_packets_received();
                             }
                         }
-                        _ => {}
+                        _ => {
+                            w.level.weather.game_event(event, param);
+                        }
                     }
                 }
             }
@@ -1287,6 +1375,15 @@ impl Game {
                         return Err(format!("chunk {x} {z}: {e}"));
                     }
                     w.entities.chunk_loaded(x, z);
+                }
+            }
+            play::Clientbound::ChunksBiomes { chunks } => {
+                if let Some(w) = &mut self.world {
+                    for (x, z, data) in chunks {
+                        if let Err(e) = w.level.load_biomes(x, z, &data, w.biome_bits) {
+                            return Err(format!("biomes of chunk {x} {z}: {e}"));
+                        }
+                    }
                 }
             }
             play::Clientbound::ForgetLevelChunk { x, z } => {
@@ -1466,7 +1563,14 @@ impl Game {
                     && let Some(physics) = &self.physics
                 {
                     if entity_id == w.player.entity_id {
-                        w.player.set_data(&values, &physics.entity_types);
+                        if w.player.set_data(&values, &physics.entity_types) {
+                            w.player.move_to_bed(&Env {
+                                level: &w.level,
+                                blocks: &physics.blocks,
+                                tags: &self.tags,
+                                colliders: &[],
+                            });
+                        }
                     } else {
                         w.entities
                             .set_data(entity_id, &values, &physics.entity_types);

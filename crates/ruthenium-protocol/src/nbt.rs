@@ -121,6 +121,19 @@ impl Compound {
         })
     }
 
+    /// A numeric entry as a float (a codec's `Codec.FLOAT` reads any number).
+    pub fn float(&self, name: &str) -> Option<f32> {
+        Some(match *self.get(name)? {
+            Tag::Byte(v) => f32::from(v),
+            Tag::Short(v) => f32::from(v),
+            Tag::Int(v) => v as f32,
+            Tag::Long(v) => v as f32,
+            Tag::Float(v) => v,
+            Tag::Double(v) => v as f32,
+            _ => return None,
+        })
+    }
+
     /// A boolean: any numeric tag, true when not zero (vanilla's `getBooleanOr`).
     pub fn boolean(&self, name: &str) -> Option<bool> {
         Some(self.int(name)? as i8 != 0)

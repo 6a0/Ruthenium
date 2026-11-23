@@ -771,6 +771,8 @@ mod tests {
             interaction_shape,
             interaction: 0,
             destroy_time: 0.0,
+            light_dampening: 0,
+            occlusion: [0, 0],
         };
         let water = StatePhysics::FLUID_WATER | 8 << 4;
         let flowing = StatePhysics::FLUID_FLOWING_WATER | 4 << 4;

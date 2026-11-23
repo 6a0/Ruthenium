@@ -105,6 +105,7 @@ impl GameData {
                     items: Arc::new(items),
                     block_transformers: Arc::new(block_transformers(&jar)),
                     enchantments: Arc::new(enchantments(&jar)),
+                    biomes: biomes(&jar),
                 })
             }
             Err(e) => {
@@ -135,8 +136,25 @@ fn dimension_types(jar: &Zip) -> HashMap<String, DimensionType> {
                 min_y: n("min_y")?,
                 height: n("height")?,
                 fast_lava,
+                has_skylight: v.get("has_skylight")?.as_bool()?,
+                has_ceiling: v.get("has_ceiling")?.as_bool()?,
             };
             Some((format!("minecraft:{file}"), t))
+        })
+        .collect()
+}
+
+/// Vanilla's biomes' climates from the jar's data pack, by name.
+fn biomes(jar: &Zip) -> HashMap<String, ruthenium_sim::biome::Climate> {
+    const DIR: &str = "data/minecraft/worldgen/biome/";
+    jar.with_prefix(DIR)
+        .filter_map(|i| {
+            let file = jar.name(i).strip_prefix(DIR)?.strip_suffix(".json")?;
+            let v: serde_json::Value = serde_json::from_slice(&jar.read(i).ok()?).ok()?;
+            Some((
+                format!("minecraft:{file}"),
+                ruthenium_sim::biome::Climate::from_json(&v)?,
+            ))
         })
         .collect()
 }

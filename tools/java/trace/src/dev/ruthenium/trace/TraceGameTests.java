@@ -81,6 +81,18 @@ public final class TraceGameTests implements FabricClientGameTest {
         return a;
     }
 
+    /** A private field's value. */
+    private static Object field(Class<?> owner, Object target, String name) {
+        try {
+            java.lang.reflect.Field f = owner.getDeclaredField(name);
+            f.setAccessible(true);
+            Object v = f.get(target);
+            return v instanceof Long l ? (Object) l : v;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     private static JsonObject header(Minecraft mc, Scenario scenario, String tp) {
         JsonObject o = new JsonObject();
         o.addProperty("format", "ruthenium-trace/1");
@@ -107,6 +119,16 @@ public final class TraceGameTests implements FabricClientGameTest {
             o.addProperty("playerName", mc.player.getGameProfile().name());
             o.addProperty("playerUuid", mc.player.getUUID().toString());
             o.addProperty("showDeathScreen", mc.player.shouldShowDeathScreen());
+        }
+        if (mc.level != null) {
+            // What the level's rain and biomes need: the sea level (the snow line is 17
+            // above), the hashed seed that jitters biome lookups, and the weather as the
+            // trace begins.
+            o.addProperty("seaLevel", mc.level.getSeaLevel());
+            o.addProperty("biomeZoomSeed", (Long) field(net.minecraft.world.level.biome.BiomeManager.class,
+                    mc.level.getBiomeManager(), "biomeZoomSeed"));
+            o.addProperty("rainLevel", (Float) field(net.minecraft.world.level.Level.class, mc.level, "rainLevel"));
+            o.addProperty("thunderLevel", (Float) field(net.minecraft.world.level.Level.class, mc.level, "thunderLevel"));
         }
         o.addProperty("harness", "Fabric client gametest: one client tick per frame, one server tick per client tick");
         return o;

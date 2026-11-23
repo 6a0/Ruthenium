@@ -125,6 +125,25 @@ fn vanilla_enchantments(game: &Path) -> ruthenium_sim::enchantment::Enchantments
     ruthenium_sim::enchantment::Enchantments::from_json_files(files).vanilla_order()
 }
 
+/// Vanilla's biomes' climates from the jar, by name in order.
+fn vanilla_biomes(game: &Path) -> Vec<(String, ruthenium_sim::biome::Climate)> {
+    let jar = ruthenium_assets::zip::Zip::open(&game.join("versions/26.3/client.jar")).unwrap();
+    const DIR: &str = "data/minecraft/worldgen/biome/";
+    let mut out: Vec<(String, ruthenium_sim::biome::Climate)> = jar
+        .with_prefix(DIR)
+        .filter_map(|i| {
+            let file = jar.name(i).strip_prefix(DIR)?.strip_suffix(".json")?;
+            let v: serde_json::Value = serde_json::from_slice(&jar.read(i).ok()?).ok()?;
+            Some((
+                format!("minecraft:{file}"),
+                ruthenium_sim::biome::Climate::from_json(&v)?,
+            ))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn trace(name: &str) -> Trace {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/26.3");
     Trace::parse(&std::fs::read_to_string(root.join(format!("{name}.jsonl"))).unwrap()).unwrap()
@@ -158,9 +177,31 @@ const CHUNKS: [(i32, i32); 56] = {
     out
 };
 
-/// The scenario's world: the flat preset, then the header's reset and build commands.
-fn build_level(t: &Trace) -> Level {
+/// The scenario's world: the flat preset (plains, the overworld's weather, the sea
+/// level and the hashed seed the header gives, else the flat preset's), then the
+/// header's reset and build commands (`fillbiome` among them).
+fn build_level(t: &Trace, d: &Data) -> Level {
     let mut level = Level::new(-64, 384);
+    let biome_id = |name: &str| {
+        let name = if name.contains(':') {
+            name.to_owned()
+        } else {
+            format!("minecraft:{name}")
+        };
+        d.biomes
+            .iter()
+            .position(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("unknown biome {name}")) as u16
+    };
+    level.biomes = ruthenium_sim::world::BiomeInfo {
+        climates: std::sync::Arc::new(d.biomes.iter().map(|(_, c)| *c).collect()),
+        seed: t.header["biomeZoomSeed"].as_i64().unwrap_or(0),
+        sea_level: t.header["seaLevel"].as_i64().map_or(-63, |s| s as i32),
+        empty_chunk_biome: biome_id("plains"),
+    };
+    level.weather = ruthenium_sim::weather::Weather::new(true, false, "minecraft:overworld");
+    level.weather.rain = t.header["rainLevel"].as_f64().map_or(0.0, |v| v as f32);
+    level.weather.thunder = t.header["thunderLevel"].as_f64().map_or(0.0, |v| v as f32);
     for (cx, cz) in CHUNKS {
         level.add_empty_chunk(cx, cz);
     }
@@ -199,6 +240,7 @@ fn build_level(t: &Trace) -> Level {
                 }
             }
             "setblock" => level.set_block(n(1), n(2), n(3), parse_state(w[4])),
+            "fillbiome" => level.fill_biome([n(1), n(2), n(3)], [n(4), n(5), n(6)], biome_id(w[7])),
             _ => {}
         }
     }
@@ -252,6 +294,8 @@ struct Data {
     items: Items,
     item_tags: ruthenium_sim::item::ItemTags,
     transformers: ruthenium_sim::use_on::Transformers,
+    /// Vanilla's biomes by name, in the registry's order (sorted by name).
+    biomes: Vec<(String, ruthenium_sim::biome::Climate)>,
 }
 
 fn replay(name: &str, d: &Data) -> Result<usize, String> {
@@ -290,6 +334,8 @@ struct Client {
     loaded: bool,
     /// The death screen, while open: the ticks since it opened.
     death_screen: Option<u32>,
+    /// The bed screen is open.
+    bed_screen: bool,
     /// Its Respawn button was pressed (it then stays inactive).
     respawn_pressed: bool,
     /// What the replay sent while handling packets, not yet matched with vanilla's.
@@ -303,11 +349,19 @@ enum Pending {
     Sent(Vec<u8>),
 }
 
-/// A request to respawn vanilla sent outside a tick: one the replay sent handling a
-/// packet, else the death screen's Respawn button, which must be there and working.
-fn sent_outside(c: &mut Client, vanilla: &[u8], n: i64) -> Result<(), (i64, String)> {
+/// A packet vanilla sent outside a tick: one the replay sent handling a packet, else
+/// a button's: the death screen's Respawn, which must be there and working, or the bed
+/// screen's Leave Bed, which must be open.
+fn sent_outside(
+    c: &mut Client,
+    p: &LocalPlayer,
+    vanilla: &[u8],
+    n: i64,
+) -> Result<(), (i64, String)> {
+    let leave_bed = p.stop_sleeping_packet();
     let ours = match c.sent_outside.pop_front() {
         Some(ours) => ours,
+        None if c.bed_screen && vanilla == leave_bed.as_slice() => leave_bed,
         None if c.death_screen.is_some_and(|t| t >= 20) && !c.respawn_pressed => {
             c.respawn_pressed = true;
             play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN)
@@ -315,7 +369,9 @@ fn sent_outside(c: &mut Client, vanilla: &[u8], n: i64) -> Result<(), (i64, Stri
         None => {
             return Err((
                 n,
-                format!("after tick {n}: vanilla sent {vanilla:02x?} with no working death screen"),
+                format!(
+                    "after tick {n}: vanilla sent {vanilla:02x?} with no working death screen or bed screen"
+                ),
             ));
         }
     };
@@ -329,13 +385,15 @@ fn sent_outside(c: &mut Client, vanilla: &[u8], n: i64) -> Result<(), (i64, Stri
 }
 
 /// Whether an `out` record is one the replay compares that was sent outside a tick: a
-/// respawn request, or a controlled vehicle's position answering the server.
+/// respawn request, Leave Bed, or a controlled vehicle's position answering the server.
 fn outside_tick_request(q: &ruthenium_trace::Record) -> bool {
     q.kind == "out"
         && q.bool("inTick") == Some(false)
         && matches!(
             q.str("name"),
-            Some("minecraft:client_command" | "minecraft:move_vehicle")
+            Some(
+                "minecraft:client_command" | "minecraft:move_vehicle" | "minecraft:player_command"
+            )
         )
 }
 
@@ -463,7 +521,14 @@ fn handle(
             entity_id, values, ..
         } => {
             if entity_id == p.entity_id {
-                p.set_data(&values, types);
+                if p.set_data(&values, types) {
+                    p.move_to_bed(&Env {
+                        level: &l.level,
+                        blocks: &d.blocks,
+                        tags: &d.tags,
+                        colliders: &[],
+                    });
+                }
             } else {
                 c.entities.set_data(entity_id, &values, types);
             }
@@ -579,12 +644,14 @@ fn handle(
             p.set_game_type(spawn.game_type);
             c.loaded = false;
             c.death_screen = None;
+            c.bed_screen = false;
             c.respawn_pressed = false;
         }
         // `handlePlayerCombatKill`: the death screen, or a respawn request at once.
         Clientbound::PlayerCombatKill { player_id, .. } if player_id == p.entity_id => {
             if p.show_death_screen {
                 c.death_screen = Some(0);
+                c.bed_screen = false;
             } else {
                 c.sent_outside
                     .push_back(play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN));
@@ -592,6 +659,9 @@ fn handle(
         }
         // IMMEDIATE_RESPAWN.
         Clientbound::GameEvent { event: 11, param } => p.show_death_screen = param == 0.0,
+        Clientbound::GameEvent { event, param } => {
+            l.level.weather.game_event(event, param);
+        }
         Clientbound::PlayerPosition(t) => {
             p.teleport(&t);
             l.predictions.on_teleport();
@@ -693,7 +763,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
     let (blocks, tags, items) = (&d.blocks, &d.tags, &d.items);
     let t = trace(name);
     let mut cl = ClientLevel {
-        level: build_level(&t),
+        level: build_level(&t, d),
         predictions: Predictions::new(),
     };
     let env = Env {
@@ -786,6 +856,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         uuid,
         loaded: true,
         death_screen: None,
+        bed_screen: false,
         respawn_pressed: false,
         sent_outside: std::collections::VecDeque::new(),
     };
@@ -840,7 +911,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             continue;
         }
         if outside_tick_request(r) {
-            sent_outside(&mut client, &r.bytes().unwrap(), -1)?;
+            sent_outside(&mut client, &p, &r.bytes().unwrap(), -1)?;
             continue;
         }
         if r.kind != "tick" {
@@ -895,7 +966,19 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         // go of the keys at once, or asks to respawn (every tick until the server answers);
         // then the death screen ticks.
         let mut keys_released = false;
-        if client.loaded && client.death_screen.is_none() && p.is_dead_or_dying() {
+        // The bed screen closes once the player is out of bed (grabbing the mouse reads
+        // the keys physically held); with no screen open, a sleeping player gets it.
+        let no_screen = client.loaded && client.death_screen.is_none() && !client.bed_screen;
+        if client.bed_screen && !p.is_sleeping() {
+            client.bed_screen = false;
+            if let Some(physical) = r.value.get("physical") {
+                held = keys(physical);
+            }
+        } else if no_screen && !p.is_dead_or_dying() && p.is_sleeping() {
+            client.bed_screen = true;
+            keys_released = true;
+        }
+        if no_screen && p.is_dead_or_dying() {
             if p.show_death_screen {
                 client.death_screen = Some(0);
                 keys_released = true;
@@ -906,7 +989,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         if let Some(t) = &mut client.death_screen {
             *t += 1;
         }
-        let screen_open = client.death_screen.is_some() || !client.loaded;
+        let screen_open = client.death_screen.is_some() || client.bed_screen || !client.loaded;
         for slot in 0..9 {
             if clicks(&format!("key.hotbar.{}", slot + 1)) > 0 && !p.spectator && !screen_open {
                 p.inventory.selected = slot;
@@ -1267,6 +1350,18 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 ));
             }
         }
+        // The bed screen.
+        if let Some(screen) = s.str("screen")
+            && (screen == "InBedChatScreen") != client.bed_screen
+        {
+            return Err((
+                n,
+                format!(
+                    "tick {n}: the bed screen differs: got {}, vanilla's screen {screen:?}",
+                    client.bed_screen
+                ),
+            ));
+        }
         let pose = Pose::from_name(s.str("pose").unwrap()).unwrap();
         let got = (
             p.position,
@@ -1314,7 +1409,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         for e in std::mem::take(&mut pending) {
             match e {
                 Pending::Handled(b) => handle(&b, &mut client, &mut p, &mut cl, &mut game_mode, d),
-                Pending::Sent(b) => sent_outside(&mut client, &b, n)?,
+                Pending::Sent(b) => sent_outside(&mut client, &p, &b, n)?,
             }
         }
         ticks += 1;
@@ -1329,7 +1424,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 82] = [
+const EXACT: [&str; 84] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1412,6 +1507,8 @@ const EXACT: [&str; 82] = [
     "world_border",
     "scale_small",
     "scale_large",
+    "sleeping",
+    "rain",
 ];
 
 #[test]
@@ -1433,6 +1530,7 @@ fn golden_traces() {
         },
         item_tags: vanilla_item_tags(&game),
         transformers: vanilla_transformers(&game),
+        biomes: vanilla_biomes(&game),
     };
     let all = [
         "walk_directions",
@@ -1517,6 +1615,8 @@ fn golden_traces() {
         "world_border",
         "scale_small",
         "scale_large",
+        "sleeping",
+        "rain",
     ];
     // RUTHENIUM_TRACES=a,b replays only those.
     let only = std::env::var("RUTHENIUM_TRACES").ok();

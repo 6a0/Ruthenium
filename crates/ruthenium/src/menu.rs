@@ -253,6 +253,8 @@ enum FormKind {
     Died,
     /// The death screen's Title Screen, confirmed (`DeathScreen.TitleConfirmScreen`).
     QuitConfirm,
+    /// The bed screen (`InBedChatScreen`): Leave Bed, until the server wakes the player.
+    InBed,
 }
 
 impl FormKind {
@@ -674,6 +676,20 @@ impl Menu {
                     });
                     self.death_form();
                 }
+                SessionEvent::InBed if !self.leaving => {
+                    self.game.release(self.session.as_ref());
+                    self.session_form(
+                        FormKind::InBed,
+                        "Sleeping",
+                        &[],
+                        vec![button("Leave Bed", Action::Confirm)],
+                    );
+                }
+                SessionEvent::WokeUp => {
+                    if matches!(self.screen, Screen::Form(FormKind::InBed, ..)) {
+                        self.enter_game();
+                    }
+                }
                 SessionEvent::RespawnReady => {
                     if let Some(d) = &mut self.death {
                         d.ready = true;
@@ -1078,6 +1094,7 @@ impl Menu {
             | FormKind::Paused
             | FormKind::Disconnected
             | FormKind::Died
+            | FormKind::InBed
             | FormKind::QuitConfirm => return,
         };
         let form = FormScreen::new(scale, &self.fonts, spec);
@@ -1102,6 +1119,7 @@ impl Menu {
             | FormKind::Paused
             | FormKind::Disconnected
             | FormKind::Died
+            | FormKind::InBed
             | FormKind::QuitConfirm => None,
         };
         if let Some(f) = addr {
@@ -1192,6 +1210,13 @@ impl Menu {
                 ),
                 _ => {}
             },
+            // Leave Bed, and Escape (`onClose` sends the same): the screen stays until
+            // the server wakes the player.
+            (Screen::Form(FormKind::InBed, ..), Action::Confirm | Action::Back) => {
+                if let Some(s) = &self.session {
+                    s.leave_bed();
+                }
+            }
             // The death screen doesn't close on Escape.
             (Screen::Form(FormKind::Died, ..), Action::Back) => {}
             (Screen::Form(FormKind::QuitConfirm, ..), Action::Confirm) => self.leave(),
@@ -1325,6 +1350,7 @@ impl Menu {
                     | FormKind::Paused
                     | FormKind::Disconnected
                     | FormKind::Died
+                    | FormKind::InBed
                     | FormKind::QuitConfirm => {}
                     // Try Again, the same way as before.
                     FormKind::SignIn => {
