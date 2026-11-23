@@ -12,8 +12,8 @@ use sdl3_sys::hints::SDL_SetHint;
 use sdl3_sys::init::{SDL_INIT_VIDEO, SDL_Init, SDL_Quit, SDL_SetAppMetadata};
 use sdl3_sys::video::{
     SDL_CreateWindow, SDL_DestroyWindow, SDL_GetWindowSize, SDL_GetWindowSizeInPixels,
-    SDL_SetWindowFullscreen, SDL_SetWindowSize, SDL_WINDOW_HIGH_PIXEL_DENSITY,
-    SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN, SDL_Window,
+    SDL_MinimizeWindow, SDL_RestoreWindow, SDL_SetWindowFullscreen, SDL_SetWindowSize,
+    SDL_WINDOW_HIGH_PIXEL_DENSITY, SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN, SDL_Window,
 };
 use sdl3_sys::vulkan::{
     SDL_Vulkan_CreateSurface, SDL_Vulkan_GetInstanceExtensions,
@@ -285,6 +285,19 @@ impl Window {
         );
         // SAFETY: raw is a live window.
         unsafe { SDL_SetWindowSize(self.raw, w, h) };
+    }
+
+    /// Asks the window manager to minimise the window (it may refuse).
+    pub fn minimize(&self) {
+        // SAFETY: raw is a live window.
+        unsafe { SDL_MinimizeWindow(self.raw) };
+    }
+
+    /// Asks the window manager to bring a minimised window back. Wayland has no request
+    /// for it, so there nothing happens.
+    pub fn restore(&self) {
+        // SAFETY: raw is a live window.
+        unsafe { SDL_RestoreWindow(self.raw) };
     }
 
     /// Asks for borderless fullscreen on the window's display (on) or the window back

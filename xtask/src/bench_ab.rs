@@ -5,15 +5,17 @@
 //! thermal drift. Every run writes its own summary (`ruthenium --bench-out`); the report
 //! gives each metric's median per side, the change, and the spread between a side's
 //! rounds, and calls a change no larger than that spread noise. `--a X --b X` (an A/A
-//! run) measures the noise itself.
+//! run) measures the noise itself; `--a-args` and `--b-args` give one side its own
+//! options, to compare two settings of one build (`--a work --b-args "--frames-ahead 1"`).
+//! While a run measures, its resident memory and GPU memory are sampled from outside.
 //!
 //! For recorded baselines and stage gates, use the full vanilla protocol (`bench run`).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 #[derive(Debug)]
 struct Options {
@@ -22,11 +24,14 @@ struct Options {
     rounds: u32,
     duration: f64,
     gpu: Option<String>,
+    /// Extra arguments for one side's runs.
+    a_args: Vec<String>,
+    b_args: Vec<String>,
     /// Extra arguments for every run (after `--`).
     extra: Vec<String>,
 }
 
-const USAGE: &str = "usage: cargo xtask bench ab [--a <rev>] [--b <rev>|work] [--rounds N] [--duration S] [--gpu <name>] [-- <ruthenium options>]";
+const USAGE: &str = "usage: cargo xtask bench ab [--a <rev>|work] [--b <rev>|work] [--a-args '<options>'] [--b-args '<options>'] [--rounds N] [--duration S] [--gpu <name>] [-- <ruthenium options>]";
 
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
@@ -35,6 +40,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         rounds: 4,
         duration: 15.0,
         gpu: None,
+        a_args: Vec::new(),
+        b_args: Vec::new(),
         extra: Vec::new(),
     };
     let mut it = args.iter();
@@ -53,6 +60,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--rounds" => o.rounds = (num(value)? as u32).max(1),
             "--duration" => o.duration = num(value)?.max(2.0),
             "--gpu" => o.gpu = Some(value.clone()),
+            "--a-args" => o.a_args = value.split_whitespace().map(str::to_owned).collect(),
+            "--b-args" => o.b_args = value.split_whitespace().map(str::to_owned).collect(),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
     }
@@ -64,7 +73,12 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     let dir = root.join("target/bench-ab");
     conditions();
     let a = build(root, &dir, &o.a)?;
-    let b = build(root, &dir, &o.b)?;
+    // The same build twice is one binary: what differs is its options.
+    let b = if o.b == o.a {
+        a.clone()
+    } else {
+        build(root, &dir, &o.b)?
+    };
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -87,16 +101,18 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
                 o.rounds,
                 ["A", "B"][side]
             );
-            runs[side].push(run_once(bin, &out, &o)?);
+            runs[side].push(run_once(bin, &out, &o, side)?);
         }
     }
-    println!("{}", report(&o, &a.0, &b.0, &runs));
+    let text = report(&o, &a.0, &b.0, &runs);
+    println!("{text}");
+    let _ = std::fs::write(results.join("report.md"), &text);
     eprintln!("bench ab: run summaries in {}", results.display());
     Ok(())
 }
 
 /// Builds one side and returns its label and binary.
-fn build(root: &Path, dir: &Path, rev: &str) -> Result<(String, PathBuf), String> {
+pub(crate) fn build(root: &Path, dir: &Path, rev: &str) -> Result<(String, PathBuf), String> {
     let bins = dir.join("bin");
     std::fs::create_dir_all(&bins).map_err(|e| format!("{}: {e}", bins.display()))?;
     let (label, src, target) = if rev == "work" {
@@ -150,27 +166,91 @@ fn build(root: &Path, dir: &Path, rev: &str) -> Result<(String, PathBuf), String
     Ok((label, bin))
 }
 
-fn run_once(bin: &Path, out: &Path, o: &Options) -> Result<Value, String> {
-    let mut cmd = Command::new(bin);
+fn run_once(bin: &Path, out: &Path, o: &Options, side: usize) -> Result<Value, String> {
     // Uncapped, so the numbers are the build's cost rather than the display's rate; the
     // client measures after its own one-second warm-up.
-    cmd.args(["--no-vsync", "--no-validation", "--quit-after"])
-        .arg(format!("{}", o.duration + 1.5))
+    let mut args: Vec<String> = vec!["--no-vsync".into()];
+    args.extend(o.extra.iter().cloned());
+    args.extend([&o.a_args, &o.b_args][side].iter().cloned());
+    run_client(bin, out, o.duration, o.gpu.as_deref(), &args)
+}
+
+/// Which GPU's counters to sample for a client asked to run on `gpu`.
+fn sampled_gpu(gpu: Option<&str>) -> crate::gpu::Gpu {
+    match gpu.map(str::to_lowercase) {
+        Some(g) if g.contains("intel") => crate::gpu::Gpu::Intel,
+        Some(g) if g.contains("nvidia") || g.contains("rtx") || g.contains("gtx") => {
+            crate::gpu::Gpu::Nvidia
+        }
+        _ => crate::gpu::Gpu::Auto,
+    }
+}
+
+/// How long a run goes unsampled: its start-up and the client's own warm-up.
+const SAMPLE_AFTER: Duration = Duration::from_millis(2500);
+
+/// Runs the client for `duration` measured seconds with `args`, sampling its memory from
+/// outside meanwhile, and returns its summary with the samples' statistics under
+/// `"sampled"` (also written back to `out`).
+pub(crate) fn run_client(
+    bin: &Path,
+    out: &Path,
+    duration: f64,
+    gpu: Option<&str>,
+    args: &[String],
+) -> Result<Value, String> {
+    let _ = std::fs::remove_file(out);
+    let mut cmd = Command::new(bin);
+    cmd.args(["--no-validation", "--quit-after"])
+        .arg(format!("{}", duration + 1.5))
         .arg("--bench-out")
         .arg(out);
-    if let Some(g) = &o.gpu {
+    if let Some(g) = gpu {
         cmd.args(["--gpu", g]);
     }
-    cmd.args(&o.extra);
-    let output = cmd
-        .output()
+    let log = out.with_extension("log");
+    let stderr = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let mut child = cmd
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
         .map_err(|e| format!("running {}: {e}", bin.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("unknown option --bench-out") {
+    let (pid, started, sampler) = (child.id(), Instant::now(), sampled_gpu(gpu));
+    let (mut rss, mut vram, mut temps, mut clocks) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut reasons: Vec<String> = Vec::new();
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs_f64(duration + 60.0) {
+            let _ = child.kill();
             return Err(format!(
-                "{} has no --bench-out: compare revisions from the commit that added \
-                 `bench ab` on",
+                "{} did not quit; see {}",
+                bin.display(),
+                log.display()
+            ));
+        }
+        if started.elapsed() >= SAMPLE_AFTER {
+            let g = sampler.sample(pid);
+            rss.extend(crate::bench::rss_kib(pid).map(|k| k as f64 / 1024.0));
+            vram.extend(g.mem_mib);
+            temps.extend(crate::bench::cpu_temp_c());
+            clocks.extend(g.clock_mhz);
+            if let Some(r) = g.reasons
+                && !reasons.contains(&r)
+            {
+                reasons.push(r);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    if !status.success() {
+        let stderr = std::fs::read_to_string(&log).unwrap_or_default();
+        if stderr.contains("unknown option") {
+            return Err(format!(
+                "{} does not know one of the options (is the revision too old?):\n{stderr}",
                 bin.display()
             ));
         }
@@ -182,10 +262,31 @@ fn run_once(bin: &Path, out: &Path, o: &Options) -> Result<Value, String> {
             bin.display()
         )
     })?;
-    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", out.display()))
+    let mut v: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", out.display()))?;
+    v["sampled"] = json!({
+        "rss_mib": stats(&rss),
+        "gpu_mib": stats(&vram),
+        "cpu_temp_c": stats(&temps),
+        "gpu_clock_mhz": stats(&clocks),
+        "gpu_reasons": reasons,
+        "cpu_mhz": crate::bench::cpu_mhz(),
+    });
+    std::fs::write(out, format!("{v}\n")).map_err(|e| format!("{}: {e}", out.display()))?;
+    Ok(v)
 }
 
-/// One reported metric: where it is in a run summary, and which way is better.
+/// The mean and maximum of some samples; null without any.
+fn stats(v: &[f64]) -> Value {
+    if v.is_empty() {
+        return Value::Null;
+    }
+    let max = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    json!({"mean": v.iter().sum::<f64>() / v.len() as f64, "max": max, "samples": v.len()})
+}
+
+/// One reported metric: where it is in a run summary (a series, or a series inside
+/// `phases` written `phases/acquire`), and which way is better.
 struct Metric {
     name: &'static str,
     series: &'static str,
@@ -237,10 +338,53 @@ const METRICS: &[Metric] = &[
         field: "p50",
         rate: false,
     },
+    Metric {
+        name: "main-thread work p50 (ms)",
+        series: "phases/work",
+        field: "p50",
+        rate: false,
+    },
+    Metric {
+        name: "main-thread work p99 (ms)",
+        series: "phases/work",
+        field: "p99",
+        rate: false,
+    },
+    Metric {
+        name: "governor wait p50 (ms)",
+        series: "phases/governor",
+        field: "p50",
+        rate: false,
+    },
+    Metric {
+        name: "acquire p99 (ms)",
+        series: "phases/acquire",
+        field: "p99",
+        rate: false,
+    },
+    Metric {
+        name: "present p99 (ms)",
+        series: "phases/present",
+        field: "p99",
+        rate: false,
+    },
+    Metric {
+        name: "RSS mean (MiB)",
+        series: "sampled/rss_mib",
+        field: "mean",
+        rate: false,
+    },
+    Metric {
+        name: "GPU memory mean (MiB)",
+        series: "sampled/gpu_mib",
+        field: "mean",
+        rate: false,
+    },
 ];
 
 fn value(run: &Value, m: &Metric) -> Option<f64> {
-    let v = run.get(m.series)?.get(m.field)?.as_f64()?;
+    let series = m.series.split('/').try_fold(run, |v, key| v.get(key))?;
+    let v = series.get(m.field)?.as_f64()?;
     if m.rate {
         (v > 0.0).then(|| 1000.0 / v)
     } else {
@@ -277,14 +421,28 @@ fn report(o: &Options, a: &str, b: &str, runs: &[Vec<Value>; 2]) -> String {
         .first()
         .and_then(|r| r.get("gpu")?.as_str().map(str::to_owned))
         .unwrap_or_default();
+    let side = |rev: &str, label: &str, args: &[String]| {
+        if args.is_empty() {
+            format!("{rev} ({label})")
+        } else {
+            format!("{rev} ({label}) with `{}`", args.join(" "))
+        }
+    };
     let mut s = format!(
-        "## bench ab: A = {} ({a}), B = {} ({b})\n\n{} rounds of {:.0} s each, ABBA order, uncapped, on {gpu}.\n\n",
-        o.a, o.b, o.rounds, o.duration
+        "## bench ab: A = {}, B = {}\n\n{} rounds of {:.0} s each, ABBA order, on {gpu}{}.\n\n",
+        side(&o.a, a, &o.a_args),
+        side(&o.b, b, &o.b_args),
+        o.rounds,
+        o.duration,
+        run_line(&runs[0])
     );
     s += "| metric | A | B | change | A spread | B spread | verdict |\n|---|---|---|---|---|---|---|\n";
     for m in METRICS {
         let va: Vec<f64> = runs[0].iter().filter_map(|r| value(r, m)).collect();
         let vb: Vec<f64> = runs[1].iter().filter_map(|r| value(r, m)).collect();
+        if va.is_empty() && vb.is_empty() {
+            continue;
+        }
         let (ma, mb) = (median(va.clone()), median(vb.clone()));
         let change = (mb - ma) / ma;
         let noise = spread(&va).max(spread(&vb));
@@ -309,9 +467,30 @@ fn report(o: &Options, a: &str, b: &str, runs: &[Vec<Value>; 2]) -> String {
     s
 }
 
+/// What side A's first run says it ran as: present mode, frames ahead, window.
+fn run_line(runs: &[Value]) -> String {
+    let Some(r) = runs.first() else {
+        return String::new();
+    };
+    let mut s = String::new();
+    if let Some(m) = r["present_mode"].as_str() {
+        s += &format!(", A presenting {m}");
+    }
+    if let Some(n) = r["frames_ahead"].as_u64() {
+        s += &format!(" with {n} frame(s) ahead");
+    }
+    if let (Some(w), Some(h)) = (
+        r["swapchain"]["width"].as_u64(),
+        r["swapchain"]["height"].as_u64(),
+    ) {
+        s += &format!(", {w} × {h} pixels");
+    }
+    s
+}
+
 /// Warns about what makes numbers incomparable (the user's laptop: power profile, other
 /// games or servers, heat). Never blocks.
-fn conditions() {
+pub(crate) fn conditions() {
     if let Ok(p) = std::fs::read_to_string("/sys/firmware/acpi/platform_profile") {
         let p = p.trim();
         if p != "performance" {
@@ -367,6 +546,13 @@ mod tests {
         assert_eq!(value(&run, &METRICS[0]), Some(250.0));
         assert_eq!(value(&run, &METRICS[1]), Some(125.0));
         assert_eq!(value(&run, &METRICS[4]), None);
+        let run: Value = serde_json::from_str(
+            r#"{"phases": {"work": {"p50": 0.25}}, "sampled": {"rss_mib": null}}"#,
+        )
+        .unwrap();
+        let named = |name: &str| METRICS.iter().find(|m| m.name == name).unwrap();
+        assert_eq!(value(&run, named("main-thread work p50 (ms)")), Some(0.25));
+        assert_eq!(value(&run, named("RSS mean (MiB)")), None);
     }
 
     #[test]
@@ -381,5 +567,14 @@ mod tests {
             ("HEAD~1", "work", 2)
         );
         assert_eq!(o.extra, vec!["--gpu", "intel"]);
+        let args: Vec<String> = ["--a", "work", "--b-args", "--frames-ahead 1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let o = parse(&args).unwrap();
+        assert!(o.a_args.is_empty());
+        assert_eq!(o.b_args, vec!["--frames-ahead", "1"]);
+        assert_eq!(sampled_gpu(Some("Intel")), crate::gpu::Gpu::Intel);
+        assert_eq!(sampled_gpu(Some("4060")), crate::gpu::Gpu::Auto);
     }
 }

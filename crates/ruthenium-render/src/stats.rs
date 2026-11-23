@@ -27,7 +27,8 @@ fn bucket_ns(b: usize) -> f64 {
     }
 }
 
-/// The last `capacity` samples of one series (frame interval, CPU time or GPU time).
+/// The last `capacity` samples of one series (frame interval, CPU time or GPU time), or
+/// every sample since the last clear ([`FrameTimes::unbounded`]).
 #[derive(Debug)]
 pub struct FrameTimes {
     counts: Box<[u32]>,
@@ -89,6 +90,19 @@ impl FrameTimes {
         }
     }
 
+    /// Keeps every sample since the last clear, in the histogram alone: a whole run's
+    /// percentiles in a few kilobytes, however long it is.
+    pub fn unbounded() -> FrameTimes {
+        FrameTimes {
+            counts: vec![0; BUCKETS].into_boxed_slice(),
+            ring: Box::default(),
+            head: 0,
+            len: 0,
+            sum_ns: 0,
+            max_ns: 0,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -106,15 +120,19 @@ impl FrameTimes {
     }
 
     pub fn push(&mut self, ns: u64) {
-        if self.len == self.ring.len() {
-            let old = self.ring[self.head];
-            self.counts[bucket(old)] -= 1;
-            self.sum_ns -= old;
-        } else {
+        if self.ring.is_empty() {
             self.len += 1;
+        } else {
+            if self.len == self.ring.len() {
+                let old = self.ring[self.head];
+                self.counts[bucket(old)] -= 1;
+                self.sum_ns -= old;
+            } else {
+                self.len += 1;
+            }
+            self.ring[self.head] = ns;
+            self.head = (self.head + 1) % self.ring.len();
         }
-        self.ring[self.head] = ns;
-        self.head = (self.head + 1) % self.ring.len();
         self.counts[bucket(ns)] += 1;
         self.sum_ns += ns;
         // The maximum is over everything since the last clear, not just the window.
@@ -122,7 +140,7 @@ impl FrameTimes {
     }
 
     /// The `p`-quantile (0..=1) in milliseconds: the smallest bucket at or above rank
-    /// ceil(p·n).
+    /// ceil(p·n), and never more than the largest sample.
     pub fn percentile_ms(&self, p: f64) -> f64 {
         if self.len == 0 {
             return 0.0;
@@ -132,7 +150,7 @@ impl FrameTimes {
         for (b, &c) in self.counts.iter().enumerate() {
             seen += c as usize;
             if seen >= rank {
-                return bucket_ns(b) / 1e6;
+                return bucket_ns(b).min(self.max_ns as f64) / 1e6;
             }
         }
         bucket_ns(BUCKETS - 1) / 1e6
@@ -197,6 +215,24 @@ mod tests {
     }
 
     #[test]
+    fn unbounded_keeps_everything() {
+        let mut t = FrameTimes::unbounded();
+        for _ in 0..5000 {
+            t.push(20_000_000);
+        }
+        for _ in 0..5000 {
+            t.push(2_000_000);
+        }
+        let s = t.summary();
+        assert_eq!(s.samples, 10_000);
+        assert!(close(s.p50_ms, 2.0), "{s:?}");
+        assert!(close(s.p99_ms, 20.0), "{s:?}");
+        assert!((s.mean_ms - 11.0).abs() < 1e-9);
+        t.clear();
+        assert!(t.is_empty());
+    }
+
+    #[test]
     fn extremes_are_clamped() {
         let mut t = FrameTimes::new(4);
         t.push(0);
@@ -205,5 +241,8 @@ mod tests {
         assert!(t.percentile_ms(1.0) >= 10_000.0);
         t.clear();
         assert_eq!(t.summary(), Summary::default());
+        // A series of zeros reports zero, not its bucket's middle.
+        t.push(0);
+        assert_eq!(t.summary().p999_ms, 0.0);
     }
 }

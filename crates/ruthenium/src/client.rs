@@ -17,6 +17,7 @@ use ruthenium_ui::modern::Action;
 
 use crate::menu::Menu;
 use crate::settings::{Settings, SettingsFile};
+use crate::telemetry::{FrameSample, Marks, RunInfo, Startup, Telemetry};
 
 /// SDL scancode of F3: shows or hides the frame-stats overlay.
 const SCANCODE_F3: u32 = 60;
@@ -27,6 +28,8 @@ const SCANCODE_F11: u32 = 68;
 const FULLSCREEN_PENDING: Duration = Duration::from_secs(2);
 /// Vanilla throttles a minimised window to 10 FPS (`FramerateLimitTracker.java:30`).
 const HIDDEN_FRAME: Duration = Duration::from_millis(100);
+/// `--exercise-minimize` minimises the window, and brings it back, this often.
+const MINIMIZE_EVERY: Duration = Duration::from_millis(1500);
 /// Frames before this are start-up noise and left out of the run summary.
 const WARMUP: Duration = Duration::from_secs(1);
 /// Deep space: near-black blue at the top, a hint of violet at the bottom.
@@ -77,6 +80,15 @@ pub struct Options {
     pub window_size: (u32, u32),
     /// Development: join this server (an address as typed) from the server list at once.
     pub join: Option<String>,
+    /// Benchmarks: how many frames the GPU may still be working on when the next one
+    /// samples input (0 or 1), over what the present policy would choose.
+    pub frames_ahead: Option<u64>,
+    /// Benchmarks: draw only the background, no menus (an empty window's cost).
+    pub empty_window: bool,
+    /// Benchmarks: write a CSV line per frame here at exit.
+    pub frame_log: Option<std::path::PathBuf>,
+    /// Development: minimise the window and bring it back every 1.5 s.
+    pub exercise_minimize: bool,
 }
 
 impl Options {
@@ -107,6 +119,10 @@ impl Options {
             select: None,
             window_size: DEFAULT_SIZE,
             join: None,
+            frames_ahead: None,
+            empty_window: false,
+            frame_log: None,
+            exercise_minimize: false,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -137,6 +153,17 @@ impl Options {
                 "--stats" => o.stats = true,
                 "--overlay" => o.overlay = true,
                 "--exercise-swapchain" => o.exercise_swapchain = true,
+                "--exercise-minimize" => o.exercise_minimize = true,
+                "--frames-ahead" => {
+                    let v = value("0 or 1")?;
+                    o.frames_ahead = match v.as_str() {
+                        "0" => Some(0),
+                        "1" => Some(1),
+                        _ => return Err(format!("--frames-ahead: not 0 or 1: {v}")),
+                    };
+                }
+                "--empty-window" => o.empty_window = true,
+                "--frame-log" => o.frame_log = Some(value("a file")?.into()),
                 "--no-pipeline-cache" => o.pipeline_cache = false,
                 "--no-transfer-queue" => o.no_transfer_queue = true,
                 "--exercise-uploads" => o.exercise_uploads = true,
@@ -255,7 +282,10 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         window.set_fullscreen(true);
         fullscreen_pending = Some((true, Instant::now()));
     }
-    let t_window = started.elapsed();
+    let mut startup = Startup {
+        window_ms: started.elapsed().as_secs_f64() * 1e3,
+        ..Startup::default()
+    };
     let gpu = create_gpu(
         &platform,
         &window,
@@ -280,6 +310,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             }
         );
     }
+    startup.gpu_ms = started.elapsed().as_secs_f64() * 1e3;
     // Declared after `window`, so it is dropped first: the surface must go before the window.
     let cache_dir = opts
         .pipeline_cache
@@ -295,6 +326,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         policy(applied.vsync),
         cache_dir.as_deref(),
     )?;
+    startup.renderer_ms = started.elapsed().as_secs_f64() * 1e3;
     renderer.overlay_mut().set_visible(applied.frame_stats);
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
@@ -313,9 +345,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut interval = FrameTimes::new(1 << 13);
     let mut cpu = FrameTimes::new(1 << 13);
     let mut gpu_times = FrameTimes::new(1 << 13);
-    let mut run_interval = FrameTimes::new(1 << 18);
-    let mut run_cpu = FrameTimes::new(1 << 18);
-    let mut run_gpu = FrameTimes::new(1 << 18);
+    // The run after warm-up, for the summary at exit.
+    let mut telemetry = Telemetry::new(opts.frame_log.is_some());
     let mut last_present: Option<Instant> = None;
     let mut last_report = Instant::now();
     let mut first_frame: Option<Duration> = None;
@@ -342,17 +373,22 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut start_screen = opts.screen.clone();
     let mut start_join = opts.join.clone();
     let mut frames: u64 = 0;
+    // --exercise-minimize: whether the window was last asked to minimise.
+    let mut minimize_asked = false;
 
     loop {
         profiling::scope!("frame");
         // 1. Wait.
+        let t_limiter = Instant::now();
         if let Some(p) = period {
-            deadline = next_deadline(deadline, p, Instant::now());
+            deadline = next_deadline(deadline, p, t_limiter);
             sleeper.sleep_until(deadline);
         }
-        renderer
-            .frames()
-            .wait_for_gpu(frames_ahead(renderer.frames().policy()))?;
+        let t_governor = Instant::now();
+        let ahead = opts
+            .frames_ahead
+            .unwrap_or_else(|| frames_ahead(renderer.frames().policy()));
+        renderer.frames().wait_for_gpu(ahead)?;
 
         // 2. Input.
         let t_input = Instant::now();
@@ -450,10 +486,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 other => eprintln!("[ruthenium] {other:?}: not there yet"),
             }
         }
-        if quit {
+        // Checked here, not after the frame: a minimised window never gets that far.
+        if quit || opts.quit_after.is_some_and(|q| started.elapsed() >= q) {
             break;
         }
         // The game's frame runs every time round, drawn or not, as vanilla's `runTick`.
+        let t_game = Instant::now();
         menu.game_frame();
         if let Some(size) = resized.take() {
             renderer.frames_mut().resize(size);
@@ -505,6 +543,17 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             renderer.frames_mut().set_policy(next);
             eprintln!("[ruthenium] {next:?}");
         }
+        if opts.exercise_minimize {
+            let minimize = (started.elapsed().as_millis() / MINIMIZE_EVERY.as_millis()) % 2 == 1;
+            if minimize != minimize_asked {
+                minimize_asked = minimize;
+                if minimize {
+                    window.minimize();
+                } else {
+                    window.restore();
+                }
+            }
+        }
         if !visible {
             // Nothing is shown: tick at 10 FPS without presenting.
             std::thread::sleep(HIDDEN_FRAME);
@@ -550,23 +599,30 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             menu.open_servers(window.pixel_size());
             menu.join_now(&address, window.pixel_size());
         }
-        let text_ready = menu.text_ready();
-        if text_ready && text_shown.is_none() {
-            text_shown = Some(Instant::now());
-        }
-        let gui = menu.frame(&mut renderer, window.pixel_size(), window.size(), |rgba| {
-            window.set_icon(rgba, crate::menu::ICON_SIZE)
-        });
-        if opts.screenshot.is_some()
-            && !screenshot_requested
-            && text_ready
-            && !gui.glyphs.is_empty()
-            && text_shown.is_some_and(|t| t.elapsed() >= opts.screenshot_after)
-        {
-            renderer.request_screenshot();
-            screenshot_requested = true;
-        }
-        let report = renderer.render(&BACKGROUND, Some(gui))?;
+        let t_gui = Instant::now();
+        let gui = if opts.empty_window {
+            None
+        } else {
+            let text_ready = menu.text_ready();
+            if text_ready && text_shown.is_none() {
+                text_shown = Some(Instant::now());
+            }
+            let gui = menu.frame(&mut renderer, window.pixel_size(), window.size(), |rgba| {
+                window.set_icon(rgba, crate::menu::ICON_SIZE)
+            });
+            if opts.screenshot.is_some()
+                && !screenshot_requested
+                && text_ready
+                && !gui.glyphs.is_empty()
+                && text_shown.is_some_and(|t| t.elapsed() >= opts.screenshot_after)
+            {
+                renderer.request_screenshot();
+                screenshot_requested = true;
+            }
+            Some(gui)
+        };
+        let t_render = Instant::now();
+        let report = renderer.render(&BACKGROUND, gui)?;
         if let Some(path) = &opts.screenshot
             && let Some((w, h, rgba)) = renderer.take_screenshot()?
         {
@@ -595,35 +651,42 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         let now = Instant::now();
         profiling::finish_frame!();
 
-        if report.presented == Presented::Yes {
+        let presented = report.presented == Presented::Yes;
+        let mut interval_ns = 0;
+        if presented {
             if first_frame.is_none() {
                 first_frame = Some(started.elapsed());
                 eprintln!(
                     "[ruthenium] window after {:.0} ms, first frame after {:.0} ms",
-                    t_window.as_secs_f64() * 1e3,
+                    startup.window_ms,
                     started.elapsed().as_secs_f64() * 1e3
                 );
             }
             if let Some(prev) = last_present {
-                let ns = (now - prev).as_nanos() as u64;
-                interval.push(ns);
-                renderer.overlay_mut().push_frame(ns as f32 / 1e6);
-                if started.elapsed() > WARMUP + first_frame.unwrap_or_default() {
-                    run_interval.push(ns);
-                }
+                interval_ns = (now - prev).as_nanos() as u64;
+                interval.push(interval_ns);
+                renderer.overlay_mut().push_frame(interval_ns as f32 / 1e6);
             }
             last_present = Some(now);
         }
         let measuring = started.elapsed() > WARMUP + first_frame.unwrap_or(Duration::MAX / 4);
-        cpu.push((now - t_input).as_nanos() as u64);
-        if measuring {
-            run_cpu.push((now - t_input).as_nanos() as u64);
-        }
+        let marks = Marks {
+            started,
+            limiter: t_limiter,
+            governor: t_governor,
+            input: t_input,
+            game: t_game,
+            gui: t_gui,
+            render: t_render,
+            end: now,
+        };
+        let sample = FrameSample::new(&marks, renderer.frames().timings(), presented, interval_ns);
+        debug_assert_eq!(sample.frame, report.frame);
+        cpu.push(sample.cpu_ns);
+        telemetry.frame(&sample, measuring);
         if let Some(g) = report.gpu_time {
             gpu_times.push(g.nanos);
-            if measuring {
-                run_gpu.push(g.nanos);
-            }
+            telemetry.gpu_time(g, measuring);
         }
 
         if now - last_report >= Duration::from_secs(1) {
@@ -660,13 +723,10 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             std::thread::sleep(HIDDEN_FRAME);
             last_present = None;
         }
-        if opts.quit_after.is_some_and(|q| started.elapsed() >= q) {
-            break;
-        }
     }
 
     menu.save_settings();
-    let run = run_interval.summary();
+    let run = telemetry.interval.summary();
     if run.samples > 0 {
         eprintln!(
             "[ruthenium] run: {} frames, {:.1} fps, median {:.3} ms, 1% low {:.1} fps, 0.1% low {:.1} fps, max {:.2} ms; 0.1%/median = {:.2}",
@@ -679,14 +739,34 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             run.p999_ms / run.p50_ms
         );
     }
+    let counters = *renderer.frames().counters();
+    if telemetry.frames > 0 {
+        eprintln!("[ruthenium] {}", telemetry.main_thread_line(&counters));
+    }
+    if let Some(path) = &opts.frame_log
+        && let Err(e) = telemetry.write_log(path)
+    {
+        eprintln!("[ruthenium] could not write {}: {e}", path.display());
+        return Ok(ExitCode::FAILURE);
+    }
     if let Some(path) = &opts.bench_out {
-        let json = bench_json(
-            &run,
-            &run_cpu.summary(),
-            &run_gpu.summary(),
-            &gpu_display,
-            renderer.frames().present_mode(),
-        );
+        startup.first_frame_ms = first_frame.map(|d| d.as_secs_f64() * 1e3);
+        startup.text_ready_ms = text_shown.map(|t| (t - started).as_secs_f64() * 1e3);
+        let policy = renderer.frames().policy();
+        let json = telemetry.bench_json(&RunInfo {
+            scene: if opts.empty_window { "empty" } else { "menu" },
+            caps: renderer.gpu().caps(),
+            transfer_queue: renderer.gpu().transfer_family().is_some(),
+            policy,
+            frames_ahead: opts.frames_ahead.unwrap_or_else(|| frames_ahead(policy)),
+            fps_cap: period.map(|p| 1.0 / p.as_secs_f64()),
+            swapchain: renderer.frames().swapchain_info(),
+            window_points: window.size(),
+            window_pixels: window.pixel_size(),
+            startup,
+            counters,
+            memory: renderer.gpu().memory_report(),
+        });
         if let Err(e) = std::fs::write(path, json) {
             eprintln!("[ruthenium] could not write {}: {e}", path.display());
             return Ok(ExitCode::FAILURE);
@@ -725,37 +805,6 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     } else {
         ExitCode::SUCCESS
     })
-}
-
-/// The run summary `cargo xtask bench ab` reads (times in milliseconds).
-fn bench_json(
-    frame: &Summary,
-    cpu: &Summary,
-    gpu: &Summary,
-    gpu_name: &str,
-    mode: Option<ruthenium_gpu::vk::PresentModeKHR>,
-) -> String {
-    let series = |s: &Summary| {
-        format!(
-            "{{\"samples\": {}, \"mean\": {:.6}, \"p50\": {:.6}, \"p99\": {:.6}, \"p999\": {:.6}, \"max\": {:.6}}}",
-            s.samples, s.mean_ms, s.p50_ms, s.p99_ms, s.p999_ms, s.max_ms
-        )
-    };
-    let escaped: String = gpu_name
-        .chars()
-        .flat_map(|c| match c {
-            '"' | '\\' => vec!['\\', c],
-            c if c.is_control() => vec![],
-            c => vec![c],
-        })
-        .collect();
-    format!(
-        "{{\"version\": 1, \"gpu\": \"{escaped}\", \"present_mode\": \"{:?}\", \"frame\": {}, \"cpu\": {}, \"gpu_time\": {}}}\n",
-        mode.unwrap_or_default(),
-        series(frame),
-        series(cpu),
-        series(gpu)
-    )
 }
 
 fn print_line(

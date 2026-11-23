@@ -31,6 +31,18 @@ pub(crate) enum MemoryUse {
 }
 
 impl MemoryUse {
+    /// How many uses there are, and this one's place among them (for the byte counts).
+    pub(crate) const COUNT: usize = 4;
+
+    fn index(self) -> usize {
+        match self {
+            MemoryUse::GpuOnly => 0,
+            MemoryUse::Upload => 1,
+            MemoryUse::Readback => 2,
+            MemoryUse::Dynamic => 3,
+        }
+    }
+
     /// Flags a type must have, flags it should have, and flags it should not have.
     fn flags(
         self,
@@ -105,6 +117,44 @@ pub(crate) struct Allocation {
     pub memory: vk::DeviceMemory,
     /// Start of the mapping, or null.
     pub mapped: *mut u8,
+    /// Its size and use, counted in [`Gpu::memory_report`].
+    size: u64,
+    usage: MemoryUse,
+}
+
+/// One memory heap of the device.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapReport {
+    pub size: u64,
+    /// The heap is the GPU's own memory (on an integrated GPU: every heap).
+    pub device_local: bool,
+    /// What this process uses of the heap and may use in all, as the driver estimates
+    /// them (`VK_EXT_memory_budget`); `None` without the extension.
+    pub usage: Option<u64>,
+    pub budget: Option<u64>,
+}
+
+/// The device memory Ruthenium has allocated, in bytes by use, beside what the driver
+/// reports for each heap. Swapchain images are the driver's and are not counted here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MemoryReport {
+    /// Live `vkAllocateMemory` allocations.
+    pub allocations: u32,
+    /// Textures and render targets (later: meshes).
+    pub gpu_only: u64,
+    /// The staging ring.
+    pub upload: u64,
+    pub readback: u64,
+    /// Per-frame data the CPU writes and shaders read.
+    pub dynamic: u64,
+    pub heaps: Vec<HeapReport>,
+}
+
+impl MemoryReport {
+    /// Every byte allocated, whatever its use.
+    pub fn allocated(&self) -> u64 {
+        self.gpu_only + self.upload + self.readback + self.dynamic
+    }
 }
 
 /// The object an allocation is dedicated to (`VkMemoryDedicatedAllocateInfo`).
@@ -132,10 +182,52 @@ impl Gpu {
             });
         }
         let result = self.allocate_counted(req, usage, dedicated);
-        if result.is_err() {
-            self.allocations.fetch_sub(1, Ordering::Relaxed);
+        match &result {
+            Ok(a) => {
+                self.allocated[a.usage.index()].fetch_add(a.size, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.allocations.fetch_sub(1, Ordering::Relaxed);
+            }
         }
         result
+    }
+
+    /// What is allocated now, and the heaps as the driver reports them now.
+    pub fn memory_report(&self) -> MemoryReport {
+        let bytes = |u: MemoryUse| self.allocated[u.index()].load(Ordering::Relaxed);
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let has_budget = self.caps().memory_budget;
+        if has_budget {
+            let mut props = vk::PhysicalDeviceMemoryProperties2::default().push(&mut budget);
+            // SAFETY: plain query; the budget struct is chained only when the device has
+            // (and enabled) VK_EXT_memory_budget.
+            unsafe {
+                self.instance
+                    .raw
+                    .get_physical_device_memory_properties2(self.physical, &mut props);
+            }
+        }
+        let heaps = self
+            .memory_properties
+            .memory_heaps_as_slice()
+            .iter()
+            .enumerate()
+            .map(|(i, h)| HeapReport {
+                size: h.size,
+                device_local: h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL),
+                usage: has_budget.then(|| budget.heap_usage[i]),
+                budget: has_budget.then(|| budget.heap_budget[i]),
+            })
+            .collect();
+        MemoryReport {
+            allocations: self.allocations.load(Ordering::Relaxed),
+            gpu_only: bytes(MemoryUse::GpuOnly),
+            upload: bytes(MemoryUse::Upload),
+            readback: bytes(MemoryUse::Readback),
+            dynamic: bytes(MemoryUse::Dynamic),
+            heaps,
+        }
     }
 
     fn allocate_counted(
@@ -192,7 +284,12 @@ impl Gpu {
             } else {
                 std::ptr::null_mut()
             };
-            return Ok(Allocation { memory, mapped });
+            return Ok(Allocation {
+                memory,
+                mapped,
+                size: req.size,
+                usage,
+            });
         }
         Err(Error::Vk {
             call: "vkAllocateMemory",
@@ -206,6 +303,7 @@ impl Gpu {
         // SAFETY: guaranteed by the caller; freeing also unmaps.
         unsafe { self.device.free_memory(a.memory, None) };
         self.allocations.fetch_sub(1, Ordering::Relaxed);
+        self.allocated[a.usage.index()].fetch_sub(a.size, Ordering::Relaxed);
     }
 }
 

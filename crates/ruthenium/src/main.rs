@@ -14,6 +14,7 @@ mod menu;
 mod prepare_cmd;
 mod servers;
 mod settings;
+mod telemetry;
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -36,10 +37,18 @@ With no command, opens the game window. Options:
                          installed; RUTHENIUM_VALIDATION=1 requires it)
   --stats                print frame-time statistics every second
   --overlay              start with the frame-stats overlay shown (F3 toggles it)
-  --bench-out <file>     write a JSON summary of the run at exit (cargo xtask bench ab);
+  --bench-out <file>     write a JSON summary of the run at exit (cargo xtask bench);
                          runs on the default settings
+  --frame-log <file>     write a CSV line per frame at exit: its number, when input
+                         was sampled, where its main-thread time went, its acquire
+                         and its GPU time
+  --frames-ahead <0|1>   frames the GPU may still be working on when the next one
+                         samples input (default: 0 without VSync, 1 with it)
+  --empty-window         draw only the background, no menus (benchmarks)
   --quit-after <s>       close after <s> seconds (for benchmarks and tests)
   --exercise-swapchain   resize and toggle VSync every few frames (development)
+  --exercise-minimize    minimise the window and bring it back every 1.5 s
+                         (development; Wayland cannot bring it back)
   --no-pipeline-cache    don't load or save the pipeline cache
   --no-transfer-queue    upload on the graphics queue even if there is a copy queue
   --exercise-uploads     check data pushed through the upload ring every frame

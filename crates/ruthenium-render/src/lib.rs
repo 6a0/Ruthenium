@@ -49,6 +49,9 @@ pub fn create_gpu(
 /// What one rendered frame reports back to the loop.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameReport {
+    /// The frame's number: the one its GPU time is reported under later, and
+    /// [`ruthenium_gpu::FrameTimings::frame`].
+    pub frame: u64,
     pub presented: Presented,
     /// GPU time of an earlier frame that has just been read back.
     pub gpu_time: Option<GpuTime>,
@@ -525,8 +528,10 @@ impl Renderer {
             }
             self.frames.zone_end(&ctx, zone);
         }
+        let frame = ctx.number;
         let presented = self.frames.submit(ctx, target)?;
         Ok(FrameReport {
+            frame,
             presented,
             gpu_time,
         })

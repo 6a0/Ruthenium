@@ -1,5 +1,5 @@
 use std::ffi::{CStr, c_char};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 use ash::vk;
 use ash::vk::TaggedStructure;
@@ -100,6 +100,8 @@ pub struct Gpu {
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
     /// Live `vkAllocateMemory` allocations, kept under `maxMemoryAllocationCount`.
     pub(crate) allocations: AtomicU32,
+    /// Bytes of live allocations, by [`crate::memory::MemoryUse`].
+    pub(crate) allocated: [AtomicU64; crate::memory::MemoryUse::COUNT],
     caps: DeviceCaps,
     pub(crate) instance: Instance,
 }
@@ -277,6 +279,7 @@ impl Gpu {
             surface,
             memory_properties: c.memory_properties,
             allocations: AtomicU32::new(0),
+            allocated: std::array::from_fn(|_| AtomicU64::new(0)),
             caps: c.caps,
             instance,
         }
@@ -497,6 +500,10 @@ fn evaluate(
     let portability_subset = has(PORTABILITY_SUBSET);
     if portability_subset {
         extensions.push(PORTABILITY_SUBSET);
+    }
+    // No features of its own: it makes the per-heap usage and budget query valid.
+    if has(ash::ext::memory_budget::NAME) {
+        extensions.push(ash::ext::memory_budget::NAME);
     }
 
     let features = query_features(raw, pd, core13, has_dynamic_rendering, has_sync2);

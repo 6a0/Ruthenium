@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use ash::vk::{Handle, TaggedStructure};
@@ -54,6 +54,83 @@ struct Retired {
 pub struct GpuTime {
     pub frame: u64,
     pub nanos: u64,
+}
+
+/// How a frame's acquire ended.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Acquired {
+    /// The frame has not reached its acquire.
+    #[default]
+    NotTried,
+    Image,
+    /// An image, from a swapchain that no longer matches the surface exactly.
+    Suboptimal,
+    /// No image within the acquire timeout.
+    Timeout,
+    NotReady,
+    OutOfDate,
+    /// There is no swapchain: the window has no area.
+    NoSurface,
+}
+
+impl Acquired {
+    /// A short name for logs.
+    pub fn name(self) -> &'static str {
+        match self {
+            Acquired::NotTried => "none",
+            Acquired::Image => "image",
+            Acquired::Suboptimal => "suboptimal",
+            Acquired::Timeout => "timeout",
+            Acquired::NotReady => "not-ready",
+            Acquired::OutOfDate => "out-of-date",
+            Acquired::NoSurface => "no-surface",
+        }
+    }
+}
+
+/// Where one frame's time inside the frame loop went: the calls that can block, timed on
+/// the calling thread. The frame number ties them to the frame's GPU time ([`GpuTime`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameTimings {
+    pub frame: u64,
+    /// Waiting in [`FrameLoop::begin`] for the slot's previous frame.
+    pub begin_wait_ns: u64,
+    /// Rebuilding the swapchain before the acquire (0: it was not rebuilt).
+    pub recreate_ns: u64,
+    /// The `vkAcquireNextImageKHR` call (0: there was none), and how it ended.
+    pub acquire_ns: u64,
+    pub acquired: Acquired,
+    /// The `vkQueueSubmit2` call.
+    pub submit_ns: u64,
+    /// The `vkQueuePresentKHR` call (0: nothing was presented).
+    pub present_ns: u64,
+    /// Swapchains created up to and including this frame: a change marks a rebuild.
+    pub swapchains: u32,
+}
+
+/// What has happened at acquire and present since the frame loop was made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameCounters {
+    /// Acquires that gave an image (suboptimal ones included).
+    pub images: u64,
+    pub suboptimal: u64,
+    pub timeouts: u64,
+    pub not_ready: u64,
+    pub out_of_date: u64,
+    /// Frames with no swapchain to acquire from.
+    pub no_surface: u64,
+    pub present_suboptimal: u64,
+    pub present_out_of_date: u64,
+    pub swapchains: u32,
+}
+
+/// The swapchain frames are presented to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapchainInfo {
+    pub extent: vk::Extent2D,
+    pub format: vk::Format,
+    pub present_mode: vk::PresentModeKHR,
+    pub images: u32,
 }
 
 /// The frame being recorded.
@@ -148,6 +225,9 @@ pub struct FrameLoop {
     policy: PresentPolicy,
     pixel_size: (u32, u32),
     stale: bool,
+    /// The frame being recorded, or the last one submitted.
+    timings: FrameTimings,
+    counters: FrameCounters,
     /// The graphics queue's GPU context in Tracy, if the profiler is running.
     #[cfg(feature = "tracy")]
     tracy: Option<tracy_client::GpuContext>,
@@ -208,6 +288,8 @@ impl FrameLoop {
             policy,
             pixel_size,
             stale: true,
+            timings: FrameTimings::default(),
+            counters: FrameCounters::default(),
             #[cfg(feature = "tracy")]
             tracy: None,
         };
@@ -270,8 +352,27 @@ impl FrameLoop {
         self.swapchain.as_ref().map(|s| s.present_mode)
     }
 
+    /// The swapchain in use, if there is one.
+    pub fn swapchain_info(&self) -> Option<SwapchainInfo> {
+        self.swapchain.as_ref().map(|s| SwapchainInfo {
+            extent: s.extent,
+            format: s.format,
+            present_mode: s.present_mode,
+            images: s.images.len() as u32,
+        })
+    }
+
     pub fn policy(&self) -> PresentPolicy {
         self.policy
+    }
+
+    /// Timings of the frame being recorded, complete once it is submitted.
+    pub fn timings(&self) -> &FrameTimings {
+        &self.timings
+    }
+
+    pub fn counters(&self) -> &FrameCounters {
+        &self.counters
     }
 
     /// Switches VSync; the swapchain is rebuilt (with `oldSwapchain`, no idle wait) at the
@@ -329,7 +430,14 @@ impl FrameLoop {
         let number = self.frame;
         let slot_index = (number % MAX_FRAMES_IN_FLIGHT as u64) as usize;
         let previous = self.slots[slot_index].frame;
+        let waited = Instant::now();
         self.wait_timeline(previous)?;
+        self.timings = FrameTimings {
+            frame: number,
+            begin_wait_ns: waited.elapsed().as_nanos() as u64,
+            swapchains: self.counters.swapchains,
+            ..FrameTimings::default()
+        };
         let gpu_time = self.read_timestamps(slot_index);
         #[cfg(feature = "tracy")]
         self.upload_zones(slot_index);
@@ -400,8 +508,8 @@ impl FrameLoop {
                 )
                 .ok()?;
         }
-        let ns =
-            ticks[1].wrapping_sub(ticks[0]) as f64 * f64::from(self.gpu.caps().timestamp_period_ns);
+        let elapsed = elapsed_ticks(ticks[0], ticks[1], self.gpu.caps().timestamp_bits);
+        let ns = elapsed as f64 * f64::from(self.gpu.caps().timestamp_period_ns);
         Some(GpuTime {
             frame: slot.frame,
             nanos: ns as u64,
@@ -414,12 +522,18 @@ impl FrameLoop {
     pub fn acquire(&mut self, ctx: &FrameCtx) -> Result<Option<Target>, Error> {
         profiling::scope!("acquire");
         if self.stale {
+            let started = Instant::now();
             self.recreate_swapchain()?;
+            self.timings.recreate_ns = started.elapsed().as_nanos() as u64;
+            self.timings.swapchains = self.counters.swapchains;
         }
         let Some(sc) = &self.swapchain else {
+            self.timings.acquired = Acquired::NoSurface;
+            self.counters.no_surface += 1;
             return Ok(None);
         };
         let acquire = self.slots[ctx.slot].acquire;
+        let started = Instant::now();
         // SAFETY: the acquire semaphore is unsignalled (its last wait has completed).
         let result = unsafe {
             self.gpu.swapchain_fn.acquire_next_image(
@@ -429,10 +543,15 @@ impl FrameLoop {
                 vk::Fence::null(),
             )
         };
+        self.timings.acquire_ns = started.elapsed().as_nanos() as u64;
         match result {
             Ok((index, suboptimal)) => {
+                self.counters.images += 1;
+                self.timings.acquired = Acquired::Image;
                 if suboptimal {
                     self.stale = true;
+                    self.counters.suboptimal += 1;
+                    self.timings.acquired = Acquired::Suboptimal;
                 }
                 let i = index as usize;
                 Ok(Some(Target {
@@ -446,9 +565,20 @@ impl FrameLoop {
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.stale = true;
+                self.counters.out_of_date += 1;
+                self.timings.acquired = Acquired::OutOfDate;
                 Ok(None)
             }
-            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => Ok(None),
+            Err(vk::Result::TIMEOUT) => {
+                self.counters.timeouts += 1;
+                self.timings.acquired = Acquired::Timeout;
+                Ok(None)
+            }
+            Err(vk::Result::NOT_READY) => {
+                self.counters.not_ready += 1;
+                self.timings.acquired = Acquired::NotReady;
+                Ok(None)
+            }
             Err(e) => Err(Error::Vk {
                 call: "vkAcquireNextImageKHR",
                 result: e,
@@ -518,9 +648,11 @@ impl FrameLoop {
             .command_buffer_infos(&cmds)
             .wait_semaphore_infos(&waits[..wait_count])
             .signal_semaphore_infos(&signals[..signal_count]);
+        let started = Instant::now();
         // SAFETY: one submitting thread; all handles are live; the waited semaphore was
         // signalled by this frame's acquire.
         unsafe { gpu.queue_submit2(std::slice::from_ref(&submit))? };
+        self.timings.submit_ns = started.elapsed().as_nanos() as u64;
 
         let (Some(t), Some(sem), Some(sc)) = (target, render_done, &self.swapchain) else {
             return Ok(Presented::Skipped);
@@ -532,16 +664,21 @@ impl FrameLoop {
             .wait_semaphores(&wait)
             .swapchains(&swapchains)
             .image_indices(&indices);
+        let started = Instant::now();
         // SAFETY: the image was acquired this frame and is in PRESENT_SRC_KHR after the
         // submitted commands (the Target contract).
-        match unsafe { gpu.swapchain_fn.queue_present(gpu.queue, &present) } {
+        let result = unsafe { gpu.swapchain_fn.queue_present(gpu.queue, &present) };
+        self.timings.present_ns = started.elapsed().as_nanos() as u64;
+        match result {
             Ok(false) => Ok(Presented::Yes),
             Ok(true) => {
                 self.stale = true;
+                self.counters.present_suboptimal += 1;
                 Ok(Presented::Yes)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.stale = true;
+                self.counters.present_out_of_date += 1;
                 Ok(Presented::Skipped)
             }
             Err(e) => Err(Error::Vk {
@@ -722,6 +859,7 @@ impl FrameLoop {
         self.swapchain = new?;
         self.stale = false;
         if let Some(sc) = &self.swapchain {
+            self.counters.swapchains += 1;
             eprintln!(
                 "[gpu] swapchain {}x{} {:?} {:?}, {} images",
                 sc.extent.width,
@@ -753,6 +891,17 @@ impl FrameLoop {
     }
 }
 
+/// Ticks from `start` to `end`, two timestamps of which only the low `valid_bits` count
+/// (`timestampValidBits`): the counter may have wrapped in between.
+fn elapsed_ticks(start: u64, end: u64, valid_bits: u32) -> u64 {
+    let mask = if valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    end.wrapping_sub(start) & mask
+}
+
 impl Drop for FrameLoop {
     fn drop(&mut self) {
         let d = &self.gpu.device;
@@ -778,5 +927,20 @@ impl Drop for FrameLoop {
             }
             d.destroy_semaphore(self.timeline, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_wrap_at_their_valid_bits() {
+        assert_eq!(elapsed_ticks(10, 25, 64), 15);
+        assert_eq!(elapsed_ticks(u64::MAX - 1, 3, 64), 5);
+        // A 36-bit counter that wrapped: the bits above it are not part of the value.
+        let top = (1u64 << 36) - 1;
+        assert_eq!(elapsed_ticks(top - 1, 3, 36), 5);
+        assert_eq!(elapsed_ticks(7, 9, 36), 2);
     }
 }

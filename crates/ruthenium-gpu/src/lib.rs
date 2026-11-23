@@ -24,12 +24,12 @@ mod upload_check;
 pub use ash::vk;
 pub use device::{DeviceCaps, Gpu, GpuOptions, Rejected};
 pub use frame::{
-    FrameCtx, FrameLoop, GpuTime, GpuZone, MAX_FRAME_WAITS, MAX_FRAMES_IN_FLIGHT, MAX_GPU_ZONES,
-    Presented, Target,
+    Acquired, FrameCounters, FrameCtx, FrameLoop, FrameTimings, GpuTime, GpuZone, MAX_FRAME_WAITS,
+    MAX_FRAMES_IN_FLIGHT, MAX_GPU_ZONES, Presented, SwapchainInfo, Target,
 };
 pub use frame_data::{FRAME_DATA_SET, FrameData};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};
-pub use memory::texel_bytes;
+pub use memory::{HeapReport, MemoryReport, texel_bytes};
 pub use pipeline::{
     Blend, GraphicsDesc, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout,
     Pipelines,

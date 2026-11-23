@@ -4,6 +4,7 @@
 
 mod bench;
 mod bench_ab;
+mod bench_menu;
 mod check_content;
 mod codegen;
 mod exporters;
@@ -56,12 +57,21 @@ tasks:
       with Fabric Loader and tools/java/bench (needs a display; see
       docs/baseline.md). setup creates the benchmark world, run measures every
       scene on every backend, report prints Markdown tables for a results folder.
-  bench ab [--a <rev>] [--b <rev>|work] [--rounds N] [--duration S] [--gpu <name>]
+  bench ab [--a <rev>|work] [--b <rev>|work] [--a-args '<options>']
+           [--b-args '<options>'] [--rounds N] [--duration S] [--gpu <name>]
            [-- <ruthenium options>]
       Quick A/B comparison of two Ruthenium builds (default HEAD against the
       working tree): release builds run in turn, A B B A..., uncapped, with the
       median, change and round-to-round spread of each metric; changes within
-      the spread are reported as noise. Results in target/bench-ab.
+      the spread are reported as noise. --a-args and --b-args give one side its
+      own options, to compare two settings of one build. Results in
+      target/bench-ab.
+  bench menu [--gpu <name>] [--duration S] [--launches N] [--pixels WxH]
+             [-- <ruthenium options>]
+      What the working tree's window and menus cost: launch times with and
+      without the pipeline cache, memory with an empty window and with the
+      menus at 1920x1080 pixels, and pacing with VSync. Results in
+      target/bench-menu.
   trace [--only <scenario,...>] [--out <folder>] [--java <java>]
       Record golden traces from vanilla 26.3 (Fabric Loader, Fabric API's client
       gametest module and tools/java/trace; see docs/golden-traces.md) into

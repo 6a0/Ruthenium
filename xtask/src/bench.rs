@@ -100,7 +100,8 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
         Some("run") => parse(&args[1..]).and_then(|o| run_all(root, &o)),
         Some("report") => report(root, args.get(1).map(PathBuf::from)),
         Some("ab") => crate::bench_ab::run(root, &args[1..]),
-        _ => Err("usage: cargo xtask bench <setup|run|report|ab> [options]".into()),
+        Some("menu") => crate::bench_menu::run(root, &args[1..]),
+        _ => Err("usage: cargo xtask bench <setup|run|report|ab|menu> [options]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -283,14 +284,14 @@ fn epoch_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn rss_kib(pid: u32) -> Option<u64> {
+pub(crate) fn rss_kib(pid: u32) -> Option<u64> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// The CPU package temperature (`x86_pkg_temp`, else `TCPU`).
-fn cpu_temp_c() -> Option<f64> {
+pub(crate) fn cpu_temp_c() -> Option<f64> {
     let mut fallback = None;
     for entry in std::fs::read_dir("/sys/class/thermal").ok()?.flatten() {
         let kind = read_trim(&entry.path().join("type").to_string_lossy());
@@ -307,7 +308,7 @@ fn cpu_temp_c() -> Option<f64> {
 }
 
 /// The mean current clock over all CPUs.
-fn cpu_mhz() -> Option<f64> {
+pub(crate) fn cpu_mhz() -> Option<f64> {
     let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
     let mhz: Vec<f64> = info
         .lines()
