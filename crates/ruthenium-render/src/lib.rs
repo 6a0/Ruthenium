@@ -169,14 +169,10 @@ impl Renderer {
         );
         let frame_data = FrameData::new(gpu.clone(), FRAME_DATA_BYTES)?;
         let layout = PipelineLayout::new(gpu.clone(), &[textures.layout(), frame_data.layout()])?;
-        let mut cache = PipelineCache::open(gpu.clone(), cache_dir)?;
-        let pipelines = Pipelines::build(
-            gpu,
-            &mut cache,
-            &layout,
-            &pipelines::descs(),
-            frames.color_format()?,
-        )?;
+        let descs = pipelines::descs();
+        let interface = ruthenium_gpu::interface_hash(&descs, &textures);
+        let mut cache = PipelineCache::open(gpu.clone(), cache_dir, interface)?;
+        let pipelines = Pipelines::build(gpu, &mut cache, &layout, &descs, frames.color_format()?)?;
         Ok(Renderer {
             frames,
             pipelines,
@@ -239,6 +235,16 @@ impl Renderer {
         self.table_check
             .as_ref()
             .map(table_check::TableCheck::report)
+    }
+
+    /// The pipeline cache this run opened: its interface hash, the bytes it loaded (none
+    /// on a cold start) and whether it is kept in a file.
+    pub fn pipeline_cache(&self) -> (u64, usize, bool) {
+        (
+            self.cache.interface(),
+            self.cache.loaded_bytes(),
+            self.cache.on_disk(),
+        )
     }
 
     /// How full the texture table is and has been.

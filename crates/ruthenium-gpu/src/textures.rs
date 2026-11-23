@@ -474,6 +474,33 @@ impl TextureTable {
         self.slots.capacity
     }
 
+    /// The table's part of the pipelines' interface, for the pipeline cache's name: its
+    /// bindings, its size and kind (both are in the set layout), and every sampler.
+    pub(crate) fn hash_interface(&self, h: &mut crate::pipeline::InterfaceHash) {
+        h.u32(SAMPLER_BINDING)
+            .u32(TEXTURE_BINDING)
+            .u32(STAGES.as_raw())
+            .u32(self.slots.capacity)
+            .u32(match self.path {
+                TextureTablePath::Ordinary => 0,
+                TextureTablePath::UpdateAfterBind => 1,
+            })
+            .u32(SAMPLER_COUNT);
+        for s in SamplerId::ALL {
+            let i = s.info();
+            h.u32(i.mag_filter.as_raw() as u32)
+                .u32(i.min_filter.as_raw() as u32)
+                .u32(i.mipmap_mode.as_raw() as u32)
+                .u32(i.address_mode_u.as_raw() as u32)
+                .u32(i.address_mode_v.as_raw() as u32)
+                .u32(i.address_mode_w.as_raw() as u32)
+                .u32(i.anisotropy_enable)
+                .u32(i.max_anisotropy.to_bits())
+                .u32(i.min_lod.to_bits())
+                .u32(i.max_lod.to_bits());
+        }
+    }
+
     /// The kind of descriptor set the table is made of.
     pub fn path(&self) -> TextureTablePath {
         self.path

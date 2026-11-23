@@ -1,5 +1,9 @@
 //! Pipelines: one shared layout, a closed table built in parallel at start-up, and a
-//! `VkPipelineCache` kept on disk so later launches skip shader compilation.
+//! `VkPipelineCache` kept on disk so later launches skip shader compilation. The cache
+//! file is named after the GPU, the driver's cache id and a hash of everything Ruthenium
+//! builds pipelines from ([`interface_hash`]): a build with other shaders or another
+//! interface starts a cache of its own, cold, and the same build always finds its own,
+//! warm.
 //!
 //! Nothing here runs per frame. A frame never creates a pipeline (vanilla compiles a missing
 //! pipeline in the middle of a frame).
@@ -13,6 +17,7 @@ use ash::vk::TaggedStructure;
 
 use crate::device::Gpu;
 use crate::memory::Image;
+use crate::textures::TextureTable;
 use crate::{Error, VkContext};
 
 /// Bytes in the single push-constant range of the shared layout: the minimum every Vulkan
@@ -29,12 +34,122 @@ pub const PUSH_CONSTANT_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::fro
 /// `VkPipelineCacheHeaderVersionOne`: 16 bytes of ids, then the cache UUID.
 const HEADER_BYTES: usize = 16 + vk::UUID_SIZE;
 
-/// The driver's pipeline cache, loaded from and saved to one file per GPU and driver.
+/// Part of [`interface_hash`]: raise it when what [`build_one`] makes of a
+/// [`GraphicsDesc`] changes (its fixed state, its attachments) in a way the hashed values
+/// don't show.
+const PIPELINE_STATE_VERSION: u32 = 1;
+
+/// Cache files of other builds kept beside the current one, newest first: enough to
+/// switch between a few builds (an A/B comparison) without any of them starting cold.
+const OTHER_CACHES_KEPT: usize = 3;
+
+/// A hash that is the same on every platform, toolchain and run (64-bit FNV-1a), for
+/// naming files after what they were made from.
+#[derive(Clone, Copy, Debug)]
+pub struct InterfaceHash(u64);
+
+impl Default for InterfaceHash {
+    fn default() -> InterfaceHash {
+        InterfaceHash(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl InterfaceHash {
+    pub fn bytes(&mut self, bytes: &[u8]) -> &mut InterfaceHash {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self
+    }
+
+    pub fn u32(&mut self, v: u32) -> &mut InterfaceHash {
+        self.bytes(&v.to_le_bytes())
+    }
+
+    /// A string or a blob, with its length, so that two in a row can't run together.
+    pub fn blob(&mut self, bytes: &[u8]) -> &mut InterfaceHash {
+        self.u32(bytes.len() as u32).bytes(bytes)
+    }
+
+    /// SPIR-V words, with their count.
+    pub fn words(&mut self, words: &[u32]) -> &mut InterfaceHash {
+        self.u32(words.len() as u32);
+        for &w in words {
+            self.u32(w);
+        }
+        self
+    }
+
+    pub fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// A hash of everything the pipelines in `descs` are built from: their compiled SPIR-V
+/// and state, and the interface they share with the renderer (the push-constant range,
+/// the texture table's bindings, size and samplers, the frame data's binding; vertex
+/// formats once a pipeline has one). The driver's own cache id covers the rest.
+pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
+    let mut h = InterfaceHash::default();
+    h.u32(PIPELINE_STATE_VERSION)
+        .u32(PUSH_CONSTANT_BYTES)
+        .u32(PUSH_CONSTANT_STAGES.as_raw());
+    textures.hash_interface(&mut h);
+    crate::frame_data::hash_interface(&mut h);
+    h.u32(descs.len() as u32);
+    for d in descs {
+        h.blob(d.name.as_bytes())
+            .u32(d.topology.as_raw() as u32)
+            .u32(match d.blend {
+                Blend::Opaque => 0,
+                Blend::Alpha => 1,
+            })
+            .words(d.vertex)
+            .words(d.fragment);
+    }
+    h.finish()
+}
+
+/// The start of the name of every cache file of one GPU model.
+fn cache_file_prefix(vendor: u32, device: u32) -> String {
+    format!("pipelines-{vendor:04x}-{device:04x}-")
+}
+
+/// The cache file of one GPU, driver cache id and interface hash.
+fn cache_file_name(vendor: u32, device: u32, uuid: &[u8; vk::UUID_SIZE], interface: u64) -> String {
+    let uuid: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}{uuid}-{interface:016x}.bin",
+        cache_file_prefix(vendor, device)
+    )
+}
+
+/// Which of `files` (name and modification time) to delete after saving `own`: cache
+/// files of the same GPU model for other drivers or other builds, except the
+/// [`OTHER_CACHES_KEPT`] used last.
+fn stale_caches(
+    mut files: Vec<(String, std::time::SystemTime)>,
+    own: &str,
+    prefix: &str,
+) -> Vec<String> {
+    files.retain(|(name, _)| name != own && name.starts_with(prefix) && name.ends_with(".bin"));
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    files
+        .into_iter()
+        .skip(OTHER_CACHES_KEPT)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The driver's pipeline cache, loaded from and saved to one file per GPU, driver and
+/// interface hash.
 pub struct PipelineCache {
     gpu: Arc<Gpu>,
     raw: vk::PipelineCache,
     path: Option<PathBuf>,
     saved_len: usize,
+    interface: u64,
+    loaded_len: usize,
 }
 
 impl std::fmt::Debug for PipelineCache {
@@ -46,19 +161,17 @@ impl std::fmt::Debug for PipelineCache {
 }
 
 impl PipelineCache {
-    /// Opens the cache for this GPU in `dir` (`None`: in memory only, nothing saved).
-    /// A missing, unreadable or foreign file just starts an empty cache.
-    pub fn open(gpu: Arc<Gpu>, dir: Option<&Path>) -> Result<PipelineCache, Error> {
+    /// Opens the cache of this GPU and `interface` ([`interface_hash`]) in `dir` (`None`:
+    /// in memory only, nothing saved). A missing, unreadable or foreign file just starts
+    /// an empty cache.
+    pub fn open(gpu: Arc<Gpu>, dir: Option<&Path>, interface: u64) -> Result<PipelineCache, Error> {
         let caps = gpu.caps();
-        let uuid: String = caps
-            .pipeline_cache_uuid
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
         let path = dir.map(|d| {
-            d.join(format!(
-                "pipelines-{:04x}-{:04x}-{uuid}.bin",
-                caps.vendor_id, caps.device_id
+            d.join(cache_file_name(
+                caps.vendor_id,
+                caps.device_id,
+                &caps.pipeline_cache_uuid,
+                interface,
             ))
         });
         let data = match &path {
@@ -71,6 +184,11 @@ impl PipelineCache {
                         &caps.pipeline_cache_uuid,
                     ) =>
                 {
+                    // Used now: pruning keeps the caches used last, and a warm cache
+                    // may never be written again.
+                    if let Ok(f) = std::fs::File::options().append(true).open(p) {
+                        let _ = f.set_modified(std::time::SystemTime::now());
+                    }
                     bytes
                 }
                 Ok(_) => {
@@ -89,16 +207,44 @@ impl PipelineCache {
         // validates the rest).
         let raw = unsafe { gpu.device.create_pipeline_cache(&info, None) }
             .ctx("vkCreatePipelineCache")?;
+        match &path {
+            Some(p) => eprintln!(
+                "[gpu] pipeline cache {}: {}",
+                p.file_name().unwrap_or_default().to_string_lossy(),
+                match data.len() {
+                    0 => "new (cold)".to_owned(),
+                    n => format!("{:.1} KiB loaded (warm)", n as f64 / 1024.0),
+                }
+            ),
+            None => eprintln!("[gpu] pipeline cache: off"),
+        }
         Ok(PipelineCache {
             gpu,
             raw,
             path,
             saved_len: data.len(),
+            interface,
+            loaded_len: data.len(),
         })
     }
 
     pub fn raw(&self) -> vk::PipelineCache {
         self.raw
+    }
+
+    /// The interface hash in the cache's file name.
+    pub fn interface(&self) -> u64 {
+        self.interface
+    }
+
+    /// Bytes loaded from the file when the cache was opened: none on a cold start.
+    pub fn loaded_bytes(&self) -> usize {
+        self.loaded_len
+    }
+
+    /// Whether the cache is kept in a file.
+    pub fn on_disk(&self) -> bool {
+        self.path.is_some()
     }
 
     /// Writes the cache to disk if it grew since it was loaded or last saved. The file is
@@ -120,7 +266,31 @@ impl PipelineCache {
         std::fs::write(&tmp, &data).map_err(|e| format!("{}: {e}", tmp.display()))?;
         std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
         self.saved_len = data.len();
+        self.prune(path);
         Ok(())
+    }
+
+    /// Deletes the cache files of this GPU model that other drivers and builds left
+    /// behind, but for the few used last. Failures don't matter: they are only a cache.
+    fn prune(&self, path: &Path) {
+        let (Some(dir), Some(own)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let files = entries
+            .flatten()
+            .filter_map(|e| {
+                let modified = e.metadata().ok()?.modified().ok()?;
+                Some((e.file_name().to_string_lossy().into_owned(), modified))
+            })
+            .collect();
+        let caps = self.gpu.caps();
+        let prefix = cache_file_prefix(caps.vendor_id, caps.device_id);
+        for name in stale_caches(files, &own.to_string_lossy(), &prefix) {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
     }
 }
 
@@ -529,6 +699,63 @@ mod tests {
         h.extend_from_slice(&uuid);
         h.extend_from_slice(&[0xAB; 64]);
         h
+    }
+
+    #[test]
+    fn the_interface_hash_is_fnv_1a() {
+        // Published test vectors of 64-bit FNV-1a.
+        assert_eq!(InterfaceHash::default().finish(), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(
+            InterfaceHash::default().bytes(b"a").finish(),
+            0xaf63_dc4c_8601_ec8c
+        );
+        assert_eq!(
+            InterfaceHash::default().bytes(b"foobar").finish(),
+            0x8594_4171_f739_67e8
+        );
+        // Lengths are part of it: the same bytes split differently hash differently.
+        let split = |a: &[u8], b: &[u8]| InterfaceHash::default().blob(a).blob(b).finish();
+        assert_ne!(split(b"ab", b"c"), split(b"a", b"bc"));
+        let words = |w: &[u32]| InterfaceHash::default().words(w).finish();
+        assert_ne!(words(&[1, 2]), words(&[1, 3]));
+        assert_ne!(words(&[1]), words(&[1, 0]));
+    }
+
+    #[test]
+    fn cache_files_are_named_after_gpu_driver_and_interface() {
+        let uuid = [0xABu8; 16];
+        let name = cache_file_name(0x10de, 0x28e0, &uuid, 0x0123_4567_89ab_cdef);
+        assert_eq!(
+            name,
+            "pipelines-10de-28e0-abababababababababababababababab-0123456789abcdef.bin"
+        );
+        assert!(name.starts_with(&cache_file_prefix(0x10de, 0x28e0)));
+        assert_ne!(name, cache_file_name(0x10de, 0x28e0, &uuid, 1));
+    }
+
+    #[test]
+    fn old_caches_of_the_same_gpu_are_pruned() {
+        let at = |s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s);
+        let prefix = cache_file_prefix(0x10de, 0x28e0);
+        let files = vec![
+            (format!("{prefix}aa-5.bin"), at(5)),
+            (format!("{prefix}aa-1.bin"), at(1)),
+            (format!("{prefix}aa-own.bin"), at(9)),
+            (format!("{prefix}aa-3.bin"), at(3)),
+            // Before the hash was part of the name.
+            (format!("{prefix}aa.bin"), at(2)),
+            (format!("{prefix}aa-4.bin"), at(4)),
+            // Another GPU's, and other files: never touched.
+            ("pipelines-8086-468b-bb-1.bin".to_owned(), at(0)),
+            (format!("{prefix}aa-0.tmp"), at(0)),
+            ("servers.dat".to_owned(), at(0)),
+        ];
+        let mut stale = stale_caches(files, &format!("{prefix}aa-own.bin"), &prefix);
+        stale.sort();
+        assert_eq!(
+            stale,
+            vec![format!("{prefix}aa-1.bin"), format!("{prefix}aa.bin")]
+        );
     }
 
     #[test]

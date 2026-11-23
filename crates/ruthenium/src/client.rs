@@ -998,6 +998,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             counters,
             memory: renderer.gpu().memory_report(),
             textures: renderer.texture_stats(),
+            pipeline_cache: renderer.pipeline_cache(),
         });
         if let Err(e) = std::fs::write(path, json) {
             eprintln!("[ruthenium] could not write {}: {e}", path.display());

@@ -37,8 +37,8 @@ pub use frame_data::{FRAME_DATA_SET, FrameData};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};
 pub use memory::{HeapReport, MemoryReport, texel_bytes};
 pub use pipeline::{
-    Blend, GraphicsDesc, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout,
-    Pipelines,
+    Blend, GraphicsDesc, InterfaceHash, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache,
+    PipelineLayout, Pipelines, interface_hash,
 };
 pub use readback::Readback;
 pub use screenshot::Screenshot;

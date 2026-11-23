@@ -29,6 +29,14 @@ const STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
         | vk::ShaderStageFlags::COMPUTE.as_raw(),
 );
 
+/// The frame data's part of the pipelines' interface, for the pipeline cache's name.
+pub(crate) fn hash_interface(h: &mut crate::pipeline::InterfaceHash) {
+    h.u32(FRAME_DATA_SET)
+        .u32(0)
+        .u32(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC.as_raw() as u32)
+        .u32(STAGES.as_raw());
+}
+
 /// See the module docs.
 pub struct FrameData {
     gpu: Arc<Gpu>,

@@ -208,6 +208,10 @@ Medians of seven launches on the RTX 4060 and three on llvmpipe, taken in turns.
 
 It also passes at 1,024 and 2,048 slots, with `--exercise-uploads`, and at 16,384 slots, where the check stops at 2,048 textures of its own and the table is never full. With `--exercise-swapchain` the glass backdrop of a resized window sometimes waits for a slot (77 frames in 8 s drew the flat tint instead), which that exercise would count as a failure and does not when the table is being filled on purpose.
 
+### The pipeline cache
+
+The cache file is named after the GPU, the driver's cache id and a hash of the compiled SPIR-V, each pipeline's state and the interface the pipelines share with the renderer (push-constant range, the texture table's bindings, size and samplers, the frame data's binding). A build with other shaders starts cold in a file of its own and the same build always finds its own: six launches with a new hash each built the six pipelines in 35 to 46 ms, every launch of a build that had run before in 0.8 to 0.9 ms. The current file and the three other ones used last are kept (an A/B of two builds stays warm on both sides); older ones are deleted. `--bench-out` records `cold`, `warm` or `off`.
+
 ## Against the targets
 
 | Target | At `balanced` | At `performance` |

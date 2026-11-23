@@ -338,6 +338,15 @@ impl Telemetry {
                 "points": [run.window_points.0, run.window_points.1],
                 "pixels": [run.window_pixels.0, run.window_pixels.1],
             },
+            "pipeline_cache": {
+                "state": match run.pipeline_cache {
+                    (_, _, false) => "off",
+                    (_, 0, true) => "cold",
+                    _ => "warm",
+                },
+                "interface": format!("{:016x}", run.pipeline_cache.0),
+                "loaded_bytes": run.pipeline_cache.1,
+            },
             "startup": {
                 "window_ms": run.startup.window_ms,
                 "gpu_ms": run.startup.gpu_ms,
@@ -411,6 +420,8 @@ pub struct RunInfo<'a> {
     pub counters: FrameCounters,
     pub memory: MemoryReport,
     pub textures: ruthenium_gpu::TextureTableStats,
+    /// The pipeline cache: its interface hash, bytes loaded at start-up, kept in a file.
+    pub pipeline_cache: (u64, usize, bool),
 }
 
 /// Milliseconds from the process's start to each start-up milestone.
@@ -566,9 +577,12 @@ mod tests {
             counters: FrameCounters::default(),
             memory: MemoryReport::default(),
             textures: ruthenium_gpu::TextureTableStats::default(),
+            pipeline_cache: (0xABCD, 0, true),
         });
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["device"]["texture_table"], "ordinary");
+        assert_eq!(v["pipeline_cache"]["state"], "cold");
+        assert_eq!(v["pipeline_cache"]["interface"], "000000000000abcd");
         assert_eq!(v["gpu"], "A \"quoted\" GPU");
         assert_eq!(v["frames_ahead"], 1);
         assert_eq!(v["frame"]["samples"], 1);
