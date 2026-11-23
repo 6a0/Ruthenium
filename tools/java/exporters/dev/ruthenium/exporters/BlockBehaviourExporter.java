@@ -91,6 +91,8 @@ final class BlockBehaviourExporter {
      * rule.
      */
     static final int SUFFOCATES_BY_TAG = 16384;
+    /** Bits 15 to 17: {@code getPistonPushReaction()}, as the enum's ordinal. */
+    static final int PUSH_REACTION_SHIFT = 15;
 
     /** The behaviours, as a name and the parameter types that tell overloads apart. */
     private record Behaviour(String name, String method, boolean optional, Class<?>... params) {
@@ -127,7 +129,7 @@ final class BlockBehaviourExporter {
     // isSolid and liquid are deprecated in the game for code that has better questions to ask; these are the flags themselves.
     @SuppressWarnings("deprecation")
     static void export(Path file) throws Exception {
-        ExportWriter w = new ExportWriter("block_behaviour", 3);
+        ExportWriter w = new ExportWriter("block_behaviour", 4);
         // The default suffocation rule is one shared object: every Properties starts with it.
         Field propertiesRule = BlockBehaviour.Properties.class.getDeclaredField("isSuffocating");
         propertiesRule.setAccessible(true);
@@ -219,6 +221,7 @@ final class BlockBehaviourExporter {
             if (state.isRandomlyTicking()) flags |= RANDOMLY_TICKING;
             if (state.hasAnalogOutputSignal()) flags |= ANALOG_OUTPUT;
             if (stateRule.get(state) == defaultRule) flags |= SUFFOCATES_BY_TAG;
+            flags |= state.getPistonPushReaction().ordinal() << PUSH_REACTION_SHIFT;
             w.u32(flags);
             w.u8(state.instrument().ordinal());
             int support = 0;

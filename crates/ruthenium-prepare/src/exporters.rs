@@ -533,7 +533,7 @@ impl BlockBehaviourData {
     }
 }
 
-/// A block state's flags and supporting faces (`block_behaviour` v3).
+/// A block state's flags and supporting faces (`block_behaviour` v4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StateBehaviour {
     /// [`Self::REPLACEABLE`] and the other flags.
@@ -571,6 +571,15 @@ impl StateBehaviour {
     /// Suffocates by the default rule: in the `causes_suffocation` tag with a full
     /// collision shape (the tag is the server's, so it isn't known when exporting).
     pub const SUFFOCATES_BY_TAG: u32 = 16384;
+    /// Bits 15 to 17 of the flags: `getPistonPushReaction()` (`PushReaction`'s ordinal:
+    /// push-pull, push, popped, immoveable, ignore-entity).
+    pub const PUSH_REACTION_SHIFT: u32 = 15;
+
+    /// `getPistonPushReaction()`: 0 push-pull, 1 push only, 2 popped, 3 immoveable,
+    /// 4 ignore-entity.
+    pub fn push_reaction(&self) -> u8 {
+        (self.flags >> Self::PUSH_REACTION_SHIFT & 7) as u8
+    }
 
     /// `isFaceSturdy` for a direction's face (ordinal) and support type (0 full,
     /// 1 centre, 2 rigid).
@@ -594,7 +603,7 @@ pub struct BlockBehaviours {
 
 /// Parses `block_behaviour.bin`.
 pub fn read_block_behaviour(bytes: &[u8]) -> Result<BlockBehaviours, String> {
-    let mut r = Reader::open(bytes, "block_behaviour", 3)?;
+    let mut r = Reader::open(bytes, "block_behaviour", 4)?;
     let n = r.u8()?;
     let instruments = (0..n)
         .map(|_| Ok((r.string()?, r.u8()? != 0)))
@@ -710,7 +719,7 @@ mod tests {
     #[test]
     fn reads_block_behaviour() {
         let mut b = b"RTHX".to_vec();
-        b.extend(3u32.to_le_bytes());
+        b.extend(4u32.to_le_bytes());
         string(&mut b, "block_behaviour");
         b.push(2);
         string(&mut b, "harp");
@@ -736,7 +745,10 @@ mod tests {
         b.extend(StateBehaviour::REPLACEABLE.to_le_bytes());
         b.push(0);
         b.extend(0u32.to_le_bytes());
-        b.extend(StateBehaviour::SIGNAL_SOURCE.to_le_bytes());
+        b.extend(
+            (StateBehaviour::SIGNAL_SOURCE | 3 << StateBehaviour::PUSH_REACTION_SHIFT)
+                .to_le_bytes(),
+        );
         b.push(1);
         b.extend((1u32 << 5).to_le_bytes());
         b.extend([15, 15, 15, 15, 15, 15, 0, 15, 0, 0, 0, 0]);
@@ -750,6 +762,13 @@ mod tests {
         assert_eq!(data.states[0].flags, StateBehaviour::REPLACEABLE);
         assert!(data.states[1].sturdy(1, 2) && !data.states[1].sturdy(1, 0));
         assert_eq!(data.states[1].direct_signal[1], 15);
+        assert_eq!(
+            (
+                data.states[0].push_reaction(),
+                data.states[1].push_reaction()
+            ),
+            (0, 3)
+        );
         assert!(read_block_behaviour(&b[..b.len() - 1]).is_err());
     }
 

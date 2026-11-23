@@ -579,6 +579,19 @@ fn handle(
                 l.predictions.server_block(&mut l.level, pos, state);
             }
         }
+        // `handleBlockEvent`: pistons move, shulker boxes open.
+        Clientbound::BlockEvent { pos, b0, b1, .. } => {
+            let fluid_shapes = ruthenium_sim::pick::FluidShapes::new();
+            interact::World::new(
+                &mut l.level,
+                &mut l.predictions,
+                &d.blocks,
+                &d.tags,
+                &c.entities,
+                &fluid_shapes,
+            )
+            .block_event(pos, b0, b1);
+        }
         Clientbound::BlockChangedAck { sequence } => {
             l.predictions
                 .acknowledge(sequence, &mut l.level, &d.blocks, p)
@@ -751,6 +764,29 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
     let records = &t.records;
     // Traces recorded before `set` records existed don't check the predicted blocks.
     let records_sets = records.iter().any(|r| r.kind == "set");
+    // Where pistons or shulker boxes run, every block the client sets outside a
+    // prediction is compared too (block events and block entity ticks set them), in
+    // order: the ones vanilla made before each tick's end, and after it while handling
+    // packets (counted with the next tick).
+    let block_events = records
+        .iter()
+        .any(|r| r.kind == "handle" && r.str("name") == Some("minecraft:block_event"));
+    if block_events {
+        cl.level.set_log = Some(Vec::new());
+    }
+    let unpredicted_set = |q: &ruthenium_trace::Record| {
+        (q.kind == "set" && q.bool("predicting") == Some(false)).then(|| {
+            let at = &q.value["pos"];
+            let c = |k: usize| at[k].as_i64().unwrap() as i32;
+            (
+                [c(0), c(1), c(2)],
+                q.value["state"].as_u64().unwrap() as u32,
+                q.value["flags"].as_u64().unwrap() as u32,
+                q.value["limit"].as_i64().unwrap() as i32,
+            )
+        })
+    };
+    let mut unpredicted_want = Vec::new();
     // Packets handled after a tick began, applied before the next one (packets are
     // handled at the start of a frame, never during a tick).
     let mut pending: Vec<Pending> = Vec::new();
@@ -762,6 +798,10 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             if let Some(b) = r.bytes() {
                 handle(&b, &mut client, &mut p, &mut cl, &mut game_mode, d);
             }
+            continue;
+        }
+        if let Some(s) = unpredicted_set(r) {
+            unpredicted_want.push(s);
             continue;
         }
         if outside_tick_request(r) {
@@ -884,22 +924,52 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         };
         let held = if keys_released { Keys::default() } else { held };
         let loaded = client.loaded;
-        // The player ticks once loaded and while still in the level; `sendChanges` only
-        // for a player still in it after the tick.
+        // The level's game time as the tick runs (the trace has it after `level.tick`
+        // added one).
+        let game_time = records[i..]
+            .iter()
+            .take_while(|q| q.kind != "tick")
+            .find(|q| q.kind == "state")
+            .and_then(|q| q.value["gameTime"].as_i64())
+            .map_or(n, |g| g - 1);
+        // The player ticks once loaded and while still in the level; then the block
+        // entities (pistons push it, shulker boxes' lids lift it); `sendChanges` only for
+        // a player still in it after the tick.
         client.entities.tick(&cx, &mut p, |p, colliders| {
             if loaded && p.is_alive() {
                 p.tick(&Env { colliders, ..env }, held);
-                if p.is_alive() {
-                    sent.extend(p.send_changes());
-                }
             }
         });
+        interact::World::new(
+            &mut cl.level,
+            &mut cl.predictions,
+            blocks,
+            tags,
+            &client.entities,
+            &fluid_shapes,
+        )
+        .tick_block_entities(&mut p, game_time);
+        if loaded && p.is_alive() {
+            sent.extend(p.send_changes());
+        }
         // Vanilla's packets and state for this tick.
         let mut want = Vec::new();
         let mut state = None;
         let mut sets_want = Vec::new();
+        let mut after_state = Vec::new();
+        let mut seen_state = false;
         while i < records.len() && records[i].kind != "tick" {
             let q = &records[i];
+            if let Some(s) = unpredicted_set(q) {
+                if seen_state {
+                    after_state.push(s);
+                } else {
+                    unpredicted_want.push(s);
+                }
+            }
+            if q.kind == "state" {
+                seen_state = true;
+            }
             if q.kind == "set" && q.tick() == Some(n) && q.bool("predicting") == Some(true) {
                 let at = &q.value["pos"];
                 let c = |k: usize| at[k].as_i64().unwrap() as i32;
@@ -931,6 +1001,34 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             i += 1;
         }
         let s = state.ok_or((n, format!("tick {n}: no state")))?;
+        // Every block set outside a prediction so far.
+        if let Some(got) = &cl.level.set_log
+            && *got != unpredicted_want
+        {
+            let show = |v: &[([i32; 3], u32, u32, i32)]| {
+                v.iter()
+                    .map(|(at, s, f, l)| {
+                        format!(
+                            "{at:?} {} f{f} l{l}",
+                            ruthenium_sim::block::state::describe(*s)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let same = got
+                .iter()
+                .zip(&unpredicted_want)
+                .take_while(|(a, b)| a == b)
+                .count();
+            return Err((
+                n,
+                format!(
+                    "tick {n}: the blocks set differ after the first {same}\n  got  {:?}\n  want {:?}",
+                    show(&got[same..]),
+                    show(&unpredicted_want[same..])
+                ),
+            ));
+        }
         // The blocks the client set while predicting, where the trace records them.
         if records_sets && sets_got != sets_want {
             let show = |v: &[([i32; 3], u32, u32, i32)]| {
@@ -1109,6 +1207,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 ),
             ));
         }
+        unpredicted_want.extend(after_state);
         for e in std::mem::take(&mut pending) {
             match e {
                 Pending::Handled(b) => handle(&b, &mut client, &mut p, &mut cl, &mut game_mode, d),
@@ -1127,7 +1226,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 57] = [
+const EXACT: [&str; 63] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1185,6 +1284,12 @@ const EXACT: [&str; 57] = [
     "elytra_fireworks",
     "riptide",
     "wind_charge",
+    "piston_up",
+    "piston_side",
+    "piston_crawl",
+    "piston_jump",
+    "sticky_slime",
+    "shulker_box",
 ];
 
 #[test]
@@ -1265,6 +1370,12 @@ fn golden_traces() {
         "elytra_fireworks",
         "riptide",
         "wind_charge",
+        "piston_up",
+        "piston_side",
+        "piston_crawl",
+        "piston_jump",
+        "sticky_slime",
+        "shulker_box",
     ];
     let mut failed = Vec::new();
     for name in all {

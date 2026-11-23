@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 use ruthenium_protocol::wire::{Reader, WireError};
 
+use crate::block_entity::{BlockEntities, BlockEntityShape, Kind, kind_of};
 use crate::blocks::Blocks;
+use crate::direction::Direction;
 use crate::shape::{Aabb, EPSILON, Placed};
 
 /// Bits per entry of the global block-state palette (`ceillog2` of the state count).
@@ -55,6 +57,15 @@ pub struct Level {
     /// pushes faster).
     fast_lava: bool,
     chunks: HashMap<(i32, i32), Chunk>,
+    /// The moving pistons and shulker boxes, and their tickers.
+    pub block_entities: BlockEntities,
+    /// `PistonMovingBlockEntity.NOCLIP`: while a piston moves an entity, the way it
+    /// goes (blocks moving that way don't stop it).
+    pub noclip: Option<Direction>,
+    /// When set, every `setBlock` call the client level makes outside a predicted
+    /// action (position, state, flags, update limit), in order: tests compare them with
+    /// vanilla's.
+    pub set_log: Option<Vec<crate::block::level::SetCall>>,
 }
 
 impl Level {
@@ -64,6 +75,9 @@ impl Level {
             height,
             fast_lava: false,
             chunks: HashMap::new(),
+            block_entities: BlockEntities::default(),
+            noclip: None,
+            set_log: None,
         }
     }
 
@@ -93,6 +107,7 @@ impl Level {
 
     pub fn forget_chunk(&mut self, x: i32, z: i32) {
         self.chunks.remove(&(x, z));
+        self.block_entities.clear_chunk(x, z);
     }
 
     /// An empty chunk of air (for tests and building levels by hand).
@@ -126,6 +141,35 @@ impl Level {
             skip_biomes(&mut r, biome_bits)?;
         }
         self.chunks.insert((x, z), Chunk { sections });
+        // `replaceWithPacketData`: the chunk's block entities go, and the ones the
+        // packet lists are made again (`getBlockEntity` with IMMEDIATE). The server lists
+        // every shulker box's, so a box is all it takes.
+        self.block_entities.clear_chunk(x, z);
+        for (i, section) in self.chunks[&(x, z)].sections.iter().enumerate() {
+            let y0 = self.min_y + i as i32 * 16;
+            let mut found = Vec::new();
+            match section {
+                Section::Single(s) => {
+                    if kind_of(u32::from(*s)) == Some(Kind::ShulkerBox) {
+                        found.extend((0..4096).map(|c| (c, *s)));
+                    }
+                }
+                Section::Mixed(a) => found.extend(
+                    a.iter()
+                        .enumerate()
+                        .filter(|(_, s)| kind_of(u32::from(**s)) == Some(Kind::ShulkerBox))
+                        .map(|(c, s)| (c, *s)),
+                ),
+            }
+            for (c, s) in found {
+                let pos = [
+                    x * 16 + (c & 15) as i32,
+                    y0 + (c >> 8) as i32,
+                    z * 16 + (c >> 4 & 15) as i32,
+                ];
+                self.block_entities.on_block_changed(pos, 0, u32::from(s));
+            }
+        }
         Ok(())
     }
 
@@ -148,9 +192,13 @@ impl Level {
             return;
         }
         let min_y = self.min_y;
+        let old = self.block(x, y, z);
         if let Some(c) = self.chunks.get_mut(&(x >> 4, z >> 4)) {
             let s = ((y - min_y) >> 4) as usize;
             c.sections[s].set(x & 15, (y - min_y) & 15, z & 15, state as u16);
+            if old != state {
+                self.block_entities.on_block_changed([x, y, z], old, state);
+            }
         }
     }
 
@@ -173,7 +221,7 @@ impl Level {
     /// `BlockCollisions` yields them: a cursor over the box grown by one block, x
     /// fastest, then y, then z; corner cells skipped, edge cells only for shapes
     /// taller or wider than a block.
-    pub fn block_collisions<'a>(&self, blocks: &'a Blocks, b: &Aabb) -> Vec<Placed<'a>> {
+    pub fn block_collisions<'a>(&'a self, blocks: &'a Blocks, b: &Aabb) -> Vec<Placed<'a>> {
         self.block_collisions_at(blocks, b)
             .into_iter()
             .map(|(_, p)| p)
@@ -182,7 +230,7 @@ impl Level {
 
     /// [`Level::block_collisions`] with each shape's block position.
     pub fn block_collisions_at<'a>(
-        &self,
+        &'a self,
         blocks: &'a Blocks,
         b: &Aabb,
     ) -> Vec<([i32; 3], Placed<'a>)> {
@@ -192,8 +240,10 @@ impl Level {
     /// [`Level::block_collisions_at`] for an entity (`BlockCollisions` with its
     /// collision context: scaffolding's shape depends on it). With `suffocating`, only
     /// the blocks that suffocate by those tags (`collidesWithSuffocatingBlock`).
+    /// Moving pistons and shulker boxes have their block entity's shape: moving pistons
+    /// count even in the cells by the box's edges, as the game's cursor lets them.
     pub fn block_collisions_for<'a>(
-        &self,
+        &'a self,
         blocks: &'a Blocks,
         b: &Aabb,
         suffocating: Option<&crate::blocks::BlockTags>,
@@ -218,21 +268,46 @@ impl Level {
                     if state == 0 {
                         continue;
                     }
-                    if suffocating.is_some_and(|tags| !blocks.suffocating(state, tags)) {
+                    let kind = kind_of(state);
+                    if suffocating
+                        .is_some_and(|tags| !self.suffocating(blocks, state, [x, y, z], tags))
+                    {
                         continue;
                     }
                     if face == 1 && !blocks.large_shape(state) {
                         continue;
                     }
-                    // Face type 2 cells count only for moving pistons, which never
-                    // collide with players here.
-                    if face == 2 {
+                    // Face type 2 cells count only for moving pistons.
+                    if face == 2 && kind != Some(Kind::MovingPiston) {
                         continue;
                     }
-                    let Some(placed) = blocks.collision_for(state, [x, y, z], who) else {
-                        continue;
+                    let at = [f64::from(x), f64::from(y), f64::from(z)];
+                    let placed = match kind.map(|k| {
+                        (
+                            k,
+                            self.block_entities
+                                .collision_shape([x, y, z], k, self.noclip),
+                        )
+                    }) {
+                        Some((_, BlockEntityShape::Shape(shape))) => Placed {
+                            shape,
+                            offset: None,
+                            pos: at,
+                        },
+                        Some((_, BlockEntityShape::Empty))
+                        | Some((Kind::MovingPiston, BlockEntityShape::Missing)) => continue,
+                        _ => match blocks.collision_for(state, [x, y, z], who) {
+                            Some(p) => p,
+                            None => continue,
+                        },
                     };
-                    if blocks.is_full_block(state) && placed.shape.is_block() {
+                    // `shape == Shapes.block()`: a block entity's full cube is that shape too.
+                    let identity = if kind.is_some() {
+                        placed.shape.is_block()
+                    } else {
+                        blocks.is_full_block(state) && placed.shape.is_block()
+                    };
+                    if identity {
                         let cell = Aabb {
                             min: [f64::from(x), f64::from(y), f64::from(z)],
                             max: [f64::from(x) + 1.0, f64::from(y) + 1.0, f64::from(z) + 1.0],
@@ -247,6 +322,25 @@ impl Level {
             }
         }
         out
+    }
+}
+
+impl Level {
+    /// `isSuffocating`: an open shulker box doesn't (`NOT_CLOSED_SHULKER`); the rest as
+    /// [`Blocks::suffocating`].
+    fn suffocating(
+        &self,
+        blocks: &Blocks,
+        state: u32,
+        pos: [i32; 3],
+        tags: &crate::blocks::BlockTags,
+    ) -> bool {
+        if let Some(s) = self.block_entities.shulker(pos)
+            && kind_of(state) == Some(Kind::ShulkerBox)
+        {
+            return s.is_closed();
+        }
+        blocks.suffocating(state, tags)
     }
 }
 

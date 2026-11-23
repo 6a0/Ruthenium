@@ -1072,6 +1072,15 @@ pub mod play {
             pos: [i32; 3],
             state: u32,
         },
+        /// A block's event (`ClientboundBlockEventPacket`): a piston moving, a chest or
+        /// shulker box opening, a note block playing. `block` is the block registry id
+        /// the server sent it for (the client runs it for whatever block is there).
+        BlockEvent {
+            pos: [i32; 3],
+            b0: u8,
+            b1: u8,
+            block: u32,
+        },
         /// The server has handled the client's predicted block changes up to this
         /// sequence.
         BlockChangedAck {
@@ -1322,6 +1331,12 @@ pub mod play {
                 C::BlockUpdate => Clientbound::BlockUpdate {
                     pos: unpack_block_pos(r.i64()?),
                     state: r.varint()? as u32,
+                },
+                C::BlockEvent => Clientbound::BlockEvent {
+                    pos: unpack_block_pos(r.i64()?),
+                    b0: r.u8()?,
+                    b1: r.u8()?,
+                    block: r.varint()? as u32,
                 },
                 C::SectionBlocksUpdate => {
                     let s = r.i64()?;

@@ -120,6 +120,18 @@ public final class Scenarios {
         ctx.waitTicks(4);
     }
 
+    /**
+     * Puts a redstone block at (x, y, z) to power the piston next to it ({@code on}), or the
+     * block the layer had there (stone in the floor at y -61, dirt below, stone above), then
+     * waits {@code ticks}.
+     */
+    private static void power(ClientGameTestContext ctx, TestServerContext server, int x, int y, int z, boolean on,
+            int ticks) {
+        String off = y == -62 ? "minecraft:dirt" : "minecraft:stone";
+        server.runCommand("setblock " + x + " " + y + " " + z + " " + (on ? "minecraft:redstone_block" : off));
+        ctx.waitTicks(ticks);
+    }
+
     /** Waits until the client's player has passed x = {@code x} going east (at most 100 ticks). */
     private static void waitUntilEastOf(ClientGameTestContext ctx, double x) {
         waitUntilEastOf(ctx, x, 100);
@@ -1762,5 +1774,142 @@ public final class Scenarios {
                         ctx.waitTicks(15);
                         server.runCommand("kill @e[type=!minecraft:player]");
                         ctx.waitTicks(5);
+                    }),
+            new Scenario("piston_up",
+                    "Pistons facing up set into the floor, powered by a redstone block put in the dirt under them: standing on one as its head extends (lifted a block onto the head) and retracts (falling back); on a stone block that a piston pushes up (it stays up); on stone on a sticky piston (pulled back down); standing over a piston's edge (x 3.2, overlapping it by 0.1); walking east across one as it extends under the player.",
+                    List.of("setblock 2 -61 0 minecraft:piston[facing=up]",
+                            "setblock 5 -61 0 minecraft:piston[facing=up]", "setblock 5 -60 0 minecraft:stone",
+                            "setblock 8 -61 0 minecraft:sticky_piston[facing=up]", "setblock 8 -60 0 minecraft:stone",
+                            "setblock 2 -61 4 minecraft:piston[facing=up]"),
+                    start(2.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.waitTicks(5);
+                        power(ctx, server, 2, -62, 0, true, 20);
+                        power(ctx, server, 2, -62, 0, false, 20);
+                        tp(ctx, server, 5.5, -59, 0.5, -90, 0);
+                        power(ctx, server, 5, -62, 0, true, 20);
+                        power(ctx, server, 5, -62, 0, false, 20);
+                        tp(ctx, server, 8.5, -59, 0.5, -90, 0);
+                        power(ctx, server, 8, -62, 0, true, 20);
+                        power(ctx, server, 8, -62, 0, false, 20);
+                        tp(ctx, server, 3.2, -60, 0.5, -90, 0);
+                        power(ctx, server, 2, -62, 0, true, 20);
+                        power(ctx, server, 2, -62, 0, false, 20);
+                        tp(ctx, server, 0.5, -60, 4.5, -90, 0);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 2.2);
+                        power(ctx, server, 2, -62, 4, true, 3);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(20);
+                        power(ctx, server, 2, -62, 4, false, 20);
+                    }),
+            new Scenario("piston_side",
+                    "Pistons facing east on the floor, powered by a redstone block put in the floor under them: the head pushing the player standing in front of it; the same on ice; walking west into a piston as its head comes out (pushed back while walking against it), then walking on as it retracts; a stone block pushed into the player.",
+                    List.of("setblock 0 -60 0 minecraft:piston[facing=east]",
+                            "setblock 0 -60 4 minecraft:piston[facing=east]", "fill 1 -61 4 8 -61 4 minecraft:ice",
+                            "setblock 0 -60 8 minecraft:piston[facing=east]",
+                            "setblock 0 -60 -6 minecraft:piston[facing=east]", "setblock 1 -60 -6 minecraft:stone"),
+                    start(1.5, -60, 0.5, 90, 0), (ctx, server) -> {
+                        ctx.waitTicks(5);
+                        power(ctx, server, 0, -61, 0, true, 20);
+                        power(ctx, server, 0, -61, 0, false, 10);
+                        tp(ctx, server, 1.5, -60, 4.5, 90, 0);
+                        power(ctx, server, 0, -61, 4, true, 20);
+                        power(ctx, server, 0, -61, 4, false, 10);
+                        tp(ctx, server, 4.5, -60, 8.5, 90, 0);
+                        ctx.getInput().holdKey(W);
+                        waitUntilWestOf(ctx, 1.6);
+                        power(ctx, server, 0, -61, 8, true, 20);
+                        power(ctx, server, 0, -61, 8, false, 10);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(5);
+                        tp(ctx, server, 2.5, -60, -5.5, 90, 0);
+                        power(ctx, server, 0, -61, -6, true, 20);
+                        power(ctx, server, 0, -61, -6, false, 10);
+                    }),
+            new Scenario("piston_crawl",
+                    "A 1-high tunnel (x 2 to 10) entered crawling (a block appears at head height). In its ceiling at x 5 an extended piston facing up (powered by a redstone block in the wall), crawled under, retracted and extended again over the player; in its south wall at x 8 a piston facing north, which pushes the crawling player north into a gap in the north wall and retracts; then crawl back into the tunnel and out of its far end.",
+                    List.of("fill 2 -60 -1 10 -59 1 minecraft:stone", "fill 2 -60 0 10 -60 0 minecraft:air",
+                            "setblock 5 -59 1 minecraft:redstone_block",
+                            "setblock 5 -59 0 minecraft:piston[facing=up,extended=true]",
+                            "setblock 5 -58 0 minecraft:piston_head[facing=up]",
+                            "setblock 8 -60 1 minecraft:piston[facing=north]", "setblock 8 -60 -1 minecraft:air"),
+                    start(1.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.waitTicks(3);
+                        server.runCommand("setblock 1 -59 0 minecraft:stone");
+                        ctx.waitTicks(8);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 5.5);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(5);
+                        power(ctx, server, 5, -59, 1, false, 10);
+                        power(ctx, server, 5, -59, 1, true, 10);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 8.5);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(5);
+                        power(ctx, server, 8, -61, 1, true, 20);
+                        power(ctx, server, 8, -61, 1, false, 10);
+                        ctx.getInput().lookAt(0, 0);
+                        ctx.waitTicks(2);
+                        hold(ctx, 12, W);
+                        ctx.getInput().lookAt(-90, 0);
+                        ctx.waitTicks(2);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 12.5);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(15);
+                    }),
+            new Scenario("piston_jump",
+                    "Standing on a piston facing up set into the floor: jumping, with its head extending under the player 0, 2, 4, 6, 8 and 10 ticks after the jump; landing on the head, then retracting it.",
+                    List.of("setblock 2 -61 0 minecraft:piston[facing=up]"),
+                    start(2.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.waitTicks(5);
+                        for (int delay : new int[] {0, 2, 4, 6, 8, 10}) {
+                            hold(ctx, 1, JUMP);
+                            ctx.waitTicks(delay);
+                            power(ctx, server, 2, -62, 0, true, 25);
+                            power(ctx, server, 2, -62, 0, false, 20);
+                        }
+                    }),
+            new Scenario("sticky_slime",
+                    "Sticky pistons moving slime and honey blocks: standing on slime pushed up (launched up, landing sneaking), then pulled back down; standing east of slime pushed east (launched east) on stone and on ice, each pulled back after; standing on honey pushed east and pulled back (the honey carries the player both ways). Obsidian under the sideways slime and honey keeps them from sticking to the floor.",
+                    List.of("setblock 2 -61 0 minecraft:sticky_piston[facing=up]", "setblock 2 -60 0 minecraft:slime_block",
+                            "setblock 0 -60 4 minecraft:sticky_piston[facing=east]", "setblock 1 -60 4 minecraft:slime_block",
+                            "fill 1 -61 4 2 -61 4 minecraft:obsidian",
+                            "setblock 0 -60 8 minecraft:sticky_piston[facing=east]", "setblock 1 -60 8 minecraft:slime_block",
+                            "fill 1 -61 8 2 -61 8 minecraft:obsidian",
+                            "fill 3 -61 8 28 -61 8 minecraft:ice", "fill 30 -60 7 30 -58 9 minecraft:stone",
+                            "setblock 0 -60 -4 minecraft:sticky_piston[facing=east]", "setblock 1 -60 -4 minecraft:honey_block",
+                            "fill 1 -61 -4 2 -61 -4 minecraft:obsidian"),
+                    start(2.5, -59, 0.5, -90, 0), (ctx, server) -> {
+                        ctx.waitTicks(5);
+                        power(ctx, server, 2, -62, 0, true, 45);
+                        hold(ctx, 30, SNEAK);
+                        power(ctx, server, 2, -62, 0, false, 15);
+                        tp(ctx, server, 2.5, -60, 4.5, -90, 0);
+                        power(ctx, server, 0, -61, 4, true, 30);
+                        power(ctx, server, 0, -61, 4, false, 10);
+                        tp(ctx, server, 2.5, -60, 8.5, -90, 0);
+                        power(ctx, server, 0, -61, 8, true, 40);
+                        power(ctx, server, 0, -61, 8, false, 10);
+                        tp(ctx, server, 1.5, -59, -3.5, -90, 0);
+                        power(ctx, server, 0, -61, -4, true, 20);
+                        power(ctx, server, 0, -61, -4, false, 20);
+                    }),
+            new Scenario("shulker_box",
+                    "Standing on a shulker box facing up and opening it (looking down at it): its lid lifts the player; the box is closed (the client closes its screen) and the player drops back onto it. Then opening a shulker box facing east from its east side: its lid pushes the player east; closed again.",
+                    List.of("setblock 2 -60 0 minecraft:shulker_box[facing=up]",
+                            "setblock 6 -60 4 minecraft:red_shulker_box[facing=east]"),
+                    start(2.5, -59, 0.5, -90, 90), (ctx, server) -> {
+                        ctx.waitTicks(5);
+                        use(ctx);
+                        ctx.waitTicks(20);
+                        ctx.runOnClient(mc -> mc.player.closeContainer());
+                        ctx.waitTicks(20);
+                        aim(ctx, server, 7.5, -60, 4.5, 7.0, -59.5, 4.5);
+                        use(ctx);
+                        ctx.waitTicks(20);
+                        ctx.runOnClient(mc -> mc.player.closeContainer());
+                        ctx.waitTicks(15);
                     }));
 }

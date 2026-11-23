@@ -475,6 +475,9 @@ struct World {
     fluid_shapes: pick::FluidShapes,
     tick_rate: f32,
     frozen: bool,
+    /// The level's game time, counted by the ticks (`tickTime`; the server's
+    /// `set_time` isn't read yet). Pistons use it to tell ticks apart.
+    game_time: i64,
 }
 
 impl World {
@@ -502,6 +505,7 @@ impl World {
             fluid_shapes: pick::FluidShapes::new(),
             tick_rate: 20.0,
             frozen: false,
+            game_time: 0,
         }
     }
 }
@@ -1010,20 +1014,36 @@ impl Game {
             tick_rate: w.tick_rate,
             runs_normally: !w.frozen,
         };
-        let (loaded, keys, connection) = (w.loaded, self.keys, &self.connection);
+        let (loaded, keys) = (w.loaded, self.keys);
         w.entities.tick(&cx, &mut w.player, |player, colliders| {
-            // A player taken out of the level (20 ticks after dying) no longer ticks,
-            // and `sendChanges` waits for a player still in it.
+            // A player taken out of the level (20 ticks after dying) no longer ticks.
             if loaded && player.is_alive() {
                 let env = Env { colliders, ..env };
                 player.tick(&env, keys);
-                if player.is_alive() {
-                    for p in player.send_changes() {
-                        connection.send(p);
-                    }
-                }
             }
         });
+        // `tickBlockEntities`: moving pistons and shulker boxes' lids, which push the
+        // player; then `sendChanges`, for a player still in the level.
+        if !w.frozen {
+            interact::World::new(
+                &mut w.level,
+                &mut w.predictions,
+                &physics.blocks,
+                &self.tags,
+                &w.entities,
+                &w.fluid_shapes,
+            )
+            .tick_block_entities(&mut w.player, w.game_time);
+        }
+        if loaded && w.player.is_alive() {
+            for p in w.player.send_changes() {
+                self.connection.send(p);
+            }
+        }
+        // `level.tick`: the game time.
+        if !w.frozen {
+            w.game_time += 1;
+        }
         self.connection.send(play::client_tick_end());
     }
 
@@ -1281,6 +1301,22 @@ impl Game {
                         ];
                         w.predictions.server_block(&mut w.level, pos, state);
                     }
+                }
+            }
+            // `handleBlockEvent`: pistons move, shulker boxes open.
+            play::Clientbound::BlockEvent { pos, b0, b1, .. } => {
+                if let Some(w) = &mut self.world
+                    && let Some(physics) = &self.physics
+                {
+                    interact::World::new(
+                        &mut w.level,
+                        &mut w.predictions,
+                        &physics.blocks,
+                        &self.tags,
+                        &w.entities,
+                        &w.fluid_shapes,
+                    )
+                    .block_event(pos, b0, b1);
                 }
             }
             play::Clientbound::BlockChangedAck { sequence } => {

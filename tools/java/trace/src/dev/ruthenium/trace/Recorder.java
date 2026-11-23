@@ -66,7 +66,7 @@ public final class Recorder {
             "minecraft:set_held_slot", "minecraft:keep_alive", "minecraft:ping", "minecraft:damage_event",
             "minecraft:hurt_animation", "minecraft:entity_event", "minecraft:set_entity_data",
             "minecraft:teleport_entity", "minecraft:entity_position_sync", "minecraft:block_changed_ack",
-            "minecraft:block_update", "minecraft:section_blocks_update", "minecraft:set_cursor_item",
+            "minecraft:block_update", "minecraft:section_blocks_update", "minecraft:block_event", "minecraft:set_cursor_item",
             "minecraft:container_set_slot", "minecraft:container_set_content", "minecraft:set_player_inventory",
             "minecraft:add_entity", "minecraft:remove_entities", "minecraft:move_entity_pos",
             "minecraft:move_entity_pos_rot", "minecraft:move_entity_rot", "minecraft:rotate_head",

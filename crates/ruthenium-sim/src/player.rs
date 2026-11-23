@@ -640,6 +640,10 @@ pub struct LocalPlayer {
     stuck_speed_multiplier: [f64; 3],
     /// `movementThisTick`: each move of the tick, for the blocks it passed through.
     movement_this_tick: Vec<Movement>,
+    /// `pistonDeltas` and the game time they are for: how far pistons have moved the
+    /// player along each axis this tick (at most 0.51 either way).
+    piston_deltas: [f64; 3],
+    piston_deltas_game_time: i64,
     /// `isInPowderSnow` (set by the blocks moved through) and `wasInPowderSnow` (as
     /// the tick began).
     in_powder_snow: bool,
@@ -650,6 +654,18 @@ pub struct LocalPlayer {
 
 /// `Entity.Movement`: a move from one place to another, with the movement asked for
 /// (when it came from `move`), whose axes order the walk through the blocks.
+/// `MoverType`: what moves an entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoverType {
+    /// `SELF`: its own travel.
+    SelfMove,
+    /// `PLAYER`.
+    Player,
+    Piston,
+    ShulkerBox,
+    Shulker,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Movement {
     from: [f64; 3],
@@ -737,6 +753,8 @@ impl LocalPlayer {
             last_item_in_main_hand: Stack::empty(),
             stuck_speed_multiplier: [0.0; 3],
             movement_this_tick: Vec::new(),
+            piston_deltas: [0.0; 3],
+            piston_deltas_game_time: 0,
             in_powder_snow: false,
             was_in_powder_snow: false,
             auto_spin_attack_ticks: 0,
@@ -1909,6 +1927,34 @@ impl LocalPlayer {
                 }),
             Some(_) => {}
         }
+        self.apply_effects_of(env, &movements);
+    }
+
+    /// `applyEffectsFromBlocks(from, to)`: the blocks one move passed through, as a
+    /// piston's push applies them.
+    pub fn apply_effects_between(&mut self, env: &Env<'_>, from: [f64; 3], to: [f64; 3]) {
+        self.apply_effects_of(
+            env,
+            &[Movement {
+                from,
+                to,
+                asked: None,
+            }],
+        );
+    }
+
+    /// `removeLatestMovementRecording`.
+    pub fn remove_latest_movement_recording(&mut self) {
+        self.movement_this_tick.pop();
+    }
+
+    /// `mainSupportingBlockPos`: the block the player stands on.
+    pub fn supporting_block(&self) -> Option<[i32; 3]> {
+        self.supporting_block
+    }
+
+    /// `applyEffectsFromBlocks(movements)`.
+    fn apply_effects_of(&mut self, env: &Env<'_>, movements: &[Movement]) {
         // isAffectedByBlocks.
         if self.no_physics {
             return;
@@ -1925,7 +1971,7 @@ impl LocalPlayer {
                 }
             }
         }
-        self.check_inside_blocks(env, &movements);
+        self.check_inside_blocks(env, movements);
     }
 
     /// `Entity.checkInsideBlocks`: walks each move through the blocks, axis by axis
@@ -2545,6 +2591,14 @@ impl LocalPlayer {
 
     /// `Entity.move` for the player moving itself; a spectator just goes there.
     fn do_move(&mut self, env: &Env<'_>, delta: [f64; 3]) {
+        self.move_by(env, MoverType::SelfMove, delta, 0);
+    }
+
+    /// `LocalPlayer.move`: the player moved by itself or by something else. A piston's
+    /// moves are cut to 0.51 an axis in a game tick (`limitPistonMovement`, by
+    /// `game_time`) and aren't slowed by cobwebs; only the player's own moves back off
+    /// edges while sneaking.
+    pub fn move_by(&mut self, env: &Env<'_>, kind: MoverType, delta: [f64; 3], game_time: i64) {
         if self.no_physics {
             self.position = [
                 self.position[0] + delta[0],
@@ -2558,17 +2612,30 @@ impl LocalPlayer {
             return;
         }
         let mut delta = delta;
+        if kind == MoverType::Piston {
+            delta = self.limit_piston_movement(delta, game_time);
+            // `delta.equals(Vec3.ZERO)`.
+            if delta.iter().all(|v| v.to_bits() == 0) {
+                return;
+            }
+        }
         let stuck = self.stuck_speed_multiplier;
         if stuck[0] * stuck[0] + stuck[1] * stuck[1] + stuck[2] * stuck[2] > 1.0E-7 {
-            delta = [
-                delta[0] * stuck[0],
-                delta[1] * stuck[1],
-                delta[2] * stuck[2],
-            ];
+            if kind != MoverType::Piston {
+                delta = [
+                    delta[0] * stuck[0],
+                    delta[1] * stuck[1],
+                    delta[2] * stuck[2],
+                ];
+            }
             self.stuck_speed_multiplier = [0.0; 3];
             self.delta = [0.0; 3];
         }
-        let delta = self.back_off_from_edge(env, delta);
+        let delta = if matches!(kind, MoverType::SelfMove | MoverType::Player) {
+            self.back_off_from_edge(env, delta)
+        } else {
+            delta
+        };
         let movement = self.collide(env, delta);
         let len = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
         let dlen = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
@@ -2625,6 +2692,31 @@ impl LocalPlayer {
         }
         let f = f64::from(self.block_speed_factor(env));
         self.delta = [self.delta[0] * f, self.delta[1], self.delta[2] * f];
+    }
+
+    /// `limitPistonMovement`: the first axis the move goes along, cut so that the
+    /// tick's piston moves along it add up to at most 0.51 either way; nothing once the
+    /// cut leaves less than 1e-5.
+    fn limit_piston_movement(&mut self, v: [f64; 3], game_time: i64) -> [f64; 3] {
+        if v[0] * v[0] + v[1] * v[1] + v[2] * v[2] <= 1.0E-7 {
+            return v;
+        }
+        if game_time != self.piston_deltas_game_time {
+            self.piston_deltas = [0.0; 3];
+            self.piston_deltas_game_time = game_time;
+        }
+        let Some(axis) = (0..3).find(|&i| v[i] != 0.0) else {
+            return [0.0; 3];
+        };
+        let limited = (v[axis] + self.piston_deltas[axis]).clamp(-0.51, 0.51);
+        let amount = limited - self.piston_deltas[axis];
+        self.piston_deltas[axis] = limited;
+        if amount.abs() <= 9.999999747378752E-6 {
+            return [0.0; 3];
+        }
+        let mut out = [0.0; 3];
+        out[axis] = amount;
+        out
     }
 
     /// `Entity.restituteMovementAfterCollisions`.

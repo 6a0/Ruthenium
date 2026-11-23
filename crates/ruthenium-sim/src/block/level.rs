@@ -152,9 +152,11 @@ impl World<'_> {
     /// can't stay any more is left for the server), and while an action is predicted
     /// the block keeps the state the server last gave it. True if it changed.
     pub fn set_block_limited(&mut self, pos: Pos, state: u32, flags: u32, limit: i32) -> bool {
-        if self.predictions.predicting()
-            && let Some(log) = &mut self.set_log
-        {
+        if self.predictions.predicting() {
+            if let Some(log) = &mut self.set_log {
+                log.push((pos, state, flags, limit));
+            }
+        } else if let Some(log) = &mut self.level.set_log {
             log.push((pos, state, flags, limit));
         }
         if !self.in_world_bounds(pos) {

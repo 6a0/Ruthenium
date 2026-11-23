@@ -67,6 +67,41 @@ impl Aabb {
     pub fn intersects(&self, o: &Aabb) -> bool {
         (0..3).all(|i| self.min[i] < o.max[i] && self.max[i] > o.min[i])
     }
+
+    /// `intersect`: the overlap of two boxes.
+    pub fn intersect(&self, o: &Aabb) -> Aabb {
+        Aabb::new(
+            std::array::from_fn(|i| self.min[i].max(o.min[i])),
+            std::array::from_fn(|i| self.max[i].min(o.max[i])),
+        )
+    }
+
+    /// `minmax`: the box around both.
+    pub fn minmax(&self, o: &Aabb) -> Aabb {
+        Aabb::new(
+            std::array::from_fn(|i| self.min[i].min(o.min[i])),
+            std::array::from_fn(|i| self.max[i].max(o.max[i])),
+        )
+    }
+
+    /// `contract`: shrinks the box on the side each amount points to (the far side
+    /// for a positive amount).
+    pub fn contract(&self, d: [f64; 3]) -> Aabb {
+        let mut b = *self;
+        for i in 0..3 {
+            if d[i] < 0.0 {
+                b.min[i] -= d[i];
+            } else if d[i] > 0.0 {
+                b.max[i] -= d[i];
+            }
+        }
+        b
+    }
+
+    /// `getXsize`, `getYsize`, `getZsize`.
+    pub fn size(&self, axis: Axis) -> f64 {
+        self.max[axis as usize] - self.min[axis as usize]
+    }
 }
 
 /// A shape's grid: coordinates per axis and full cells (x outermost, z innermost).
@@ -91,6 +126,102 @@ impl Shape {
             empty: !data.full.iter().any(|&f| f),
             full: data.full.clone(),
         }
+    }
+
+    /// `Shapes.empty()`.
+    pub fn empty() -> Shape {
+        Shape::new(&ShapeData {
+            coords: [vec![0.0, 0.0], vec![0.0, 0.0], vec![0.0, 0.0]],
+            full: vec![false],
+        })
+    }
+
+    /// The union of boxes, as `Shapes.or` and `optimize` build it: the grid of every
+    /// box's coordinates, a cell full where a box covers it. Boxes thinner than the
+    /// tolerance are left out, as `Shapes.create` makes them empty; none at all gives
+    /// the empty shape.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    pub fn from_boxes(boxes: &[Aabb]) -> Shape {
+        let boxes: Vec<&Aabb> = boxes
+            .iter()
+            .filter(|b| (0..3).all(|i| !(b.max[i] - b.min[i] < EPSILON)))
+            .collect();
+        if boxes.is_empty() {
+            return Shape::empty();
+        }
+        let coords: [Vec<f64>; 3] = std::array::from_fn(|axis| {
+            let mut c: Vec<f64> = boxes
+                .iter()
+                .flat_map(|b| [b.min[axis], b.max[axis]])
+                .collect();
+            c.sort_by(f64::total_cmp);
+            // `IndexMerger`: values within the tolerance of the last one kept merge.
+            let mut out: Vec<f64> = Vec::with_capacity(c.len());
+            for v in c {
+                if out.last().is_none_or(|&last| !(last >= v - EPSILON)) {
+                    out.push(v);
+                }
+            }
+            out
+        });
+        let sizes = [
+            coords[0].len() - 1,
+            coords[1].len() - 1,
+            coords[2].len() - 1,
+        ];
+        let mut full = vec![false; sizes[0] * sizes[1] * sizes[2]];
+        for x in 0..sizes[0] {
+            for y in 0..sizes[1] {
+                for z in 0..sizes[2] {
+                    let mid = [
+                        (coords[0][x] + coords[0][x + 1]) / 2.0,
+                        (coords[1][y] + coords[1][y + 1]) / 2.0,
+                        (coords[2][z] + coords[2][z + 1]) / 2.0,
+                    ];
+                    full[(x * sizes[1] + y) * sizes[2] + z] = boxes
+                        .iter()
+                        .any(|b| (0..3).all(|i| b.min[i] <= mid[i] && mid[i] <= b.max[i]));
+                }
+            }
+        }
+        Shape::new(&ShapeData { coords, full })
+    }
+
+    /// The full cells as boxes (`toAabbs`, in `forAllBoxes`' order).
+    pub fn aabbs(&self) -> Vec<Aabb> {
+        self.boxes()
+            .into_iter()
+            .map(|[x1, y1, z1, x2, y2, z2]| Aabb {
+                min: [self.coords[0][x1], self.coords[1][y1], self.coords[2][z1]],
+                max: [self.coords[0][x2], self.coords[1][y2], self.coords[2][z2]],
+            })
+            .collect()
+    }
+
+    /// `bounds()`: from the first to the last full cell on each axis (`None` when
+    /// empty).
+    pub fn bounds(&self) -> Option<Aabb> {
+        if self.empty {
+            return None;
+        }
+        let mut lo = [usize::MAX; 3];
+        let mut hi = [0usize; 3];
+        for x in 0..self.sizes[0] {
+            for y in 0..self.sizes[1] {
+                for z in 0..self.sizes[2] {
+                    if self.full[(x * self.sizes[1] + y) * self.sizes[2] + z] {
+                        for (i, v) in [x, y, z].into_iter().enumerate() {
+                            lo[i] = lo[i].min(v);
+                            hi[i] = hi[i].max(v + 1);
+                        }
+                    }
+                }
+            }
+        }
+        Some(Aabb {
+            min: std::array::from_fn(|i| self.coords[i][lo[i]]),
+            max: std::array::from_fn(|i| self.coords[i][hi[i]]),
+        })
     }
 
     /// `Shapes.block()`: one full cell from 0 to 1.
