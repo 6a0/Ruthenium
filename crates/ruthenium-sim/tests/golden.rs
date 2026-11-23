@@ -1329,7 +1329,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 80] = [
+const EXACT: [&str; 82] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1410,6 +1410,8 @@ const EXACT: [&str; 80] = [
     "minecart_ride",
     "passenger_push",
     "world_border",
+    "scale_small",
+    "scale_large",
 ];
 
 #[test]
@@ -1513,6 +1515,8 @@ fn golden_traces() {
         "minecart_ride",
         "passenger_push",
         "world_border",
+        "scale_small",
+        "scale_large",
     ];
     // RUTHENIUM_TRACES=a,b replays only those.
     let only = std::env::var("RUTHENIUM_TRACES").ok();

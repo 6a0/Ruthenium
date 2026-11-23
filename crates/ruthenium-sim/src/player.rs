@@ -23,7 +23,9 @@
 //! crouching, sprinting only on a vehicle that can, the fluids a boat leaves it in), a
 //! horse's charged jump, and `sendChanges` sending the rotation and the vehicle's place
 //! instead of the position. The world border ([`crate::border`]) stops it as a block
-//! does when it is near it. Not yet: a spin hitting an entity, the scale attribute.
+//! does when it is near it. The scale attribute sizes the box, the eyes and the
+//! attachment points (a new scale takes effect as the next tick ends; the step
+//! height doesn't scale). Not yet: a spin hitting an entity.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
@@ -169,8 +171,9 @@ impl Pose {
         NAMES.iter().position(|n| *n == name).map(|i| Pose::ALL[i])
     }
 
-    /// Width, height and eye height (`Avatar.POSES`; the poses it doesn't list stand).
-    fn dimensions(self) -> (f32, f32, f32) {
+    /// Width, height and eye height at scale 1 (`Avatar.POSES` and
+    /// `LivingEntity.SLEEPING_DIMENSIONS`; the poses it doesn't list stand).
+    fn unscaled(self) -> (f32, f32, f32) {
         match self {
             Pose::Sleeping => (0.2, 0.2, 0.2),
             Pose::FallFlying | Pose::Swimming | Pose::SpinAttack => (0.6, 0.6, 0.4),
@@ -180,22 +183,58 @@ impl Pose {
         }
     }
 
-    /// Width and height.
-    fn size(self) -> (f32, f32) {
-        let (w, h, _) = self.dimensions();
-        (w, h)
+    /// `getDimensions(pose)` for a player of scale `scale` (`EntityDimensions.scale`):
+    /// sleeping and dying have fixed sizes and a scale of 1 changes nothing; else the
+    /// sizes are multiplied in floats and the attachment points in doubles.
+    pub fn dimensions(self, scale: f32) -> Dimensions {
+        let (width, height, eye_height) = self.unscaled();
+        // The standing dimensions' vehicle point (crouching has it too); the other
+        // listed poses have the fallback at the feet.
+        let vehicle_point = match self {
+            Pose::Sleeping | Pose::FallFlying | Pose::Swimming | Pose::SpinAttack | Pose::Dying => {
+                0.0
+            }
+            _ => 0.6,
+        };
+        // The passenger point's fallback: the box's height.
+        let passenger_point = f64::from(height);
+        if matches!(self, Pose::Sleeping | Pose::Dying) || scale == 1.0 {
+            return Dimensions {
+                width,
+                height,
+                eye_height,
+                vehicle_point,
+                passenger_point,
+            };
+        }
+        Dimensions {
+            width: width * scale,
+            height: height * scale,
+            eye_height: eye_height * scale,
+            vehicle_point: vehicle_point * f64::from(scale),
+            passenger_point: passenger_point * f64::from(scale),
+        }
     }
+}
 
-    /// The eye height.
-    fn eye_height(self) -> f32 {
-        self.dimensions().2
-    }
+/// The player's `EntityDimensions` in a pose: its box, its eyes and where it sits on
+/// a vehicle and seats a passenger.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Dimensions {
+    pub width: f32,
+    pub height: f32,
+    pub eye_height: f32,
+    /// The height of `EntityAttachment.VEHICLE`.
+    pub vehicle_point: f64,
+    /// The height of `EntityAttachment.PASSENGER`.
+    pub passenger_point: f64,
+}
 
+impl Dimensions {
     /// `EntityDimensions.makeBoundingBox`: half the width in floats.
-    fn bounding_box(self, p: [f64; 3]) -> Aabb {
-        let (w, h) = self.size();
-        let w = f64::from(w / 2.0);
-        let h = f64::from(h);
+    pub fn bounding_box(&self, p: [f64; 3]) -> Aabb {
+        let w = f64::from(self.width / 2.0);
+        let h = f64::from(self.height);
         Aabb {
             min: [p[0] - w, p[1], p[2] - w],
             max: [p[0] + w, p[1] + h, p[2] + w],
@@ -281,6 +320,8 @@ pub struct Attributes {
     pub block_break_speed: Attribute,
     /// The mining speed's factor with the eyes under water (aqua affinity).
     pub submerged_mining_speed: Attribute,
+    /// The player's size: its box, its eyes and its attachment points.
+    pub scale: Attribute,
 }
 
 impl Default for Attributes {
@@ -303,6 +344,7 @@ impl Default for Attributes {
             mining_efficiency: Attribute::new(0.0, 0.0, 1024.0),
             block_break_speed: Attribute::new(1.0, 0.0, 1024.0),
             submerged_mining_speed: Attribute::new(0.2, 0.0, 20.0),
+            scale: Attribute::new(1.0, 0.0625, 16.0),
         }
     }
 }
@@ -328,6 +370,7 @@ impl Attributes {
             "minecraft:mining_efficiency" => &mut self.mining_efficiency,
             "minecraft:block_break_speed" => &mut self.block_break_speed,
             "minecraft:submerged_mining_speed" => &mut self.submerged_mining_speed,
+            "minecraft:scale" => &mut self.scale,
             _ => return None,
         })
     }
@@ -353,6 +396,7 @@ impl Attributes {
             &mut a.mining_efficiency,
             &mut a.block_break_speed,
             &mut a.submerged_mining_speed,
+            &mut a.scale,
         ] {
             attribute.modifiers.clear();
         }
@@ -589,6 +633,13 @@ pub struct LocalPlayer {
     /// flying and not a spectator).
     pub swimming: bool,
     pub pose: Pose,
+    /// `dimensions` and `eyeHeight`: the pose's at the scale they were last refreshed
+    /// with. A pose change refreshes them at once; a new scale only at the end of the
+    /// player's next tick (`refreshDirtyAttributes`).
+    dimensions: Dimensions,
+    /// The scale attribute changed since the dimensions were last refreshed by a tick
+    /// (its instance in `getAttributesToUpdate`).
+    scale_dirty: bool,
     pub attributes: Attributes,
     pub food: i32,
     /// `getHealth` (`set_health` and the entity data). At 0 or below the player is
@@ -781,6 +832,8 @@ impl LocalPlayer {
             sprinting: false,
             swimming: false,
             pose: Pose::Standing,
+            dimensions: Pose::Standing.dimensions(1.0),
+            scale_dirty: false,
             attributes: Attributes::default(),
             food: 20,
             health: 20.0,
@@ -873,7 +926,37 @@ impl LocalPlayer {
     }
 
     pub fn bounding_box(&self) -> Aabb {
-        self.pose.bounding_box(self.position)
+        self.dimensions.bounding_box(self.position)
+    }
+
+    /// `dimensions`: the box's size, the eye height and the attachment points as the
+    /// player has them now.
+    pub fn dimensions(&self) -> Dimensions {
+        self.dimensions
+    }
+
+    /// `getScale`.
+    pub fn scale(&self) -> f32 {
+        self.attributes.scale.value() as f32
+    }
+
+    /// `getDimensions(pose)`: a pose's dimensions at the scale the attribute has now.
+    fn dimensions_for(&self, pose: Pose) -> Dimensions {
+        pose.dimensions(self.scale())
+    }
+
+    /// `refreshDimensions` (a player is never nudged to fit).
+    fn refresh_dimensions(&mut self) {
+        self.dimensions = self.dimensions_for(self.pose);
+    }
+
+    /// `setPose`: the entity data only calls back (refreshing the dimensions) when the
+    /// pose changes.
+    fn set_pose(&mut self, pose: Pose) {
+        if pose != self.pose {
+            self.pose = pose;
+            self.refresh_dimensions();
+        }
     }
 
     /// `handleRespawn`'s new player. With [`KEEP_ENTITY_DATA`] it keeps the entity data,
@@ -890,7 +973,10 @@ impl LocalPlayer {
             // `getNonDefaultValues`, assigned.
             p.sprinting = self.sprinting;
             p.swimming = self.swimming;
+            // `assignValues` calls back for the pose before the attributes are
+            // assigned: its dimensions at the new player's scale of 1.
             p.pose = self.pose;
+            p.refresh_dimensions();
             p.health = self.health;
             p.data = self.data;
             p.delta = self.delta;
@@ -902,6 +988,9 @@ impl LocalPlayer {
         } else {
             self.attributes.base_values()
         };
+        // `replaceFrom` always marks the scale dirty, `setBaseValue` when it differs
+        // from the new player's: its first tick refreshes the dimensions.
+        p.scale_dirty = keep & KEEP_ATTRIBUTES != 0 || p.attributes.scale.base != 1.0;
         p.spectator = self.spectator;
         p.creative = self.creative;
         p.show_death_screen = self.show_death_screen;
@@ -977,7 +1066,12 @@ impl LocalPlayer {
                 }
                 DataValue::Int(n) if field == f.air_supply => self.data.air_supply = n,
                 DataValue::Boolean(b) if field == f.no_gravity => self.data.no_gravity = b,
-                DataValue::Pose(p) if field == f.pose => self.pose = Pose::from_id(p),
+                // `assignValues` calls back for every value it assigns, even an
+                // unchanged pose: the dimensions take the scale the attribute has now.
+                DataValue::Pose(p) if field == f.pose => {
+                    self.pose = Pose::from_id(p);
+                    self.refresh_dimensions();
+                }
                 DataValue::Int(n) if field == f.ticks_frozen => self.data.ticks_frozen = n,
                 DataValue::Byte(b) if field == f.living_flags => {
                     self.data.living_flags = b as u8;
@@ -1066,7 +1160,7 @@ impl LocalPlayer {
     /// `getEyePosition()`: where the eyes are now.
     pub fn eye_position(&self) -> [f64; 3] {
         let p = self.position;
-        [p[0], p[1] + f64::from(self.pose.eye_height()), p[2]]
+        [p[0], p[1] + f64::from(self.dimensions.eye_height), p[2]]
     }
 
     /// `getEyePosition(1.0)`, as the crosshair's pick takes it: interpolated all the way
@@ -1076,7 +1170,7 @@ impl LocalPlayer {
         let lerp = |a: f64, b: f64| a + 1.0 * (b - a);
         [
             lerp(o[0], p[0]),
-            lerp(o[1], p[1]) + f64::from(self.pose.eye_height()),
+            lerp(o[1], p[1]) + f64::from(self.dimensions.eye_height),
             lerp(o[2], p[2]),
         ]
     }
@@ -1350,6 +1444,12 @@ impl LocalPlayer {
                 continue;
             };
             if let Some(instance) = self.attributes.get_mut(name.name()) {
+                // `setBaseValue` marks it dirty when the base changes, removing and
+                // adding modifiers whenever there are any.
+                let dirty = instance.base != a.base
+                    || !instance.modifiers.is_empty()
+                    || !a.modifiers.is_empty();
+                self.scale_dirty |= dirty && name.name() == "minecraft:scale";
                 instance.base = a.base;
                 instance.modifiers = a
                     .modifiers
@@ -1539,9 +1639,14 @@ impl LocalPlayer {
             .push(play::player_abilities(self.abilities.flying));
     }
 
+    /// `canPlayerFitWithinBlocksAndEntitiesWhen`: the pose's box at the scale the
+    /// attribute has now.
     fn can_fit(&self, env: &Env<'_>, pose: Pose) -> bool {
         env.no_collision_for(
-            &pose.bounding_box(self.position).inflate([-EPSILON; 3]),
+            &self
+                .dimensions_for(pose)
+                .bounding_box(self.position)
+                .inflate([-EPSILON; 3]),
             Some(self.who()),
         )
     }
@@ -1578,12 +1683,12 @@ impl LocalPlayer {
     }
 
     fn eye_y(&self) -> f64 {
-        self.position[1] + f64::from(self.pose.eye_height())
+        self.position[1] + f64::from(self.dimensions.eye_height)
     }
 
     /// `getFluidJumpThreshold`.
     fn fluid_jump_threshold(&self) -> f64 {
-        if f64::from(self.pose.eye_height()) < 0.4 {
+        if f64::from(self.dimensions.eye_height) < 0.4 {
             0.0
         } else {
             0.4
@@ -1613,6 +1718,10 @@ impl LocalPlayer {
         self.updating_using_item();
         if !self.removed {
             self.ai_step(env, keys);
+        }
+        // `refreshDirtyAttributes`: a new scale reaches the box and the eyes.
+        if std::mem::take(&mut self.scale_dirty) {
+            self.refresh_dimensions();
         }
         let clamp = |v: f64| v.clamp(-2.9999999E7, 2.9999999E7);
         self.position[0] = clamp(self.position[0]);
@@ -1729,13 +1838,14 @@ impl LocalPlayer {
             } else {
                 Pose::Standing
             };
-            self.pose = if self.spectator || self.riding.is_some() || self.can_fit(env, desired) {
+            let pose = if self.spectator || self.riding.is_some() || self.can_fit(env, desired) {
                 desired
             } else if self.can_fit(env, Pose::Crouching) {
                 Pose::Crouching
             } else {
                 Pose::Swimming
             };
+            self.set_pose(pose);
         }
     }
 
@@ -1776,7 +1886,7 @@ impl LocalPlayer {
 
         // Push out of blocks the player is stuck in.
         if !self.no_physics && self.riding.is_none() {
-            let w = f64::from(self.pose.size().0) * 0.35;
+            let w = f64::from(self.dimensions.width) * 0.35;
             let (px, pz) = (self.position[0], self.position[2]);
             for (x, z) in [
                 (px - w, pz + w),
@@ -2216,7 +2326,7 @@ impl LocalPlayer {
         }
         let dx = (f64::from(pos[0]) + 0.5 - self.position[0]).abs();
         let dz = (f64::from(pos[2]) + 0.5 - self.position[2]).abs();
-        let overlap = 0.4375 + f64::from(self.pose.size().0 / 2.0);
+        let overlap = 0.4375 + f64::from(self.dimensions.width / 2.0);
         dx + 1.0E-7 > overlap || dz + 1.0E-7 > overlap
     }
 
@@ -2855,23 +2965,23 @@ impl LocalPlayer {
         self.outbox.push(packet);
     }
 
-    /// The height of its passenger point (the top of its box in its pose).
-    pub(crate) fn passenger_height(&self) -> f32 {
-        self.pose.size().1
+    /// The height of its passenger point (`LivingEntity.getPassengerRidingPosition`
+    /// takes it from `getDimensions`, at the scale the attribute has now): the top of
+    /// its box.
+    pub(crate) fn passenger_height(&self) -> f64 {
+        self.dimensions_for(self.pose).passenger_point
     }
 
-    /// Its width in its pose (`getBbWidth`).
+    /// Its width (`getBbWidth`).
     pub(crate) fn width(&self) -> f32 {
-        self.pose.size().0
+        self.dimensions.width
     }
 
     /// The player's vehicle attachment point (`EntityAttachment.VEHICLE`): 0.6 up
-    /// standing or crouching, at the feet in the other poses.
+    /// (scaled) standing or crouching, at the feet gliding, swimming, spinning, sleeping
+    /// or dying.
     pub(crate) fn vehicle_attachment(&self) -> [f64; 3] {
-        match self.pose {
-            Pose::Standing | Pose::Crouching => [0.0, 0.6, 0.0],
-            _ => [0.0; 3],
-        }
+        [0.0, self.dimensions.vehicle_point, 0.0]
     }
 
     /// `LocalPlayer.isHorizontalCollisionMinor`.
@@ -3331,7 +3441,7 @@ impl InsideMover for LocalPlayer {
     }
 
     fn inside_box(&self, at: [f64; 3]) -> Aabb {
-        self.pose.bounding_box(at)
+        self.dimensions.bounding_box(at)
     }
 
     fn inside_who(&self) -> Who {
@@ -3936,8 +4046,46 @@ mod tests {
         assert_eq!(Pose::from_id(5), Pose::Crouching);
         assert_eq!(Pose::from_id(99), Pose::Standing);
         assert_eq!(Pose::from_name("SPIN_ATTACK"), Some(Pose::SpinAttack));
-        assert_eq!(Pose::Dying.size(), (0.2, 0.2));
-        assert_eq!(Pose::FallFlying.eye_height(), 0.4);
+        assert_eq!(Pose::Dying.dimensions(2.0).height, 0.2);
+        assert_eq!(Pose::FallFlying.dimensions(1.0).eye_height, 0.4);
+    }
+
+    #[test]
+    fn a_new_scale_reaches_the_box_as_the_next_tick_ends() {
+        let (level, blocks, tags) = world();
+        let env = Env {
+            level: &level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+        };
+        let mut p = standing(&env, play::SURVIVAL);
+        let scale = |base| play::AttributeSnapshot {
+            attribute: ruthenium_data::v26_3::registries::Attribute::Scale.id() as i32,
+            base,
+            modifiers: Vec::new(),
+        };
+        p.apply_attributes(&[scale(2.0)]);
+        // The packet only marks the scale dirty: the box and the eyes stay as they were.
+        assert_eq!(p.dimensions(), Pose::Standing.dimensions(1.0));
+        assert_eq!(p.eye_position()[1], -60.0 + f64::from(1.62f32));
+        p.tick(&env, NONE);
+        assert_eq!(p.dimensions(), Pose::Standing.dimensions(2.0));
+        assert_eq!(p.bounding_box().max[1], -60.0 + f64::from(3.6f32));
+        assert_eq!(p.vehicle_attachment(), [0.0, 1.2, 0.0]);
+        // The same base again marks nothing.
+        p.apply_attributes(&[scale(2.0)]);
+        assert!(!p.scale_dirty);
+        // The fixed sizes don't scale.
+        assert_eq!(
+            Pose::Sleeping.dimensions(2.0),
+            Pose::Sleeping.dimensions(1.0)
+        );
+        assert_eq!(Pose::Crouching.dimensions(0.5).eye_height, 0.635);
+        // A new player takes the old one's base value: its first tick refreshes.
+        let fresh = p.respawned(0);
+        assert_eq!(fresh.dimensions(), Pose::Standing.dimensions(1.0));
+        assert!(fresh.scale_dirty);
     }
 
     #[test]

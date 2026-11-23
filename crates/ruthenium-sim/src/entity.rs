@@ -779,7 +779,14 @@ pub struct Entity {
     /// A slime's or magma cube's size.
     pub cube_size: i32,
     pub scale: Attribute,
+    /// The scale changed since its tick last refreshed the size (`refreshDirtyAttributes`
+    /// at the end of `LivingEntity.tick`).
+    scale_dirty: bool,
+    /// `dimensions`: refreshed as the pose, youth or a slime's size change, and as its
+    /// tick takes in a new scale.
     pub size: Size,
+    /// The scale `size` was refreshed with (the cached dimensions' attachment points).
+    size_scale: f32,
     pub bounding_box: Aabb,
     pub vehicle: Option<i32>,
     pub passengers: Vec<i32>,
@@ -886,7 +893,9 @@ impl Entity {
             cube_size: 1,
             // `Attributes.SCALE`'s default and range.
             scale: Attribute::new(1.0, 0.0625, 16.0),
+            scale_dirty: false,
             size: info.size,
+            size_scale: 1.0,
             bounding_box: info.size.bounding_box([0.0; 3]),
             vehicle: None,
             passengers: Vec::new(),
@@ -1006,6 +1015,7 @@ impl Entity {
     /// `refreshDimensions` (the client never nudges the entity to fit).
     pub(crate) fn refresh_dimensions(&mut self) {
         self.size = self.dimensions();
+        self.size_scale = self.scale.value() as f32;
         self.set_pos(self.position);
     }
 
@@ -1025,7 +1035,8 @@ impl Entity {
                 p.map(|c| c * f64::from(factor))
             }
         };
-        let scale = self.scale.value() as f32;
+        // `getAttachments`: the cached dimensions', at the scale they were refreshed with.
+        let scale = self.size_scale;
         let point = if !t.living {
             t.vehicle_point
         } else if self.pose == pose::SLEEPING {
@@ -2163,6 +2174,10 @@ impl Entities {
                     .collect();
             }
             if name == Some(ATTRIBUTE_SCALE) {
+                // Dirty as `setBaseValue`, `removeModifiers` and the adds mark it.
+                e.scale_dirty |= e.scale.base != a.base
+                    || !e.scale.modifiers.is_empty()
+                    || !a.modifiers.is_empty();
                 e.scale.base = a.base;
                 e.scale.modifiers = a
                     .modifiers
@@ -2173,7 +2188,6 @@ impl Entities {
                         operation: *operation,
                     })
                     .collect();
-                e.refresh_dimensions();
             }
         }
     }
@@ -2419,7 +2433,7 @@ impl Entities {
             }
             // An avatar's passenger point: the top of its box.
             let seat = rotate_y(
-                [0.0, f64::from(player.passenger_height()), 0.0],
+                [0.0, player.passenger_height(), 0.0],
                 -player.y_rot * DEG_TO_RAD_F,
             );
             (
@@ -2484,10 +2498,13 @@ impl Entities {
         if lowered && v.info.minecart {
             return [0.0; 3];
         }
+        // `LivingEntity.getPassengerRidingPosition` takes the dimensions and the scale
+        // the vehicle has now, not the cached ones.
+        let size = v.dimensions();
         if v.info.cube_size_field.is_some() {
             // `AbstractCubeMob`: its height less a 64th per size.
             let scale = v.scale.value() as f32;
-            let y = f64::from(v.size.height) - 0.015625 * f64::from(v.cube_size) * f64::from(scale);
+            let y = f64::from(size.height) - 0.015625 * f64::from(v.cube_size) * f64::from(scale);
             return [0.0, y, 0.0];
         }
         match v.info.ride {
@@ -2506,7 +2523,7 @@ impl Entities {
             RideKind::Camel => v.camel_passenger_point(index, self.game_time),
             _ => {
                 let points = &v.info.passenger_points;
-                let scale = f64::from(v.size.height / v.info.size.height);
+                let scale = f64::from(size.height / v.info.size.height);
                 let p = points[index.min(points.len() - 1)].map(|c| c * scale);
                 let mut a = rotate_y(p, turn);
                 // `AbstractHorse`: lifted as it rears (a llama keeps the default).
@@ -2728,6 +2745,13 @@ impl Entities {
             {
                 self.push_player(player, cx, e.position, e.no_physics, id, 1.0);
             }
+        }
+        // The end of `LivingEntity.tick`: `refreshDirtyAttributes` takes in a new scale.
+        if let Some(e) = self.entities.get_mut(&id)
+            && e.info.living
+            && std::mem::take(&mut e.scale_dirty)
+        {
+            e.refresh_dimensions();
         }
     }
 

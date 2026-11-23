@@ -2520,6 +2520,152 @@ public final class Scenarios {
                         server.runCommand("worldborder set 59999968");
                         ctx.waitTicks(5);
                     }),
+            new Scenario("scale_small",
+                    "At scale 0.5 (0.3 wide, 0.9 tall, eyes at 0.81): walking standing through a 1-high tunnel, up a slab onto a block, sneaking to its east edge (backed off at the narrower box's edge), down into a 1-deep pool whose surface is above the eyes, sprint-swimming in it and back; at 0.2 (eyes below 0.4) jumping in the pool, then on a waterlogged slab (0.39 of water over the feet) swimming up, and at 0.5 jumping from it; crouching in the tunnel at 0.5, set to 1 there (neither standing nor crouching fits: crawling) and crawling out; hopping on the slab with jump held, set to 0.5 and then 1.5 in mid-hop.",
+                    List.of("fill 3 -59 -1 6 -59 1 minecraft:stone",
+                            "setblock 8 -60 0 minecraft:smooth_stone_slab",
+                            "fill 9 -60 -1 10 -60 1 minecraft:stone",
+                            "fill 13 -61 -2 18 -61 2 minecraft:water",
+                            "setblock 17 -61 0 minecraft:smooth_stone_slab[waterlogged=true]"),
+                    start(0.5, -60, 0.5, -90, 20), (ctx, server) -> {
+                        server.runCommand("attribute @p minecraft:scale base set 0.5");
+                        ctx.waitTicks(5);
+                        // Standing through the 1-high tunnel, up the slab onto the block.
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 9.6);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(5);
+                        // Sneaking to its east edge (backed off), then off it into the pool.
+                        hold(ctx, 25, W, SNEAK);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 13.6);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        // Eyes under a 1-deep pool's surface: a sprint swims.
+                        ctx.getInput().holdKey(SPRINT);
+                        hold(ctx, 20, W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(90, 20);
+                        ctx.waitTicks(2);
+                        hold(ctx, 10, W);
+                        ctx.waitTicks(10);
+                        // At 0.2 the eyes are below 0.4: any water to jump in.
+                        server.runCommand("attribute @p minecraft:scale base set 0.2");
+                        ctx.waitTicks(10);
+                        hold(ctx, 20, JUMP);
+                        ctx.waitTicks(15);
+                        // On a waterlogged slab, 0.39 of water over the feet: deeper than
+                        // the threshold at 0.2 (a swim up), not at 0.5 (a jump).
+                        tp(ctx, server, 17.5, -60.5, 0.5, 90, 20);
+                        hold(ctx, 15, JUMP);
+                        ctx.waitTicks(10);
+                        server.runCommand("attribute @p minecraft:scale base set 0.5");
+                        ctx.waitTicks(5);
+                        hold(ctx, 15, JUMP);
+                        ctx.waitTicks(10);
+                        tp(ctx, server, 4.5, -60, 0.5, -90, 30);
+                        hold(ctx, 10, W, SNEAK);
+                        ctx.waitTicks(5);
+                        // Back to 1 inside the tunnel: neither standing nor crouching fits.
+                        server.runCommand("attribute @p minecraft:scale base set 1");
+                        ctx.waitTicks(10);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 8.0);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        // Shrinking and growing in mid-hop.
+                        ctx.getInput().holdKey(JUMP);
+                        ctx.waitTicks(3);
+                        server.runCommand("attribute @p minecraft:scale base set 0.5");
+                        ctx.waitTicks(12);
+                        server.runCommand("attribute @p minecraft:scale base set 1.5");
+                        ctx.waitTicks(12);
+                        ctx.getInput().releaseKey(JUMP);
+                        ctx.waitTicks(15);
+                        server.runCommand("attribute @p minecraft:scale base reset");
+                        ctx.waitTicks(10);
+                    }),
+            new Scenario("scale_large",
+                    "At scale 2 (1.2 wide, 3.6 tall, eyes at 3.24): walking into a 3-high corridor (stopped by its roof), in crouching (3.0 fits exactly), sneak let go inside (it stays crouched), out and standing; a jump into a block's side (the step height stays 0.6); sneaking to the east edge of the block's top (backed off at the wider box's edge); set to 1 in mid-jump; under a 2-high ceiling set to 1.25 (it crouches) and 2 (it crawls), crawling out; a boat ridden at 2 (seated 0.6 lower than at 1: the player's vehicle point scales); at 1, a still zombie a block east set to 3, which pushes the player from the tick after the packet (its own tick takes in the size); set to 2 beside a wall the box then reaches into: pushed out of it; killed at 2 with its centre past a block's edge (the body stays: the server doesn't send the dying pose to the player itself); respawned keeping the base value, walking south into a wall (stopped 0.6 from it).",
+                    List.of("spawnpoint @a 4 -60 -8",
+                            "fill 5 -57 -2 9 -57 2 minecraft:stone",
+                            "fill 13 -60 -1 13 -60 1 minecraft:stone",
+                            "fill 18 -58 -2 22 -58 2 minecraft:stone",
+                            "fill 2 -60 -5 7 -59 -5 minecraft:stone",
+                            "fill 26 -60 3 30 -58 3 minecraft:stone"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("attribute @p minecraft:scale base set 2");
+                        ctx.waitTicks(5);
+                        // Too tall for the 3-high corridor; crouching fits exactly.
+                        hold(ctx, 25, W);
+                        hold(ctx, 25, W, SNEAK);
+                        hold(ctx, 10, W);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 11.0);
+                        // A block: no step up at 0.6, a jump onto it.
+                        hold(ctx, 10, W, JUMP);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        tp(ctx, server, 13.5, -59, 0.5, -90, 30);
+                        hold(ctx, 20, W, SNEAK);
+                        ctx.waitTicks(5);
+                        // Shrinking to 1 in mid-jump, and back.
+                        tp(ctx, server, 15.5, -60, 0.5, -90, 0);
+                        ctx.getInput().holdKey(JUMP);
+                        ctx.waitTicks(4);
+                        server.runCommand("attribute @p minecraft:scale base set 1");
+                        ctx.waitTicks(15);
+                        ctx.getInput().releaseKey(JUMP);
+                        ctx.waitTicks(10);
+                        // Growing under a 2-high ceiling: crouching at 1.25, crawling at 2.
+                        tp(ctx, server, 19.5, -60, 0.5, -90, 0);
+                        server.runCommand("attribute @p minecraft:scale base set 1.25");
+                        ctx.waitTicks(10);
+                        server.runCommand("attribute @p minecraft:scale base set 2");
+                        ctx.waitTicks(10);
+                        ctx.getInput().holdKey(W);
+                        waitUntilEastOf(ctx, 24.5);
+                        ctx.getInput().releaseKey(W);
+                        ctx.waitTicks(10);
+                        // A boat seats the big player lower (its own vehicle point, 0.6 x 2).
+                        tp(ctx, server, 1.5, -60, -6.5, -90, 0);
+                        server.runCommand("summon minecraft:oak_boat 3.5 -60 -6.5 {Rotation:[-90f,0f]}");
+                        ctx.waitTicks(10);
+                        ride(ctx, server, "minecraft:oak_boat");
+                        hold(ctx, 20, W);
+                        hold(ctx, 3, SNEAK);
+                        ctx.waitTicks(10);
+                        gone(ctx, server, "minecraft:oak_boat");
+                        // A still zombie a block east grows to 3: it pushes a tick after the
+                        // packet, once its tick has taken in the new size.
+                        server.runCommand("attribute @p minecraft:scale base set 1");
+                        tp(ctx, server, 26.5, -60, -5.5, -90, 0);
+                        server.runCommand("summon minecraft:zombie 27.5 -60 -5.5 " + STILL);
+                        fireproof(server);
+                        ctx.waitTicks(10);
+                        server.runCommand("attribute @e[type=minecraft:zombie,limit=1] minecraft:scale base set 3");
+                        ctx.waitTicks(20);
+                        server.runCommand("kill @e[type=minecraft:zombie]");
+                        ctx.waitTicks(30);
+                        // Growing beside a wall: the box reaches into it and the client
+                        // pushes the player out.
+                        tp(ctx, server, 28.5, -60, 2.65, -90, 0);
+                        server.runCommand("attribute @p minecraft:scale base set 2");
+                        ctx.waitTicks(15);
+                        // Dying at 2 with the centre past a block's edge: the dying pose's
+                        // fixed box no longer reaches the block. The new player keeps the
+                        // base value and walks into a wall.
+                        tp(ctx, server, 14.15, -59, 0.5, -90, 0);
+                        ctx.waitTicks(5);
+                        server.runCommand("kill @p");
+                        ctx.waitTicks(5);
+                        respawn(ctx);
+                        hold(ctx, 15, W);
+                        ctx.waitTicks(5);
+                        server.runCommand("attribute @p minecraft:scale base reset");
+                        ctx.waitTicks(10);
+                    }),
             new Scenario("horse_promoted",
                     "Riding a tame horse with no saddle (a passenger, not its rider) with forward held; the horse is saddled while forward is still held, and the player takes control; sneaking off.",
                     List.of(),
