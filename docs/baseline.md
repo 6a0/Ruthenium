@@ -8,7 +8,7 @@ These are the numbers later stages are judged against (plan §3): vanilla 26.3 o
 |---|---|
 | Device | Lenovo laptop: Intel Core i5-13500HX (20 threads), 64 GB RAM, NVIDIA GeForce RTX 4060 Laptop GPU (8 GB) |
 | Software | Fedora Linux 45 (kernel 7.3.4), KDE Plasma on Wayland; NVIDIA driver 620.70.06 |
-| Power | On AC. Firmware platform profile `performance`, CPU governor `performance`, Lenovo power mode "Balanced" |
+| Power | On AC. Firmware platform profile `performance` (set by the desktop's power mode), CPU governor `performance` |
 | Display | 2560 × 1600 at 240 Hz; game window 1920 × 1080, windowed, with SDL's native Wayland driver |
 | Java | Mojang's runtime from Prism Launcher: OpenJDK 25.0.1+8 (Microsoft build) |
 

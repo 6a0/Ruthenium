@@ -14,6 +14,8 @@ The laptop of the vanilla baseline, in Discrete GPU mode: NVIDIA GeForce RTX 406
 - The desktop was in use: Sunshine and Discord were running, and the panel's variable refresh rate was set to Always.
 - Round-to-round spread was 20–30% on average FPS and more on the lows (see [Throughput](#throughput-without-vsync)). Small differences mean nothing here.
 
+The runs were repeated later the same day at the `performance` profile with variable refresh rate off: see [At the performance profile](#at-the-performance-profile). The tables before that section are from the conditions above.
+
 The Intel iGPU needs the laptop's Hybrid mode and is not measured yet.
 
 ## Launch
@@ -152,20 +154,41 @@ With VSync, three runs of 13 s with each wait, in turns, came out the same: a me
 
 The uncapped runs showed something about the machine, not the change. It has two states, with a frame time median of 0.075 ms or of 0.128 ms (GPU time 0.020 or 0.026 ms a frame), and moves between them within a run or stays in one for minutes. In 28 runs of 6 s taken in turns, the baseline's build was in the slow state in 3 of 7 and this one in 3 of 7, 2 of 7 and 4 of 7 for its three settings. An A/B here needs the median per second of each run looked at before its averages are believed.
 
+## At the performance profile
+
+The firmware platform profile `performance` (the vanilla baseline's), variable refresh rate set to Never, the build with the swapchain changes. Sunshine was still capturing the desktop: the machine was being used through it.
+
+| | `balanced`, VRR Always | `performance`, VRR Never |
+|---|---:|---:|
+| Window / first frame, pipelines cached (ms) | 140 / 277 | 84 / 189 |
+| Menus faded in (ms) | 846 | 755 |
+| GPU memory, empty window / menus (MiB) | 39 / 56 | 39 / 56 |
+| Uncapped menu: average FPS | 9400 to 11000 | 12900 to 13500 |
+| Uncapped menu: frame time median (ms) | 0.075 or 0.128 | 0.058 to 0.059 |
+| Uncapped menu: main-thread work, median / P99 (ms) | 0.018 / 0.05 | 0.012 / 0.042 |
+| VSync, menus: P99 / P99.9 (ms) | 5.4 / 6.8 | 4.6 / 6.0 |
+| VSync, menus: P99.9 / median | 1.64 to 1.85 | 1.42 to 1.50 |
+| Swapchain recreation, median (ms) | 1.05 | 0.52 |
+
+- **The two states were the `balanced` profile's.** At `performance`, 14 runs of 6 s taken in turns with the baseline's build had no half second in the slow state for either build (medians of 0.058 to 0.065 ms). Right before, at `balanced` with variable refresh rate already off, the slow state was still there, so the refresh setting is not what causes it.
+- **The pacing gate is met, narrowly:** 1.42 to 1.50 in four runs of 13 s and two of 30 s, with the capture running.
+- **The change costs nothing measurable here either:** the A/B against the baseline's build has a frame time median of 0.058 against 0.059 ms, within the spread, and the same memory.
+- The 34.5 ms acquire bursts did not come back in any run of the day after the baseline's, at either setting, so what caused them is still open.
+
 ## Against the targets
 
-| Target | Measured here |
-|---|---|
-| Window visible within 300 ms | Window 121–145 ms, first frame 238–282 ms |
-| Main menu ready within 1.5 s warm | 0.81–0.85 s, the fade-in included |
-| Menu pacing: P99.9 at most 1.5 × median | 1.6 to 1.8 in quiet runs, about 8.5 in disturbed ones: not met |
-| GPU memory at most 300 MB in a world | 39 MiB before any world data, 56 MiB with a menu open |
-| RSS at most 600 MB in a world | 208–215 MiB before any world data, most of it shared libraries |
+| Target | At `balanced` | At `performance` |
+|---|---|---|
+| Window visible within 300 ms | Window 121–145 ms, first frame 238–282 ms | Window 82–84 ms, first frame 184–189 ms |
+| Main menu ready within 1.5 s warm | 0.81–0.85 s, the fade-in included | 0.75 s |
+| Menu pacing: P99.9 at most 1.5 × median | 1.6 to 1.8 in quiet runs, about 8.5 in disturbed ones: not met | 1.42 to 1.50: met |
+| GPU memory at most 300 MB in a world | 39 MiB before any world data, 56 MiB with a menu open | the same |
+| RSS at most 600 MB in a world | 208–215 MiB before any world data, most of it shared libraries | the same |
 
 ## Not measured yet
 
 - **The Intel iGPU** (Hybrid mode), where memory is shared and the DRM client statistics replace `nvidia-smi`.
-- **The same runs at the `performance` profile on a quiet desktop**, with variable refresh rate off and no capture running. Until then the throughput lows and the VSync pacing are indicative only.
+- **The same runs with no capture running.** The desktop was streamed by Sunshine in every run here, also those at the `performance` profile, so the lows and the VSync pacing may still carry its cost.
 - **A cold start** with the files out of the page cache.
 - **Occlusion, moving between displays and a stalled compositor**, which need a person at the machine. They are also where the shorter acquire wait has yet to be measured, together with the CPU an idle, covered window takes with it.
 - **A surface that really offers only sRGB formats.** `--pretend-srgb-surface` hides the others to show that it is refused; presenting to one through UNORM views of a mutable-format swapchain is not built.
