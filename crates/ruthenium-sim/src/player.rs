@@ -22,8 +22,8 @@
 //! riptide trident's launch and spin. Riding ([`Riding`]): a passenger's tick (no
 //! crouching, sprinting only on a vehicle that can, the fluids a boat leaves it in), a
 //! horse's charged jump, and `sendChanges` sending the rotation and the vehicle's place
-//! instead of the position. Not yet: a spin hitting an entity, the scale attribute and
-//! the world border.
+//! instead of the position. The world border ([`crate::border`]) stops it as a block
+//! does when it is near it. Not yet: a spin hitting an entity, the scale attribute.
 
 // Negated float comparisons (`!(a < b)`) are kept as the game writes them: they differ
 // from the plain comparison when a value is NaN.
@@ -522,9 +522,37 @@ impl<'a> Env<'a> {
         self.no_collision_for(b, None)
     }
 
-    /// `noCollision(entity, box)`: the same for an entity's own query.
+    /// `noCollision(entity, box)`: the same for an entity's own query, which the world
+    /// border also stops when the entity is near it (`noBorderCollision`).
     pub(crate) fn no_collision_for(&self, b: &Aabb, who: Option<Who>) -> bool {
-        self.collisions(b, who).is_empty() && self.entity_colliders(b).next().is_none()
+        self.collisions(b, who).is_empty()
+            && self.entity_colliders(b).next().is_none()
+            && who.is_none_or(|w| self.no_border_collision(b, w))
+    }
+
+    /// `noBorderCollision`: the border's shape, when the entity is close to it inside,
+    /// doesn't overlap `b`.
+    fn no_border_collision(&self, b: &Aabb, who: Who) -> bool {
+        let border = &self.level.border;
+        if !border.is_inside_close_to_border(who.xz, b) {
+            return true;
+        }
+        let shape = border.collision_shape();
+        !Placed {
+            shape: &shape,
+            offset: None,
+            pos: [0.0; 3],
+        }
+        .overlaps(b)
+    }
+
+    /// The world border's shape when an entity (`who`) moving through `area` collides
+    /// with it (`isInsideCloseToBorder`).
+    fn border_collision(&self, area: &Aabb, who: Who) -> Option<Shape> {
+        let border = &self.level.border;
+        border
+            .is_inside_close_to_border(who.xz, area)
+            .then(|| border.collision_shape())
     }
 
     /// `getEntityCollisions`: the colliders touching the area (grown by 1e-7), none
@@ -2827,6 +2855,16 @@ impl LocalPlayer {
         self.outbox.push(packet);
     }
 
+    /// The height of its passenger point (the top of its box in its pose).
+    pub(crate) fn passenger_height(&self) -> f32 {
+        self.pose.size().1
+    }
+
+    /// Its width in its pose (`getBbWidth`).
+    pub(crate) fn width(&self) -> f32 {
+        self.pose.size().0
+    }
+
     /// The player's vehicle attachment point (`EntityAttachment.VEHICLE`): 0.6 up
     /// standing or crouching, at the feet in the other poses.
     pub(crate) fn vehicle_attachment(&self) -> [f64; 3] {
@@ -2946,6 +2984,7 @@ impl LocalPlayer {
             fall_distance: self.fall_distance,
             walks_on_powder_snow: self.walks_on_powder_snow(),
             stands_on_lava: false,
+            xz: [self.position[0], self.position[2]],
         }
     }
 
@@ -3098,12 +3137,19 @@ pub(crate) fn collide(
         )
         .map(box_shape)
         .collect();
-    let with_entities = |blocks| entities_then(&entity_shapes, blocks);
+    // Then the world border's shape (when the entity is near it), then the blocks
+    // (`collectColliders`).
     let len = movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2];
     let result = if len == 0.0 {
         movement
     } else {
-        let shapes = with_entities(env.collisions(&b.expand_towards(movement), Some(who)));
+        let area = b.expand_towards(movement);
+        let border = env.border_collision(&area, who);
+        let shapes = entities_then(
+            &entity_shapes,
+            border.as_ref(),
+            env.collisions(&area, Some(who)),
+        );
         collide_with_shapes(movement, &b, &shapes)
     };
     let x_c = movement[0] != result[0];
@@ -3120,7 +3166,12 @@ pub(crate) fn collide(
         if !grounded_after {
             area = area.expand_towards([0.0, -9.999999747378752E-6, 0.0]);
         }
-        let shapes = with_entities(env.collisions(&area, Some(who)));
+        let border = env.border_collision(&area, who);
+        let shapes = entities_then(
+            &entity_shapes,
+            border.as_ref(),
+            env.collisions(&area, Some(who)),
+        );
         let skip = result[1] as f32;
         for h in candidate_step_heights(&grounded, &shapes, step, skip) {
             let stepped =
@@ -3380,9 +3431,14 @@ pub(crate) fn distance_sqr(a: [f64; 3], b: [f64; 3]) -> f64 {
     dot(d, d)
 }
 
-fn entities_then<'s>(entities: &'s [Shape], blocks: Vec<Placed<'s>>) -> Vec<Placed<'s>> {
+fn entities_then<'s>(
+    entities: &'s [Shape],
+    border: Option<&'s Shape>,
+    blocks: Vec<Placed<'s>>,
+) -> Vec<Placed<'s>> {
     let mut all: Vec<Placed<'s>> = entities
         .iter()
+        .chain(border)
         .map(|shape| Placed {
             shape,
             offset: None,

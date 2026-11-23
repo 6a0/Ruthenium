@@ -433,8 +433,10 @@ impl GameMode {
         direction: Direction,
         out: &mut Vec<Vec<u8>>,
     ) -> bool {
-        // The world border isn't tracked: every block is inside it.
         if p.block_action_restricted(w.block(pos), w.tags) {
+            return false;
+        }
+        if !w.level.border.block_within_bounds(pos) {
             return false;
         }
         let face = i32::from(direction.id());
@@ -504,7 +506,7 @@ impl GameMode {
             return true;
         }
         let face = i32::from(direction.id());
-        if p.abilities.instabuild {
+        if p.abilities.instabuild && w.level.border.block_within_bounds(pos) {
             self.destroy_delay = 5;
             let sequence = w.predictions.start();
             self.destroy_block(p, w, pos);
@@ -651,6 +653,15 @@ impl GameMode {
             let held = p.hand(hand).clone();
             match *hit {
                 HitResult::Entity { id, location } => {
+                    // Nothing outside the world border is used, with either hand.
+                    if let Some(e) = w.entities.get(id)
+                        && !w
+                            .level
+                            .border
+                            .block_within_bounds(e.position.map(ruthenium_javamath::mth::floor))
+                    {
+                        return;
+                    }
                     if let Some(e) = w.entities.get(id)
                         && within_entity_range(p, &e.bounding_box)
                     {
@@ -720,7 +731,9 @@ impl GameMode {
         out: &mut Vec<Vec<u8>>,
     ) -> Outcome {
         self.ensure_carried(&p.inventory, out);
-        // The world border isn't tracked: every block is inside it.
+        if !w.level.border.block_within_bounds(b.pos) {
+            return Outcome::Fail;
+        }
         w.track_player(p);
         let sequence = w.predictions.start();
         let result = perform_use_item_on(p, w, hand, b);

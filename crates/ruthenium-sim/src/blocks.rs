@@ -46,6 +46,8 @@ pub struct Who {
     pub walks_on_powder_snow: bool,
     /// `canStandOnFluid` of lava: a strider walks on a lava source's surface.
     pub stands_on_lava: bool,
+    /// Where the entity is across (x and z): how near the world border it is.
+    pub xz: [f64; 2],
 }
 
 impl Who {

@@ -66,6 +66,8 @@ pub struct Level {
     /// action (position, state, flags, update limit), in order: tests compare them with
     /// vanilla's.
     pub set_log: Option<Vec<crate::block::level::SetCall>>,
+    /// The level's world border (`ClientLevel.getWorldBorder`).
+    pub border: crate::border::WorldBorder,
 }
 
 impl Level {
@@ -78,6 +80,7 @@ impl Level {
             block_entities: BlockEntities::default(),
             noclip: None,
             set_log: None,
+            border: crate::border::WorldBorder::default(),
         }
     }
 

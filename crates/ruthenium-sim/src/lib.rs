@@ -18,7 +18,7 @@
 //! - [`pick`]: what the crosshair is on, and the raycasts items make.
 //! - [`input`]: the mouse's turn, the scroll wheel and the movement keys.
 //! - [`blocks`], [`shape`], [`world`], [`fluid`]: the level the player moves in;
-//!   [`inside`]: the blocks a movement passes through.
+//!   [`inside`]: the blocks a movement passes through; [`border`]: the world border.
 //! - [`pick`]: what the crosshair points at (block and entity raycasts).
 
 #![forbid(unsafe_code)]
@@ -26,6 +26,7 @@
 pub mod block;
 pub mod block_entity;
 pub mod blocks;
+pub mod border;
 pub mod clock;
 pub mod direction;
 pub mod effect;

@@ -1263,6 +1263,39 @@ pub mod play {
         SetTime {
             game_time: i64,
         },
+        /// `ClientboundInitializeBorderPacket`: the whole world border.
+        InitializeBorder {
+            center: [f64; 2],
+            old_size: f64,
+            new_size: f64,
+            lerp_time: i64,
+            absolute_max_size: i32,
+            warning_blocks: i32,
+            warning_time: i32,
+        },
+        /// `ClientboundSetBorderCenterPacket`.
+        SetBorderCenter {
+            center: [f64; 2],
+        },
+        /// `ClientboundSetBorderLerpSizePacket`: from one size to another over
+        /// `lerp_time` ticks.
+        SetBorderLerpSize {
+            old_size: f64,
+            new_size: f64,
+            lerp_time: i64,
+        },
+        /// `ClientboundSetBorderSizePacket`.
+        SetBorderSize {
+            size: f64,
+        },
+        /// `ClientboundSetBorderWarningDelayPacket`.
+        SetBorderWarningDelay {
+            warning_time: i32,
+        },
+        /// `ClientboundSetBorderWarningDistancePacket`.
+        SetBorderWarningDistance {
+            warning_blocks: i32,
+        },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
     }
@@ -1675,6 +1708,30 @@ pub mod play {
                     r.rest();
                     Clientbound::SetTime { game_time }
                 }
+                C::InitializeBorder => Clientbound::InitializeBorder {
+                    center: [r.f64()?, r.f64()?],
+                    old_size: r.f64()?,
+                    new_size: r.f64()?,
+                    lerp_time: r.varlong()?,
+                    absolute_max_size: r.varint()?,
+                    warning_blocks: r.varint()?,
+                    warning_time: r.varint()?,
+                },
+                C::SetBorderCenter => Clientbound::SetBorderCenter {
+                    center: [r.f64()?, r.f64()?],
+                },
+                C::SetBorderLerpSize => Clientbound::SetBorderLerpSize {
+                    old_size: r.f64()?,
+                    new_size: r.f64()?,
+                    lerp_time: r.varlong()?,
+                },
+                C::SetBorderSize => Clientbound::SetBorderSize { size: r.f64()? },
+                C::SetBorderWarningDelay => Clientbound::SetBorderWarningDelay {
+                    warning_time: r.varint()?,
+                },
+                C::SetBorderWarningDistance => Clientbound::SetBorderWarningDistance {
+                    warning_blocks: r.varint()?,
+                },
                 other => {
                     r.rest();
                     Clientbound::Other(other)

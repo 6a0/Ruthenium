@@ -2431,6 +2431,95 @@ public final class Scenarios {
                         ctx.waitTicks(20);
                         gone(ctx, server, "minecraft:llama");
                     }),
+            new Scenario("passenger_push",
+                    "A minecart launched east by powered rails carrying a villager (still) past the player, who stands on a block beside the rail, looking at it: the villager's box pushes the player and takes the crosshair, the minecart's doesn't reach; then one carrying a spider (sitting lower on a cart no wider than itself, too low to reach the player) with a wither skeleton on it, which pushes the player and takes the crosshair.",
+                    List.of("fill 0 -60 0 24 -60 0 minecraft:rail[shape=east_west]",
+                            "fill 0 -61 0 2 -61 0 minecraft:redstone_block",
+                            "fill 0 -60 0 2 -60 0 minecraft:powered_rail[shape=east_west,powered=true]",
+                            "setblock 25 -60 0 minecraft:stone", "setblock -1 -60 0 minecraft:stone",
+                            "fill 4 -60 1 10 -60 1 minecraft:stone"),
+                    start(7.5, -59, 1.5, 90, 20), (ctx, server) -> {
+                        tp(ctx, server, 7.5, -59, 0.75, 90, 20);
+                        server.runCommand("summon minecraft:minecart 0.5 -60 0.5 {Passengers:[{id:\"minecraft:villager\","
+                                + "NoAI:1b,Silent:1b,PersistenceRequired:1b}]}");
+                        ctx.waitTicks(70);
+                        server.runCommand("kill @e[type=minecraft:villager]");
+                        gone(ctx, server, "minecraft:minecart");
+                        tp(ctx, server, 7.5, -59, 0.75, 90, 15);
+                        server.runCommand("summon minecraft:minecart 0.5 -60 0.5 {Passengers:[{id:\"minecraft:spider\","
+                                + "NoAI:1b,Silent:1b,PersistenceRequired:1b,Passengers:[{id:\"minecraft:wither_skeleton\","
+                                + "NoAI:1b,Silent:1b,PersistenceRequired:1b}]}]}");
+                        ctx.waitTicks(80);
+                        server.runCommand("kill @e[type=minecraft:wither_skeleton]");
+                        server.runCommand("kill @e[type=minecraft:spider]");
+                        gone(ctx, server, "minecraft:minecart");
+                    }),
+            new Scenario("world_border",
+                    "A world border 16 across around the origin (x and z from -8 to 8): walking east into it (stopped at x 7.7), sprint-jumping into it, walking north-east along it (sliding north); with stone in hand, an attack and a use on the floor block just outside it (refused: nothing sent) and a use on the one inside it; a bed aimed so its head would go outside (not placed); a still pig outside it used (nothing sent). Then it shrinks to 10 over 40 ticks with the player crouching at x 7 (left outside; it stands once the border is more than a block away), who walks back in and east into it again; it grows to 20 over 20 ticks while the player walks east, and its centre moves to x 3. Back at the origin and 15 across (x to 7.5): walking east stops at x 7.7, past the border line, at the edge of the whole blocks it covers; crouching there, it is set to 14 (the player's centre outside it, within a block): let go of sneak, the player can't stand and crawls; crawling back in, it stands; reset.",
+                    List.of("item replace entity @a hotbar.0 with minecraft:stone 16",
+                            "item replace entity @a hotbar.1 with minecraft:red_bed 1"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("worldborder set 16");
+                        ctx.waitTicks(5);
+                        hold(ctx, 30, W);
+                        tp(ctx, server, 2.5, -60, 0.5, -90, 0);
+                        ctx.getInput().holdKey(SPRINT);
+                        hold(ctx, 25, W, JUMP);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(-135, 0);
+                        ctx.waitTicks(2);
+                        hold(ctx, 30, W);
+                        ctx.waitTicks(5);
+                        aim(ctx, server, 7.5, -60, 0.5, 8.5, -60, 0.5);
+                        hold(ctx, 10, ATTACK);
+                        ctx.waitTicks(5);
+                        use(ctx);
+                        aim(ctx, server, 6.5, -60, 0.5, 7.3, -60, 0.5);
+                        use(ctx);
+                        slot(ctx, 1);
+                        aim(ctx, server, 5.5, -60, -2.5, 7.5, -60, -2.5);
+                        use(ctx);
+                        server.runCommand("summon minecraft:pig 8.8 -60 3.5 " + STILL);
+                        ctx.waitTicks(5);
+                        aim(ctx, server, 7.5, -60, 3.5, 9.0, -59.5, 3.5);
+                        use(ctx);
+                        server.runCommand("kill @e[type=minecraft:pig]");
+                        ctx.waitTicks(25);
+                        tp(ctx, server, 7.0, -60, -1.5, -90, 0);
+                        ctx.getInput().holdKey(SNEAK);
+                        ctx.waitTicks(3);
+                        server.runCommand("worldborder set 10 40t");
+                        ctx.waitTicks(50);
+                        ctx.getInput().releaseKey(SNEAK);
+                        ctx.waitTicks(5);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.waitTicks(2);
+                        hold(ctx, 30, W);
+                        ctx.getInput().lookAt(-90, 0);
+                        ctx.waitTicks(2);
+                        hold(ctx, 20, W);
+                        server.runCommand("worldborder set 20 20t");
+                        hold(ctx, 30, W);
+                        server.runCommand("worldborder center 3 0");
+                        ctx.waitTicks(2);
+                        hold(ctx, 30, W);
+                        server.runCommand("worldborder center 0.0 0.0");
+                        server.runCommand("worldborder set 15");
+                        tp(ctx, server, 5.5, -60, -3.5, -90, 0);
+                        hold(ctx, 20, W);
+                        ctx.getInput().holdKey(SNEAK);
+                        ctx.waitTicks(3);
+                        server.runCommand("worldborder set 14");
+                        ctx.waitTicks(5);
+                        ctx.getInput().releaseKey(SNEAK);
+                        ctx.waitTicks(10);
+                        ctx.getInput().lookAt(90, 0);
+                        ctx.waitTicks(2);
+                        hold(ctx, 20, W);
+                        server.runCommand("worldborder set 59999968");
+                        ctx.waitTicks(5);
+                    }),
             new Scenario("horse_promoted",
                     "Riding a tame horse with no saddle (a passenger, not its rider) with forward held; the horse is saddled while forward is still held, and the player takes control; sneaking off.",
                     List.of(),

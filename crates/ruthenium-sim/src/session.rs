@@ -1051,8 +1051,9 @@ impl Game {
                 self.connection.send(p);
             }
         }
-        // `level.tick`: the game time.
+        // `level.tick`: the world border, then the game time.
         if !w.frozen {
+            w.level.border.tick();
             w.game_time += 1;
         }
         self.connection.send(play::client_tick_end());
@@ -1680,6 +1681,17 @@ impl Game {
             play::Clientbound::SetTime { game_time } => {
                 if let Some(w) = &mut self.world {
                     w.game_time = game_time;
+                }
+            }
+            // The world border's packets.
+            p @ (play::Clientbound::InitializeBorder { .. }
+            | play::Clientbound::SetBorderCenter { .. }
+            | play::Clientbound::SetBorderLerpSize { .. }
+            | play::Clientbound::SetBorderSize { .. }
+            | play::Clientbound::SetBorderWarningDelay { .. }
+            | play::Clientbound::SetBorderWarningDistance { .. }) => {
+                if let Some(w) = &mut self.world {
+                    w.level.border.handle(&p);
                 }
             }
             play::Clientbound::Other(kind) => {

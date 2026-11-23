@@ -536,12 +536,12 @@ fn copper_chest_update_shape(w: &World<'_>, u: &Update) -> u32 {
 
 /// `AbstractBedBlock.getStateForPlacement`: the bed faces the way the player looks,
 /// its foot where it is placed and its head on the next block that way, which must
-/// be free to build over. (The world border isn't tracked; the head is taken to be
-/// inside it.)
+/// be free to build over and inside the world border.
 fn bed_placement(w: &World<'_>, ctx: &PlaceContext, default: u32) -> Option<u32> {
     let facing = ctx.horizontal_direction();
     let head = facing.step(ctx.clicked_pos());
-    super::can_be_replaced(w, w.get(head), ctx).then(|| state::set_dir(default, "facing", facing))
+    (super::can_be_replaced(w, w.get(head), ctx) && w.level.border.block_within_bounds(head))
+        .then(|| state::set_dir(default, "facing", facing))
 }
 
 /// `AbstractBedBlock.updateShape`: each half watches the other (the head is the

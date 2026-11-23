@@ -72,7 +72,9 @@ public final class Recorder {
             "minecraft:move_entity_pos_rot", "minecraft:move_entity_rot", "minecraft:rotate_head",
             "minecraft:swing_animation", "minecraft:set_equipment", "minecraft:sound",
             "minecraft:set_passengers", "minecraft:set_player_team", "minecraft:player_info_update",
-            "minecraft:cooldown", "minecraft:player_combat_kill", "minecraft:respawn", "minecraft:move_vehicle");
+            "minecraft:cooldown", "minecraft:player_combat_kill", "minecraft:respawn", "minecraft:move_vehicle",
+            "minecraft:initialize_border", "minecraft:set_border_center", "minecraft:set_border_lerp_size",
+            "minecraft:set_border_size", "minecraft:set_border_warning_delay", "minecraft:set_border_warning_distance");
 
     private static final Gson GSON = new GsonBuilder().serializeSpecialFloatingPointValues().disableHtmlEscaping().create();
     private static final Object LOCK = new Object();

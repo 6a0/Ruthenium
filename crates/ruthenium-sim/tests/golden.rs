@@ -682,7 +682,10 @@ fn handle(
         } if k.iter().all(|v| v.is_finite()) => {
             p.delta = [p.delta[0] + k[0], p.delta[1] + k[1], p.delta[2] + k[2]];
         }
-        _ => {}
+        // The world border's packets; nothing else.
+        other => {
+            l.level.border.handle(&other);
+        }
     }
 }
 
@@ -995,6 +998,8 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             let vehicle = client.entities.vehicle_move();
             sent.extend(p.send_changes_riding(vehicle));
         }
+        // `level.tick`: the world border.
+        cl.level.border.tick();
         // Vanilla's packets and state for this tick.
         let mut want = Vec::new();
         let mut state = None;
@@ -1324,7 +1329,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 78] = [
+const EXACT: [&str; 80] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1403,6 +1408,8 @@ const EXACT: [&str; 78] = [
     "strider_ride",
     "nautilus_ride",
     "minecart_ride",
+    "passenger_push",
+    "world_border",
 ];
 
 #[test]
@@ -1504,6 +1511,8 @@ fn golden_traces() {
         "strider_ride",
         "nautilus_ride",
         "minecart_ride",
+        "passenger_push",
+        "world_border",
     ];
     // RUTHENIUM_TRACES=a,b replays only those.
     let only = std::env::var("RUTHENIUM_TRACES").ok();

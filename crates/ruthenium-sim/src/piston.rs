@@ -242,7 +242,10 @@ impl World<'_> {
         allow_destroy: bool,
         connection: Direction,
     ) -> bool {
-        if pos[1] < self.min_y() || pos[1] > self.max_y() {
+        if pos[1] < self.min_y()
+            || pos[1] > self.max_y()
+            || !self.level.border.block_within_bounds(pos)
+        {
             return false;
         }
         if self.blocks.is_air(s) {

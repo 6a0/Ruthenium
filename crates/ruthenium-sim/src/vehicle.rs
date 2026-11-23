@@ -277,6 +277,7 @@ impl Entity {
             fall_distance: self.body().fall_distance,
             walks_on_powder_snow: false,
             stands_on_lava: self.body().kind == RideKind::Strider,
+            xz: [self.position[0], self.position[2]],
         }
     }
 
@@ -329,6 +330,7 @@ impl Entity {
         env: &Env<'_>,
         controller: Option<Controller>,
         game_time: i64,
+        on_warm_strider: bool,
         out: &mut Vec<Vec<u8>>,
     ) {
         match self.body().kind {
@@ -348,7 +350,7 @@ impl Entity {
             }
             RideKind::Strider => {
                 if !self.no_ai {
-                    self.strider_warmth(env);
+                    self.strider_warmth(env, on_warm_strider);
                 }
                 self.living_step(env, controller, game_time);
                 self.float_strider(env);
@@ -1200,16 +1202,16 @@ impl Entity {
         }
     }
 
-    /// `Strider.tick`'s warmth (when its AI is on): out of warm blocks and lava it
-    /// suffocates, which slows it by a third.
-    fn strider_warmth(&mut self, env: &Env<'_>) {
+    /// `Strider.tick`'s warmth (when its AI is on): out of warm blocks and lava, and
+    /// not riding a strider that is warm, it suffocates, which slows it by a third.
+    fn strider_warmth(&mut self, env: &Env<'_>, on_warm_strider: bool) {
         let inside = env.state(self.block_position());
         let on = env.state(self.on_pos(env, 0.2));
         let warm_tag = "minecraft:strider_warm_blocks";
         let warm = env.tags.is(inside, warm_tag)
             || env.tags.is(on, warm_tag)
             || self.body().fluids.height(false) > 0.0;
-        self.set_suffocating(!warm);
+        self.set_suffocating(!warm && !on_warm_strider);
     }
 
     /// `Strider.setSuffocating`: the flag and the speed modifier with it.
