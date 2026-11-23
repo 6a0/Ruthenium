@@ -23,10 +23,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ruthenium_gpu::{
-    Arrival, COLOR_RANGE, FrameData, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
-    PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented,
-    Screenshot, SwapchainInfo, TextureDesc, TextureId, TextureTable, TextureTableStats,
-    UploadCheck, UploadCheckReport, UploadRing, Validation, vk,
+    Arrival, Encoder, FrameData, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
+    PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented, Screenshot, SwapchainInfo,
+    TextureDesc, TextureId, TextureTable, TextureTableStats, UploadCheck, UploadCheckReport,
+    UploadRing, Validation, vk,
 };
 use ruthenium_platform::{Platform, Window};
 
@@ -436,7 +436,7 @@ impl Renderer {
         self.update_backdrop(wants_backdrop, surface);
         // SAFETY: ctx.cmd is recording frame ctx.number on the graphics queue; completed
         // was just read from the timeline; every upload destination is owned by self and
-        // outlives the frame; the layout's set 0 is the texture table's.
+        // outlives the frame.
         unsafe {
             let zone = self.frames.zone_begin(&ctx, "uploads");
             self.uploads.record(&mut ctx, completed)?;
@@ -448,33 +448,34 @@ impl Renderer {
                 c.step(&mut self.uploads, &mut self.textures, &ctx, completed)?;
                 self.frames.zone_end(&ctx, zone);
             }
-            self.textures.bind(ctx.cmd, ctx.slot(), self.layout.raw());
-            self.frame_data.begin_frame(ctx.slot());
-            self.frame_data.bind(ctx.cmd, self.layout.raw());
-            // First frame (and after a rebuild): draw once with every pipeline.
-            if !self.pipelines.warmed_up() {
-                let zone = self.frames.zone_begin(&ctx, "warm-up");
-                self.pipelines.record_warm_up(ctx.cmd, &self.layout)?;
-                self.frames.zone_end(&ctx, zone);
-            }
+        }
+        self.frame_data.begin_frame(ctx.slot());
+        let gpu = self.frames.gpu().clone();
+        // SAFETY: the layout was made of the texture table's and the frame data's set
+        // layouts (Renderer::new); both have begun this frame; self.pipelines are only
+        // ever built with it.
+        let mut encoder =
+            unsafe { Encoder::begin(&gpu, &ctx, &self.layout, &self.textures, &self.frame_data) };
+        // First frame (and after a rebuild): draw once with every pipeline.
+        if !self.pipelines.warmed_up() {
+            let zone = self.frames.zone_begin(&ctx, "warm-up");
+            encoder.warm_up(&mut self.pipelines)?;
+            self.frames.zone_end(&ctx, zone);
         }
         // Off-screen passes, before the late acquire: the backdrop for this swapchain's
         // size and format. It stays drawn if the acquire then gives no image.
         let backdrop = match (&mut self.backdrop, surface) {
             (Some(b), Some(s)) if wants_backdrop && b.matches(s.format, s.extent) => {
                 let zone = self.frames.zone_begin(&ctx, "backdrop");
-                // SAFETY: outside a render pass, sets bound; the images were created
-                // before this frame's begin_frame; the pipelines are for this format.
-                unsafe {
-                    b.record(
-                        self.frames.gpu(),
-                        ctx.cmd,
-                        &self.pipelines,
-                        &self.layout,
-                        background,
-                        self.stars,
-                    )
-                };
+                // Its images were created before this frame's begin_frame, and the
+                // pipelines are for this format.
+                b.record(
+                    &mut encoder,
+                    &self.pipelines,
+                    &self.textures,
+                    background,
+                    self.stars,
+                );
                 self.frames.zone_end(&ctx, zone);
                 Some(b.textures())
             }
@@ -482,34 +483,25 @@ impl Renderer {
         };
         if let Some(c) = &mut self.colour_check {
             let zone = self.frames.zone_begin(&ctx, "colour check");
-            // SAFETY: as for the table check below.
-            unsafe {
-                c.step(
-                    &ctx,
-                    completed,
-                    &self.textures,
-                    &mut self.frame_data,
-                    &self.pipelines,
-                    &self.layout,
-                )?
-            };
+            c.step(
+                &mut encoder,
+                completed,
+                &self.textures,
+                &mut self.frame_data,
+                &self.pipelines,
+            )?;
             self.frames.zone_end(&ctx, zone);
         }
         if let Some(c) = &mut self.table_check {
             let zone = self.frames.zone_begin(&ctx, "table check");
-            // SAFETY: outside a render pass, after begin_frame, sets bound; the pipelines
-            // were built with the layout.
-            unsafe {
-                c.step(
-                    &ctx,
-                    completed,
-                    &mut self.textures,
-                    &mut self.uploads,
-                    &mut self.frame_data,
-                    &self.pipelines,
-                    &self.layout,
-                )?
-            };
+            c.step(
+                &mut encoder,
+                completed,
+                &mut self.textures,
+                &mut self.uploads,
+                &mut self.frame_data,
+                &self.pipelines,
+            )?;
             self.frames.zone_end(&ctx, zone);
         }
         let target = self.frames.acquire(&ctx)?;
@@ -521,92 +513,47 @@ impl Renderer {
                 self.glass_fallbacks += 1;
             }
             let zone = self.frames.zone_begin(&ctx, "window pass");
-            let gpu = self.frames.gpu().clone();
-            let cmd = ctx.cmd;
-            let to_attachment = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::NONE)
-                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .image(t.image)
-                .subresource_range(COLOR_RANGE)];
-            let to_present = [vk::ImageMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
-                .dst_access_mask(vk::AccessFlags2::NONE)
-                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                .image(t.image)
-                .subresource_range(COLOR_RANGE)];
-            // The background covers every pixel, so the old contents are never loaded.
-            let attachments = [vk::RenderingAttachmentInfo::default()
-                .image_view(t.view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .store_op(vk::AttachmentStoreOp::STORE)];
-            let area = vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent: t.extent,
-            };
-            let rendering = vk::RenderingInfo::default()
-                .render_area(area)
-                .layer_count(1)
-                .color_attachments(&attachments);
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: t.extent.width as f32,
-                height: t.extent.height as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            let push = background.push_constants(self.stars);
-            let d = gpu.device();
-            // SAFETY: cmd is recording; the image was acquired this frame and its acquire
-            // semaphore is waited at COLOR_ATTACHMENT_OUTPUT, the first barrier's source stage;
-            // the pipeline was built for the target's format with the shared layout.
+            // What every GUI pipeline's push constants start with: the target's size.
+            let mut screen = [0u8; 8];
+            screen[0..4].copy_from_slice(&(t.extent.width as f32).to_ne_bytes());
+            screen[4..8].copy_from_slice(&(t.extent.height as f32).to_ne_bytes());
+            // A screenshot someone asked for is of the frame as it is, without the colour
+            // check's patches.
+            let wanted_shot = self.screenshot_requested && self.screenshot.is_none();
+            let mut checked = false;
+            let mut pass = encoder.window_pass(&self.pipelines, &t);
+            // SAFETY (every draw of the pass): each block of push constants is laid out
+            // as its pipeline's shaders declare it; the elements it points at were
+            // written into the frame's data just before; texture indices are ones this
+            // renderer's table handed out (the starfield, the backdrop's images, the
+            // GUI's textures, the colour check's), and none is the window.
             unsafe {
-                gpu.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_attachment),
-                );
-                gpu.cmd_begin_rendering(cmd, &rendering);
-                // With a backdrop, the background is already drawn: copy it.
-                let (pipeline, push) = match backdrop {
-                    Some((scene, _)) => {
-                        (PipelineId::Blur, backdrop::blur_push_copy(scene).to_vec())
-                    }
-                    None => (PipelineId::Background, push.to_vec()),
-                };
-                d.cmd_bind_pipeline(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.pipelines.get(pipeline.index()),
-                );
-                d.cmd_set_viewport(cmd, 0, &[viewport]);
-                d.cmd_set_scissor(cmd, 0, &[area]);
-                d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
-                d.cmd_draw(cmd, 3, 1, 0, 0);
+                // The background covers every pixel, so the old contents are never
+                // loaded. With a backdrop, it is already drawn: copy it.
+                match backdrop {
+                    Some((scene, _)) => pass.draw(
+                        PipelineId::Blur.index(),
+                        &backdrop::blur_push_copy(scene),
+                        3,
+                        1,
+                    ),
+                    None => pass.draw(
+                        PipelineId::Background.index(),
+                        &background.push_constants(self.stars),
+                        3,
+                        1,
+                    ),
+                }
                 if let Some(g) = gui.filter(|g| !g.quads.is_empty() && g.scale > 0)
                     && let Some((first, bytes)) =
                         self.frame_data.alloc(g.quads.len() as u32, gui::QUAD_BYTES)
                 {
                     gui::write_quads(g.quads, bytes);
                     let mut push = [0u8; 16];
-                    push[0..4].copy_from_slice(&(t.extent.width as f32).to_ne_bytes());
-                    push[4..8].copy_from_slice(&(t.extent.height as f32).to_ne_bytes());
+                    push[0..8].copy_from_slice(&screen);
                     push[8..12].copy_from_slice(&(g.scale as f32).to_ne_bytes());
                     push[12..16].copy_from_slice(&first.to_ne_bytes());
-                    d.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.pipelines.get(PipelineId::Gui.index()),
-                    );
-                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
-                    d.cmd_draw(cmd, 6, g.quads.len() as u32, 0, 0);
+                    pass.draw(PipelineId::Gui.index(), &push, 6, g.quads.len() as u32);
                 }
                 if let Some(g) = gui.filter(|g| !g.shapes.is_empty())
                     && let Some((first, bytes)) = self
@@ -617,19 +564,12 @@ impl Renderer {
                     let (scene, blurred) =
                         backdrop.unwrap_or((TextureId::MISSING, TextureId::MISSING));
                     let mut push = [0u8; 24];
-                    push[0..4].copy_from_slice(&(t.extent.width as f32).to_ne_bytes());
-                    push[4..8].copy_from_slice(&(t.extent.height as f32).to_ne_bytes());
+                    push[0..8].copy_from_slice(&screen);
                     push[8..12].copy_from_slice(&scene.index().to_ne_bytes());
                     push[12..16].copy_from_slice(&blurred.index().to_ne_bytes());
                     push[16..20].copy_from_slice(&first.to_ne_bytes());
                     push[20..24].copy_from_slice(&u32::from(backdrop.is_some()).to_ne_bytes());
-                    d.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.pipelines.get(PipelineId::Shape.index()),
-                    );
-                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
-                    d.cmd_draw(cmd, 6, g.shapes.len() as u32, 0, 0);
+                    pass.draw(PipelineId::Shape.index(), &push, 6, g.shapes.len() as u32);
                 }
                 if let Some(g) = gui.filter(|g| !g.glyphs.is_empty())
                     && let Some((first, bytes)) = self
@@ -638,17 +578,10 @@ impl Renderer {
                 {
                     gui::write_glyphs(g.glyphs, bytes);
                     let mut push = [0u8; 16];
-                    push[0..4].copy_from_slice(&(t.extent.width as f32).to_ne_bytes());
-                    push[4..8].copy_from_slice(&(t.extent.height as f32).to_ne_bytes());
+                    push[0..8].copy_from_slice(&screen);
                     push[8..12].copy_from_slice(&g.font_atlas.to_ne_bytes());
                     push[12..16].copy_from_slice(&first.to_ne_bytes());
-                    d.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.pipelines.get(PipelineId::Text.index()),
-                    );
-                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
-                    d.cmd_draw(cmd, 6, g.glyphs.len() as u32, 0, 0);
+                    pass.draw(PipelineId::Text.index(), &push, 6, g.glyphs.len() as u32);
                 }
                 let rects = self.overlay.build(t.extent.width, t.extent.height);
                 if let Some((first, bytes)) = self
@@ -658,21 +591,12 @@ impl Renderer {
                 {
                     overlay::write_rects(rects, bytes);
                     let mut push = [0u8; 12];
-                    push[0..4].copy_from_slice(&(t.extent.width as f32).to_ne_bytes());
-                    push[4..8].copy_from_slice(&(t.extent.height as f32).to_ne_bytes());
+                    push[0..8].copy_from_slice(&screen);
                     push[8..12].copy_from_slice(&first.to_ne_bytes());
-                    d.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.pipelines.get(PipelineId::Overlay.index()),
-                    );
-                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
-                    d.cmd_draw(cmd, 6, rects.len() as u32, 0, 0);
+                    pass.draw(PipelineId::Overlay.index(), &push, 6, rects.len() as u32);
                 }
                 // The colour check's patches, over everything else in the window's top
-                // left corner, in frames whose copy is not a screenshot someone asked for.
-                let wanted_shot = self.screenshot_requested && self.screenshot.is_none();
-                let mut checked = false;
+                // left corner.
                 if let Some(c) = &self.colour_check
                     && !wanted_shot
                     && c.wants_window(&self.textures, ctx.number)
@@ -682,39 +606,26 @@ impl Renderer {
                 {
                     gui::write_quads(&c.quads(), bytes);
                     let push = check_pass::pixel_quads_push(t.extent.width, t.extent.height, first);
-                    d.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.pipelines.get(PipelineId::Gui.index()),
-                    );
-                    d.cmd_push_constants(cmd, self.layout.raw(), PUSH_CONSTANT_STAGES, 0, &push);
-                    d.cmd_draw(cmd, 6, 2, 0, 0);
+                    pass.draw(PipelineId::Gui.index(), &push, 6, 2);
                     checked = true;
                 }
-                gpu.cmd_end_rendering(cmd);
-                let shot = if wanted_shot || checked {
-                    Screenshot::record(&gpu, &ctx, &t)?
-                } else {
-                    None
-                };
-                match (shot, &mut self.colour_check) {
-                    // A copy made the transition to PRESENT_SRC itself.
-                    (Some(s), Some(c)) if checked => c.window_recorded(s),
-                    (Some(s), _) => {
-                        self.screenshot_of = Some((ctx.number, t.generation, t.first));
-                        self.screenshot = Some(s);
-                        self.screenshot_requested = false;
-                    }
-                    (None, c) => {
-                        if let Some(c) = c.as_mut().filter(|_| checked) {
-                            c.window_unreadable();
-                        }
-                        gpu.cmd_pipeline_barrier2(
-                            cmd,
-                            &vk::DependencyInfo::default().image_memory_barriers(&to_present),
-                        );
-                    }
+            }
+            // Ready to present, after a copy of it if one is wanted.
+            let shot = if wanted_shot || checked {
+                pass.finish_captured()?
+            } else {
+                pass.finish();
+                None
+            };
+            match (shot, &mut self.colour_check) {
+                (Some(s), Some(c)) if checked => c.window_recorded(s),
+                (Some(s), _) => {
+                    self.screenshot_of = Some((ctx.number, t.generation, t.first));
+                    self.screenshot = Some(s);
+                    self.screenshot_requested = false;
                 }
+                (None, Some(c)) if checked => c.window_unreadable(),
+                (None, _) => {}
             }
             self.frames.zone_end(&ctx, zone);
         }

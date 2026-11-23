@@ -11,6 +11,7 @@
 //! driver; the portability subset is enabled whenever the device reports it.
 
 mod device;
+mod encoder;
 mod frame;
 mod frame_data;
 mod instance;
@@ -29,6 +30,7 @@ pub use device::{
     OptionalFeatures, PretendSrgb, Rejected, SwapchainMaintenance, TextureTableLimits,
     TextureTablePath,
 };
+pub use encoder::{Encoder, Pass};
 pub use frame::{
     ACQUIRE_TIMEOUT, Acquired, FrameCounters, FrameCtx, FrameLoop, FrameTimings, GpuTime, GpuZone,
     MAX_FRAME_WAITS, MAX_FRAMES_IN_FLIGHT, MAX_GPU_ZONES, Presented, SwapchainInfo, Target,

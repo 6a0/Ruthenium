@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use ruthenium_gpu::{
-    Arrival, Error, FrameCtx, FrameData, Gpu, PipelineLayout, Pipelines, Readback, TextureDesc,
-    TextureId, TextureTable, UploadError, UploadRing, vk,
+    Arrival, Encoder, Error, FrameData, Gpu, Pipelines, Readback, TextureDesc, TextureId,
+    TextureTable, UploadError, UploadRing, vk,
 };
 use ruthenium_ui::Quad;
 
@@ -137,23 +137,17 @@ impl TableCheck {
 
     /// One frame of the check: compares the grid that has come back, draws the next one,
     /// then creates or destroys textures (visible from the next frame on, so the grid
-    /// just drawn is of the table as this frame's set shows it).
-    ///
-    /// # Safety
-    /// `ctx.cmd` is recording frame `ctx.number` on the graphics queue, outside a render
-    /// pass, after `textures.begin_frame` for this frame, with the shared layout's sets
-    /// bound; `completed` is a frame the GPU has finished; `pipelines` were built with
-    /// `layout`.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn step(
+    /// just drawn is of the table as this frame's set shows it). `completed` is a frame
+    /// the GPU has finished; call it after `textures.begin_frame` for the frame `encoder`
+    /// records.
+    pub fn step(
         &mut self,
-        ctx: &FrameCtx,
+        encoder: &mut Encoder<'_>,
         completed: u64,
         textures: &mut TextureTable,
         uploads: &mut UploadRing,
         frame_data: &mut FrameData,
         pipelines: &Pipelines,
-        layout: &PipelineLayout,
     ) -> Result<(), Error> {
         profiling::scope!("table_check");
         self.compare(completed, textures.capacity());
@@ -163,8 +157,7 @@ impl TableCheck {
             self.target = Readback::new(self.gpu.clone(), pipelines.format(), grid_extent())?;
         }
         if !self.target.pending() {
-            // SAFETY: forwarded from the caller.
-            unsafe { self.draw(ctx, textures, frame_data, pipelines, layout) };
+            self.draw(encoder, textures, frame_data, pipelines);
         }
         match self.phase {
             Phase::Fill => self.fill(textures, uploads)?,
@@ -207,17 +200,14 @@ impl TableCheck {
         };
     }
 
-    /// Draws one pixel per slot of the window and records the copy back.
-    ///
-    /// # Safety
-    /// As [`Self::step`]; no copy is pending.
-    unsafe fn draw(
+    /// Draws one pixel per slot of the window and records the copy back. No copy is
+    /// pending.
+    fn draw(
         &mut self,
-        ctx: &FrameCtx,
+        encoder: &mut Encoder<'_>,
         textures: &TextureTable,
         frame_data: &mut FrameData,
         pipelines: &Pipelines,
-        layout: &PipelineLayout,
     ) {
         let count = WINDOW.min(textures.capacity() - self.window_first);
         let missing = u32::from_le_bytes(TextureTable::MISSING_COLORS[0]);
@@ -241,16 +231,13 @@ impl TableCheck {
             });
         }
         // Without room in the frame's data (the GUI took it), the next frame draws the grid.
-        // SAFETY: forwarded from the caller; the GUI pipeline was built for the target's
-        // format (checked in step).
+        // SAFETY: every quad samples a slot below the table's capacity.
         unsafe {
             check_pass::gui_quads_into(
-                &self.gpu,
-                ctx,
+                encoder,
+                pipelines,
                 &mut self.target,
                 frame_data,
-                pipelines,
-                layout,
                 &self.quads,
             )
         };

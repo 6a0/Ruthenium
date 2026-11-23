@@ -216,6 +216,8 @@ struct Texture {
     image: Image,
     desc: TextureDesc,
     state: State,
+    /// A render target ([`TextureTable::create_target`]): passes draw into it.
+    target: bool,
 }
 
 /// Free indices of the table. Index 0 is the missing texture and never handed out.
@@ -556,6 +558,7 @@ impl TextureTable {
             image,
             desc,
             state: State::Empty,
+            target: false,
         })
     }
 
@@ -582,15 +585,14 @@ impl TextureTable {
     }
 
     /// Creates a texture the renderer draws into (a render target) instead of uploading
-    /// to: colour attachment and sampled, one mip level, starting in `UNDEFINED` layout.
-    /// Its slot shows it from the next frame begun; layout transitions are the caller's,
-    /// and it must be in `SHADER_READ_ONLY_OPTIMAL` whenever a shader samples it. Returns
-    /// the id, the image and its view.
+    /// to: one mip level, undefined until its first pass
+    /// ([`crate::Encoder::texture_pass`], which leaves it ready for sampling). Its slot
+    /// shows it from the next frame begun, so draw into it before sampling it.
     pub fn create_target(
         &mut self,
         format: vk::Format,
         extent: vk::Extent2D,
-    ) -> Result<(TextureId, vk::Image, vk::ImageView), Error> {
+    ) -> Result<TextureId, Error> {
         let desc = TextureDesc {
             width: extent.width,
             height: extent.height,
@@ -611,16 +613,27 @@ impl TextureTable {
                 return Err(e);
             }
         };
-        let (raw, view) = (image.raw, image.view);
+        let view = image.view;
         self.textures[i as usize] = Some(Texture {
             image,
             desc,
             state: State::Ready,
+            target: true,
         });
         for p in &mut self.pending {
             p.push((i, view));
         }
-        Ok((TextureId(i), raw, view))
+        Ok(TextureId(i))
+    }
+
+    /// The image, view and description of a render target, for a pass into it.
+    ///
+    /// # Panics
+    /// If `id` is not a live render target.
+    pub(crate) fn target(&self, id: TextureId) -> (vk::Image, vk::ImageView, TextureDesc) {
+        let t = self.live(id);
+        assert!(t.target, "{id:?} is not a render target");
+        (t.image.raw, t.image.view, t.desc)
     }
 
     /// Whether the texture's slot shows it in the frame last begun (and every later one).
@@ -881,7 +894,12 @@ impl TextureTable {
     /// # Safety
     /// `cmd` is recording the frame passed to `begin_frame` with this `slot`; `layout` was
     /// created with [`Self::layout`] as set 0.
-    pub unsafe fn bind(&self, cmd: vk::CommandBuffer, slot: usize, layout: vk::PipelineLayout) {
+    pub(crate) unsafe fn bind(
+        &self,
+        cmd: vk::CommandBuffer,
+        slot: usize,
+        layout: vk::PipelineLayout,
+    ) {
         let sets = [self.sets[slot]];
         for point in [
             vk::PipelineBindPoint::GRAPHICS,

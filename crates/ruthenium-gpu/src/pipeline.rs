@@ -476,17 +476,17 @@ impl Pipelines {
     /// constants (texture 0: the missing texture). Some drivers finish compiling, or upload
     /// shader code, only at a pipeline's first draw; this moves that to the first frame
     /// instead of the frame that first needs the pipeline (a HUD element, the world).
-    /// Call it once, outside a render pass, before the frame's passes; later calls do
-    /// nothing.
+    /// Recorded once, through [`crate::Encoder::warm_up`], before the frame's passes; later
+    /// calls do nothing.
     ///
     /// # Safety
     /// `cmd` is recording a frame on the graphics queue, outside a render pass, with every
     /// descriptor set of `layout` (the layout these pipelines were built with) bound: the
     /// texture table, with its missing texture ready, and the frame's data.
-    pub unsafe fn record_warm_up(
+    pub(crate) unsafe fn record_warm_up(
         &mut self,
         cmd: vk::CommandBuffer,
-        layout: &PipelineLayout,
+        layout: vk::PipelineLayout,
     ) -> Result<(), Error> {
         if self.warmed {
             return Ok(());
@@ -546,7 +546,7 @@ impl Pipelines {
             gpu.cmd_begin_rendering(cmd, &rendering);
             d.cmd_set_viewport(cmd, 0, &[viewport]);
             d.cmd_set_scissor(cmd, 0, &[area]);
-            d.cmd_push_constants(cmd, layout.raw, PUSH_CONSTANT_STAGES, 0, &push);
+            d.cmd_push_constants(cmd, layout, PUSH_CONSTANT_STAGES, 0, &push);
             for &p in &self.pipelines {
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, p);
                 d.cmd_draw(cmd, 3, 1, 0, 0);

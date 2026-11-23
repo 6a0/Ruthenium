@@ -181,7 +181,7 @@ impl FrameData {
     /// # Safety
     /// `cmd` is recording the frame passed to [`Self::begin_frame`]; `layout` was created
     /// with [`Self::layout`] as set 1.
-    pub unsafe fn bind(&self, cmd: vk::CommandBuffer, layout: vk::PipelineLayout) {
+    pub(crate) unsafe fn bind(&self, cmd: vk::CommandBuffer, layout: vk::PipelineLayout) {
         let sets = [self.set];
         let offsets = [(self.slot as u64 * self.region) as u32];
         for point in [

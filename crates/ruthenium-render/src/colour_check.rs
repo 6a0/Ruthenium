@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use ruthenium_gpu::{
-    Arrival, Error, FrameCtx, FrameData, Gpu, PipelineLayout, Pipelines, Readback, Screenshot,
-    TextureDesc, TextureId, TextureTable, UploadRing, vk,
+    Arrival, Encoder, Error, FrameData, Gpu, Pipelines, Readback, Screenshot, TextureDesc,
+    TextureId, TextureTable, UploadRing, vk,
 };
 use ruthenium_ui::{NO_TEXTURE, Quad};
 
@@ -140,21 +140,16 @@ impl ColourCheck {
         ]
     }
 
-    /// Compares what has come back and draws the patches off screen again.
-    ///
-    /// # Safety
-    /// `ctx.cmd` is recording frame `ctx.number` on the graphics queue, outside a render
-    /// pass, after `textures.begin_frame` for this frame, with the shared layout's sets
-    /// bound; `completed` is a frame the GPU has finished; `pipelines` were built with
-    /// `layout`.
-    pub unsafe fn step(
+    /// Compares what has come back and draws the patches off screen again. `completed`
+    /// is a frame the GPU has finished; call it after `textures.begin_frame` for the
+    /// frame `encoder` records.
+    pub fn step(
         &mut self,
-        ctx: &FrameCtx,
+        encoder: &mut Encoder<'_>,
         completed: u64,
         textures: &TextureTable,
         frame_data: &mut FrameData,
         pipelines: &Pipelines,
-        layout: &PipelineLayout,
     ) -> Result<(), Error> {
         if let Some((frame, pixels)) = self.target.take(completed) {
             let ok = compare("off screen", frame, pixels, WIDTH, &mut self.report);
@@ -174,18 +169,9 @@ impl ColourCheck {
         }
         if textures.is_ready(self.grey) && !self.target.pending() {
             let quads = self.quads();
-            // SAFETY: forwarded from the caller; the GUI pipeline was built for the
-            // target's format (checked just above); no copy is pending.
+            // SAFETY: the quads sample the check's own texture or none.
             unsafe {
-                check_pass::gui_quads_into(
-                    &self.gpu,
-                    ctx,
-                    &mut self.target,
-                    frame_data,
-                    pipelines,
-                    layout,
-                    &quads,
-                )
+                check_pass::gui_quads_into(encoder, pipelines, &mut self.target, frame_data, &quads)
             };
         }
         Ok(())
