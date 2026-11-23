@@ -551,6 +551,17 @@ pub struct Env<'a> {
     /// The boxes of the entities the player collides with (boats, shulkers:
     /// `canBeCollidedWith`), as solid as blocks.
     pub colliders: &'a [Aabb],
+    /// The level's other entities, for what a riptide spin touches: only there while
+    /// the player ticks.
+    pub others: Option<Others<'a>>,
+}
+
+/// The other entities of the level the player ticks in, and the player list that says
+/// which of them are spectators.
+#[derive(Debug, Clone, Copy)]
+pub struct Others<'a> {
+    pub entities: &'a crate::entity::Entities,
+    pub players: &'a crate::entity::PlayerInfos,
 }
 
 impl<'a> Env<'a> {
@@ -724,8 +735,8 @@ pub struct LocalPlayer {
     using_hand: Option<Hand>,
     /// `attackStrengthTicker` and `itemSwapTicker`: ticks since the last attack and
     /// since the main hand last changed item.
-    attack_strength_ticker: i32,
-    item_swap_ticker: i32,
+    pub(crate) attack_strength_ticker: i32,
+    pub(crate) item_swap_ticker: i32,
     /// `lastItemInMainHand`: a copy of the main hand as the last tick left it.
     last_item_in_main_hand: Stack,
     /// `stuckSpeedMultiplier`: set by a cobweb, a berry bush or powder snow the
@@ -743,6 +754,9 @@ pub struct LocalPlayer {
     was_in_powder_snow: bool,
     /// `autoSpinAttackTicks`: a riptide spin's ticks left.
     pub auto_spin_attack_ticks: i32,
+    /// `autoSpinAttackDmg`: the damage of the last spin started here (the client never
+    /// clears it).
+    auto_spin_attack_dmg: f32,
     /// The vehicle the player rides (`isPassenger`).
     pub riding: Option<Riding>,
     /// `LocalPlayer.handsBusy`: paddling a boat keeps the hands from using or
@@ -896,6 +910,7 @@ impl LocalPlayer {
             in_powder_snow: false,
             was_in_powder_snow: false,
             auto_spin_attack_ticks: 0,
+            auto_spin_attack_dmg: 0.0,
             riding: None,
             hands_busy: false,
             jump_riding_ticks: 0,
@@ -1369,6 +1384,7 @@ impl LocalPlayer {
         }
         // Player.startAutoSpinAttack: the living flag is the server's.
         self.auto_spin_attack_ticks = 20;
+        self.auto_spin_attack_dmg = 8.0;
         if self.on_ground {
             self.do_move(env, [0.0, 1.1999999284744263, 0.0]);
         }
@@ -1626,13 +1642,15 @@ impl LocalPlayer {
     /// vehicles, shulker bullets and end crystals, not for mobs. The client's attack
     /// damage is the player's base of 1 and its attack knockback 0 (neither attribute
     /// is sent to clients, and only the server applies equipment and effect
-    /// modifiers), so the damage is never zero and the knockback is the sprint's alone:
+    /// modifiers), and a spin's its own (none while the server says the player spins
+    /// but no spin ever started here), so the knockback is the sprint's alone:
     /// a sprinting hit at more than 0.9 strength slows the attacker to 0.6 across and
     /// ends the sprint. `onAttack`'s reset is the caller's (`resetAttackStrengthTicker`
     /// follows at once).
     pub fn attack(&mut self, hurts: bool) {
         let scale = self.attack_strength_scale(0.5);
-        if !hurts {
+        let no_damage = self.is_auto_spin_attack() && !(self.auto_spin_attack_dmg > 0.0);
+        if !hurts || no_damage {
             return;
         }
         let full_strength = scale > 0.9;
@@ -2225,15 +2243,30 @@ impl LocalPlayer {
         self.apply_effects_from_blocks(env);
         if self.auto_spin_attack_ticks > 0 {
             self.auto_spin_attack_ticks -= 1;
-            self.check_auto_spin_attack(&before_travel);
+            self.check_auto_spin_attack(env, &before_travel);
         }
     }
 
-    /// `checkAutoSpinAttack` on the client: running into a wall ends the spin. (Hitting
-    /// a living entity on the way, which attacks it and bounces back, isn't ported.)
-    fn check_auto_spin_attack(&mut self, _before: &Aabb) {
-        if self.horizontal_collision {
+    /// `checkAutoSpinAttack` on the client: the first living entity touched on the way
+    /// (from the box before the move to the one after) is attacked, without a packet,
+    /// ends the spin and bounces the player back at a fifth of its motion. Touching
+    /// nothing at all, running into a wall ends the spin.
+    pub(crate) fn check_auto_spin_attack(&mut self, env: &Env<'_>, before: &Aabb) {
+        let area = before.minmax(&self.bounding_box());
+        let touched = env
+            .others
+            .map(|o| o.entities.touching(&area, o.players))
+            .unwrap_or_default();
+        if touched.is_empty() {
+            if self.horizontal_collision {
+                self.auto_spin_attack_ticks = 0;
+            }
+        } else if let Some(e) = touched.iter().find(|e| e.info().living) {
+            // `Player.doAutoAttackOnTouch`: `attack`, with `onAttack`.
+            self.attack(e.info().hurt_by_attack);
+            self.on_attack();
             self.auto_spin_attack_ticks = 0;
+            self.delta = self.delta.map(|d| d * -0.2);
         }
     }
 
@@ -3821,6 +3854,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         // Survival never flies.
         let mut p = standing(&env, play::SURVIVAL);
@@ -3888,6 +3922,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         let mut p = standing(&env, play::SURVIVAL);
         p.entity_id = 7;
@@ -3924,6 +3959,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         let forward = Keys {
             forward: true,
@@ -3964,6 +4000,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         let mut p = standing(&env, 0);
         p.y_rot = -90.0;
@@ -3995,6 +4032,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         for (asleep, crouching) in [(true, false), (false, true)] {
             p.data.sleeping_pos = asleep.then_some([0, -60, 0]);
@@ -4025,6 +4063,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         let mut p = standing(&env, play::SPECTATOR);
         p.spectator = true;
@@ -4200,6 +4239,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         let mut p = standing(&env, play::SURVIVAL);
         let scale = |base| play::AttributeSnapshot {
@@ -4264,6 +4304,17 @@ mod tests {
         assert!(!p.sprinting);
         assert!(p.attributes.movement_speed.modifiers.is_empty());
         assert_eq!(p.delta, [0.25 * 0.6, -0.08, -0.5 * 0.6]);
+        // While the server says the player spins, a spin that never started here does no
+        // damage and one that did does its own.
+        p.data.living_flags |= 4;
+        for (dmg, slowed) in [(0.0, false), (8.0, true)] {
+            p.auto_spin_attack_dmg = dmg;
+            p.attack_strength_ticker = 5;
+            p.set_sprinting(true);
+            p.attack(true);
+            assert_eq!(p.sprinting, !slowed);
+        }
+        p.data.living_flags = 0;
         // Not sprinting any more: the next hit leaves the motion alone.
         let before = p.delta;
         p.attack(true);

@@ -587,6 +587,7 @@ impl World<'_> {
             blocks: self.blocks,
             tags: self.tags,
             colliders,
+            others: None,
         };
         target.push(&env, MoverType::Piston, v, game_time);
         let to = target.position();
@@ -669,6 +670,7 @@ impl World<'_> {
                 blocks: self.blocks,
                 tags: self.tags,
                 colliders,
+                others: None,
             };
             target.push(&env, MoverType::ShulkerBox, v, game_time);
         }

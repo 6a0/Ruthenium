@@ -1811,6 +1811,78 @@ public final class Scenarios {
                         waitUntilDown(ctx, 120);
                         ctx.waitTicks(15);
                     }),
+            new Scenario("riptide_hit",
+                    "A riptide III trident in a two-deep pool (x 0 to 10), the spin hitting things: a still husk (hit, bounced back); a husk passed within the launch tick (hit); an end crystal at the east wall (not living: the spin goes on against the wall); a crystal and a husk together (the husk is hit); up into a floating husk (bounced down); a husk killed just before (dying: hit); sprinting into a husk in the rain, from the ground (hit, the sprint goes on); then mounted on a horse in the middle of a spin (the horse is hit).",
+                    List.of(UNHURT, "fill 0 -62 -4 10 -61 4 minecraft:water"),
+                    start(-2.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("item replace entity @a hotbar.0 with minecraft:trident[enchantments={riptide:3}]");
+                        // A husk met on the second tick, and the bounce back from it.
+                        server.runCommand("summon minecraft:husk 6.5 -62 0.5 " + STILL);
+                        spin(ctx, server, 2.5, -62, 0.5, -90, 0, 25);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(25);
+                        // Only the box from before the move to after it touches the husk.
+                        server.runCommand("summon minecraft:husk 4.0 -62 0.5 " + STILL);
+                        spin(ctx, server, 2.5, -62, 0.5, -90, 0, 25);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(25);
+                        // Not living, and a wall.
+                        server.runCommand("summon minecraft:end_crystal 10.0 -62 0.5");
+                        spin(ctx, server, 2.5, -62, 0.5, -90, 0, 30);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(25);
+                        // Not living, then living.
+                        server.runCommand("summon minecraft:end_crystal 6.5 -62 0.5");
+                        ctx.waitTicks(2);
+                        server.runCommand("summon minecraft:husk 6.5 -62 0.5 " + STILL);
+                        spin(ctx, server, 2.5, -62, 0.5, -90, 0, 25);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(25);
+                        // Upwards.
+                        server.runCommand("summon minecraft:husk 2.5 -55 0.5 {NoAI:1b,NoGravity:1b,Silent:1b,PersistenceRequired:1b}");
+                        spin(ctx, server, 2.5, -62, 0.5, -90, -90, 5);
+                        waitUntilDown(ctx, 100);
+                        ctx.waitTicks(10);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(25);
+                        // Dying.
+                        server.runCommand("summon minecraft:husk 6.5 -62 0.5 " + STILL);
+                        tp(ctx, server, 2.5, -62, 0.5, -90, 0);
+                        ctx.waitTicks(10);
+                        ctx.getInput().holdKey(USE);
+                        ctx.waitTicks(12);
+                        server.runCommand("kill @e[type=minecraft:husk]");
+                        ctx.waitTicks(3);
+                        ctx.getInput().releaseKey(USE);
+                        ctx.waitTicks(40);
+                        // Sprinting, on land in the rain.
+                        server.runCommand("weather rain");
+                        for (int i = 0; i < 120 && ctx.computeOnClient(mc -> mc.level.getRainLevel(1.0F)) < 0.9F; i++) {
+                            ctx.waitTick();
+                        }
+                        server.runCommand("summon minecraft:husk 22.5 -60 0.5 " + STILL);
+                        tp(ctx, server, 13.5, -60, 0.5, -90, 0);
+                        ctx.getInput().holdKey(USE);
+                        ctx.waitTicks(12);
+                        ctx.getInput().releaseKey(USE);
+                        hold(ctx, 10, W, SPRINT);
+                        ctx.waitTicks(20);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        server.runCommand("weather clear");
+                        for (int i = 0; i < 120 && ctx.computeOnClient(mc -> mc.level.getRainLevel(1.0F)) > 0.0F; i++) {
+                            ctx.waitTick();
+                        }
+                        ctx.waitTicks(25);
+                        // Mounted while spinning.
+                        server.runCommand("summon minecraft:horse 20.5 -60 8.5 {NoAI:1b,Silent:1b,Tame:1b}");
+                        spin(ctx, server, 2.5, -62, 0.5, -90, -90, 3);
+                        server.runCommand("ride @p mount @e[type=minecraft:horse,limit=1]");
+                        ctx.waitTicks(20);
+                        server.runCommand("ride @p dismount");
+                        ctx.waitTicks(10);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(25);
+                    }),
             new Scenario("wind_charge",
                     "Wearing an elytra: jump looking straight down and throw a wind charge at the floor near the top of the jump: the explosion's knockback (the server's explode packet) launches the player, who presses jump in the air to glide east and lands. Then the same without gliding.",
                     List.of(ELYTRA, UNHURT, "item replace entity @a hotbar.0 with minecraft:wind_charge 16"),
@@ -2788,6 +2860,18 @@ public final class Scenarios {
                         server.runCommand("fillbiome 26 4 -8 31 35 -1 minecraft:plains");
                         ctx.waitTicks(5);
                     }));
+
+    /**
+     * Teleports the player to (x, y, z), launches with a riptide trident held 12 ticks, and
+     * waits {@code after} ticks.
+     */
+    private static void spin(ClientGameTestContext ctx, TestServerContext server, double x, double y, double z,
+            double yaw, double pitch, int after) {
+        tp(ctx, server, x, y, z, yaw, pitch);
+        ctx.waitTicks(10);
+        hold(ctx, 12, USE);
+        ctx.waitTicks(after);
+    }
 
     /**
      * Teleports the player to (x, y, z) looking straight down, holds the use key 15 ticks

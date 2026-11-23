@@ -230,6 +230,7 @@ impl<'a> World<'a> {
             blocks: self.blocks,
             tags: self.tags,
             colliders: &[],
+            others: None,
         }
     }
 
@@ -628,6 +629,7 @@ impl GameMode {
             blocks: w.blocks,
             tags: w.tags,
             colliders: &colliders,
+            others: None,
         };
         p.release_using_item(&env);
     }
@@ -893,6 +895,7 @@ fn item_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> (Outcome, Opt
                 blocks: w.blocks,
                 tags: w.tags,
                 colliders: &[],
+                others: None,
             };
             if stack.next_damage_will_break()
                 || stack.c.spin_attack_strength > 0.0 && !p.is_in_water_or_rain(&env)

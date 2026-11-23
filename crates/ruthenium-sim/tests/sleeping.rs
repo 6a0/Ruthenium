@@ -39,6 +39,7 @@ fn a_sleeper_lies_an_eighth_above_the_bed() {
         blocks: &blocks,
         tags: &tags,
         colliders: &[],
+        others: None,
     };
     let field = types
         .player_fields()

@@ -836,6 +836,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         clip(&env, from, to, fluid, "minecraft:air", shapes)
     }
@@ -1183,6 +1184,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         pick(
             &env,

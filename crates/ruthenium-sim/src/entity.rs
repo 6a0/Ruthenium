@@ -957,18 +957,22 @@ impl Entity {
         &self.info
     }
 
+    /// `isSpectator`: a player by its player-list entry
+    /// (`AbstractClientPlayer.gameMode`).
+    fn is_spectator(&self, players: &PlayerInfos) -> bool {
+        self.info.player
+            && players
+                .get(self.uuid)
+                .is_some_and(|i| i.game_mode == play::SPECTATOR)
+    }
+
     /// `isPickable` (`EntitySelector.CAN_BE_PICKED`): a player is a spectator by its
     /// player-list entry (`AbstractClientPlayer.gameMode`).
     pub fn is_pickable(&self, players: &PlayerInfos) -> bool {
         match self.info.pickable {
             Pickable::No => false,
             Pickable::NotRemoved => !self.removed,
-            Pickable::Player => {
-                !self.removed
-                    && !players
-                        .get(self.uuid)
-                        .is_some_and(|i| i.game_mode == play::SPECTATOR)
-            }
+            Pickable::Player => !self.removed && !self.is_spectator(players),
             Pickable::ArmorStand => !self.removed && !self.marker,
             Pickable::Always => true,
             Pickable::Projectile { redirectable } => redirectable,
@@ -1630,6 +1634,15 @@ impl Entities {
         out
     }
 
+    /// What `Level.getEntities(player, b)` finds for the local player: the entities
+    /// touching `b` in order, spectators aside. (The ender dragon's parts aren't
+    /// tracked.)
+    pub fn touching(&self, b: &Aabb, players: &PlayerInfos) -> Vec<&Entity> {
+        let mut found = self.in_box(b);
+        found.retain(|e| !e.removed && !e.is_spectator(players));
+        found
+    }
+
     /// The ids in tick order, the local player's among them.
     pub fn tick_order(&self) -> &[i32] {
         &self.ticking
@@ -2195,13 +2208,14 @@ impl Entities {
     }
 
     /// `ClientLevel.tickEntities`: every entity that ticks, in order, the local player
-    /// in its place (`tick_player` runs its tick), each vehicle's passengers right after
+    /// in its place (`tick_player` runs its tick, among the entities as they are then
+    /// and the boxes it collides with), each vehicle's passengers right after
     /// it.
     pub fn tick(
         &mut self,
         cx: &TickContext<'_, '_>,
         player: &mut LocalPlayer,
-        mut tick_player: impl FnMut(&mut LocalPlayer, &[Aabb]),
+        mut tick_player: impl FnMut(&mut LocalPlayer, &Entities, &[Aabb]),
     ) {
         // The list as it was when the iteration began (`EntityTickList` copies it if
         // it changes meanwhile).
@@ -2221,7 +2235,7 @@ impl Entities {
                 }
                 self.sync_riding(player);
                 let colliders = self.colliders(player);
-                tick_player(player, &colliders);
+                tick_player(player, self, &colliders);
                 self.tick_local_passengers(cx, player, speed, &mut tick_player);
                 continue;
             }
@@ -2353,7 +2367,7 @@ impl Entities {
         &mut self,
         vehicle: i32,
         player: &mut LocalPlayer,
-        tick_player: &mut dyn FnMut(&mut LocalPlayer, &[Aabb]),
+        tick_player: &mut dyn FnMut(&mut LocalPlayer, &Entities, &[Aabb]),
     ) {
         if !player.is_alive() {
             // `isRemoved`: off the vehicle.
@@ -2366,7 +2380,7 @@ impl Entities {
         self.sync_riding(player);
         player.delta = [0.0; 3];
         let colliders = self.colliders(player);
-        tick_player(player, &colliders);
+        tick_player(player, self, &colliders);
         self.position_local_rider(vehicle, player);
         player.fall_distance = 0.0;
         player.hands_busy = false;
@@ -2600,7 +2614,7 @@ impl Entities {
         player: &mut LocalPlayer,
         speed: f32,
         riding: bool,
-        tick_player: &mut dyn FnMut(&mut LocalPlayer, &[Aabb]),
+        tick_player: &mut dyn FnMut(&mut LocalPlayer, &Entities, &[Aabb]),
     ) {
         let free = |b: &Aabb| cx.env.no_collision(b);
         let Some(e) = self.entities.get_mut(&id) else {
@@ -2655,7 +2669,7 @@ impl Entities {
         cx: &TickContext<'_, '_>,
         player: &mut LocalPlayer,
         speed: f32,
-        tick_player: &mut dyn FnMut(&mut LocalPlayer, &[Aabb]),
+        tick_player: &mut dyn FnMut(&mut LocalPlayer, &Entities, &[Aabb]),
     ) {
         let Some(local) = self.local_id else {
             return;
@@ -2910,6 +2924,7 @@ mod tests {
     const BAT: i32 = 2;
     const PIG: i32 = 4;
     const STRIDER: i32 = 5;
+    const REMOTE_PLAYER: i32 = 6;
     const PLAYER_ID: i32 = 1;
 
     fn data(
@@ -2994,6 +3009,13 @@ mod tests {
                     ("Strider.DATA_SUFFOCATING", 18),
                 ],
             ),
+            data(
+                6,
+                "minecraft:player",
+                &["Player", "Avatar", "LivingEntity", "Entity"],
+                (0.6, 1.8),
+                &[],
+            ),
         ])
     }
 
@@ -3057,6 +3079,7 @@ mod tests {
             blocks: &blocks,
             tags: &tags,
             colliders: &[],
+            others: None,
         };
         let players = PlayerInfos::default();
         let cx = TickContext {
@@ -3072,7 +3095,7 @@ mod tests {
             runs_normally: true,
             game_time: 0,
         };
-        e.tick(&cx, player, |_, _| {});
+        e.tick(&cx, player, |_, _, _| {});
     }
 
     /// `Entity.push` as vanilla computes it for an `(dx, dz)` from the pushed one to the
@@ -3109,6 +3132,92 @@ mod tests {
         p.removed = true;
         tick(&mut e, &Teams::default(), &mut p);
         assert_eq!(p.delta, [0.0; 3]);
+    }
+
+    #[test]
+    fn a_riptide_spin_hits_what_it_touches() {
+        let (level, blocks, tags) = world();
+        let mut players = PlayerInfos::default();
+        players.update(
+            play::PLAYER_INFO_ADD,
+            &[play::PlayerInfoEntry {
+                uuid: 1007,
+                name: Some("Alex".into()),
+                game_mode: None,
+            }],
+        );
+        let mut e = Entities::new(PLAYER_ID, false);
+        e.chunk_loaded(0, 0);
+        let other = play::AddEntity {
+            entity_id: 7,
+            uuid: 1007,
+            entity_type: REMOTE_PLAYER,
+            position: [8.0, -60.0, 8.0],
+            movement: [0.0; 3],
+            x_rot: 0,
+            y_rot: 0,
+            y_head_rot: 0,
+            data: 0,
+        };
+        e.add(&other, &types(), &players);
+        let spin = |e: &Entities, players: &PlayerInfos| {
+            let env = Env {
+                level: &level,
+                blocks: &blocks,
+                tags: &tags,
+                colliders: &[],
+                others: Some(crate::player::Others {
+                    entities: e,
+                    players,
+                }),
+            };
+            // A full-strength sprinting spin that went over x 6 to 10 this tick, into a
+            // wall.
+            let mut p = player_at([6.0, -60.0, 8.0]);
+            let before = p.bounding_box();
+            p.position[0] = 10.0;
+            p.delta = [2.0, 0.5, -1.0];
+            p.horizontal_collision = true;
+            p.attack_strength_ticker = 50;
+            p.item_swap_ticker = 50;
+            p.auto_spin_attack_ticks = 10;
+            p.sprinting = true;
+            p.check_auto_spin_attack(&env, &before);
+            p
+        };
+        // Another player takes the hit: the sprint slows the attacker before the bounce.
+        let p = spin(&e, &players);
+        assert_eq!(p.delta, [2.0 * 0.6 * -0.2, 0.5 * -0.2, -0.6 * -0.2]);
+        assert!(!p.sprinting);
+        assert_eq!(p.auto_spin_attack_ticks, 0);
+        // `onAttack` starts only the attack strength over.
+        assert_eq!((p.attack_strength_ticker, p.item_swap_ticker), (0, 50));
+        // A spectator isn't touched: the wall ends the spin.
+        players.update(
+            play::PLAYER_INFO_GAME_MODE,
+            &[play::PlayerInfoEntry {
+                uuid: 1007,
+                name: None,
+                game_mode: Some(play::SPECTATOR),
+            }],
+        );
+        let p = spin(&e, &players);
+        assert_eq!((p.delta, p.sprinting), ([2.0, 0.5, -1.0], true));
+        assert_eq!(
+            (p.auto_spin_attack_ticks, p.attack_strength_ticker),
+            (0, 50)
+        );
+        // A boat isn't hit, but the spin goes on against the wall.
+        add(&mut e, 8, BOAT, [8.0, -60.0, 8.0]);
+        let p = spin(&e, &players);
+        assert_eq!((p.delta, p.auto_spin_attack_ticks), ([2.0, 0.5, -1.0], 10));
+        assert_eq!(p.attack_strength_ticker, 50);
+        // A mob is hit and bounced off, but doesn't slow the sprint.
+        add(&mut e, 9, ZOMBIE, [8.0, -60.0, 8.0]);
+        let p = spin(&e, &players);
+        assert_eq!(p.delta, [2.0 * -0.2, 0.5 * -0.2, 0.2]);
+        assert!(p.sprinting);
+        assert_eq!((p.auto_spin_attack_ticks, p.attack_strength_ticker), (0, 0));
     }
 
     #[test]

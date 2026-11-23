@@ -18,7 +18,7 @@ use ruthenium_sim::interact::{self, GameMode, UseKeys};
 use ruthenium_sim::inventory::{Hand, SLOT_OFFHAND};
 use ruthenium_sim::item::Items;
 use ruthenium_sim::pick::HitResult;
-use ruthenium_sim::player::{Env, Keys, LocalPlayer, Pose};
+use ruthenium_sim::player::{Env, Keys, LocalPlayer, Others, Pose};
 use ruthenium_sim::predict::Predictions;
 use ruthenium_sim::session::pick_target;
 use ruthenium_sim::world::Level;
@@ -527,6 +527,7 @@ fn handle(
                         blocks: &d.blocks,
                         tags: &d.tags,
                         colliders: &[],
+                        others: None,
                     });
                 }
             } else {
@@ -744,6 +745,7 @@ fn handle(
                 blocks: &d.blocks,
                 tags: &d.tags,
                 colliders: &colliders,
+                others: None,
             })
         }
         // `pushFromExplosion`: the knockback is added, if finite.
@@ -771,6 +773,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         blocks,
         tags,
         colliders: &[],
+        others: None,
     };
     let tp: Vec<f64> = t.header["teleport"]
         .as_str()
@@ -960,6 +963,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             blocks,
             tags,
             colliders: &[],
+            others: None,
         };
         let hit = pick_target(&env, &client.entities, &client.players, &p);
         // `Gui.tick`: a dead player with no screen open gets the death screen, which lets
@@ -1027,6 +1031,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             blocks,
             tags,
             colliders: &[],
+            others: None,
         };
         // The level's game time as the tick runs (the trace has it after `level.tick`
         // added one).
@@ -1054,9 +1059,20 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         // The player ticks once loaded and while still in the level; then the block
         // entities (pistons push it, shulker boxes' lids lift it); `sendChanges` only for
         // a player still in it after the tick.
-        client.entities.tick(&cx, &mut p, |p, colliders| {
+        client.entities.tick(&cx, &mut p, |p, entities, colliders| {
             if loaded && p.is_alive() {
-                p.tick(&Env { colliders, ..env }, held);
+                let others = Some(Others {
+                    entities,
+                    players: &client.players,
+                });
+                p.tick(
+                    &Env {
+                        colliders,
+                        others,
+                        ..env
+                    },
+                    held,
+                );
             }
         });
         let mut vehicle = client.entities.take_controlled_vehicle(&p);
@@ -1424,7 +1440,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 }
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 84] = [
+const EXACT: [&str; 85] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1509,6 +1525,7 @@ const EXACT: [&str; 84] = [
     "scale_large",
     "sleeping",
     "rain",
+    "riptide_hit",
 ];
 
 #[test]
@@ -1617,6 +1634,7 @@ fn golden_traces() {
         "scale_large",
         "sleeping",
         "rain",
+        "riptide_hit",
     ];
     // RUTHENIUM_TRACES=a,b replays only those.
     let only = std::env::var("RUTHENIUM_TRACES").ok();

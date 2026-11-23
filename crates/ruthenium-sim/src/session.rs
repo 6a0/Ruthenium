@@ -49,7 +49,7 @@ use crate::inventory::Hand;
 use crate::item::Items;
 use crate::level_load::LevelLoad;
 use crate::pick;
-use crate::player::{Env, Keys, LocalPlayer, Pose};
+use crate::player::{Env, Keys, LocalPlayer, Others, Pose};
 use crate::predict::Predictions;
 use crate::weather::Weather;
 use crate::world::{BiomeInfo, Level, global_bits};
@@ -1045,6 +1045,7 @@ impl Game {
                 blocks: &physics.blocks,
                 tags: &self.tags,
                 colliders: &[],
+                others: None,
             };
             let hit = pick_target(&env, &w.entities, &self.players, &w.player);
             for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
@@ -1084,6 +1085,7 @@ impl Game {
             blocks: &physics.blocks,
             tags: &self.tags,
             colliders: &[],
+            others: None,
         };
         // `level.tickEntities`: the entities in order, the player among them, which
         // ticks and sends its changes (`sendPosition`) only once it has loaded.
@@ -1101,13 +1103,21 @@ impl Game {
             game_time: w.game_time,
         };
         let (loaded, keys) = (w.loaded, self.keys);
-        w.entities.tick(&cx, &mut w.player, |player, colliders| {
-            // A player taken out of the level (20 ticks after dying) no longer ticks.
-            if loaded && player.is_alive() {
-                let env = Env { colliders, ..env };
-                player.tick(&env, keys);
-            }
-        });
+        w.entities
+            .tick(&cx, &mut w.player, |player, entities, colliders| {
+                // A player taken out of the level (20 ticks after dying) no longer ticks.
+                if loaded && player.is_alive() {
+                    let env = Env {
+                        colliders,
+                        others: Some(Others {
+                            entities,
+                            players: &self.players,
+                        }),
+                        ..env
+                    };
+                    player.tick(&env, keys);
+                }
+            });
         // `tickBlockEntities`: moving pistons and shulker boxes' lids, which push the
         // player; then `sendChanges`, for a player still in the level.
         if !w.frozen {
@@ -1569,6 +1579,7 @@ impl Game {
                                 blocks: &physics.blocks,
                                 tags: &self.tags,
                                 colliders: &[],
+                                others: None,
                             });
                         }
                     } else {
@@ -1717,6 +1728,7 @@ impl Game {
                                     blocks: &physics.blocks,
                                     tags: &self.tags,
                                     colliders: &colliders,
+                                    others: None,
                                 };
                                 w.player.complete_using_item(&env);
                             }
