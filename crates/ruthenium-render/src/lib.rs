@@ -20,8 +20,8 @@ use std::sync::Arc;
 use ruthenium_gpu::{
     Arrival, COLOR_RANGE, FrameData, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
     PUSH_CONSTANT_STAGES, PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented,
-    Screenshot, TextureDesc, TextureId, TextureTable, UploadCheck, UploadCheckReport, UploadRing,
-    Validation, vk,
+    Screenshot, SwapchainInfo, TextureDesc, TextureId, TextureTable, UploadCheck,
+    UploadCheckReport, UploadRing, Validation, vk,
 };
 use ruthenium_platform::{Platform, Window};
 
@@ -104,10 +104,15 @@ pub struct Renderer {
     /// The next presented frame is copied for a screenshot.
     screenshot_requested: bool,
     screenshot: Option<Screenshot>,
+    /// The frame, swapchain and "first image of that swapchain" of the last screenshot
+    /// recorded.
+    screenshot_of: Option<(u64, u32, bool)>,
     /// The menus' backdrop, while frames draw shapes.
     backdrop: Option<backdrop::Backdrop>,
-    /// The window's size as last acquired: the size the backdrop is made for.
-    window_extent: vk::Extent2D,
+    /// Frames that drew glass shapes into the window without a backdrop to sample.
+    glass_fallbacks: u64,
+    /// `--exercise-swapchain`: every so often a frame replaces its swapchain twice.
+    exercise_recreation: bool,
 }
 
 impl Renderer {
@@ -167,11 +172,10 @@ impl Renderer {
             check: None,
             screenshot_requested: false,
             screenshot: None,
+            screenshot_of: None,
             backdrop: None,
-            window_extent: vk::Extent2D {
-                width: pixel_size.0,
-                height: pixel_size.1,
-            },
+            glass_fallbacks: 0,
+            exercise_recreation: false,
         })
     }
 
@@ -236,6 +240,25 @@ impl Renderer {
         }
     }
 
+    /// Which frame the last screenshot recorded was of, which swapchain it drew to
+    /// ([`ruthenium_gpu::SwapchainInfo::generation`]) and whether it was the first frame
+    /// drawn to that swapchain.
+    pub fn screenshot_of(&self) -> Option<(u64, u32, bool)> {
+        self.screenshot_of
+    }
+
+    /// Frames that drew glass shapes into the window with no backdrop behind them (a flat
+    /// tint instead): none, unless the backdrop's images could not be made.
+    pub fn glass_fallbacks(&self) -> u64 {
+        self.glass_fallbacks
+    }
+
+    /// Development: now and then, replace the swapchain a second time in one frame, so
+    /// one is retired that no frame drew to (see also [`FrameLoop::invalidate`]).
+    pub fn exercise_recreation(&mut self) {
+        self.exercise_recreation = true;
+    }
+
     /// The development overlay (hidden until `set_visible`).
     pub fn overlay_mut(&mut self) -> &mut Overlay {
         &mut self.overlay
@@ -254,32 +277,40 @@ impl Renderer {
     }
 
     /// Creates the backdrop's images when shapes are drawn (before the texture table's
-    /// `begin_frame`, so this frame's set holds them), remakes them when the window size or
-    /// format changed, and frees them when no shapes are drawn.
-    fn update_backdrop(&mut self, wanted: bool) {
-        let (format, extent) = (self.pipelines.format(), self.window_extent);
-        let fits = self
+    /// `begin_frame`, so this frame's set holds them), remakes them for the swapchain this
+    /// frame draws to when its size or format differs, and frees them when no shapes are
+    /// drawn. Without a swapchain (a minimised window) they stay as they are.
+    fn update_backdrop(&mut self, wanted: bool, surface: Option<SwapchainInfo>) {
+        if !wanted {
+            if let Some(old) = self.backdrop.take() {
+                old.destroy(&mut self.textures);
+            }
+            return;
+        }
+        let Some(s) = surface else {
+            return;
+        };
+        if self
             .backdrop
             .as_ref()
-            .is_some_and(|b| b.matches(format, extent));
-        if wanted && fits {
+            .is_some_and(|b| b.matches(s.format, s.extent))
+        {
             return;
         }
         if let Some(old) = self.backdrop.take() {
             old.destroy(&mut self.textures);
         }
-        if wanted && extent.width > 0 && extent.height > 0 {
-            match backdrop::Backdrop::new(&mut self.textures, format, extent) {
-                Ok(b) => self.backdrop = Some(b),
-                // Glass falls back to a flat tint.
-                Err(e) => eprintln!("[render] no glass backdrop: {e}"),
-            }
+        match backdrop::Backdrop::new(&mut self.textures, s.format, s.extent) {
+            Ok(b) => self.backdrop = Some(b),
+            // Glass falls back to a flat tint.
+            Err(e) => eprintln!("[render] no glass backdrop: {e}"),
         }
     }
 
     /// Rebuilds the pipelines if the swapchain's format changed (rare: a different monitor
-    /// or surface). Waits for earlier frames, which may still use the old pipelines.
-    /// Returns whether the pipelines were rebuilt.
+    /// or surface), before the frame records anything with them. Waits for earlier frames,
+    /// which may still use the old pipelines. Returns whether the pipelines were rebuilt
+    /// (they are then not warmed up).
     fn ensure_format(&mut self, format: vk::Format) -> Result<bool, ruthenium_gpu::Error> {
         if format == self.pipelines.format() {
             return Ok(false);
@@ -305,8 +336,18 @@ impl Renderer {
         profiling::scope!("render");
         let (mut ctx, gpu_time) = self.frames.begin()?;
         let completed = self.frames.completed()?;
+        // The swapchain this frame draws to, replaced first if the window changed, so that
+        // everything below is chosen and recorded for its format and size.
+        let mut surface = self.frames.prepare()?;
+        if self.exercise_recreation && ctx.number.is_multiple_of(97) {
+            self.frames.invalidate();
+            surface = self.frames.prepare()?;
+        }
+        if let Some(s) = surface {
+            self.ensure_format(s.format)?;
+        }
         let wants_backdrop = gui.is_some_and(|g| !g.shapes.is_empty());
-        self.update_backdrop(wants_backdrop);
+        self.update_backdrop(wants_backdrop, surface);
         // SAFETY: ctx.cmd is recording frame ctx.number on the graphics queue; completed
         // was just read from the timeline; every upload destination is owned by self and
         // outlives the frame; the layout's set 0 is the texture table's.
@@ -331,35 +372,36 @@ impl Renderer {
                 self.frames.zone_end(&ctx, zone);
             }
         }
-        // Off-screen passes will be recorded here, before the late acquire.
+        // Off-screen passes, before the late acquire: the backdrop for this swapchain's
+        // size and format. It stays drawn if the acquire then gives no image.
+        let backdrop = match (&mut self.backdrop, surface) {
+            (Some(b), Some(s)) if wants_backdrop && b.matches(s.format, s.extent) => {
+                let zone = self.frames.zone_begin(&ctx, "backdrop");
+                // SAFETY: outside a render pass, sets bound; the images were created
+                // before this frame's begin_frame; the pipelines are for this format.
+                unsafe {
+                    b.record(
+                        self.frames.gpu(),
+                        ctx.cmd,
+                        &self.pipelines,
+                        &self.layout,
+                        background,
+                        self.stars,
+                    )
+                };
+                self.frames.zone_end(&ctx, zone);
+                Some(b.textures())
+            }
+            _ => None,
+        };
         let target = self.frames.acquire(&ctx)?;
         if let Some(t) = target {
-            if self.ensure_format(t.format)? {
-                // SAFETY: as above; outside a render pass.
-                unsafe { self.pipelines.record_warm_up(ctx.cmd, &self.layout)? };
+            // The image is from the swapchain prepared above.
+            debug_assert_eq!(t.format, self.pipelines.format());
+            debug_assert_eq!(Some(t.extent), surface.map(|s| s.extent));
+            if wants_backdrop && backdrop.is_none() {
+                self.glass_fallbacks += 1;
             }
-            self.window_extent = t.extent;
-            // The backdrop for this size and format (else it is remade next frame).
-            let backdrop = match &mut self.backdrop {
-                Some(b) if wants_backdrop && b.matches(t.format, t.extent) => {
-                    let zone = self.frames.zone_begin(&ctx, "backdrop");
-                    // SAFETY: outside a render pass, sets bound; the images were created
-                    // before this frame's begin_frame.
-                    unsafe {
-                        b.record(
-                            self.frames.gpu(),
-                            ctx.cmd,
-                            &self.pipelines,
-                            &self.layout,
-                            background,
-                            self.stars,
-                        )
-                    };
-                    self.frames.zone_end(&ctx, zone);
-                    Some(b.textures())
-                }
-                _ => None,
-            };
             let zone = self.frames.zone_begin(&ctx, "window pass");
             let gpu = self.frames.gpu().clone();
             let cmd = ctx.cmd;
@@ -517,6 +559,7 @@ impl Renderer {
                 };
                 if let Some(s) = shot {
                     // It made the transition to PRESENT_SRC itself.
+                    self.screenshot_of = Some((ctx.number, t.generation, t.first));
                     self.screenshot = Some(s);
                     self.screenshot_requested = false;
                 } else {

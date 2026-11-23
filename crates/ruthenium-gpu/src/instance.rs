@@ -46,6 +46,11 @@ pub struct Instance {
     pub(crate) surface_fn: ash::khr::surface::Instance,
     debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     pub(crate) api_version: u32,
+    /// `VK_KHR_surface_maintenance1` and `VK_EXT_surface_maintenance1` are enabled (each
+    /// with `VK_KHR_get_surface_capabilities2`, which both need): what a device's
+    /// swapchain maintenance extension of the same kind depends on.
+    pub(crate) surface_maintenance_khr: bool,
+    pub(crate) surface_maintenance_ext: bool,
 }
 
 impl std::fmt::Debug for Instance {
@@ -108,6 +113,27 @@ impl Instance {
         if has_ext(ash::khr::portability_enumeration::NAME) {
             extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
             flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+        }
+        // Swapchain maintenance is a device extension that depends on these. Both kinds are
+        // enabled when the loader has them, so the device can use whichever chain is whole.
+        let mut enable = |name: &'static CStr| {
+            if !desc.surface_extensions.contains(&name) {
+                extensions.push(name.as_ptr());
+            }
+        };
+        let surface_caps2 = has_ext(ash::khr::get_surface_capabilities2::NAME);
+        if surface_caps2 {
+            enable(ash::khr::get_surface_capabilities2::NAME);
+        }
+        let surface_maintenance_khr =
+            surface_caps2 && has_ext(ash::khr::surface_maintenance1::NAME);
+        if surface_maintenance_khr {
+            enable(ash::khr::surface_maintenance1::NAME);
+        }
+        let surface_maintenance_ext =
+            surface_caps2 && has_ext(ash::ext::surface_maintenance1::NAME);
+        if surface_maintenance_ext {
+            enable(ash::ext::surface_maintenance1::NAME);
         }
         let validate = match desc.validation {
             Validation::Off => false,
@@ -207,6 +233,8 @@ impl Instance {
             surface_fn,
             debug,
             api_version,
+            surface_maintenance_khr,
+            surface_maintenance_ext,
         })
     }
 

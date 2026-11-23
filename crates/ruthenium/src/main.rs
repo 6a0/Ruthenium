@@ -46,7 +46,18 @@ With no command, opens the game window. Options:
                          samples input (default: 0 without VSync, 1 with it)
   --empty-window         draw only the background, no menus (benchmarks)
   --quit-after <s>       close after <s> seconds (for benchmarks and tests)
-  --exercise-swapchain   resize and toggle VSync every few frames (development)
+  --acquire-wait <ms|pace>
+                         how long a frame waits for a swapchain image before it goes
+                         on without presenting: pace (default: until two display or
+                         frame-limiter intervals after its input), or <ms> at most
+  --swapchain-maintenance <auto|khr|ext|none>
+                         use only this swapchain maintenance extension, or none
+                         (default auto: KHR, else EXT, else none)
+  --exercise-swapchain   resize, toggle VSync, replace the swapchain and capture
+                         frames every few frames (development)
+  --pretend-srgb-surface <start|recreate>
+                         treat the window's surface as offering only sRGB formats,
+                         from the start or from the second swapchain (development)
   --exercise-minimize    minimise the window and bring it back every 1.5 s
                          (development; Wayland cannot bring it back)
   --no-pipeline-cache    don't load or save the pipeline cache
@@ -55,6 +66,9 @@ With no command, opens the game window. Options:
                          (development; a mismatch fails the run)
   --screenshot <file>    write the window to a PNG, then quit (development); runs
                          on the default settings unless --data-dir is given
+  --screenshot-resize <WxH>
+                         with --screenshot: resize the window first, and capture the
+                         first frame at the new size
   --data-dir <folder>    Ruthenium's data folder (accounts, servers, settings in
                          config/client.toml); default: the per-user one
   --join <address>       join this server at once (development)

@@ -134,9 +134,14 @@ pub struct Telemetry {
     pub cpu: FrameTimes,
     pub gpu: FrameTimes,
     pub phases: [FrameTimes; PHASE_COUNT],
-    /// Frames rendered, and those of them that presented nothing, warm-up included.
+    /// Time from one frame sampling its input to the next doing so (frames of a hidden or
+    /// covered window, which are throttled, left out): how promptly events are handled.
+    pub event_gap: FrameTimes,
+    /// Frames rendered, those of them that presented nothing, and the time those took,
+    /// warm-up included.
     pub frames: u64,
     pub skipped: u64,
+    pub skipped_ns: u64,
     log: Option<Vec<FrameSample>>,
     /// Frames the log had no room for.
     unlogged: u64,
@@ -149,8 +154,10 @@ impl Telemetry {
             cpu: FrameTimes::unbounded(),
             gpu: FrameTimes::unbounded(),
             phases: std::array::from_fn(|_| FrameTimes::unbounded()),
+            event_gap: FrameTimes::unbounded(),
             frames: 0,
             skipped: 0,
+            skipped_ns: 0,
             log: log.then(|| Vec::with_capacity(LOG_FRAMES)),
             unlogged: 0,
         }
@@ -159,7 +166,10 @@ impl Telemetry {
     /// Adds a frame: to the log always, to the statistics once `measuring`.
     pub fn frame(&mut self, s: &FrameSample, measuring: bool) {
         self.frames += 1;
-        self.skipped += u64::from(!s.presented);
+        if !s.presented {
+            self.skipped += 1;
+            self.skipped_ns += s.phases[LIMITER] + s.phases[GOVERNOR] + s.cpu_ns;
+        }
         if let Some(log) = &mut self.log {
             if log.len() < log.capacity() {
                 log.push(*s);
@@ -176,6 +186,13 @@ impl Telemetry {
         self.cpu.push(s.cpu_ns);
         for (series, &v) in self.phases.iter_mut().zip(&s.phases) {
             series.push(v);
+        }
+    }
+
+    /// Adds the time since the frame before this one sampled its input.
+    pub fn event_gap(&mut self, ns: u64, measuring: bool) {
+        if measuring {
+            self.event_gap.push(ns);
         }
     }
 
@@ -238,8 +255,9 @@ impl Telemetry {
     pub fn main_thread_line(&self, c: &FrameCounters) -> String {
         let p = |i: usize| self.phases[i].summary();
         let (work, governor, acquire, present) = (p(WORK), p(GOVERNOR), p(ACQUIRE), p(PRESENT));
+        let events = self.event_gap.summary();
         format!(
-            "main thread: work p50 {:.3} ms, p99 {:.3} ms; governor p50 {:.3} ms; acquire p50 {:.3} ms, p99 {:.3} ms, max {:.2} ms; present p50 {:.3} ms, p99 {:.3} ms; {} images ({} suboptimal), {} timeouts, {} not ready, {} out of date, {} frames without a surface, {} swapchains",
+            "main thread: work p50 {:.3} ms, p99 {:.3} ms; governor p50 {:.3} ms; acquire p50 {:.3} ms, p99 {:.3} ms, max {:.2} ms; present p50 {:.3} ms, p99 {:.3} ms; events every {:.3} ms, p99 {:.2} ms, max {:.2} ms; {} of {} frames without a present ({:.0} ms); {} images ({} suboptimal), {} timeouts, {} not ready, {} out of date, {} frames without a surface, {} swapchains",
             work.p50_ms,
             work.p99_ms,
             governor.p50_ms,
@@ -248,6 +266,12 @@ impl Telemetry {
             acquire.max_ms,
             present.p50_ms,
             present.p99_ms,
+            events.p50_ms,
+            events.p99_ms,
+            events.max_ms,
+            self.skipped,
+            self.frames,
+            self.skipped_ns as f64 / 1e6,
             c.images,
             c.suboptimal,
             c.timeouts,
@@ -280,10 +304,14 @@ impl Telemetry {
                 "unified_memory": run.caps.unified_memory,
                 "texture_slots": run.caps.texture_slots,
                 "transfer_queue": run.transfer_queue,
+                "swapchain_maintenance": run.caps.swapchain_maintenance.name(),
+                "swapchain_maintenance_khr": run.caps.swapchain_maintenance_khr,
+                "swapchain_maintenance_ext": run.caps.swapchain_maintenance_ext,
             },
             "policy": format!("{:?}", run.policy),
             "present_mode": format!("{:?}", run.swapchain.map(|s| s.present_mode).unwrap_or_default()),
             "frames_ahead": run.frames_ahead,
+            "acquire_wait": run.acquire_wait,
             "fps_cap": run.fps_cap,
             "swapchain": run.swapchain.map(|s| json!({
                 "width": s.extent.width,
@@ -304,6 +332,8 @@ impl Telemetry {
             },
             "frames": self.frames,
             "skipped": self.skipped,
+            "skipped_ms": self.skipped_ns as f64 / 1e6,
+            "event_gap": series(&self.event_gap.summary()),
             "frame": series(&self.interval.summary()),
             "cpu": series(&self.cpu.summary()),
             "gpu_time": series(&self.gpu.summary()),
@@ -321,6 +351,8 @@ impl Telemetry {
                 "out_of_date": c.present_out_of_date,
             },
             "swapchains": c.swapchains,
+            "swapchains_destroyed": c.swapchains_destroyed,
+            "retired_peak": c.retired_peak,
             "memory": {
                 "rss_kib": rss,
                 "rss_peak_kib": peak,
@@ -354,6 +386,8 @@ pub struct RunInfo<'a> {
     pub transfer_queue: bool,
     pub policy: PresentPolicy,
     pub frames_ahead: u64,
+    /// `pace`, or the longest an acquire may block.
+    pub acquire_wait: &'a str,
     pub fps_cap: Option<f64>,
     pub swapchain: Option<SwapchainInfo>,
     pub window_points: (u32, u32),
@@ -459,6 +493,8 @@ mod tests {
             t.frame(&s, frame >= 7);
         }
         assert_eq!((t.frames, t.skipped), (4, 1));
+        // The skipped frame's whole turn of the loop: limiter, governor and the rest.
+        assert_eq!(t.skipped_ns, 100_000 + 300_000 + 600_000);
         assert_eq!(t.cpu.len(), 2);
         assert_eq!(t.phases[ACQUIRE].len(), 2);
         t.gpu_time(
@@ -505,6 +541,7 @@ mod tests {
             transfer_queue: false,
             policy: PresentPolicy::NoVSync,
             frames_ahead: 1,
+            acquire_wait: "100 ms",
             fps_cap: None,
             swapchain: None,
             window_points: (854, 480),

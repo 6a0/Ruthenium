@@ -105,13 +105,60 @@ Two kinds of run came out of the same command. In a quiet one, about one frame i
 
 `--exercise-minimize` minimises the window and brings it back every 1.5 s. Under XWayland (`SDL_VIDEODRIVER=x11`) each return made a new swapchain in about 2.5 ms, with no timeout and no skipped frame; the longest acquire was 60 ms. Wayland has no request to bring a window back, so there the window stays minimised and the loop idles at 10 Hz.
 
+## After the swapchain changes
+
+Measured the same day, on top of `859d243`, in the same conditions. Since the baseline above:
+
+- **A replaced swapchain is destroyed when its presents are over**, not a fixed number of frames later. With `VK_KHR_swapchain_maintenance1` (or the EXT one) every present carries a fence that says so. Without either, the fence of the acquire that next returns the same image does, and a replaced swapchain waits for a present to a later one to finish. `--swapchain-maintenance khr|ext|none` picks the path.
+- **The swapchain is replaced at the start of the frame**, before anything is recorded for its size or format, so a frame never draws glass without its backdrop, and the first frame at a new size is complete.
+- **An acquire waits two display (or frame limiter) intervals after the frame sampled its input**, and at least 8 ms, instead of up to 100 ms. Then the frame is submitted without an image and the loop goes back to its events. `--acquire-wait 100` is the old wait.
+- **A surface with no 8-bit UNORM format in the sRGB colour space is refused** with what it offers instead, at start-up and when a swapchain is replaced. Before, its first format was used, whatever it was.
+
+### Recreation
+
+`--exercise-swapchain` now also replaces the swapchain in the first frame, in three frames running every 60, and twice in one frame every 97, and captures a swapchain's first frame every 60. 8 s under the validation layer, in release:
+
+| | Present fences (KHR) | Present fences, `--acquire-wait 100` | Acquire fences (`none`) |
+|---|---:|---:|---:|
+| Swapchains created | 242 | 230 | 233 |
+| Destroyed while running | 241 | 229 | 230 |
+| Most waiting to be destroyed at once | 2 | 2 | 4 |
+| Recreation, median / maximum ms | 1.05 / 12.4 | 1.07 / 9.1 | 1.04 / 8.1 |
+| Acquire, median / P99 / maximum ms | 0.17 / 10.0 / 11.0 | 0.16 / 27.0 / 36.8 | 0.16 / 9.7 / 10.5 |
+| Acquires given up (frames without a present) | 142, 8.3 ms each | 0 | 127 |
+| From one event poll to the next, P99 / maximum ms | 11.3 / 15.2 | 28.2 / 35.9 | 11.3 / 13.6 |
+| Captures of a swapchain's first frame | 37 | 35 | 35 |
+| Frames that drew glass without its backdrop | 0 | 0 | 0 |
+| Validation messages | 0 | 0 | 0 |
+
+The long acquires are the compositor's, after a resize; another pair of runs had them at 50 to 60 ms, where the fixed wait polled events every 56 ms at P99 and the shorter wait every 12 ms. The frames presented are no closer together with the shorter wait (their P99 interval is 27 ms either way): what it buys is the loop returning to its events, and the next frame being drawn from newer input.
+
+The same exercise passes with the EXT extension, with `--exercise-uploads` (every chunk intact; textures destroyed before their upload arrives included), under XWayland, where a resize makes the acquire report out of date (45 times in 8 s), and on Mesa's llvmpipe, whose present fences are Mesa's own.
+
+A screenshot of the first frame after a resize (`--screenshot-resize`) is identical, pixel for pixel, to one of a window started at that size (2200 × 1240 pixels, the server list with its glass shapes).
+
+### The rest, against the baseline
+
+| | Baseline | Now |
+|---|---:|---:|
+| First frame, pipelines compiled / cached (ms) | 282 / 238 | 275 / 277 |
+| Menus faded in (ms) | 850 / 807 | 844 / 846 |
+| GPU memory, empty window / menus (MiB) | 39 / 56 | 39 / 56 |
+| Uncapped menu, frame time median (ms), A/B of 4 rounds | 0.074 | 0.075 |
+| VSync pacing, quiet runs: P99.9 / median | 1.82 to 1.85 | 1.64 to 1.85 |
+| Minimise and restore under XWayland: longest acquire (ms) | 60 | 11 |
+
+With VSync, three runs of 13 s with each wait, in turns, came out the same: a median of 4.17 to 4.18 ms, P99 of 4.9 to 5.3 ms and P99.9 of 7.4 to 7.7 ms either way. No run was disturbed, so the 34.5 ms bursts of the baseline were not seen and the shorter wait is not measured against them. At start-up it gives up two to five acquires while the compositor maps the window, each about 8 ms, before the measured part of a run.
+
+The uncapped runs showed something about the machine, not the change. It has two states, with a frame time median of 0.075 ms or of 0.128 ms (GPU time 0.020 or 0.026 ms a frame), and moves between them within a run or stays in one for minutes. In 28 runs of 6 s taken in turns, the baseline's build was in the slow state in 3 of 7 and this one in 3 of 7, 2 of 7 and 4 of 7 for its three settings. An A/B here needs the median per second of each run looked at before its averages are believed.
+
 ## Against the targets
 
 | Target | Measured here |
 |---|---|
 | Window visible within 300 ms | Window 121–145 ms, first frame 238–282 ms |
 | Main menu ready within 1.5 s warm | 0.81–0.85 s, the fade-in included |
-| Menu pacing: P99.9 at most 1.5 × median | 1.8 in quiet runs, about 8.5 in disturbed ones: not met |
+| Menu pacing: P99.9 at most 1.5 × median | 1.6 to 1.8 in quiet runs, about 8.5 in disturbed ones: not met |
 | GPU memory at most 300 MB in a world | 39 MiB before any world data, 56 MiB with a menu open |
 | RSS at most 600 MB in a world | 208–215 MiB before any world data, most of it shared libraries |
 
@@ -120,7 +167,8 @@ Two kinds of run came out of the same command. In a quiet one, about one frame i
 - **The Intel iGPU** (Hybrid mode), where memory is shared and the DRM client statistics replace `nvidia-smi`.
 - **The same runs at the `performance` profile on a quiet desktop**, with variable refresh rate off and no capture running. Until then the throughput lows and the VSync pacing are indicative only.
 - **A cold start** with the files out of the page cache.
-- **Occlusion, moving between displays and a stalled compositor**, which need a person at the machine.
+- **Occlusion, moving between displays and a stalled compositor**, which need a person at the machine. They are also where the shorter acquire wait has yet to be measured, together with the CPU an idle, covered window takes with it.
+- **A surface that really offers only sRGB formats.** `--pretend-srgb-surface` hides the others to show that it is refused; presenting to one through UNORM views of a mutable-format swapchain is not built.
 
 ## Reproducing
 
@@ -136,6 +184,11 @@ Every run writes its summary as JSON under `target/bench-menu` or `target/bench-
 ```sh
 ruthenium --vsync --quit-after 15 --frame-log frames.csv
 ruthenium --validation --exercise-swapchain --quit-after 8 --frame-log resize.csv
+ruthenium --validation --exercise-swapchain --exercise-uploads --swapchain-maintenance none --quit-after 8
+ruthenium --screenshot first.png --screenshot-resize 1100x620 --screenshot-after 0.5 --screen servers
+ruthenium --screenshot steady.png --window-size 1100x620 --screenshot-after 0.5 --screen servers
 ```
+
+`--exercise-swapchain` fails the run if a replaced swapchain is not destroyed while the client runs, if a frame draws glass without its backdrop, or on any validation message.
 
 Each line has the frame's number, when its input was sampled, the time in each part of the main thread's frame (limiter, governor, events, game, GUI, recording, and the acquire, submit and present calls), how the acquire ended, and the frame's GPU time.

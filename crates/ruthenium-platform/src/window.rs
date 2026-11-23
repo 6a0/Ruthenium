@@ -11,9 +11,10 @@ use sdl3_sys::events::{
 use sdl3_sys::hints::SDL_SetHint;
 use sdl3_sys::init::{SDL_INIT_VIDEO, SDL_Init, SDL_Quit, SDL_SetAppMetadata};
 use sdl3_sys::video::{
-    SDL_CreateWindow, SDL_DestroyWindow, SDL_GetWindowSize, SDL_GetWindowSizeInPixels,
-    SDL_MinimizeWindow, SDL_RestoreWindow, SDL_SetWindowFullscreen, SDL_SetWindowSize,
-    SDL_WINDOW_HIGH_PIXEL_DENSITY, SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN, SDL_Window,
+    SDL_CreateWindow, SDL_DestroyWindow, SDL_GetCurrentDisplayMode, SDL_GetDisplayForWindow,
+    SDL_GetWindowSize, SDL_GetWindowSizeInPixels, SDL_MinimizeWindow, SDL_RestoreWindow,
+    SDL_SetWindowFullscreen, SDL_SetWindowSize, SDL_WINDOW_HIGH_PIXEL_DENSITY,
+    SDL_WINDOW_RESIZABLE, SDL_WINDOW_VULKAN, SDL_Window,
 };
 use sdl3_sys::vulkan::{
     SDL_Vulkan_CreateSurface, SDL_Vulkan_GetInstanceExtensions,
@@ -285,6 +286,17 @@ impl Window {
         );
         // SAFETY: raw is a live window.
         unsafe { SDL_SetWindowSize(self.raw, w, h) };
+    }
+
+    /// The refresh rate of the display the window is on, in hertz, if SDL knows it.
+    pub fn refresh_rate(&self) -> Option<f32> {
+        // SAFETY: raw is a live window; the mode SDL returns is its own and is only read
+        // here, before any other SDL call.
+        let rate = unsafe {
+            let mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(self.raw));
+            mode.as_ref().map(|m| m.refresh_rate)
+        };
+        rate.filter(|r| r.is_finite() && *r >= 1.0)
     }
 
     /// Asks the window manager to minimise the window (it may refuse).

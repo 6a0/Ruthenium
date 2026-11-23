@@ -22,10 +22,10 @@ mod upload;
 mod upload_check;
 
 pub use ash::vk;
-pub use device::{DeviceCaps, Gpu, GpuOptions, Rejected};
+pub use device::{DeviceCaps, Gpu, GpuOptions, PretendSrgb, Rejected, SwapchainMaintenance};
 pub use frame::{
-    Acquired, FrameCounters, FrameCtx, FrameLoop, FrameTimings, GpuTime, GpuZone, MAX_FRAME_WAITS,
-    MAX_FRAMES_IN_FLIGHT, MAX_GPU_ZONES, Presented, SwapchainInfo, Target,
+    ACQUIRE_TIMEOUT, Acquired, FrameCounters, FrameCtx, FrameLoop, FrameTimings, GpuTime, GpuZone,
+    MAX_FRAME_WAITS, MAX_FRAMES_IN_FLIGHT, MAX_GPU_ZONES, Presented, SwapchainInfo, Target,
 };
 pub use frame_data::{FRAME_DATA_SET, FrameData};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};

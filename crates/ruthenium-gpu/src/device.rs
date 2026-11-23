@@ -28,6 +28,59 @@ pub struct GpuOptions {
     /// Don't use a dedicated transfer queue even if the GPU has one: every upload goes on
     /// the graphics queue (for A/B comparisons and driver problems).
     pub no_transfer_queue: bool,
+    /// Use only this swapchain maintenance chain, or none of them, whatever the device
+    /// has (`None`: KHR if it is whole, else EXT, else neither). For testing each path.
+    pub swapchain_maintenance: Option<SwapchainMaintenance>,
+    /// Development: treat the window's surface as offering only sRGB formats.
+    pub pretend_srgb: PretendSrgb,
+}
+
+/// The swapchain maintenance extension a device was created with. With one, every present
+/// carries a fence that says when it is over; without, that is inferred from the fences of
+/// later acquires (see [`crate::FrameLoop`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SwapchainMaintenance {
+    #[default]
+    None,
+    /// `VK_KHR_swapchain_maintenance1` over `VK_KHR_surface_maintenance1`.
+    Khr,
+    /// `VK_EXT_swapchain_maintenance1` over `VK_EXT_surface_maintenance1`.
+    Ext,
+}
+
+impl SwapchainMaintenance {
+    /// A short name for logs and options.
+    pub fn name(self) -> &'static str {
+        match self {
+            SwapchainMaintenance::None => "none",
+            SwapchainMaintenance::Khr => "khr",
+            SwapchainMaintenance::Ext => "ext",
+        }
+    }
+
+    /// The chain to use out of the whole ones, or the only one allowed.
+    fn choose(khr: bool, ext: bool, only: Option<SwapchainMaintenance>) -> SwapchainMaintenance {
+        match only {
+            Some(SwapchainMaintenance::None) => SwapchainMaintenance::None,
+            Some(SwapchainMaintenance::Khr) if khr => SwapchainMaintenance::Khr,
+            Some(SwapchainMaintenance::Ext) if ext => SwapchainMaintenance::Ext,
+            Some(_) => SwapchainMaintenance::None,
+            None if khr => SwapchainMaintenance::Khr,
+            None if ext => SwapchainMaintenance::Ext,
+            None => SwapchainMaintenance::None,
+        }
+    }
+}
+
+/// When to pretend that the surface offers only sRGB formats ([`GpuOptions::pretend_srgb`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PretendSrgb {
+    #[default]
+    Never,
+    /// From the start: no GPU can present to the window.
+    Always,
+    /// From the second swapchain on: the surface changes under a running client.
+    OnRecreation,
 }
 
 /// A GPU that was not chosen because it misses part of the baseline.
@@ -76,7 +129,12 @@ pub struct DeviceCaps {
     pub present_id2: bool,
     pub present_wait2: bool,
     pub present_timing: bool,
-    pub swapchain_maintenance1: bool,
+    /// The KHR and the EXT swapchain maintenance chains that are whole: the device
+    /// extension, its feature, and the instance extensions it depends on.
+    pub swapchain_maintenance_khr: bool,
+    pub swapchain_maintenance_ext: bool,
+    /// The one the device was created with.
+    pub swapchain_maintenance: SwapchainMaintenance,
     pub memory_budget: bool,
     pub calibrated_timestamps: bool,
     pub low_latency2: bool,
@@ -102,6 +160,7 @@ pub struct Gpu {
     pub(crate) allocations: AtomicU32,
     /// Bytes of live allocations, by [`crate::memory::MemoryUse`].
     pub(crate) allocated: [AtomicU64; crate::memory::MemoryUse::COUNT],
+    pub(crate) pretend_srgb: PretendSrgb,
     caps: DeviceCaps,
     pub(crate) instance: Instance,
 }
@@ -191,7 +250,12 @@ impl Gpu {
     ) -> Result<Gpu, Error> {
         let result = Self::create(&instance, surface, options);
         match result {
-            Ok(parts) => Ok(Gpu::assemble(instance, surface, parts)),
+            Ok(parts) => Ok(Gpu::assemble(
+                instance,
+                surface,
+                parts,
+                options.pretend_srgb,
+            )),
             Err(e) => {
                 // SAFETY: nothing else uses the surface; it was created from this instance.
                 unsafe { instance.surface_fn.destroy_surface(surface, None) };
@@ -211,7 +275,7 @@ impl Gpu {
         let mut rejected = Vec::new();
         let mut candidates = Vec::new();
         for pd in physicals {
-            match evaluate(instance, pd, surface) {
+            match evaluate(instance, pd, surface, options) {
                 Ok(c) => candidates.push(c),
                 Err(r) => rejected.push(r),
             }
@@ -226,6 +290,21 @@ impl Gpu {
             .caps
             .transfer_family
             .filter(|_| !options.no_transfer_queue);
+        let maintenance = SwapchainMaintenance::choose(
+            chosen.caps.swapchain_maintenance_khr,
+            chosen.caps.swapchain_maintenance_ext,
+            options.swapchain_maintenance,
+        );
+        chosen.caps.swapchain_maintenance = maintenance;
+        match maintenance {
+            SwapchainMaintenance::Khr => chosen
+                .extensions
+                .push(ash::khr::swapchain_maintenance1::NAME),
+            SwapchainMaintenance::Ext => chosen
+                .extensions
+                .push(ash::ext::swapchain_maintenance1::NAME),
+            SwapchainMaintenance::None => {}
+        }
         if let Some(p) = prefer
             && !chosen.caps.name.to_lowercase().contains(&p.to_lowercase())
         {
@@ -245,6 +324,7 @@ impl Gpu {
         instance: Instance,
         surface: vk::SurfaceKHR,
         (c, device): (Candidate, ash::Device),
+        pretend_srgb: PretendSrgb,
     ) -> Gpu {
         // SAFETY: the device was created with one queue in this family.
         let queue = unsafe { device.get_device_queue(c.queue_family, 0) };
@@ -280,6 +360,7 @@ impl Gpu {
             memory_properties: c.memory_properties,
             allocations: AtomicU32::new(0),
             allocated: std::array::from_fn(|_| AtomicU64::new(0)),
+            pretend_srgb,
             caps: c.caps,
             instance,
         }
@@ -451,6 +532,7 @@ fn evaluate(
     instance: &Instance,
     pd: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
+    options: &GpuOptions,
 ) -> Result<Candidate, Rejected> {
     let raw = &instance.raw;
     let mut driver_props = vk::PhysicalDeviceDriverProperties::default();
@@ -537,19 +619,33 @@ fn evaluate(
         reasons.push("cannot present to this window".into());
         return Err(reject(name, reasons));
     };
-    // SAFETY: plain queries.
-    let formats = unsafe {
-        instance
-            .surface_fn
-            .get_physical_device_surface_formats(pd, surface)
-    }
+    let formats = crate::swapchain::offered_formats(
+        instance,
+        pd,
+        surface,
+        options.pretend_srgb == PretendSrgb::Always,
+    )
     .unwrap_or_default();
-    if formats.is_empty() {
-        reasons.push("no surface formats for this window".into());
+    if let Err(why) = crate::swapchain::choose_format(&formats) {
+        reasons.push(why);
     }
     if !reasons.is_empty() {
         return Err(reject(name, reasons));
     }
+
+    // A swapchain maintenance chain is whole with its device extension, the instance
+    // extensions that one depends on, and the feature (one structure for both kinds).
+    let maintenance_khr =
+        has(ash::khr::swapchain_maintenance1::NAME) && instance.surface_maintenance_khr;
+    let maintenance_ext =
+        has(ash::ext::swapchain_maintenance1::NAME) && instance.surface_maintenance_ext;
+    let maintenance_feature = (maintenance_khr || maintenance_ext) && {
+        let mut m = vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR::default();
+        let mut f2 = vk::PhysicalDeviceFeatures2::default().push(&mut m);
+        // SAFETY: the device has an extension that defines the chained structure.
+        unsafe { raw.get_physical_device_features2(pd, &mut f2) };
+        m.swapchain_maintenance1 == vk::TRUE
+    };
 
     let transfer_family = transfer_family(&families);
     // SAFETY: plain query.
@@ -594,8 +690,10 @@ fn evaluate(
         present_id2: has(ash::khr::present_id2::NAME),
         present_wait2: has(ash::khr::present_wait2::NAME),
         present_timing: has(ash::ext::present_timing::NAME),
-        swapchain_maintenance1: has(ash::khr::swapchain_maintenance1::NAME)
-            || has(ash::ext::swapchain_maintenance1::NAME),
+        swapchain_maintenance_khr: maintenance_khr && maintenance_feature,
+        swapchain_maintenance_ext: maintenance_ext && maintenance_feature,
+        // Chosen once the device is picked.
+        swapchain_maintenance: SwapchainMaintenance::None,
         memory_budget: has(ash::ext::memory_budget::NAME),
         calibrated_timestamps: has(ash::khr::calibrated_timestamps::NAME)
             || has(ash::ext::calibrated_timestamps::NAME),
@@ -732,6 +830,11 @@ fn create_device(instance: &Instance, c: &Candidate) -> Result<ash::Device, Erro
     } else {
         f2.push(&mut dynr).push(&mut sync2)
     };
+    let mut maintenance =
+        vk::PhysicalDeviceSwapchainMaintenance1FeaturesKHR::default().swapchain_maintenance1(true);
+    if c.caps.swapchain_maintenance != SwapchainMaintenance::None {
+        f2 = f2.push(&mut maintenance);
+    }
 
     let priorities = [1.0f32];
     let mut queues = [vk::DeviceQueueCreateInfo::default()
@@ -835,6 +938,20 @@ mod tests {
         ];
         assert_eq!(transfer_family(&video), None);
         assert_eq!(transfer_family(&nvidia[..1]), None);
+    }
+
+    #[test]
+    fn the_khr_maintenance_chain_comes_first_and_an_override_allows_one() {
+        use SwapchainMaintenance::{Ext, Khr, None as Neither};
+        let choose = SwapchainMaintenance::choose;
+        assert_eq!(choose(true, true, None), Khr);
+        assert_eq!(choose(false, true, None), Ext);
+        assert_eq!(choose(false, false, None), Neither);
+        assert_eq!(choose(true, true, Some(Ext)), Ext);
+        assert_eq!(choose(true, true, Some(Neither)), Neither);
+        // An override never falls back to the other chain.
+        assert_eq!(choose(false, true, Some(Khr)), Neither);
+        assert_eq!(choose(true, false, Some(Ext)), Neither);
     }
 
     #[test]

@@ -10,7 +10,10 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use ruthenium_gpu::{GpuOptions, PresentPolicy, Presented, Validation};
+use ruthenium_gpu::{
+    ACQUIRE_TIMEOUT, GpuOptions, PresentPolicy, Presented, PretendSrgb, SwapchainMaintenance,
+    Validation,
+};
 use ruthenium_platform::{DEFAULT_SIZE, Event, Platform, Sleeper, next_deadline};
 use ruthenium_render::{Background, FrameTimes, OverlayStats, Renderer, Summary, create_gpu};
 use ruthenium_ui::modern::Action;
@@ -30,6 +33,13 @@ const FULLSCREEN_PENDING: Duration = Duration::from_secs(2);
 const HIDDEN_FRAME: Duration = Duration::from_millis(100);
 /// `--exercise-minimize` minimises the window, and brings it back, this often.
 const MINIMIZE_EVERY: Duration = Duration::from_millis(1500);
+/// An acquire may block until this many pacing intervals (the longer of the frame limiter's
+/// and the display's) after the frame sampled its input, and at least this long. Then the
+/// frame goes on without an image, and the loop is back at its events.
+const PACE_INTERVALS: u32 = 2;
+const PACE_FLOOR: Duration = Duration::from_millis(8);
+/// The display's refresh rate when the window system doesn't say.
+const ASSUMED_REFRESH_HZ: f32 = 60.0;
 /// Frames before this are start-up noise and left out of the run summary.
 const WARMUP: Duration = Duration::from_secs(1);
 /// Deep space: near-black blue at the top, a hint of violet at the bottom.
@@ -37,6 +47,15 @@ const BACKGROUND: Background = Background {
     top: [0.010, 0.010, 0.030, 1.0],
     bottom: [0.060, 0.030, 0.090, 1.0],
 };
+
+/// How long a frame may wait for a swapchain image before it goes on without one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AcquireWait {
+    /// This long in the acquire call.
+    Fixed(Duration),
+    /// Until [`PACE_INTERVALS`] pacing intervals after the frame's input was sampled.
+    Pace,
+}
 
 #[derive(Debug)]
 pub struct Options {
@@ -89,6 +108,16 @@ pub struct Options {
     pub frame_log: Option<std::path::PathBuf>,
     /// Development: minimise the window and bring it back every 1.5 s.
     pub exercise_minimize: bool,
+    /// Use only this swapchain maintenance extension, or none (default: the best the GPU
+    /// has), to test each way of retiring swapchains.
+    pub swapchain_maintenance: Option<SwapchainMaintenance>,
+    /// How long a frame waits for a swapchain image.
+    pub acquire_wait: AcquireWait,
+    /// Development: pretend the window's surface offers only sRGB formats.
+    pub pretend_srgb: PretendSrgb,
+    /// Development: with `--screenshot`, resize the window to this size in points once
+    /// the menus show, and take the screenshot of the first frame at the new size.
+    pub screenshot_resize: Option<(u32, u32)>,
 }
 
 impl Options {
@@ -123,6 +152,10 @@ impl Options {
             empty_window: false,
             frame_log: None,
             exercise_minimize: false,
+            swapchain_maintenance: None,
+            acquire_wait: AcquireWait::Pace,
+            pretend_srgb: PretendSrgb::Never,
+            screenshot_resize: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -178,11 +211,53 @@ impl Options {
                 }
                 "--window-size" => {
                     let v = value("a size like 1280x720")?;
-                    let parsed = v
-                        .split_once('x')
-                        .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
-                        .filter(|&(w, h)| (64..=16384).contains(&w) && (64..=16384).contains(&h));
-                    o.window_size = parsed.ok_or(format!("--window-size: not a size: {v}"))?;
+                    o.window_size =
+                        parse_size(&v).ok_or(format!("--window-size: not a size: {v}"))?;
+                }
+                "--screenshot-resize" => {
+                    let v = value("a size like 1280x720")?;
+                    o.screenshot_resize = Some(
+                        parse_size(&v).ok_or(format!("--screenshot-resize: not a size: {v}"))?,
+                    );
+                }
+                "--swapchain-maintenance" => {
+                    let v = value("auto, khr, ext or none")?;
+                    o.swapchain_maintenance = match v.as_str() {
+                        "auto" => None,
+                        "khr" => Some(SwapchainMaintenance::Khr),
+                        "ext" => Some(SwapchainMaintenance::Ext),
+                        "none" => Some(SwapchainMaintenance::None),
+                        _ => {
+                            return Err(format!(
+                                "--swapchain-maintenance: not auto, khr, ext or none: {v}"
+                            ));
+                        }
+                    };
+                }
+                "--acquire-wait" => {
+                    let v = value("milliseconds, or pace")?;
+                    o.acquire_wait = if v == "pace" {
+                        AcquireWait::Pace
+                    } else {
+                        let ms: f64 = v
+                            .parse()
+                            .ok()
+                            .filter(|ms| (0.0..=100.0).contains(ms))
+                            .ok_or(format!("--acquire-wait: not pace or 0 to 100 ms: {v}"))?;
+                        AcquireWait::Fixed(Duration::from_secs_f64(ms / 1e3))
+                    };
+                }
+                "--pretend-srgb-surface" => {
+                    let v = value("start or recreate")?;
+                    o.pretend_srgb = match v.as_str() {
+                        "start" => PretendSrgb::Always,
+                        "recreate" => PretendSrgb::OnRecreation,
+                        _ => {
+                            return Err(format!(
+                                "--pretend-srgb-surface: not start or recreate: {v}"
+                            ));
+                        }
+                    };
                 }
                 "--data-dir" => o.data_dir = Some(value("a folder")?.into()),
                 "--join" => o.join = Some(value("a server address")?),
@@ -200,6 +275,24 @@ impl Options {
         }
         Ok(o)
     }
+}
+
+fn parse_size(v: &str) -> Option<(u32, u32)> {
+    v.split_once('x')
+        .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+        .filter(|&(w, h)| (64..=16384).contains(&w) && (64..=16384).contains(&h))
+}
+
+/// The latest moment an acquire may still be waiting, for a frame whose input was sampled
+/// at `input`. An acquire can take a whole refresh of the display with VSync, and the
+/// frame limiter may be slower still, so the longer of the two is the pacing interval.
+fn pace_deadline(input: Instant, limiter: Option<Duration>, refresh_hz: Option<f32>) -> Instant {
+    let refresh = Duration::from_secs_f32(1.0 / refresh_hz.unwrap_or(ASSUMED_REFRESH_HZ));
+    let interval = limiter.map_or(refresh, |p| p.max(refresh));
+    input
+        + (interval * PACE_INTERVALS)
+            .max(PACE_FLOOR)
+            .min(ACQUIRE_TIMEOUT)
 }
 
 pub fn run(opts: &Options, started: Instant) -> ExitCode {
@@ -293,6 +386,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         &GpuOptions {
             prefer: opts.gpu.clone(),
             no_transfer_queue: opts.no_transfer_queue,
+            swapchain_maintenance: opts.swapchain_maintenance,
+            pretend_srgb: opts.pretend_srgb,
         },
     )?;
     {
@@ -307,6 +402,24 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 ", portability subset"
             } else {
                 ""
+            }
+        );
+        eprintln!(
+            "[ruthenium] swapchain maintenance: {} (KHR {}, EXT {}); finished presents are known from {}",
+            c.swapchain_maintenance.name(),
+            if c.swapchain_maintenance_khr {
+                "usable"
+            } else {
+                "missing"
+            },
+            if c.swapchain_maintenance_ext {
+                "usable"
+            } else {
+                "missing"
+            },
+            match c.swapchain_maintenance {
+                SwapchainMaintenance::None => "the fences of later acquires",
+                _ => "present fences",
             }
         );
     }
@@ -331,6 +444,17 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
         renderer.enable_upload_check()?;
+    }
+    if opts.exercise_swapchain {
+        renderer.exercise_recreation();
+    }
+    let mut refresh_hz = window.refresh_rate();
+    let acquire_wait = match opts.acquire_wait {
+        AcquireWait::Fixed(d) => format!("{} ms", d.as_secs_f64() * 1e3),
+        AcquireWait::Pace => "pace".to_owned(),
+    };
+    if let AcquireWait::Fixed(d) = opts.acquire_wait {
+        renderer.frames_mut().set_acquire_limit(d, None);
     }
 
     let mut sleeper = Sleeper::new();
@@ -375,6 +499,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut frames: u64 = 0;
     // --exercise-minimize: whether the window was last asked to minimise.
     let mut minimize_asked = false;
+    // When input was last sampled by a frame that was not throttled afterwards.
+    let mut last_input: Option<Instant> = None;
+    // --screenshot-resize: the resize has been asked for.
+    let mut resize_asked = false;
+    // --exercise-swapchain: screenshots read back, and those of a swapchain's first frame.
+    let mut captures = (0u32, 0u32);
 
     loop {
         profiling::scope!("frame");
@@ -392,6 +522,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
 
         // 2. Input.
         let t_input = Instant::now();
+        let event_gap = last_input.map(|prev| (t_input - prev).as_nanos() as u64);
+        last_input = Some(t_input);
         platform.poll_events(|e| match e {
             Event::Quit | Event::CloseRequested => quit = true,
             Event::PixelSizeChanged { width, height } => resized = Some((width, height)),
@@ -495,6 +627,11 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         menu.game_frame();
         if let Some(size) = resized.take() {
             renderer.frames_mut().resize(size);
+            if resize_asked && !screenshot_requested {
+                // The frame about to be drawn is the first at the new size.
+                renderer.request_screenshot();
+                screenshot_requested = true;
+            }
         }
         if std::mem::take(&mut toggle_overlay) {
             menu.toggle_frame_stats();
@@ -558,11 +695,21 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             // Nothing is shown: tick at 10 FPS without presenting.
             std::thread::sleep(HIDDEN_FRAME);
             last_present = None;
+            last_input = None;
             continue;
         }
 
         frames += 1;
         if opts.exercise_swapchain {
+            // A new swapchain in the first frame, with its warm-up draws, and then three
+            // frames running now and then: each is replaced after one present.
+            if frames == 1 || frames % 60 < 3 {
+                renderer.frames_mut().invalidate();
+            }
+            // A capture of a swapchain's first frame.
+            if frames % 60 == 1 && opts.screenshot.is_none() {
+                renderer.request_screenshot();
+            }
             if frames.is_multiple_of(40) {
                 toggle_vsync = true;
             }
@@ -612,17 +759,43 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             });
             if opts.screenshot.is_some()
                 && !screenshot_requested
+                && !resize_asked
                 && text_ready
                 && !gui.glyphs.is_empty()
                 && text_shown.is_some_and(|t| t.elapsed() >= opts.screenshot_after)
             {
-                renderer.request_screenshot();
-                screenshot_requested = true;
+                match opts.screenshot_resize {
+                    // The screenshot follows when the new size arrives.
+                    Some((w, h)) => {
+                        window.request_size(w, h);
+                        resize_asked = true;
+                    }
+                    None => {
+                        renderer.request_screenshot();
+                        screenshot_requested = true;
+                    }
+                }
             }
             Some(gui)
         };
         let t_render = Instant::now();
+        if opts.acquire_wait == AcquireWait::Pace {
+            let deadline = pace_deadline(t_input, period, refresh_hz);
+            renderer
+                .frames_mut()
+                .set_acquire_limit(ACQUIRE_TIMEOUT, Some(deadline));
+        }
         let report = renderer.render(&BACKGROUND, gui)?;
+        if opts.exercise_swapchain
+            && opts.screenshot.is_none()
+            && let Some((w, h, rgba)) = renderer.take_screenshot()?
+        {
+            if rgba.len() != w as usize * h as usize * 4 {
+                return Err(format!("a {w}x{h} capture has {} bytes", rgba.len()).into());
+            }
+            captures.0 += 1;
+            captures.1 += u32::from(renderer.screenshot_of().is_some_and(|s| s.2));
+        }
         if let Some(path) = &opts.screenshot
             && let Some((w, h, rgba)) = renderer.take_screenshot()?
         {
@@ -646,6 +819,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             .encode_png();
             std::fs::write(path, png)?;
             eprintln!("[ruthenium] screenshot written to {}", path.display());
+            if let Some((frame, generation, first)) = renderer.screenshot_of() {
+                eprintln!(
+                    "[ruthenium] it is {w}x{h} pixels, of frame {frame}, {} drawn to swapchain {generation}",
+                    if first { "the first" } else { "not the first" }
+                );
+            }
             break;
         }
         let now = Instant::now();
@@ -684,6 +863,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         debug_assert_eq!(sample.frame, report.frame);
         cpu.push(sample.cpu_ns);
         telemetry.frame(&sample, measuring);
+        if let Some(gap) = event_gap {
+            telemetry.event_gap(gap, measuring);
+        }
         if let Some(g) = report.gpu_time {
             gpu_times.push(g.nanos);
             telemetry.gpu_time(g, measuring);
@@ -716,12 +898,15 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             cpu.clear();
             gpu_times.clear();
             last_report = now;
+            // The window may have moved to another display.
+            refresh_hz = window.refresh_rate();
         }
         if occluded {
             // Covered by other windows: keep presenting (so the compositor can tell us when
             // it is visible again) but only at 10 FPS.
             std::thread::sleep(HIDDEN_FRAME);
             last_present = None;
+            last_input = None;
         }
     }
 
@@ -759,6 +944,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             transfer_queue: renderer.gpu().transfer_family().is_some(),
             policy,
             frames_ahead: opts.frames_ahead.unwrap_or_else(|| frames_ahead(policy)),
+            acquire_wait: &acquire_wait,
             fps_cap: period.map(|p| 1.0 / p.as_secs_f64()),
             swapchain: renderer.frames().swapchain_info(),
             window_points: window.size(),
@@ -795,6 +981,23 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             || c.late_textures > 0
             || c.textures == 0;
     }
+    if opts.exercise_swapchain {
+        let fallbacks = renderer.glass_fallbacks();
+        eprintln!(
+            "[ruthenium] swapchain exercise: {} created, {} destroyed while running, at most {} waiting at once; {} captures read back, {} of a swapchain's first frame; {} frames drew glass without its backdrop",
+            counters.swapchains,
+            counters.swapchains_destroyed,
+            counters.retired_peak,
+            captures.0,
+            captures.1,
+            fallbacks
+        );
+        // Each replaced swapchain must go while the client runs, and the backdrop must be
+        // there in a swapchain's first frame.
+        failed |= fallbacks > 0
+            || captures.0 == 0
+            || counters.swapchains_destroyed + 8 < counters.swapchains;
+    }
     let validation = ruthenium_gpu::validation_messages();
     if validation > 0 {
         eprintln!("[ruthenium] {validation} Vulkan validation message(s)");
@@ -823,4 +1026,29 @@ fn print_line(
         gpu.p50_ms,
         mode.unwrap_or_default()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_acquire_may_wait_two_pacing_intervals() {
+        let t = Instant::now();
+        let after = |limiter: Option<f64>, hz: Option<f32>| {
+            let d = pace_deadline(t, limiter.map(Duration::from_secs_f64), hz) - t;
+            (d.as_secs_f64() * 1e3).round() as u32
+        };
+        // The display's interval, twice; 60 Hz when it is unknown.
+        assert_eq!(after(None, Some(60.0)), 33);
+        assert_eq!(after(None, None), 33);
+        // A limiter slower than the display counts instead; a faster one doesn't, as with
+        // VSync an acquire still takes up to a refresh.
+        assert_eq!(after(Some(1.0 / 30.0), Some(60.0)), 67);
+        assert_eq!(after(Some(1.0 / 240.0), Some(60.0)), 33);
+        // Never less than the floor, nor more than the longest an acquire may block.
+        assert_eq!(after(None, Some(240.0)), 8);
+        assert_eq!(after(None, Some(500.0)), 8);
+        assert_eq!(after(Some(1.0), Some(60.0)), 100);
+    }
 }

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use ash::vk::{Handle, TaggedStructure};
 
-use crate::device::Gpu;
+use crate::device::{Gpu, PretendSrgb, SwapchainMaintenance};
 use crate::swapchain::{PresentPolicy, Swapchain};
 use crate::{Error, VkContext};
 
@@ -12,9 +12,13 @@ use crate::{Error, VkContext};
 /// client usually waits for fewer (see [`FrameLoop::wait_for_gpu`]).
 pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-/// How long one acquire may block before the frame is skipped, so a stalled compositor
-/// never stalls the game loop (vanilla gives up only after 5 s).
-const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(100);
+/// The longest one acquire may block before the frame is skipped, so a stalled compositor
+/// never stalls the game loop (vanilla gives up only after 5 s). It can be made shorter
+/// ([`FrameLoop::set_acquire_limit`]).
+pub const ACQUIRE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// How long dropping the frame loop waits for presents that are still out.
+const DROP_PRESENT_WAIT: Duration = Duration::from_millis(250);
 
 /// Semaphore waits a frame can carry besides its acquire (see [`FrameCtx::wait_timeline`]).
 pub const MAX_FRAME_WAITS: usize = 4;
@@ -43,10 +47,37 @@ struct Slot {
     event_count: usize,
 }
 
-/// A swapchain kept alive until the frames that used it are surely done.
+/// A swapchain that has been replaced, kept until nothing uses it: the frames that drew
+/// to it and the presents of its images.
 struct Retired {
     swapchain: Swapchain,
-    destroy_after: u64,
+    /// The last frame that drew to one of its images (0: none did).
+    last_frame: u64,
+    /// Some of its presents had no fence when it was replaced, and never will: they are
+    /// over once a present to a later swapchain is.
+    chained: bool,
+}
+
+/// A present not known to be over, or the fence of an acquire still to signal.
+///
+/// With swapchain maintenance a present carries its own fence, which signals when the
+/// presentation engine is done with the present's semaphore and image. Without it, the
+/// fence is the one given to the acquire that next returns the same image (an image comes
+/// back only after its present is over), unknown until then; and when a swapchain is
+/// replaced first, its presents wait for a present to a later swapchain instead
+/// ([`Retired::chained`]). This is the scheme of Khronos' swapchain recreation sample.
+#[derive(Clone, Copy)]
+struct PresentOp {
+    generation: u32,
+    image: u32,
+    /// Null: not known yet (only without swapchain maintenance).
+    fence: vk::Fence,
+    /// False: an acquire of an image that had no present waiting; only its fence is kept,
+    /// to be taken back.
+    present: bool,
+    /// The present was refused (out of date): its fence may never signal, and it proves
+    /// nothing about earlier presents.
+    rejected: bool,
 }
 
 /// GPU execution time of an earlier frame, read back from timestamp queries.
@@ -122,11 +153,16 @@ pub struct FrameCounters {
     pub present_suboptimal: u64,
     pub present_out_of_date: u64,
     pub swapchains: u32,
+    /// Replaced swapchains destroyed, and the most that were waiting for it at once.
+    pub swapchains_destroyed: u32,
+    pub retired_peak: u32,
 }
 
 /// The swapchain frames are presented to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SwapchainInfo {
+    /// Which of the window's swapchains it is, counted from 1.
+    pub generation: u32,
     pub extent: vk::Extent2D,
     pub format: vk::Format,
     pub present_mode: vk::PresentModeKHR,
@@ -191,6 +227,10 @@ pub struct Target {
     pub format: vk::Format,
     /// The image may be copied from (see [`crate::Screenshot`]).
     pub readable: bool,
+    /// Its swapchain ([`SwapchainInfo::generation`]), and whether it is the first image
+    /// acquired from that one.
+    pub generation: u32,
+    pub first: bool,
     index: u32,
 }
 
@@ -221,7 +261,19 @@ pub struct FrameLoop {
     frame: u64,
     query_pool: vk::QueryPool,
     swapchain: Option<Swapchain>,
+    /// The last frame that drew to the swapchain, and the images acquired from it.
+    drawn_frame: u64,
+    acquired_images: u64,
     retired: Vec<Retired>,
+    presents: Vec<PresentOp>,
+    /// Fences free to use: unsignalled and in no pending operation.
+    fences: Vec<vk::Fence>,
+    /// Fences of refused presents that never signalled, kept until the frame loop goes.
+    stuck_fences: Vec<vk::Fence>,
+    /// The newest swapchain with a present known to be over (0: none yet).
+    completed_generation: u32,
+    acquire_timeout: Duration,
+    acquire_deadline: Option<Instant>,
     policy: PresentPolicy,
     pixel_size: (u32, u32),
     stale: bool,
@@ -284,7 +336,15 @@ impl FrameLoop {
             frame: 0,
             query_pool,
             swapchain: None,
-            retired: Vec::with_capacity(4),
+            drawn_frame: 0,
+            acquired_images: 0,
+            retired: Vec::with_capacity(8),
+            presents: Vec::with_capacity(32),
+            fences: Vec::with_capacity(8),
+            stuck_fences: Vec::new(),
+            completed_generation: 0,
+            acquire_timeout: ACQUIRE_TIMEOUT,
+            acquire_deadline: None,
             policy,
             pixel_size,
             stale: true,
@@ -355,6 +415,7 @@ impl FrameLoop {
     /// The swapchain in use, if there is one.
     pub fn swapchain_info(&self) -> Option<SwapchainInfo> {
         self.swapchain.as_ref().map(|s| SwapchainInfo {
+            generation: s.generation,
             extent: s.extent,
             format: s.format,
             present_mode: s.present_mode,
@@ -375,8 +436,8 @@ impl FrameLoop {
         &self.counters
     }
 
-    /// Switches VSync; the swapchain is rebuilt (with `oldSwapchain`, no idle wait) at the
-    /// next acquire.
+    /// Switches VSync; the swapchain is rebuilt (with `oldSwapchain`, no idle wait) when the
+    /// next frame is prepared.
     pub fn set_policy(&mut self, policy: PresentPolicy) {
         if policy != self.policy {
             self.policy = policy;
@@ -384,13 +445,27 @@ impl FrameLoop {
         }
     }
 
-    /// Records a new drawable size; the swapchain is rebuilt at most once per frame, at the
-    /// next acquire, however many resize events arrive.
+    /// Records a new drawable size; the swapchain is rebuilt at most once per frame, when
+    /// the next frame is prepared, however many resize events arrive.
     pub fn resize(&mut self, pixel_size: (u32, u32)) {
         if pixel_size != self.pixel_size {
             self.pixel_size = pixel_size;
             self.stale = true;
         }
+    }
+
+    /// Has the swapchain rebuilt when the next frame is prepared although nothing changed
+    /// (development: to exercise recreation).
+    pub fn invalidate(&mut self) {
+        self.stale = true;
+    }
+
+    /// How long the acquires from now on may block: `timeout` each ([`ACQUIRE_TIMEOUT`] at
+    /// most, and by default), and not past `deadline` if there is one. Past the deadline an
+    /// acquire only takes an image that is free.
+    pub fn set_acquire_limit(&mut self, timeout: Duration, deadline: Option<Instant>) {
+        self.acquire_timeout = timeout.min(ACQUIRE_TIMEOUT);
+        self.acquire_deadline = deadline;
     }
 
     /// Number of the last frame the GPU has finished.
@@ -441,7 +516,7 @@ impl FrameLoop {
         let gpu_time = self.read_timestamps(slot_index);
         #[cfg(feature = "tracy")]
         self.upload_zones(slot_index);
-        self.destroy_retired()?;
+        self.reap()?;
 
         let d = &self.gpu.device;
         let slot = &mut self.slots[slot_index];
@@ -516,34 +591,63 @@ impl FrameLoop {
         })
     }
 
-    /// Acquires the swapchain image for this frame. Call it as late as possible: after all
-    /// work that doesn't write to the window has been recorded. Rebuilds the swapchain first
-    /// if the window changed. `None`: nothing to draw to this frame (still submit it).
-    pub fn acquire(&mut self, ctx: &FrameCtx) -> Result<Option<Target>, Error> {
-        profiling::scope!("acquire");
-        if self.stale {
+    /// Makes the swapchain match the window, as the first thing a frame does after
+    /// [`Self::begin`]: what it returns is what this frame's acquire will draw to, so
+    /// pipelines and off-screen images can be chosen for its format and size before anything
+    /// is recorded. `None`: the window has no area. A swapchain the acquire or the present
+    /// finds out of date is replaced here in the next frame.
+    pub fn prepare(&mut self) -> Result<Option<SwapchainInfo>, Error> {
+        // Without a swapchain, try again each frame: not every window system says when a
+        // window has an area again.
+        if self.stale || self.swapchain.is_none() {
             let started = Instant::now();
             self.recreate_swapchain()?;
-            self.timings.recreate_ns = started.elapsed().as_nanos() as u64;
+            self.timings.recreate_ns += started.elapsed().as_nanos() as u64;
             self.timings.swapchains = self.counters.swapchains;
         }
-        let Some(sc) = &self.swapchain else {
+        Ok(self.swapchain_info())
+    }
+
+    /// Acquires the swapchain image for this frame, from the swapchain [`Self::prepare`]
+    /// returned. Call it as late as possible: after all work that doesn't write to the
+    /// window has been recorded. `None`: nothing to draw to this frame (still submit it).
+    pub fn acquire(&mut self, ctx: &FrameCtx) -> Result<Option<Target>, Error> {
+        profiling::scope!("acquire");
+        if self.swapchain.is_none() {
             self.timings.acquired = Acquired::NoSurface;
             self.counters.no_surface += 1;
             return Ok(None);
+        }
+        // Without present fences, the acquire's fence says when the image's last present
+        // was over.
+        let fence = match self.gpu.caps().swapchain_maintenance {
+            SwapchainMaintenance::None => take_fence(&self.gpu, &mut self.fences)?,
+            _ => vk::Fence::null(),
         };
+        let sc = self.swapchain.as_ref().expect("checked above");
         let acquire = self.slots[ctx.slot].acquire;
         let started = Instant::now();
-        // SAFETY: the acquire semaphore is unsignalled (its last wait has completed).
+        let timeout = match self.acquire_deadline {
+            Some(d) => d
+                .saturating_duration_since(started)
+                .min(self.acquire_timeout),
+            None => self.acquire_timeout,
+        };
+        // SAFETY: the acquire semaphore is unsignalled (its last wait has completed); the
+        // fence, if any, is unsignalled and in no pending operation.
         let result = unsafe {
             self.gpu.swapchain_fn.acquire_next_image(
                 sc.raw,
-                ACQUIRE_TIMEOUT.as_nanos() as u64,
+                timeout.as_nanos() as u64,
                 acquire,
-                vk::Fence::null(),
+                fence,
             )
         };
         self.timings.acquire_ns = started.elapsed().as_nanos() as u64;
+        if result.is_err() && !fence.is_null() {
+            // No image, so the fence was not taken.
+            self.fences.push(fence);
+        }
         match result {
             Ok((index, suboptimal)) => {
                 self.counters.images += 1;
@@ -553,6 +657,26 @@ impl FrameLoop {
                     self.counters.suboptimal += 1;
                     self.timings.acquired = Acquired::Suboptimal;
                 }
+                if !fence.is_null() {
+                    let waiting = self.presents.iter_mut().find(|p| {
+                        p.present
+                            && p.fence.is_null()
+                            && p.generation == sc.generation
+                            && p.image == index
+                    });
+                    match waiting {
+                        Some(p) => p.fence = fence,
+                        None => self.presents.push(PresentOp {
+                            generation: sc.generation,
+                            image: index,
+                            fence,
+                            present: false,
+                            rejected: false,
+                        }),
+                    }
+                }
+                self.drawn_frame = ctx.number;
+                self.acquired_images += 1;
                 let i = index as usize;
                 Ok(Some(Target {
                     image: sc.images[i],
@@ -560,6 +684,8 @@ impl FrameLoop {
                     extent: sc.extent,
                     format: sc.format,
                     readable: sc.readable,
+                    generation: sc.generation,
+                    first: self.acquired_images == 1,
                     index,
                 }))
             }
@@ -657,34 +783,62 @@ impl FrameLoop {
         let (Some(t), Some(sem), Some(sc)) = (target, render_done, &self.swapchain) else {
             return Ok(Presented::Skipped);
         };
+        // With swapchain maintenance, a fence that signals when this present is over.
+        let fence = match gpu.caps().swapchain_maintenance {
+            SwapchainMaintenance::None => vk::Fence::null(),
+            _ => take_fence(gpu, &mut self.fences)?,
+        };
         let swapchains = [sc.raw];
         let indices = [t.index];
         let wait = [sem];
-        let present = vk::PresentInfoKHR::default()
+        let fences = [fence];
+        let mut fence_info = vk::SwapchainPresentFenceInfoKHR::default().fences(&fences);
+        let mut present = vk::PresentInfoKHR::default()
             .wait_semaphores(&wait)
             .swapchains(&swapchains)
             .image_indices(&indices);
+        if !fence.is_null() {
+            present = present.push(&mut fence_info);
+        }
         let started = Instant::now();
         // SAFETY: the image was acquired this frame and is in PRESENT_SRC_KHR after the
-        // submitted commands (the Target contract).
+        // submitted commands (the Target contract); the fence, if any, is unsignalled and
+        // in no pending operation, and the device has the extension its structure is from.
         let result = unsafe { gpu.swapchain_fn.queue_present(gpu.queue, &present) };
         self.timings.present_ns = started.elapsed().as_nanos() as u64;
+        let rejected = match result {
+            Ok(_) => false,
+            // Refused, but queued as far as its semaphore goes.
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => true,
+            Err(e) => {
+                if !fence.is_null() {
+                    self.stuck_fences.push(fence);
+                }
+                return Err(Error::Vk {
+                    call: "vkQueuePresentKHR",
+                    result: e,
+                });
+            }
+        };
+        self.presents.push(PresentOp {
+            generation: sc.generation,
+            image: t.index,
+            fence,
+            present: true,
+            rejected,
+        });
         match result {
-            Ok(false) => Ok(Presented::Yes),
             Ok(true) => {
                 self.stale = true;
                 self.counters.present_suboptimal += 1;
                 Ok(Presented::Yes)
             }
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+            Ok(false) => Ok(Presented::Yes),
+            Err(_) => {
                 self.stale = true;
                 self.counters.present_out_of_date += 1;
                 Ok(Presented::Skipped)
             }
-            Err(e) => Err(Error::Vk {
-                call: "vkQueuePresentKHR",
-                result: e,
-            }),
         }
     }
 
@@ -847,19 +1001,42 @@ impl FrameLoop {
         profiling::scope!("recreate_swapchain");
         let old = self.swapchain.take();
         let old_raw = old.as_ref().map_or(vk::SwapchainKHR::null(), |s| s.raw);
-        let new = Swapchain::create(&self.gpu, self.pixel_size, self.policy, old_raw);
+        let srgb_only = match self.gpu.pretend_srgb {
+            PretendSrgb::Never => false,
+            PretendSrgb::Always => true,
+            PretendSrgb::OnRecreation => self.counters.swapchains > 0,
+        };
+        let new = Swapchain::create(
+            &self.gpu,
+            self.pixel_size,
+            self.policy,
+            old_raw,
+            self.counters.swapchains + 1,
+            srgb_only,
+        );
         if let Some(swapchain) = old {
-            // The old one may still be read by queued frames and presents: keep it until a
-            // few frames after the last one that used it have completed.
+            // Frames and presents may still use the old one: see reap(). Its presents
+            // without a fence get none now that no image of it is acquired again.
+            let generation = swapchain.generation;
+            let mut chained = false;
+            self.presents.retain(|p| {
+                let orphan = p.generation == generation && p.fence.is_null();
+                chained |= orphan;
+                !orphan
+            });
             self.retired.push(Retired {
                 swapchain,
-                destroy_after: self.frame + MAX_FRAMES_IN_FLIGHT as u64 + 1,
+                last_frame: self.drawn_frame,
+                chained,
             });
+            self.counters.retired_peak = self.counters.retired_peak.max(self.retired.len() as u32);
         }
         self.swapchain = new?;
         self.stale = false;
         if let Some(sc) = &self.swapchain {
             self.counters.swapchains += 1;
+            self.drawn_frame = 0;
+            self.acquired_images = 0;
             eprintln!(
                 "[gpu] swapchain {}x{} {:?} {:?}, {} images",
                 sc.extent.width,
@@ -872,22 +1049,78 @@ impl FrameLoop {
         Ok(())
     }
 
-    fn destroy_retired(&mut self) -> Result<(), Error> {
+    /// Takes back the fences of presents that are over, and destroys the replaced
+    /// swapchains nothing uses any more: the frames that drew to it have finished, and its
+    /// presents are over, which their fences say or, for those without one, a finished
+    /// present to a later swapchain.
+    fn reap(&mut self) -> Result<(), Error> {
+        if self.presents.is_empty() && self.retired.is_empty() {
+            return Ok(());
+        }
+        let d = &self.gpu.device;
+        let mut i = 0;
+        while i < self.presents.len() {
+            let op = self.presents[i];
+            // SAFETY: a live fence.
+            let over = !op.fence.is_null()
+                && unsafe { d.get_fence_status(op.fence) }.ctx("vkGetFenceStatus")?;
+            if !over {
+                i += 1;
+                continue;
+            }
+            if op.present && !op.rejected {
+                self.completed_generation = self.completed_generation.max(op.generation);
+            }
+            // SAFETY: signalled, so the operation it was given to is over.
+            unsafe { d.reset_fences(&[op.fence]) }.ctx("vkResetFences")?;
+            self.fences.push(op.fence);
+            self.presents.swap_remove(i);
+        }
         if self.retired.is_empty() {
             return Ok(());
         }
         let done = self.completed()?;
-        let gpu = &self.gpu;
-        self.retired.retain_mut(|r| {
-            if done >= r.destroy_after {
-                // SAFETY: every frame that used the swapchain, and the frames after it, are done.
-                unsafe { r.swapchain.destroy(gpu) };
-                false
-            } else {
-                true
+        let mut i = 0;
+        while i < self.retired.len() {
+            let r = &self.retired[i];
+            let generation = r.swapchain.generation;
+            let succeeded = self.completed_generation > generation;
+            // A refused present's fence may never signal; a later present being over
+            // covers it too.
+            let presenting = self
+                .presents
+                .iter()
+                .any(|p| p.generation == generation && !(p.rejected && succeeded));
+            if done < r.last_frame || presenting || (r.chained && !succeeded) {
+                i += 1;
+                continue;
             }
-        });
+            let mut r = self.retired.swap_remove(i);
+            // SAFETY: the frames that drew to it have finished and its presents are over.
+            unsafe { r.swapchain.destroy(&self.gpu) };
+            self.counters.swapchains_destroyed += 1;
+            let stuck = &mut self.stuck_fences;
+            self.presents.retain(|p| {
+                if p.generation == generation {
+                    stuck.push(p.fence);
+                }
+                p.generation != generation
+            });
+        }
         Ok(())
+    }
+}
+
+/// A fence from `pool`, or a new one: unsignalled and in no pending operation.
+fn take_fence(gpu: &Gpu, pool: &mut Vec<vk::Fence>) -> Result<vk::Fence, Error> {
+    match pool.pop() {
+        Some(f) => Ok(f),
+        // SAFETY: plain object creation; the frame loop destroys it in Drop.
+        None => unsafe {
+            gpu.device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+        }
+        .ctx("vkCreateFence"),
     }
 }
 
@@ -905,14 +1138,32 @@ fn elapsed_ticks(start: u64, end: u64, valid_bits: u32) -> u64 {
 impl Drop for FrameLoop {
     fn drop(&mut self) {
         let d = &self.gpu.device;
-        // SAFETY: after the idle wait nothing uses any of these objects.
+        // SAFETY: after the idle wait no queue uses any of these objects. Presents still
+        // out get a moment to finish; then the swapchains go first, which ends them, and
+        // the fences after.
         unsafe {
             let _ = d.device_wait_idle();
+            let out: Vec<vk::Fence> = self
+                .presents
+                .iter()
+                .map(|p| p.fence)
+                .filter(|f| !f.is_null())
+                .collect();
+            if !out.is_empty() {
+                let _ = d.wait_for_fences(&out, true, DROP_PRESENT_WAIT.as_nanos() as u64);
+            }
             for mut r in self.retired.drain(..) {
                 r.swapchain.destroy(&self.gpu);
             }
             if let Some(mut sc) = self.swapchain.take() {
                 sc.destroy(&self.gpu);
+            }
+            for f in out
+                .into_iter()
+                .chain(self.fences.drain(..))
+                .chain(self.stuck_fences.drain(..))
+            {
+                d.destroy_fence(f, None);
             }
             for s in &self.slots {
                 if !s.acquire.is_null() {
