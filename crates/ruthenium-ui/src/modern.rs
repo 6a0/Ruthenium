@@ -659,7 +659,7 @@ pub(crate) const WHITE_TEXT: [f32; 4] = WHITE;
 const LOGO: f32 = 136.0;
 const LABEL_SIZE: f32 = 19.0;
 const SMALL_SIZE: f32 = 11.5;
-const CHIP_SIZE: f32 = 13.0;
+const CHIP_SIZE: f32 = 17.0;
 const WHITE: [f32; 4] = [0.95, 0.96, 1.0, 1.0];
 const LABEL: [f32; 4] = [1.0, 1.0, 1.0, 0.88];
 const LABEL_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -790,7 +790,7 @@ impl Presence {
     }
 }
 
-/// The title's account chip: a small glass pill, top left, with the player's face and a
+/// The title's account chip: a glass pill, top left, with the player's face and a
 /// line.
 #[derive(Debug, Clone)]
 struct Chip {
@@ -798,12 +798,14 @@ struct Chip {
     text: Text,
 }
 
-const CHIP_H: f32 = 36.0;
-const CHIP_FACE: f32 = 24.0;
-const CHIP_FACE_RADIUS: f32 = 6.0;
+const CHIP_H: f32 = 47.0;
+const CHIP_FACE: f32 = 31.0;
+const CHIP_FACE_RADIUS: f32 = 8.0;
 const CHIP_MARGIN: f32 = 16.0;
 /// The face sits as far from the chip's left edge as from the text.
-const CHIP_GAP: f32 = 10.0;
+const CHIP_GAP: f32 = 13.0;
+/// From the text to the chip's right edge.
+const CHIP_END: f32 = 21.0;
 /// Shown instead of a face until one is ready.
 const FACE_PLACEHOLDER: [f32; 4] = [0.75, 0.8, 1.0, 0.14];
 
@@ -904,7 +906,7 @@ impl TitleScreen {
     pub fn set_account(&mut self, fonts: &Fonts, line: &str) {
         let s = self.scale;
         let text = Text::new(fonts, line, &s, CHIP_SIZE, Weight::MEDIUM, 0.0);
-        let w = CHIP_GAP + CHIP_FACE + CHIP_GAP + text.width(&s) + 16.0;
+        let w = CHIP_GAP + CHIP_FACE + CHIP_GAP + text.width(&s) + CHIP_END;
         self.chip = Chip {
             rect: Rect {
                 x: CHIP_MARGIN,

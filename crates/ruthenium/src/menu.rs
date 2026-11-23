@@ -1071,7 +1071,7 @@ impl Menu {
                 };
                 (
                     FormSpec {
-                        title: "Sign Out?".into(),
+                        title: "Remove Account?".into(),
                         message: vec![
                             format!("{} will be signed out of Ruthenium.", a.name),
                             "You can sign in again at any time.".into(),
@@ -1079,7 +1079,7 @@ impl Menu {
                         code: None,
                         fields: Vec::new(),
                         buttons: vec![
-                            button("Sign Out", Action::Confirm),
+                            button("Remove", Action::Confirm),
                             button("Cancel", Action::Cancel),
                         ],
                     },

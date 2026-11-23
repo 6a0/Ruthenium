@@ -1,6 +1,6 @@
 //! The Accounts screen: the Microsoft accounts signed in, as glass rows with the
 //! player's face, name and (for the account in use) how its sign-in went; buttons to
-//! add an account, switch to the selected one, sign it out, and go back.
+//! add an account, switch to the selected one, remove it (signing it out), and go back.
 //!
 //! The screen keeps layout, shaped text, scrolling, selection and hover; the client keeps
 //! the accounts and hands them over as [`AccountView`]s whenever they change.
@@ -41,8 +41,8 @@ const DOT: f32 = 7.0;
 const BUTTON_H: f32 = 44.0;
 const BUTTON_GAP: f32 = 12.0;
 const FOOTER_MARGIN: f32 = 30.0;
-/// Space between the list and the buttons, where the note goes.
-const NOTE_H: f32 = 40.0;
+/// Space between the list and the buttons.
+const LIST_GAP: f32 = 26.0;
 
 const ROW_TINT: [f32; 4] = [0.85, 0.88, 1.0, 0.03];
 const ROW_HOVER: [f32; 4] = [0.90, 0.93, 1.0, 0.08];
@@ -73,7 +73,6 @@ pub struct AccountsScreen {
     labels: Vec<Text>,
     title: Text,
     empty: [Text; 2],
-    note: Text,
     badge: Text,
     rows: Vec<Row>,
 }
@@ -81,9 +80,9 @@ pub struct AccountsScreen {
 impl AccountsScreen {
     pub fn new(scale: UiScale, fonts: &Fonts) -> AccountsScreen {
         let entries = [
-            ("Add Account", Action::AddAccount),
+            ("Add", Action::AddAccount),
             ("Use", Action::UseAccount),
-            ("Sign Out", Action::SignOut),
+            ("Remove", Action::SignOut),
             ("Back", Action::Back),
         ];
         let zero = Rect {
@@ -108,7 +107,6 @@ impl AccountsScreen {
             labels: Vec::new(),
             title: blank(),
             empty: [blank(), blank()],
-            note: blank(),
             badge: blank(),
             rows: Vec::new(),
         };
@@ -128,7 +126,7 @@ impl AccountsScreen {
             x: cx - 0.5 * w,
             y: top,
             w,
-            h: (y0 - NOTE_H - top).max(ROW_H),
+            h: (y0 - LIST_GAP - top).max(ROW_H),
         });
         let n = self.buttons.len() as f32;
         let bw = (w - (n - 1.0) * BUTTON_GAP) / n;
@@ -164,14 +162,6 @@ impl AccountsScreen {
                 0.0,
             ),
         ];
-        self.note = Text::new(
-            fonts,
-            "Sign-ins are kept in your system's credential store, never in Ruthenium's files.",
-            &scale,
-            12.5,
-            Weight::REGULAR,
-            0.0,
-        );
         self.badge = Text::new(fonts, "IN USE", &scale, 11.0, Weight::EXTRABOLD, 0.08);
     }
 
@@ -257,7 +247,6 @@ impl AccountsScreen {
     /// Adds the screen's shapes and text.
     pub fn draw(&self, shapes: &mut ShapeList, text: &mut TextList, atlas: Option<&GlyphAtlas>) {
         let s = &self.scale;
-        let area = self.list.area;
         if let Some(atlas) = atlas {
             let title = Rect {
                 x: 0.0,
@@ -267,7 +256,8 @@ impl AccountsScreen {
             };
             self.title.centred(text, atlas, s, title, WHITE_TEXT);
             if self.rows.is_empty() {
-                let mid = area.y + 0.35 * area.h;
+                // The two lines together sit in the middle of the window.
+                let mid = 0.5 * s.height;
                 let line = |y: f32, h: f32| Rect {
                     x: 0.0,
                     y,
@@ -277,13 +267,6 @@ impl AccountsScreen {
                 self.empty[0].centred(text, atlas, s, line(mid - 30.0, 30.0), SOFT);
                 self.empty[1].centred(text, atlas, s, line(mid + 4.0, 24.0), FAINT);
             }
-            let note = Rect {
-                x: 0.0,
-                y: area.y + area.h,
-                w: s.width,
-                h: NOTE_H,
-            };
-            self.note.centred(text, atlas, s, note, FAINT);
         }
         let clip = self.list.clip(s, 8.0);
         shapes.set_clip(clip);
