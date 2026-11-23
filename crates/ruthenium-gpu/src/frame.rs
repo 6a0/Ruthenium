@@ -376,16 +376,8 @@ impl FrameLoop {
                     .ctx("vkCreateSemaphore")?;
             }
         }
-        if !fl.query_pool.is_null() {
-            // SAFETY: hostQueryReset is enabled; the pool is unused.
-            unsafe {
-                fl.gpu.device.reset_query_pool(
-                    fl.query_pool,
-                    0,
-                    QUERIES_PER_SLOT * MAX_FRAMES_IN_FLIGHT as u32,
-                )
-            };
-        }
+        // No reset of the query pool here: a frame resets its slot's queries in its command
+        // buffer before writing them, and a slot's results are read only once it was timed.
         #[cfg(feature = "tracy")]
         if !fl.query_pool.is_null() && tracy_client::Client::running().is_some() {
             fl.tracy = fl.tracy_context()?;

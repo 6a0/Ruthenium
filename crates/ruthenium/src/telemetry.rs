@@ -303,6 +303,10 @@ impl Telemetry {
                 "api": ruthenium_gpu::version_string(run.caps.api_version),
                 "unified_memory": run.caps.unified_memory,
                 "texture_slots": run.caps.texture_slots,
+                "optional_features": run.caps.optional.named().iter()
+                    .filter(|(_, on)| *on)
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>(),
                 "transfer_queue": run.transfer_queue,
                 "swapchain_maintenance": run.caps.swapchain_maintenance.name(),
                 "swapchain_maintenance_khr": run.caps.swapchain_maintenance_khr,

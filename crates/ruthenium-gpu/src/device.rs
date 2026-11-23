@@ -139,6 +139,10 @@ pub struct DeviceCaps {
     pub calibrated_timestamps: bool,
     pub low_latency2: bool,
     pub anti_lag: bool,
+    /// Features beyond the baseline that the device was created with.
+    pub optional: OptionalFeatures,
+    /// `maxSamplerAnisotropy` (meaningful with [`OptionalFeatures::sampler_anisotropy`]).
+    pub max_sampler_anisotropy: f32,
 }
 
 /// The logical device, its graphics queue and the window surface. Shared (`Arc`) by
@@ -191,6 +195,45 @@ struct Candidate {
     use_transfer: Option<u32>,
 }
 
+/// Features nothing needs yet, enabled wherever the driver has them so that their first
+/// users (indirect terrain draws, the anisotropic terrain sampler) only have to look here.
+/// Each of those users keeps a path that works without.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OptionalFeatures {
+    /// `multiDrawIndirect`: one call draws a buffer of draw commands.
+    pub multi_draw_indirect: bool,
+    /// `drawIndirectFirstInstance`: those commands may start at a nonzero instance.
+    pub draw_indirect_first_instance: bool,
+    /// `shaderDrawParameters`: `gl_DrawID`, `gl_BaseInstance` and `gl_BaseVertex`.
+    pub shader_draw_parameters: bool,
+    /// `samplerAnisotropy`, up to [`DeviceCaps::max_sampler_anisotropy`].
+    pub sampler_anisotropy: bool,
+}
+
+impl OptionalFeatures {
+    fn of(f: &Features) -> OptionalFeatures {
+        OptionalFeatures {
+            multi_draw_indirect: f.core.multi_draw_indirect == vk::TRUE,
+            draw_indirect_first_instance: f.core.draw_indirect_first_instance == vk::TRUE,
+            shader_draw_parameters: f.shader_draw_parameters,
+            sampler_anisotropy: f.core.sampler_anisotropy == vk::TRUE,
+        }
+    }
+
+    /// Each feature's Vulkan name and whether the device has it enabled.
+    pub fn named(&self) -> [(&'static str, bool); 4] {
+        [
+            ("multiDrawIndirect", self.multi_draw_indirect),
+            (
+                "drawIndirectFirstInstance",
+                self.draw_indirect_first_instance,
+            ),
+            ("shaderDrawParameters", self.shader_draw_parameters),
+            ("samplerAnisotropy", self.sampler_anisotropy),
+        ]
+    }
+}
+
 /// A baseline feature: its name for diagnostics and how to read it from the query.
 type FeatureCheck = (&'static str, fn(&Features) -> bool);
 
@@ -199,11 +242,9 @@ struct Features {
     core: vk::PhysicalDeviceFeatures,
     shader_draw_parameters: bool,
     timeline_semaphore: bool,
-    host_query_reset: bool,
     runtime_descriptor_array: bool,
     sampled_image_array_non_uniform_indexing: bool,
     descriptor_binding_partially_bound: bool,
-    descriptor_binding_variable_descriptor_count: bool,
     descriptor_binding_sampled_image_update_after_bind: bool,
     dynamic_rendering: bool,
     synchronization2: bool,
@@ -213,13 +254,6 @@ const REQUIRED_FEATURES: &[FeatureCheck] = &[
     ("dynamicRendering", |f| f.dynamic_rendering),
     ("synchronization2", |f| f.synchronization2),
     ("timelineSemaphore", |f| f.timeline_semaphore),
-    ("multiDrawIndirect", |f| {
-        f.core.multi_draw_indirect == vk::TRUE
-    }),
-    ("drawIndirectFirstInstance", |f| {
-        f.core.draw_indirect_first_instance == vk::TRUE
-    }),
-    ("shaderDrawParameters", |f| f.shader_draw_parameters),
     ("runtimeDescriptorArray", |f| f.runtime_descriptor_array),
     ("shaderSampledImageArrayNonUniformIndexing", |f| {
         f.sampled_image_array_non_uniform_indexing
@@ -227,16 +261,9 @@ const REQUIRED_FEATURES: &[FeatureCheck] = &[
     ("descriptorBindingPartiallyBound", |f| {
         f.descriptor_binding_partially_bound
     }),
-    ("descriptorBindingVariableDescriptorCount", |f| {
-        f.descriptor_binding_variable_descriptor_count
-    }),
     ("descriptorBindingSampledImageUpdateAfterBind", |f| {
         f.descriptor_binding_sampled_image_update_after_bind
     }),
-    ("samplerAnisotropy", |f| {
-        f.core.sampler_anisotropy == vk::TRUE
-    }),
-    ("hostQueryReset", |f| f.host_query_reset),
 ];
 
 impl Gpu {
@@ -699,6 +726,8 @@ fn evaluate(
             || has(ash::ext::calibrated_timestamps::NAME),
         low_latency2: has(ash::nv::low_latency2::NAME),
         anti_lag: has(ash::amd::anti_lag::NAME),
+        optional: OptionalFeatures::of(&features),
+        max_sampler_anisotropy: props.limits.max_sampler_anisotropy,
     };
     Ok(Candidate {
         physical: pd,
@@ -777,15 +806,11 @@ fn query_features(
         core,
         shader_draw_parameters: t(f11.shader_draw_parameters),
         timeline_semaphore: t(f12.timeline_semaphore),
-        host_query_reset: t(f12.host_query_reset),
         runtime_descriptor_array: t(f12.runtime_descriptor_array),
         sampled_image_array_non_uniform_indexing: t(
             f12.shader_sampled_image_array_non_uniform_indexing
         ),
         descriptor_binding_partially_bound: t(f12.descriptor_binding_partially_bound),
-        descriptor_binding_variable_descriptor_count: t(
-            f12.descriptor_binding_variable_descriptor_count
-        ),
         descriptor_binding_sampled_image_update_after_bind: t(
             f12.descriptor_binding_sampled_image_update_after_bind
         ),
@@ -803,18 +828,18 @@ fn query_features(
 }
 
 fn create_device(instance: &Instance, c: &Candidate) -> Result<ash::Device, Error> {
+    let optional = c.caps.optional;
     let core = vk::PhysicalDeviceFeatures::default()
-        .multi_draw_indirect(true)
-        .draw_indirect_first_instance(true)
-        .sampler_anisotropy(true);
-    let mut f11 = vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+        .multi_draw_indirect(optional.multi_draw_indirect)
+        .draw_indirect_first_instance(optional.draw_indirect_first_instance)
+        .sampler_anisotropy(optional.sampler_anisotropy);
+    let mut f11 = vk::PhysicalDeviceVulkan11Features::default()
+        .shader_draw_parameters(optional.shader_draw_parameters);
     let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
         .timeline_semaphore(true)
-        .host_query_reset(true)
         .runtime_descriptor_array(true)
         .shader_sampled_image_array_non_uniform_indexing(true)
         .descriptor_binding_partially_bound(true)
-        .descriptor_binding_variable_descriptor_count(true)
         .descriptor_binding_sampled_image_update_after_bind(true);
     let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
         .dynamic_rendering(true)
@@ -856,7 +881,8 @@ fn create_device(instance: &Instance, c: &Candidate) -> Result<ash::Device, Erro
             .enabled_extension_names(&ext_ptrs)
             .extend(&mut f2)
     };
-    // SAFETY: every enabled feature and extension was checked in evaluate().
+    // SAFETY: every enabled feature and extension was checked in evaluate(); the optional
+    // features are enabled only where the query reported them.
     unsafe { instance.raw.create_device(c.physical, &info, None) }.ctx("vkCreateDevice")
 }
 

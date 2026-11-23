@@ -1,10 +1,11 @@
 //! Ruthenium's Vulkan layer.
 //!
 //! The baseline is Vulkan 1.2 plus dynamic rendering, synchronization2 (core in 1.3, or
-//! as extensions), timeline semaphores, the descriptor-indexing subset for one bindless
-//! table, multi-draw-indirect and shader draw parameters: the same envelope vanilla 26.3's
-//! Vulkan backend needs, so any GPU that runs vanilla on Vulkan runs Ruthenium. Newer
-//! features are probed into [`DeviceCaps`] and used only with a fallback.
+//! as extensions), timeline semaphores and the descriptor-indexing subset for one indexed
+//! texture table: less than vanilla 26.3's Vulkan backend needs, so any GPU that runs
+//! vanilla on Vulkan runs Ruthenium. Everything else (multi-draw indirect, shader draw
+//! parameters, anisotropic filtering, newer extensions) is probed into [`DeviceCaps`] and
+//! used only with a fallback.
 //!
 //! On macOS the same code runs on Metal through MoltenVK, enumerated as a portability
 //! driver; the portability subset is enabled whenever the device reports it.
@@ -22,7 +23,9 @@ mod upload;
 mod upload_check;
 
 pub use ash::vk;
-pub use device::{DeviceCaps, Gpu, GpuOptions, PretendSrgb, Rejected, SwapchainMaintenance};
+pub use device::{
+    DeviceCaps, Gpu, GpuOptions, OptionalFeatures, PretendSrgb, Rejected, SwapchainMaintenance,
+};
 pub use frame::{
     ACQUIRE_TIMEOUT, Acquired, FrameCounters, FrameCtx, FrameLoop, FrameTimings, GpuTime, GpuZone,
     MAX_FRAME_WAITS, MAX_FRAMES_IN_FLIGHT, MAX_GPU_ZONES, Presented, SwapchainInfo, Target,

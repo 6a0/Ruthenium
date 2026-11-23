@@ -422,6 +422,11 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 _ => "present fences",
             }
         );
+        let optional = c
+            .optional
+            .named()
+            .map(|(name, on)| format!("{name} {}", if on { "on" } else { "missing" }));
+        eprintln!("[ruthenium] optional features: {}", optional.join(", "));
     }
     startup.gpu_ms = started.elapsed().as_secs_f64() * 1e3;
     // Declared after `window`, so it is dropped first: the surface must go before the window.
