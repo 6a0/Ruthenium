@@ -790,6 +790,9 @@ impl StateRender {
     pub const EMISSIVE: u8 = 2;
     /// A `LeavesBlock`.
     pub const LEAVES: u8 = 4;
+    /// `getShadeBrightness` is 0.2 (else 1): the state darkens the corners of faces
+    /// beside it under smooth lighting.
+    pub const DARK: u8 = 8;
 }
 
 /// `block_render.bin`: what drawing every block state needs beyond its model.
@@ -801,7 +804,7 @@ pub struct BlockRender {
 
 /// Parses `block_render.bin`.
 pub fn read_block_render(bytes: &[u8]) -> Result<BlockRender, String> {
-    let mut r = Reader::open(bytes, "block_render", 1)?;
+    let mut r = Reader::open(bytes, "block_render", 2)?;
     let shapes = r.shapes()?;
     let n = r.u32()? as usize;
     let mut states = Vec::with_capacity(n.min(1 << 17));
@@ -867,7 +870,7 @@ mod tests {
     #[test]
     fn reads_block_render() {
         let mut b = b"RTHX".to_vec();
-        b.extend(1u32.to_le_bytes());
+        b.extend(2u32.to_le_bytes());
         string(&mut b, "block_render");
         // Two shapes: the empty one (a single empty cell) and the full block.
         b.extend(2u32.to_le_bytes());
@@ -881,7 +884,7 @@ mod tests {
         }
         b.extend(2u32.to_le_bytes());
         // A plain cube.
-        b.push(StateRender::MODEL);
+        b.push(StateRender::MODEL | StateRender::DARK);
         b.push(0);
         for _ in 0..6 {
             b.extend(1u32.to_le_bytes());
@@ -910,6 +913,7 @@ mod tests {
         assert_eq!(r.shapes.len(), 2);
         assert_eq!(r.shapes[1].full, vec![true]);
         assert_eq!(r.states[0].occlusion, [1; 6]);
+        assert_eq!(r.states[0].flags, StateRender::MODEL | StateRender::DARK);
         assert_eq!(r.states[0].skip, SkipRule::None);
         assert!(r.states[0].tints.is_empty());
         assert_eq!(r.states[1].skip, SkipRule::Leaves);

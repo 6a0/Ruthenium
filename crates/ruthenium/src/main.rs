@@ -107,6 +107,11 @@ With no command, opens the game window. Options:
                          what of the world is meshed and drawn: what can be seen
                          from the camera through the sections' open faces (graph, the
                          default), or everything loaded inside the view (frustum)
+  --smooth-lighting <on|off>
+                         whether corners are lit and darkened by the blocks around
+                         them (on, the default) or every face has one light (off)
+  --biome-blend <0..7>   over how many columns each way grass, leaves and water take
+                         the mean of the biomes' colours (default 2: 5 x 5)
   --route <file>         with --join: play a route file from cargo xtask bench
                          dedicated once in the world, measure the frames of its
                          capture (for --bench-out, with every frame interval and what

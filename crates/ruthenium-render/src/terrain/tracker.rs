@@ -1122,6 +1122,7 @@ mod tests {
     }
 
     use super::super::mesher::{MeshOptions, Mesher};
+    use super::super::tint::BiomeTints;
     use super::super::visibility::{Batch, Camera, Graph};
 
     /// A tracker with cave culling and its graph, which answers at once.
@@ -1178,12 +1179,16 @@ mod tests {
         fn mesh_all(&mut self, world: &World) -> Vec<SectionKey> {
             let options = MeshOptions {
                 shades: [1.0; 6],
+                smooth_lighting: true,
+                biome_blend: 2,
                 cutout_leaves: true,
             };
             let mut done = Vec::new();
             while let Some(job) = self.t.next_job(&world.scene, self.camera) {
                 let key = job.neighbourhood.section();
-                let mesh = self.mesher.mesh(&job.neighbourhood, &options);
+                let mesh = self
+                    .mesher
+                    .mesh(&job.neighbourhood, &options, &BiomeTints::default());
                 let stamp = job.neighbourhood.stamp().clone();
                 assert!(self.t.accept(&world.scene, &stamp));
                 self.t.connect(key, mesh.connectivity, false);
@@ -1317,8 +1322,11 @@ mod tests {
             &shaft.neighbourhood,
             &MeshOptions {
                 shades: [1.0; 6],
+                smooth_lighting: true,
+                biome_blend: 2,
                 cutout_leaves: true,
             },
+            &BiomeTints::default(),
         );
         c.t.set_clock(Since { at, frame: 41 });
         c.t.connect([0, 0, 0], mesh.connectivity, false);
@@ -1368,8 +1376,11 @@ mod tests {
                 &job.neighbourhood,
                 &MeshOptions {
                     shades: [1.0; 6],
+                    smooth_lighting: true,
+                    biome_blend: 2,
                     cutout_leaves: true,
                 },
+                &BiomeTints::default(),
             )
             .connectivity;
         assert!(open.sees(0, 1));

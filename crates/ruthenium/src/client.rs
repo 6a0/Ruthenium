@@ -161,6 +161,11 @@ pub struct Options {
     /// Whether only what can be seen from the camera is meshed and drawn (cave
     /// culling: the default) or everything loaded inside the view.
     pub terrain_culling: Option<bool>,
+    /// Smooth Lighting: corners lit by the blocks around them (the default), or off.
+    pub smooth_lighting: Option<bool>,
+    /// Biome Blend: over how many columns each way biome colours are the mean (0 to 7;
+    /// default 2).
+    pub biome_blend: Option<u8>,
 }
 
 impl Options {
@@ -213,6 +218,8 @@ impl Options {
             expected: Expected::default(),
             terrain_draws: None,
             terrain_culling: None,
+            smooth_lighting: None,
+            biome_blend: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -379,6 +386,22 @@ impl Options {
                         "frustum" => false,
                         v => return Err(format!("--terrain-culling: not graph or frustum: {v}")),
                     });
+                }
+                "--smooth-lighting" => {
+                    o.smooth_lighting = Some(match value("on or off")?.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        v => return Err(format!("--smooth-lighting: not on or off: {v}")),
+                    });
+                }
+                "--biome-blend" => {
+                    let v = value("a radius from 0 to 7")?;
+                    o.biome_blend = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|r| *r <= ruthenium_render::terrain::MAX_BLEND_RADIUS)
+                            .ok_or(format!("--biome-blend: not a radius from 0 to 7: {v}"))?,
+                    );
                 }
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
                 "--screen" => o.screen = Some(value("a screen name")?),
@@ -633,6 +656,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     if let Some(culling) = opts.terrain_culling {
         renderer.set_terrain_culling(culling);
+    }
+    if let Some(smooth) = opts.smooth_lighting {
+        renderer.set_smooth_lighting(smooth);
+    }
+    if let Some(radius) = opts.biome_blend {
+        renderer.set_biome_blend(radius);
     }
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
@@ -1254,6 +1283,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             json!({
                 "draws": renderer.terrain_draws().name(),
                 "culling": if renderer.terrain_culling() { "graph" } else { "frustum" },
+                "smooth_lighting": renderer.smooth_lighting(),
+                "biome_blend": renderer.biome_blend(),
                 "mesh_workers": menu.mesh_workers(),
                 "envelope_bytes": ruthenium_render::terrain::POOL_ENVELOPE,
                 "at_capture_start": at_start,

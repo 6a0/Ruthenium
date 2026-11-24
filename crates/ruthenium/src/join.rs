@@ -14,7 +14,7 @@ use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, R
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
 use ruthenium_render::WorldAssets;
-use ruthenium_render::terrain::BlockTable;
+use ruthenium_render::terrain::{BlockTable, ColourMaps};
 use ruthenium_sim::blocks::Blocks;
 use ruthenium_sim::enchantment::Enchantments;
 use ruthenium_sim::entity::EntityTypes;
@@ -127,8 +127,8 @@ impl GameData {
 }
 
 /// Vanilla's definitions of what a level looks like, as the jar's data pack has them:
-/// dimension types, timelines, world clocks, and each biome's attributes and effects
-/// (a biome's world generation is left out). A server that names these without sending
+/// dimension types, timelines, world clocks, and each biome's attributes, effects and
+/// climate (a biome's world generation is left out). A server that names these without sending
 /// them means these.
 fn local_registries(jar: &Zip) -> ruthenium_sim::environment::LocalRegistries {
     use ruthenium_sim::environment::{BIOME, DIMENSION_TYPE, TIMELINE, WORLD_CLOCK};
@@ -158,7 +158,12 @@ fn local_registries(jar: &Zip) -> ruthenium_sim::environment::LocalRegistries {
             if registry == BIOME
                 && let Some(o) = v.as_object_mut()
             {
-                o.retain(|k, _| k == "attributes" || k == "effects");
+                o.retain(|k, _| {
+                    matches!(
+                        k.as_str(),
+                        "attributes" | "effects" | "temperature" | "downfall"
+                    )
+                });
             }
             entries.insert(format!("minecraft:{name}"), v);
         }
@@ -226,8 +231,11 @@ fn enchantments(jar: &Zip) -> Enchantments {
 
 /// The `bars` block tag as the game's own data pack has it.
 const BARS_TAG: &str = "data/minecraft/tags/block/bars.json";
-/// The grass colour map, whose default colour tints grass until biomes do.
+/// The colour maps biomes take their grass and foliage colours from. The grass map's
+/// default colour tints grass until biomes do.
 const GRASS_MAP: &str = "textures/colormap/grass.png";
+const FOLIAGE_MAP: &str = "textures/colormap/foliage.png";
+const DRY_FOLIAGE_MAP: &str = "textures/colormap/dry_foliage.png";
 
 /// Builds what drawing a world needs from the imported game in `game`: the block atlas
 /// with its mip levels, and every block state's baked model and drawing rules.
@@ -258,13 +266,23 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
     }
     // The pixel the game reads for a temperature of 0.5 and a downfall of 1
     // (`GrassColor.getDefaultColor`); its own stand-in where the map is missing.
-    let grass_id = Id::minecraft(GRASS_MAP).expect("a valid id");
-    let grass_default = resources
-        .get(&grass_id)
-        .and_then(|r| r.read().ok())
-        .and_then(|bytes| Image::decode_png(&bytes).ok())
+    let colour_map = |file: &str| {
+        resources
+            .get(&Id::minecraft(file).expect("a valid id"))
+            .and_then(|r| r.read().ok())
+            .and_then(|bytes| Image::decode_png(&bytes).ok())
+    };
+    let grass_map = colour_map(GRASS_MAP);
+    let grass_default = grass_map
+        .as_ref()
         .filter(|map| map.width == 256 && map.height == 256)
         .map_or(0xFFFF_00FF, |map| map.get(127, 127));
+    let pixels = |map: Option<Image>| map.map_or(Vec::new(), |m| m.pixels);
+    let colour_maps = ColourMaps {
+        grass: pixels(grass_map),
+        foliage: pixels(colour_map(FOLIAGE_MAP)),
+        dry_foliage: pixels(colour_map(DRY_FOLIAGE_MAP)),
+    };
     let bars: Vec<String> = Zip::open(&imported.client_jar)
         .ok()
         .and_then(|jar| {
@@ -302,6 +320,7 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         atlas_width: atlas.width,
         atlas_height: atlas.height,
         atlas_levels,
+        colour_maps,
     })
 }
 

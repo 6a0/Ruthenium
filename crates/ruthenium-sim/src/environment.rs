@@ -65,6 +65,10 @@ pub struct Timeline {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BiomeLook {
     pub id: String,
+    /// Its climate, which picks its colours from the colour maps where its effects name
+    /// none (`temperature`, `downfall`).
+    pub temperature: f32,
+    pub downfall: f32,
     /// Its environment attribute overrides (`attributes`).
     pub attributes: Value,
     /// Its special effects (`effects`: water, grass and foliage colours, the grass
@@ -156,8 +160,11 @@ impl Environment {
             .iter()
             .map(|e| {
                 let d = definition(BIOME, e, local).unwrap_or(Value::Null);
+                let number = |name: &str| d.get(name).and_then(Value::as_f64).unwrap_or(0.0) as f32;
                 BiomeLook {
                     id: e.id.clone(),
+                    temperature: number("temperature"),
+                    downfall: number("downfall"),
                     attributes: d.get("attributes").cloned().unwrap_or(Value::Null),
                     effects: d.get("effects").cloned().unwrap_or(Value::Null),
                 }
@@ -379,6 +386,7 @@ mod tests {
         l.entry(BIOME.into()).or_default().insert(
             "minecraft:swamp".into(),
             json!({"attributes": {"minecraft:visual/fog_color": "#c0d8ff"},
+                   "temperature": 0.8, "downfall": 0.9,
                    "effects": {"water_color": "#617b64"}, "features": [[1, 2, 3]]}),
         );
         l
@@ -456,6 +464,15 @@ mod tests {
         assert_eq!(env.biomes.len(), 2);
         assert_eq!(env.biomes[0].attributes, Value::Null);
         assert_eq!(env.biomes[1].effects["water_color"], "#617b64");
+        // Its climate, which picks its grass and foliage colours.
+        assert_eq!(
+            (env.biomes[1].temperature, env.biomes[1].downfall),
+            (0.8, 0.9)
+        );
+        assert_eq!(
+            (env.biomes[0].temperature, env.biomes[0].downfall),
+            (0.0, 0.0)
+        );
     }
 
     #[test]

@@ -57,6 +57,13 @@ pub(crate) fn grass() -> u32 {
     state("minecraft:short_grass", &[])
 }
 
+/// Two crossed planes two blocks high: the upper half takes its tint from where the
+/// lower one stands.
+pub(crate) fn tall_grass(upper: bool) -> u32 {
+    let half = if upper { "upper" } else { "lower" };
+    state("minecraft:tall_grass", &[("half", half)])
+}
+
 /// A cube that gives off light 15.
 pub(crate) fn glowstone() -> u32 {
     state("minecraft:glowstone", &[])
@@ -185,6 +192,7 @@ pub(crate) fn table() -> Arc<BlockTable> {
     block("ice", "cube_ice", cube("ice"));
     block("oak_slab", "slab", SLAB.into());
     block("short_grass", "cross", CROSS.into());
+    block("tall_grass", "cross", CROSS.into());
     let atlas = atlas();
     let models = BlockModels::bake(&files, &atlas);
 
@@ -243,6 +251,10 @@ pub(crate) fn table() -> Arc<BlockTable> {
     for id in [stone(), glowstone(), magma()] {
         behaviour.states[id as usize].flags |= StateBehaviour::SOLID_RENDER;
     }
+    // The glowing cube takes no light away, solid as it is to the eye.
+    for id in [stone(), magma()] {
+        physics.states[id as usize].light_dampening = 15;
+    }
     for (id, occlusion, collision_full) in [
         (stone(), [1; 6], true),
         (glowstone(), [1; 6], true),
@@ -251,6 +263,8 @@ pub(crate) fn table() -> Arc<BlockTable> {
         (ice(), [1; 6], true),
         (slab(), [1, 0, 2, 2, 2, 2], false),
         (grass(), [0; 6], false),
+        (tall_grass(false), [0; 6], false),
+        (tall_grass(true), [0; 6], false),
     ] {
         let r = &mut render.states[id as usize];
         r.flags = StateRender::MODEL;
@@ -262,13 +276,19 @@ pub(crate) fn table() -> Arc<BlockTable> {
     for id in [glass(), ice()] {
         render.states[id as usize].skip = SkipRule::SameBlock;
     }
+    // Glass is a `TransparentBlock`: full to walk on, and it darkens nothing.
+    for id in [stone(), glowstone(), magma(), ice()] {
+        render.states[id as usize].flags |= StateRender::DARK;
+    }
     physics.states[glowstone() as usize].light_emission = 15;
     render.states[magma() as usize].flags |= StateRender::EMISSIVE;
-    render.states[grass() as usize].tints = vec![TintLayer {
-        hand: None,
-        world: WorldTint::Grass,
-        dy: 0,
-    }];
+    for (id, dy) in [(grass(), 0), (tall_grass(false), 0), (tall_grass(true), -1)] {
+        render.states[id as usize].tints = vec![TintLayer {
+            hand: None,
+            world: WorldTint::Grass,
+            dy,
+        }];
+    }
     physics.states[grass() as usize].offset = Some(OffsetData {
         vertical: false,
         max_horizontal: 0.25,

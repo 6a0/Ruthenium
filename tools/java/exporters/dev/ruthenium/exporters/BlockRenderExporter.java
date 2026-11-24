@@ -20,6 +20,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.world.level.CardinalLighting;
 import net.minecraft.world.level.ColorResolver;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.GrassColor;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
@@ -45,13 +46,15 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * with, the rule by which it leaves out faces against particular neighbours, and the
  * colours its tinted faces are multiplied by.
  *
- * <p>Format {@code block_render} v1, after the header:
+ * <p>Format {@code block_render} v2, after the header:
  * <ul>
  *   <li>u32 shape count, then the shapes as in {@code block_physics} (shape 0 is the
  *       empty shape).</li>
  *   <li>u32 state count, then per state in id order: u8 flags (1: drawn from its model,
  *       {@code RenderShape.MODEL}; 2: {@code emissiveRendering}; 4: a {@code
- *       LeavesBlock}); u8 the rule its class leaves faces out by ({@code skipRendering}:
+ *       LeavesBlock}; 8: {@code getShadeBrightness} is 0.2, where it is 1 otherwise: how
+ *       much the state darkens the corners of faces beside it under smooth lighting);
+ *       u8 the rule its class leaves faces out by ({@code skipRendering}:
  *       0 none, 1 against the same block, 2 leaves against leaves when leaves are drawn
  *       opaque, 3 bars, 4 mangrove roots above and below each other, 5 a liquid against
  *       the same fluid); six u32 face occlusion shapes, one per {@code Direction} in
@@ -72,6 +75,7 @@ final class BlockRenderExporter {
     private static final int MODEL = 1;
     private static final int EMISSIVE = 2;
     private static final int LEAVES = 4;
+    private static final int DARK = 8;
 
     private static final int SKIP_NONE = 0;
     private static final int SKIP_SAME_BLOCK = 1;
@@ -167,6 +171,12 @@ final class BlockRenderExporter {
             if (state.getRenderShape() == RenderShape.MODEL) flags |= MODEL;
             if (state.emissiveRendering()) flags |= EMISSIVE;
             if (block instanceof LeavesBlock) flags |= LEAVES;
+            float shade = state.getShadeBrightness(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+            if (shade == 0.2F) {
+                flags |= DARK;
+            } else if (shade != 1.0F) {
+                throw new IllegalStateException("shade brightness " + shade + " of " + state);
+            }
             states.u8(flags);
             Integer rule = rules.get(block.getClass());
             if (rule == null) {
@@ -201,7 +211,7 @@ final class BlockRenderExporter {
             }
         }
 
-        ExportWriter w = new ExportWriter("block_render", 1);
+        ExportWriter w = new ExportWriter("block_render", 2);
         w.u32(shapes.size());
         for (byte[] s : shapes) {
             w.bytes(s);

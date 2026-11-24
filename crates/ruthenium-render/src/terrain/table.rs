@@ -5,6 +5,7 @@
 
 use std::path::Path;
 
+use super::tint::BiomeColour;
 use ruthenium_assets::BlockModels;
 use ruthenium_data::v26_3::blocks::STATE_COUNT;
 use ruthenium_data::v26_3::{Block, BlockState};
@@ -25,7 +26,7 @@ pub(crate) enum ShapeKind {
 /// A block state as the mesher reads it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StateInfo {
-    pub flags: u8,
+    pub flags: u16,
     pub skip: SkipRule,
     /// `getLightEmission`.
     pub light_emission: u8,
@@ -44,19 +45,24 @@ pub(crate) struct StateInfo {
 
 impl StateInfo {
     /// Drawn from a model that has quads.
-    pub const DRAWN: u8 = 1;
+    pub const DRAWN: u16 = 1;
     /// `emissiveRendering`: lit fully whatever the light.
-    pub const EMISSIVE: u8 = 2;
+    pub const EMISSIVE: u16 = 2;
     /// A `LeavesBlock`.
-    pub const LEAVES: u8 = 4;
+    pub const LEAVES: u16 = 4;
     /// `isCollisionShapeFullBlock`.
-    pub const COLLISION_FULL: u8 = 8;
+    pub const COLLISION_FULL: u16 = 8;
     /// In the `bars` block tag.
-    pub const BARS: u8 = 16;
+    pub const BARS: u16 = 16;
     /// `isSolidRender`: nothing is seen through it.
-    pub const SOLID_RENDER: u8 = 32;
+    pub const SOLID_RENDER: u16 = 32;
     /// `isAir`.
-    pub const AIR: u8 = 64;
+    pub const AIR: u16 = 64;
+    /// `getShadeBrightness` is 0.2 (else 1): it darkens the corners of faces beside it
+    /// under smooth lighting.
+    pub const DARK: u16 = 128;
+    /// `isLightPermeable`: something is seen through it, or it takes no light away.
+    pub const PERMEABLE: u16 = 256;
 }
 
 /// How a block is moved by its position (`BlockBehaviour.OffsetType`).
@@ -74,18 +80,36 @@ pub struct BlockTable {
     pub(crate) states: Vec<StateInfo>,
     pub(crate) shapes: Vec<ShapeData>,
     pub(crate) kinds: Vec<ShapeKind>,
-    /// 0xAARRGGBB.
-    pub(crate) tints: Vec<u32>,
+    pub(crate) tints: Vec<Tint>,
     pub(crate) offsets: Vec<Offset>,
     pub(crate) mangrove_roots: u16,
 }
 
-/// The colour a tinted face gets until biomes are read: what the game gives outside a
-/// world, or the constant it gives in one.
-fn tint_colour(layer: &exporters::TintLayer, grass_default: u32) -> u32 {
-    match layer.world {
-        WorldTint::Constant(c) => c,
-        _ => layer.hand.unwrap_or(grass_default),
+/// What a tint layer multiplies its faces by, 0xAARRGGBB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tint {
+    Constant(u32),
+    /// One of the biomes' colours, read `dy` blocks above the block; `hand` is what the
+    /// game gives outside a world, for as long as no biome's colours are known.
+    Biome {
+        kind: BiomeColour,
+        dy: i8,
+        hand: u32,
+    },
+}
+
+fn tint(layer: &exporters::TintLayer, grass_default: u32) -> Tint {
+    let kind = match layer.world {
+        WorldTint::Constant(c) => return Tint::Constant(c),
+        WorldTint::Grass => BiomeColour::Grass,
+        WorldTint::Foliage => BiomeColour::Foliage,
+        WorldTint::DryFoliage => BiomeColour::DryFoliage,
+        WorldTint::Water => BiomeColour::Water,
+    };
+    Tint::Biome {
+        kind,
+        dy: layer.dy,
+        hand: layer.hand.unwrap_or(grass_default),
     }
 }
 
@@ -160,6 +184,12 @@ impl BlockTable {
             if b.flags & StateBehaviour::AIR != 0 {
                 flags |= StateInfo::AIR;
             }
+            if r.flags & StateRender::DARK != 0 {
+                flags |= StateInfo::DARK;
+            }
+            if b.flags & StateBehaviour::SOLID_RENDER == 0 || p.light_dampening == 0 {
+                flags |= StateInfo::PERMEABLE;
+            }
             let mut connects = 0;
             if r.skip == SkipRule::Bars {
                 if in_bars_tag(block.name()) {
@@ -190,7 +220,7 @@ impl BlockTable {
                 }
             };
             let first_tint = tints.len() as u32;
-            tints.extend(r.tints.iter().map(|t| tint_colour(t, grass_default)));
+            tints.extend(r.tints.iter().map(|t| tint(t, grass_default)));
             states.push(StateInfo {
                 flags,
                 skip: r.skip,

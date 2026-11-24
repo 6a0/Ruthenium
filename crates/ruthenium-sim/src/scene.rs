@@ -149,6 +149,9 @@ pub struct Dims {
     /// How many sections a chunk has.
     pub sections: i32,
     pub has_skylight: bool,
+    /// The level's hashed seed, which jitters the borders between biomes
+    /// (`BiomeManager`).
+    pub biome_seed: i64,
 }
 
 impl Dims {
@@ -157,6 +160,7 @@ impl Dims {
             min_section: level.min_y() >> 4,
             sections: level.height() >> 4,
             has_skylight: level.has_skylight(),
+            biome_seed: level.biomes.seed,
         }
     }
 }

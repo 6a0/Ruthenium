@@ -28,12 +28,14 @@ use ruthenium_gpu::{
     TextureId, TextureTable, UploadError, UploadRing, UploadTicket, Urgency, Users, vk,
 };
 use ruthenium_shaders::interface::{SECTION, WORLD, WORLD_MATRIX};
+use ruthenium_sim::environment::Environment;
 use ruthenium_sim::scene::{Scene, SectionKey, Stamp};
 
 use super::camera::{CameraPose, View};
 use super::lightmap::{self, LightmapInputs};
 use super::mesher::{MeshOptions, Mesher, SectionMesh};
 use super::table::BlockTable;
+use super::tint::{BiomeTints, ColourMaps, MAX_BLEND_RADIUS};
 use super::tracker::{Job, Since, Tracker, TrackerStats};
 use super::visibility::{Batch, Camera, Connectivity, Visibility};
 use crate::pipelines::PipelineId;
@@ -185,6 +187,8 @@ pub struct WorldAssets {
     pub atlas_width: u32,
     pub atlas_height: u32,
     pub atlas_levels: Vec<Vec<u8>>,
+    /// The colour maps biomes take their grass and foliage colours from.
+    pub colour_maps: ColourMaps,
 }
 
 /// The indices of quads as two triangles each, sharing the diagonal from a quad's first
@@ -217,6 +221,7 @@ enum Work {
     Mesh {
         job: Box<Job>,
         options: MeshOptions,
+        biomes: Arc<BiomeTints>,
         /// Which run of sessions the job is of ([`WorldRenderer::clear`]).
         session: u64,
     },
@@ -322,11 +327,12 @@ fn work(
             Work::Mesh {
                 job,
                 options,
+                biomes,
                 session,
             } => {
                 profiling::scope!("mesh_section");
                 let started = Instant::now();
-                let mesh = mesher.mesh(&job.neighbourhood, &options);
+                let mesh = mesher.mesh(&job.neighbourhood, &options, &biomes);
                 let done = Meshed {
                     session,
                     stamp: job.neighbourhood.stamp().clone(),
@@ -483,6 +489,10 @@ pub(crate) struct WorldRenderer {
     calls: Vec<(vk::Buffer, u32, u32)>,
     latencies: [LatencySeries; 3],
     options: MeshOptions,
+    colour_maps: ColourMaps,
+    /// The dimension's environment the biomes' colours were last worked out from.
+    environment: Option<Arc<Environment>>,
+    biomes: Arc<BiomeTints>,
     stats: WorldStats,
     warned_dropped: bool,
     warned_envelope: bool,
@@ -653,8 +663,13 @@ impl WorldRenderer {
             ],
             options: MeshOptions {
                 shades: [0.5, 1.0, 0.8, 0.8, 0.6, 0.6],
+                smooth_lighting: true,
+                biome_blend: 2,
                 cutout_leaves: true,
             },
+            colour_maps: assets.colour_maps,
+            environment: None,
+            biomes: Arc::new(BiomeTints::default()),
             stats: WorldStats::default(),
             warned_dropped: false,
             warned_envelope: false,
@@ -759,11 +774,40 @@ impl WorldRenderer {
         self.session += 1;
     }
 
-    /// Sets what meshes are shaded by (the dimension's cardinal light). A change makes
-    /// every mesh out of date; a dimension change, which is when it happens, empties
-    /// them anyway.
-    pub fn set_shades(&mut self, shades: [f32; 6]) {
-        self.options.shades = shades;
+    /// Sets what meshes are shaded and tinted by: the dimension's cardinal light and
+    /// its biomes' colours. A change makes every mesh out of date; a dimension change,
+    /// which is when it happens, empties them anyway.
+    pub fn set_environment(&mut self, environment: &Arc<Environment>) {
+        if self
+            .environment
+            .as_ref()
+            .is_some_and(|e| Arc::ptr_eq(e, environment))
+        {
+            return;
+        }
+        self.options.shades = environment.cardinal_light.shades();
+        self.biomes = Arc::new(BiomeTints::new(&self.colour_maps, &environment.biomes));
+        self.environment = Some(environment.clone());
+    }
+
+    /// Biome Blend: how many columns each way a biome colour is the mean over (2 unless
+    /// said otherwise, 7 at most). To be set before anything is meshed.
+    pub fn set_biome_blend(&mut self, radius: u8) {
+        self.options.biome_blend = radius.min(MAX_BLEND_RADIUS);
+    }
+
+    pub fn biome_blend(&self) -> u8 {
+        self.options.biome_blend
+    }
+
+    /// Smooth Lighting (on unless said otherwise). To be set before anything is meshed:
+    /// meshes made before a change keep the lighting they were made with.
+    pub fn set_smooth_lighting(&mut self, smooth: bool) {
+        self.options.smooth_lighting = smooth;
+    }
+
+    pub fn smooth_lighting(&self) -> bool {
+        self.options.smooth_lighting
     }
 
     /// Creates the light map, or rewrites it when its inputs changed.
@@ -922,6 +966,7 @@ impl WorldRenderer {
             self.workers.push(Work::Mesh {
                 job: Box::new(job),
                 options: self.options,
+                biomes: self.biomes.clone(),
                 session: self.session,
             });
         }

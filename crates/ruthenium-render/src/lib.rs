@@ -118,7 +118,7 @@ pub struct WorldFrame<'a> {
     /// told.
     pub view_distance: i32,
     /// The dimension's own look: how faces are shaded, its light and its sky.
-    pub environment: &'a Environment,
+    pub environment: &'a Arc<Environment>,
 }
 
 /// The colour the world's pass is cleared to: the dimension's sky colour as its type
@@ -161,6 +161,8 @@ pub struct Renderer {
     /// How the terrain's sections are to be drawn, for the world once it is loaded.
     terrain_draws: TerrainDraws,
     terrain_culling: bool,
+    smooth_lighting: bool,
+    biome_blend: u8,
     /// The terrain's part of the last frame.
     world_times: WorldTimes,
     /// The number of the last frame recorded.
@@ -256,6 +258,8 @@ impl Renderer {
             depth: None,
             terrain_draws: TerrainDraws::default(),
             terrain_culling: true,
+            smooth_lighting: true,
+            biome_blend: 2,
             world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
@@ -296,8 +300,40 @@ impl Renderer {
                 self.terrain_culling,
             )?);
             self.set_terrain_draws(self.terrain_draws);
+            if let Some(w) = &mut self.world {
+                w.set_smooth_lighting(self.smooth_lighting);
+                w.set_biome_blend(self.biome_blend);
+            }
         }
         Ok(())
+    }
+
+    /// Whether blocks are lit corner by corner from the blocks around them (Smooth
+    /// Lighting, on unless said otherwise) or a face at a time. Takes effect when the
+    /// world's assets are loaded ([`Self::load_world`]).
+    pub fn set_smooth_lighting(&mut self, smooth: bool) {
+        self.smooth_lighting = smooth;
+    }
+
+    /// Biome Blend: over how many columns each way grass, leaves and water take the mean
+    /// of the biomes' colours (0 to 7; 2 unless said otherwise). Takes effect when the
+    /// world's assets are loaded ([`Self::load_world`]).
+    pub fn set_biome_blend(&mut self, radius: u8) {
+        self.biome_blend = radius.min(terrain::MAX_BLEND_RADIUS);
+    }
+
+    pub fn biome_blend(&self) -> u8 {
+        self.world
+            .as_ref()
+            .map_or(self.biome_blend, |w| w.biome_blend())
+    }
+
+    /// Whether the terrain is meshed with smooth lighting (what was asked for until a
+    /// world is loaded).
+    pub fn smooth_lighting(&self) -> bool {
+        self.world
+            .as_ref()
+            .map_or(self.smooth_lighting, |w| w.smooth_lighting())
     }
 
     /// Whether only what can be seen from the camera through the sections' open faces
@@ -710,7 +746,7 @@ impl Renderer {
         let view = match (&world, surface, &mut self.world) {
             (Some(w), Some(s), Some(renderer)) => {
                 let started = std::time::Instant::now();
-                renderer.set_shades(w.environment.cardinal_light.shades());
+                renderer.set_environment(w.environment);
                 renderer.update(
                     w.scene,
                     &w.camera,

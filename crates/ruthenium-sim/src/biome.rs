@@ -255,6 +255,11 @@ impl Simplex {
     }
 }
 
+/// `Biome.BIOME_INFO_NOISE` at a place: what a swamp's grass takes its colour by.
+pub fn biome_info(x: f64, z: f64) -> f32 {
+    noises().biome_info.sample(x, z)
+}
+
 /// `LinearCongruentialGenerator.next`.
 fn lcg(r: i64, c: i64) -> i64 {
     r.wrapping_mul(

@@ -1,12 +1,14 @@
 //! The reference mesher: one 16 x 16 x 16 section's block models as packed vertices,
 //! block by block and quad by quad, with nothing merged or reordered.
 //!
-//! It does what 26.3's section compiler does for blocks drawn from models, with
-//! lighting as with Smooth Lighting off (`ModelBlockRenderer.tesselateFlat`): a face
-//! whose neighbour hides it is left out (`Block.shouldRenderFace`); a face on the
-//! block's boundary is lit by the block it looks into, any other by the block's own
-//! place; every face is shaded by the direction it looks in (the dimension's cardinal
-//! light) and multiplied by its tint. Quads go to the solid or the cutout layer by
+//! It does what 26.3's section compiler does for blocks drawn from models. A face whose
+//! neighbour hides it is left out (`Block.shouldRenderFace`). With Smooth Lighting on,
+//! the quads of a block that gives off no light and whose model has ambient occlusion
+//! are lit corner by corner from the blocks around ([`super::smooth`]). Any other quad is
+//! lit flat (`ModelBlockRenderer.tesselateFlat`): on the block's boundary by the block
+//! it looks into, else by the block's own place. Every face is shaded by the direction
+//! it looks in (the dimension's cardinal light) and multiplied by its tint. Quads go to
+//! the solid or the cutout layer by
 //! their texture; translucent ones are counted and left out, as are fluids and blocks
 //! that block entities draw, until their steps.
 
@@ -17,7 +19,9 @@ use ruthenium_assets::{BakedQuad, Layer, ModelPart};
 use ruthenium_sim::blocks::{offset as block_offset, seed};
 use ruthenium_sim::scene::{HALO_SIDE, Neighbourhood};
 
-use super::table::{BlockTable, ShapeKind, StateInfo, sticks_out};
+use super::smooth::{self, Cell, Face, Lit};
+use super::table::{BlockTable, ShapeKind, StateInfo, Tint, sticks_out};
+use super::tint::{BiomeTints, TintScratch};
 use super::visibility::Connectivity;
 use crate::terrain_vertex::{Vertex, position_code, position_of, uv_code};
 
@@ -40,6 +44,11 @@ pub struct MeshOptions {
     /// How much light a face keeps by the direction it looks in
     /// (`CardinalLighting`), by direction ordinal.
     pub shades: [f32; 6],
+    /// Smooth Lighting: corners are lit and darkened by the blocks around them
+    /// (ambient occlusion). Off, every quad has one light and one shade.
+    pub smooth_lighting: bool,
+    /// Biome Blend: how many columns each way a biome colour is the mean over (0 to 7).
+    pub biome_blend: u8,
     /// Leaves have holes (the Fancy setting); off, they are opaque and hide each
     /// other's faces.
     pub cutout_leaves: bool,
@@ -80,6 +89,10 @@ pub struct Mesher {
     /// Whether a face shape sticks out of the shape over it, by the two shapes.
     pairs: HashMap<(u16, u16), bool>,
     cutout: Vec<u8>,
+    /// What smooth lighting has read of each block of the scratch so far, packed
+    /// ([`pack_cell`]); 0: not read yet.
+    cells: Vec<u16>,
+    tints: TintScratch,
 }
 
 impl std::fmt::Debug for Mesher {
@@ -102,10 +115,14 @@ fn multiply(a: u32, b: u32) -> u32 {
     channel(24) | channel(16) | channel(8) | channel(0)
 }
 
-/// A quad's colour as red, green, blue, alpha: its shade as a grey (`ARGB.gray`),
-/// times its tint.
-fn colour(shade: f32, tint: Option<u32>) -> [u8; 4] {
-    let grey = (shade * 255.0).floor() as u32 & 0xFF;
+/// A shade as a grey (`ARGB.gray`).
+fn grey(shade: f32) -> u8 {
+    (shade * 255.0).floor() as u32 as u8
+}
+
+/// A vertex's colour as red, green, blue, alpha: its grey times the quad's tint.
+fn colour(grey: u8, tint: Option<u32>) -> [u8; 4] {
+    let grey = u32::from(grey);
     let mut c = 0xFF00_0000 | grey << 16 | grey << 8 | grey;
     if let Some(t) = tint {
         c = multiply(c, t);
@@ -128,6 +145,74 @@ fn face_cubic(q: &BakedQuad, collision_full: bool) -> bool {
     min == max && (collision_full || if outward { max > 0.9999 } else { min < 1.0e-4 })
 }
 
+/// `LightCoordsUtil.getLightCoords` of a state at a place: block and sky light there,
+/// the block light not below what the state gives off itself.
+fn light_at(n: &Neighbourhood, state: &StateInfo, p: [i32; 3]) -> (u8, u8) {
+    if state.flags & StateInfo::EMISSIVE != 0 {
+        return (15, 15);
+    }
+    (
+        n.block_light(p[0], p[1], p[2]).max(state.light_emission),
+        n.sky_light(p[0], p[1], p[2]),
+    )
+}
+
+const CELL_READ: u16 = 1 << 15;
+
+fn pack_cell(c: Cell) -> u16 {
+    CELL_READ | u16::from(c.flags) << 8 | u16::from(c.sky) << 4 | u16::from(c.block)
+}
+
+fn unpack_cell(c: u16) -> Cell {
+    Cell {
+        block: (c & 15) as u8,
+        sky: (c >> 4 & 15) as u8,
+        flags: (c >> 8 & 7) as u8,
+    }
+}
+
+/// What smooth lighting reads of the block at a place in or around the section (up to
+/// two blocks outside it), remembered for the places the scratch holds.
+fn cell_at(
+    n: &Neighbourhood,
+    table: &BlockTable,
+    blocks: &[u16; HALO],
+    cells: &mut [u16],
+    p: [i32; 3],
+) -> Cell {
+    let held = p.iter().all(|c| (-1..17).contains(c));
+    let i = if held {
+        halo_index(p[0], p[1], p[2])
+    } else {
+        0
+    };
+    if held && cells[i] != 0 {
+        return unpack_cell(cells[i]);
+    }
+    let id = if held {
+        blocks[i]
+    } else {
+        n.block(p[0], p[1], p[2])
+    };
+    let state = table.state(u32::from(id));
+    let (block, sky) = light_at(n, state, p);
+    let mut flags = 0;
+    if state.flags & StateInfo::DARK != 0 {
+        flags |= Cell::DARK;
+    }
+    if state.flags & StateInfo::PERMEABLE != 0 {
+        flags |= Cell::PERMEABLE;
+    }
+    if state.flags & StateInfo::SOLID_RENDER != 0 {
+        flags |= Cell::SOLID;
+    }
+    let cell = Cell { block, sky, flags };
+    if held {
+        cells[i] = pack_cell(cell);
+    }
+    cell
+}
+
 fn halo_index(x: i32, y: i32, z: i32) -> usize {
     ((x + 1) + HALO_SIDE as i32 * (z + 1) + (HALO_SIDE * HALO_SIDE) as i32 * (y + 1)) as usize
 }
@@ -142,6 +227,8 @@ impl Mesher {
                 .expect("the size it was made with"),
             pairs: HashMap::new(),
             cutout: Vec::new(),
+            cells: Vec::new(),
+            tints: TintScratch::default(),
         }
     }
 
@@ -182,8 +269,13 @@ impl Mesher {
         })
     }
 
-    /// Meshes the section `n` was pinned for.
-    pub fn mesh(&mut self, n: &Neighbourhood, options: &MeshOptions) -> SectionMesh {
+    /// Meshes the section `n` was pinned for, its tinted blocks in the `biomes`' colours.
+    pub fn mesh(
+        &mut self,
+        n: &Neighbourhood,
+        options: &MeshOptions,
+        biomes: &BiomeTints,
+    ) -> SectionMesh {
         n.fill_blocks(&mut self.blocks);
         let table = self.table.clone();
         let section = n.section();
@@ -191,23 +283,18 @@ impl Mesher {
         let mut out = SectionMesh::default();
         let mut cutout = std::mem::take(&mut self.cutout);
         cutout.clear();
+        let mut cells = std::mem::take(&mut self.cells);
+        cells.clear();
+        if options.smooth_lighting {
+            cells.resize(HALO, 0);
+        }
+        let mut tints = std::mem::take(&mut self.tints);
+        tints.clear();
         let mut parts: Vec<&ModelPart> = Vec::with_capacity(8);
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
         // The blocks nothing is seen through (`SectionCompiler.java:78`), in the planes'
         // order.
         let mut solid = [0u64; 64];
-
-        // `LightCoordsUtil.getLightCoords` of the state at a place: block and sky light
-        // there, the block light not below what the state gives off itself.
-        let light_at = |state: &StateInfo, p: [i32; 3]| -> (u8, u8) {
-            if state.flags & StateInfo::EMISSIVE != 0 {
-                return (15, 15);
-            }
-            (
-                n.block_light(p[0], p[1], p[2]).max(state.light_emission),
-                n.sky_light(p[0], p[1], p[2]),
-            )
-        };
 
         // The order of `BlockPos.betweenClosed`: x first, then y, then z.
         for z in 0..16_i32 {
@@ -247,7 +334,19 @@ impl Mesher {
                     }
                     let opaque_leaves =
                         !options.cutout_leaves && state.flags & StateInfo::LEAVES != 0;
-                    let mut emit = |q: &BakedQuad, light: (u8, u8)| {
+                    let collision_full = state.flags & StateInfo::COLLISION_FULL != 0;
+                    // `ModelBlockRenderer.tesselateBlock`: by the first part's model.
+                    let smooth = options.smooth_lighting
+                        && state.light_emission == 0
+                        && parts.first().is_some_and(|p| p.ambient_occlusion);
+                    let shade_of = |q: &BakedQuad| {
+                        options.shades[usize::from(q.shade_direction.unwrap_or(q.direction))]
+                    };
+                    let flat = |q: &BakedQuad, light: (u8, u8)| Lit {
+                        grey: [grey(shade_of(q)); 4],
+                        light: [[light.0 << 4, light.1 << 4]; 4],
+                    };
+                    let mut emit = |q: &BakedQuad, lit: Lit| {
                         let layer = match q.layer {
                             Layer::Solid => &mut out.vertices,
                             Layer::Cutout | Layer::Translucent if opaque_leaves => {
@@ -259,18 +358,25 @@ impl Mesher {
                                 return;
                             }
                         };
-                        // The element's own light raises both lights
-                        // (`lightCoordsWithEmission`).
-                        let e = q.light_emission;
-                        let (block, sky) = (light.0.max(e), light.1.max(e));
                         let tint = usize::try_from(q.tint_index)
                             .ok()
                             .filter(|i| *i < usize::from(state.tints.1))
-                            .map(|i| table.tints[state.tints.0 as usize + i]);
-                        let shade =
-                            options.shades[usize::from(q.shade_direction.unwrap_or(q.direction))];
-                        let colour = colour(shade, tint);
+                            .map(|i| match table.tints[state.tints.0 as usize + i] {
+                                Tint::Constant(c) => c,
+                                Tint::Biome { kind, dy, hand } => tints
+                                    .colour(
+                                        n,
+                                        biomes,
+                                        options.biome_blend,
+                                        kind,
+                                        [x, y + i32::from(dy), z],
+                                    )
+                                    .unwrap_or(hand),
+                            });
                         for i in 0..4 {
+                            // The element's own light raises both lights.
+                            let [block_light, sky_light] =
+                                smooth::with_emission(lit.light[i], q.light_emission);
                             let mut position = [0u16; 3];
                             for a in 0..3 {
                                 let p = base[a] + q.positions[i][a];
@@ -290,9 +396,9 @@ impl Mesher {
                             });
                             Vertex {
                                 position,
-                                block_light: block << 4,
-                                sky_light: sky << 4,
-                                colour,
+                                block_light,
+                                sky_light,
+                                colour: colour(lit.grey[i], tint),
                                 uv,
                             }
                             .pack(layer);
@@ -320,19 +426,41 @@ impl Mesher {
                             if shown & bit == 0 {
                                 continue;
                             }
-                            let light = light_at(&state, beside);
-                            for q in quads {
-                                emit(q, light);
+                            if smooth {
+                                for q in quads {
+                                    let face = Face::of(&q.positions, d, collision_full);
+                                    let lit = smooth::smooth(&face, d, shade_of(q), |o| {
+                                        let p = [x + o[0], y + o[1], z + o[2]];
+                                        cell_at(n, &table, &self.blocks, &mut cells, p)
+                                    });
+                                    emit(q, lit);
+                                }
+                            } else {
+                                let light = light_at(n, &state, beside);
+                                for q in quads {
+                                    emit(q, flat(q, light));
+                                }
                             }
                         }
                         for q in part.unculled() {
-                            let step =
-                                if face_cubic(q, state.flags & StateInfo::COLLISION_FULL != 0) {
-                                    STEPS[usize::from(q.direction)]
-                                } else {
-                                    [0; 3]
-                                };
-                            emit(q, light_at(&state, [x + step[0], y + step[1], z + step[2]]));
+                            let d = usize::from(q.direction);
+                            if smooth {
+                                let face = Face::of(&q.positions, d, collision_full);
+                                let lit = smooth::smooth(&face, d, shade_of(q), |o| {
+                                    let p = [x + o[0], y + o[1], z + o[2]];
+                                    cell_at(n, &table, &self.blocks, &mut cells, p)
+                                });
+                                emit(q, lit);
+                                continue;
+                            }
+                            let step = if face_cubic(q, collision_full) {
+                                STEPS[d]
+                            } else {
+                                [0; 3]
+                            };
+                            let light =
+                                light_at(n, &state, [x + step[0], y + step[1], z + step[2]]);
+                            emit(q, flat(q, light));
                         }
                     }
                 }
@@ -342,6 +470,8 @@ impl Mesher {
         out.cutout_quads = (cutout.len() / (4 * crate::terrain_vertex::VERTEX_BYTES)) as u32;
         out.vertices.extend_from_slice(&cutout);
         self.cutout = cutout;
+        self.cells = cells;
+        self.tints = tints;
         if out.quads() > 0 {
             out.bounds = Some([min, max]);
         }
@@ -356,14 +486,17 @@ mod tests {
     use super::*;
     use crate::terrain_vertex::VERTEX_BYTES;
 
+    /// Flat lighting, which most of these tests are about.
     const OPTIONS: MeshOptions = MeshOptions {
         shades: [0.5, 1.0, 0.8, 0.8, 0.6, 0.6],
+        smooth_lighting: false,
+        biome_blend: 2,
         cutout_leaves: true,
     };
 
     fn mesh(world: &mut World, section: [i32; 3]) -> SectionMesh {
         let n = world.pin(section);
-        Mesher::new(testing::table()).mesh(&n, &OPTIONS)
+        Mesher::new(testing::table()).mesh(&n, &OPTIONS, &BiomeTints::default())
     }
 
     /// The mesh's quads: four vertices each.
@@ -464,7 +597,7 @@ mod tests {
         // A corner of the shared edge has the same place in both meshes: 16 blocks
         // from one section's corner, none from the other's.
         let n = world.pin([0, 0, 0]);
-        let west = Mesher::new(testing::table()).mesh(&n, &OPTIONS);
+        let west = Mesher::new(testing::table()).mesh(&n, &OPTIONS, &BiomeTints::default());
         assert_eq!(west.bounds.unwrap()[1][0], 16.0);
         let east = mesh(&mut world, [1, 0, 0]);
         assert_eq!(east.bounds.unwrap()[0][0], 0.0);
@@ -498,6 +631,283 @@ mod tests {
                 _ => assert_eq!(lights, (1, 2)),
             }
         }
+    }
+
+    const SMOOTH: MeshOptions = MeshOptions {
+        smooth_lighting: true,
+        ..OPTIONS
+    };
+
+    fn smooth_mesh(world: &mut World, section: [i32; 3]) -> SectionMesh {
+        let n = world.pin(section);
+        Mesher::new(testing::table()).mesh(&n, &SMOOTH, &BiomeTints::default())
+    }
+
+    /// The quad facing `direction` with a corner at each of the block's corners there.
+    fn face_of(m: &SectionMesh, direction: usize) -> [Vertex; 4] {
+        let found: Vec<_> = quads(m)
+            .into_iter()
+            .filter(|q| facing(q) == Some(direction))
+            .collect();
+        assert_eq!(found.len(), 1, "one face looks that way");
+        found[0]
+    }
+
+    #[test]
+    fn in_the_open_smooth_light_is_the_flat_light() {
+        let mut world = World::new(&[(0, 0)]);
+        world.set(5, 6, 7, testing::stone());
+        world.set(9, 6, 7, testing::slab());
+        world.light(0, 0, 0, 13, 4);
+        let flat = mesh(&mut world, [0, 0, 0]);
+        let smooth = smooth_mesh(&mut world, [0, 0, 0]);
+        // All but the faces that look into the blocks' own places, which are lit from
+        // there: the slab's top lies inside its block.
+        assert_eq!(flat.quads(), smooth.quads());
+        for (f, s) in quads(&flat).iter().zip(quads(&smooth)) {
+            for (f, s) in f.iter().zip(s) {
+                assert_eq!((f.position, f.uv, f.colour), (s.position, s.uv, s.colour));
+                assert_eq!((f.block_light, f.sky_light), (s.block_light, s.sky_light));
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_beside_a_face_darkens_the_corners_it_touches() {
+        let mut world = World::new(&[(0, 0)]);
+        world.set(5, 6, 7, testing::stone());
+        // Above and to the east of it.
+        world.set(6, 7, 7, testing::stone());
+        let m = smooth_mesh(&mut world, [0, 0, 0]);
+        let top = quads(&m)
+            .into_iter()
+            .find(|q| facing(q) == Some(1) && corners(q).iter().all(|c| c[1] == 7.0))
+            .unwrap();
+        for (v, c) in top.iter().zip(corners(&top)) {
+            // Three places at full brightness and the block at 0.2: 0.8 of the face's
+            // shade. The western corners touch nothing.
+            let grey = if c[0] == 6.0 { 204 } else { 255 };
+            assert_eq!(v.colour, [grey, grey, grey, 255], "at {c:?}");
+            // The block is dark inside, and counts as the lit place in front of the
+            // face: no light is lost.
+            assert_eq!((v.block_light, v.sky_light), (0, 240));
+        }
+        // Glass in the same place is full to walk on and darkens nothing.
+        world.set(6, 7, 7, testing::glass());
+        let m = smooth_mesh(&mut world, [0, 0, 0]);
+        let top = quads(&m)
+            .into_iter()
+            .find(|q| facing(q) == Some(1) && corners(q).iter().all(|c| c[1] == 7.0))
+            .unwrap();
+        assert!(top.iter().all(|v| v.colour == [255; 4]));
+    }
+
+    #[test]
+    fn a_diagonal_counts_only_where_light_gets_past_the_sides() {
+        // The grey of the north-eastern corner of a block's top, with a block
+        // diagonally beside the face there and `cover` above the two places next to it.
+        let corner = |cover: u32| {
+            let mut world = World::new(&[(0, 0)]);
+            world.set(5, 5, 5, testing::stone());
+            world.set(6, 6, 4, testing::stone());
+            world.set(6, 7, 5, cover);
+            world.set(5, 7, 4, cover);
+            let m = smooth_mesh(&mut world, [0, 0, 0]);
+            let top = quads(&m)
+                .into_iter()
+                .find(|q| {
+                    let c = corners(q);
+                    facing(q) == Some(1)
+                        && c.iter().all(|c| c[1] == 6.0 && c[2] >= 5.0 && c[0] <= 6.0)
+                })
+                .unwrap();
+            let at = corners(&top)
+                .iter()
+                .position(|c| *c == [6.0, 6.0, 5.0])
+                .unwrap();
+            top[at].colour[0]
+        };
+        // Under solid blocks the diagonal is not looked at: the corner is as bright
+        // as its sides.
+        assert_eq!(corner(testing::stone()), 255);
+        // Glass lets light past, and the block in the diagonal darkens the corner.
+        assert_eq!(corner(testing::glass()), 204);
+        // So does a block that is solid to the eye and takes no light away.
+        assert_eq!(corner(testing::glowstone()), 204);
+    }
+
+    #[test]
+    fn what_is_two_blocks_beyond_a_sections_border_decides_as_inside_it() {
+        // As above for the east face of a block on its chunk's border: what covers the
+        // sides lies two blocks into the next chunk.
+        let corner = |cover: u32| {
+            let mut world = World::new(&[(0, 0), (1, 0)]);
+            world.set(15, 5, 5, testing::stone());
+            world.set(16, 6, 4, testing::stone());
+            world.set(17, 6, 5, cover);
+            world.set(17, 5, 4, cover);
+            let m = smooth_mesh(&mut world, [0, 0, 0]);
+            let east = face_of(&m, 5);
+            let at = corners(&east)
+                .iter()
+                .position(|c| *c == [16.0, 6.0, 5.0])
+                .unwrap();
+            east[at].colour[0]
+        };
+        // 0.6 of 255, and of 204.
+        assert_eq!(corner(testing::stone()), 153);
+        assert_eq!(corner(testing::glass()), 122);
+    }
+
+    #[test]
+    fn a_face_inside_its_block_is_lit_from_there_under_a_solid_block() {
+        // A slab under the top of its section, which is lit 2 by blocks; the section
+        // above is lit 9.
+        let top = |above: u32| {
+            let mut world = World::new(&[(0, 0)]);
+            world.light(0, 0, 0, 15, 2);
+            world.light(0, 1, 0, 15, 9);
+            world.set(5, 15, 5, testing::slab());
+            world.set(5, 16, 5, above);
+            let m = smooth_mesh(&mut world, [0, 0, 0]);
+            face_of(&m, 1).map(|v| v.block_light)
+        };
+        // Solid above: the face's own place counts, with the three beside it.
+        assert_eq!(top(testing::stone()), [2 * 16; 4]);
+        // Else the place above does.
+        assert_eq!(top(testing::glass()), [(2 + 2 + 2 + 9) * 4; 4]);
+    }
+
+    #[test]
+    fn a_block_that_gives_off_light_lights_the_corners_beside_it() {
+        let mut world = World::new(&[(0, 0)]);
+        world.set(5, 5, 5, testing::stone());
+        world.set(6, 6, 5, testing::glowstone());
+        world.set(5, 9, 5, testing::stone());
+        world.set(6, 10, 5, testing::magma());
+        let m = smooth_mesh(&mut world, [0, 0, 0]);
+        for (y, lights) in [(6.0, [15 * 4, 240]), (10.0, [15 * 4, 240])] {
+            let top = quads(&m)
+                .into_iter()
+                .find(|q| {
+                    let c = corners(q);
+                    facing(q) == Some(1) && c.iter().all(|c| c[1] == y && c[0] <= 6.0)
+                })
+                .unwrap();
+            for (v, c) in top.iter().zip(corners(&top)) {
+                // One of a corner's four places gives off 15; none of the level's
+                // light is from blocks.
+                let want = if c[0] == 6.0 { lights } else { [0, 240] };
+                assert_eq!([v.block_light, v.sky_light], want, "at {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn light_differs_from_corner_to_corner() {
+        let mut world = World::new(&[(0, 0), (1, 0)]);
+        // A block on the chunks' border: its top's western corners are in a chunk lit
+        // 4 by blocks, its eastern ones between that and one lit 12.
+        world.set(15, 6, 7, testing::stone());
+        world.light(0, 0, 0, 15, 4);
+        world.light(1, 0, 0, 15, 12);
+        let m = smooth_mesh(&mut world, [0, 0, 0]);
+        let top = face_of(&m, 1);
+        for (v, c) in top.iter().zip(corners(&top)) {
+            // Sixteenths of a level: the mean of four places.
+            let block = if c[0] == 16.0 {
+                (4 + 4 + 12 + 12) * 4
+            } else {
+                4 * 16
+            };
+            assert_eq!((v.block_light, v.sky_light), (block, 240), "at {c:?}");
+        }
+    }
+
+    #[test]
+    fn blocks_that_give_off_light_and_models_without_occlusion_stay_flat() {
+        let mut world = World::new(&[(0, 0)]);
+        world.light(0, 0, 0, 9, 2);
+        world.set(1, 1, 1, testing::glowstone());
+        world.set(2, 2, 1, testing::stone());
+        world.set(8, 1, 8, testing::grass());
+        world.set(9, 1, 8, testing::stone());
+        let flat = mesh(&mut world, [0, 0, 0]);
+        let smooth = smooth_mesh(&mut world, [0, 0, 0]);
+        let stone = |q: &[Vertex; 4]| {
+            let c = corners(q);
+            c.iter().all(|c| c[0] >= 2.0 && c[1] >= 2.0) || c.iter().all(|c| c[0] >= 9.0)
+        };
+        let (flat, smooth) = (quads(&flat), quads(&smooth));
+        assert_eq!(flat.len(), smooth.len());
+        let mut same = 0;
+        for (f, s) in flat.iter().zip(&smooth) {
+            if !stone(f) {
+                assert_eq!(f, s);
+                same += 1;
+            }
+        }
+        // The glowing cube's six faces and the plant's four.
+        assert_eq!(same, 10);
+        // The stones are lit smoothly, and the cube beside one darkens its corners.
+        assert_ne!(flat, smooth);
+    }
+
+    #[test]
+    fn smooth_light_reads_the_same_across_a_sections_border() {
+        // A step of three blocks, once in the middle of a section and once across the
+        // border of two chunks and of two sections: the block's lighting reads two
+        // blocks beyond it, past what the mesher's scratch holds.
+        let step = |world: &mut World, at: [i32; 3]| {
+            world.set(at[0], at[1], at[2], testing::stone());
+            world.set(at[0] + 1, at[1], at[2], testing::stone());
+            world.set(at[0] + 2, at[1], at[2], testing::glass());
+            world.set(at[0] + 2, at[1] + 1, at[2], testing::stone());
+            world.set(at[0], at[1] + 2, at[2], testing::stone());
+            world.set(at[0], at[1] + 1, at[2] + 1, testing::slab());
+        };
+        let lit = |m: &SectionMesh, from: [f32; 3]| {
+            let mut v: Vec<_> = quads(m)
+                .iter()
+                .filter(|q| {
+                    // The first block's faces only.
+                    let c = corners(q);
+                    (0..3).all(|a| c.iter().all(|c| c[a] >= from[a] && c[a] <= from[a] + 1.0))
+                })
+                .map(|q| (facing(q), q.map(|v| (v.colour, v.block_light, v.sky_light))))
+                .collect();
+            v.sort();
+            v
+        };
+        let mut world = World::new(&[(0, 0), (1, 0)]);
+        step(&mut world, [5, 5, 5]);
+        let inside = lit(&smooth_mesh(&mut world, [0, 0, 0]), [5.0, 5.0, 5.0]);
+        assert_eq!(inside.len(), 5);
+        for at in [[15, 5, 5], [14, 5, 5], [5, 15, 5], [5, 14, 5], [5, 5, 15]] {
+            let mut world = World::new(&[(0, 0), (1, 0), (0, 1), (1, 1)]);
+            step(&mut world, at);
+            let across = lit(&smooth_mesh(&mut world, [0, 0, 0]), at.map(|c| c as f32));
+            assert_eq!(across, inside, "at {at:?}");
+        }
+    }
+
+    #[test]
+    fn a_mesher_keeps_nothing_of_the_last_sections_light() {
+        let mut world = World::new(&[(0, 0)]);
+        world.set(5, 6, 7, testing::stone());
+        world.set(6, 7, 7, testing::stone());
+        world.set(5, 22, 7, testing::stone());
+        world.light(0, 1, 0, 3, 9);
+        let (below, above) = (world.pin([0, 0, 0]), world.pin([0, 1, 0]));
+        let mut mesher = Mesher::new(testing::table());
+        let first = mesher.mesh(&below, &SMOOTH, &BiomeTints::default());
+        let other = mesher.mesh(&above, &SMOOTH, &BiomeTints::default());
+        assert_eq!(mesher.mesh(&below, &SMOOTH, &BiomeTints::default()), first);
+        assert_eq!(
+            Mesher::new(testing::table()).mesh(&above, &SMOOTH, &BiomeTints::default()),
+            other
+        );
+        assert_ne!(mesher.mesh(&below, &OPTIONS, &BiomeTints::default()), first);
     }
 
     #[test]
@@ -598,7 +1008,7 @@ mod tests {
             assert!((mid[1] - (9.5 + d[2] as f32)).abs() < 1.0 / 1024.0);
         }
         // Tint times shade, a channel at a time, as whole numbers.
-        let north = colour(0.8, Some(GRASS_TINT));
+        let north = colour(grey(0.8), Some(GRASS_TINT));
         assert_eq!(
             north,
             [
@@ -609,9 +1019,51 @@ mod tests {
             ]
             .map(|c| c as u8)
         );
-        assert_eq!(colour(1.0, Some(GRASS_TINT)), [0x40, 0x80, 0x20, 255]);
-        assert_eq!(colour(0.5, None), [127, 127, 127, 255]);
-        assert_eq!(colour(0.6, Some(u32::MAX)), [153, 153, 153, 255]);
+        assert_eq!(colour(grey(1.0), Some(GRASS_TINT)), [0x40, 0x80, 0x20, 255]);
+        assert_eq!(colour(grey(0.5), None), [127, 127, 127, 255]);
+        assert_eq!(colour(grey(0.6), Some(u32::MAX)), [153, 153, 153, 255]);
+    }
+
+    #[test]
+    fn tinted_blocks_take_the_colour_of_the_biome_they_are_read_in() {
+        use super::super::tint::tests::{tints, world};
+        use ruthenium_sim::biome::zoomed_cell;
+
+        let seed = 99;
+        let mut world = world(seed, &[(0, 0)]);
+        // Badlands up to y 7, a dark forest above.
+        world.level.fill_biome([0, -16, 0], [15, 7, 15], 1);
+        world.level.fill_biome([0, 8, 0], [15, 47, 15], 2);
+        // A column where a block at y 6 is in the dark forest's cell, as the game picks
+        // it. One at y 5 never is.
+        let (x, z) = (2..14)
+            .flat_map(|x| (2..14).map(move |z| (x, z)))
+            .find(|&(x, z)| zoomed_cell(seed, [x, 6, z])[1] == 2)
+            .expect("the jitter lifts some column's block into the upper cell");
+        world.set(x, 5, z, testing::tall_grass(false));
+        world.set(x, 6, z, testing::tall_grass(true));
+        let n = world.pin([0, 0, 0]);
+        let options = MeshOptions {
+            biome_blend: 0,
+            ..OPTIONS
+        };
+        let m = Mesher::new(testing::table()).mesh(&n, &options, &tints());
+        assert_eq!(m.cutout_quads, 8);
+        // Both halves in the badlands' grass colour, read at the lower half; times the
+        // shade of a face that looks north or south, or west or east.
+        let (north, west) = (
+            colour(grey(0.8), Some(0xFF90_814D)),
+            colour(grey(0.6), Some(0xFF90_814D)),
+        );
+        for q in quads(&m) {
+            for v in q {
+                assert!(v.colour == north || v.colour == west, "{:?}", v.colour);
+            }
+        }
+        // With no biome's colours known, the colour the game gives outside a world.
+        let m = Mesher::new(testing::table()).mesh(&n, &options, &BiomeTints::default());
+        let plain = colour(grey(0.8), Some(GRASS_TINT));
+        assert!(quads(&m).iter().flatten().any(|v| v.colour == plain));
     }
 
     #[test]
@@ -648,16 +1100,19 @@ mod tests {
         }
         let n = world.pin([0, 0, 0]);
         let mut mesher = Mesher::new(testing::table());
-        let first = mesher.mesh(&n, &OPTIONS);
+        let first = mesher.mesh(&n, &OPTIONS, &BiomeTints::default());
         assert!(first.quads() > 300);
-        assert_eq!(mesher.mesh(&n, &OPTIONS), first);
-        assert_eq!(Mesher::new(testing::table()).mesh(&n, &OPTIONS), first);
+        assert_eq!(mesher.mesh(&n, &OPTIONS, &BiomeTints::default()), first);
+        assert_eq!(
+            Mesher::new(testing::table()).mesh(&n, &OPTIONS, &BiomeTints::default()),
+            first
+        );
         // Opaque leaves and a nether's shades change it; nothing else does.
         let nether = MeshOptions {
             shades: [0.9, 0.9, 0.8, 0.8, 0.6, 0.6],
             ..OPTIONS
         };
-        assert_ne!(mesher.mesh(&n, &nether), first);
+        assert_ne!(mesher.mesh(&n, &nether, &BiomeTints::default()), first);
     }
 
     #[test]

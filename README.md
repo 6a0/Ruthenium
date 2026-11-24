@@ -10,7 +10,7 @@ Ruthenium is an open-source client for **Minecraft: Java Edition** (currently ta
 
 ## Status
 
-**Pre-alpha. Nothing is playable yet.** Stage 0 is done: workspace, CI, game-file import, code generation, golden traces of the vanilla client and its baseline measurements ([docs/baseline.md](docs/baseline.md)). Stage 1, the engine skeleton, has started: `cargo run -p ruthenium` opens an empty Vulkan window with a paced frame loop. Joined to a server, it draws the world's opaque blocks and plants from the game's own models, evenly lit; water, glass, smooth lighting, biome colours, the sky and everything that moves are still to come. What that costs so far, on the routes the vanilla client was measured on, is in [docs/world-baseline.md](docs/world-baseline.md).
+**Pre-alpha. Nothing is playable yet.** Stage 0 is done: workspace, CI, game-file import, code generation, golden traces of the vanilla client and its baseline measurements ([docs/baseline.md](docs/baseline.md)). Stage 1, the engine skeleton, has started: `cargo run -p ruthenium` opens an empty Vulkan window with a paced frame loop. Joined to a server, it draws the world's opaque blocks and plants from the game's own models, with the game's smooth lighting and biome colours; water, glass, the sky and everything that moves are still to come. What that costs so far, on the routes the vanilla client was measured on, is in [docs/world-baseline.md](docs/world-baseline.md).
 
 ## How Ruthenium treats Mojang's content and accounts
 
