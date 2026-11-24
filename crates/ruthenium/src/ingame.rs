@@ -16,10 +16,9 @@ use std::sync::Arc;
 use ruthenium_data::v26_3::registries::MobEffect;
 use ruthenium_protocol::packets::ClientInformation;
 use ruthenium_render::{CameraPose, WorldStats};
-use ruthenium_sim::environment::Environment;
 use ruthenium_sim::input::{self, HeldKeys, KeyBinds, MouseMotion, MouseOptions, ScrollWheel};
 use ruthenium_sim::player::Pose;
-use ruthenium_sim::scene::Scene;
+use ruthenium_sim::scene::{Frame, Scene};
 use ruthenium_sim::session::{PlayerView, Session};
 use ruthenium_ui::modern::{Rect, ShapeList, UiScale};
 use ruthenium_ui::text::{Fonts, GlyphAtlas, TextList, TextStyle, Weight};
@@ -170,7 +169,9 @@ pub struct WorldView {
     pub camera: CameraPose,
     /// The render distance in chunks, as the server was told it.
     pub view_distance: i32,
-    pub environment: Arc<Environment>,
+    /// The game thread's frame the camera is of, and how far its tick had come.
+    pub frame: Arc<Frame>,
+    pub partial_tick: f32,
 }
 
 /// The world as the session's latest frame has it, seen from the player's eyes: the
@@ -179,7 +180,8 @@ pub struct WorldView {
 pub fn world_view(session: &Session, now: Instant) -> Option<WorldView> {
     let camera = session.camera()?;
     let f = &camera.frame;
-    let t = f64::from(f.partial_tick(now));
+    let partial_tick = f.partial_tick(now);
+    let t = f64::from(partial_tick);
     let p = &f.player;
     let mut position: [f64; 3] =
         std::array::from_fn(|i| p.old_position[i] + (p.position[i] - p.old_position[i]) * t);
@@ -194,7 +196,8 @@ pub fn world_view(session: &Session, now: Instant) -> Option<WorldView> {
         },
         // What every session tells its server (`crate::join`).
         view_distance: i32::from(ClientInformation::default().view_distance),
-        environment: f.environment.clone(),
+        frame: camera.frame.clone(),
+        partial_tick,
     })
 }
 

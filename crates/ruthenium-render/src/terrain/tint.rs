@@ -374,6 +374,7 @@ pub(crate) mod tests {
             id: id.into(),
             temperature,
             downfall,
+            has_precipitation: true,
             attributes: Value::Null,
             effects,
         }

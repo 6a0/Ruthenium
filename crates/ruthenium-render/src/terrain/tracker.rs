@@ -70,6 +70,9 @@ struct Entry {
     /// The batch of events that tells the graph of this load of its chunk: what the
     /// graph said before it had that batch is of another chunk.
     born: u64,
+    /// When it first had a mesh, or was first found to be air: what its fade into view
+    /// counts from, whatever is meshed there later. Forgotten with its chunk.
+    first_at: Option<Instant>,
 }
 
 /// A mesh to draw.
@@ -78,6 +81,8 @@ struct Slot<M> {
     key: SectionKey,
     /// Its section is reached.
     shown: bool,
+    /// Its section's `first_at`.
+    since: Instant,
     mesh: M,
 }
 
@@ -243,6 +248,15 @@ impl<M> Tracker<M> {
             .iter()
             .filter(|s| s.shown)
             .map(|s| (s.key, &s.mesh))
+    }
+
+    /// Every mesh to draw, with the moment its section first had one (or was first
+    /// found to be air): what a section's fade into view counts from.
+    pub fn meshes_since(&self) -> impl Iterator<Item = (SectionKey, &M, Instant)> + '_ {
+        self.meshes
+            .iter()
+            .filter(|s| s.shown)
+            .map(|s| (s.key, &s.mesh, s.since))
     }
 
     /// Every mesh there is, drawn or not.
@@ -415,8 +429,10 @@ impl<M> Tracker<M> {
     /// A section turned out to be nothing but air: it has nothing to draw, needs no
     /// job and connects everything.
     fn set_empty(&mut self, key: SectionKey, removed: &mut Vec<M>) {
+        let now = self.now.at;
         let e = self.entry(key);
         e.empty = true;
+        e.first_at.get_or_insert(now);
         e.stamp = None;
         e.since = None;
         e.connectivity = Some(Connectivity::ALL);
@@ -696,10 +712,13 @@ impl<M> Tracker<M> {
     /// is drawn from now on. Returns the mesh it replaces. A result for a section that
     /// is no longer tracked is handed back as it came.
     pub fn install(&mut self, stamp: Stamp, mesh: Option<M>) -> Option<M> {
+        let now = self.now.at;
         let Some(e) = self.sections.get_mut(&stamp.section) else {
             return mesh;
         };
         let key = stamp.section;
+        // A first result is one, with something to draw or without.
+        let since = *e.first_at.get_or_insert(now);
         e.meshing = false;
         e.in_flight = None;
         // The stamp's place is kept from one mesh to the next.
@@ -727,6 +746,7 @@ impl<M> Tracker<M> {
                 self.meshes.push(Slot {
                     key,
                     shown: e.reached,
+                    since,
                     mesh,
                 });
                 None
@@ -884,6 +904,80 @@ mod tests {
         t.sync(&world.scene, &mut removed);
         assert_eq!(mesh_all(&mut t, &world).len(), 4);
         assert!(removed.is_empty());
+    }
+
+    /// Since when a section has been there to draw, if it has a mesh.
+    fn since(t: &Tracker<SectionKey>, key: SectionKey) -> Option<Instant> {
+        t.meshes_since()
+            .find(|(k, ..)| *k == key)
+            .map(|(.., at)| at)
+    }
+
+    #[test]
+    fn a_section_fades_from_its_first_result_whatever_is_meshed_there_later() {
+        let mut world = World::new(&surrounded());
+        world.publish();
+        let mut t: Tracker<SectionKey> = Tracker::new();
+        let mut removed = Vec::new();
+        let start = Instant::now();
+        let at = |ms: u64| Since {
+            at: start + std::time::Duration::from_millis(ms),
+            frame: ms,
+        };
+        t.set_clock(at(100));
+        t.sync(&world.scene, &mut removed);
+        // The camera's section gets a result with nothing to draw, the others meshes.
+        let job = t.next_job(&world.scene, CAMERA).unwrap();
+        assert_eq!(job.neighbourhood.section(), [0, 0, 0]);
+        assert!(t.install(job.neighbourhood.stamp().clone(), None).is_none());
+        assert_eq!(since(&t, [0, 0, 0]), None);
+        t.set_clock(at(200));
+        mesh_all(&mut t, &world);
+        assert_eq!(since(&t, [0, 1, 0]), Some(at(200).at));
+        // Meshed again later, each counts from its first result: the one that had
+        // nothing to draw too.
+        t.set_clock(at(900));
+        world.set(1, 1, 1, testing::stone());
+        world.set(1, 17, 1, testing::stone());
+        world.publish();
+        t.sync(&world.scene, &mut removed);
+        let again = mesh_all(&mut t, &world);
+        assert!(again.contains(&[0, 0, 0]) && again.contains(&[0, 1, 0]));
+        assert_eq!(since(&t, [0, 0, 0]), Some(at(100).at));
+        assert_eq!(since(&t, [0, 1, 0]), Some(at(200).at));
+        // A chunk that left and came back fades in anew.
+        world.level.forget_chunk(0, 0);
+        world.publish();
+        t.sync(&world.scene, &mut removed);
+        world.load(0, 0);
+        world.publish();
+        t.set_clock(at(5000));
+        t.sync(&world.scene, &mut removed);
+        mesh_all(&mut t, &world);
+        assert_eq!(since(&t, [0, 0, 0]), Some(at(5000).at));
+    }
+
+    #[test]
+    fn a_section_of_air_counts_from_when_it_was_found_to_be_air() {
+        let mut world = World::new(&surrounded());
+        let mut c = Culled::new([0, 0, 0]);
+        let start = Instant::now();
+        let at = |ms: u64| Since {
+            at: start + std::time::Duration::from_millis(ms),
+            frame: ms,
+        };
+        c.t.set_clock(at(100));
+        c.sync(&mut world);
+        c.mesh_all(&world);
+        assert_eq!(since(&c.t, [0, 0, 0]), None);
+        // Its first block, much later: the section has been there all along, and the
+        // block is not faded in.
+        c.t.set_clock(at(4000));
+        let (x, y, z) = block(&world);
+        world.set(x, y, z, testing::stone());
+        c.sync(&mut world);
+        assert!(c.mesh_all(&world).contains(&[0, 0, 0]));
+        assert_eq!(since(&c.t, [0, 0, 0]), Some(at(100).at));
     }
 
     #[test]

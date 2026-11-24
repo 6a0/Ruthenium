@@ -393,6 +393,9 @@ pub struct Level {
     /// The rain and thunder the server says there are.
     pub weather: crate::weather::Weather,
     pub biomes: BiomeInfo,
+    /// The server says the world is a flat one (`ClientLevelData.isFlat`): its horizon
+    /// is at its floor and its void's darkness sets in within a block of it.
+    pub flat: bool,
 }
 
 impl Level {
@@ -413,6 +416,7 @@ impl Level {
             set_log: None,
             border: crate::border::WorldBorder::default(),
             weather: crate::weather::Weather::default(),
+            flat: false,
             biomes: BiomeInfo::default(),
         }
     }

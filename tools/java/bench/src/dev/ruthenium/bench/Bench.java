@@ -144,6 +144,16 @@ public final class Bench {
         if (firstFrameEpochMs < 0) {
             firstFrameEpochMs = System.currentTimeMillis();
         }
+        if (Boolean.getBoolean("ruthenium.bench.bare")) {
+            // A picture of the world alone, to hold another client's picture against:
+            // no HUD, hand or vignette, and no clouds. Not a run to take times from.
+            if (!mc.gui.hud.isHidden()) {
+                mc.gui.hud.toggle();
+            }
+            if (mc.options.cloudStatus().get() != net.minecraft.client.CloudStatus.OFF) {
+                mc.options.cloudStatus().set(net.minecraft.client.CloudStatus.OFF);
+            }
+        }
         switch (phase) {
             case STARTING -> {
                 boolean menu = mc.gui.overlay() == null && mc.gui.screen() instanceof TitleScreen;

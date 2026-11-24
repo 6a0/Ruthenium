@@ -31,14 +31,42 @@ pub static SHAPE_FRAG: Spirv = crate::spirv!("shape.frag");
 /// `glsl/shape.vert`
 pub static SHAPE_VERT: Spirv = crate::spirv!("shape.vert");
 
-/// `glsl/terrain.frag`
-pub static TERRAIN_FRAG: Spirv = crate::spirv!("terrain.frag");
+/// `glsl/sky.frag`
+pub static SKY_FRAG: Spirv = crate::spirv!("sky.frag");
+
+/// `glsl/sky.vert`
+pub static SKY_VERT: Spirv = crate::spirv!("sky.vert");
 
 /// `glsl/terrain.vert`
 pub static TERRAIN_VERT: Spirv = crate::spirv!("terrain.vert");
 
-/// `glsl/terrain_cutout.frag`
-pub static TERRAIN_CUTOUT_FRAG: Spirv = crate::spirv!("terrain_cutout.frag");
+/// `glsl/terrain_nearest.frag`
+pub static TERRAIN_NEAREST_FRAG: Spirv = crate::spirv!("terrain_nearest.frag");
+
+/// `glsl/terrain_nearest_cutout.frag`
+pub static TERRAIN_NEAREST_CUTOUT_FRAG: Spirv = crate::spirv!("terrain_nearest_cutout.frag");
+
+/// `glsl/terrain_plain.frag`
+pub static TERRAIN_PLAIN_FRAG: Spirv = crate::spirv!("terrain_plain.frag");
+
+/// `glsl/terrain_plain.vert`
+pub static TERRAIN_PLAIN_VERT: Spirv = crate::spirv!("terrain_plain.vert");
+
+/// `glsl/terrain_plain_cutout.frag`
+pub static TERRAIN_PLAIN_CUTOUT_FRAG: Spirv = crate::spirv!("terrain_plain_cutout.frag");
+
+/// `glsl/terrain_rgss.frag`
+pub static TERRAIN_RGSS_FRAG: Spirv = crate::spirv!("terrain_rgss.frag");
+
+/// `glsl/terrain_rgss_cutout.frag`
+pub static TERRAIN_RGSS_CUTOUT_FRAG: Spirv = crate::spirv!("terrain_rgss_cutout.frag");
+
+/// `glsl/terrain_rgss_reference.frag`
+pub static TERRAIN_RGSS_REFERENCE_FRAG: Spirv = crate::spirv!("terrain_rgss_reference.frag");
+
+/// `glsl/terrain_rgss_reference_cutout.frag`
+pub static TERRAIN_RGSS_REFERENCE_CUTOUT_FRAG: Spirv =
+    crate::spirv!("terrain_rgss_reference_cutout.frag");
 
 /// `glsl/text.frag`
 pub static TEXT_FRAG: Spirv = crate::spirv!("text.frag");
@@ -57,9 +85,18 @@ pub static ALL: &[&Spirv] = &[
     &OVERLAY_VERT,
     &SHAPE_FRAG,
     &SHAPE_VERT,
-    &TERRAIN_FRAG,
+    &SKY_FRAG,
+    &SKY_VERT,
     &TERRAIN_VERT,
-    &TERRAIN_CUTOUT_FRAG,
+    &TERRAIN_NEAREST_FRAG,
+    &TERRAIN_NEAREST_CUTOUT_FRAG,
+    &TERRAIN_PLAIN_FRAG,
+    &TERRAIN_PLAIN_VERT,
+    &TERRAIN_PLAIN_CUTOUT_FRAG,
+    &TERRAIN_RGSS_FRAG,
+    &TERRAIN_RGSS_CUTOUT_FRAG,
+    &TERRAIN_RGSS_REFERENCE_FRAG,
+    &TERRAIN_RGSS_REFERENCE_CUTOUT_FRAG,
     &TEXT_FRAG,
     &TEXT_VERT,
 ];

@@ -15,6 +15,7 @@ profiling = "1.0.18"
 ruthenium-assets = { path = "../ruthenium-assets" }
 ruthenium-data = { path = "../ruthenium-data" }
 ruthenium-gpu = { path = "../ruthenium-gpu" }
+ruthenium-javamath = { path = "../ruthenium-javamath" }
 ruthenium-platform = { path = "../ruthenium-platform" }
 ruthenium-prepare = { path = "../ruthenium-prepare" }
 ruthenium-shaders = { path = "../ruthenium-shaders" }

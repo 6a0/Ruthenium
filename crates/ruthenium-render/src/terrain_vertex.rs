@@ -117,7 +117,6 @@ impl Vertex {
     }
 
     /// Reads a packed vertex back.
-    #[cfg(test)]
     pub fn unpack(bytes: &[u8; VERTEX_BYTES]) -> Vertex {
         let word = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
         Vertex {

@@ -42,7 +42,7 @@ use crate::gpu::Gpu;
 use crate::routes::{self, Checked, Route};
 use crate::server::{self, Server};
 
-const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--keep-worlds]";
+const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--time <ticks of the day>] [--keep-worlds]";
 /// The view and simulation distance of the server and the render distance of the
 /// clients, as in the integrated-server scenes.
 const VIEW_DISTANCE: i32 = 12;
@@ -91,6 +91,12 @@ struct Options {
     height: u32,
     any_drawable: bool,
     screenshot: bool,
+    /// With the screenshots: vanilla draws no HUD, hand, vignette or clouds, for a
+    /// picture of the world alone to hold Ruthenium's against. Not for times.
+    bare: bool,
+    /// The time of day the scenes are set to, in ticks of the day (noon unless said
+    /// otherwise: the baselines').
+    time: u32,
     keep_worlds: bool,
     accept_eula: bool,
 }
@@ -121,6 +127,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         height: DRAWABLE.1,
         any_drawable: false,
         screenshot: false,
+        bare: false,
+        time: 6000,
         keep_worlds: false,
         accept_eula: false,
     };
@@ -130,6 +138,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
         match arg.as_str() {
             "--accept-eula" => o.accept_eula = true,
             "--screenshot" => o.screenshot = true,
+            "--bare-picture" => {
+                o.screenshot = true;
+                o.bare = true;
+            }
             "--keep-worlds" => o.keep_worlds = true,
             "--any-drawable" => o.any_drawable = true,
             _ => {
@@ -188,6 +200,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     "--results" => o.results = Some(PathBuf::from(value)),
                     "--compare" => o.compare = Some(PathBuf::from(value)),
                     "--timeout" => o.timeout = num(value)?.max(0.0),
+                    "--time" => o.time = num(value)? as u32 % 24000,
                     "--width" => o.width = num(value)? as u32,
                     "--height" => o.height = num(value)? as u32,
                     "--expect" => {
@@ -299,15 +312,16 @@ fn world_id(dir: &Path) -> Result<String, String> {
 /// random ticks. With them, plants grow while a route runs: in the first recorded
 /// baseline a vine had grown into the walk route in one vanilla run of three, and that
 /// run climbed it from tick 625 on while the others, and Ruthenium, walked through.
-fn fix_world(server: &mut Server, spawn: [f64; 3]) -> Result<(), String> {
+fn fix_world(server: &mut Server, spawn: [f64; 3], time: u32) -> Result<(), String> {
     let spawn = format!("setworldspawn {} {} {}", spawn[0], spawn[1], spawn[2]);
+    let (set_time, time) = (format!("time set {time}"), time.to_string());
     for (command, expect) in [
         ("gamerule advance_time false", "advance_time"),
         ("gamerule advance_weather false", "advance_weather"),
         ("gamerule spawn_mobs false", "spawn_mobs"),
         ("gamerule respawn_radius 0", "respawn_radius"),
         ("gamerule random_tick_speed 0", "random_tick_speed"),
-        ("time set 6000", "6000"),
+        (set_time.as_str(), time.as_str()),
         ("weather clear", "clear"),
         (spawn.as_str(), "spawn point"),
         (&format!("team add {TEAM}"), TEAM),
@@ -368,7 +382,7 @@ impl Harness<'_> {
                 accept_eula: self.o.accept_eula,
             },
         )?;
-        fix_world(&mut server, self.spawn)?;
+        fix_world(&mut server, self.spawn, self.o.time)?;
         Ok(Trial {
             dir,
             route,
@@ -1001,6 +1015,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         java: o.java.clone(),
         results: o.results.clone(),
         screenshot: o.screenshot,
+        bare: o.bare,
         render_distance: VIEW_DISTANCE as u32,
         gpu: o.gpu,
     };

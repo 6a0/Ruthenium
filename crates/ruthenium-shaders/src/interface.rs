@@ -120,20 +120,17 @@ impl Record {
 pub const FRAME_DATA_SET: u32 = 1;
 pub const FRAME_DATA_BINDING: u32 = 0;
 
-/// What every world draw of a frame reads.
+/// What every terrain draw of a frame reads in its vertex stage. (What the fragment
+/// stages read is in push constants: read from this buffer for every pixel, the same
+/// few values cost a fifth of a frame's GPU time.)
 pub const WORLD: Record = Record {
     name: "world",
-    doc: "What every world draw of a frame shares.",
+    doc: "What every terrain vertex of a frame shares.",
     fields: &[
         Field {
             name: "camera_offset",
             ty: Ty::Vec3,
             doc: "Minus the camera's place inside its block: positions are taken relative to the camera's block in whole numbers first.",
-        },
-        Field {
-            name: "atlas",
-            ty: Ty::Uint,
-            doc: "The block atlas, an index into the texture table.",
         },
         Field {
             name: "atlas_size",
@@ -177,8 +174,19 @@ pub const SECTION: Record = Record {
     ],
 };
 
+/// What one draw of the sky reads in its vertex stage.
+pub const SKY: Record = Record {
+    name: "sky",
+    doc: "One draw of the sky: the dome, the glow of a sunrise, the sun, the moon, the stars.",
+    fields: &[Field {
+        name: "transform",
+        ty: Ty::Mat4,
+        doc: "From the draw's own space, in blocks around the camera, to clip space, columns first.",
+    }],
+};
+
 /// Every record `world.glsl` has accessors for.
-pub const RECORDS: [&Record; 3] = [&WORLD, &WORLD_MATRIX, &SECTION];
+pub const RECORDS: [&Record; 4] = [&WORLD, &WORLD_MATRIX, &SECTION, &SKY];
 
 /// The text of `glsl/include/world.glsl`.
 pub fn world_glsl() -> String {
@@ -240,10 +248,11 @@ mod tests {
     #[test]
     fn fields_follow_each_other_a_word_at_a_time() {
         assert_eq!(WORLD.offset("camera_offset"), 0);
-        assert_eq!(WORLD.offset("atlas"), 3);
-        assert_eq!(WORLD.offset("atlas_size"), 4);
-        assert_eq!(WORLD.offset("lightmap"), 6);
-        assert_eq!(WORLD.words(), 7);
+        assert_eq!(WORLD.offset("atlas_size"), 3);
+        assert_eq!(WORLD.offset("lightmap"), 5);
+        assert_eq!(WORLD.words(), 6);
+        assert_eq!(SKY.offset("transform"), 0);
+        assert_eq!(SKY.bytes(), 64);
         assert_eq!(WORLD_MATRIX.bytes(), 64);
         assert_eq!(SECTION.offset("visibility"), 3);
         assert_eq!(SECTION.bytes(), 16);
@@ -261,7 +270,7 @@ mod tests {
         assert_eq!(committed, world_glsl(), "run `cargo xtask shaders`");
         // One accessor per field, reading the words its offset says.
         assert!(
-            committed.contains("uint world_atlas(uint at) {\n    return frame_words[at + 3u];")
+            committed.contains("uint world_lightmap(uint at) {\n    return frame_words[at + 5u];")
         );
         assert!(committed.contains("#define SECTION_WORDS 4u"));
     }

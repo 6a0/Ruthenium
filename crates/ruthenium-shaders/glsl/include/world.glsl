@@ -8,27 +8,22 @@ layout(set = 1, binding = 0, std430) readonly buffer FrameWords {
     uint frame_words[];
 };
 
-// What every world draw of a frame shares.
-#define WORLD_WORDS 7u
+// What every terrain vertex of a frame shares.
+#define WORLD_WORDS 6u
 
 // Minus the camera's place inside its block: positions are taken relative to the camera's block in whole numbers first.
 vec3 world_camera_offset(uint at) {
     return vec3(uintBitsToFloat(frame_words[at + 0u]), uintBitsToFloat(frame_words[at + 1u]), uintBitsToFloat(frame_words[at + 2u]));
 }
 
-// The block atlas, an index into the texture table.
-uint world_atlas(uint at) {
-    return frame_words[at + 3u];
-}
-
 // The atlas's size in texels.
 vec2 world_atlas_size(uint at) {
-    return vec2(uintBitsToFloat(frame_words[at + 4u]), uintBitsToFloat(frame_words[at + 5u]));
+    return vec2(uintBitsToFloat(frame_words[at + 3u]), uintBitsToFloat(frame_words[at + 4u]));
 }
 
 // The 16 x 16 light map, an index into the texture table.
 uint world_lightmap(uint at) {
-    return frame_words[at + 6u];
+    return frame_words[at + 5u];
 }
 
 // The camera's matrix.
@@ -54,4 +49,16 @@ ivec3 section_origin(uint at) {
 // How far the section has faded in, 0 to 1.
 float section_visibility(uint at) {
     return uintBitsToFloat(frame_words[at + 3u]);
+}
+
+// One draw of the sky: the dome, the glow of a sunrise, the sun, the moon, the stars.
+#define SKY_WORDS 16u
+
+// From the draw's own space, in blocks around the camera, to clip space, columns first.
+mat4 sky_transform(uint at) {
+    return mat4(
+        uintBitsToFloat(frame_words[at + 0u]), uintBitsToFloat(frame_words[at + 1u]), uintBitsToFloat(frame_words[at + 2u]), uintBitsToFloat(frame_words[at + 3u]),
+        uintBitsToFloat(frame_words[at + 4u]), uintBitsToFloat(frame_words[at + 5u]), uintBitsToFloat(frame_words[at + 6u]), uintBitsToFloat(frame_words[at + 7u]),
+        uintBitsToFloat(frame_words[at + 8u]), uintBitsToFloat(frame_words[at + 9u]), uintBitsToFloat(frame_words[at + 10u]), uintBitsToFloat(frame_words[at + 11u]),
+        uintBitsToFloat(frame_words[at + 12u]), uintBitsToFloat(frame_words[at + 13u]), uintBitsToFloat(frame_words[at + 14u]), uintBitsToFloat(frame_words[at + 15u]));
 }

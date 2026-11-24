@@ -1164,6 +1164,7 @@ impl Game {
         }
         level.track_changes(DEFAULT_DIRTY_CAPACITY);
         level.weather = Weather::new(t.has_skylight, t.has_ceiling, &spawn.dimension);
+        level.flat = spawn.is_flat;
         level.biomes = BiomeInfo {
             climates: Arc::new(climates),
             seed: spawn.seed,

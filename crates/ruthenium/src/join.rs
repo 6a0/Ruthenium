@@ -13,8 +13,8 @@ use ruthenium_assets::{BlockModels, Id, Image, Pack, Resources};
 use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, Reason, Stage};
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
-use ruthenium_render::WorldAssets;
 use ruthenium_render::terrain::{BlockTable, ColourMaps};
+use ruthenium_render::{MOON_PHASES, SkyImage, SkyImages, WorldAssets};
 use ruthenium_sim::blocks::Blocks;
 use ruthenium_sim::enchantment::Enchantments;
 use ruthenium_sim::entity::EntityTypes;
@@ -161,7 +161,7 @@ fn local_registries(jar: &Zip) -> ruthenium_sim::environment::LocalRegistries {
                 o.retain(|k, _| {
                     matches!(
                         k.as_str(),
-                        "attributes" | "effects" | "temperature" | "downfall"
+                        "attributes" | "effects" | "temperature" | "downfall" | "has_precipitation"
                     )
                 });
             }
@@ -236,6 +236,10 @@ const BARS_TAG: &str = "data/minecraft/tags/block/bars.json";
 const GRASS_MAP: &str = "textures/colormap/grass.png";
 const FOLIAGE_MAP: &str = "textures/colormap/foliage.png";
 const DRY_FOLIAGE_MAP: &str = "textures/colormap/dry_foliage.png";
+/// The sky's pictures: the sun, the folder of the moon's phases, and the End's sky.
+const SUN: &str = "textures/environment/celestial/sun.png";
+const MOON_DIR: &str = "textures/environment/celestial/moon/";
+const END_SKY: &str = "textures/environment/end_sky.png";
 
 /// Builds what drawing a world needs from the imported game in `game`: the block atlas
 /// with its mip levels, and every block state's baked model and drawing rules.
@@ -277,6 +281,23 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         .as_ref()
         .filter(|map| map.width == 256 && map.height == 256)
         .map_or(0xFFFF_00FF, |map| map.get(127, 127));
+    // The sun, the moon and the End's sky, as bytes of red, green, blue and alpha.
+    let sky_image = |file: &str| {
+        colour_map(file).map(|image| SkyImage {
+            width: image.width,
+            height: image.height,
+            rgba: image
+                .pixels
+                .iter()
+                .flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, *p as u8, (p >> 24) as u8])
+                .collect(),
+        })
+    };
+    let sky = SkyImages {
+        sun: sky_image(SUN),
+        moon: MOON_PHASES.map(|phase| sky_image(&format!("{MOON_DIR}{phase}.png"))),
+        end_sky: sky_image(END_SKY),
+    };
     let pixels = |map: Option<Image>| map.map_or(Vec::new(), |m| m.pixels);
     let colour_maps = ColourMaps {
         grass: pixels(grass_map),
@@ -321,6 +342,7 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         atlas_height: atlas.height,
         atlas_levels,
         colour_maps,
+        sky,
     })
 }
 

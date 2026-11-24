@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attributes;
 pub mod biome;
 pub mod block;
 pub mod block_entity;

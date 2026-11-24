@@ -38,6 +38,7 @@ use super::table::BlockTable;
 use super::tint::{BiomeTints, ColourMaps, MAX_BLEND_RADIUS};
 use super::tracker::{Job, Since, Tracker, TrackerStats};
 use super::visibility::{Batch, Camera, Connectivity, Visibility};
+use crate::atmosphere::Fog;
 use crate::pipelines::PipelineId;
 use crate::terrain_vertex::VERTEX_BYTES;
 
@@ -96,6 +97,75 @@ impl TerrainDraws {
         ]
         .into_iter()
         .find(|d| d.name() == name)
+    }
+}
+
+/// How the terrain's texels are filtered, and with what besides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerrainShader {
+    /// Far texels averaged as vanilla's Texture Filtering "RGSS" averages them (the
+    /// Fancy preset's), taking only the samples that count for something.
+    #[default]
+    Rgss,
+    /// The same picture with all nine samples taken for every pixel, as vanilla's
+    /// shader is written: what `Rgss` is measured against.
+    RgssReference,
+    /// Every texel with hard edges, as with Texture Filtering off (the Fast preset's).
+    Nearest,
+    /// `Nearest` without fog and without fade: what those two cost is measured
+    /// against it.
+    Plain,
+}
+
+impl TerrainShader {
+    pub const ALL: [TerrainShader; 4] = [
+        TerrainShader::Rgss,
+        TerrainShader::RgssReference,
+        TerrainShader::Nearest,
+        TerrainShader::Plain,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TerrainShader::Rgss => "rgss",
+            TerrainShader::RgssReference => "rgss-reference",
+            TerrainShader::Nearest => "nearest",
+            TerrainShader::Plain => "plain",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<TerrainShader> {
+        TerrainShader::ALL.into_iter().find(|s| s.name() == name)
+    }
+
+    /// The pipelines of the solid and of the cutout layer.
+    pub(crate) fn pipelines(self) -> [PipelineId; 2] {
+        match self {
+            TerrainShader::Rgss => [PipelineId::TerrainRgss, PipelineId::TerrainRgssCutout],
+            TerrainShader::RgssReference => [
+                PipelineId::TerrainRgssReference,
+                PipelineId::TerrainRgssReferenceCutout,
+            ],
+            TerrainShader::Nearest => {
+                [PipelineId::TerrainNearest, PipelineId::TerrainNearestCutout]
+            }
+            TerrainShader::Plain => [PipelineId::TerrainPlain, PipelineId::TerrainPlainCutout],
+        }
+    }
+}
+
+/// How long a section takes to fade in, unless said otherwise: the default of
+/// vanilla's Chunk Fade option, in milliseconds.
+pub const DEFAULT_FADE_MS: u32 = 750;
+
+/// How far a section has faded in at `now`: none of the way when it first had a mesh
+/// (`since`), all the way `fade_ms` later (`RenderSection.getVisibility`).
+pub(crate) fn visibility(now: Instant, since: Instant, fade_ms: u32) -> f32 {
+    let elapsed = now.saturating_duration_since(since).as_millis();
+    if elapsed >= u128::from(fade_ms) {
+        1.0
+    } else {
+        elapsed as f32 / fade_ms as f32
     }
 }
 
@@ -189,6 +259,8 @@ pub struct WorldAssets {
     pub atlas_levels: Vec<Vec<u8>>,
     /// The colour maps biomes take their grass and foliage colours from.
     pub colour_maps: ColourMaps,
+    /// The sun, the moon's phases and the End's sky.
+    pub sky: crate::sky::SkyImages,
 }
 
 /// The indices of quads as two triangles each, sharing the diagonal from a quad's first
@@ -390,6 +462,8 @@ struct Visible {
     distance: i64,
     mesh: MeshRange,
     origin: [i32; 3],
+    /// How far it has faded in.
+    visibility: f32,
 }
 
 /// What the terrain is doing, for the debug text and the logs.
@@ -481,6 +555,10 @@ pub(crate) struct WorldRenderer {
     /// How the sections are drawn, and whether the GPU can draw them indirectly.
     draws: TerrainDraws,
     indirect: bool,
+    /// How their texels are filtered, and how long a section takes to fade in (0: it
+    /// is there at once).
+    shader: TerrainShader,
+    fade_ms: u32,
     /// Scratch of [`Self::draw`]: each page's nearest section and then its place in the
     /// order of pages; a layer's draw commands; and the calls that read them (a vertex
     /// buffer, its first command and how many).
@@ -527,7 +605,6 @@ impl std::fmt::Debug for WorldRenderer {
 }
 
 const WORLD_CAMERA_OFFSET: usize = WORLD.offset("camera_offset") as usize * 4;
-const WORLD_ATLAS: usize = WORLD.offset("atlas") as usize * 4;
 const WORLD_ATLAS_SIZE: usize = WORLD.offset("atlas_size") as usize * 4;
 const WORLD_LIGHTMAP: usize = WORLD.offset("lightmap") as usize * 4;
 const SECTION_ORIGIN: usize = SECTION.offset("origin") as usize * 4;
@@ -539,15 +616,72 @@ fn put(bytes: &mut [u8], at: usize, word: [u8; 4]) {
     bytes[at..at + 4].copy_from_slice(&word);
 }
 
-/// `terrain.vert`'s push constants: the word offsets of the frame's world record, its
-/// matrix and its first section record, and that the draw is a real one.
-pub(crate) fn terrain_push(world: u32, matrix: u32, sections: u32) -> [u8; 16] {
-    let mut push = [0u8; 16];
+/// Where the terrain's push constants are, in bytes: four words the vertex stage reads
+/// (the word offsets of the frame's world record, its matrix and its first section
+/// record, and that the draw is a real one), then what every fragment reads: the fog's
+/// colour and its two ranges, one texel of the atlas in its coordinates, and the
+/// atlas's index in the texture table. `terrain_frag.glsl` declares the same block.
+pub(crate) const PUSH_ENABLED: usize = 12;
+pub(crate) const PUSH_FOG_COLOUR: usize = 16;
+pub(crate) const PUSH_FOG_ENVIRONMENTAL: usize = 32;
+pub(crate) const PUSH_FOG_RENDER_DISTANCE: usize = 40;
+pub(crate) const PUSH_ATLAS_TEXEL: usize = 48;
+pub(crate) const PUSH_ATLAS: usize = 56;
+/// Bytes of the terrain's push constants.
+pub(crate) const TERRAIN_PUSH_BYTES: usize = 60;
+
+/// The terrain's push constants for a frame's draws.
+pub(crate) fn terrain_push(
+    world: u32,
+    matrix: u32,
+    sections: u32,
+    fog: &Fog,
+    atlas: TextureId,
+    atlas_size: [f32; 2],
+) -> [u8; TERRAIN_PUSH_BYTES] {
+    let mut push = [0u8; TERRAIN_PUSH_BYTES];
     put(&mut push, 0, world.to_ne_bytes());
     put(&mut push, 4, matrix.to_ne_bytes());
     put(&mut push, 8, sections.to_ne_bytes());
-    put(&mut push, 12, 1u32.to_ne_bytes());
+    put(&mut push, PUSH_ENABLED, 1u32.to_ne_bytes());
+    for (i, c) in fog.colour.iter().enumerate() {
+        put(&mut push, PUSH_FOG_COLOUR + i * 4, c.to_ne_bytes());
+    }
+    for i in 0..2 {
+        put(
+            &mut push,
+            PUSH_FOG_ENVIRONMENTAL + i * 4,
+            fog.environmental[i].to_ne_bytes(),
+        );
+        put(
+            &mut push,
+            PUSH_FOG_RENDER_DISTANCE + i * 4,
+            fog.render_distance[i].to_ne_bytes(),
+        );
+        put(
+            &mut push,
+            PUSH_ATLAS_TEXEL + i * 4,
+            (1.0 / atlas_size[i]).to_ne_bytes(),
+        );
+    }
+    put(&mut push, PUSH_ATLAS, atlas.index().to_ne_bytes());
     push
+}
+
+/// Writes a world record: what every terrain vertex of a frame reads but the camera's
+/// matrix.
+pub(crate) fn write_world_record(
+    bytes: &mut [u8],
+    camera_offset: [f32; 3],
+    atlas_size: [f32; 2],
+    lightmap: TextureId,
+) {
+    for (i, c) in camera_offset.iter().enumerate() {
+        put(bytes, WORLD_CAMERA_OFFSET + i * 4, c.to_ne_bytes());
+    }
+    put(bytes, WORLD_ATLAS_SIZE, atlas_size[0].to_ne_bytes());
+    put(bytes, WORLD_ATLAS_SIZE + 4, atlas_size[1].to_ne_bytes());
+    put(bytes, WORLD_LIGHTMAP, lightmap.index().to_ne_bytes());
 }
 
 /// Writes a frame's world record and its matrix into the frame's data: their word
@@ -555,18 +689,11 @@ pub(crate) fn terrain_push(world: u32, matrix: u32, sections: u32) -> [u8; 16] {
 pub(crate) fn write_world(
     frame_data: &mut FrameData,
     view: &View,
-    atlas: TextureId,
     atlas_size: [f32; 2],
     lightmap: TextureId,
 ) -> Option<(u32, u32)> {
     let (world, bytes) = frame_data.alloc(WORLD.words(), 4)?;
-    for (i, c) in view.offset.iter().enumerate() {
-        put(bytes, WORLD_CAMERA_OFFSET + i * 4, c.to_ne_bytes());
-    }
-    put(bytes, WORLD_ATLAS, atlas.index().to_ne_bytes());
-    put(bytes, WORLD_ATLAS_SIZE, atlas_size[0].to_ne_bytes());
-    put(bytes, WORLD_ATLAS_SIZE + 4, atlas_size[1].to_ne_bytes());
-    put(bytes, WORLD_LIGHTMAP, lightmap.index().to_ne_bytes());
+    write_world_record(bytes, view.offset, atlas_size, lightmap);
     let (matrix, bytes) = frame_data.alloc(WORLD_MATRIX.words(), 4)?;
     for (i, c) in view.view_projection.iter().enumerate() {
         put(bytes, i * 4, c.to_ne_bytes());
@@ -653,6 +780,8 @@ impl WorldRenderer {
                 let o = gpu.caps().optional;
                 o.multi_draw_indirect && o.draw_indirect_first_instance
             },
+            shader: TerrainShader::default(),
+            fade_ms: DEFAULT_FADE_MS,
             page_order: Vec::new(),
             commands: Vec::new(),
             calls: Vec::new(),
@@ -788,6 +917,17 @@ impl WorldRenderer {
         self.options.shades = environment.cardinal_light.shades();
         self.biomes = Arc::new(BiomeTints::new(&self.colour_maps, &environment.biomes));
         self.environment = Some(environment.clone());
+    }
+
+    /// How the terrain's texels are filtered. It applies from the next frame.
+    pub fn set_shader(&mut self, shader: TerrainShader) {
+        self.shader = shader;
+    }
+
+    /// How long a section takes to fade in once it has a mesh, in milliseconds (750
+    /// unless said otherwise; 0: it is there at once).
+    pub fn set_fade_ms(&mut self, ms: u32) {
+        self.fade_ms = ms;
     }
 
     /// Biome Blend: how many columns each way a biome colour is the mean over (2 unless
@@ -1166,16 +1306,24 @@ impl WorldRenderer {
     }
 
     /// Draws the sections `view` can see into `pass`, which has a depth attachment:
-    /// the solid layer nearest first, then the cutout layer.
+    /// the solid layer nearest first, then the cutout layer, in `fog`.
     ///
     /// # Safety
     /// [`Self::ready`] holds for the frame being recorded, whose `UploadRing::record`
     /// and [`Self::install_ready`] have run; `pass` is of that frame.
-    pub unsafe fn draw(&mut self, pass: &mut Pass<'_>, frame_data: &mut FrameData, view: &View) {
+    pub unsafe fn draw(
+        &mut self,
+        pass: &mut Pass<'_>,
+        frame_data: &mut FrameData,
+        view: &View,
+        fog: &Fog,
+    ) {
         profiling::scope!("world_draw");
         self.visible.clear();
         let mut tested = 0;
-        for (key, mesh) in self.tracker.meshes() {
+        let now = Instant::now();
+        let fade_ms = self.fade_ms;
+        for (key, mesh, since) in self.tracker.meshes_since() {
             tested += 1;
             let origin = [
                 (key[0] << 4) - view.block[0],
@@ -1195,6 +1343,7 @@ impl WorldRenderer {
                 distance,
                 mesh: *mesh,
                 origin,
+                visibility: visibility(now, since, fade_ms),
             });
         }
         self.stats.tested = tested;
@@ -1234,9 +1383,7 @@ impl WorldRenderer {
         else {
             return;
         };
-        let Some((world, matrix)) =
-            write_world(frame_data, view, self.atlas, self.atlas_size, lightmap)
-        else {
+        let Some((world, matrix)) = write_world(frame_data, view, self.atlas_size, lightmap) else {
             self.stats.overflowed += self.visible.len() as u64;
             return;
         };
@@ -1255,9 +1402,10 @@ impl WorldRenderer {
             .iter()
             .zip(bytes.as_chunks_mut::<SECTION_BYTES>().0)
         {
-            write_section(record, v.origin, 1.0);
+            write_section(record, v.origin, v.visibility);
         }
-        let push = terrain_push(world, matrix, first);
+        let push = terrain_push(world, matrix, first, fog, self.atlas, self.atlas_size);
+        let [solid, with_holes] = self.shader.pipelines();
         self.stats.visible = count as u32;
         let indirect = self.draws == TerrainDraws::Indirect;
         // SAFETY: the push constants are terrain.vert's and the records they point at
@@ -1268,10 +1416,7 @@ impl WorldRenderer {
         // data before the calls that read them.
         unsafe {
             pass.bind_index_buffer(indices.buffer, indices.offset);
-            for (pipeline, cutout) in [
-                (PipelineId::TerrainSolid, false),
-                (PipelineId::TerrainCutout, true),
-            ] {
+            for (pipeline, cutout) in [(solid, false), (with_holes, true)] {
                 let mut bound = None;
                 let mut pushed = false;
                 self.commands.clear();
@@ -1395,10 +1540,83 @@ mod tests {
         assert_eq!(word(1), 64);
         assert_eq!(word(2), 1_000_000);
         assert_eq!(f32::from_bits(word(3)), 0.25);
-        let push = terrain_push(7, 14, 30);
+        // The push constants: four words for the vertex stage, then the fog, a texel
+        // of the atlas and the atlas, where terrain_frag.glsl's block has them.
+        let fog = Fog {
+            colour: [0.1, 0.2, 0.3, 1.0],
+            environmental: [4.0, 5.0],
+            render_distance: [6.0, 7.0],
+            sky_end: 8.0,
+        };
+        let push = terrain_push(7, 14, 30, &fog, TextureId::MISSING, [1024.0, 512.0]);
+        assert_eq!(push.len(), 60);
         assert_eq!(push[0..4], 7u32.to_ne_bytes());
         assert_eq!(push[4..8], 14u32.to_ne_bytes());
         assert_eq!(push[8..12], 30u32.to_ne_bytes());
         assert_eq!(push[12..16], 1u32.to_ne_bytes());
+        let pushed = |at: usize| f32::from_ne_bytes(push[at..at + 4].try_into().unwrap());
+        assert_eq!([pushed(16), pushed(20), pushed(24), pushed(28)], fog.colour);
+        assert_eq!([pushed(32), pushed(36)], fog.environmental);
+        assert_eq!([pushed(40), pushed(44)], fog.render_distance);
+        assert_eq!([pushed(48), pushed(52)], [1.0 / 1024.0, 1.0 / 512.0]);
+        assert_eq!(push[56..60], TextureId::MISSING.index().to_ne_bytes());
+        // The world record: the camera's offset, the atlas's size and the light map.
+        let mut world = [0u8; WORLD.bytes() as usize];
+        write_world_record(
+            &mut world,
+            [0.5, 0.25, 0.125],
+            [1024.0, 512.0],
+            TextureId::MISSING,
+        );
+        let float = |i: usize| f32::from_ne_bytes(world[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!([float(0), float(1), float(2)], [0.5, 0.25, 0.125]);
+        assert_eq!([float(3), float(4)], [1024.0, 512.0]);
+        assert_eq!(world[20..24], TextureId::MISSING.index().to_ne_bytes());
+    }
+
+    #[test]
+    fn a_section_fades_in_from_its_first_mesh() {
+        let since = Instant::now();
+        let after = |ms: u64| since + std::time::Duration::from_millis(ms);
+        assert_eq!(visibility(since, since, 750), 0.0);
+        assert_eq!(visibility(after(375), since, 750), 0.5);
+        assert_eq!(visibility(after(749), since, 750), 749.0 / 750.0);
+        assert_eq!(visibility(after(750), since, 750), 1.0);
+        assert_eq!(visibility(after(60_000), since, 750), 1.0);
+        // Whole milliseconds, as the game counts them.
+        assert_eq!(
+            visibility(since + std::time::Duration::from_micros(1_900), since, 750),
+            1.0 / 750.0
+        );
+        // No fade: there at once.
+        assert_eq!(visibility(since, since, 0), 1.0);
+        // A clock read before the mesh was noted is no time at all.
+        assert_eq!(visibility(since, after(5), 750), 0.0);
+    }
+
+    #[test]
+    fn every_shader_has_a_name_of_its_own_and_two_pipelines() {
+        for s in TerrainShader::ALL {
+            assert_eq!(TerrainShader::parse(s.name()), Some(s));
+            let [solid, cutout] = s.pipelines();
+            assert_ne!(solid, cutout);
+            assert!(solid.terrain_stages().is_some() && cutout.terrain_stages().is_some());
+        }
+        assert_eq!(TerrainShader::parse("fancy"), None);
+        assert_eq!(TerrainShader::default(), TerrainShader::Rgss);
+        // No two draw with the same pipelines, and each with those of its name.
+        let names: Vec<[&str; 2]> = TerrainShader::ALL
+            .iter()
+            .map(|s| s.pipelines().map(|p| p.terrain_stages().unwrap().0))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ["terrain_rgss", "terrain_rgss_cutout"],
+                ["terrain_rgss_reference", "terrain_rgss_reference_cutout"],
+                ["terrain_nearest", "terrain_nearest_cutout"],
+                ["terrain_plain", "terrain_plain_cutout"],
+            ]
+        );
     }
 }

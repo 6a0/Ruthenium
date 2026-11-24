@@ -166,6 +166,16 @@ pub struct Options {
     /// Biome Blend: over how many columns each way biome colours are the mean (0 to 7;
     /// default 2).
     pub biome_blend: Option<u8>,
+    /// How the terrain's texels are filtered (default: as vanilla's RGSS).
+    pub terrain_shader: Option<ruthenium_render::TerrainShader>,
+    /// Whether the terrain is fogged (the default) or not.
+    pub fog: Option<bool>,
+    /// Chunk Fade: how long a section takes to fade in, in milliseconds (default 750).
+    pub chunk_fade_ms: Option<u32>,
+    /// When the sky is drawn (default: after the world's opaque layers).
+    pub sky: Option<ruthenium_render::SkyOrder>,
+    /// Whether block light flickers (the default) or holds still.
+    pub light_flicker: Option<bool>,
 }
 
 impl Options {
@@ -220,6 +230,11 @@ impl Options {
             terrain_culling: None,
             smooth_lighting: None,
             biome_blend: None,
+            terrain_shader: None,
+            fog: None,
+            chunk_fade_ms: None,
+            sky: None,
+            light_flicker: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -401,6 +416,42 @@ impl Options {
                             .ok()
                             .filter(|r| *r <= ruthenium_render::terrain::MAX_BLEND_RADIUS)
                             .ok_or(format!("--biome-blend: not a radius from 0 to 7: {v}"))?,
+                    );
+                }
+                "--terrain-shader" => {
+                    let v = value("rgss, rgss-reference, nearest or plain")?;
+                    o.terrain_shader =
+                        Some(ruthenium_render::TerrainShader::parse(&v).ok_or(format!(
+                            "--terrain-shader: not rgss, rgss-reference, nearest or plain: {v}"
+                        ))?);
+                }
+                "--fog" | "--light-flicker" => {
+                    let on = match value("on or off")?.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        v => return Err(format!("{a}: not on or off: {v}")),
+                    };
+                    if a == "--fog" {
+                        o.fog = Some(on);
+                    } else {
+                        o.light_flicker = Some(on);
+                    }
+                }
+                "--chunk-fade" => {
+                    let v = value("seconds from 0 to 1.5")?;
+                    let seconds: f64 = v
+                        .parse()
+                        .ok()
+                        .filter(|s| (0.0..=1.5).contains(s))
+                        .ok_or(format!("--chunk-fade: not seconds from 0 to 1.5: {v}"))?;
+                    // Whole milliseconds, as the game counts the fade.
+                    o.chunk_fade_ms = Some((seconds * 1000.0) as u32);
+                }
+                "--sky" => {
+                    let v = value("late, first or off")?;
+                    o.sky = Some(
+                        ruthenium_render::SkyOrder::parse(&v)
+                            .ok_or(format!("--sky: not late, first or off: {v}"))?,
                     );
                 }
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
@@ -662,6 +713,21 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     if let Some(radius) = opts.biome_blend {
         renderer.set_biome_blend(radius);
+    }
+    if let Some(shader) = opts.terrain_shader {
+        renderer.set_terrain_shader(shader);
+    }
+    if let Some(ms) = opts.chunk_fade_ms {
+        renderer.set_chunk_fade_ms(ms);
+    }
+    if let Some(order) = opts.sky {
+        renderer.set_sky_order(order);
+    }
+    {
+        let mut air = renderer.atmosphere_options();
+        air.fog = opts.fog.unwrap_or(air.fog);
+        air.flicker = opts.light_flicker.unwrap_or(air.flicker);
+        renderer.set_atmosphere_options(air);
     }
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
@@ -1067,7 +1133,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             scene: &w.scene,
             camera: w.camera,
             view_distance: w.view_distance,
-            environment: &w.environment,
+            frame: &w.frame,
+            partial_tick: w.partial_tick,
         });
         let report = renderer.render(&BACKGROUND, world, gui)?;
         if opts.exercise_swapchain
@@ -1090,13 +1157,11 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                     .as_chunks::<4>()
                     .0
                     .iter()
+                    // Opaque, as the window shows the frame (and as the game saves its
+                    // screenshots): the frame's own alpha is what was last drawn there,
+                    // a cut-out texel's among others.
                     .map(|p| {
-                        ruthenium_assets::image::argb(
-                            p[3].into(),
-                            p[0].into(),
-                            p[1].into(),
-                            p[2].into(),
-                        )
+                        ruthenium_assets::image::argb(255, p[0].into(), p[1].into(), p[2].into())
                     })
                     .collect(),
             }
@@ -1285,6 +1350,11 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 "culling": if renderer.terrain_culling() { "graph" } else { "frustum" },
                 "smooth_lighting": renderer.smooth_lighting(),
                 "biome_blend": renderer.biome_blend(),
+                "shader": renderer.terrain_shader().name(),
+                "fog": renderer.atmosphere_options().fog,
+                "chunk_fade_ms": renderer.chunk_fade_ms(),
+                "sky": renderer.sky_order().name(),
+                "light_flicker": renderer.atmosphere_options().flicker,
                 "mesh_workers": menu.mesh_workers(),
                 "envelope_bytes": ruthenium_render::terrain::POOL_ENVELOPE,
                 "at_capture_start": at_start,

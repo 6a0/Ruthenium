@@ -42,6 +42,9 @@ pub(crate) struct Options {
     pub java: Option<PathBuf>,
     pub results: Option<PathBuf>,
     pub screenshot: bool,
+    /// With the screenshot: vanilla draws no HUD, hand, vignette or clouds, so that its
+    /// picture is of the world alone. Such a run's times are not vanilla's.
+    pub bare: bool,
     pub render_distance: u32,
     pub gpu: Gpu,
 }
@@ -59,6 +62,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         java: None,
         results: None,
         screenshot: false,
+        bare: false,
         render_distance: 12,
         gpu: Gpu::Auto,
     };
@@ -67,6 +71,11 @@ fn parse(args: &[String]) -> Result<Options, String> {
     while let Some(arg) = it.next() {
         if arg == "--screenshot" {
             o.screenshot = true;
+            continue;
+        }
+        if arg == "--bare-picture" {
+            o.screenshot = true;
+            o.bare = true;
             continue;
         }
         let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;
@@ -242,6 +251,7 @@ pub(crate) fn launch(
         format!("-Druthenium.bench.world={WORLD}"),
         format!("-Druthenium.bench.seed={}", o.seed),
         format!("-Druthenium.bench.screenshot={}", o.screenshot),
+        format!("-Druthenium.bench.bare={}", o.bare),
     ];
     if let Some((address, route)) = &run.dedicated {
         let route = std::path::absolute(route).map_err(|e| e.to_string())?;

@@ -2,7 +2,7 @@
 
 What Ruthenium's world renderer costs on the routes the vanilla client was measured on, and where its frame time, memory and latency go. It measures an unfinished renderer: read [what the scene leaves out](#what-ruthenium-draws-and-what-it-does-not) before any ratio. The vanilla numbers are the dedicated-server runs of [baseline.md](baseline.md); the menus' own cost is in [menu-baseline.md](menu-baseline.md).
 
-There are two measurements here, both of 2026-11-24 and in release. The first, from the working tree on top of `d447d22`, is of a renderer that meshed every loaded section and drew every one inside the view: everything from [Against vanilla](#against-vanilla) on, where nothing else is said. The second, on top of `50564e0`, is of [cave culling](#cave-culling), which is the default since.
+There are two measurements here, both of 2026-11-24 and in release. The first, from the working tree on top of `d447d22`, is of a renderer that meshed every loaded section and drew every one inside the view: everything from [Against vanilla](#against-vanilla) on, where nothing else is said. The second, on top of `50564e0`, is of [cave culling](#cave-culling), which is the default since. A third, on top of `92e7bb6`, is of the terrain drawn as vanilla's shader draws it, with fog and sky: [the picture against vanilla's](#the-picture-against-vanillas), which also holds the two clients' pictures against each other for the first time.
 
 ## Machine and conditions
 
@@ -129,10 +129,73 @@ Idle, spin and walk are bound by the GPU: it takes 0.26 to 0.31 ms for the half 
 
 A ratio above compares two different pictures.
 
-- **Left out:** water and lava, translucent blocks, block entities, entities and the player's hand, the sky, clouds, fog and the fade-in of new chunks, smooth lighting and ambient occlusion, biome colours, animated textures, the time of day, particles and every part of the HUD but the crosshair. Vanilla draws all of them in its runs.
+- **Left out in the measurements above:** water and lava, translucent blocks, block entities, entities and the player's hand, the sky, clouds, fog and the fade-in of new chunks, smooth lighting and ambient occlusion, biome colours, animated textures, the time of day, particles and every part of the HUD but the crosshair. Vanilla draws all of them in its runs.
 - **Drawn since these runs:** smooth lighting with ambient occlusion, and the biomes' colours on grass, leaves and the like, both worked out when a section is meshed, as vanilla does. The vertices stay as they were (a colour and two lights each), so a frame draws the same quads at the same cost: one run each with and without smooth lighting, with a viewer on the streamed desktop, gave 2697 and 2683 FPS on average in idle and 3687 and 3695 in fly, the GPU's 0.206 and 0.120 ms in both. Meshing a section took 0.31 to 0.38 ms on a worker at the spawn in three joins, for 0.24 ms in one join lit flat and untinted. The medians above were not measured again.
+- **Drawn since, at a cost:** the terrain as vanilla's shader draws it (its texture filtering, both fogs, the fade-in of new sections), the sky, and the time of day in the light, the fog and the sky. [The picture against vanilla's](#the-picture-against-vanillas) has what that looks like and what it costs.
+- **Still left out:** water and lava, translucent blocks, block entities, entities and the player's hand, clouds, animated textures, particles, the weather's rain and snow, what the camera sees from inside water, lava or powder snow, the effects on the player (blindness, darkness, night vision) and every part of the HUD but the crosshair.
 - **Drawn in excess, in the first measurement:** every loaded section that had anything to draw got a mesh, and every one of those inside the view's frustum was drawn, hidden or not: at the spawn 925 sections and 522,119 quads in view, of 4,037 with a mesh among 15,288 loaded. Vanilla builds and draws only what its occlusion graph reaches, and with [cave culling](#cave-culling) so does Ruthenium, by the same rules: 405 sections and 291,723 quads, of 1,409 with a mesh. One difference remains: Ruthenium meshes what the walk reaches behind the camera too, where vanilla builds a section when it is first inside the view.
 - **The same pixels whichever way the sections are drawn.** The frame after the route's end, captured with `--screenshot`, is the same file byte for byte with direct, paged and indirect draws, at the spawn and at the end of the fly route.
+
+## The picture against vanilla's
+
+Since the measurements above, the terrain is drawn as vanilla's terrain shader draws it, and the air is vanilla's:
+
+- **Texture filtering.** Texels keep hard edges with a blend one screen pixel wide between two of them, and with the Fancy preset's "RGSS" filtering, the default here too, a texel smaller than a pixel is the mean of four samples at each of two mip levels. `--terrain-shader nearest` is the Fast preset's.
+- **Fog.** The stronger of the fog of the place (by the distance in a straight line) and the fog at the edge of the view (sideways or in height, whichever is more, over the last tenth of the render distance), both worked out for every corner and carried across the faces, in the colour vanilla gives the fog: the dimension's, the sky's mixed in, a sunset's glow where the camera looks at it, darker towards the void.
+- **Fade.** A section comes out of the fog's colour over 0.75 s from its first mesh, beyond 16 blocks from the camera (`--chunk-fade`).
+- **Sky.** The dome in the sky's colour fading to the fog's, the glow of sunrise and sunset, the sun, the moon in its phase, the stars, the dark half below the horizon; the End's sky; none in the Nether.
+- **The time of day, the weather and the biomes** move the sky's and the fog's colours, the sun and the light map through the dimension's environment attributes and timelines, read once a tick around the camera and blended between ticks. Block light flickers.
+
+Not there yet: clouds, rain and snow themselves, what a camera sees from inside water, lava or powder snow, the effects on the player (blindness, darkness, night vision) and a boss's fog.
+
+### The two pictures
+
+`cargo xtask bench dedicated --client vanilla,ruthenium --scene idle --bare-picture` saves one frame of each client at the idle scene's place. Vanilla draws it without its HUD, hand, vignette and clouds, none of which Ruthenium has; Ruthenium with `--light-flicker off`. `--time` sets the time of day. Of the 2,073,600 pixels of a frame:
+
+| Time of day | The same byte for byte | Within one step of 255 | More than 8 steps apart | The upper 400 rows (sky and treetops) the same |
+|---|---:|---:|---:|---:|
+| noon (6000) | 95.1% | 99.4% | 0.55% | 99.8% |
+| sunset (12600) | 98.6% | 99.4% | 0.54% | 100.0% |
+| midnight (18000) | 98.9% | 99.5% | 0.50% | 100.0% |
+
+What is more than 8 steps apart is what Ruthenium does not draw: the water at the frame's right edge (8,345 of the 11,466 such pixels at noon), a handful of animals, and its own crosshair. The pixels one step apart are on leaves and plants, in both directions; the cause was not looked for. With vanilla's HUD on, its vignette alone darkens the frame by up to 4% towards the edges.
+
+So the sky's and the fog's colours, the sun's glow, the stars, the light by day and by night, the smooth lighting and the biomes' colours are vanilla's at this place at these three times, with the time standing still. Not compared: a picture in motion or with time passing, rain, another biome's fog, the Nether and the End (looked at, not held against vanilla), and distances at which most texels are smaller than a pixel.
+
+### The same picture, however it is drawn
+
+Vanilla draws the sky first and the world over it. Ruthenium draws it after the world's opaque layers, only where they left nothing (`--sky late`, the default; `first` is vanilla's order). Vanilla's shader takes nine samples of the atlas for every pixel with RGSS. Ruthenium's leaves out the ones whose weight is exactly nothing, which is eight of them wherever texels are larger than pixels (`--terrain-shader rgss`, the default; `rgss-reference` takes them all). The frame after each route's end is the same file byte for byte with `late` and `first` and with `rgss` and `rgss-reference`, at the spawn and at the fly route's end, in both repetitions, and again in the three repetitions of every route below.
+
+`--exercise-terrain` now draws its scene with each of the four shaders in turn and in five fogs, and compares every pixel with the scene as a small rasteriser in the client draws it by the shaders' arithmetic: no pixel wrong in 1,587 frames on the RTX 4060 and 1,481 on llvmpipe. 27 deliberate breakages of the shaders and of what is written for them each fail it or a test, and so do 59 of the rules of the fog, the fade and the sky in the client (two of them only after tests were added for them). Its atlas is 4096 by 8 texels, where vanilla's rule counts every texel as smaller than a pixel: of RGSS it shows the averaging, and the screenshots above the rest.
+
+### What it costs
+
+On the RTX 4060 as before, 24 runs, medians of 3, each with the vanilla runs' position on every tick; average FPS / 1% low / 0.1% low, then against vanilla's. "Before" is the same build told to draw as it did (`--terrain-shader plain --sky off`).
+
+| Scene | Before | With vanilla's shader and sky | × vanilla |
+|---|---|---|---|
+| idle | 3098 / 1384 / 1018 | 2417 / 1286 / 939 | 1.66 / 1.44 / 1.47 |
+| spin | 3272 / 1406 / 1041 | 2443 / 1302 / 958 | 1.59 / 1.44 / 1.51 |
+| walk | 3096 / 1376 / 1011 | 2465 / 1265 / 940 | 1.75 / 1.57 / 1.83 |
+| fly | 4181 / 1490 / 1119 | 3355 / 1361 / 1017 | 2.14 / 1.70 / 2.52 |
+
+A fifth to a quarter of the frames went to it, and the 1% lows' target of twice vanilla's is missed on every route in these runs. **A video encoding session was open during 17 of the 24 runs**, without the 2.9 ms waits a viewer gave [before](#a-viewer-on-the-streamed-desktop) (at most 0.65 intervals over 2 ms a second in any run), but with lower lows: the first repetition of idle, spin and walk ran without one, at 2518 / 1558 / 1243, 2558 / 1550 / 1254 and 2573 / 1460 / 1186, which is 1.73 to 1.82 times vanilla's average and 1.71 to 1.81 times its 1% low. The "before" column is under the same sessions, and below the [cave culling](#cave-culling) runs' medians, which had none.
+
+Where the GPU's time goes, from one run of 20 s for each way of drawing (the frame's GPU time at the median, in milliseconds; fly is the route's first 20 s):
+
+| Drawn with | idle | fly | What it adds |
+|---|---:|---:|---|
+| `--terrain-shader plain` | 0.202 | 0.125 | the shader as it was, and the sky |
+| `--terrain-shader nearest` | 0.212 | 0.132 | fog and fade: 0.010 and 0.007 |
+| `--terrain-shader rgss` (the default) | 0.257 | 0.162 | RGSS: 0.045 and 0.030 |
+| `--terrain-shader rgss-reference` | 0.363 | 0.200 | all nine samples for every pixel: 0.106 and 0.038 more |
+| `--sky first` | 0.254 | 0.161 | the order makes no difference here |
+| `--sky off` | 0.249 | 0.154 | the sky costs 0.008 |
+
+- **RGSS is most of it**, and leaving out the samples that count for nothing saves 29% of the frame's GPU time in idle against taking them all.
+- **Where a fragment's constants come from mattered more than what is done with them.** Read from the frame's data for every pixel, the fog's colour and ranges and the atlas's size made fog and fade cost 0.051 ms instead of 0.010 in idle, and the default 0.298 ms instead of 0.270 in runs of the same day under one condition (a viewer on the stream). They are push constants now, and the terrain's and the sky's fragment stages read nothing of the frame's data.
+- **The sky's order** was expected to matter on a GPU bound by its pixels. On this one the sky is 3% of a frame either way; the Intel iGPU is where it has to be measured.
+- The main thread's work is 0.049 to 0.075 ms a frame, of which working out the fog, the sky and the light map is part of the terrain's stage, 0.001 ms at the median as before. The rise in idle from 0.054 is in recording the frame (0.046 to 0.064 ms), with the same draws; it comes with the longer wait for the GPU and was not looked into.
 
 ## Where a frame's time goes
 
@@ -203,7 +266,8 @@ Two runs before those fixes also showed frames waiting 2.5 ms for the GPU about 
 ## Not measured yet
 
 - **The Intel iGPU, AMD and Macs.** Every number here is one discrete NVIDIA GPU's. Which way of drawing is fastest, and whether a frame ahead pays, may differ where the GPU is slow and memory is shared.
-- **The whole picture.** Everything [left out](#what-ruthenium-draws-and-what-it-does-not) has yet to be drawn. No ratio here is a result until it is; the comparison of images with vanilla's waits for the same.
+- **The whole picture.** Everything [still left out](#what-ruthenium-draws-and-what-it-does-not) has yet to be drawn, and no ratio here is a result until it is. Pictures are compared with vanilla's [at one place, at rest, at three times of day](#the-two-pictures).
+- **The shader's variants and the sky's order on the Intel iGPU**, where a frame is bound by its pixels: what RGSS, the shorter RGSS, fog and fade and the sky drawn late each cost there is what the options of [what it costs](#what-it-costs) are for.
 - **Whether vanilla draws the same sections.** Cave culling follows vanilla's rules, but the vanilla runs did not record how many sections they drew, and the walk's order of work differs once meshes arrive.
 - **The picture in motion with cave culling.** The pictures compared are of scenes at rest. What a moving camera can miss is a section between being reached and having its mesh, 5 to 6 ms at P99 on these routes.
 - **The walk on a slow processor**, where its 4 ms would be longer, and whether meshing what is inside the view first would show.
@@ -228,6 +292,20 @@ cargo xtask bench dedicated --accept-eula --client ruthenium \
     --baseline cache/bench/results/<the vanilla runs>       # cave culling against the frustum alone
 cargo xtask bench dedicated --accept-eula --client ruthenium,headless --scene dig
 cargo xtask bench report <folder> --baseline <folder>       # the tables again
+```
+
+```sh
+# The terrain's shader and the sky: the default against the build drawing as before, then each part
+cargo xtask bench dedicated --accept-eula --client ruthenium \
+    --variant rgss --variant 'before=--terrain-shader plain --sky off' \
+    --baseline cache/bench/results/<the vanilla runs> --screenshot
+cargo xtask bench dedicated --accept-eula --client ruthenium --scene idle,fly --reps 1 --warmup 5 --duration 20 \
+    --variant rgss --variant 'ref=--terrain-shader rgss-reference' --variant 'nearest=--terrain-shader nearest' \
+    --variant 'plain=--terrain-shader plain' --variant 'skyfirst=--sky first' --variant 'nosky=--sky off'
+# One frame of each client, vanilla's without HUD, hand, vignette and clouds (its PNG is
+# cache/bench/game/screenshots/ruthenium-bench-idle.png, Ruthenium's in the results folder)
+cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium --variant 'ruthenium=--light-flicker off' \
+    --scene idle --reps 1 --warmup 5 --duration 10 --bare-picture --time 12600
 ```
 
 At a display scale of 2, add `--width 960 --height 540`. `--screenshot` saves the frame after each route's end next to the run's file. A variant's options are the client's own (`ruthenium --help`); add `--frame-log <file>` to one for a line per frame with where its time went. Each run's file holds the frame intervals, the route's record and Ruthenium's own summary (phases, terrain, uploads, latencies) under `ruthenium`; trial folders with the client's and the server's logs are under `cache/bench/dedicated`.

@@ -64,6 +64,49 @@ pub fn java_cos(radians: f64) -> f64 {
     libm::cos(radians)
 }
 
+/// Java's `Math.sin(double)`, for the few places the game calls it rather than
+/// `Mth.sin` (the elastic easing curves). fdlibm's algorithm, as [`java_cos`].
+#[inline]
+pub fn java_sin(radians: f64) -> f64 {
+    libm::sin(radians)
+}
+
+/// Java's `Math.pow(double, double)` (the easing curves). fdlibm's algorithm; HotSpot's
+/// intrinsic is allowed to differ from it by an ulp.
+#[inline]
+pub fn java_pow(base: f64, exponent: f64) -> f64 {
+    libm::pow(base, exponent)
+}
+
+/// Java's `Math.min(float, float)`: NaN when either is, and -0 below +0.
+#[inline]
+pub fn java_min(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        // Equal values differ only as zeros: the negative one is the lesser.
+        if a.is_sign_negative() { a } else { b }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Java's `Math.max(float, float)`: NaN when either is, and +0 above -0.
+#[inline]
+pub fn java_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        if a.is_sign_negative() { b } else { a }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
 /// Vanilla `Mth.floor(float)`: `(int) Math.floor(v)`, saturating, NaN to 0.
 #[inline]
 pub fn floor_f32(v: f32) -> i32 {
@@ -197,6 +240,16 @@ mod tests {
         assert_eq!(round(-1.5000000000000002), -2);
         assert_eq!(round(f64::NAN), 0);
         assert_eq!(round(1e300), i64::MAX);
+    }
+
+    #[test]
+    fn min_and_max_order_the_zeros() {
+        assert_eq!(java_min(0.0, -0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(java_min(-0.0, 0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(java_max(0.0, -0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!(java_max(-0.0, 0.0).to_bits(), 0.0f32.to_bits());
+        assert_eq!((java_min(1.0, 2.0), java_max(1.0, 2.0)), (1.0, 2.0));
+        assert!(java_min(f32::NAN, 1.0).is_nan() && java_max(1.0, f32::NAN).is_nan());
     }
 
     #[test]

@@ -69,6 +69,9 @@ pub struct BiomeLook {
     /// none (`temperature`, `downfall`).
     pub temperature: f32,
     pub downfall: f32,
+    /// It rains or snows there (`has_precipitation`; yes where the definition does not
+    /// say).
+    pub has_precipitation: bool,
     /// Its environment attribute overrides (`attributes`).
     pub attributes: Value,
     /// Its special effects (`effects`: water, grass and foliage colours, the grass
@@ -89,7 +92,8 @@ pub struct Environment {
     pub skybox: String,
     /// The dimension type's environment attributes by id (`minecraft:visual/sky_color`...).
     pub attributes: Map<String, Value>,
-    /// The timelines of the dimension type's `timelines`, in the registry's order.
+    /// The timelines of the dimension type's `timelines`, in the order of its tag (as
+    /// the server sent it) or of its list. Attributes take them in this order.
     pub timelines: Vec<Timeline>,
     /// The world clocks' names by registry id.
     pub clocks: Vec<String>,
@@ -165,6 +169,7 @@ impl Environment {
                     id: e.id.clone(),
                     temperature: number("temperature"),
                     downfall: number("downfall"),
+                    has_precipitation: d.get("has_precipitation").and_then(truthy).unwrap_or(true),
                     attributes: d.get("attributes").cloned().unwrap_or(Value::Null),
                     effects: d.get("effects").cloned().unwrap_or(Value::Null),
                 }
@@ -239,11 +244,9 @@ impl Environment {
                 .collect(),
             _ => Vec::new(),
         };
-        let mut members: Vec<usize> = members.into_iter().filter(|&i| i < all.len()).collect();
-        members.sort_unstable();
-        members.dedup();
         env.timelines = members
             .into_iter()
+            .filter(|&i| i < all.len())
             .filter_map(|i| {
                 let definition = definition(TIMELINE, &all[i], local)?;
                 Some(Timeline {
@@ -447,19 +450,19 @@ mod tests {
         assert_eq!(env.skybox, "overworld");
         assert_eq!(env.attributes["minecraft:visual/sky_color"], "#78a7ff");
         assert_eq!(env.default_clock, Some(0));
-        // The tag's timelines in the registry's order; early_game has no local
-        // definition here and is left out.
+        // The tag's timelines in the tag's order (the order their layers apply in);
+        // early_game has no local definition here and is left out.
         let ids: Vec<&str> = env.timelines.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(
             ids,
             [
+                "minecraft:villager_schedule",
                 "minecraft:day",
-                "minecraft:moon",
-                "minecraft:villager_schedule"
+                "minecraft:moon"
             ]
         );
-        assert_eq!(env.timelines[1].clock, Some(0));
-        assert_eq!(env.timelines[1].definition["period_ticks"], 192000);
+        assert_eq!(env.timelines[2].clock, Some(0));
+        assert_eq!(env.timelines[2].definition["period_ticks"], 192000);
         // Biomes by network id; one without data keeps empty looks.
         assert_eq!(env.biomes.len(), 2);
         assert_eq!(env.biomes[0].attributes, Value::Null);

@@ -209,7 +209,8 @@ mod tests {
     use ruthenium_shaders::interface::{FRAME_DATA_BINDING, FRAME_DATA_SET};
 
     use super::*;
-    use crate::terrain::world::terrain_push;
+    use crate::pipelines::PipelineId;
+    use crate::sky::SKY_VERTEX;
     use crate::terrain_vertex::TERRAIN_VERTEX;
 
     /// What a shader sees of a vertex attribute of a format: unsigned whole numbers or
@@ -219,6 +220,8 @@ mod tests {
             vk::Format::R16G16B16A16_UINT => Type::Vector(Box::new(Type::Uint), 4),
             vk::Format::R16G16_UINT => Type::Vector(Box::new(Type::Uint), 2),
             vk::Format::R8G8B8A8_UNORM => Type::Vector(Box::new(Type::Float), 4),
+            vk::Format::R32G32B32_SFLOAT => Type::Vector(Box::new(Type::Float), 3),
+            vk::Format::R32G32_SFLOAT => Type::Vector(Box::new(Type::Float), 2),
             other => panic!("no shader type known for {other:?}"),
         }
     }
@@ -227,72 +230,148 @@ mod tests {
         Type::Vector(Box::new(Type::Float), n)
     }
 
+    /// Every terrain pipeline's two stages, and the sky's.
+    fn terrain_stages() -> Vec<(&'static shaders::Spirv, &'static shaders::Spirv)> {
+        let stages: Vec<_> = PipelineId::ALL
+            .iter()
+            .filter_map(|p| p.terrain_stages())
+            .map(|(_, vertex, fragment)| (vertex, fragment))
+            .collect();
+        assert_eq!(stages.len(), 8);
+        stages
+    }
+
+    /// The bytes a vertex attribute of a format takes.
+    fn bytes(format: vk::Format) -> u32 {
+        match format {
+            vk::Format::R16G16B16A16_UINT | vk::Format::R32G32_SFLOAT => 8,
+            vk::Format::R32G32B32_SFLOAT => 12,
+            _ => 4,
+        }
+    }
+
     #[test]
-    fn the_terrain_vertex_layout_is_what_the_shader_reads() {
-        let vert = interface(shaders::TERRAIN_VERT.words());
-        let inputs = Interface::located(&vert.inputs);
-        assert_eq!(inputs.len(), TERRAIN_VERTEX.attributes.len());
-        for (i, attribute) in TERRAIN_VERTEX.attributes.iter().enumerate() {
-            assert_eq!(inputs[i].0, i as u32, "locations are the attributes' order");
-            assert_eq!(*inputs[i].1, seen(attribute.format), "location {i}");
+    fn the_vertex_layouts_are_what_the_shaders_read() {
+        for (vertex, layout) in [
+            (&shaders::TERRAIN_VERT, TERRAIN_VERTEX),
+            (&shaders::TERRAIN_PLAIN_VERT, TERRAIN_VERTEX),
+            (&shaders::SKY_VERT, SKY_VERTEX),
+        ] {
+            let vert = interface(vertex.words());
+            let inputs = Interface::located(&vert.inputs);
+            assert_eq!(inputs.len(), layout.attributes.len(), "{}", vertex.name);
+            for (i, attribute) in layout.attributes.iter().enumerate() {
+                assert_eq!(inputs[i].0, i as u32, "locations are the attributes' order");
+                assert_eq!(*inputs[i].1, seen(attribute.format), "location {i}");
+            }
+            // The attributes lie inside the vertex and do not overlap.
+            let mut end = 0;
+            for a in layout.attributes {
+                assert!(a.offset >= end);
+                end = a.offset + bytes(a.format);
+            }
+            assert_eq!(end, layout.stride, "{}", vertex.name);
         }
-        // The attributes lie inside the vertex and do not overlap.
-        let mut end = 0;
-        for a in TERRAIN_VERTEX.attributes {
-            assert!(a.offset >= end);
-            end = a.offset
-                + match a.format {
-                    vk::Format::R16G16B16A16_UINT => 8,
-                    _ => 4,
-                };
-        }
-        assert_eq!(end, TERRAIN_VERTEX.stride);
     }
 
     #[test]
     fn the_stages_agree_on_what_passes_between_them() {
-        let vert = interface(shaders::TERRAIN_VERT.words());
-        let outputs = Interface::located(&vert.outputs);
-        assert_eq!(outputs, vec![(0, &vec(4)), (1, &vec(2))]);
-        for frag in [&shaders::TERRAIN_FRAG, &shaders::TERRAIN_CUTOUT_FRAG] {
-            let frag = interface(frag.words());
-            assert_eq!(Interface::located(&frag.inputs), outputs);
+        let float = Type::Float;
+        for (vertex, fragment) in terrain_stages() {
+            let vert = interface(vertex.words());
+            let outputs = Interface::located(&vert.outputs);
+            // The lit colour and the coordinates; with fog, its two distances and the
+            // fade.
+            if vertex.name == shaders::TERRAIN_PLAIN_VERT.name {
+                assert_eq!(outputs, vec![(0, &vec(4)), (1, &vec(2))]);
+            } else {
+                assert_eq!(
+                    outputs,
+                    vec![
+                        (0, &vec(4)),
+                        (1, &vec(2)),
+                        (2, &float),
+                        (3, &float),
+                        (4, &float)
+                    ]
+                );
+            }
+            let frag = interface(fragment.words());
+            assert_eq!(
+                Interface::located(&frag.inputs),
+                outputs,
+                "{}",
+                fragment.name
+            );
             assert_eq!(Interface::located(&frag.outputs), vec![(0, &vec(4))]);
         }
+        let vert = interface(shaders::SKY_VERT.words());
+        let outputs = Interface::located(&vert.outputs);
+        assert_eq!(
+            outputs,
+            vec![(0, &vec(4)), (1, &vec(2)), (2, &float), (3, &float)]
+        );
+        let frag = interface(shaders::SKY_FRAG.words());
+        assert_eq!(Interface::located(&frag.inputs), outputs);
+        assert_eq!(Interface::located(&frag.outputs), vec![(0, &vec(4))]);
+    }
+
+    /// A stage's push constants as its module declares them: each member's type and
+    /// byte offset.
+    fn pushed(shader: &shaders::Spirv) -> Vec<(Type, u32)> {
+        let i = interface(shader.words());
+        assert_eq!(i.push_constants.len(), 1, "{}", shader.name);
+        let Type::Struct(members) = &i.push_constants[0].ty else {
+            panic!("the push constants are a block");
+        };
+        members
+            .iter()
+            .map(|(ty, offset)| (ty.clone(), offset.expect("a member's offset")))
+            .collect()
     }
 
     #[test]
-    fn push_constants_are_four_words_in_the_order_they_are_written() {
-        // What the renderer pushes: four words, the last one the draw's "enabled".
-        let pushed = terrain_push(1, 2, 3);
-        assert_eq!(pushed.len(), 16);
-        assert!(pushed.len() <= ruthenium_gpu::PUSH_CONSTANT_BYTES as usize);
-        let vert = interface(shaders::TERRAIN_VERT.words());
-        assert_eq!(vert.push_constants.len(), 1);
-        // The vertex stage reads all four.
+    fn push_constants_are_where_they_are_written() {
+        use crate::sky as s;
+        use crate::terrain::world as w;
+        let words = |n: u32| -> Vec<(Type, u32)> { (0..n).map(|i| (Type::Uint, i * 4)).collect() };
+        // What the renderer pushes for terrain: four words for the vertex stage, then
+        // what every fragment reads.
+        assert!(w::TERRAIN_PUSH_BYTES <= ruthenium_gpu::PUSH_CONSTANT_BYTES as usize);
+        let mut terrain = words(4);
+        terrain.extend([
+            (vec(4), w::PUSH_FOG_COLOUR as u32),
+            (vec(2), w::PUSH_FOG_ENVIRONMENTAL as u32),
+            (vec(2), w::PUSH_FOG_RENDER_DISTANCE as u32),
+            (vec(2), w::PUSH_ATLAS_TEXEL as u32),
+            (Type::Uint, w::PUSH_ATLAS as u32),
+        ]);
+        assert_eq!(terrain[3].1 as usize, w::PUSH_ENABLED);
         assert_eq!(
-            vert.push_constants[0].ty,
-            Type::Struct(vec![
-                (Type::Uint, Some(0)),
-                (Type::Uint, Some(4)),
-                (Type::Uint, Some(8)),
-                (Type::Uint, Some(12)),
-            ])
+            terrain.last().unwrap().1 as usize + 4,
+            w::TERRAIN_PUSH_BYTES
         );
-        // A fragment stage declares the same block; what it keeps of it after
-        // optimisation is words at offsets the renderer writes.
-        for frag in [&shaders::TERRAIN_FRAG, &shaders::TERRAIN_CUTOUT_FRAG] {
-            let frag = interface(frag.words());
-            assert_eq!(frag.push_constants.len(), 1);
-            let Type::Struct(members) = &frag.push_constants[0].ty else {
-                panic!("the push constants are a block");
-            };
-            assert!(!members.is_empty());
-            for (ty, offset) in members {
-                assert_eq!(*ty, Type::Uint);
-                assert!(matches!(offset, Some(0 | 4 | 8 | 12)), "{offset:?}");
-            }
+        for (vertex, fragment) in terrain_stages() {
+            // The vertex stage reads the four words, and declares no more.
+            assert_eq!(pushed(vertex), words(4), "{}", vertex.name);
+            // A fragment stage declares the whole block: every member where the
+            // renderer writes it.
+            assert_eq!(pushed(fragment), terrain, "{}", fragment.name);
         }
+        // For the sky: the record's offset and "enabled", then the fragments' values.
+        assert!(s::SKY_PUSH_BYTES <= ruthenium_gpu::PUSH_CONSTANT_BYTES as usize);
+        let mut sky = words(2);
+        sky.extend([
+            (Type::Uint, s::PUSH_KIND as u32),
+            (Type::Uint, s::PUSH_TEXTURE as u32),
+            (vec(4), s::PUSH_COLOUR as u32),
+            (vec(4), s::PUSH_FOG_COLOUR as u32),
+            (Type::Float, s::PUSH_FOG_END as u32),
+            (Type::Uint, s::PUSH_SAMPLER as u32),
+        ]);
+        assert_eq!(sky.last().unwrap().1 as usize + 4, s::SKY_PUSH_BYTES);
+        assert_eq!(pushed(&shaders::SKY_VERT), words(2));
+        assert_eq!(pushed(&shaders::SKY_FRAG), sky);
     }
 
     #[test]
@@ -302,11 +381,17 @@ mod tests {
             Type::RuntimeArray(Box::new(Type::Uint), Some(4)),
             Some(0),
         )]);
-        for shader in [
-            &shaders::TERRAIN_VERT,
-            &shaders::TERRAIN_FRAG,
-            &shaders::TERRAIN_CUTOUT_FRAG,
-        ] {
+        let samplers = Type::Array(Box::new(Type::Sampler), ruthenium_gpu::SAMPLER_COUNT);
+        let textures = Type::RuntimeArray(Box::new(Type::Image), None);
+        let mut vertex_stages = vec![&shaders::SKY_VERT];
+        let mut fragment_stages = vec![&shaders::SKY_FRAG];
+        for (vertex, fragment) in terrain_stages() {
+            vertex_stages.push(vertex);
+            fragment_stages.push(fragment);
+        }
+        for shader in vertex_stages {
+            // A vertex stage reads the frame's data: its section, the camera, its
+            // draw's record.
             let i = interface(shader.words());
             assert_eq!(
                 i.resource(FRAME_DATA_SET, FRAME_DATA_BINDING),
@@ -314,24 +399,33 @@ mod tests {
                 "{}",
                 shader.name
             );
-            // The texture table: samplers at binding 0, textures at binding 1 of set 0.
+            // The terrain's also samples the light map: samplers at binding 0,
+            // textures at binding 1 of set 0. Nothing else is bound.
+            let samples = shader.name != shaders::SKY_VERT.name;
+            if samples {
+                assert_eq!(i.resource(0, 0), Some(&samplers), "{}", shader.name);
+                assert_eq!(i.resource(0, 1), Some(&textures), "{}", shader.name);
+            }
             assert_eq!(
-                i.resource(0, 0),
-                Some(&Type::Array(
-                    Box::new(Type::Sampler),
-                    ruthenium_gpu::SAMPLER_COUNT
-                )),
+                i.resources.len(),
+                if samples { 3 } else { 1 },
                 "{}",
                 shader.name
             );
+        }
+        for shader in fragment_stages {
+            // A fragment stage reads nothing of the frame's data: what its fragments
+            // share is pushed. The texture table is all it has bound.
+            let i = interface(shader.words());
             assert_eq!(
-                i.resource(0, 1),
-                Some(&Type::RuntimeArray(Box::new(Type::Image), None)),
+                i.resource(FRAME_DATA_SET, FRAME_DATA_BINDING),
+                None,
                 "{}",
                 shader.name
             );
-            // Nothing else is bound.
-            assert_eq!(i.resources.len(), 3, "{}", shader.name);
+            assert_eq!(i.resource(0, 0), Some(&samplers), "{}", shader.name);
+            assert_eq!(i.resource(0, 1), Some(&textures), "{}", shader.name);
+            assert_eq!(i.resources.len(), 2, "{}", shader.name);
         }
     }
 

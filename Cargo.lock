@@ -2267,6 +2267,7 @@ dependencies = [
  "ruthenium-assets",
  "ruthenium-data",
  "ruthenium-gpu",
+ "ruthenium-javamath",
  "ruthenium-platform",
  "ruthenium-prepare",
  "ruthenium-protocol",

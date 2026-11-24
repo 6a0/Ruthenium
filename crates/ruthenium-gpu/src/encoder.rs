@@ -464,6 +464,40 @@ impl Pass<'_> {
         }
     }
 
+    /// Draws `vertices` vertices from `first` of the bound vertex buffer, in order, with
+    /// pipeline `pipeline` and `push` as its push constants.
+    ///
+    /// # Safety
+    /// As [`Self::draw`]; a vertex buffer is bound, and every vertex the draw reads lies
+    /// inside what was written to it.
+    ///
+    /// # Panics
+    /// As [`Self::draw`]; or if `pipeline` reads no vertex buffer.
+    pub unsafe fn draw_vertices(
+        &mut self,
+        pipeline: usize,
+        push: &[u8],
+        first: u32,
+        vertices: u32,
+    ) {
+        assert!(
+            push.len() <= PUSH_CONSTANT_BYTES as usize && push.len().is_multiple_of(4),
+            "{} bytes of push constants",
+            push.len()
+        );
+        assert!(
+            self.pipelines.has_vertex_input(pipeline),
+            "pipeline {pipeline} reads no vertex buffer: draw"
+        );
+        // SAFETY: as in `draw`; the caller guarantees the vertices.
+        unsafe {
+            self.bind(pipeline, push);
+            self.gpu
+                .device
+                .cmd_draw(self.ctx.cmd, vertices, 1, first, 0);
+        }
+    }
+
     /// Binds `pipeline` if it is not bound and sets `push` if there is any.
     ///
     /// # Safety

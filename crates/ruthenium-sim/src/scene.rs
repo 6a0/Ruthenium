@@ -152,6 +152,9 @@ pub struct Dims {
     /// The level's hashed seed, which jitters the borders between biomes
     /// (`BiomeManager`).
     pub biome_seed: i64,
+    /// A flat world, as the server says: where the horizon is and how soon the void
+    /// darkens depend on it.
+    pub flat: bool,
 }
 
 impl Dims {
@@ -161,6 +164,7 @@ impl Dims {
             sections: level.height() >> 4,
             has_skylight: level.has_skylight(),
             biome_seed: level.biomes.seed,
+            flat: level.flat,
         }
     }
 }
@@ -178,6 +182,17 @@ impl Terrain {
     /// Which level this is: a new number for every level the session enters.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The biome id of a 4 x 4 x 4 cell (its coordinates are blocks divided by four,
+    /// before the client's jitter of cell borders), its y clamped into the level;
+    /// `None` where no chunk is published.
+    pub fn biome_cell(&self, cell: [i32; 3]) -> Option<u16> {
+        let c = self.column(cell[0] >> 2, cell[2] >> 2)?;
+        let cells = (self.dims.sections << 2).max(1);
+        let y = (cell[1] - (self.dims.min_section << 2)).clamp(0, cells - 1);
+        let s = c.sections().get((y >> 2) as usize)?;
+        Some(s.biomes.get(cell[0] & 3, y & 3, cell[2] & 3))
     }
 
     pub fn dims(&self) -> Dims {

@@ -23,6 +23,16 @@
 //!   records from three places in the frame's data, which move from frame to frame; and
 //!   the sections' origins and the camera's offset change together so that the picture
 //!   must stay the same.
+//! - **Fade**: a fourth section, a quarter faded in, far behind the others: its quads
+//!   are all there within 16 blocks of the camera and go towards the fog's colour
+//!   beyond, with their texels' alpha kept.
+//! - **Fog and filtering**: every frame draws the scene with the next of the terrain's
+//!   shaders and, every fourth frame, the next of a few fogs: none, the fog of the
+//!   place, the fog at the edge of the view, both, and a fog that is half there. What
+//!   comes back is compared pixel by pixel with the scene as a small rasteriser here
+//!   draws it from the same vertices, by the shaders' own arithmetic. The scene's
+//!   texels are larger than its pixels, where every filter must give the same bytes;
+//!   one quad shows four texels a pixel of an evenly coloured stretch of the atlas.
 
 use std::sync::Arc;
 
@@ -33,11 +43,12 @@ use ruthenium_gpu::{
 };
 use ruthenium_shaders::interface::{SECTION, WORLD, WORLD_MATRIX};
 
-use crate::pipelines::PipelineId;
+use crate::atmosphere::Fog;
+use crate::terrain::TerrainShader;
 use crate::terrain::world::{
     SECTION_BYTES, draw_command, quad_indices, terrain_push, write_section,
 };
-use crate::terrain_vertex::{VERTEX_BYTES, Vertex, position_code, uv_code};
+use crate::terrain_vertex::{VERTEX_BYTES, Vertex, position_code, position_of, uv_code};
 
 /// Pixels per block, and the scene's size in blocks.
 const SCALE: u32 = 8;
@@ -74,14 +85,107 @@ const TURNED: [Rgba; 4] = [
 const EDGE: Rgba = [17, 34, 51, 255];
 const BEFORE_EDGE: Rgba = [1, 2, 3, 255];
 const AT_EDGE: Rgba = [250, 240, 230, 255];
+/// An even stretch of the atlas, for the quad that shows four of its texels a pixel:
+/// its colour, where it starts and how many texels it is wide; it fills rows 4 to 6.
+const EVEN: Rgba = [30, 144, 222, 255];
+const EVEN_AT: u32 = 96;
+const EVEN_WIDTH: u32 = 48;
 
-/// Where each texel a quad shows is in the atlas.
+/// Where each section's corner is, in blocks from the scene's corner, and how far each
+/// has faded in. The fourth is 12 blocks behind the others.
+const ORIGINS: [[i32; 3]; 4] = [[0, 0, 0], [-12, 0, 0], [4, 0, 0], [0, 0, -12]];
+const VISIBILITY: [f32; 4] = [1.0, 1.0, 1.0, 0.25];
+
+/// The fogs the scene is drawn in, in turn. Their ranges lie inside the scene's own
+/// distances (at most 21 blocks from its corner, where the camera is).
+const FOGS: [Fog; 5] = [
+    // None, in a colour no pixel may show but the fading section's.
+    Fog {
+        colour: [1.0, 0.0, 1.0, 1.0],
+        environmental: [f32::MAX; 2],
+        render_distance: [f32::MAX; 2],
+        sky_end: f32::MAX,
+    },
+    // The fog of the place alone, by the distance in a straight line.
+    Fog {
+        colour: [0.2, 0.6, 1.0, 1.0],
+        environmental: [3.0, 19.0],
+        render_distance: [f32::MAX; 2],
+        sky_end: f32::MAX,
+    },
+    // The fog at the edge of the view alone, sideways or in height.
+    Fog {
+        colour: [0.9, 0.5, 0.1, 1.0],
+        environmental: [f32::MAX; 2],
+        render_distance: [2.0, 14.0],
+        sky_end: f32::MAX,
+    },
+    // Both: the stronger counts, here one and there the other.
+    Fog {
+        colour: [0.2, 0.6, 1.0, 1.0],
+        environmental: [0.0, 24.0],
+        render_distance: [6.0, 12.5],
+        sky_end: f32::MAX,
+    },
+    // A fog whose colour is half there.
+    Fog {
+        colour: [1.0, 1.0, 1.0, 0.5],
+        environmental: [3.0, 19.0],
+        render_distance: [f32::MAX; 2],
+        sky_end: f32::MAX,
+    },
+];
+
+/// How a frame draws the scene: with which shader and in which fog.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Case {
+    shader: TerrainShader,
+    fog: usize,
+}
+
+impl Case {
+    /// The frame's: every shader in turn, and the next fog once all have drawn in one.
+    fn of(frame: u64) -> Case {
+        let shaders = TerrainShader::ALL;
+        Case {
+            shader: shaders[(frame % shaders.len() as u64) as usize],
+            fog: ((frame / shaders.len() as u64) % FOGS.len() as u64) as usize,
+        }
+    }
+
+    /// Whether the shader fogs and fades at all.
+    fn fogged(self) -> bool {
+        self.shader != TerrainShader::Plain
+    }
+
+    /// Whether the shader averages far texels. In this atlas, 512 times as wide as it
+    /// is high, every texel is far by vanilla's rule: all of the scene is averaged.
+    fn rgss(self) -> bool {
+        matches!(
+            self.shader,
+            TerrainShader::Rgss | TerrainShader::RgssReference
+        )
+    }
+
+    /// Where the case's picture is kept among the pictures there can be: one for each
+    /// fog with hard texels and one with averaged ones, and one without fog.
+    fn picture(self) -> usize {
+        match (self.fogged(), self.rgss()) {
+            (false, _) => 2 * FOGS.len(),
+            (true, rgss) => self.fog + if rgss { FOGS.len() } else { 0 },
+        }
+    }
+}
+
+/// Where each texel a quad shows is in the atlas. The two texels around half opaque
+/// are not side by side: averaged, their border would be a hole or not by the last bit
+/// of a GPU's arithmetic.
 const TEXELS: [([u32; 2], Rgba); 20] = [
     ([0, 0], WHITE),
     ([1, 0], GREY),
     ([2, 0], SOLID),
+    ([3, 0], HALF),
     ([5, 0], BELOW_HALF),
-    ([6, 0], HALF),
     ([7, 0], NEAR),
     ([8, 0], FAR),
     ([9, 0], LEFT_SECTION),
@@ -111,24 +215,28 @@ fn light_texel(block: u32, sky: u32) -> Rgba {
     ]
 }
 
-/// A rectangle of pixels and what every one of them must read, within `tolerance`
-/// steps per channel.
+/// A rectangle of pixels and what every one of them must read without fog, within
+/// `tolerance` steps per channel.
 #[derive(Debug, Clone, Copy)]
 struct Probe {
     what: &'static str,
     /// `[x0, y0, x1, y1]` in pixels, the far corner excluded.
     rect: [u32; 4],
-    want: Rgba,
+    /// `None`: not one colour (a quad that fades): judged by the rasteriser's picture
+    /// alone. (The check itself judges every probe by that picture; the tests hold the
+    /// picture to these colours.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    want: Option<Rgba>,
     tolerance: u8,
 }
 
 /// The scene: vertices by draw, and what it must look like.
 #[derive(Debug, Default)]
 struct Scene {
-    /// Solid quads of the three sections, then the cutout quads (of the first).
+    /// Solid quads of the four sections, then the cutout quads (of the first).
     vertices: Vec<u8>,
-    /// Quads of each of the four draws.
-    quads: [u32; 4],
+    /// Quads of each of the five draws.
+    quads: [u32; 5],
     probes: Vec<Probe>,
 }
 
@@ -207,14 +315,14 @@ fn times(a: Rgba, b: Rgba) -> Rgba {
 impl Scene {
     fn build() -> Scene {
         let mut scene = Scene::default();
-        let mut solid: [Vec<Quad>; 3] = Default::default();
+        let mut solid: [Vec<Quad>; 4] = Default::default();
         let mut cutout: Vec<Quad> = Vec::new();
         let mut probes = Vec::new();
         let mut probe = |what, rect: [f32; 4], want: Rgba, tolerance: u8| {
             probes.push(Probe {
                 what,
                 rect: pixels(rect),
-                want,
+                want: Some(want),
                 tolerance,
             });
         };
@@ -268,7 +376,7 @@ impl Scene {
         // Cutout: less than half opaque is a hole, half opaque is not.
         cutout.push(Quad::texel(cell(8, 7), [5, 0]));
         probe("a texel under half opaque", cell(8, 7), CLEAR, 0);
-        cutout.push(Quad::texel(cell(9, 7), [6, 0]));
+        cutout.push(Quad::texel(cell(9, 7), [3, 0]));
         probe("a half opaque texel", cell(9, 7), HALF, 0);
 
         // Winding: seen from behind, nothing; and a quad in its block's top left.
@@ -358,8 +466,51 @@ impl Scene {
         probe("beside them", [0.0, 2.0, 3.5, 3.0], CLEAR, 0);
         probe("beside them", [4.5, 2.0, 12.0, 3.0], CLEAR, 0);
 
+        // Four texels a pixel along the atlas, of an even stretch of it: whatever is
+        // sampled there, and however often, is its colour.
+        solid[0].push(Quad {
+            uv: [(EVEN_AT + 8) as f32, 5.0, (EVEN_AT + 40) as f32, 6.0],
+            ..Quad::texel(cell(0, 1), [EVEN_AT, 5])
+        });
+        probe("four texels a pixel", cell(0, 1), EVEN, 1);
+
+        // Fade: the fourth section's quads, 15.5 blocks behind the scene's corner. Up
+        // to 16 blocks from the camera they are as they are; beyond, they go towards
+        // the fog's colour. A half opaque texel keeps its alpha.
+        for (x, at) in [(0, [2, 0]), (5, [2, 0]), (8, [3, 0]), (11, [2, 0])] {
+            solid[3].push(Quad {
+                z: -3.5,
+                ..Quad::texel(cell(x, 0), at)
+            });
+        }
+        probe(
+            "a fading section's quad near the camera",
+            cell(0, 0),
+            SOLID,
+            0,
+        );
+        for x in [5, 8, 11] {
+            probes.push(Probe {
+                what: "a fading section's quad",
+                rect: pixels(cell(x, 0)),
+                want: None,
+                tolerance: 1,
+            });
+        }
+        let mut probe = |what, rect: [f32; 4], want: Rgba, tolerance: u8| {
+            probes.push(Probe {
+                what,
+                rect: pixels(rect),
+                want: Some(want),
+                tolerance,
+            });
+        };
+
         // Nothing else is drawn.
-        probe("the empty rows", [0.0, 0.0, 12.0, 2.0], CLEAR, 0);
+        probe("between the fading quads", [1.0, 0.0, 5.0, 1.0], CLEAR, 0);
+        probe("between the fading quads", [6.0, 0.0, 8.0, 1.0], CLEAR, 0);
+        probe("between the fading quads", [9.0, 0.0, 11.0, 1.0], CLEAR, 0);
+        probe("the empty row", [1.0, 1.0, 12.0, 2.0], CLEAR, 0);
         probe("the empty row", [0.0, 4.0, 12.0, 5.0], CLEAR, 0);
         probe("right of the border quads", [8.0, 3.0, 12.0, 4.0], CLEAR, 0);
         probe("right of the cutout quad", [8.0, 6.0, 12.0, 7.0], CLEAR, 0);
@@ -402,6 +553,236 @@ fn matrix() -> [f32; 16] {
     ]
 }
 
+/// The fixture's atlas: every texel a quad shows, the even stretch, and poison.
+fn atlas_texels() -> Vec<Rgba> {
+    let mut texels = vec![POISON; (ATLAS[0] * ATLAS[1]) as usize];
+    for y in 4..7 {
+        for x in EVEN_AT..EVEN_AT + EVEN_WIDTH {
+            texels[(y * ATLAS[0] + x) as usize] = EVEN;
+        }
+    }
+    for (at, colour) in TEXELS {
+        texels[(at[1] * ATLAS[0] + at[0]) as usize] = colour;
+    }
+    texels
+}
+
+/// The light map's colour for a vertex's two lights, as the vertex stage looks it up:
+/// sixteenths of a level, blended between the texels' centres.
+fn lit(light: [u8; 2]) -> [f32; 4] {
+    let at =
+        |l: u8| (f32::from(l) / 256.0 + 0.5 / 16.0).clamp(0.5 / 16.0, 15.5 / 16.0) * 16.0 - 0.5;
+    let (block, sky) = (at(light[0]), at(light[1]));
+    let (b, s) = (block.floor(), sky.floor());
+    let (fb, fs) = (block - b, sky - s);
+    let texel = |db: u32, ds: u32| {
+        light_texel((b as u32 + db).min(15), (s as u32 + ds).min(15)).map(|c| f32::from(c) / 255.0)
+    };
+    let (t00, t10, t01, t11) = (texel(0, 0), texel(1, 0), texel(0, 1), texel(1, 1));
+    std::array::from_fn(|i| {
+        (t00[i] * (1.0 - fb) + t10[i] * fb) * (1.0 - fs) + (t01[i] * (1.0 - fb) + t11[i] * fb) * fs
+    })
+}
+
+/// The atlas read between its texels' centres at `at` (in texels), as the linear
+/// sampler reads its one level: nothing beyond the edges but the edge.
+fn bilinear(texels: &[Rgba], at: [f32; 2]) -> [f32; 4] {
+    let (x, y) = (at[0] - 0.5, at[1] - 0.5);
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let texel = |dx: f32, dy: f32| {
+        let tx = (x0 + dx).clamp(0.0, (ATLAS[0] - 1) as f32) as u32;
+        let ty = (y0 + dy).clamp(0.0, (ATLAS[1] - 1) as f32) as u32;
+        texels[(ty * ATLAS[0] + tx) as usize].map(|c| f32::from(c) / 255.0)
+    };
+    let (t00, t10, t01, t11) = (
+        texel(0.0, 0.0),
+        texel(1.0, 0.0),
+        texel(0.0, 1.0),
+        texel(1.0, 1.0),
+    );
+    std::array::from_fn(|i| {
+        (t00[i] * (1.0 - fx) + t10[i] * fx) * (1.0 - fy) + (t01[i] * (1.0 - fx) + t11[i] * fx) * fy
+    })
+}
+
+/// The atlas's colour at `at` (in texels) as `terrain_frag.glsl` samples it. `du` and
+/// `dv` are how far the place moves, in texels, from one pixel to the next across and
+/// down the screen. `rgss`: with far texels averaged.
+fn sampled(texels: &[Rgba], at: [f32; 2], du: [f32; 2], dv: [f32; 2], rgss: bool) -> [f32; 4] {
+    let size = [ATLAS[0] as f32, ATLAS[1] as f32];
+    // The shader works in coordinates from 0 to 1 across the whole atlas: a texel is
+    // not as wide there as it is high, in this atlas.
+    let texel = [1.0 / size[0], 1.0 / size[1]];
+    let (du, dv): ([f32; 2], [f32; 2]) = (
+        std::array::from_fn(|i| du[i] * texel[i]),
+        std::array::from_fn(|i| dv[i] * texel[i]),
+    );
+    let pixel: [f32; 2] = std::array::from_fn(|i| (du[i] * du[i] + dv[i] * dv[i]).sqrt());
+    // Hard edges: a texel's centre, but for a band one pixel wide between two texels.
+    let snapped: [f32; 2] = std::array::from_fn(|i| {
+        let border = at[i].round() - 0.5;
+        let along = ((at[i] - border - 0.5) * texel[i] / pixel[i] + 0.5).clamp(0.0, 1.0);
+        border + along
+    });
+    let nearest = bilinear(texels, snapped);
+    if !rgss {
+        return nearest;
+    }
+    let texel_size = texel[0].min(texel[1]);
+    let edge = ((pixel[0].max(pixel[1]) - texel_size) / texel_size).clamp(0.0, 1.0);
+    let blend = edge * edge * (3.0 - 2.0 * edge);
+    // Four samples a pixel. (The fixture's atlas has one level, so the two levels the
+    // shader reads them at are the same.)
+    let offsets = [
+        [0.125, 0.375],
+        [-0.125, -0.375],
+        [0.375, -0.125],
+        [-0.375, 0.125],
+    ];
+    let mut far = [0.0_f32; 4];
+    for o in offsets {
+        let tap = bilinear(texels, [at[0] + o[0], at[1] + o[1]]);
+        for (sum, c) in far.iter_mut().zip(tap) {
+            *sum += c;
+        }
+    }
+    std::array::from_fn(|i| nearest[i] * (1.0 - blend) + far[i] * 0.25 * blend)
+}
+
+/// How much fog there is at a distance, as `terrain_frag.glsl` works it out.
+fn fog_amount(distance: f32, range: [f32; 2]) -> f32 {
+    if distance <= range[0] {
+        0.0
+    } else if distance >= range[1] {
+        1.0
+    } else {
+        (distance - range[0]) / (range[1] - range[0])
+    }
+}
+
+/// The scene as a small rasteriser draws it from the packed vertices, by the terrain
+/// shaders' arithmetic: the lit colour, the two fog distances and the fade worked out
+/// at each corner and carried across each of a quad's two triangles; the atlas's
+/// colour as the case's shader filters it, times the lit colour; the fade towards the
+/// fog's colour; the cutout layer's holes; the fog. What a frame of `case` must read,
+/// pixel for pixel.
+fn picture(scene: &Scene, case: Case) -> Vec<u8> {
+    let fog = &FOGS[case.fog];
+    let fogged = case.fogged();
+    let rgss = case.rgss();
+    let texels = atlas_texels();
+    let mut colour = vec![CLEAR; (WIDTH * HEIGHT) as usize];
+    let mut depth = vec![0.0_f32; (WIDTH * HEIGHT) as usize];
+    let quads: Vec<[Vertex; 4]> = scene
+        .vertices
+        .as_chunks::<VERTEX_BYTES>()
+        .0
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|q| q.map(|v| Vertex::unpack(&v)))
+        .collect();
+    let mut next = 0;
+    for (draw, &count) in scene.quads.iter().enumerate() {
+        // The last draw is the first section's cutout layer.
+        let section = if draw < ORIGINS.len() { draw } else { 0 };
+        let cutout = draw == ORIGINS.len();
+        let origin = ORIGINS[section].map(|c| c as f32);
+        for q in &quads[next..next + count as usize] {
+            let p: [[f32; 3]; 4] = q.map(|v| {
+                let local = v.position.map(position_of);
+                std::array::from_fn(|i| local[i] + origin[i])
+            });
+            // Counter-clockwise with y up: the area is positive.
+            let area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1])
+                - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]);
+            if area <= 0.0 {
+                continue;
+            }
+            let (left, right) = (p[0][0].min(p[2][0]), p[0][0].max(p[2][0]));
+            let (bottom, top) = (p[0][1].min(p[2][1]), p[0][1].max(p[2][1]));
+            let z = 0.5 + p[0][2] / 32.0;
+            // What the vertex stage hands on from each corner.
+            let spherical = p.map(|c| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt());
+            let cylindrical = p.map(|c| (c[0] * c[0] + c[2] * c[2]).sqrt().max(c[1].abs()));
+            let fade = spherical.map(|d| {
+                let beyond = ((d - 16.0) / 16.0).clamp(0.0, 1.0);
+                (1.0 - beyond) + VISIBILITY[section] * beyond
+            });
+            let light = lit([q[0].block_light, q[0].sky_light]);
+            let lit_colour: [f32; 4] =
+                std::array::from_fn(|i| f32::from(q[0].colour[i]) / 255.0 * light[i]);
+            // The texture coordinates in texels at corner 0, and how they change along
+            // the quad's two sides and from one pixel to the next.
+            let corner_uv = |i: usize| q[i].uv.map(|c| f32::from(c) / 8.0);
+            let (uv0, uv1, uv3) = (corner_uv(0), corner_uv(1), corner_uv(3));
+            let s_step = 1.0 / SCALE as f32 / (p[2][0] - p[0][0]);
+            let t_step = -1.0 / SCALE as f32 / (p[2][1] - p[0][1]);
+            let du: [f32; 2] = std::array::from_fn(|a| (uv3[a] - uv0[a]) * s_step);
+            let dv: [f32; 2] = std::array::from_fn(|a| (uv1[a] - uv0[a]) * t_step);
+            for py in 0..HEIGHT {
+                for px in 0..WIDTH {
+                    let (wx, wy) = (
+                        (px as f32 + 0.5) / SCALE as f32,
+                        BLOCKS[1] as f32 - (py as f32 + 0.5) / SCALE as f32,
+                    );
+                    if wx < left || wx >= right || wy < bottom || wy >= top {
+                        continue;
+                    }
+                    // Where in the quad: corner 0 is (0, 0), corners 0 and 1 share
+                    // s = 0, corners 0 and 3 share t = 0.
+                    let (s, t) = (
+                        (wx - p[0][0]) / (p[2][0] - p[0][0]),
+                        (wy - p[0][1]) / (p[2][1] - p[0][1]),
+                    );
+                    // A corner's value at the pixel, in the triangle the pixel is in:
+                    // corners 0, 1, 2 or corners 2, 3, 0.
+                    let across = |c: [f32; 4]| {
+                        if s <= t {
+                            c[0] + (c[1] - c[0]) * t + (c[2] - c[1]) * s
+                        } else {
+                            c[0] + (c[3] - c[0]) * s + (c[2] - c[3]) * t
+                        }
+                    };
+                    let uv: [f32; 2] = std::array::from_fn(|a| {
+                        uv0[a] + (uv3[a] - uv0[a]) * s + (uv1[a] - uv0[a]) * t
+                    });
+                    let texel = sampled(&texels, uv, du, dv, rgss);
+                    let mut c: [f32; 4] = std::array::from_fn(|i| texel[i] * lit_colour[i]);
+                    if fogged {
+                        // Towards the fog's colour, with the texel's own alpha.
+                        let f = across(fade);
+                        let alpha = c[3];
+                        for (i, v) in c.iter_mut().enumerate() {
+                            let from = fog.colour[i] * if i == 3 { alpha } else { 1.0 };
+                            *v = from * (1.0 - f) + *v * f;
+                        }
+                    }
+                    if cutout && c[3] < 0.5 {
+                        continue;
+                    }
+                    if fogged {
+                        let amount = fog_amount(across(spherical), fog.environmental)
+                            .max(fog_amount(across(cylindrical), fog.render_distance))
+                            * fog.colour[3];
+                        for (v, f) in c.iter_mut().zip(fog.colour).take(3) {
+                            *v = *v * (1.0 - amount) + f * amount;
+                        }
+                    }
+                    let i = (py * WIDTH + px) as usize;
+                    if z >= depth[i] {
+                        depth[i] = z;
+                        colour[i] = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                    }
+                }
+            }
+        }
+        next += count as usize;
+    }
+    colour.into_iter().flatten().collect()
+}
+
 /// What the check has seen so far.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TerrainCheckReport {
@@ -433,6 +814,8 @@ pub(crate) struct TerrainCheck {
     uploads: [Option<UploadTicket>; 2],
     atlas: TextureId,
     lightmap: TextureId,
+    /// What each kind of frame must read ([`Case::picture`]), once one was drawn.
+    pictures: Vec<Option<Vec<u8>>>,
     report: TerrainCheckReport,
 }
 
@@ -475,14 +858,7 @@ impl TerrainCheck {
         alloc(&mut pool, 3 * VERTEX_BYTES)?;
         let vertices = alloc(&mut pool, scene.vertices.len())?;
         let indices = alloc(&mut pool, quad_indices().len())?;
-        let mut texels = vec![0u8; (ATLAS[0] * ATLAS[1] * 4) as usize];
-        for t in texels.as_chunks_mut::<4>().0 {
-            *t = POISON;
-        }
-        for (at, colour) in TEXELS {
-            let i = ((at[1] * ATLAS[0] + at[0]) * 4) as usize;
-            texels[i..i + 4].copy_from_slice(&colour);
-        }
+        let texels: Vec<u8> = atlas_texels().into_iter().flatten().collect();
         let atlas = textures.create_with(
             uploads,
             TextureDesc::rgba8(ATLAS[0], ATLAS[1]),
@@ -513,6 +889,7 @@ impl TerrainCheck {
             uploads: [None; 2],
             atlas,
             lightmap,
+            pictures: vec![None; 2 * FOGS.len() + 1],
             report,
         })
     }
@@ -559,7 +936,18 @@ impl TerrainCheck {
         indirect: bool,
     ) -> Result<(), Error> {
         if let Some((drawn, pixels)) = self.target.take(completed) {
-            let ok = compare(&self.scene.probes, drawn, pixels, self.report.mismatches);
+            let case = Case::of(drawn);
+            let scene = &self.scene;
+            let expected =
+                self.pictures[case.picture()].get_or_insert_with(|| picture(scene, case));
+            let ok = compare(
+                &self.scene.probes,
+                expected,
+                case,
+                drawn,
+                pixels,
+                self.report.mismatches,
+            );
             self.report.compared += 1;
             self.report.mismatches += u64::from(!ok);
         }
@@ -601,11 +989,6 @@ impl TerrainCheck {
         word(bytes, camera, (-shift as f32).to_ne_bytes());
         word(bytes, camera + 1, 0f32.to_ne_bytes());
         word(bytes, camera + 2, 0f32.to_ne_bytes());
-        word(
-            bytes,
-            WORLD.offset("atlas"),
-            self.atlas.index().to_ne_bytes(),
-        );
         let size = WORLD.offset("atlas_size");
         word(bytes, size, (ATLAS[0] as f32).to_ne_bytes());
         word(bytes, size + 1, (ATLAS[1] as f32).to_ne_bytes());
@@ -614,6 +997,10 @@ impl TerrainCheck {
             WORLD.offset("lightmap"),
             self.lightmap.index().to_ne_bytes(),
         );
+        // The frame's fog and shader: the fog goes with the push constants.
+        let case = Case::of(frame);
+        let fog = &FOGS[case.fog];
+        let [solid, with_holes] = case.shader.pipelines();
         if !gap(frame_data, 4) {
             return Ok(());
         }
@@ -626,26 +1013,38 @@ impl TerrainCheck {
         if !gap(frame_data, 7) {
             return Ok(());
         }
-        let Some((sections, bytes)) = frame_data.alloc(3 * SECTION.words(), 4) else {
+        let Some((sections, bytes)) = frame_data.alloc(ORIGINS.len() as u32 * SECTION.words(), 4)
+        else {
             return Ok(());
         };
-        for (record, origin) in bytes
+        for (record, (origin, visibility)) in bytes
             .as_chunks_mut::<SECTION_BYTES>()
             .0
             .iter_mut()
-            .zip([0, -12, 4])
+            .zip(ORIGINS.into_iter().zip(VISIBILITY))
         {
-            write_section(record, [origin + shift, 0, 0], 1.0);
+            write_section(
+                record,
+                [origin[0] + shift, origin[1], origin[2]],
+                visibility,
+            );
         }
-        let push = terrain_push(world, matrix_at, sections);
+        let push = terrain_push(
+            world,
+            matrix_at,
+            sections,
+            fog,
+            self.atlas,
+            [ATLAS[0] as f32, ATLAS[1] as f32],
+        );
         let first = (vertices.offset / VERTEX_BYTES as u64) as u32;
         // The scene's draws: pipeline, instance, quads and first quad.
         let mut draws = Vec::with_capacity(self.scene.quads.len());
         let mut quad = 0;
         for (i, &quads) in self.scene.quads.iter().enumerate() {
             let (pipeline, instance) = match i {
-                3 => (PipelineId::TerrainCutout, 0),
-                section => (PipelineId::TerrainSolid, section as u32),
+                4 => (with_holes, 0),
+                section => (solid, section as u32),
             };
             if quads > 0 {
                 draws.push((pipeline, instance, quads, quad));
@@ -656,7 +1055,7 @@ impl TerrainCheck {
         // after a gap that changes like the records'.
         let mut calls = Vec::new();
         if indirect {
-            for pipeline in [PipelineId::TerrainSolid, PipelineId::TerrainCutout] {
+            for pipeline in [solid, with_holes] {
                 let commands: Vec<u8> = draws
                     .iter()
                     .filter(|d| d.0 == pipeline)
@@ -724,32 +1123,47 @@ impl TerrainCheck {
     }
 }
 
-/// Judges every probe's pixels in an RGBA image of the scene, and says so if one is
-/// wrong (in detail for the first few mismatching frames).
-fn compare(probes: &[Probe], frame: u64, pixels: &[u8], mismatches: u64) -> bool {
-    let at = |x: u32, y: u32| -> Rgba {
+/// Judges every probe's pixels in an RGBA image of the scene drawn as `case` against
+/// `expected`, the rasteriser's picture of that case, and says so if one is wrong (in
+/// detail for the first few mismatching frames). In fog a pixel may be a step further
+/// off than its probe allows, and with averaged texels two: its colour went through
+/// more arithmetic.
+fn compare(
+    probes: &[Probe],
+    expected: &[u8],
+    case: Case,
+    frame: u64,
+    pixels: &[u8],
+    mismatches: u64,
+) -> bool {
+    let at = |image: &[u8], x: u32, y: u32| -> Rgba {
         let i = ((y * WIDTH + x) * 4) as usize;
-        pixels[i..i + 4].try_into().expect("4 bytes")
+        image[i..i + 4].try_into().expect("4 bytes")
     };
+    // Averaged texels are read between their centres, where a GPU's weights are
+    // coarser than the arithmetic here.
+    let slack = u8::from(case.fogged() && case.fog != 0) + if case.rgss() { 2 } else { 0 };
     let mut ok = true;
     for p in probes {
         let [x0, y0, x1, y1] = p.rect;
+        let tolerance = p.tolerance + slack;
         let wrong = (y0..y1)
             .flat_map(|y| (x0..x1).map(move |x| (x, y)))
             .find(|&(x, y)| {
-                at(x, y)
+                at(pixels, x, y)
                     .iter()
-                    .zip(p.want)
-                    .any(|(&got, want)| got.abs_diff(want) > p.tolerance)
+                    .zip(at(expected, x, y))
+                    .any(|(&got, want)| got.abs_diff(want) > tolerance)
             });
         if let Some((x, y)) = wrong {
             if mismatches < PRINTED {
                 eprintln!(
-                    "[terrain-check] frame {frame}, {}: pixel ({x}, {y}) reads {:?}, must be {:?} within {}",
+                    "[terrain-check] frame {frame} ({}, fog {}), {}: pixel ({x}, {y}) reads {:?}, must be {:?} within {tolerance}",
+                    case.shader.name(),
+                    case.fog,
                     p.what,
-                    at(x, y),
-                    p.want,
-                    p.tolerance
+                    at(pixels, x, y),
+                    at(expected, x, y),
                 );
             }
             ok = false;
@@ -762,78 +1176,14 @@ fn compare(probes: &[Probe], frame: u64, pixels: &[u8], mismatches: u64) -> bool
 mod tests {
     use super::*;
 
-    /// The scene as a simple rasteriser draws it from the packed vertices: what the
-    /// probes must agree with if the scene's own description is consistent.
-    fn render(scene: &Scene) -> Vec<u8> {
-        let mut texels = vec![POISON; (ATLAS[0] * ATLAS[1]) as usize];
-        for (at, colour) in TEXELS {
-            texels[(at[1] * ATLAS[0] + at[0]) as usize] = colour;
-        }
-        let mut colour = vec![CLEAR; (WIDTH * HEIGHT) as usize];
-        let mut depth = vec![0.0_f32; (WIDTH * HEIGHT) as usize];
-        let quads: Vec<[Vertex; 4]> = scene
-            .vertices
-            .as_chunks::<VERTEX_BYTES>()
-            .0
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|q| q.map(|v| Vertex::unpack(&v)))
-            .collect();
-        let origins = [0.0_f32, -12.0, 4.0, 0.0];
-        let mut next = 0;
-        for (draw, &count) in scene.quads.iter().enumerate() {
-            for q in &quads[next..next + count as usize] {
-                let p = q.map(|v| v.position.map(crate::terrain_vertex::position_of));
-                let x = |i: usize| p[i][0] + origins[draw];
-                // Counter-clockwise with y up: the area is positive.
-                let area =
-                    (x(1) - x(0)) * (p[2][1] - p[0][1]) - (x(2) - x(0)) * (p[1][1] - p[0][1]);
-                if area <= 0.0 {
-                    continue;
-                }
-                let (left, right) = (x(0).min(x(2)), x(0).max(x(2)));
-                let (bottom, top) = (p[0][1].min(p[2][1]), p[0][1].max(p[2][1]));
-                let z = 0.5 + p[0][2] / 32.0;
-                for py in 0..HEIGHT {
-                    for px in 0..WIDTH {
-                        let (wx, wy) = (
-                            (px as f32 + 0.5) / SCALE as f32,
-                            BLOCKS[1] as f32 - (py as f32 + 0.5) / SCALE as f32,
-                        );
-                        if wx < left || wx >= right || wy < bottom || wy >= top {
-                            continue;
-                        }
-                        // Where in the quad, as weights of its corners 0 to 3.
-                        let (s, t) = (
-                            (wx - x(0)) / (x(2) - x(0)),
-                            (wy - p[0][1]) / (p[2][1] - p[0][1]),
-                        );
-                        let uv: [f32; 2] = std::array::from_fn(|a| {
-                            let c = |i: usize| f32::from(q[i].uv[a]) / 8.0;
-                            // Corners 0 and 1 share s = 0, corners 0 and 3 share t = 0.
-                            c(0) + (c(3) - c(0)) * s + (c(1) - c(0)) * t
-                        });
-                        let texel = texels[(uv[1] as u32 * ATLAS[0] + uv[0] as u32) as usize];
-                        let light = light_texel(
-                            (u32::from(q[0].block_light) / 16).min(15),
-                            (u32::from(q[0].sky_light) / 16).min(15),
-                        );
-                        let out = times(times(texel, q[0].colour), light);
-                        if draw == 3 && out[3] < 128 {
-                            continue;
-                        }
-                        let i = (py * WIDTH + px) as usize;
-                        if z >= depth[i] {
-                            depth[i] = z;
-                            colour[i] = out;
-                        }
-                    }
-                }
-            }
-            next += count as usize;
-        }
-        colour.into_iter().flatten().collect()
+    const HARD: Case = Case {
+        shader: TerrainShader::Nearest,
+        fog: 0,
+    };
+
+    fn pixel(image: &[u8], x: u32, y: u32) -> Rgba {
+        let i = ((y * WIDTH + x) * 4) as usize;
+        image[i..i + 4].try_into().unwrap()
     }
 
     #[test]
@@ -843,22 +1193,24 @@ mod tests {
             scene.quads.iter().sum::<u32>() as usize * 4 * VERTEX_BYTES,
             scene.vertices.len()
         );
-        let mut image = render(&scene);
-        // The light between two levels is the one thing the simple rasteriser does not
-        // blend: it reads the lower texels.
-        let between = scene
-            .probes
-            .iter()
-            .find(|p| p.what == "light between two levels")
-            .unwrap();
-        for y in between.rect[1]..between.rect[3] {
-            for x in between.rect[0]..between.rect[2] {
-                let i = ((y * WIDTH + x) * 4) as usize;
-                assert_eq!(image[i..i + 4], light_texel(7, 12));
-                image[i..i + 4].copy_from_slice(&between.want);
+        // Without fog the rasteriser's picture is the colours the probes name.
+        let image = picture(&scene, HARD);
+        for p in &scene.probes {
+            let Some(want) = p.want else { continue };
+            for y in p.rect[1]..p.rect[3] {
+                for x in p.rect[0]..p.rect[2] {
+                    let got = pixel(&image, x, y);
+                    assert!(
+                        got.iter()
+                            .zip(want)
+                            .all(|(g, w)| g.abs_diff(w) <= p.tolerance),
+                        "{}: ({x}, {y}) is {got:?}, not {want:?}",
+                        p.what
+                    );
+                }
             }
         }
-        assert!(compare(&scene.probes, 0, &image, 0));
+        assert!(compare(&scene.probes, &image, HARD, 0, &image, 0));
         // Every pixel is judged by some probe.
         let mut covered = vec![false; (WIDTH * HEIGHT) as usize];
         for p in &scene.probes {
@@ -874,19 +1226,11 @@ mod tests {
     #[test]
     fn a_wrong_picture_fails() {
         let scene = Scene::build();
-        let good = render(&scene);
+        let good = picture(&scene, HARD);
         let fails = |change: &dyn Fn(&mut Vec<u8>)| {
             let mut image = good.clone();
             change(&mut image);
-            // (The light between two levels is wrong in every simple render: leave it
-            // out of what is compared.)
-            let probes: Vec<Probe> = scene
-                .probes
-                .iter()
-                .copied()
-                .filter(|p| p.what != "light between two levels")
-                .collect();
-            !compare(&probes, 0, &image, PRINTED)
+            !compare(&scene.probes, &good, HARD, 0, &image, PRINTED)
         };
         assert!(!fails(&|_| {}));
         // A grey one step off (an sRGB view would be tens off).
@@ -902,6 +1246,164 @@ mod tests {
             let rows: Vec<Vec<u8>> = i.chunks((WIDTH * 4) as usize).map(<[u8]>::to_vec).collect();
             *i = rows.into_iter().rev().flatten().collect();
         }));
+        // A frame drawn in one fog is not the picture of another, nor of none; and
+        // the shader without fog draws the same whatever the fog.
+        let pictures: Vec<Vec<u8>> = (0..FOGS.len())
+            .map(|fog| picture(&scene, Case { fog, ..HARD }))
+            .collect();
+        for (a, drawn) in pictures.iter().enumerate() {
+            for (b, expected) in pictures.iter().enumerate() {
+                let case = Case { fog: b, ..HARD };
+                assert_eq!(
+                    compare(&scene.probes, expected, case, 0, drawn, PRINTED),
+                    a == b,
+                    "fog {a} judged as fog {b}"
+                );
+            }
+        }
+        let plain = |fog| {
+            picture(
+                &scene,
+                Case {
+                    shader: TerrainShader::Plain,
+                    fog,
+                },
+            )
+        };
+        assert_eq!(plain(0), plain(3));
+        assert_ne!(plain(0), pictures[0]);
+    }
+
+    #[test]
+    fn the_rasteriser_fogs_and_fades_as_the_shaders_do() {
+        let scene = Scene::build();
+        let clear = picture(&scene, HARD);
+        // The unlit grey block's top left pixel, in the fog of the place: its corners
+        // are (0, 7), (0, 8), (1, 7), (1, 8) blocks from the camera, in its plane.
+        let (x, y) = (0, 0);
+        let (wx, wy) = (0.5 / SCALE as f32, 8.0 - 0.5 / SCALE as f32);
+        // The pixel is in the triangle of the top left, bottom left and bottom right
+        // corners: the top left's distance, then down and across.
+        let (top_left, bottom_left, bottom_right) = (8.0_f32, 7.0, 50.0_f32.sqrt());
+        let down = (8.0 - wy) / 1.0;
+        let distance =
+            top_left + (bottom_left - top_left) * down + (bottom_right - bottom_left) * wx;
+        let amount = (distance - 3.0) / 16.0;
+        let fog = FOGS[1].colour;
+        let want: Vec<u8> = (0..3)
+            .map(|i| {
+                let grey = f32::from(GREY[i]) / 255.0;
+                ((grey * (1.0 - amount) + fog[i] * amount) * 255.0).round() as u8
+            })
+            .collect();
+        let fogged = picture(&scene, Case { fog: 1, ..HARD });
+        assert_eq!(pixel(&fogged, x, y)[..3], want[..]);
+        assert_eq!(pixel(&clear, x, y), GREY);
+        // Half a fog is half as much of it.
+        let half = picture(&scene, Case { fog: 4, ..HARD });
+        let grey = f32::from(GREY[0]) / 255.0;
+        let half_want = ((grey * (1.0 - amount * 0.5) + amount * 0.5) * 255.0).round() as u8;
+        assert_eq!(pixel(&half, x, y)[0], half_want);
+        // At the edge of the view the height counts where it is more than the
+        // distance sideways: 8 blocks up at the top left corner, whatever x is.
+        let edge = picture(&scene, Case { fog: 2, ..HARD });
+        let amount = (top_left + (bottom_left - top_left) * down - 2.0) / 12.0;
+        let fog = FOGS[2].colour;
+        assert_eq!(
+            pixel(&edge, x, y)[0],
+            ((grey * (1.0 - amount) + fog[0] * amount) * 255.0).round() as u8
+        );
+        // The fading section: as it is up to 16 blocks out, on its way to the fog's
+        // colour beyond, more so the further; its half opaque texel keeps its alpha.
+        let fade = |cell_x: u32| pixel(&clear, cell_x * SCALE + 4, HEIGHT - 4);
+        assert_eq!(fade(0), SOLID);
+        let (middle, far) = (fade(5), fade(11));
+        assert!(
+            middle[2] > SOLID[2] && far[2] > middle[2],
+            "{middle:?} {far:?}"
+        );
+        assert!(middle[1] < SOLID[1] && far[1] < middle[1]);
+        assert_eq!(fade(8)[3], HALF[3]);
+        // 19.2 blocks out, a fifth of the way to a quarter there: 0.85 of itself.
+        let d = (11.5_f32 * 11.5 + 0.5 * 0.5 + 15.5 * 15.5).sqrt();
+        let f = 1.0 - (d - 16.0) / 16.0 * 0.75;
+        let want = (f32::from(SOLID[0]) / 255.0 * f + (1.0 - f)) * 255.0;
+        assert!((f32::from(far[0]) - want).abs() <= 1.0, "{far:?} {want}");
+        // Without fog and fade in the shader, it is as it is everywhere.
+        let plain = picture(
+            &scene,
+            Case {
+                shader: TerrainShader::Plain,
+                fog: 1,
+            },
+        );
+        assert_eq!(pixel(&plain, 11 * SCALE + 4, HEIGHT - 4), SOLID);
+        assert_eq!(pixel(&plain, 0, 0), GREY);
+    }
+
+    #[test]
+    fn averaged_texels_are_the_mean_of_four_samples() {
+        let texels = atlas_texels();
+        // A texel a pixel across and an eighth of one down, as most of the scene: by
+        // vanilla's rule that is far in this atlas, where a texel is 512 times as high
+        // as it is wide in the shader's coordinates.
+        let (du, dv) = ([0.125, 0.0], [0.0, 0.125]);
+        // In the middle of the even stretch every sample reads its colour.
+        let even = sampled(&texels, [(EVEN_AT + 20) as f32 + 0.3, 5.4], du, dv, true);
+        for (got, want) in even.iter().zip(EVEN) {
+            assert!((got * 255.0 - f32::from(want)).abs() < 0.01);
+        }
+        // At the middle of the grey texel, with white to its left, red to its right
+        // and poison below: the four samples lie an eighth and three eighths of a
+        // texel from it, so each reads some of a neighbour.
+        let grey = sampled(&texels, [1.5, 0.5], du, dv, true);
+        let part = |x: f32, y: f32| -> [f32; 4] {
+            // Towards the left neighbour for x below the middle, the right one above;
+            // towards the row below for y above the middle (there is none above).
+            let side = if x < 0.0 { WHITE } else { SOLID };
+            let (fx, fy) = (x.abs(), y.max(0.0));
+            std::array::from_fn(|i| {
+                let row = f32::from(GREY[i]) * (1.0 - fx) + f32::from(side[i]) * fx;
+                let below = f32::from(POISON[i]);
+                (row * (1.0 - fy) + below * fy) / 255.0
+            })
+        };
+        let taps = [
+            part(0.125, 0.375),
+            part(-0.125, -0.375),
+            part(0.375, -0.125),
+            part(-0.375, 0.125),
+        ];
+        for i in 0..4 {
+            let mean = taps.iter().map(|t| t[i]).sum::<f32>() / 4.0;
+            assert!((grey[i] - mean).abs() < 1e-5, "{grey:?} {mean}");
+        }
+        // With hard edges it is the grey itself, there and a pixel from its border.
+        for x in [1.5, 1.0625, 1.9375] {
+            let hard = sampled(&texels, [x, 0.5], du, dv, false);
+            assert_eq!(hard.map(|c| (c * 255.0).round() as u8), GREY);
+        }
+        // A square atlas would count the same texel as near, and give the grey with
+        // either filter; this one's shape is why the fixture cannot show that.
+        let pixel_v = 0.125 / ATLAS[1] as f32;
+        assert!(pixel_v > 2.0 / ATLAS[0] as f32);
+    }
+
+    #[test]
+    fn every_shader_draws_in_every_fog() {
+        let mut seen = std::collections::HashSet::new();
+        for frame in 0..20 {
+            let case = Case::of(frame);
+            seen.insert((case.shader.name(), case.fog));
+            assert!(case.picture() <= 2 * FOGS.len());
+        }
+        assert_eq!(seen.len(), TerrainShader::ALL.len() * FOGS.len());
+        // The fogs' ranges lie inside the scene, so that each does something.
+        for fog in &FOGS[1..] {
+            for range in [fog.environmental, fog.render_distance] {
+                assert!(range[0] == f32::MAX || (range[0] < range[1] && range[0] < 21.0));
+            }
+        }
     }
 
     #[test]

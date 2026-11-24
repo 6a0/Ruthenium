@@ -112,6 +112,22 @@ With no command, opens the game window. Options:
                          them (on, the default) or every face has one light (off)
   --biome-blend <0..7>   over how many columns each way grass, leaves and water take
                          the mean of the biomes' colours (default 2: 5 x 5)
+  --terrain-shader <rgss|rgss-reference|nearest|plain>
+                         how the terrain's texels are filtered: far ones averaged
+                         as vanilla's RGSS does it (rgss, the default; rgss-reference
+                         takes every sample the game's shader takes, for the same
+                         picture), or all with hard edges (nearest); plain is
+                         nearest without fog or fade, to measure those against
+  --fog <on|off>         whether the terrain fades into the fog's colour with
+                         distance (on, the default)
+  --chunk-fade <seconds> how long a section takes to fade in once it has a mesh,
+                         0 to 1.5 (default 0.75; 0: it is there at once)
+  --sky <late|first|off> when the sky is drawn: after the world's opaque layers,
+                         only where they left nothing (late, the default), before
+                         the world as vanilla does it (first), or not at all
+  --light-flicker <on|off>
+                         whether block light flickers (on, the default); off, two
+                         frames of one place and time are the same picture
   --route <file>         with --join: play a route file from cargo xtask bench
                          dedicated once in the world, measure the frames of its
                          capture (for --bench-out, with every frame interval and what

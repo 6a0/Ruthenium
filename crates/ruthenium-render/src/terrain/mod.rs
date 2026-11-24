@@ -15,11 +15,11 @@ pub(crate) mod world;
 
 pub use camera::{CameraPose, NEAR_PLANE, View};
 pub use lightmap::LightmapInputs;
-pub(crate) use lightmap::colour_attribute;
 pub use mesher::{MeshOptions, Mesher, SectionMesh};
 pub use table::BlockTable;
 pub use tint::{BiomeTints, ColourMaps, MAX_BLEND_RADIUS};
 pub use tracker::{CAUSES, TrackerStats};
 pub use world::{
-    LatencySummary, POOL_ENVELOPE, TerrainDraws, WorldAssets, WorldLatencies, WorldStats,
+    DEFAULT_FADE_MS, LatencySummary, POOL_ENVELOPE, TerrainDraws, TerrainShader, WorldAssets,
+    WorldLatencies, WorldStats,
 };

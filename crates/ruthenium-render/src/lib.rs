@@ -3,6 +3,7 @@
 //! the GUI's draw list over it, recorded and presented through
 //! [`ruthenium_gpu::FrameLoop`].
 
+mod atmosphere;
 mod backdrop;
 mod check_pass;
 mod colour_check;
@@ -11,6 +12,7 @@ mod overlay;
 mod pipelines;
 #[cfg(test)]
 mod reflect;
+mod sky;
 mod starfield;
 mod stats;
 mod table_check;
@@ -18,14 +20,17 @@ pub mod terrain;
 mod terrain_check;
 mod terrain_vertex;
 
+pub use atmosphere::{AtmosphereOptions, Fog, FogInputs, Medium, fog, rain_fog_target};
 pub use colour_check::ColourCheckReport;
 pub use gui::GuiFrame;
 pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
+pub use sky::{MOON_PHASES, SkyImage, SkyImages, SkyOrder};
 pub use stats::{FrameTimes, Summary};
 pub use table_check::TableCheckReport;
 pub use terrain::{
-    CameraPose, LatencySummary, TerrainDraws, WorldAssets, WorldLatencies, WorldStats,
+    CameraPose, LatencySummary, TerrainDraws, TerrainShader, WorldAssets, WorldLatencies,
+    WorldStats,
 };
 pub use terrain_check::TerrainCheckReport;
 pub use terrain_vertex::{TERRAIN_VERTEX_CANDIDATES, VertexCandidate};
@@ -41,11 +46,12 @@ use ruthenium_gpu::{
     Validation, vk,
 };
 use ruthenium_platform::{Platform, Window};
-use ruthenium_sim::environment::Environment;
-use ruthenium_sim::scene::Scene;
+use ruthenium_sim::scene::{Frame, Scene};
 
+use atmosphere::{Atmosphere, Look};
+use sky::{Sky, SkyRenderer};
+use terrain::View;
 use terrain::world::WorldRenderer;
-use terrain::{LightmapInputs, View};
 
 /// Creates the Vulkan instance, the window's surface and the device.
 ///
@@ -117,16 +123,62 @@ pub struct WorldFrame<'a> {
     /// How many chunks far the world is drawn: the render distance the server was
     /// told.
     pub view_distance: i32,
-    /// The dimension's own look: how faces are shaded, its light and its sky.
-    pub environment: &'a Arc<Environment>,
+    /// The game thread's frame the camera is of: its clocks, its weather and the
+    /// dimension's own look (how faces are shaded, its light, its fog and its sky),
+    /// and how far its tick has come.
+    pub frame: &'a Frame,
+    pub partial_tick: f32,
 }
 
-/// The colour the world's pass is cleared to: the dimension's sky colour as its type
-/// gives it (black where it gives none). Until the sky is drawn, that is all of it.
-fn sky_colour(environment: &Environment) -> [f32; 4] {
-    let [r, g, b] =
-        terrain::colour_attribute(environment, "minecraft:visual/sky_color").unwrap_or([0.0; 3]);
+/// The colour the world's pass is cleared to: the fog's, as in vanilla. Where no sky is
+/// drawn over it, that is what is seen behind the world.
+fn clear_colour(look: &Look) -> [f32; 4] {
+    let [r, g, b, _] = look.fog.colour;
     [r, g, b, 1.0]
+}
+
+/// Draws the world and its sky into `pass`, which has a depth attachment, in the order
+/// asked for.
+///
+/// # Safety
+/// As [`WorldRenderer::draw`] and [`SkyRenderer::draw`].
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_world(
+    world: &mut WorldRenderer,
+    sky: Option<&mut SkyRenderer>,
+    order: SkyOrder,
+    pass: &mut ruthenium_gpu::Pass<'_>,
+    frame_data: &mut FrameData,
+    textures: &TextureTable,
+    view: &View,
+    look: &Look,
+) {
+    let mut sky = sky.filter(|_| order != SkyOrder::Off && look.sky != Sky::None);
+    let mut draw_sky = |pass: &mut ruthenium_gpu::Pass<'_>, frame_data: &mut FrameData, behind| {
+        if let Some(s) = &mut sky {
+            // SAFETY: the caller's.
+            unsafe {
+                s.draw(
+                    pass,
+                    frame_data,
+                    textures,
+                    view,
+                    &look.sky,
+                    look.fog.colour,
+                    look.fog.sky_end,
+                    behind,
+                );
+            }
+        }
+    };
+    if order == SkyOrder::First {
+        draw_sky(pass, frame_data, false);
+    }
+    // SAFETY: the caller's.
+    unsafe { world.draw(pass, frame_data, view, &look.fog) };
+    if order == SkyOrder::Late {
+        draw_sky(pass, frame_data, true);
+    }
 }
 
 /// Staging ring size (research 04 §4.3: 8 MiB on the lowest tier, 16 MiB by default).
@@ -163,6 +215,14 @@ pub struct Renderer {
     terrain_culling: bool,
     smooth_lighting: bool,
     biome_blend: u8,
+    terrain_shader: TerrainShader,
+    chunk_fade_ms: u32,
+    sky_order: SkyOrder,
+    atmosphere_options: AtmosphereOptions,
+    /// The air of the level being drawn, and the sky's meshes and pictures once the
+    /// world's assets are loaded.
+    atmosphere: Atmosphere,
+    sky: Option<SkyRenderer>,
     /// The terrain's part of the last frame.
     world_times: WorldTimes,
     /// The number of the last frame recorded.
@@ -260,6 +320,12 @@ impl Renderer {
             terrain_culling: true,
             smooth_lighting: true,
             biome_blend: 2,
+            terrain_shader: TerrainShader::default(),
+            chunk_fade_ms: terrain::DEFAULT_FADE_MS,
+            sky_order: SkyOrder::default(),
+            atmosphere_options: AtmosphereOptions::default(),
+            atmosphere: Atmosphere::new(),
+            sky: None,
             world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
@@ -291,6 +357,15 @@ impl Renderer {
     ) -> Result<(), ruthenium_gpu::Error> {
         if self.world.is_none() {
             let gpu = self.frames.gpu().clone();
+            // A sky that cannot be made is left out: the world is drawn without it.
+            self.sky =
+                match SkyRenderer::new(&gpu, &mut self.textures, &mut self.uploads, &assets.sky) {
+                    Ok(sky) => Some(sky),
+                    Err(e) => {
+                        eprintln!("[render] no sky: {e}");
+                        None
+                    }
+                };
             self.world = Some(WorldRenderer::new(
                 &gpu,
                 &mut self.textures,
@@ -303,9 +378,55 @@ impl Renderer {
             if let Some(w) = &mut self.world {
                 w.set_smooth_lighting(self.smooth_lighting);
                 w.set_biome_blend(self.biome_blend);
+                w.set_shader(self.terrain_shader);
+                w.set_fade_ms(self.chunk_fade_ms);
             }
         }
         Ok(())
+    }
+
+    /// How the terrain's texels are filtered (as vanilla's RGSS unless said otherwise).
+    pub fn set_terrain_shader(&mut self, shader: TerrainShader) {
+        self.terrain_shader = shader;
+        if let Some(w) = &mut self.world {
+            w.set_shader(shader);
+        }
+    }
+
+    pub fn terrain_shader(&self) -> TerrainShader {
+        self.terrain_shader
+    }
+
+    /// Chunk Fade: how long a section takes to come out of the fog's colour once it
+    /// has a mesh, in milliseconds (750 unless said otherwise; 0: no fade).
+    pub fn set_chunk_fade_ms(&mut self, ms: u32) {
+        self.chunk_fade_ms = ms;
+        if let Some(w) = &mut self.world {
+            w.set_fade_ms(ms);
+        }
+    }
+
+    pub fn chunk_fade_ms(&self) -> u32 {
+        self.chunk_fade_ms
+    }
+
+    /// When the sky is drawn: after the world's opaque layers unless said otherwise.
+    pub fn set_sky_order(&mut self, order: SkyOrder) {
+        self.sky_order = order;
+    }
+
+    pub fn sky_order(&self) -> SkyOrder {
+        self.sky_order
+    }
+
+    /// Whether the terrain is fogged and block light flickers, and how bright the
+    /// Brightness option makes things.
+    pub fn set_atmosphere_options(&mut self, options: AtmosphereOptions) {
+        self.atmosphere_options = options;
+    }
+
+    pub fn atmosphere_options(&self) -> AtmosphereOptions {
+        self.atmosphere_options
     }
 
     /// Whether blocks are lit corner by corner from the blocks around them (Smooth
@@ -746,19 +867,31 @@ impl Renderer {
         let view = match (&world, surface, &mut self.world) {
             (Some(w), Some(s), Some(renderer)) => {
                 let started = std::time::Instant::now();
-                renderer.set_environment(w.environment);
+                let look = self.atmosphere.update(
+                    w.frame,
+                    w.partial_tick,
+                    &w.camera,
+                    w.scene,
+                    w.view_distance,
+                    started,
+                    &self.atmosphere_options,
+                );
+                renderer.set_environment(&w.frame.environment);
                 renderer.update(
                     w.scene,
                     &w.camera,
                     w.view_distance,
                     &mut self.textures,
                     &mut self.uploads,
-                    LightmapInputs::of(w.environment),
+                    look.lightmap,
                     ctx.number,
                 );
+                if let Some(sky) = &mut self.sky {
+                    sky.stage(&mut self.uploads);
+                }
                 self.world_times.stage_ns = started.elapsed().as_nanos() as u64;
                 let aspect = s.extent.width as f32 / s.extent.height.max(1) as f32;
-                Some((View::new(&w.camera, aspect), sky_colour(w.environment)))
+                Some((View::new(&w.camera, aspect), look))
             }
             _ => None,
         };
@@ -792,6 +925,9 @@ impl Renderer {
         if let (Some(w), Some(renderer)) = (&world, &mut self.world) {
             let started = std::time::Instant::now();
             renderer.install_ready(w.scene, &self.uploads, ctx.number);
+            if let Some(sky) = &mut self.sky {
+                sky.note_ready(&self.uploads);
+            }
             self.world_times.stage_ns += started.elapsed().as_nanos() as u64;
         }
         // The world is drawn once everything its draws read has arrived.
@@ -822,17 +958,28 @@ impl Renderer {
                 match (&view, &mut self.world, &self.depth) {
                     // The world is what is behind the menu: drawn into the backdrop's
                     // full-size image, then blurred like any background.
-                    (Some((view, sky)), Some(renderer), Some(depth)) => {
+                    (Some((view, look)), Some(renderer), Some(depth)) => {
                         let mut pass = encoder.texture_pass_with_depth(
                             &self.pipelines,
                             &self.textures,
                             b.scene(),
                             depth,
-                            *sky,
+                            clear_colour(look),
                         );
                         // SAFETY: `view` is only kept once the world is ready, and this
                         // frame's uploads are recorded and its meshes installed.
-                        unsafe { renderer.draw(&mut pass, &mut self.frame_data, view) };
+                        unsafe {
+                            draw_world(
+                                renderer,
+                                self.sky.as_mut(),
+                                self.sky_order,
+                                &mut pass,
+                                &mut self.frame_data,
+                                &self.textures,
+                                view,
+                                look,
+                            );
+                        }
                         pass.finish();
                         b.blur(&mut encoder, &self.pipelines, &self.textures);
                         world_in_backdrop = true;
@@ -913,7 +1060,9 @@ impl Renderer {
             // then the window's pass has a depth attachment, and what is drawn over the
             // world uses the pipelines built for one.
             let in_window = match (&view, &self.depth) {
-                (Some((view, sky)), Some(depth)) if !world_in_backdrop => Some((view, *sky, depth)),
+                (Some((view, look)), Some(depth)) if !world_in_backdrop => {
+                    Some((view, look, depth))
+                }
                 _ => None,
             };
             let over = |id: PipelineId| {
@@ -924,8 +1073,8 @@ impl Renderer {
                 }
             };
             let mut pass = match in_window {
-                Some((_, sky, depth)) => {
-                    encoder.window_pass_with_depth(&self.pipelines, &t, depth, sky)
+                Some((_, look, depth)) => {
+                    encoder.window_pass_with_depth(&self.pipelines, &t, depth, clear_colour(look))
                 }
                 None => encoder.window_pass(&self.pipelines, &t),
             };
@@ -941,9 +1090,18 @@ impl Renderer {
                 // contents are never loaded); with a backdrop, that is already drawn:
                 // copy it.
                 match (in_window, &mut self.world, backdrop) {
-                    (Some((view, ..)), Some(renderer), _) => {
+                    (Some((view, look, _)), Some(renderer), _) => {
                         let started = std::time::Instant::now();
-                        renderer.draw(&mut pass, &mut self.frame_data, view);
+                        draw_world(
+                            renderer,
+                            self.sky.as_mut(),
+                            self.sky_order,
+                            &mut pass,
+                            &mut self.frame_data,
+                            &self.textures,
+                            view,
+                            look,
+                        );
                         self.world_times.draw_ns = started.elapsed().as_nanos() as u64;
                     }
                     (_, _, Some((scene, _))) => pass.draw(

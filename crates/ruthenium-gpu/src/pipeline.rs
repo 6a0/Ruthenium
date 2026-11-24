@@ -103,11 +103,13 @@ pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
             .u32(match d.blend {
                 Blend::Opaque => 0,
                 Blend::Alpha => 1,
+                Blend::Glow => 2,
             })
             .u32(match d.depth {
                 Depth::None => 0,
                 Depth::Ignore => 1,
                 Depth::TestAndWrite => 2,
+                Depth::Test => 3,
             })
             .u32(u32::from(d.cull_back));
         match &d.vertex_input {
@@ -338,6 +340,9 @@ pub enum Blend {
     Opaque,
     /// Straight alpha: `src.a * src + (1 - src.a) * dst`; alpha accumulates likewise.
     Alpha,
+    /// Light added to what is there: `src.a * src + dst`; the target's alpha becomes
+    /// the source's (vanilla's blend of the sun, the moon and the stars).
+    Glow,
 }
 
 /// How a pipeline uses the depth attachment of the passes it draws in. A pipeline only
@@ -351,6 +356,9 @@ pub enum Depth {
     /// A fragment is kept if it is as near as what is there or nearer, and written.
     /// Depth is reversed ([`crate::DepthTarget`]): greater is nearer.
     TestAndWrite,
+    /// Kept by the same test, and not written: what is drawn behind everything that
+    /// wrote its depth before it (the sky after the terrain).
+    Test,
 }
 
 /// The layout of the one vertex buffer a pipeline reads (binding 0, a vertex per
@@ -824,7 +832,7 @@ fn build_one(
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(d.depth == Depth::TestAndWrite)
+        .depth_test_enable(matches!(d.depth, Depth::TestAndWrite | Depth::Test))
         .depth_write_enable(d.depth == Depth::TestAndWrite)
         .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
@@ -841,6 +849,15 @@ fn build_one(
             .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA),
+        Blend::Glow => vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA),
     };
     let attachments = [attachment];
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
@@ -851,7 +868,7 @@ fn build_one(
         .color_attachment_formats(&formats)
         .depth_attachment_format(match d.depth {
             Depth::None => vk::Format::UNDEFINED,
-            Depth::Ignore | Depth::TestAndWrite => depth_format,
+            Depth::Ignore | Depth::TestAndWrite | Depth::Test => depth_format,
         });
     let info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
