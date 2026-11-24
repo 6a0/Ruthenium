@@ -179,7 +179,7 @@ final class BlockPhysicsExporter {
     }
 
     /** A shape's index in the table, added if it is new. */
-    private static int intern(VoxelShape shape, Field discrete, Field delegate, boolean offset,
+    static int intern(VoxelShape shape, Field discrete, Field delegate, boolean offset,
             List<byte[]> shapes, Map<String, Integer> shapeIds) throws IllegalAccessException {
         byte[] encoded = encode(shape, (DiscreteVoxelShape) discrete.get(shape), delegate, offset);
         String key = java.util.Base64.getEncoder().encodeToString(encoded);

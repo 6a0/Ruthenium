@@ -15,7 +15,9 @@ use ruthenium_gpu::{
     TextureTablePath, Validation,
 };
 use ruthenium_platform::{DEFAULT_SIZE, Event, Platform, Sleeper, next_deadline};
-use ruthenium_render::{Background, FrameTimes, OverlayStats, Renderer, Summary, create_gpu};
+use ruthenium_render::{
+    Background, FrameTimes, OverlayStats, Renderer, Summary, WorldFrame, create_gpu,
+};
 use ruthenium_ui::modern::Action;
 
 use crate::menu::Menu;
@@ -133,9 +135,17 @@ pub struct Options {
     /// Development: draw a known grey and a translucent swatch over it every frame, off
     /// screen and into the window, and read the bytes back; a wrong byte fails the run.
     pub exercise_colour: bool,
+    /// Development: draw a made-up scene with the terrain pipelines every frame, off
+    /// screen, and read it back; a wrong pixel fails the run.
+    pub exercise_terrain: bool,
     /// Write what the GPU reported and what was chosen from it to this JSON file, once the
     /// renderer exists.
     pub adapter_report: Option<std::path::PathBuf>,
+    /// Threads that mesh the world's sections (default: by the machine's size).
+    pub mesh_workers: Option<usize>,
+    /// Development: with `--join`, leave the server this long after the start and join
+    /// it again at once, in the same run.
+    pub rejoin_after: Option<Duration>,
 }
 
 impl Options {
@@ -179,7 +189,10 @@ impl Options {
             texture_table: None,
             exercise_textures: false,
             exercise_colour: false,
+            exercise_terrain: false,
             adapter_report: None,
+            mesh_workers: None,
+            rejoin_after: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -309,9 +322,26 @@ impl Options {
                 }
                 "--exercise-textures" => o.exercise_textures = true,
                 "--exercise-colour" => o.exercise_colour = true,
+                "--exercise-terrain" => o.exercise_terrain = true,
                 "--adapter-report" => o.adapter_report = Some(value("a file")?.into()),
                 "--data-dir" => o.data_dir = Some(value("a folder")?.into()),
                 "--join" => o.join = Some(value("a server address")?),
+                "--rejoin-after" => {
+                    let v = value("a number of seconds")?;
+                    let s: f64 = v
+                        .parse()
+                        .map_err(|_| format!("--rejoin-after: not a number: {v}"))?;
+                    o.rejoin_after = Some(Duration::from_secs_f64(s.max(0.0)));
+                }
+                "--mesh-workers" => {
+                    let v = value("a number of threads")?;
+                    o.mesh_workers = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|n| (1..=64).contains(n))
+                            .ok_or(format!("--mesh-workers: not 1 to 64: {v}"))?,
+                    );
+                }
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
                 "--screen" => o.screen = Some(value("a screen name")?),
                 "--select" => {
@@ -419,6 +449,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         settings.settings.frame_stats = true;
     }
     let mut menu = Menu::new(servers_file, accounts, settings);
+    if let Some(n) = opts.mesh_workers {
+        menu.set_mesh_workers(n);
+    }
     menu.set_joiner(crate::join::Joiner::new(
         data_dir.as_ref().map(|d| d.join("game")),
         ruthenium_prepare::default_cache_dir(&env),
@@ -550,6 +583,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     if opts.exercise_colour {
         renderer.enable_colour_check()?;
     }
+    if opts.exercise_terrain {
+        renderer.enable_terrain_check()?;
+    }
     if opts.exercise_textures {
         renderer.enable_table_check()?;
     }
@@ -604,6 +640,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut text_shown: Option<Instant> = None;
     let mut start_screen = opts.screen.clone();
     let mut start_join = opts.join.clone();
+    let mut rejoin_after = opts.rejoin_after;
     let mut frames: u64 = 0;
     // --exercise-minimize: whether the window was last asked to minimise.
     let mut minimize_asked = false;
@@ -854,7 +891,18 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             menu.open_servers(window.pixel_size());
             menu.join_now(&address, window.pixel_size());
         }
+        if let (Some(after), Some(address)) = (rejoin_after, &opts.join)
+            && started.elapsed() >= after
+        {
+            // Joining again drops the session there is, which disconnects it.
+            rejoin_after = None;
+            eprintln!("[ruthenium] leaving and joining {address} again");
+            menu.join_now(address, window.pixel_size());
+        }
         let t_gui = Instant::now();
+        // The world as the game thread last published it, seen from where the mouse
+        // has turned to: taken before the menus borrow themselves for the frame.
+        let world = menu.world_view();
         let gui = if opts.empty_window {
             None
         } else {
@@ -869,7 +917,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 && !screenshot_requested
                 && !resize_asked
                 && text_ready
-                && !gui.glyphs.is_empty()
+                // (A drawn world has no text over it unless the statistics are on.)
+                && (!gui.glyphs.is_empty() || renderer.world_ready())
                 && text_shown.is_some_and(|t| t.elapsed() >= opts.screenshot_after)
             {
                 match opts.screenshot_resize {
@@ -893,7 +942,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 .frames_mut()
                 .set_acquire_limit(ACQUIRE_TIMEOUT, Some(deadline));
         }
-        let report = renderer.render(&BACKGROUND, gui)?;
+        let world = world.as_ref().map(|w| WorldFrame {
+            scene: &w.scene,
+            camera: w.camera,
+            environment: &w.environment,
+        });
+        let report = renderer.render(&BACKGROUND, world, gui)?;
         if opts.exercise_swapchain
             && opts.screenshot.is_none()
             && let Some((w, h, rgba)) = renderer.take_screenshot()?
@@ -1153,6 +1207,18 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 0 => String::new(),
                 n => format!("; the window could not be read in {n} frames"),
             }
+        );
+        failed |= !c.passed();
+    }
+    if let Some(s) = renderer.world_stats() {
+        for line in crate::ingame::terrain_lines(&s).lines() {
+            eprintln!("[ruthenium] {line}");
+        }
+    }
+    if let Some(c) = renderer.terrain_check() {
+        eprintln!(
+            "[ruthenium] terrain check: {} frames of {} rectangles compared, {} wrong",
+            c.compared, c.probes, c.mismatches
         );
         failed |= !c.passed();
     }

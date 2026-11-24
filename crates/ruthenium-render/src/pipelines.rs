@@ -1,7 +1,7 @@
 //! The closed set of pipelines the renderer uses. All of them are built at start-up; adding
 //! one means adding an id here and its shaders in `ruthenium-shaders`.
 
-use ruthenium_gpu::{Blend, GraphicsDesc, vk};
+use ruthenium_gpu::{Blend, Depth, GraphicsDesc, vk};
 use ruthenium_shaders as shaders;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,67 +19,111 @@ pub enum PipelineId {
     Text,
     /// The development overlay's rectangles.
     Overlay,
+    /// Terrain whose texels are all opaque.
+    TerrainSolid,
+    /// Terrain with holes (leaves, plants, panes).
+    TerrainCutout,
+    /// The four pipelines that also draw over the world, built for a pass with a depth
+    /// attachment (which they neither test nor write).
+    WorldGui,
+    WorldShape,
+    WorldText,
+    WorldOverlay,
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 6] = [
+    pub const ALL: [PipelineId; 12] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
         PipelineId::Shape,
         PipelineId::Text,
         PipelineId::Overlay,
+        PipelineId::TerrainSolid,
+        PipelineId::TerrainCutout,
+        PipelineId::WorldGui,
+        PipelineId::WorldShape,
+        PipelineId::WorldText,
+        PipelineId::WorldOverlay,
     ];
+
+    /// The pipeline that draws the same in a pass with a depth attachment, for the
+    /// four that have one.
+    pub fn over_world(self) -> PipelineId {
+        match self {
+            PipelineId::Gui => PipelineId::WorldGui,
+            PipelineId::Shape => PipelineId::WorldShape,
+            PipelineId::Text => PipelineId::WorldText,
+            PipelineId::Overlay => PipelineId::WorldOverlay,
+            other => other,
+        }
+    }
 
     pub fn index(self) -> usize {
         self as usize
     }
 
     fn desc(self) -> GraphicsDesc {
+        let terrain = |name, fragment: &'static [u32]| GraphicsDesc {
+            name,
+            vertex: shaders::TERRAIN_VERT.words(),
+            fragment,
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            blend: Blend::Opaque,
+            vertex_input: Some(crate::terrain_vertex::TERRAIN_VERTEX),
+            depth: Depth::TestAndWrite,
+            cull_back: true,
+        };
+        let over_world = |name, of: PipelineId| GraphicsDesc {
+            name,
+            depth: Depth::Ignore,
+            ..of.desc()
+        };
         match self {
-            PipelineId::Background => GraphicsDesc {
-                name: "background",
-                vertex: shaders::BACKGROUND_VERT.words(),
-                fragment: shaders::BACKGROUND_FRAG.words(),
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                blend: Blend::Opaque,
-            },
-            PipelineId::Blur => GraphicsDesc {
-                name: "blur",
-                vertex: shaders::BACKGROUND_VERT.words(),
-                fragment: shaders::BLUR_FRAG.words(),
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                blend: Blend::Opaque,
-            },
-            PipelineId::Shape => GraphicsDesc {
-                name: "shape",
-                vertex: shaders::SHAPE_VERT.words(),
-                fragment: shaders::SHAPE_FRAG.words(),
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                blend: Blend::Alpha,
-            },
-            PipelineId::Text => GraphicsDesc {
-                name: "text",
-                vertex: shaders::TEXT_VERT.words(),
-                fragment: shaders::TEXT_FRAG.words(),
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                blend: Blend::Alpha,
-            },
-            PipelineId::Gui => GraphicsDesc {
-                name: "gui",
-                vertex: shaders::GUI_VERT.words(),
-                fragment: shaders::GUI_FRAG.words(),
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                // Vanilla's TRANSLUCENT blend function.
-                blend: Blend::Alpha,
-            },
-            PipelineId::Overlay => GraphicsDesc {
-                name: "overlay",
-                vertex: shaders::OVERLAY_VERT.words(),
-                fragment: shaders::OVERLAY_FRAG.words(),
-                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-                blend: Blend::Alpha,
-            },
+            PipelineId::TerrainSolid => terrain("terrain_solid", shaders::TERRAIN_FRAG.words()),
+            PipelineId::TerrainCutout => {
+                terrain("terrain_cutout", shaders::TERRAIN_CUTOUT_FRAG.words())
+            }
+            PipelineId::WorldGui => over_world("gui_world", PipelineId::Gui),
+            PipelineId::WorldShape => over_world("shape_world", PipelineId::Shape),
+            PipelineId::WorldText => over_world("text_world", PipelineId::Text),
+            PipelineId::WorldOverlay => over_world("overlay_world", PipelineId::Overlay),
+            PipelineId::Background => GraphicsDesc::flat(
+                "background",
+                shaders::BACKGROUND_VERT.words(),
+                shaders::BACKGROUND_FRAG.words(),
+                Blend::Opaque,
+            ),
+            PipelineId::Blur => GraphicsDesc::flat(
+                "blur",
+                shaders::BACKGROUND_VERT.words(),
+                shaders::BLUR_FRAG.words(),
+                Blend::Opaque,
+            ),
+            PipelineId::Shape => GraphicsDesc::flat(
+                "shape",
+                shaders::SHAPE_VERT.words(),
+                shaders::SHAPE_FRAG.words(),
+                Blend::Alpha,
+            ),
+            PipelineId::Text => GraphicsDesc::flat(
+                "text",
+                shaders::TEXT_VERT.words(),
+                shaders::TEXT_FRAG.words(),
+                Blend::Alpha,
+            ),
+            PipelineId::Gui => GraphicsDesc::flat(
+                "gui",
+                shaders::GUI_VERT.words(),
+                shaders::GUI_FRAG.words(),
+                Blend::Alpha,
+            ),
+            PipelineId::Overlay => GraphicsDesc::flat(
+                "overlay",
+                shaders::OVERLAY_VERT.words(),
+                shaders::OVERLAY_FRAG.words(),
+                Blend::Alpha,
+            ),
         }
     }
 }

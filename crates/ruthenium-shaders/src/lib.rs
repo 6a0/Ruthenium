@@ -3,6 +3,7 @@
 //! build time or at run time.
 
 mod generated;
+pub mod interface;
 
 pub use generated::*;
 

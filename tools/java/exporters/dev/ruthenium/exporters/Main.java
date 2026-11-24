@@ -32,5 +32,6 @@ public final class Main {
         BlockPhysicsExporter.export(out.resolve(BlockPhysicsExporter.FILE));
         ItemClassExporter.export(out.resolve(ItemClassExporter.FILE));
         BlockBehaviourExporter.export(out.resolve(BlockBehaviourExporter.FILE));
+        BlockRenderExporter.export(out.resolve(BlockRenderExporter.FILE));
     }
 }

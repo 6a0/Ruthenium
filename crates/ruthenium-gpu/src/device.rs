@@ -760,6 +760,28 @@ impl Gpu {
         )
     }
 
+    /// The format of depth attachments on this device: 32-bit float where an attachment
+    /// can be that (as vanilla's), else 24 bits. Every Vulkan device can do one of the
+    /// two.
+    pub fn depth_format(&self) -> vk::Format {
+        let usable = |format| {
+            // SAFETY: plain query on the device this Gpu was created from.
+            let props = unsafe {
+                self.instance
+                    .raw
+                    .get_physical_device_format_properties(self.physical, format)
+            };
+            props
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        };
+        if usable(vk::Format::D32_SFLOAT) {
+            vk::Format::D32_SFLOAT
+        } else {
+            vk::Format::X8_D24_UNORM_PACK32
+        }
+    }
+
     pub fn device(&self) -> &ash::Device {
         &self.device
     }

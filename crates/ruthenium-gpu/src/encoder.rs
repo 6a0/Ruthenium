@@ -3,16 +3,18 @@
 //! image layouts, barriers, attachments, viewport), so the renderer says which target to
 //! draw into and which pipeline draws what, and holds no raw handle.
 //!
-//! It wraps what the menus draw today: full-target passes into the window, into a
-//! render-target texture of the table or into a read-back target, and draws that pull
-//! everything from push constants, the frame's data and the texture table. Depth, vertex
-//! and index buffers and indirect draws come with their first users.
+//! It wraps what the menus and the world draw: full-target passes into the window, into a
+//! render-target texture of the table or into a read-back target, each with a depth
+//! attachment or without; draws that pull everything from push constants, the frame's
+//! data and the texture table; and indexed draws from a vertex buffer. Indirect draws
+//! come with their first user.
 
 use std::sync::Arc;
 
 use ash::vk;
 
 use crate::Error;
+use crate::depth::{DEPTH_CLEAR, DEPTH_RANGE, DepthTarget};
 use crate::device::Gpu;
 use crate::frame::{FrameCtx, Target};
 use crate::frame_data::FrameData;
@@ -21,6 +23,12 @@ use crate::readback::Readback;
 use crate::screenshot::Screenshot;
 use crate::swapchain::COLOR_RANGE;
 use crate::textures::{TextureId, TextureTable};
+
+/// The stages that read and write a depth attachment.
+pub(crate) const DEPTH_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
+        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
+);
 
 /// Records the passes of one frame. See the module docs.
 pub struct Encoder<'f> {
@@ -92,7 +100,39 @@ impl<'f> Encoder<'f> {
             target.view,
             target.extent,
             vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AttachmentLoadOp::DONT_CARE,
+            None,
+            None,
+            End::Window(*target),
+        )
+    }
+
+    /// A pass over the whole window image, cleared to `clear` (a display-encoded
+    /// colour), with `depth` as its depth attachment, cleared to the far distance and
+    /// not kept after the pass. Only pipelines built for a depth attachment draw in it.
+    ///
+    /// # Panics
+    /// If `pipelines` were built for another format than the window's or the depth
+    /// image's, or `depth` is not the window's size.
+    pub fn window_pass_with_depth<'e>(
+        &'e mut self,
+        pipelines: &'e Pipelines,
+        target: &Target,
+        depth: &DepthTarget,
+        clear: [f32; 4],
+    ) -> Pass<'e> {
+        assert_eq!(
+            pipelines.format(),
+            target.format,
+            "pipelines for the window"
+        );
+        self.pass(
+            pipelines,
+            target.image,
+            target.view,
+            target.extent,
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+            Some(clear),
+            Some(depth),
             End::Window(*target),
         )
     }
@@ -121,7 +161,40 @@ impl<'f> Encoder<'f> {
             view,
             extent,
             vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            vk::AttachmentLoadOp::DONT_CARE,
+            None,
+            None,
+            End::Sampled(image),
+        )
+    }
+
+    /// [`Self::texture_pass`] cleared to `clear` first, with `depth` as its depth
+    /// attachment (see [`Self::window_pass_with_depth`]).
+    ///
+    /// # Panics
+    /// As [`Self::texture_pass`]; or if `depth` is not the texture's size or the
+    /// pipelines were built for another depth format.
+    pub fn texture_pass_with_depth<'e>(
+        &'e mut self,
+        pipelines: &'e Pipelines,
+        textures: &TextureTable,
+        id: TextureId,
+        depth: &DepthTarget,
+        clear: [f32; 4],
+    ) -> Pass<'e> {
+        let (image, view, desc) = textures.target(id);
+        assert_eq!(pipelines.format(), desc.format, "pipelines for {id:?}");
+        let extent = vk::Extent2D {
+            width: desc.width,
+            height: desc.height,
+        };
+        self.pass(
+            pipelines,
+            image,
+            view,
+            extent,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            Some(clear),
+            Some(depth),
             End::Sampled(image),
         )
     }
@@ -154,7 +227,42 @@ impl<'f> Encoder<'f> {
             view,
             target.extent(),
             vk::PipelineStageFlags2::COPY,
-            vk::AttachmentLoadOp::CLEAR,
+            Some([0.0; 4]),
+            None,
+            End::Readback(target),
+        )
+    }
+
+    /// [`Self::readback_pass`] with `depth` as its depth attachment (see
+    /// [`Self::window_pass_with_depth`]).
+    ///
+    /// # Panics
+    /// As [`Self::readback_pass`]; or if `depth` is not the target's size or the
+    /// pipelines were built for another depth format.
+    pub fn readback_pass_with_depth<'e>(
+        &'e mut self,
+        pipelines: &'e Pipelines,
+        target: &'e mut Readback,
+        depth: &DepthTarget,
+    ) -> Pass<'e> {
+        assert!(
+            !target.pending(),
+            "one copy of a read-back target at a time"
+        );
+        assert_eq!(
+            pipelines.format(),
+            target.format(),
+            "pipelines for the target"
+        );
+        let (image, view) = target.image();
+        self.pass(
+            pipelines,
+            image,
+            view,
+            target.extent(),
+            vk::PipelineStageFlags2::COPY,
+            Some([0.0; 4]),
+            Some(depth),
             End::Readback(target),
         )
     }
@@ -167,10 +275,26 @@ impl<'f> Encoder<'f> {
         view: vk::ImageView,
         extent: vk::Extent2D,
         after: vk::PipelineStageFlags2,
-        load: vk::AttachmentLoadOp,
+        // The colour the target is cleared to; none: its old contents are not kept
+        // and every pixel is drawn.
+        clear: Option<[f32; 4]>,
+        depth: Option<&DepthTarget>,
         end: End<'e>,
     ) -> Pass<'e> {
-        let to_attachment = [vk::ImageMemoryBarrier2::default()
+        if let Some(depth) = depth {
+            assert_eq!(
+                depth.extent(),
+                extent,
+                "the depth image is the target's size"
+            );
+            assert_eq!(
+                depth.format(),
+                pipelines.depth_format(),
+                "pipelines for the depth image"
+            );
+        }
+        let mut barriers = [vk::ImageMemoryBarrier2::default(); 2];
+        barriers[0] = vk::ImageMemoryBarrier2::default()
             .src_stage_mask(after)
             .src_access_mask(vk::AccessFlags2::NONE)
             .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -178,20 +302,60 @@ impl<'f> Encoder<'f> {
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
             .image(image)
-            .subresource_range(COLOR_RANGE)];
+            .subresource_range(COLOR_RANGE);
+        if let Some(depth) = depth {
+            // After the pass that used the depth image last; its old contents go.
+            barriers[1] = vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(DEPTH_STAGES)
+                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_stage_mask(DEPTH_STAGES)
+                .dst_access_mask(
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                )
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .image(depth.image().0)
+                .subresource_range(DEPTH_RANGE);
+        }
+        let to_attachment = &barriers[..1 + usize::from(depth.is_some())];
         let attachments = [vk::RenderingAttachmentInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(load)
+            .load_op(match clear {
+                Some(_) => vk::AttachmentLoadOp::CLEAR,
+                None => vk::AttachmentLoadOp::DONT_CARE,
+            })
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: clear.unwrap_or_default(),
+                },
+            })
             .store_op(vk::AttachmentStoreOp::STORE)];
+        let depth_attachment = depth.map(|depth| {
+            vk::RenderingAttachmentInfo::default()
+                .image_view(depth.image().1)
+                .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: DEPTH_CLEAR,
+                        stencil: 0,
+                    },
+                })
+        });
         let area = vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent,
         };
-        let rendering = vk::RenderingInfo::default()
+        let mut rendering = vk::RenderingInfo::default()
             .render_area(area)
             .layer_count(1)
             .color_attachments(&attachments);
+        if let Some(a) = &depth_attachment {
+            rendering = rendering.depth_attachment(a);
+        }
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -203,14 +367,15 @@ impl<'f> Encoder<'f> {
         let gpu = &*self.gpu;
         let cmd = self.ctx.cmd;
         // SAFETY: the frame is being recorded and no pass is open (a pass borrows the
-        // encoder until it is finished); the image and its view are alive, as their
+        // encoder until it is finished); the images and their views are alive, as their
         // owners (a window target of this frame, the texture table, the read-back
-        // target) keep them at least until the frame has finished; leaving UNDEFINED is
-        // valid whatever layout the image is in.
+        // target, the depth target, which waits for the GPU before it goes) keep them at
+        // least until the frame has finished; leaving UNDEFINED is valid whatever layout
+        // an image is in.
         unsafe {
             gpu.cmd_pipeline_barrier2(
                 cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_attachment),
+                &vk::DependencyInfo::default().image_memory_barriers(to_attachment),
             );
             gpu.cmd_begin_rendering(cmd, &rendering);
             gpu.device.cmd_set_viewport(cmd, 0, &[viewport]);
@@ -222,6 +387,7 @@ impl<'f> Encoder<'f> {
             layout: self.layout,
             pipelines,
             bound: None,
+            depth: depth.is_some(),
             end: Some(end),
         }
     }
@@ -246,6 +412,8 @@ pub struct Pass<'e> {
     pipelines: &'e Pipelines,
     /// The pipeline bound last.
     bound: Option<usize>,
+    /// The pass has a depth attachment.
+    depth: bool,
     /// `None` once finished.
     end: Option<End<'e>>,
 }
@@ -276,12 +444,35 @@ impl Pass<'_> {
             "{} bytes of push constants",
             push.len()
         );
+        assert!(
+            !self.pipelines.has_vertex_input(pipeline),
+            "pipeline {pipeline} reads a vertex buffer: draw_indexed"
+        );
+        // SAFETY: inside the pass this value began; the pipeline was built with the
+        // layout for the target's formats (checked when the pass began and in `bind`);
+        // the caller guarantees what the shaders read.
+        unsafe {
+            self.bind(pipeline, push);
+            self.gpu
+                .device
+                .cmd_draw(self.ctx.cmd, vertices, instances, 0, 0);
+        }
+    }
+
+    /// Binds `pipeline` if it is not bound and sets `push` if there is any.
+    ///
+    /// # Safety
+    /// Inside the pass; `push` is what the pipeline's shaders expect.
+    unsafe fn bind(&mut self, pipeline: usize, push: &[u8]) {
+        assert_eq!(
+            self.pipelines.has_depth(pipeline),
+            self.depth,
+            "pipeline {pipeline} and the pass disagree about a depth attachment"
+        );
         let raw = self.pipelines.get(pipeline);
         let d = &self.gpu.device;
         let cmd = self.ctx.cmd;
-        // SAFETY: inside the pass this value began; the pipeline was built with the
-        // layout for the target's format (checked when the pass began); the caller
-        // guarantees what the shaders read.
+        // SAFETY: the caller's.
         unsafe {
             if self.bound != Some(pipeline) {
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, raw);
@@ -290,7 +481,81 @@ impl Pass<'_> {
             if !push.is_empty() {
                 d.cmd_push_constants(cmd, self.layout, PUSH_CONSTANT_STAGES, 0, push);
             }
-            d.cmd_draw(cmd, vertices, instances, 0, 0);
+        }
+    }
+
+    /// Binds `buffer` from `offset` as the vertex buffer of the draws that follow.
+    ///
+    /// # Safety
+    /// `buffer` is alive until the frame has finished and was created for vertices; the
+    /// bytes the draws read from it were written by copies that this frame may read
+    /// ([`crate::UploadRing::is_ready`]).
+    pub unsafe fn bind_vertex_buffer(&mut self, buffer: vk::Buffer, offset: u64) {
+        // SAFETY: inside the pass; the rest is the caller's guarantee.
+        unsafe {
+            self.gpu
+                .device
+                .cmd_bind_vertex_buffers(self.ctx.cmd, 0, &[buffer], &[offset]);
+        }
+    }
+
+    /// Binds `buffer` from `offset` as the 16-bit index buffer of the draws that follow.
+    ///
+    /// # Safety
+    /// As [`Self::bind_vertex_buffer`], for indices.
+    pub unsafe fn bind_index_buffer(&mut self, buffer: vk::Buffer, offset: u64) {
+        // SAFETY: inside the pass; the rest is the caller's guarantee.
+        unsafe {
+            self.gpu.device.cmd_bind_index_buffer(
+                self.ctx.cmd,
+                buffer,
+                offset,
+                vk::IndexType::UINT16,
+            );
+        }
+    }
+
+    /// Draws `indices` indices from `first_index` of the bound index buffer, each added
+    /// to `vertex_offset` to give a vertex of the bound vertex buffer, with pipeline
+    /// `pipeline` and `push` as its push constants (none: those set last stay). The one
+    /// instance drawn has the number `instance`, which the shaders may read to find the
+    /// draw's own data.
+    ///
+    /// # Safety
+    /// As [`Self::draw`]; a vertex and an index buffer are bound, and every index and
+    /// vertex the draw reads lies inside what was written to them.
+    ///
+    /// # Panics
+    /// As [`Self::draw`]; or if `pipeline` reads no vertex buffer.
+    pub unsafe fn draw_indexed(
+        &mut self,
+        pipeline: usize,
+        push: &[u8],
+        indices: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        instance: u32,
+    ) {
+        assert!(
+            push.len() <= PUSH_CONSTANT_BYTES as usize && push.len().is_multiple_of(4),
+            "{} bytes of push constants",
+            push.len()
+        );
+        assert!(
+            self.pipelines.has_vertex_input(pipeline),
+            "pipeline {pipeline} reads no vertex buffer"
+        );
+        // SAFETY: as in `draw`.
+        unsafe {
+            self.bind(pipeline, push);
+            self.gpu.device.cmd_draw_indexed(
+                self.ctx.cmd,
+                indices,
+                1,
+                first_index,
+                vertex_offset,
+                instance,
+            );
         }
     }
 

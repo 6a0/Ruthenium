@@ -20,6 +20,7 @@ pub const ENTITY_DIMENSIONS: &str = "entity_dimensions.bin";
 pub const BLOCK_PHYSICS: &str = "block_physics.bin";
 pub const ITEM_CLASSES: &str = "item_classes.bin";
 pub const BLOCK_BEHAVIOUR: &str = "block_behaviour.bin";
+pub const BLOCK_RENDER: &str = "block_render.bin";
 
 /// The exporter bundle: `explicit`, then `RUTHENIUM_EXPORTERS`, then next to
 /// the executable, then `../java/` from it (`target/java/` in a dev build).
@@ -78,6 +79,7 @@ pub fn run(java: &Java, imported: &Imported, bundle: &Path) -> Result<(PathBuf, 
             BLOCK_PHYSICS,
             ITEM_CLASSES,
             BLOCK_BEHAVIOUR,
+            BLOCK_RENDER,
         ] {
             let expected = tmp.join(file);
             if !expected.is_file() {
@@ -207,6 +209,29 @@ impl<'a> Reader<'a> {
         (0..n)
             .map(|_| Ok((self.string()?, self.string()?)))
             .collect()
+    }
+
+    /// A table of shapes: a count, then each shape's coordinates and cells.
+    fn shapes(&mut self) -> Result<Vec<ShapeData>, String> {
+        let n = self.u32()? as usize;
+        let mut shapes = Vec::with_capacity(n.min(1 << 16));
+        for _ in 0..n {
+            let mut coords: [Vec<f64>; 3] = Default::default();
+            for axis in &mut coords {
+                let len = self.u32()? as usize;
+                if len == 0 || len > 1024 {
+                    return Err(format!("bad coordinate count {len}"));
+                }
+                *axis = (0..len).map(|_| self.f64()).collect::<Result<_, _>>()?;
+            }
+            let cells = (coords[0].len() - 1) * (coords[1].len() - 1) * (coords[2].len() - 1);
+            let packed = self.take(cells.div_ceil(8))?;
+            let full = (0..cells)
+                .map(|i| packed[i / 8] >> (i % 8) & 1 != 0)
+                .collect();
+            shapes.push(ShapeData { coords, full });
+        }
+        Ok(shapes)
     }
 
     fn finish(&self) -> Result<(), String> {
@@ -379,24 +404,7 @@ pub struct BlockPhysics {
 /// Parses `block_physics.bin`.
 pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
     let mut r = Reader::open(bytes, "block_physics", 8)?;
-    let n = r.u32()? as usize;
-    let mut shapes = Vec::with_capacity(n.min(1 << 16));
-    for _ in 0..n {
-        let mut coords: [Vec<f64>; 3] = Default::default();
-        for axis in &mut coords {
-            let len = r.u32()? as usize;
-            if len == 0 || len > 1024 {
-                return Err(format!("bad coordinate count {len}"));
-            }
-            *axis = (0..len).map(|_| r.f64()).collect::<Result<_, _>>()?;
-        }
-        let cells = (coords[0].len() - 1) * (coords[1].len() - 1) * (coords[2].len() - 1);
-        let packed = r.take(cells.div_ceil(8))?;
-        let full = (0..cells)
-            .map(|i| packed[i / 8] >> (i % 8) & 1 != 0)
-            .collect();
-        shapes.push(ShapeData { coords, full });
-    }
+    let shapes = r.shapes()?;
     let n = r.u32()? as usize;
     let mut states = Vec::with_capacity(n.min(1 << 17));
     for _ in 0..n {
@@ -719,6 +727,134 @@ pub fn read_block_behaviour(bytes: &[u8]) -> Result<BlockBehaviours, String> {
     })
 }
 
+/// The rule by which a block leaves out faces against particular neighbours
+/// (`skipRendering`), by the class that decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkipRule {
+    #[default]
+    None,
+    /// Against a neighbour of the same block (glass, ice, slime, powder snow).
+    SameBlock,
+    /// Leaves against leaves, when leaves are drawn opaque (the graphics setting).
+    Leaves,
+    /// Bars and panes: against the same block, or bars of another kind that connect
+    /// back; vertically always, sideways where both connect.
+    Bars,
+    /// Mangrove roots above and below each other.
+    MangroveRoots,
+    /// A liquid against the same fluid.
+    SameFluid,
+}
+
+/// What a tinted face's colour comes from in a world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorldTint {
+    /// 0xAARRGGBB, as the game gives it.
+    Constant(u32),
+    Grass,
+    Foliage,
+    DryFoliage,
+    Water,
+}
+
+/// One tint layer of a block state (a model's `tintindex` picks one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TintLayer {
+    /// The colour outside a world (0xAARRGGBB); `None`: the grass colour map's
+    /// default.
+    pub hand: Option<u32>,
+    pub world: WorldTint,
+    /// How far above the block the biomes are read (-1: the upper half of a double
+    /// plant reads at its lower half).
+    pub dy: i8,
+}
+
+/// What drawing a block state needs beyond its model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateRender {
+    pub flags: u8,
+    pub skip: SkipRule,
+    /// Indices into [`BlockRender::shapes`] of the state's face occlusion shapes, one
+    /// per `Direction` in ordinal order (`getFaceOcclusionShape`).
+    pub occlusion: [u32; 6],
+    pub tints: Vec<TintLayer>,
+    /// Where, from the block, the position lies whose seed picks the state's model
+    /// variants (`getSeed`: the lower half of a door or a double plant, a bed's head).
+    pub seed_offset: [i8; 3],
+}
+
+impl StateRender {
+    /// Drawn from its model (`RenderShape.MODEL`).
+    pub const MODEL: u8 = 1;
+    /// `emissiveRendering`: drawn at full light.
+    pub const EMISSIVE: u8 = 2;
+    /// A `LeavesBlock`.
+    pub const LEAVES: u8 = 4;
+}
+
+/// `block_render.bin`: what drawing every block state needs beyond its model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockRender {
+    pub shapes: Vec<ShapeData>,
+    pub states: Vec<StateRender>,
+}
+
+/// Parses `block_render.bin`.
+pub fn read_block_render(bytes: &[u8]) -> Result<BlockRender, String> {
+    let mut r = Reader::open(bytes, "block_render", 1)?;
+    let shapes = r.shapes()?;
+    let n = r.u32()? as usize;
+    let mut states = Vec::with_capacity(n.min(1 << 17));
+    for _ in 0..n {
+        let flags = r.u8()?;
+        let skip = match r.u8()? {
+            0 => SkipRule::None,
+            1 => SkipRule::SameBlock,
+            2 => SkipRule::Leaves,
+            3 => SkipRule::Bars,
+            4 => SkipRule::MangroveRoots,
+            5 => SkipRule::SameFluid,
+            other => return Err(format!("unknown skip rule {other}")),
+        };
+        let mut occlusion = [0; 6];
+        for face in &mut occlusion {
+            *face = r.u32()?;
+            if *face as usize >= shapes.len() {
+                return Err(format!("occlusion shape {face} out of range"));
+            }
+        }
+        let layers = r.u8()?;
+        let mut tints = Vec::with_capacity(usize::from(layers));
+        for _ in 0..layers {
+            let (default, colour) = (r.u8()? != 0, r.u32()?);
+            let (kind, constant) = (r.u8()?, r.u32()?);
+            let dy = r.u8()? as i8;
+            tints.push(TintLayer {
+                hand: (!default).then_some(colour),
+                world: match kind {
+                    0 => WorldTint::Constant(constant),
+                    1 => WorldTint::Grass,
+                    2 => WorldTint::Foliage,
+                    3 => WorldTint::DryFoliage,
+                    4 => WorldTint::Water,
+                    other => return Err(format!("unknown tint source {other}")),
+                },
+                dy,
+            });
+        }
+        let seed_offset = [r.u8()? as i8, r.u8()? as i8, r.u8()? as i8];
+        states.push(StateRender {
+            flags,
+            skip,
+            occlusion,
+            tints,
+            seed_offset,
+        });
+    }
+    r.finish()?;
+    Ok(BlockRender { shapes, states })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +862,79 @@ mod tests {
     fn string(out: &mut Vec<u8>, s: &str) {
         out.extend((s.len() as u16).to_le_bytes());
         out.extend(s.as_bytes());
+    }
+
+    #[test]
+    fn reads_block_render() {
+        let mut b = b"RTHX".to_vec();
+        b.extend(1u32.to_le_bytes());
+        string(&mut b, "block_render");
+        // Two shapes: the empty one (a single empty cell) and the full block.
+        b.extend(2u32.to_le_bytes());
+        for full in [0u8, 1] {
+            for _ in 0..3 {
+                b.extend(2u32.to_le_bytes());
+                b.extend(0f64.to_le_bytes());
+                b.extend(1f64.to_le_bytes());
+            }
+            b.push(full);
+        }
+        b.extend(2u32.to_le_bytes());
+        // A plain cube.
+        b.push(StateRender::MODEL);
+        b.push(0);
+        for _ in 0..6 {
+            b.extend(1u32.to_le_bytes());
+        }
+        b.push(0);
+        b.extend([0, 0, 0]);
+        // The upper half of a double plant: no faces, and a grass tint read one below.
+        b.push(StateRender::MODEL | StateRender::LEAVES);
+        b.push(2);
+        for _ in 0..6 {
+            b.extend(0u32.to_le_bytes());
+        }
+        b.push(2);
+        b.push(1);
+        b.extend(0u32.to_le_bytes());
+        b.push(1);
+        b.extend(0u32.to_le_bytes());
+        b.push(0xFF);
+        b.push(0);
+        b.extend(0xFF9E_D1DCu32.to_le_bytes());
+        b.push(0);
+        b.extend(0xFF20_8030u32.to_le_bytes());
+        b.push(0);
+        b.extend([0, 0xFF, 0]);
+        let r = read_block_render(&b).unwrap();
+        assert_eq!(r.shapes.len(), 2);
+        assert_eq!(r.shapes[1].full, vec![true]);
+        assert_eq!(r.states[0].occlusion, [1; 6]);
+        assert_eq!(r.states[0].skip, SkipRule::None);
+        assert!(r.states[0].tints.is_empty());
+        assert_eq!(r.states[1].skip, SkipRule::Leaves);
+        assert_eq!(r.states[0].seed_offset, [0, 0, 0]);
+        assert_eq!(r.states[1].seed_offset, [0, -1, 0]);
+        assert_eq!(
+            r.states[1].tints,
+            vec![
+                TintLayer {
+                    hand: None,
+                    world: WorldTint::Grass,
+                    dy: -1
+                },
+                TintLayer {
+                    hand: Some(0xFF9E_D1DC),
+                    world: WorldTint::Constant(0xFF20_8030),
+                    dy: 0
+                },
+            ]
+        );
+        // An unknown rule, and bytes left over, are errors.
+        let mut bad = b.clone();
+        bad.push(0);
+        assert!(read_block_render(&bad).is_err());
+        assert!(read_block_render(&b[..b.len() - 1]).is_err());
     }
 
     #[test]

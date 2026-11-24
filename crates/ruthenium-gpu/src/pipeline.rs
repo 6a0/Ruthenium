@@ -15,8 +15,8 @@ use std::time::Instant;
 use ash::vk;
 use ash::vk::TaggedStructure;
 
-use crate::device::Gpu;
-use crate::memory::Image;
+use crate::device::{Gpu, VertexAttribute};
+use crate::memory::{Buffer, Image, MemoryUse};
 use crate::textures::TextureTable;
 use crate::{Error, VkContext};
 
@@ -37,7 +37,7 @@ const HEADER_BYTES: usize = 16 + vk::UUID_SIZE;
 /// Part of [`interface_hash`]: raise it when what [`build_one`] makes of a
 /// [`GraphicsDesc`] changes (its fixed state, its attachments) in a way the hashed values
 /// don't show.
-const PIPELINE_STATE_VERSION: u32 = 1;
+const PIPELINE_STATE_VERSION: u32 = 2;
 
 /// Cache files of other builds kept beside the current one, newest first: enough to
 /// switch between a few builds (an A/B comparison) without any of them starting cold.
@@ -87,8 +87,8 @@ impl InterfaceHash {
 
 /// A hash of everything the pipelines in `descs` are built from: their compiled SPIR-V
 /// and state, and the interface they share with the renderer (the push-constant range,
-/// the texture table's bindings, size and samplers, the frame data's binding; vertex
-/// formats once a pipeline has one). The driver's own cache id covers the rest.
+/// the texture table's bindings, size and samplers, the frame data's binding, vertex
+/// layouts, depth and culling). The driver's own cache id covers the rest.
 pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
     let mut h = InterfaceHash::default();
     h.u32(PIPELINE_STATE_VERSION)
@@ -104,8 +104,23 @@ pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
                 Blend::Opaque => 0,
                 Blend::Alpha => 1,
             })
-            .words(d.vertex)
-            .words(d.fragment);
+            .u32(match d.depth {
+                Depth::None => 0,
+                Depth::Ignore => 1,
+                Depth::TestAndWrite => 2,
+            })
+            .u32(u32::from(d.cull_back));
+        match &d.vertex_input {
+            None => h.u32(0),
+            Some(v) => {
+                h.u32(v.stride).u32(v.attributes.len() as u32);
+                for a in v.attributes {
+                    h.u32(a.offset).u32(a.format.as_raw() as u32);
+                }
+                &mut h
+            }
+        };
+        h.words(d.vertex).words(d.fragment);
     }
     h.finish()
 }
@@ -325,9 +340,30 @@ pub enum Blend {
     Alpha,
 }
 
+/// How a pipeline uses the depth attachment of the passes it draws in. A pipeline only
+/// draws in passes that match: with a depth attachment or without.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Depth {
+    /// Its passes have no depth attachment (the menus, off-screen passes).
+    None,
+    /// Its passes have one, which it neither tests nor writes (the HUD over the world).
+    Ignore,
+    /// A fragment is kept if it is as near as what is there or nearer, and written.
+    /// Depth is reversed ([`crate::DepthTarget`]): greater is nearer.
+    TestAndWrite,
+}
+
+/// The layout of the one vertex buffer a pipeline reads (binding 0, a vertex per
+/// `stride` bytes); the attribute at index `i` is the shader's input at location `i`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VertexInput {
+    pub stride: u32,
+    pub attributes: &'static [VertexAttribute],
+}
+
 /// One graphics pipeline of the closed set: what differs between pipelines. Everything
-/// else is shared: the layout, dynamic viewport and scissor, no depth yet, one colour
-/// attachment in the target's format.
+/// else is shared: the layout, dynamic viewport and scissor, one colour attachment in
+/// the target's format.
 #[derive(Clone, Copy, Debug)]
 pub struct GraphicsDesc {
     pub name: &'static str,
@@ -335,6 +371,35 @@ pub struct GraphicsDesc {
     pub fragment: &'static [u32],
     pub topology: vk::PrimitiveTopology,
     pub blend: Blend,
+    /// `None`: the shaders pull everything from push constants and the frame's data.
+    pub vertex_input: Option<VertexInput>,
+    pub depth: Depth,
+    /// Leave out triangles seen from behind: those whose corners go round clockwise on
+    /// the target. (A face whose corners go round counter-clockwise seen from its front
+    /// in the world does so on the target too, when the projection draws the world the
+    /// right way up.)
+    pub cull_back: bool,
+}
+
+impl GraphicsDesc {
+    /// A pipeline of the menus: no vertex buffer, no depth, nothing culled.
+    pub const fn flat(
+        name: &'static str,
+        vertex: &'static [u32],
+        fragment: &'static [u32],
+        blend: Blend,
+    ) -> GraphicsDesc {
+        GraphicsDesc {
+            name,
+            vertex,
+            fragment,
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            blend,
+            vertex_input: None,
+            depth: Depth::None,
+            cull_back: false,
+        }
+    }
 }
 
 /// The one pipeline layout every pipeline uses: the descriptor sets (set 0 is the texture
@@ -381,13 +446,23 @@ impl Drop for PipelineLayout {
     }
 }
 
-/// Every pipeline, built for one colour format with the shared layout.
+/// What the warm-up draws need, kept until the pipelines go.
+struct WarmUp {
+    colour: Image,
+    depth: Option<Image>,
+    vertices: Option<Buffer>,
+}
+
+/// Every pipeline, built for one colour format and one depth format with the shared
+/// layout.
 pub struct Pipelines {
     gpu: Arc<Gpu>,
     pipelines: Vec<vk::Pipeline>,
+    /// What each was built from, by index.
+    descs: Vec<GraphicsDesc>,
     format: vk::Format,
-    /// The 1×1 target of the warm-up draws, until they are recorded.
-    warm_up: Option<Image>,
+    depth_format: vk::Format,
+    warm_up: Option<WarmUp>,
     warmed: bool,
 }
 
@@ -401,8 +476,9 @@ impl std::fmt::Debug for Pipelines {
 }
 
 impl Pipelines {
-    /// Builds every pipeline in `descs` (index = id) for `format` with `layout`, in
-    /// parallel, through `cache`; then saves the cache if it grew.
+    /// Builds every pipeline in `descs` (index = id) for colour targets of `format` and
+    /// the device's depth format, with `layout`, in parallel, through `cache`; then
+    /// saves the cache if it grew.
     pub fn build(
         gpu: Arc<Gpu>,
         cache: &mut PipelineCache,
@@ -412,10 +488,13 @@ impl Pipelines {
     ) -> Result<Pipelines, Error> {
         let started = Instant::now();
         let layout = layout.raw;
+        let depth_format = gpu.depth_format();
         let mut set = Pipelines {
             gpu,
             pipelines: Vec::with_capacity(descs.len()),
+            descs: descs.to_vec(),
             format,
+            depth_format,
             warm_up: None,
             warmed: false,
         };
@@ -426,7 +505,7 @@ impl Pipelines {
                 .iter()
                 .map(|d| {
                     let gpu = &set.gpu;
-                    s.spawn(move || build_one(gpu, cache_raw, layout, d, format))
+                    s.spawn(move || build_one(gpu, cache_raw, layout, d, format, depth_format))
                 })
                 .collect();
             handles
@@ -467,6 +546,21 @@ impl Pipelines {
         self.format
     }
 
+    /// The format of the depth attachment the pipelines that have one were built for.
+    pub fn depth_format(&self) -> vk::Format {
+        self.depth_format
+    }
+
+    /// Whether the pipeline at `index` draws in passes with a depth attachment.
+    pub fn has_depth(&self, index: usize) -> bool {
+        self.descs[index].depth != Depth::None
+    }
+
+    /// Whether the pipeline at `index` reads a vertex buffer.
+    pub fn has_vertex_input(&self, index: usize) -> bool {
+        self.descs[index].vertex_input.is_some()
+    }
+
     /// Whether [`Self::record_warm_up`] has run for these pipelines.
     pub fn warmed_up(&self) -> bool {
         self.warmed
@@ -496,37 +590,49 @@ impl Pipelines {
             width: 1,
             height: 1,
         };
-        let target = Image::new_2d(
+        let colour = Image::new_2d(
             &self.gpu,
             self.format,
             one,
             1,
             vk::ImageUsageFlags::COLOR_ATTACHMENT,
         )?;
+        // Kept from here on, so that Drop frees what was made if a later step fails.
+        let warm_up = self.warm_up.insert(WarmUp {
+            colour,
+            depth: None,
+            vertices: None,
+        });
+        if self.descs.iter().any(|d| d.depth != Depth::None) {
+            warm_up.depth = Some(Image::new_2d(
+                &self.gpu,
+                self.depth_format,
+                one,
+                1,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            )?);
+        }
+        // Three vertices of the widest layout. Their bytes are whatever the memory
+        // holds: the shaders draw nothing with zeroed push constants.
+        let widest = self
+            .descs
+            .iter()
+            .filter_map(|d| d.vertex_input.map(|v| v.stride))
+            .max();
+        if let Some(stride) = widest {
+            warm_up.vertices = Some(Buffer::new(
+                &self.gpu,
+                u64::from(stride) * 3,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                MemoryUse::GpuOnly,
+            )?);
+        }
         let gpu = &*self.gpu;
         let d = &gpu.device;
-        let to_attachment = [vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::NONE)
-            .src_access_mask(vk::AccessFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .image(target.raw)
-            .subresource_range(crate::swapchain::COLOR_RANGE)];
-        let attachments = [vk::RenderingAttachmentInfo::default()
-            .image_view(target.view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(vk::AttachmentLoadOp::DONT_CARE)
-            .store_op(vk::AttachmentStoreOp::DONT_CARE)];
         let area = vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent: one,
         };
-        let rendering = vk::RenderingInfo::default()
-            .render_area(area)
-            .layer_count(1)
-            .color_attachments(&attachments);
         let viewport = vk::Viewport {
             x: 0.0,
             y: 0.0,
@@ -536,24 +642,79 @@ impl Pipelines {
             max_depth: 1.0,
         };
         let push = [0u8; PUSH_CONSTANT_BYTES as usize];
-        // SAFETY: guaranteed by the caller; the target is alive until these pipelines are
-        // dropped, which happens only once no submitted frame uses them.
-        unsafe {
-            gpu.cmd_pipeline_barrier2(
-                cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_attachment),
-            );
-            gpu.cmd_begin_rendering(cmd, &rendering);
-            d.cmd_set_viewport(cmd, 0, &[viewport]);
-            d.cmd_set_scissor(cmd, 0, &[area]);
-            d.cmd_push_constants(cmd, layout, PUSH_CONSTANT_STAGES, 0, &push);
-            for &p in &self.pipelines {
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, p);
-                d.cmd_draw(cmd, 3, 1, 0, 0);
+        // One pass for the pipelines without a depth attachment, one for those with.
+        for with_depth in [false, true] {
+            let depth = warm_up.depth.as_ref().filter(|_| with_depth);
+            if with_depth && depth.is_none() {
+                continue;
             }
-            gpu.cmd_end_rendering(cmd);
+            let mut barriers = vec![
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(warm_up.colour.raw)
+                    .subresource_range(crate::swapchain::COLOR_RANGE),
+            ];
+            if let Some(depth) = depth {
+                barriers.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(crate::encoder::DEPTH_STAGES)
+                        .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                        .image(depth.raw)
+                        .subresource_range(crate::depth::DEPTH_RANGE),
+                );
+            }
+            let attachments = [vk::RenderingAttachmentInfo::default()
+                .image_view(warm_up.colour.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)];
+            let depth_attachment = depth.map(|depth| {
+                vk::RenderingAttachmentInfo::default()
+                    .image_view(depth.view)
+                    .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::DONT_CARE)
+            });
+            let mut rendering = vk::RenderingInfo::default()
+                .render_area(area)
+                .layer_count(1)
+                .color_attachments(&attachments);
+            if let Some(a) = &depth_attachment {
+                rendering = rendering.depth_attachment(a);
+            }
+            // SAFETY: guaranteed by the caller; the targets and the vertex buffer are
+            // alive until these pipelines are dropped, which happens only once no
+            // submitted frame uses them.
+            unsafe {
+                gpu.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&barriers),
+                );
+                gpu.cmd_begin_rendering(cmd, &rendering);
+                d.cmd_set_viewport(cmd, 0, &[viewport]);
+                d.cmd_set_scissor(cmd, 0, &[area]);
+                d.cmd_push_constants(cmd, layout, PUSH_CONSTANT_STAGES, 0, &push);
+                if let Some(vertices) = &warm_up.vertices {
+                    d.cmd_bind_vertex_buffers(cmd, 0, &[vertices.raw], &[0]);
+                }
+                for (&p, desc) in self.pipelines.iter().zip(&self.descs) {
+                    if (desc.depth != Depth::None) == with_depth {
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, p);
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
+                    }
+                }
+                gpu.cmd_end_rendering(cmd);
+            }
         }
-        self.warm_up = Some(target);
         self.warmed = true;
         eprintln!(
             "[gpu] warm-up draws for {} pipeline(s) recorded in {:.2} ms",
@@ -575,8 +736,14 @@ impl Drop for Pipelines {
                     d.destroy_pipeline(p, None);
                 }
             }
-            if let Some(t) = self.warm_up.take() {
-                t.destroy(&self.gpu);
+            if let Some(w) = self.warm_up.take() {
+                w.colour.destroy(&self.gpu);
+                if let Some(depth) = w.depth {
+                    depth.destroy(&self.gpu);
+                }
+                if let Some(vertices) = w.vertices {
+                    vertices.destroy(&self.gpu);
+                }
             }
         }
     }
@@ -600,6 +767,7 @@ fn build_one(
     layout: vk::PipelineLayout,
     d: &GraphicsDesc,
     format: vk::Format,
+    depth_format: vk::Format,
 ) -> Result<vk::Pipeline, Error> {
     let vs = shader_module(gpu, d.name, d.vertex)?;
     let fs = match shader_module(gpu, d.name, d.fragment) {
@@ -620,16 +788,45 @@ fn build_one(
             .module(fs)
             .name(c"main"),
     ];
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+    let bindings = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(d.vertex_input.map_or(0, |v| v.stride))
+        .input_rate(vk::VertexInputRate::VERTEX)];
+    let attributes: Vec<vk::VertexInputAttributeDescription> = d
+        .vertex_input
+        .iter()
+        .flat_map(|v| v.attributes.iter().enumerate())
+        .map(|(location, a)| {
+            vk::VertexInputAttributeDescription::default()
+                .location(location as u32)
+                .binding(0)
+                .format(a.format)
+                .offset(a.offset)
+        })
+        .collect();
+    let vertex_input = match d.vertex_input {
+        Some(_) => vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&bindings)
+            .vertex_attribute_descriptions(&attributes),
+        None => vk::PipelineVertexInputStateCreateInfo::default(),
+    };
     let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default().topology(d.topology);
     let viewport = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)
         .scissor_count(1);
     let raster = vk::PipelineRasterizationStateCreateInfo::default()
         .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::NONE)
+        .cull_mode(if d.cull_back {
+            vk::CullModeFlags::BACK
+        } else {
+            vk::CullModeFlags::NONE
+        })
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(d.depth == Depth::TestAndWrite)
+        .depth_write_enable(d.depth == Depth::TestAndWrite)
+        .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
     let attachment = match d.blend {
@@ -650,8 +847,12 @@ fn build_one(
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let formats = [format];
-    let mut rendering =
-        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+    let mut rendering = vk::PipelineRenderingCreateInfo::default()
+        .color_attachment_formats(&formats)
+        .depth_attachment_format(match d.depth {
+            Depth::None => vk::Format::UNDEFINED,
+            Depth::Ignore | Depth::TestAndWrite => depth_format,
+        });
     let info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)
         .vertex_input_state(&vertex_input)
@@ -659,6 +860,7 @@ fn build_one(
         .viewport_state(&viewport)
         .rasterization_state(&raster)
         .multisample_state(&multisample)
+        .depth_stencil_state(&depth_stencil)
         .color_blend_state(&blend)
         .dynamic_state(&dynamic)
         .layout(layout)

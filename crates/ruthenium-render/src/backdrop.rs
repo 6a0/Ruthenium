@@ -125,6 +125,12 @@ impl Backdrop {
         self.drawn.as_ref() == Some(background)
     }
 
+    /// The full-size image: what is behind the menus. The caller may draw it itself
+    /// (the world) and then call [`Self::blur`].
+    pub fn scene(&self) -> TextureId {
+        self.scene.id
+    }
+
     /// `(scene, blurred)` texture indices.
     pub fn textures(&self) -> (TextureId, TextureId) {
         (self.scene.id, self.a.id)
@@ -144,19 +150,41 @@ impl Backdrop {
         if self.ready(background) {
             return;
         }
+        let mut pass = encoder.texture_pass(pipelines, textures, self.scene.id);
+        // SAFETY: the push constants are background.frag's, which reads no frame data;
+        // the texture it names is the starfield.
+        unsafe {
+            pass.draw(
+                PipelineId::Background.index(),
+                &background.push_constants(stars),
+                3,
+                1,
+            )
+        };
+        pass.finish();
+        self.blur(encoder, pipelines, textures);
+        self.drawn = Some(*background);
+    }
+
+    /// Blurs the full-size image, which has just been drawn into (and is ready for
+    /// sampling), into the quarter-size one, in passes of their own. What the images
+    /// hold afterwards is no background the menus know: the next static one is drawn
+    /// anew.
+    pub fn blur(
+        &mut self,
+        encoder: &mut Encoder<'_>,
+        pipelines: &Pipelines,
+        textures: &TextureTable,
+    ) {
+        self.drawn = None;
         let mut pass = |dst: &Target, pipeline: PipelineId, push: &[u8]| {
             let mut pass = encoder.texture_pass(pipelines, textures, dst.id);
-            // SAFETY: the push constants are those of background.frag and blur.frag, which
-            // read no frame data; the textures they name are the starfield and the
-            // backdrop's other images, never the one drawn into.
+            // SAFETY: the push constants are blur.frag's, which reads no frame data; the
+            // textures they name are the backdrop's other images, never the one drawn
+            // into.
             unsafe { pass.draw(pipeline.index(), push, 3, 1) };
             pass.finish();
         };
-        pass(
-            &self.scene,
-            PipelineId::Background,
-            &background.push_constants(stars),
-        );
         pass(
             &self.a,
             PipelineId::Blur,
@@ -174,6 +202,5 @@ impl Backdrop {
                 &blur_push(&self.b, [0.0, 1.0], 1),
             );
         }
-        self.drawn = Some(*background);
     }
 }

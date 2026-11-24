@@ -395,7 +395,8 @@ impl Image {
         Image::new_2d(gpu, format, extent, mip_levels, usage)
     }
 
-    /// A 2D image with `usage`, in GPU-only memory, with a view of every mip level.
+    /// A 2D image with `usage`, in GPU-only memory, with a view of every mip level (of
+    /// its depth, for a depth attachment).
     pub(crate) fn new_2d(
         gpu: &Gpu,
         format: vk::Format,
@@ -427,12 +428,17 @@ impl Image {
                 return Err(e);
             }
         };
+        let aspect_mask = if usage.contains(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT) {
+            vk::ImageAspectFlags::DEPTH
+        } else {
+            vk::ImageAspectFlags::COLOR
+        };
         let view_info = vk::ImageViewCreateInfo::default()
             .image(raw)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(format)
             .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
+                aspect_mask,
                 base_mip_level: 0,
                 level_count: mip_levels,
                 base_array_layer: 0,

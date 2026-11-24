@@ -3,6 +3,9 @@
 //! every machine and runner that can open a window:
 //!
 //! - the colour fixture and the upload check, which also writes the adapter report;
+//! - the terrain check: a made-up scene drawn with the real terrain pipelines (vertex
+//!   layout, quad indices, pooled ranges, frame records, depth) and read back pixel by
+//!   pixel;
 //! - the streaming check (a texture larger than the upload ring in tiles, worker-written
 //!   blocks, pooled ranges) on the copy queue the GPU has and, if that is a transfer
 //!   queue, once more with every upload on the graphics queue;
@@ -23,6 +26,8 @@ const SHOWN: &[&str] = &[
     "texture table check",
     "upload check",
     "streaming check",
+    "terrain check",
+    "[terrain-check]",
     "[stream-check]",
     "[colour-check]",
     "[table-check]",
@@ -138,6 +143,10 @@ fn run_inner(root: &Path, args: &[String]) -> Result<bool, String> {
                 &adapter_arg,
             ],
         ),
+    );
+    check(
+        "terrain pipeline",
+        launch(&binary, &o, "terrain", &o.seconds, &["--exercise-terrain"]),
     );
     let streamed = check(
         "streaming, the GPU's copy queue",

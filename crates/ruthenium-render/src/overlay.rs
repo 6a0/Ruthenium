@@ -131,6 +131,11 @@ impl Overlay {
         self.set_line(3, |l| write!(l, "{}  {}", s.present, s.gpu));
     }
 
+    /// Where the overlay's panel ends, in pixels from the target's top: text laid out
+    /// below it does not run into it.
+    pub const BOTTOM: f32 =
+        MARGIN + 2.0 * PADDING + LINES as f32 * LINE_HEIGHT + PADDING + GRAPH_HEIGHT;
+
     /// The overlay's rectangles for a `width` × `height` target, back to front.
     pub fn build(&mut self, width: u32, height: u32) -> &[Rect] {
         self.rects.clear();

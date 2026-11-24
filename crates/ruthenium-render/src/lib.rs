@@ -1,6 +1,7 @@
-//! Ruthenium's renderer. For now: GPU start-up for a window, the pipeline set, the upload
-//! ring and texture table, and a frame that draws the menu background and the GUI's draw
-//! list, recorded and presented through [`ruthenium_gpu::FrameLoop`].
+//! Ruthenium's renderer: GPU start-up for a window, the pipeline set, the upload ring and
+//! texture table, and a frame that draws the world's terrain or the menu background, and
+//! the GUI's draw list over it, recorded and presented through
+//! [`ruthenium_gpu::FrameLoop`].
 
 mod backdrop;
 mod check_pass;
@@ -8,9 +9,13 @@ mod colour_check;
 mod gui;
 mod overlay;
 mod pipelines;
+#[cfg(test)]
+mod reflect;
 mod starfield;
 mod stats;
 mod table_check;
+pub mod terrain;
+mod terrain_check;
 mod terrain_vertex;
 
 pub use colour_check::ColourCheckReport;
@@ -19,18 +24,26 @@ pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
 pub use stats::{FrameTimes, Summary};
 pub use table_check::TableCheckReport;
+pub use terrain::{CameraPose, WorldAssets, WorldStats};
+pub use terrain_check::TerrainCheckReport;
 pub use terrain_vertex::{TERRAIN_VERTEX_CANDIDATES, VertexCandidate};
 
 use std::path::Path;
 use std::sync::Arc;
 
 use ruthenium_gpu::{
-    Arrival, Encoder, FrameData, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
-    PipelineCache, PipelineLayout, Pipelines, PoolStats, PresentPolicy, Presented, Screenshot,
-    StreamCheck, StreamCheckReport, SwapchainInfo, TextureDesc, TextureId, TextureTable,
-    TextureTableStats, UploadCheck, UploadCheckReport, UploadRing, UploadStats, Validation, vk,
+    Arrival, DepthTarget, Encoder, FrameData, FrameLoop, Gpu, GpuOptions, GpuTime, Instance,
+    InstanceDesc, PipelineCache, PipelineLayout, Pipelines, PoolStats, PresentPolicy, Presented,
+    Screenshot, StreamCheck, StreamCheckReport, SwapchainInfo, TextureDesc, TextureId,
+    TextureTable, TextureTableStats, UploadCheck, UploadCheckReport, UploadRing, UploadStats,
+    Validation, vk,
 };
 use ruthenium_platform::{Platform, Window};
+use ruthenium_sim::environment::Environment;
+use ruthenium_sim::scene::Scene;
+
+use terrain::world::WorldRenderer;
+use terrain::{LightmapInputs, View};
 
 /// Creates the Vulkan instance, the window's surface and the device.
 ///
@@ -83,6 +96,24 @@ impl Background {
     }
 }
 
+/// The world as one frame draws it.
+#[derive(Debug, Clone, Copy)]
+pub struct WorldFrame<'a> {
+    /// What the game thread publishes: the level, to mesh from.
+    pub scene: &'a Scene,
+    pub camera: CameraPose,
+    /// The dimension's own look: how faces are shaded, its light and its sky.
+    pub environment: &'a Environment,
+}
+
+/// The colour the world's pass is cleared to: the dimension's sky colour as its type
+/// gives it (black where it gives none). Until the sky is drawn, that is all of it.
+fn sky_colour(environment: &Environment) -> [f32; 4] {
+    let [r, g, b] =
+        terrain::colour_attribute(environment, "minecraft:visual/sky_color").unwrap_or([0.0; 3]);
+    [r, g, b, 1.0]
+}
+
 /// Staging ring size (research 04 §4.3: 8 MiB on the lowest tier, 16 MiB by default).
 const UPLOAD_RING_BYTES: u64 = 16 << 20;
 /// Bytes one frame may upload: less on integrated GPUs, which share memory bandwidth
@@ -105,6 +136,15 @@ pub struct Renderer {
     layout: PipelineLayout,
     textures: TextureTable,
     uploads: UploadRing,
+    /// The world's terrain, once its assets are loaded. After the upload ring: its
+    /// buffer pages go once the ring's copies into them have finished. (Its worker
+    /// threads, which write into the ring's staging, are stopped before anything is
+    /// dropped: see `Drop`.)
+    world: Option<WorldRenderer>,
+    /// The depth image of the passes the world is drawn in, the size of the window.
+    depth: Option<DepthTarget>,
+    /// The number of the last frame recorded.
+    last_frame: u64,
     frame_data: FrameData,
     overlay: Overlay,
     cache: PipelineCache,
@@ -115,6 +155,8 @@ pub struct Renderer {
     table_check: Option<table_check::TableCheck>,
     /// `--exercise-colour`.
     colour_check: Option<colour_check::ColourCheck>,
+    /// `--exercise-terrain`.
+    terrain_check: Option<terrain_check::TerrainCheck>,
     /// The backdrop could not be made in the last frame that wanted it.
     backdrop_failed: bool,
     /// The next presented frame is copied for a screenshot.
@@ -190,6 +232,9 @@ impl Renderer {
             layout,
             textures,
             uploads,
+            world: None,
+            depth: None,
+            last_frame: 0,
             frame_data,
             overlay: Overlay::new(),
             cache,
@@ -197,6 +242,7 @@ impl Renderer {
             check: None,
             table_check: None,
             colour_check: None,
+            terrain_check: None,
             backdrop_failed: false,
             screenshot_requested: false,
             screenshot: None,
@@ -205,6 +251,70 @@ impl Renderer {
             glass_fallbacks: 0,
             exercise_recreation: false,
         })
+    }
+
+    /// Takes the world's assets: creates the block atlas's texture (which then streams
+    /// to the GPU over the next frames) and the terrain's first buffer page, and starts
+    /// `workers` meshing threads. Call it behind a loading screen. A world already
+    /// loaded is kept as it is.
+    pub fn load_world(
+        &mut self,
+        assets: WorldAssets,
+        workers: usize,
+    ) -> Result<(), ruthenium_gpu::Error> {
+        if self.world.is_none() {
+            let gpu = self.frames.gpu().clone();
+            self.world = Some(WorldRenderer::new(
+                &gpu,
+                &mut self.textures,
+                &mut self.uploads,
+                assets,
+                workers,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Whether the world's assets are loaded ([`Self::load_world`]).
+    pub fn has_world(&self) -> bool {
+        self.world.is_some()
+    }
+
+    /// Whether frames given a world draw it: its atlas, light map and indices have
+    /// arrived on the GPU.
+    pub fn world_ready(&self) -> bool {
+        self.world.as_ref().is_some_and(|w| w.ready(&self.textures))
+    }
+
+    /// How far the block atlas has got on its way to the GPU, 0 to 1.
+    pub fn world_progress(&self) -> f32 {
+        self.world
+            .as_ref()
+            .map_or(0.0, |w| w.atlas_progress(&self.textures))
+    }
+
+    /// Forgets every section's mesh: the session they were of has ended. The assets
+    /// stay for the next one.
+    pub fn clear_world(&mut self) {
+        if let Some(w) = &mut self.world {
+            w.clear(&mut self.uploads, self.last_frame);
+        }
+    }
+
+    /// What the terrain is doing, if a world is loaded.
+    pub fn world_stats(&self) -> Option<WorldStats> {
+        self.world.as_ref().map(WorldRenderer::stats)
+    }
+
+    /// Makes the depth image the size of the target the world is drawn into.
+    fn ensure_depth(&mut self, extent: vk::Extent2D) -> Result<(), ruthenium_gpu::Error> {
+        if self.depth.as_ref().is_some_and(|d| d.extent() == extent) {
+            return Ok(());
+        }
+        // The old one first: it waits for the frames that used it.
+        self.depth = None;
+        self.depth = Some(DepthTarget::new(self.frames.gpu().clone(), extent)?);
+        Ok(())
     }
 
     /// Starts checking every frame that uploads arrive intact (see [`UploadCheck`]).
@@ -281,6 +391,27 @@ impl Renderer {
             )?);
         }
         Ok(())
+    }
+
+    /// Starts drawing and reading back the terrain fixture every frame (see
+    /// [`TerrainCheckReport`]).
+    pub fn enable_terrain_check(&mut self) -> Result<(), ruthenium_gpu::Error> {
+        if self.terrain_check.is_none() {
+            self.terrain_check = Some(terrain_check::TerrainCheck::new(
+                self.frames.gpu().clone(),
+                self.pipelines.format(),
+                &mut self.textures,
+                &mut self.uploads,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// What the terrain check has seen, if it is on.
+    pub fn terrain_check(&self) -> Option<TerrainCheckReport> {
+        self.terrain_check
+            .as_ref()
+            .map(terrain_check::TerrainCheck::report)
     }
 
     /// What the colour check has seen, if it is on.
@@ -459,14 +590,19 @@ impl Renderer {
         Ok(true)
     }
 
-    /// Records, submits and presents one frame showing `background`, then the GUI.
+    /// Records, submits and presents one frame: the world if one is given and its
+    /// assets have arrived, else `background`; then the GUI over it. Under menus with
+    /// glass shapes the world is drawn into the backdrop they sample instead of the
+    /// window.
     pub fn render(
         &mut self,
         background: &Background,
+        world: Option<WorldFrame<'_>>,
         gui: Option<GuiFrame<'_>>,
     ) -> Result<FrameReport, ruthenium_gpu::Error> {
         profiling::scope!("render");
         let (mut ctx, gpu_time) = self.frames.begin()?;
+        self.last_frame = ctx.number;
         let completed = self.frames.completed()?;
         // The swapchain this frame draws to, replaced first if the window changed, so that
         // everything below is chosen and recorded for its format and size.
@@ -478,8 +614,34 @@ impl Renderer {
         if let Some(s) = surface {
             self.ensure_format(s.format)?;
         }
-        let wants_backdrop = gui.is_some_and(|g| !g.shapes.is_empty());
+        // Only glass samples what is behind the menus.
+        let wants_backdrop = gui.is_some_and(|g| g.shapes.iter().any(|s| s.glass));
         self.update_backdrop(wants_backdrop, surface);
+        // The world's work that stages uploads, before the frame's copies are recorded:
+        // what changed in the level, finished meshes, new jobs.
+        let view = match (&world, surface, &mut self.world) {
+            (Some(w), Some(s), Some(renderer)) => {
+                let section = w.camera.position.map(|c| (c.floor() as i32) >> 4);
+                renderer.set_shades(w.environment.cardinal_light.shades());
+                renderer.update(
+                    w.scene,
+                    section,
+                    &mut self.textures,
+                    &mut self.uploads,
+                    LightmapInputs::of(w.environment),
+                    ctx.number,
+                );
+                let aspect = s.extent.width as f32 / s.extent.height.max(1) as f32;
+                Some((View::new(&w.camera, aspect), sky_colour(w.environment)))
+            }
+            _ => None,
+        };
+        if let (Some(_), Some(s)) = (&view, surface) {
+            self.ensure_depth(s.extent)?;
+        }
+        if let Some(c) = &mut self.terrain_check {
+            c.stage(&mut self.uploads);
+        }
         // SAFETY: ctx.cmd is recording frame ctx.number on the graphics queue; completed
         // was just read from the timeline; every upload destination is owned by self and
         // outlives the frame.
@@ -500,6 +662,14 @@ impl Renderer {
                 self.frames.zone_end(&ctx, zone);
             }
         }
+        // The meshes whose copies this frame may read take their sections' places.
+        if let (Some(w), Some(renderer)) = (&world, &mut self.world) {
+            renderer.install_ready(w.scene, &self.uploads, ctx.number);
+        }
+        // The world is drawn once everything its draws read has arrived.
+        let view = view.filter(|_| {
+            self.depth.is_some() && self.world.as_ref().is_some_and(|w| w.ready(&self.textures))
+        });
         self.frame_data.begin_frame(ctx.slot());
         let gpu = self.frames.gpu().clone();
         // SAFETY: the layout was made of the texture table's and the frame data's set
@@ -515,18 +685,38 @@ impl Renderer {
         }
         // Off-screen passes, before the late acquire: the backdrop for this swapchain's
         // size and format. It stays drawn if the acquire then gives no image.
+        let mut world_in_backdrop = false;
         let backdrop = match (&mut self.backdrop, surface) {
             (Some(b), Some(s)) if wants_backdrop && b.matches(s.format, s.extent) => {
                 let zone = self.frames.zone_begin(&ctx, "backdrop");
                 // Its images were created before this frame's begin_frame, and the
                 // pipelines are for this format.
-                b.record(
-                    &mut encoder,
-                    &self.pipelines,
-                    &self.textures,
-                    background,
-                    self.stars,
-                );
+                match (&view, &mut self.world, &self.depth) {
+                    // The world is what is behind the menu: drawn into the backdrop's
+                    // full-size image, then blurred like any background.
+                    (Some((view, sky)), Some(renderer), Some(depth)) => {
+                        let mut pass = encoder.texture_pass_with_depth(
+                            &self.pipelines,
+                            &self.textures,
+                            b.scene(),
+                            depth,
+                            *sky,
+                        );
+                        // SAFETY: `view` is only kept once the world is ready, and this
+                        // frame's uploads are recorded and its meshes installed.
+                        unsafe { renderer.draw(&mut pass, &mut self.frame_data, view) };
+                        pass.finish();
+                        b.blur(&mut encoder, &self.pipelines, &self.textures);
+                        world_in_backdrop = true;
+                    }
+                    _ => b.record(
+                        &mut encoder,
+                        &self.pipelines,
+                        &self.textures,
+                        background,
+                        self.stars,
+                    ),
+                }
                 self.frames.zone_end(&ctx, zone);
                 Some(b.textures())
             }
@@ -538,6 +728,19 @@ impl Renderer {
                 &mut encoder,
                 completed,
                 &self.textures,
+                &mut self.frame_data,
+                &self.pipelines,
+            )?;
+            self.frames.zone_end(&ctx, zone);
+        }
+        if let Some(c) = &mut self.terrain_check {
+            let zone = self.frames.zone_begin(&ctx, "terrain check");
+            c.step(
+                &mut encoder,
+                completed,
+                ctx.number,
+                &self.textures,
+                &self.uploads,
                 &mut self.frame_data,
                 &self.pipelines,
             )?;
@@ -572,23 +775,48 @@ impl Renderer {
             // check's patches.
             let wanted_shot = self.screenshot_requested && self.screenshot.is_none();
             let mut checked = false;
-            let mut pass = encoder.window_pass(&self.pipelines, &t);
+            // The world goes straight into the window unless it went into the backdrop:
+            // then the window's pass has a depth attachment, and what is drawn over the
+            // world uses the pipelines built for one.
+            let in_window = match (&view, &self.depth) {
+                (Some((view, sky)), Some(depth)) if !world_in_backdrop => Some((view, *sky, depth)),
+                _ => None,
+            };
+            let over = |id: PipelineId| {
+                if in_window.is_some() {
+                    id.over_world().index()
+                } else {
+                    id.index()
+                }
+            };
+            let mut pass = match in_window {
+                Some((_, sky, depth)) => {
+                    encoder.window_pass_with_depth(&self.pipelines, &t, depth, sky)
+                }
+                None => encoder.window_pass(&self.pipelines, &t),
+            };
             // SAFETY (every draw of the pass): each block of push constants is laid out
             // as its pipeline's shaders declare it; the elements it points at were
             // written into the frame's data just before; texture indices are ones this
             // renderer's table handed out (the starfield, the backdrop's images, the
-            // GUI's textures, the colour check's), and none is the window.
+            // GUI's textures, the colour check's), and none is the window. The world is
+            // drawn only once it is ready, after this frame's uploads were recorded and
+            // its meshes installed.
             unsafe {
-                // The background covers every pixel, so the old contents are never
-                // loaded. With a backdrop, it is already drawn: copy it.
-                match backdrop {
-                    Some((scene, _)) => pass.draw(
+                // The world, or a background that covers every pixel (so the old
+                // contents are never loaded); with a backdrop, that is already drawn:
+                // copy it.
+                match (in_window, &mut self.world, backdrop) {
+                    (Some((view, ..)), Some(renderer), _) => {
+                        renderer.draw(&mut pass, &mut self.frame_data, view);
+                    }
+                    (_, _, Some((scene, _))) => pass.draw(
                         PipelineId::Blur.index(),
                         &backdrop::blur_push_copy(scene),
                         3,
                         1,
                     ),
-                    None => pass.draw(
+                    _ => pass.draw(
                         PipelineId::Background.index(),
                         &background.push_constants(self.stars),
                         3,
@@ -604,7 +832,7 @@ impl Renderer {
                     push[0..8].copy_from_slice(&screen);
                     push[8..12].copy_from_slice(&(g.scale as f32).to_ne_bytes());
                     push[12..16].copy_from_slice(&first.to_ne_bytes());
-                    pass.draw(PipelineId::Gui.index(), &push, 6, g.quads.len() as u32);
+                    pass.draw(over(PipelineId::Gui), &push, 6, g.quads.len() as u32);
                 }
                 if let Some(g) = gui.filter(|g| !g.shapes.is_empty())
                     && let Some((first, bytes)) = self
@@ -620,7 +848,7 @@ impl Renderer {
                     push[12..16].copy_from_slice(&blurred.index().to_ne_bytes());
                     push[16..20].copy_from_slice(&first.to_ne_bytes());
                     push[20..24].copy_from_slice(&u32::from(backdrop.is_some()).to_ne_bytes());
-                    pass.draw(PipelineId::Shape.index(), &push, 6, g.shapes.len() as u32);
+                    pass.draw(over(PipelineId::Shape), &push, 6, g.shapes.len() as u32);
                 }
                 if let Some(g) = gui.filter(|g| !g.glyphs.is_empty())
                     && let Some((first, bytes)) = self
@@ -632,7 +860,7 @@ impl Renderer {
                     push[0..8].copy_from_slice(&screen);
                     push[8..12].copy_from_slice(&g.font_atlas.to_ne_bytes());
                     push[12..16].copy_from_slice(&first.to_ne_bytes());
-                    pass.draw(PipelineId::Text.index(), &push, 6, g.glyphs.len() as u32);
+                    pass.draw(over(PipelineId::Text), &push, 6, g.glyphs.len() as u32);
                 }
                 let rects = self.overlay.build(t.extent.width, t.extent.height);
                 if let Some((first, bytes)) = self
@@ -644,7 +872,7 @@ impl Renderer {
                     let mut push = [0u8; 12];
                     push[0..8].copy_from_slice(&screen);
                     push[8..12].copy_from_slice(&first.to_ne_bytes());
-                    pass.draw(PipelineId::Overlay.index(), &push, 6, rects.len() as u32);
+                    pass.draw(over(PipelineId::Overlay), &push, 6, rects.len() as u32);
                 }
                 // The colour check's patches, over everything else in the window's top
                 // left corner.
@@ -657,7 +885,7 @@ impl Renderer {
                 {
                     gui::write_quads(&c.quads(), bytes);
                     let push = check_pass::pixel_quads_push(t.extent.width, t.extent.height, first);
-                    pass.draw(PipelineId::Gui.index(), &push, 6, 2);
+                    pass.draw(over(PipelineId::Gui), &push, 6, 2);
                     checked = true;
                 }
             }
@@ -687,5 +915,15 @@ impl Renderer {
             presented,
             gpu_time,
         })
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // The meshing threads write into the upload ring's staging memory: they end
+        // before any field goes.
+        if let Some(w) = &mut self.world {
+            w.stop_workers();
+        }
     }
 }

@@ -12,6 +12,7 @@
 
 mod budget;
 mod buffer_pool;
+mod depth;
 mod device;
 mod encoder;
 mod frame;
@@ -36,6 +37,7 @@ mod users;
 pub use ash::vk;
 pub use budget::{Pacing, PacingConfig, UploadPhase};
 pub use buffer_pool::{BufferPool, PooledBuffer};
+pub use depth::{DEPTH_CLEAR, DepthTarget};
 pub use device::{
     DEFAULT_TEXTURE_SLOTS, DescriptorLimits, DeviceCaps, Gpu, GpuOptions, MAX_TEXTURE_SLOTS,
     MIN_TEXTURE_SLOTS, OptionalFeatures, PortabilitySubset, PretendSrgb, Rejected,
@@ -50,8 +52,8 @@ pub use frame_data::{FRAME_DATA_SET, FrameData};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};
 pub use memory::{HeapReport, MemoryReport, texel_bytes};
 pub use pipeline::{
-    Blend, GraphicsDesc, InterfaceHash, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache,
-    PipelineLayout, Pipelines, interface_hash,
+    Blend, Depth, GraphicsDesc, InterfaceHash, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES,
+    PipelineCache, PipelineLayout, Pipelines, VertexInput, interface_hash,
 };
 pub use pool::{PoolConfig, PoolError, PoolStats, PooledRange, RangeHandle, RangePool};
 pub use readback::Readback;

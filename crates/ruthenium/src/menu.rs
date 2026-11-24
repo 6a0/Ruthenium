@@ -343,6 +343,11 @@ pub struct Menu {
     death: Option<DeathForm>,
     /// Input in the world.
     game: InGame,
+    /// The session the terrain's meshes are of ended or was replaced: the renderer
+    /// forgets them in the next frame.
+    forget_world: bool,
+    /// Meshing threads to start with the world's assets.
+    mesh_workers: usize,
 }
 
 impl std::fmt::Debug for Menu {
@@ -447,6 +452,39 @@ impl Menu {
             leaving: false,
             death: None,
             game: InGame::default(),
+            forget_world: false,
+            mesh_workers: default_mesh_workers(),
+        }
+    }
+
+    /// Sets how many threads mesh the world's sections.
+    pub fn set_mesh_workers(&mut self, workers: usize) {
+        self.mesh_workers = workers.max(1);
+    }
+
+    /// The world to draw this frame, if the session is in one.
+    pub fn world_view(&self) -> Option<crate::ingame::WorldView> {
+        crate::ingame::world_view(self.session.as_ref()?, Instant::now())
+    }
+
+    /// Hands the world's drawing assets to the renderer once they are built (they
+    /// start building when the first session starts), and has it forget the meshes of
+    /// a session that is over.
+    fn sync_world(&mut self, renderer: &mut Renderer) {
+        if std::mem::take(&mut self.forget_world) {
+            renderer.clear_world();
+        }
+        if self.session.is_none() || renderer.has_world() {
+            return;
+        }
+        let Some(joiner) = &mut self.joiner else {
+            return;
+        };
+        joiner.start_world_assets(renderer.gpu().caps().max_image_dimension_2d);
+        if let Some(assets) = joiner.take_world_assets()
+            && let Err(e) = renderer.load_world(assets, self.mesh_workers)
+        {
+            eprintln!("[ruthenium] the world is not drawn: {e}");
         }
     }
 
@@ -495,6 +533,7 @@ impl Menu {
         self.leaving = false;
         // A session still closing is dropped (and so disconnected) here.
         self.session = None;
+        self.forget_world = true;
         let started = match &mut self.joiner {
             Some(j) => j.join(address, &self.accounts),
             None => Err("Joining servers isn't possible here".into()),
@@ -714,6 +753,7 @@ impl Menu {
                 }
                 SessionEvent::Closed(c) => {
                     self.session = None;
+                    self.forget_world = true;
                     if self.leaving || crate::join::left_on_purpose(&c) {
                         self.leaving = false;
                     } else {
@@ -1826,6 +1866,7 @@ impl Menu {
         self.last_frame = Some(now);
         let scale = self.layout(pixel_size);
         self.poll_session();
+        self.sync_world(renderer);
         if matches!(self.screen, Screen::Game) && self.game.should_pause() {
             self.pause();
         }
@@ -1891,11 +1932,17 @@ impl Menu {
             Screen::Game => {
                 let view = self.session.as_ref().and_then(Session::view);
                 let world = self.session.as_ref().and_then(crate::ingame::scene_line);
+                let terrain = renderer
+                    .world_stats()
+                    .map(|s| crate::ingame::terrain_lines(&s));
                 crate::ingame::draw_hud(
                     crate::ingame::HudText {
                         view: view.as_ref(),
                         world: world.as_deref(),
+                        terrain: terrain.as_deref(),
                         server: &self.server_name,
+                        drawn: renderer.world_ready(),
+                        debug: self.settings.settings.frame_stats,
                     },
                     &scale,
                     &self.fonts,
@@ -2046,6 +2093,14 @@ impl Menu {
             s.screen.select(Some(i));
         }
     }
+}
+
+/// How many threads mesh the world unless told otherwise: half of what the machine has
+/// beyond the main thread and the game thread, four at most. The game thread's ticks
+/// and the frames come first.
+pub fn default_mesh_workers() -> usize {
+    let threads = std::thread::available_parallelism().map_or(4, usize::from);
+    (threads.saturating_sub(2) / 2).clamp(1, 4)
 }
 
 #[cfg(test)]

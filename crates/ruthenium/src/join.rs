@@ -7,10 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use ruthenium_assets::atlas::AtlasOptions;
 use ruthenium_assets::zip::Zip;
+use ruthenium_assets::{BlockModels, Id, Image, Pack, Resources};
 use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, Reason, Stage};
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
+use ruthenium_render::WorldAssets;
+use ruthenium_render::terrain::BlockTable;
 use ruthenium_sim::blocks::Blocks;
 use ruthenium_sim::enchantment::Enchantments;
 use ruthenium_sim::entity::EntityTypes;
@@ -220,10 +224,103 @@ fn enchantments(jar: &Zip) -> Enchantments {
     Enchantments::from_json_files(files)
 }
 
+/// The `bars` block tag as the game's own data pack has it.
+const BARS_TAG: &str = "data/minecraft/tags/block/bars.json";
+/// The grass colour map, whose default colour tints grass until biomes do.
+const GRASS_MAP: &str = "textures/colormap/grass.png";
+
+/// Builds what drawing a world needs from the imported game in `game`: the block atlas
+/// with its mip levels, and every block state's baked model and drawing rules.
+/// `max_texture` is the largest texture the GPU takes.
+pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, String> {
+    let started = std::time::Instant::now();
+    let version = ruthenium_prepare::supported_version();
+    let imported = ruthenium_prepare::import::open(version, game)
+        .ok_or("the game files are not imported; run `ruthenium prepare`")?;
+    let pack = Pack::vanilla(
+        &imported.client_jar,
+        &imported.asset_index(),
+        &imported.assets.join("objects"),
+    )
+    .map_err(|e| format!("cannot open the game files: {e}"))?;
+    let resources = Resources::new(vec![pack]);
+    let def = ruthenium_assets::atlas::atlas_def("blocks").expect("a known atlas");
+    let options = AtlasOptions {
+        max_size: max_texture,
+        ..AtlasOptions::default()
+    };
+    let atlas = ruthenium_assets::atlas::build(&resources, def, &options)
+        .map_err(|e| format!("the block atlas: {e}"))?;
+    let stitched = started.elapsed();
+    let models = BlockModels::bake(&resources, &atlas);
+    for w in &models.warnings {
+        eprintln!("[ruthenium] block models: {w}");
+    }
+    // The pixel the game reads for a temperature of 0.5 and a downfall of 1
+    // (`GrassColor.getDefaultColor`); its own stand-in where the map is missing.
+    let grass_id = Id::minecraft(GRASS_MAP).expect("a valid id");
+    let grass_default = resources
+        .get(&grass_id)
+        .and_then(|r| r.read().ok())
+        .and_then(|bytes| Image::decode_png(&bytes).ok())
+        .filter(|map| map.width == 256 && map.height == 256)
+        .map_or(0xFFFF_00FF, |map| map.get(127, 127));
+    let bars: Vec<String> = Zip::open(&imported.client_jar)
+        .ok()
+        .and_then(|jar| {
+            let bytes = jar.read(jar.find(BARS_TAG)?).ok()?;
+            let tag: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            Some(
+                tag.get("values")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+    let exports = ruthenium_prepare::exporters::exports_dir(&imported);
+    let table = BlockTable::load(&exports, models, grass_default, &|name| {
+        bars.iter().any(|b| b == name)
+    })
+    .map_err(|e| format!("{e}; run `ruthenium prepare`"))?;
+    let atlas_levels: Vec<Vec<u8>> = atlas.levels.iter().map(Image::to_rgba8).collect();
+    eprintln!(
+        "[ruthenium] world assets in {:.0?}: block atlas {}x{} with {} levels ({:.1} MiB, {:.0?}), {} of {} block states drawn from {} model parts",
+        started.elapsed(),
+        atlas.width,
+        atlas.height,
+        atlas_levels.len(),
+        atlas_levels.iter().map(Vec::len).sum::<usize>() as f64 / f64::from(1 << 20),
+        stitched,
+        table.drawn_states(),
+        ruthenium_data::v26_3::blocks::STATE_COUNT,
+        table.part_count(),
+    );
+    Ok(WorldAssets {
+        table: Arc::new(table),
+        atlas_width: atlas.width,
+        atlas_height: atlas.height,
+        atlas_levels,
+    })
+}
+
+/// The world's drawing assets on their way: built on a thread from the first join on.
+#[derive(Debug, Default)]
+enum WorldLoad {
+    #[default]
+    NotStarted,
+    Loading(JoinHandle<Result<WorldAssets, String>>),
+    /// Handed over, or failed (said once).
+    Done,
+}
+
 /// Starts joining servers: loads the game data on a thread meanwhile.
 #[derive(Debug)]
 pub struct Joiner {
     data: Data,
+    game: Option<PathBuf>,
+    world: WorldLoad,
     /// For the services' discovery document (online logins).
     #[cfg_attr(feature = "dev-offline", allow(dead_code))]
     cache_dir: Option<PathBuf>,
@@ -238,7 +335,7 @@ enum Data {
 impl Joiner {
     /// `game`: the imported game files; `cache_dir`: for the services' discovery document.
     pub fn new(game: Option<PathBuf>, cache_dir: Option<PathBuf>) -> Joiner {
-        let data = match game {
+        let data = match game.clone() {
             Some(dir) => match std::thread::Builder::new()
                 .name("game-data".into())
                 .spawn(move || GameData::load(&dir))
@@ -248,7 +345,54 @@ impl Joiner {
             },
             None => Data::Ready(Arc::default()),
         };
-        Joiner { data, cache_dir }
+        Joiner {
+            data,
+            game,
+            world: WorldLoad::NotStarted,
+            cache_dir,
+        }
+    }
+
+    /// Starts building the world's drawing assets on a thread, the first time it is
+    /// called (when a world is first entered).
+    pub fn start_world_assets(&mut self, max_texture: u32) {
+        if !matches!(self.world, WorldLoad::NotStarted) {
+            return;
+        }
+        self.world = match self.game.clone().map(|game| {
+            std::thread::Builder::new()
+                .name("world-assets".into())
+                .spawn(move || load_world_assets(&game, max_texture))
+        }) {
+            Some(Ok(thread)) => WorldLoad::Loading(thread),
+            _ => {
+                eprintln!(
+                    "[ruthenium] the world is not drawn: there are no game files to draw it from"
+                );
+                WorldLoad::Done
+            }
+        };
+    }
+
+    /// The world's drawing assets once they are built: handed over once.
+    pub fn take_world_assets(&mut self) -> Option<WorldAssets> {
+        if !matches!(&self.world, WorldLoad::Loading(t) if t.is_finished()) {
+            return None;
+        }
+        let WorldLoad::Loading(thread) = std::mem::replace(&mut self.world, WorldLoad::Done) else {
+            unreachable!()
+        };
+        match thread.join() {
+            Ok(Ok(assets)) => Some(assets),
+            Ok(Err(e)) => {
+                eprintln!("[ruthenium] the world is not drawn: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!("[ruthenium] the world is not drawn: its assets' thread panicked");
+                None
+            }
+        }
     }
 
     /// The game data, waiting for it if it is still loading.

@@ -12,7 +12,15 @@ workspace = true
 
 [dependencies]
 profiling = "1.0.18"
+ruthenium-assets = { path = "../ruthenium-assets" }
+ruthenium-data = { path = "../ruthenium-data" }
 ruthenium-gpu = { path = "../ruthenium-gpu" }
 ruthenium-platform = { path = "../ruthenium-platform" }
+ruthenium-prepare = { path = "../ruthenium-prepare" }
 ruthenium-shaders = { path = "../ruthenium-shaders" }
+ruthenium-sim = { path = "../ruthenium-sim" }
+serde_json = "1.0.154"
 ruthenium-ui = { path = "../ruthenium-ui" }
+
+[dev-dependencies]
+ruthenium-protocol = { path = "../ruthenium-protocol" }

@@ -13,6 +13,12 @@ use std::process::{Command, ExitCode};
 
 use sha2::{Digest, Sha256};
 
+/// The tables the world shaders' accessors are written from. Included as source: the
+/// xtask must build without the compiled shaders it is about to write.
+#[path = "../../crates/ruthenium-shaders/src/interface.rs"]
+#[allow(dead_code)]
+mod interface;
+
 const SDK_VERSION: &str = "1.4.363.1";
 const SDK_URL: &str =
     "https://sdk.lunarg.com/sdk/download/1.4.363.1/linux/vulkansdk-linux-x86_64-1.4.363.1.tar.xz";
@@ -80,6 +86,18 @@ fn run_inner(root: &Path, args: &[String]) -> Result<ExitCode, String> {
     let tmp = root.join("target/shaders");
     std::fs::create_dir_all(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
     let mut outputs: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    // The generated include first: the shaders compiled below read it. A check compiles
+    // against the committed one and reports it if it is stale.
+    let world = glsl.join("include/world.glsl");
+    let generated = interface::world_glsl().into_bytes();
+    if !check && std::fs::read(&world).ok().as_deref() != Some(generated.as_slice()) {
+        std::fs::write(&world, &generated).map_err(|e| format!("{}: {e}", world.display()))?;
+        println!(
+            "updated {}",
+            world.strip_prefix(root).unwrap_or(&world).display()
+        );
+    }
+    outputs.push((world, generated));
     for name in &sources {
         let out = tmp.join(format!("{name}.spv"));
         // Relative paths from inside glsl/, so nothing machine-specific reaches the output.

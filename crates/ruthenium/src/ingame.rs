@@ -1,6 +1,7 @@
 //! In the world: the mouse grabbed and turning the camera, the movement, hotbar and
-//! swap-hands keys, the use button and the scroll wheel handed to the game thread, and, until the world is drawn, a
-//! readout of where the player is.
+//! swap-hands keys, the use button and the scroll wheel handed to the game thread; where
+//! the world is seen from; and a readout of where the player is and what the terrain is
+//! doing (always while the world can't be drawn, else with the frame statistics).
 //!
 //! Vanilla's rules: keys count only while no screen is open (`KeyMapping.releaseAll`
 //! when one opens); the mouse's motion is summed over a frame and turns the camera once
@@ -10,9 +11,14 @@
 
 use std::time::{Duration, Instant};
 
+use std::sync::Arc;
+
 use ruthenium_data::v26_3::registries::MobEffect;
+use ruthenium_render::{CameraPose, WorldStats};
+use ruthenium_sim::environment::Environment;
 use ruthenium_sim::input::{self, HeldKeys, KeyBinds, MouseMotion, MouseOptions, ScrollWheel};
 use ruthenium_sim::player::Pose;
+use ruthenium_sim::scene::Scene;
 use ruthenium_sim::session::{PlayerView, Session};
 use ruthenium_ui::modern::{Rect, ShapeList, UiScale};
 use ruthenium_ui::text::{Fonts, GlyphAtlas, TextList, TextStyle, Weight};
@@ -138,6 +144,79 @@ impl InGame {
     }
 }
 
+/// The field of view from top to bottom, in degrees: the FOV option's default.
+const FOV: f32 = 70.0;
+
+/// What a frame draws of the world: what the game thread published, and where it is
+/// seen from.
+#[derive(Debug, Clone)]
+pub struct WorldView {
+    pub scene: Scene,
+    pub camera: CameraPose,
+    pub environment: Arc<Environment>,
+}
+
+/// The world as the session's latest frame has it, seen from the player's eyes: the
+/// player's place between its last two ticks (`now` says how far), looking where the
+/// mouse has turned to since.
+pub fn world_view(session: &Session, now: Instant) -> Option<WorldView> {
+    let camera = session.camera()?;
+    let f = &camera.frame;
+    let t = f64::from(f.partial_tick(now));
+    let p = &f.player;
+    let mut position: [f64; 3] =
+        std::array::from_fn(|i| p.old_position[i] + (p.position[i] - p.old_position[i]) * t);
+    position[1] += f64::from(p.eye_height);
+    Some(WorldView {
+        scene: session.scene().clone(),
+        camera: CameraPose {
+            position,
+            y_rot: camera.y_rot,
+            x_rot: camera.x_rot,
+            fov: FOV,
+        },
+        environment: f.environment.clone(),
+    })
+}
+
+/// What the terrain is doing, as lines for the readout.
+pub fn terrain_lines(s: &WorldStats) -> String {
+    let mib = |bytes: u64| bytes as f64 / f64::from(1 << 20);
+    let average = if s.tracker.jobs == 0 {
+        0.0
+    } else {
+        s.mesh_micros as f64 / s.tracker.jobs as f64
+    };
+    format!(
+        "Terrain: {} sections with a mesh of {} ({} waiting, {} jobs out, {} on their way); drawn {} of {} tested, {} quads in {} draws with {} buffer binds\n\
+         Meshed {} times ({} for the player's changes, {} stale, {} waits for neighbours), {:.2} ms a section, slowest {:.2} ms; to the screen in at most {:.1} ms\n\
+         Pages {:.1} MiB holding {:.1} MiB ({:.0} planned); left out: {} translucent quads, {} meshes for memory, {} sections a frame's data had no room for",
+        s.meshed,
+        s.sections,
+        s.dirty,
+        s.jobs_out,
+        s.pending,
+        s.visible,
+        s.tested,
+        s.quads,
+        s.draws,
+        s.binds,
+        s.tracker.jobs,
+        s.tracker.urgent_jobs,
+        s.tracker.stale,
+        s.tracker.waits_for_neighbours,
+        average / 1000.0,
+        s.slowest_mesh_micros as f64 / 1000.0,
+        s.slowest_install_ms,
+        mib(s.pool.reserved_bytes),
+        mib(s.pool.payload_bytes),
+        mib(ruthenium_render::terrain::POOL_ENVELOPE),
+        s.translucent_quads,
+        s.dropped,
+        s.overflowed,
+    )
+}
+
 /// `Mth.wrapDegrees` for floats.
 fn wrap_degrees(v: f32) -> f32 {
     let mut w = v % 360.0;
@@ -192,12 +271,17 @@ pub fn scene_line(session: &Session) -> Option<String> {
 }
 
 /// What the HUD's text says: the player as of its last tick, the published scene
-/// ([`scene_line`]) and the server's name.
+/// ([`scene_line`]), the terrain ([`terrain_lines`]) and the server's name.
 #[derive(Debug, Clone, Copy)]
 pub struct HudText<'a> {
     pub view: Option<&'a PlayerView>,
     pub world: Option<&'a str>,
+    pub terrain: Option<&'a str>,
     pub server: &'a str,
+    /// The world is drawn behind the HUD.
+    pub drawn: bool,
+    /// Show the readout over a drawn world too (with the frame statistics).
+    pub debug: bool,
 }
 
 pub fn draw_hud(
@@ -211,7 +295,10 @@ pub fn draw_hud(
     let HudText {
         view,
         world,
+        terrain,
         server,
+        drawn,
+        debug,
     } = hud;
     let (cx, cy) = (scale.width / 2.0, scale.height / 2.0);
     let white = [1.0, 1.0, 1.0, 0.9];
@@ -238,6 +325,10 @@ pub fn draw_hud(
         white,
     );
     let Some(atlas) = atlas else { return };
+    // Over a drawn world there is only the crosshair, unless the statistics are on.
+    if drawn && !debug {
+        return;
+    }
     let style = |size: f32, weight| TextStyle {
         size: size * scale.px,
         weight,
@@ -327,20 +418,28 @@ pub fn draw_hud(
             }
             lines.push((hands, body));
             lines.push((format!("{} ({} chunks)", v.dimension, v.chunks), body));
-            for line in world.into_iter().flat_map(str::lines) {
+            for line in world.into_iter().chain(terrain).flat_map(str::lines) {
                 lines.push((line.to_owned(), body));
             }
         }
         None => lines.push(("Joining...".into(), body)),
     }
-    let mut y = 36.0 * scale.px;
+    // Below the frame statistics, which sit in the same corner.
+    let mut y = if debug {
+        ruthenium_render::Overlay::BOTTOM + 28.0 * scale.px
+    } else {
+        36.0 * scale.px
+    };
     for (s, st) in &lines {
         let line = fonts.shape(s, *st);
         text.line(atlas, &line, 24.0 * scale.px, y, white);
         y += st.size * 1.5;
     }
+    if drawn {
+        return;
+    }
     let hint = fonts.shape(
-        "Ruthenium can't draw the world yet. Esc for the menu.",
+        "The world isn't drawn yet. Esc for the menu.",
         style(15.0, Weight::MEDIUM),
     );
     text.line(

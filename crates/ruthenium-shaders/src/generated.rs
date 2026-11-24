@@ -31,6 +31,15 @@ pub static SHAPE_FRAG: Spirv = crate::spirv!("shape.frag");
 /// `glsl/shape.vert`
 pub static SHAPE_VERT: Spirv = crate::spirv!("shape.vert");
 
+/// `glsl/terrain.frag`
+pub static TERRAIN_FRAG: Spirv = crate::spirv!("terrain.frag");
+
+/// `glsl/terrain.vert`
+pub static TERRAIN_VERT: Spirv = crate::spirv!("terrain.vert");
+
+/// `glsl/terrain_cutout.frag`
+pub static TERRAIN_CUTOUT_FRAG: Spirv = crate::spirv!("terrain_cutout.frag");
+
 /// `glsl/text.frag`
 pub static TEXT_FRAG: Spirv = crate::spirv!("text.frag");
 
@@ -48,6 +57,9 @@ pub static ALL: &[&Spirv] = &[
     &OVERLAY_VERT,
     &SHAPE_FRAG,
     &SHAPE_VERT,
+    &TERRAIN_FRAG,
+    &TERRAIN_VERT,
+    &TERRAIN_CUTOUT_FRAG,
     &TEXT_FRAG,
     &TEXT_VERT,
 ];

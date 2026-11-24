@@ -2177,6 +2177,7 @@ dependencies = [
  "png",
  "rayon",
  "regex",
+ "ruthenium-data",
  "serde_json",
 ]
 
@@ -2263,10 +2264,16 @@ name = "ruthenium-render"
 version = "0.0.0"
 dependencies = [
  "profiling",
+ "ruthenium-assets",
+ "ruthenium-data",
  "ruthenium-gpu",
  "ruthenium-platform",
+ "ruthenium-prepare",
+ "ruthenium-protocol",
  "ruthenium-shaders",
+ "ruthenium-sim",
  "ruthenium-ui",
+ "serde_json",
 ]
 
 [[package]]
