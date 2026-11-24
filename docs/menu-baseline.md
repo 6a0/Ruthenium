@@ -236,6 +236,49 @@ The renderer no longer issues Vulkan commands: the window pass, the backdrop's p
 
 `--adapter-report <file>` writes what the GPU reported and what was chosen from it: descriptor limits and the table's path, optional features, the portability subset's features and `minVertexInputBindingStrideAlignment` where a device has them, and whether the two candidate terrain vertex layouts (16 and 20 bytes, in formats every Vulkan device reads from vertex buffers) can be drawn and with which stride. Both GPUs here take both at their own size. `cargo xtask bundle` assembles `Ruthenium.app` with MoltenVK 1.4.2 (pinned by the release archive's SHA-256) in `Contents/Frameworks`, which the client loads through SDL when it runs from the bundle. **None of this has run on a Mac yet:** the bundle's layout was checked on Linux, and the CI job that builds it and runs the fixtures from it on a macOS runner has not run.
 
+## Streaming uploads
+
+Recorded on 2026-11-24 from the working tree on top of `a3bfe66`, in a debug build under the validation layer with synchronisation checks, on the RTX 4060 (Wayland) and on llvmpipe. Other builds were running on the machine, so nothing here is a time: the runs say what works, in bytes and counts.
+
+### What changed
+
+- **Upload submissions outside frames have a sequence of their own.** One owner, the copy queue, submits them: to the transfer queue where a GPU has a copy engine, else as copy-only command buffers on the graphics queue. Each submission that actually goes takes the next value of a timeline of its own; a batch that has to wait takes none and keeps its staged bytes, and its ticket stays pending. Frame numbers count frames only, so any number of copy submissions fit between two presents.
+- **A texture larger than the ring streams in tiles.** A tile is a band of rows across a mip level, cut to the copy queue's `minImageTransferGranularity` (the adapter report now has it; a transfer family that copies whole levels only is not used). The image stays private until the batch with its last tiles has finished; the frame recorded after that acquires it and only then is it written into a descriptor set. A visible texture can be replaced the same way, and shows its old contents until the new ones are whole.
+- **The staging budget has two phases.** Behind a loading screen a burst takes what the ring has free and batches are drained between presents. While playing, a frame gets the smaller of the fixed byte ceiling and one derived from the frame interval (a tenth of it on a discrete GPU, a twentieth where memory is shared, between 48 and 500 µs, turned into bytes with the measured speed of writes into the ring, under a cap on sustained bytes per second). The interval is the shortest of the last eight, so one long frame never raises the next allowance. The menus do not report a pace, so they stage exactly as before; the numbers are starting values for the terrain runs.
+- **Workers write their own staging.** The ring's owner grants a slice of a second staging buffer, a worker fills it and publishes that it is done, the owner records the copy. Slices come from a free list, so a slow worker holds its own slice only; 64 can be out at once, and ordinary ones leave 8 slots and an eighth of the bytes for urgent edits.
+- **Pooled buffer ranges.** Ranges of GPU buffer pages come from a size-class free list (split on allocation, joined with free neighbours on retirement) and are named by generational handles: a retired handle resolves to nothing, also after its place is reused. A range is handed out again only when the last frame that drew it and the last copy that wrote it have finished. The pool grows within a budget, has the next page created on a worker when free space falls to a low watermark, and releases empty pages after a wait. Nothing moves a live range.
+
+### The check
+
+`--exercise-streaming` streams a 2048 × 2048 RGBA8 texture with twelve mip levels (21.3 MiB, through the 16 MiB ring), reads every level back and compares every byte, round after round:
+
+- the first upload, staged by hand: the first batch deferred before it is submitted, two submissions in one frame with a deferred batch between them, a staged batch held back until staging goes around the end of the ring, and the batch with the last tiles deferred. A deferral must leave what is submitted, the layout and the release as they were, sequence values must grow, and every tile must reach the queue exactly once;
+- a replacement streamed by the ring itself, as a loading burst or under the gameplay budget, with the old generation read back unchanged meanwhile;
+- a replacement cancelled part-way; a texture cancelled before its first submission while a small one in the same batch arrives intact; one cancelled during streaming; one cancelled between the submission of its release and the acquire;
+- all the while, blocks of up to 128 KiB written by a worker thread into granted slices and copied through pooled ranges, with slow and abandoning workers, slices copied on both queues, slices let go while the writer still holds them, and a burst of reservations up to the limit.
+
+No slot may show a stream before it is published, and each round ends only when the ring, the worker staging buffer and the pool are empty again. In 6 s each, from `cargo xtask fixtures -- --validation`:
+
+| | RTX 4060, transfer queue | `--no-transfer-queue` | llvmpipe |
+|---|---:|---:|---:|
+| Rounds finished | 27 | 27 | 15 |
+| Texture read-backs compared, wrong | 135 (2,304 MiB), 0 | 136 (2,326 MiB), 0 | 78 (1,344 MiB), 0 |
+| First, middle, final batch deferred | 27, 27, 27 | 28, 28, 28 | 16, 16, 16 |
+| Frames with two submissions around a deferred batch | 27 | 28 | 16 |
+| Cancelled before submit, during, after release | 27, 27, 27 | 27, 27, 27 | 15, 15, 15 |
+| Replacements published, cancelled | 27, 27 | 27, 27 | 16, 16 |
+| Copy submissions | 895 | 544 | 387 |
+| Worker blocks compared, wrong | 3,619, 0 | 4,001, 0 | 2,850, 0 |
+| Stale handles checked | 4,367 | 4,862 | 3,460 |
+| Pool pages added, released | 10, 8 | 14, 11 | 4, 2 |
+| Validation messages | 0 | 0 | 0 |
+
+Workers wrote 231 MiB of the blocks themselves; the render thread copied none of them. Nearly all of the 1,281 MiB it did copy are the check's texture tiles, which is the path the block atlas will take behind a loading screen.
+
+The check was tested by breaking one rule at a time; each of these fails the run: publishing a stream once its first batch has gone, signalling a sequence value twice, freeing ring bytes before their copy batch is done, submitting staged tiles again with the next batch, publishing a stream cancelled after its release, taking a slice back while its writer holds it, keeping a handle's generation across retirement, and committing an image's layout on a deferred batch. One more, recording the final transition with every batch instead of the last, fails only the graphics-queue run (the layer reports the copy into an image left in SHADER_READ_ONLY_OPTIMAL): behind a queue-family release on the transfer queue the validation layer does not follow the image's layout, and the bytes still arrive, so the two runs are both needed. The allocator, the reservations, the ring's bookkeeping, the tile planner and the budget have unit tests of their own, with a churn test of 29,000 steps over a deterministic size trace for the pool.
+
+The menus are unchanged: `cargo xtask fixtures` passes on both GPUs, and screenshots of the main menu and of the settings screen (2200 × 1240) are byte for byte those of `a3bfe66`, the main menu also with `--no-transfer-queue`.
+
 ## Against the targets
 
 | Target | At `balanced` | At `performance` |
@@ -254,6 +297,10 @@ The renderer no longer issues Vulkan commands: the window pass, the backdrop's p
 - **Occlusion, moving between displays and a stalled compositor**, which need a person at the machine. They are also where the shorter acquire wait has yet to be measured, together with the CPU an idle, covered window takes with it.
 - **A surface that really offers only sRGB formats.** `--pretend-srgb-surface` hides the others to show that it is refused; presenting to one through UNORM views of a mutable-format swapchain is not built. `--exercise-colour` is the run such a path has to pass.
 - **Macs.** The bundle with MoltenVK, the portability subset's answers and the texture table's limits there (with and without Metal argument buffers) wait for a Mac or for the CI job's first run.
+- **Streaming under load, and anything about its speed.** The streaming check ran while other builds used the machine: no copy throughput, staging time or frame time was taken, and the budget's starting values are untuned. The time-derived ceiling is exercised by unit tests and by a part of the check only; the client does not report its pace to the ring yet.
+- **Render-thread heap allocations during streamed arrivals.** Not counted: it needs a counting allocator in the client. The ring's paths were written not to allocate per upload (a stream allocates when it starts, the pool when it grows), which nothing measures yet.
+- **A transfer queue with a coarser granularity than one texel** (AMD), and an Intel GPU: tiles are cut to the granularity in unit tests, on no such hardware.
+- **Relocation of pooled ranges under fragmentation** is not built; the pool counts allocations that failed with enough free bytes in total, for the terrain runs to judge whether it is needed.
 - **A GPU whose ordinary descriptor limits are below the table.** Both GPUs here allow a million sampled images in ordinary sets, so the update-after-bind path was only run forced.
 
 ## Reproducing
@@ -277,10 +324,12 @@ ruthenium --screenshot steady.png --window-size 1100x620 --screenshot-after 0.5 
 
 `--exercise-swapchain` fails the run if a replaced swapchain is not destroyed while the client runs, if a frame draws glass without its backdrop, or on any validation message.
 
-The renderer's checks, one short run each (the colour fixture and the upload check, the texture table at 256 slots on both kinds of descriptor set, the pipeline cache warm on a second launch), and single ones:
+The renderer's checks, one short run each (the colour fixture and the upload check, the streaming check on the GPU's copy queue and on the graphics queue, the texture table at 256 slots on both kinds of descriptor set, the pipeline cache warm on a second launch), and single ones:
 
 ```sh
 cargo xtask fixtures -- --validation            # all of them; --gpu llvmpipe for Mesa's software driver
+ruthenium --validation --exercise-streaming --quit-after 6
+ruthenium --validation --exercise-streaming --no-transfer-queue --quit-after 6
 ruthenium --validation --exercise-textures --texture-slots 256 --texture-table update-after-bind --quit-after 6
 ruthenium --validation --exercise-colour --quit-after 5
 ruthenium --adapter-report adapter.json --quit-after 1

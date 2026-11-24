@@ -9,8 +9,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ruthenium_gpu::{
-    Acquired, DeviceCaps, FrameCounters, FrameTimings, GpuTime, MemoryReport, PresentPolicy,
-    SwapchainInfo,
+    Acquired, DeviceCaps, FrameCounters, FrameTimings, GpuTime, MemoryReport, PoolStats,
+    PresentPolicy, StreamCheckReport, SwapchainInfo, UploadStats,
 };
 use ruthenium_render::{FrameTimes, Summary};
 use serde_json::{Value, json};
@@ -402,6 +402,78 @@ impl Telemetry {
     }
 }
 
+/// What `--exercise-streaming` saw, as the lines printed at exit: the streamed texture,
+/// the worker-written blocks and their pool, and the upload ring's counters (bytes, not
+/// times: the check runs under validation).
+pub fn stream_check_lines(
+    c: &StreamCheckReport,
+    ring: &UploadStats,
+    pool: &PoolStats,
+    limit_hits: u64,
+) -> String {
+    const MIB: f64 = (1u64 << 20) as f64;
+    format!(
+        "[ruthenium] streaming check: {} rounds; {} texture read-backs ({:.1} MiB) compared, {} mismatched, {} frames showed an unpublished stream; first, middle and final batch deferred {}, {} and {} times; {} frames with two submissions around a deferred batch; {} replacements, the old generation read {} times meanwhile, {} replacements cancelled; cancelled before the first submit {}, during streaming {}, between release and acquire {}; {} survivors of a cancelled batch; {} rules broken\n\
+         [ruthenium] streaming check, workers: {} blocks ({:.1} MiB) compared, {} mismatched; {} copied on both queues, {} slices abandoned, {} let go under their writer, {} stale handles checked, {} blocks waited for room, {} bursts refused with room kept for an urgent slice; pool: {} pages added, {} released, at most {:.1} MiB of pages and {:.1} MiB of payload, {} allocations failed ({} with enough free bytes)\n\
+         [ruthenium] streaming check, ring: {:.1} MiB copied in by the render thread, {:.1} MiB written by workers, {} GPU copies ({:.1} MiB); {} copy submissions (sequence {} of {} finished), {} batches deferred ({} forced); at most {:.1} MiB of the ring in use, {} wraps ({} made by the check); {} streams begun, {} published, {} cancelled; {} tiles, {:.1} MiB submitted, {:.1} MiB dropped; {} slices granted, {} refused, at most {} out; {} frames under a paced budget, {} uploads refused by the budget",
+        c.rounds,
+        c.readbacks,
+        c.readback_bytes as f64 / MIB,
+        c.mismatches,
+        c.early_publications,
+        c.deferred_first,
+        c.deferred_middle,
+        c.deferred_final,
+        c.double_submits,
+        c.replacements,
+        c.old_generation_reads,
+        c.cancelled_replacements,
+        c.cancelled_before,
+        c.cancelled_during,
+        c.cancelled_released,
+        c.survivors,
+        c.violations,
+        c.blocks,
+        c.block_bytes as f64 / MIB,
+        c.block_mismatches,
+        c.dual_blocks,
+        c.abandoned,
+        c.held_writers,
+        c.stale_handles,
+        c.refused,
+        limit_hits,
+        pool.pages_added,
+        pool.pages_released,
+        pool.peak_reserved_bytes as f64 / MIB,
+        pool.peak_payload_bytes as f64 / MIB,
+        pool.failures,
+        pool.failures_with_space,
+        ring.render_memcpy_bytes as f64 / MIB,
+        ring.worker_write_bytes as f64 / MIB,
+        ring.gpu_copies,
+        ring.gpu_copy_bytes as f64 / MIB,
+        ring.copy_submissions,
+        ring.copy_completed,
+        ring.copy_submitted,
+        ring.deferred,
+        ring.forced_deferrals,
+        ring.ring_peak as f64 / MIB,
+        ring.ring_wraps,
+        c.wraps,
+        ring.streams_begun,
+        ring.streams_published,
+        ring.streams_cancelled,
+        ring.tiles,
+        ring.tile_bytes_submitted as f64 / MIB,
+        ring.tile_bytes_dropped as f64 / MIB,
+        ring.reservations,
+        ring.reservations_refused,
+        ring.reservations_peak,
+        c.paced_frames,
+        ring.budget_refusals,
+    )
+}
+
 /// What a run was, for its summary.
 #[derive(Debug)]
 pub struct RunInfo<'a> {
@@ -459,6 +531,12 @@ pub fn adapter_report(
             "max_memory_allocations": caps.max_memory_allocations,
             "timestamp_bits": caps.timestamp_bits,
             "transfer_family": caps.transfer_family,
+            // minImageTransferGranularity of that family: what tiles of a streamed
+            // image are cut to.
+            "transfer_granularity": caps.transfer_family.map(|_| {
+                let g = caps.transfer_granularity;
+                [g.width, g.height, g.depth]
+            }),
             "transfer_queue": transfer_queue,
         },
         "texture_table": {

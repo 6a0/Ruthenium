@@ -82,6 +82,10 @@ pub struct Options {
     /// Development: push checked data through the upload ring every frame (run it under
     /// validation); a mismatch fails the run.
     pub exercise_uploads: bool,
+    /// Development: stream a texture larger than the upload ring, worker-written blocks
+    /// and pooled ranges every frame (run it under validation); a wrong byte or a broken
+    /// rule fails the run.
+    pub exercise_streaming: bool,
     /// Development: write the window's contents to this PNG once the menus show, then quit.
     pub screenshot: Option<std::path::PathBuf>,
     /// Development: wait this long after the menus show before the screenshot.
@@ -153,6 +157,7 @@ impl Options {
             pipeline_cache: true,
             no_transfer_queue: false,
             exercise_uploads: false,
+            exercise_streaming: false,
             bench_out: None,
             screenshot: None,
             screenshot_after: Duration::ZERO,
@@ -219,6 +224,7 @@ impl Options {
                 "--no-pipeline-cache" => o.pipeline_cache = false,
                 "--no-transfer-queue" => o.no_transfer_queue = true,
                 "--exercise-uploads" => o.exercise_uploads = true,
+                "--exercise-streaming" => o.exercise_streaming = true,
                 "--bench-out" => o.bench_out = Some(value("a file")?.into()),
                 "--screenshot" => o.screenshot = Some(value("a file")?.into()),
                 "--screenshot-after" => {
@@ -317,6 +323,12 @@ impl Options {
                 }
                 other => return Err(format!("unknown option {other}")),
             }
+        }
+        if o.exercise_streaming && (o.exercise_uploads || o.exercise_textures) {
+            return Err(
+                "--exercise-streaming needs the upload ring to itself: run it without --exercise-uploads and --exercise-textures"
+                    .into(),
+            );
         }
         Ok(o)
     }
@@ -531,6 +543,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
         renderer.enable_upload_check()?;
+    }
+    if opts.exercise_streaming {
+        renderer.enable_stream_check()?;
     }
     if opts.exercise_colour {
         renderer.enable_colour_check()?;
@@ -1075,6 +1090,20 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             || c.texture_mismatches > 0
             || c.late_textures > 0
             || c.textures == 0;
+    }
+    if let Some((c, ring, pool, limit_hits)) = renderer.stream_check() {
+        eprintln!(
+            "{}",
+            crate::telemetry::stream_check_lines(&c, &ring, &pool, limit_hits)
+        );
+        match c.missing() {
+            Some(what) => eprintln!("[ruthenium] streaming check: the run did not get to {what}"),
+            None if limit_hits == 0 => {
+                eprintln!("[ruthenium] streaming check: no reservation was ever refused")
+            }
+            None => {}
+        }
+        failed |= !c.passed() || limit_hits == 0;
     }
     let table = renderer.texture_stats();
     eprintln!(

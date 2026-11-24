@@ -22,6 +22,12 @@
 //! - Once visible, a texture can be rewritten in part ([`TextureTable::update`]: animated
 //!   textures, atlas patches); a frame's updates are recorded before its passes, so the
 //!   frame samples the new texels.
+//! - A texture too large for one burst of the upload ring (the block atlas) streams in
+//!   tiles ([`TextureTable::stream`]). Its image stays private until every tile has been
+//!   copied; only then is it written into a frame's set. A visible texture can be replaced
+//!   the same way ([`TextureTable::replace_streamed`]): the slot keeps showing the old
+//!   image, whole, until the new generation is whole, and the old image is destroyed after
+//!   the frames that may still sample it.
 
 use std::fmt;
 use std::sync::Arc;
@@ -32,7 +38,11 @@ use ash::vk::TaggedStructure;
 use crate::device::{Gpu, TextureTablePath};
 use crate::frame::MAX_FRAMES_IN_FLIGHT;
 use crate::memory::{Image, texel_bytes};
-use crate::upload::{ImageDst, ImageRegion, UploadError, UploadRing, UploadTicket};
+use crate::upload::{
+    ImageDst, ImageRegion, StreamHandle, StreamOutcome, StreamProgress, UploadError, UploadRing,
+    UploadTicket,
+};
+use crate::users::{Completed, Users};
 use crate::{Error, VkContext};
 
 /// Mip levels a texture may have (a 32768² texture has 16).
@@ -202,14 +212,23 @@ impl TextureDesc {
 }
 
 /// Where a texture's first upload is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 enum State {
     /// Not staged yet.
     Empty,
     /// Staged; visible once the ticket is ready.
     Arriving(UploadTicket),
+    /// Streaming in tiles; visible once the stream is published.
+    Streaming(StreamHandle),
     /// Its slot shows it.
     Ready,
+}
+
+/// The next generation of a visible texture, streaming into an image of its own.
+struct Replacement {
+    image: Image,
+    desc: TextureDesc,
+    stream: StreamHandle,
 }
 
 struct Texture {
@@ -218,6 +237,26 @@ struct Texture {
     state: State,
     /// A render target ([`TextureTable::create_target`]): passes draw into it.
     target: bool,
+    /// Which contents the slot shows: 0 for the first, one more with each replacement
+    /// that was published.
+    generation: u32,
+    replacement: Option<Replacement>,
+}
+
+/// An image nothing new refers to, kept until its last users have finished.
+struct Retiring {
+    users: Users,
+    /// The slot to give back with it, unless a newer generation keeps the slot.
+    slot: Option<u32>,
+    image: Image,
+}
+
+/// The image of a cancelled stream, until the upload ring says which submission wrote it
+/// last.
+struct CancelledStream {
+    stream: StreamHandle,
+    slot: Option<u32>,
+    image: Image,
 }
 
 /// Free indices of the table. Index 0 is the missing texture and never handed out.
@@ -290,12 +329,16 @@ pub struct TextureTable {
     sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
     textures: Vec<Option<Texture>>,
     slots: Slots,
-    /// Destroyed textures, freed once the frame number they carry has finished.
-    retiring: Vec<(u64, u32, Texture)>,
+    /// Images of destroyed or replaced textures, freed once their users have finished.
+    retiring: Vec<Retiring>,
     /// Textures whose first upload is staged but not ready, by index.
     arriving: Vec<u32>,
+    /// Textures with a stream in flight (a first upload or a replacement), by index.
+    streaming: Vec<u32>,
+    /// Images whose stream was cancelled and that the upload ring has not let go yet.
+    cancelled: Vec<CancelledStream>,
     /// Destroyed textures whose first upload is not ready yet: they retire once it is.
-    orphans: Vec<(UploadTicket, u32, Texture)>,
+    orphans: Vec<(UploadTicket, u32, Image)>,
     /// Per set: (index, view) writes to make at the start of that set's next frame.
     pending: [Vec<(u32, vk::ImageView)>; MAX_FRAMES_IN_FLIGHT],
     /// Scratch for those writes, [`WRITE_BATCH`] at a time: the image infos, then the
@@ -344,6 +387,8 @@ impl TextureTable {
             slots: Slots::new(capacity),
             retiring: Vec::new(),
             arriving: Vec::new(),
+            streaming: Vec::new(),
+            cancelled: Vec::new(),
             orphans: Vec::new(),
             pending: std::array::from_fn(|_| Vec::new()),
             write_infos: Vec::with_capacity(WRITE_BATCH),
@@ -559,6 +604,8 @@ impl TextureTable {
             desc,
             state: State::Empty,
             target: false,
+            generation: 0,
+            replacement: None,
         })
     }
 
@@ -619,6 +666,8 @@ impl TextureTable {
             desc,
             state: State::Ready,
             target: true,
+            generation: 0,
+            replacement: None,
         });
         for p in &mut self.pending {
             p.push((i, view));
@@ -641,7 +690,7 @@ impl TextureTable {
     /// # Panics
     /// If `id` is not a live texture.
     pub fn is_ready(&self, id: TextureId) -> bool {
-        self.live(id).state == State::Ready
+        matches!(self.live(id).state, State::Ready)
     }
 
     fn live(&self, id: TextureId) -> &Texture {
@@ -689,24 +738,168 @@ impl TextureTable {
         for (level, data) in mips.iter().enumerate() {
             regions[level] = (ImageRegion::whole_mip(t.desc.extent(), level as u32), data);
         }
-        let state = t.state;
-        if let State::Arriving(_) = state {
-            return Err(UploadError::NotReady);
-        }
+        let fresh = match t.state {
+            State::Arriving(_) | State::Streaming(_) => return Err(UploadError::NotReady),
+            State::Empty => true,
+            State::Ready => false,
+        };
         let dst = ImageDst {
             image: t.image.raw,
             format: t.desc.format,
             extent: t.desc.extent(),
             mip_levels: t.desc.mip_levels,
-            fresh: state == State::Empty,
+            fresh,
             background: arrival == Arrival::Background,
         };
         let ticket = upload.upload_image(&dst, &regions[..mips.len()])?;
-        if state == State::Empty {
+        if fresh {
             t.state = State::Arriving(ticket);
             self.arriving.push(id.0);
         }
         Ok(())
+    }
+
+    /// Starts the first upload of a texture in tiles, for one too large to stage at once
+    /// (`upload` answers [`UploadError::TooLarge`] for it): `mips` are its levels,
+    /// level 0 first, which the upload ring keeps until they are staged. The slot shows
+    /// the missing texture until every tile has been copied; check [`Self::is_ready`].
+    /// On `Err(Full)` nothing was started (too many textures stream at once): try again
+    /// in a later frame.
+    ///
+    /// # Panics
+    /// If `id` is not a live texture without contents, or `mips` doesn't match its
+    /// levels and sizes.
+    pub fn stream(
+        &mut self,
+        upload: &mut UploadRing,
+        id: TextureId,
+        mips: Vec<Vec<u8>>,
+    ) -> Result<(), UploadError> {
+        let t = self.live_mut(id);
+        assert!(
+            matches!(t.state, State::Empty),
+            "{id:?} already has contents"
+        );
+        let dst = ImageDst {
+            image: t.image.raw,
+            format: t.desc.format,
+            extent: t.desc.extent(),
+            mip_levels: t.desc.mip_levels,
+            fresh: true,
+            background: true,
+        };
+        t.state = State::Streaming(upload.begin_stream(&dst, mips)?);
+        self.streaming.push(id.0);
+        Ok(())
+    }
+
+    /// Starts replacing a visible texture's contents with a new generation, streamed in
+    /// tiles into an image of its own (which may have another size, format or number of
+    /// levels). The slot shows the old contents, whole, until the new ones are; from the
+    /// frame that publishes them on, [`Self::generation`] is one higher, and the old
+    /// image is destroyed once the frames that may sample it have finished. Updates
+    /// ([`Self::update`]) made meanwhile go to the old contents.
+    ///
+    /// Errors leave the texture as it was: [`UploadError::NotReady`] if it is not
+    /// visible yet or a replacement is already on its way, [`UploadError::Full`] if too
+    /// many textures stream at once.
+    ///
+    /// # Panics
+    /// If `id` is not a live texture or is a render target, or `mips` doesn't match
+    /// `desc`.
+    pub fn replace_streamed(
+        &mut self,
+        upload: &mut UploadRing,
+        id: TextureId,
+        desc: TextureDesc,
+        mips: Vec<Vec<u8>>,
+    ) -> Result<(), Error> {
+        let t = self.live(id);
+        assert!(!t.target, "{id:?} is a render target");
+        if !matches!(t.state, State::Ready) || t.replacement.is_some() {
+            return Err(Error::Upload(UploadError::NotReady));
+        }
+        let next = self.create_texture(desc)?;
+        let dst = ImageDst {
+            image: next.image.raw,
+            format: desc.format,
+            extent: desc.extent(),
+            mip_levels: desc.mip_levels,
+            fresh: true,
+            background: true,
+        };
+        match upload.begin_stream(&dst, mips) {
+            Ok(stream) => {
+                self.live_mut(id).replacement = Some(Replacement {
+                    image: next.image,
+                    desc,
+                    stream,
+                });
+                self.streaming.push(id.0);
+                Ok(())
+            }
+            Err(e) => {
+                // SAFETY: nothing was staged for it and no descriptor refers to it.
+                unsafe { next.image.destroy(&self.gpu) };
+                Err(Error::Upload(e))
+            }
+        }
+    }
+
+    /// Gives up a replacement that is still streaming: the texture keeps its contents.
+    /// Returns whether there was one.
+    ///
+    /// # Panics
+    /// If `id` is not a live texture.
+    pub fn cancel_replacement(&mut self, id: TextureId) -> bool {
+        let Some(r) = self.live_mut(id).replacement.take() else {
+            return false;
+        };
+        self.streaming.retain(|&i| i != id.0);
+        r.stream.cancel();
+        self.cancelled.push(CancelledStream {
+            stream: r.stream,
+            slot: None,
+            image: r.image,
+        });
+        true
+    }
+
+    /// Which contents the texture's slot shows: 0 for the first, one more for each
+    /// replacement published since.
+    ///
+    /// # Panics
+    /// If `id` is not a live texture.
+    pub fn generation(&self, id: TextureId) -> u32 {
+        self.live(id).generation
+    }
+
+    /// The texture's stream, to follow it after the texture is destroyed: its
+    /// replacement's if one is on its way, else its first upload's.
+    ///
+    /// # Panics
+    /// If `id` is not a live texture.
+    pub fn stream_of(&self, id: TextureId) -> Option<StreamHandle> {
+        let t = self.live(id);
+        match (&t.replacement, &t.state) {
+            (Some(r), _) => Some(r.stream.clone()),
+            (None, State::Streaming(stream)) => Some(stream.clone()),
+            _ => None,
+        }
+    }
+
+    /// How far the texture's stream has got: its replacement's if one is on its way,
+    /// else its first upload's. `None` if nothing of it streams.
+    ///
+    /// # Panics
+    /// If `id` is not a live texture.
+    pub fn stream_progress(&self, id: TextureId) -> Option<StreamProgress> {
+        let t = self.live(id);
+        match (&t.replacement, &t.state) {
+            (Some(r), _) => Some(r.stream.progress()),
+            (None, State::Streaming(stream)) => Some(stream.progress()),
+            _ => None,
+        }
     }
 
     /// Stages rectangles of a visible texture (each region's texels tightly packed, rows
@@ -725,7 +918,7 @@ impl TextureTable {
         regions: &[(ImageRegion, &[u8])],
     ) -> Result<(), UploadError> {
         let t = self.live(id);
-        if t.state != State::Ready {
+        if !matches!(t.state, State::Ready) {
             return Err(UploadError::NotReady);
         }
         let dst = ImageDst {
@@ -748,7 +941,15 @@ impl TextureTable {
         arrival: Arrival,
     ) -> Result<TextureId, Error> {
         let id = self.create(desc)?;
-        if let Err(e) = self.upload(upload, id, mips, arrival) {
+        let staged = match self.upload(upload, id, mips, arrival) {
+            // Larger than the ring holds at once: in tiles, from a copy the ring keeps
+            // until they are staged. (Pass owned levels to `stream` to save the copy.)
+            Err(UploadError::TooLarge) if arrival == Arrival::Background => {
+                self.stream(upload, id, mips.iter().map(|m| m.to_vec()).collect())
+            }
+            staged => staged,
+        };
+        if let Err(e) = staged {
             self.destroy(id);
             return Err(Error::Upload(e));
         }
@@ -765,6 +966,17 @@ impl TextureTable {
         let t = self.textures[id.0 as usize]
             .take()
             .unwrap_or_else(|| panic!("{id:?} is not a live texture"));
+        self.streaming.retain(|&i| i != id.0);
+        self.stats.count(-1, 1);
+        if let Some(r) = t.replacement {
+            // The next generation goes with it: never shown.
+            r.stream.cancel();
+            self.cancelled.push(CancelledStream {
+                stream: r.stream,
+                slot: None,
+                image: r.image,
+            });
+        }
         match t.state {
             State::Ready => {
                 let missing = self.textures[0]
@@ -778,17 +990,29 @@ impl TextureTable {
             State::Arriving(ticket) => {
                 // Its copies may not even be submitted yet: it retires once they are done.
                 self.arriving.retain(|&i| i != id.0);
-                self.orphans.push((ticket, id.0, t));
-                self.stats.count(-1, 1);
+                self.orphans.push((ticket, id.0, t.image));
+                return;
+            }
+            State::Streaming(stream) => {
+                // The upload ring drops its staged tiles before it submits anything else,
+                // and says which submission wrote the image last: it retires after that.
+                stream.cancel();
+                self.cancelled.push(CancelledStream {
+                    stream,
+                    slot: Some(id.0),
+                    image: t.image,
+                });
                 return;
             }
             State::Empty => {}
         }
-        self.stats.count(-1, 1);
         // Frames up to self.frame may sample it or record its staged copies, and each set
         // drops it at its own next frame: after self.frame + MAX_FRAMES_IN_FLIGHT, all have.
-        self.retiring
-            .push((self.frame + MAX_FRAMES_IN_FLIGHT as u64, id.0, t));
+        self.retiring.push(Retiring {
+            users: Users::until_frame(self.frame + MAX_FRAMES_IN_FLIGHT as u64),
+            slot: Some(id.0),
+            image: t.image,
+        });
     }
 
     /// Shows the textures whose first upload is ready, brings frame `frame`'s copy of the
@@ -817,27 +1041,99 @@ impl TextureTable {
                 _ => i += 1,
             }
         }
+        // Streams the upload ring has published: this frame acquired their image, whole
+        // and in the layout shaders sample it in. Not before does a set get to hold it.
+        let after_sets = Users::until_frame(frame + MAX_FRAMES_IN_FLIGHT as u64);
+        let mut i = 0;
+        while i < self.streaming.len() {
+            let index = self.streaming[i];
+            let t = self.textures[index as usize]
+                .as_mut()
+                .expect("streaming textures are live");
+            let published = |s: &StreamHandle| s.progress().outcome == StreamOutcome::Published;
+            let view = match (&t.state, &t.replacement) {
+                (State::Streaming(stream), _) if published(stream) => {
+                    t.state = State::Ready;
+                    Some(t.image.view)
+                }
+                (State::Ready, Some(r)) if published(&r.stream) => {
+                    let r = t.replacement.take().expect("matched above");
+                    let old = std::mem::replace(&mut t.image, r.image);
+                    t.desc = r.desc;
+                    t.generation += 1;
+                    // Frames up to this one, and the other set's next one, may still
+                    // sample the old generation; the slot stays with the texture.
+                    self.retiring.push(Retiring {
+                        users: after_sets,
+                        slot: None,
+                        image: old,
+                    });
+                    Some(t.image.view)
+                }
+                _ => None,
+            };
+            match view {
+                Some(view) => {
+                    for p in &mut self.pending {
+                        p.push((index, view));
+                    }
+                    self.streaming.swap_remove(i);
+                }
+                None => i += 1,
+            }
+        }
+        let mut i = 0;
+        while i < self.cancelled.len() {
+            let users = match self.cancelled[i].stream.progress().outcome {
+                // The ring has not acted on the cancellation yet.
+                StreamOutcome::Streaming => {
+                    i += 1;
+                    continue;
+                }
+                // Never samplable: only the submissions that wrote it hold it.
+                StreamOutcome::Cancelled(users) => users,
+                // Published in the frame it was cancelled in, before the ring saw the
+                // cancellation: a frame up to this one acquired it; no set shows it.
+                StreamOutcome::Published => after_sets,
+            };
+            let c = self.cancelled.swap_remove(i);
+            self.retiring.push(Retiring {
+                users,
+                slot: c.slot,
+                image: c.image,
+            });
+        }
         let mut i = 0;
         while i < self.orphans.len() {
             if upload.is_ready(self.orphans[i].0) {
                 // Its copies were recorded or acquired by this frame at the latest.
-                let (_, index, t) = self.orphans.swap_remove(i);
-                self.retiring
-                    .push((frame + MAX_FRAMES_IN_FLIGHT as u64, index, t));
+                let (_, index, image) = self.orphans.swap_remove(i);
+                self.retiring.push(Retiring {
+                    users: after_sets,
+                    slot: Some(index),
+                    image,
+                });
             } else {
                 i += 1;
             }
         }
         self.flush_writes(slot);
+        let completed = Completed {
+            frame: completed,
+            ..upload.completed()
+        };
         let mut i = 0;
         while i < self.retiring.len() {
-            if self.retiring[i].0 <= completed {
-                let (_, index, t) = self.retiring.swap_remove(i);
-                // SAFETY: every frame that could sample it has finished, and both sets
-                // were rewritten to the missing texture in frames that came before.
-                unsafe { t.image.destroy(&self.gpu) };
-                self.slots.give_back(index);
-                self.stats.count(0, -1);
+            if self.retiring[i].users.done(&completed) {
+                let r = self.retiring.swap_remove(i);
+                // SAFETY: every frame that could sample it and every submission that
+                // wrote it have finished, and both sets were rewritten to another image
+                // in frames that came before.
+                unsafe { r.image.destroy(&self.gpu) };
+                if let Some(index) = r.slot {
+                    self.slots.give_back(index);
+                    self.stats.count(0, -1);
+                }
             } else {
                 i += 1;
             }
@@ -924,12 +1220,18 @@ impl Drop for TextureTable {
         unsafe {
             for t in self.textures.drain(..).flatten() {
                 t.image.destroy(gpu);
+                if let Some(r) = t.replacement {
+                    r.image.destroy(gpu);
+                }
             }
-            for (_, _, t) in self.retiring.drain(..) {
-                t.image.destroy(gpu);
+            for r in self.retiring.drain(..) {
+                r.image.destroy(gpu);
             }
-            for (_, _, t) in self.orphans.drain(..) {
-                t.image.destroy(gpu);
+            for c in self.cancelled.drain(..) {
+                c.image.destroy(gpu);
+            }
+            for (_, _, image) in self.orphans.drain(..) {
+                image.destroy(gpu);
             }
             if self.pool != vk::DescriptorPool::null() {
                 d.destroy_descriptor_pool(self.pool, None);

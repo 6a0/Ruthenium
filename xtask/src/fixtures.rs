@@ -3,6 +3,9 @@
 //! every machine and runner that can open a window:
 //!
 //! - the colour fixture and the upload check, which also writes the adapter report;
+//! - the streaming check (a texture larger than the upload ring in tiles, worker-written
+//!   blocks, pooled ranges) on the copy queue the GPU has and, if that is a transfer
+//!   queue, once more with every upload on the graphics queue;
 //! - the texture table filled to exhaustion and reloaded at 256 slots, on ordinary
 //!   descriptor sets and, where the GPU has them, on update-after-bind sets;
 //! - the pipeline cache: a second launch of the same build must find the first one's.
@@ -19,6 +22,8 @@ const SHOWN: &[&str] = &[
     "colour check",
     "texture table check",
     "upload check",
+    "streaming check",
+    "[stream-check]",
     "[colour-check]",
     "[table-check]",
     "[upload-check]",
@@ -26,6 +31,9 @@ const SHOWN: &[&str] = &[
     "validation message",
     "ruthenium:",
 ];
+
+/// What the renderer prints when uploads have a transfer queue of their own.
+const TRANSFER_QUEUE_LINE: &str = "background textures on the transfer queue";
 
 struct Options {
     binary: Option<PathBuf>,
@@ -131,6 +139,31 @@ fn run_inner(root: &Path, args: &[String]) -> Result<bool, String> {
             ],
         ),
     );
+    let streamed = check(
+        "streaming, the GPU's copy queue",
+        launch(
+            &binary,
+            &o,
+            "streaming",
+            &o.seconds,
+            &["--exercise-streaming"],
+        ),
+    );
+    // Without a transfer queue the first run was already on the graphics queue.
+    if streamed.is_some_and(|run| run.output.contains(TRANSFER_QUEUE_LINE)) {
+        check(
+            "streaming, graphics queue only",
+            launch(
+                &binary,
+                &o,
+                "streaming-graphics-queue",
+                &o.seconds,
+                &["--exercise-streaming", "--no-transfer-queue"],
+            ),
+        );
+    } else {
+        println!("skip streaming, graphics queue only: the GPU's copy queue is its graphics queue");
+    }
     check(
         "texture table, 256 slots, ordinary sets",
         launch(

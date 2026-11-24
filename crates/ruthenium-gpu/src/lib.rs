@@ -10,6 +10,8 @@
 //! On macOS the same code runs on Metal through MoltenVK, enumerated as a portability
 //! driver; the portability subset is enabled whenever the device reports it.
 
+mod budget;
+mod buffer_pool;
 mod device;
 mod encoder;
 mod frame;
@@ -17,14 +19,23 @@ mod frame_data;
 mod instance;
 mod memory;
 mod pipeline;
+mod pool;
 mod readback;
+mod reserve;
 mod screenshot;
+mod staging;
+mod stream;
+mod stream_check;
 mod swapchain;
 mod textures;
+mod transfer;
 mod upload;
 mod upload_check;
+mod users;
 
 pub use ash::vk;
+pub use budget::{Pacing, PacingConfig, UploadPhase};
+pub use buffer_pool::{BufferPool, PooledBuffer};
 pub use device::{
     DEFAULT_TEXTURE_SLOTS, DescriptorLimits, DeviceCaps, Gpu, GpuOptions, MAX_TEXTURE_SLOTS,
     MIN_TEXTURE_SLOTS, OptionalFeatures, PortabilitySubset, PretendSrgb, Rejected,
@@ -42,15 +53,22 @@ pub use pipeline::{
     Blend, GraphicsDesc, InterfaceHash, PUSH_CONSTANT_BYTES, PUSH_CONSTANT_STAGES, PipelineCache,
     PipelineLayout, Pipelines, interface_hash,
 };
+pub use pool::{PoolConfig, PoolError, PoolStats, PooledRange, RangeHandle, RangePool};
 pub use readback::Readback;
+pub use reserve::{Reservation, ReservationState, StagingWriter};
 pub use screenshot::Screenshot;
+pub use stream_check::{StreamCheck, StreamCheckReport};
 pub use swapchain::{COLOR_RANGE, PresentPolicy};
 pub use textures::{
     Arrival, MAX_MIP_LEVELS, SAMPLER_COUNT, SamplerId, TextureDesc, TextureId, TextureTable,
     TextureTableStats,
 };
-pub use upload::{ImageDst, ImageRegion, UploadError, UploadRing, UploadTicket};
+pub use upload::{
+    Drained, ImageDst, ImageRegion, StreamHandle, StreamOutcome, StreamProgress, UploadError,
+    UploadRing, UploadStats, UploadTicket, Urgency,
+};
 pub use upload_check::{UploadCheck, UploadCheckReport};
+pub use users::{Completed, Users};
 
 use std::fmt;
 

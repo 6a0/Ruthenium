@@ -274,6 +274,9 @@ pub struct DeviceCaps {
     /// A queue family with transfer but no graphics, compute or video, for background
     /// uploads (whether it is used: [`Gpu::transfer_family`]).
     pub transfer_family: Option<u32>,
+    /// That family's `minImageTransferGranularity`: image copies on it move blocks of
+    /// this many texels (tiles of a streamed image are cut to it).
+    pub transfer_granularity: vk::Extent3D,
     pub portability_subset: bool,
     /// What a portability-subset device reports about itself.
     pub portability: Option<PortabilitySubset>,
@@ -1085,6 +1088,9 @@ fn evaluate(
         copy_offset_alignment: props.limits.optimal_buffer_copy_offset_alignment,
         storage_offset_alignment: props.limits.min_storage_buffer_offset_alignment,
         transfer_family,
+        transfer_granularity: transfer_family
+            .map(|f| families[f as usize].min_image_transfer_granularity)
+            .unwrap_or_default(),
         portability_subset,
         portability: portability_subset.then(|| PortabilitySubset::query(raw, pd)),
         present_id: has(ash::khr::present_id::NAME),
@@ -1117,7 +1123,9 @@ fn evaluate(
 
 /// A family of copy-engine queues: transfer without graphics or compute. Families that also
 /// do video or optical flow are skipped (NVIDIA lists those after its copy family; they
-/// are separate engines with fewer queues).
+/// are separate engines with fewer queues). So is a family that can only copy whole mip
+/// levels of an image (a granularity of zero): an image larger than the staging ring could
+/// never be streamed through it.
 fn transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
     let not = vk::QueueFlags::GRAPHICS
         | vk::QueueFlags::COMPUTE
@@ -1130,6 +1138,8 @@ fn transfer_family(families: &[vk::QueueFamilyProperties]) -> Option<u32> {
             f.queue_count > 0
                 && f.queue_flags.contains(vk::QueueFlags::TRANSFER)
                 && !f.queue_flags.intersects(not)
+                && f.min_image_transfer_granularity.width > 0
+                && f.min_image_transfer_granularity.height > 0
         })
         .map(|i| i as u32)
 }
@@ -1310,6 +1320,11 @@ mod tests {
         let family = |queue_flags, queue_count| vk::QueueFamilyProperties {
             queue_flags,
             queue_count,
+            min_image_transfer_granularity: vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
             ..Default::default()
         };
         type Q = vk::QueueFlags;
@@ -1331,6 +1346,10 @@ mod tests {
         ];
         assert_eq!(transfer_family(&video), None);
         assert_eq!(transfer_family(&nvidia[..1]), None);
+        // Nor does a copy engine that only moves whole mip levels.
+        let mut whole_levels = nvidia;
+        whole_levels[1].min_image_transfer_granularity = vk::Extent3D::default();
+        assert_eq!(transfer_family(&whole_levels), None);
     }
 
     #[test]

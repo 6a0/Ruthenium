@@ -26,9 +26,9 @@ use std::sync::Arc;
 
 use ruthenium_gpu::{
     Arrival, Encoder, FrameData, FrameLoop, Gpu, GpuOptions, GpuTime, Instance, InstanceDesc,
-    PipelineCache, PipelineLayout, Pipelines, PresentPolicy, Presented, Screenshot, SwapchainInfo,
-    TextureDesc, TextureId, TextureTable, TextureTableStats, UploadCheck, UploadCheckReport,
-    UploadRing, Validation, vk,
+    PipelineCache, PipelineLayout, Pipelines, PoolStats, PresentPolicy, Presented, Screenshot,
+    StreamCheck, StreamCheckReport, SwapchainInfo, TextureDesc, TextureId, TextureTable,
+    TextureTableStats, UploadCheck, UploadCheckReport, UploadRing, UploadStats, Validation, vk,
 };
 use ruthenium_platform::{Platform, Window};
 
@@ -98,6 +98,9 @@ pub struct Renderer {
     // Fields drop in order: the frame loop first (its Drop waits for the GPU), then what
     // its frames used, then the cache, which saves itself as it goes.
     frames: FrameLoop,
+    /// `--exercise-streaming`. Before the upload ring: its worker thread writes into
+    /// the ring's staging memory and has to end first.
+    stream_check: Option<StreamCheck>,
     pipelines: Pipelines,
     layout: PipelineLayout,
     textures: TextureTable,
@@ -182,6 +185,7 @@ impl Renderer {
         let pipelines = Pipelines::build(gpu, &mut cache, &layout, &descs, frames.color_format()?)?;
         Ok(Renderer {
             frames,
+            stream_check: None,
             pipelines,
             layout,
             textures,
@@ -221,6 +225,33 @@ impl Renderer {
                 c.report(),
                 self.uploads.deferred_transfers(),
                 self.uploads.transferred_images(),
+            )
+        })
+    }
+
+    /// Starts streaming a texture larger than the upload ring, worker-written blocks and
+    /// pooled ranges every frame (see [`StreamCheck`]). It needs the upload ring to
+    /// itself: not together with the upload or the texture table check.
+    pub fn enable_stream_check(&mut self) -> Result<(), ruthenium_gpu::Error> {
+        if self.stream_check.is_none() {
+            self.stream_check = Some(StreamCheck::new(
+                self.frames.gpu().clone(),
+                &mut self.uploads,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// What the streaming check has seen, if it is on: its report, the upload ring's
+    /// counters, its pool's, and how often a reservation was refused for want of room
+    /// while an urgent one still got some.
+    pub fn stream_check(&self) -> Option<(StreamCheckReport, UploadStats, PoolStats, u64)> {
+        self.stream_check.as_ref().map(|c| {
+            (
+                c.report(),
+                self.uploads.stats(),
+                c.pool_stats(),
+                c.limit_hits(),
             )
         })
     }
@@ -460,6 +491,11 @@ impl Renderer {
             self.frames.zone_end(&ctx, zone);
             if let Some(c) = &mut self.check {
                 let zone = self.frames.zone_begin(&ctx, "upload check");
+                c.step(&mut self.uploads, &mut self.textures, &ctx, completed)?;
+                self.frames.zone_end(&ctx, zone);
+            }
+            if let Some(c) = &mut self.stream_check {
+                let zone = self.frames.zone_begin(&ctx, "stream check");
                 c.step(&mut self.uploads, &mut self.textures, &ctx, completed)?;
                 self.frames.zone_end(&ctx, zone);
             }

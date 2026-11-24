@@ -64,6 +64,10 @@ With no command, opens the game window. Options:
   --no-transfer-queue    upload on the graphics queue even if there is a copy queue
   --exercise-uploads     check data pushed through the upload ring every frame
                          (development; a mismatch fails the run)
+  --exercise-streaming   stream a texture larger than the upload ring in tiles, with
+                         deferred, repeated and cancelled batches, and worker-written
+                         blocks through pooled buffer ranges; read everything back
+                         (development; a wrong byte or a broken rule fails the run)
   --texture-slots <n>    slots of the texture table to ask the GPU for (default 1024,
                          at least 256)
   --texture-table <auto|ordinary|update-after-bind>
