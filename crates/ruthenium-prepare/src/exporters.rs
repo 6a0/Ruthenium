@@ -332,10 +332,14 @@ pub struct StatePhysics {
     pub destroy_time: f32,
     /// How much sky and block light the state takes away (`getLightDampening`).
     pub light_dampening: u8,
-    /// Indices into [`BlockPhysics::shapes`] of the state's light occlusion faces
-    /// downwards and upwards (`LightEngine.getOcclusionShape`): empty unless it occludes
-    /// and uses its shape for light.
-    pub occlusion: [u32; 2],
+    /// How much light the state gives off (`getLightEmission`).
+    pub light_emission: u8,
+    /// `useShapeForLightOcclusion`.
+    pub light_shape: bool,
+    /// Indices into [`BlockPhysics::shapes`] of the state's light occlusion faces, one
+    /// per `Direction` in ordinal order (`LightEngine.getOcclusionShape`): empty unless
+    /// it occludes and uses its shape for light.
+    pub occlusion: [u32; 6],
 }
 
 impl StatePhysics {
@@ -374,7 +378,7 @@ pub struct BlockPhysics {
 
 /// Parses `block_physics.bin`.
 pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
-    let mut r = Reader::open(bytes, "block_physics", 7)?;
+    let mut r = Reader::open(bytes, "block_physics", 8)?;
     let n = r.u32()? as usize;
     let mut shapes = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
@@ -434,7 +438,9 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
         let interaction = r.u8()?;
         let destroy_time = r.f32()?;
         let light_dampening = r.u8()?;
-        let mut occlusion = [0; 2];
+        let light_emission = r.u8()?;
+        let light_shape = r.u8()? != 0;
+        let mut occlusion = [0; 6];
         for face in &mut occlusion {
             *face = r.u32()?;
             if *face as usize >= shapes.len() {
@@ -456,6 +462,8 @@ pub fn read_block_physics(bytes: &[u8]) -> Result<BlockPhysics, String> {
             interaction,
             destroy_time,
             light_dampening,
+            light_emission,
+            light_shape,
             occlusion,
         });
     }

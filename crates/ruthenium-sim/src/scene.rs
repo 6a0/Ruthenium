@@ -117,6 +117,11 @@ impl Changes {
         self.columns.insert((x, z));
     }
 
+    /// Whether a chunk is noted as a whole: its sections need no keys of their own.
+    pub(crate) fn column_marked(&self, x: i32, z: i32) -> bool {
+        self.overflowed || self.dirty.contains_key(&[x, WHOLE_COLUMN, z])
+    }
+
     pub(crate) fn mark_column(&mut self, x: i32, z: i32, flags: u8) {
         self.mark_section([x, WHOLE_COLUMN, z], flags);
     }
@@ -206,7 +211,7 @@ impl Terrain {
         };
         let count = |planes: &mut [usize; 3], p: &LightPlane| {
             planes[match p {
-                LightPlane::Dense(_) => 0,
+                LightPlane::Dense(_) | LightPlane::Full => 0,
                 LightPlane::Dark => 1,
                 LightPlane::Absent => 2,
             }] += 1;
@@ -295,7 +300,8 @@ pub struct TerrainSummary {
     pub chunks: usize,
     /// Sections with a state per block (the others are of one state).
     pub dense_sections: usize,
-    /// Light sections with sky light as an array, sent dark, and not sent.
+    /// Light sections with sky light as an array or all lit, all dark, and holding
+    /// none.
     pub sky: [usize; 3],
     /// The same for block light.
     pub block: [usize; 3],
@@ -864,6 +870,9 @@ impl ScenePublisher {
     /// columns replace their published copies, unloaded ones leave, and the dirty keys
     /// join the queue. Costs nothing when nothing changed.
     pub fn publish_level(&mut self, level: &mut Level) {
+        // The frame's light first (`ClientLevel.update`, once per frame before
+        // drawing): a chunk is never published without its light.
+        level.run_light_updates();
         let Some(changes) = level.take_changes() else {
             return;
         };
@@ -1121,8 +1130,9 @@ mod tests {
                 }
             }
         }
-        // Without sky light everything is dark; with it, a missing chunk is lit.
-        assert_eq!(n.sky_light(3, 5, 3), 15);
+        // A section that holds light and was sent none is dark until light is
+        // computed; the sections above all light are lit.
+        assert_eq!((n.sky_light(3, 5, 3), top.sky_light(3, 5, 3)), (0, 15));
         // A probe reads the same as a pin, by block position.
         level.update_light(0, 0, &light(&[(2, Some(11))], &[(2, Some(6)), (3, None)]));
         publisher.publish_level(&mut level);
@@ -1137,7 +1147,9 @@ mod tests {
             assert_eq!((s.chunks, s.with_heights, s.block_entities), (9, 0, 0));
             // The four sections the blocks above were set in.
             assert_eq!(s.dense_sections, 4);
-            assert_eq!((s.sky, s.block), ([1, 0, 53], [1, 1, 52]));
+            // Light is held up to the section above the highest one with blocks: the
+            // top light section of each of the nine chunks holds none.
+            assert_eq!((s.sky[2], s.block), (9, [1, 44, 9]));
             assert!(
                 s.to_string()
                     .starts_with("9 chunks (0 with heights), 4 dense")
@@ -1165,7 +1177,22 @@ mod tests {
         assert_eq!(keys[&[2, WHOLE_COLUMN, 0]], dirty::NEIGHBOUR);
         assert_eq!(keys.len(), 25);
 
-        // A block in the middle of a section: that section alone.
+        // The first block of a section makes the sections around it hold light: their
+        // planes are new, and they and the sections around them are noted too.
+        level.set_block(8, 12, 8, STONE);
+        publisher.publish_level(&mut level);
+        let (keys, _) = drain(&scene);
+        assert_eq!(keys[&[0, 0, 0]], dirty::BLOCKS | dirty::NEIGHBOUR);
+        // The light section above (y 16 to 31) is new in the nine chunks.
+        assert_eq!(keys[&[1, 1, -1]], dirty::LIGHT);
+        assert_eq!(keys[&[1, 2, 1]], dirty::NEIGHBOUR);
+        // No chunk, no key.
+        assert!(!keys.contains_key(&[2, 1, 0]));
+        level.set_block(8, 28, 8, STONE);
+        publisher.publish_level(&mut level);
+        drain(&scene);
+
+        // A block in the middle of a section that has blocks: that section alone.
         level.set_block(8, 8, 8, STONE);
         publisher.publish_level(&mut level);
         let (keys, d) = drain(&scene);
@@ -1299,7 +1326,9 @@ mod tests {
         assert_eq!(todo.iter().filter(|k| (k[0], k[2]) == (-1, -1)).count(), 4);
         // Each changed section is found; an untouched one is not.
         assert!(todo.contains(&[0, 0, 0]) && todo.contains(&[0, 1, 0]));
-        assert!(!todo.contains(&[0, 2, 0]) && !todo.contains(&[1, 1, 0]));
+        // The section above a section that got its first block holds light now.
+        assert!(todo.contains(&[1, 1, 0]));
+        assert!(!todo.contains(&[0, 2, 0]));
         assert!(reconcile(&scene, &mut known).is_empty());
 
         // Keys after the rescan are complete again.
@@ -1363,15 +1392,20 @@ mod tests {
         assert_eq!(publisher.stats().columns_published, 100);
         assert_eq!(scene.with_terrain(Terrain::len), 100);
         // One block among a hundred chunks: one column goes out again.
-        level.set_block(40, 3, 40, STONE);
+        level.set_block(40, -3, 40, 2);
         publisher.publish_level(&mut level);
         assert_eq!(publisher.stats().columns_published, 101);
         // A block at a chunk's edge dirties its neighbour's section, but only the
         // chunk that changed is published again.
-        level.set_block(48, 3, 40, STONE);
+        level.set_block(48, -3, 40, 2);
         publisher.publish_level(&mut level);
         assert_eq!(publisher.stats().columns_published, 102);
         assert_eq!(publisher.stats().terrain_publications, 3);
+        // The first block of a section: the sections around it start holding light,
+        // in the eight chunks around too.
+        level.set_block(40, 3, 40, STONE);
+        publisher.publish_level(&mut level);
+        assert_eq!(publisher.stats().columns_published, 111);
         // Every other chunk is the very column published the first time.
         let first = scene.with_terrain(|t| t.column(9, 9).cloned()).unwrap();
         assert!(Arc::ptr_eq(&first, level.column(9, 9).unwrap()));

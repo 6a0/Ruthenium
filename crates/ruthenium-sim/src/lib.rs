@@ -42,6 +42,7 @@ pub mod interact;
 pub mod inventory;
 pub mod item;
 pub mod level_load;
+pub mod light;
 pub mod mining;
 pub mod pick;
 pub mod piston;

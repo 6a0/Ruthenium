@@ -41,7 +41,7 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * game's collision code sees it, the block's friction and speed and jump factors, and
  * the state's fluid and sturdy faces.
  *
- * <p>Format {@code block_physics} v7, after the header:
+ * <p>Format {@code block_physics} v8, after the header:
  * <ul>
  *   <li>u32 shape count, then per shape, for x, y and z: u32 n and n f64 coordinates;
  *       then the (nx-1)(ny-1)(nz-1) voxels as bits, x outermost and z innermost, packed
@@ -59,9 +59,11 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  *       outline shape and u32 interaction shape (in the same table), u8 interaction (1: the block's class
  *       overrides {@code useWithoutItem}, 2: it overrides {@code useItemOn}) and f32 destroy time
  *       ({@code getDestroySpeed}, -1 for unbreakable blocks), u8 light dampening
- *       ({@code getLightDampening}) and u32 down and up light occlusion faces ({@code
- *       LightEngine.getOcclusionShape}: empty unless the state occludes and uses its shape
- *       for light occlusion), in the same table.</li>
+ *       ({@code getLightDampening}), u8 light emission ({@code getLightEmission}), u8
+ *       whether the state uses its shape for light occlusion ({@code
+ *       useShapeForLightOcclusion}) and six u32 light occlusion faces, one per {@code
+ *       Direction} in ordinal order ({@code LightEngine.getOcclusionShape}: empty unless
+ *       the state occludes and uses its shape for light occlusion), in the same table.</li>
  * </ul>
  *
  * <p>The shape is the collision shape at the origin with an empty collision context, the
@@ -157,14 +159,16 @@ final class BlockPhysicsExporter {
             states.u8(interaction(block.getClass()));
             states.f32(state.getDestroySpeed(EmptyBlockGetter.INSTANCE, BlockPos.ZERO));
             states.u8(state.getLightDampening());
-            for (Direction d : new Direction[] {Direction.DOWN, Direction.UP}) {
+            states.u8(state.getLightEmission());
+            states.u8(state.useShapeForLightOcclusion() ? 1 : 0);
+            for (Direction d : Direction.values()) {
                 VoxelShape face = LightEngine.getOcclusionShape(state, d);
                 states.u32(intern(face, discrete, delegate, false, shapes, shapeIds));
             }
         }
 
         // The empty shape first, so 0 means "no collision".
-        ExportWriter w = new ExportWriter("block_physics", 7);
+        ExportWriter w = new ExportWriter("block_physics", 8);
         w.u32(shapes.size());
         for (byte[] s : shapes) {
             w.bytes(s);

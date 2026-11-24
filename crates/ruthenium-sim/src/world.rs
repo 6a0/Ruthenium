@@ -2,8 +2,9 @@
 //! and the collision shapes around a box in the order the game visits them
 //! (`BlockCollisions`).
 //!
-//! The level also keeps what only drawing reads: each section's light as the server
-//! sends it, the motion-blocking heightmap, and the data of block entities. A chunk is a
+//! The level also keeps what only drawing reads: each section's light (the server's,
+//! and what the client's own light engine makes of block changes: [`crate::light`]),
+//! the motion-blocking heightmap, and the data of block entities. A chunk is a
 //! [`Column`] of planes (block states, biomes, sky light, block light), each behind an
 //! `Arc`: a snapshot of the level ([`crate::scene`]) shares them, and the level copies a
 //! plane only when it changes one that a snapshot still holds. Every change stamps the
@@ -21,6 +22,7 @@ use crate::biome::Climate;
 use crate::block_entity::{BlockEntities, BlockEntityShape, Kind, kind_of};
 use crate::blocks::Blocks;
 use crate::direction::Direction;
+use crate::light::{self, BlockSource, LightEngine, LightTable, SkySources};
 use crate::scene::{Changes, dirty};
 use crate::shape::{Aabb, EPSILON, Placed};
 
@@ -109,15 +111,18 @@ impl BiomePlane {
     }
 }
 
-/// One light section's sky or block light (`DataLayer`): a nibble per block. The
-/// server sends an array, says the section is all dark, or says nothing about it.
+/// One light section's sky or block light (`DataLayer`): a nibble per block, or one
+/// level for all of them. A section holds light only while its chunk section or one
+/// next to it has blocks ([`crate::light`]).
 #[derive(Debug, Clone, Default)]
 pub enum LightPlane {
-    /// The server sent nothing for the section.
+    /// The section holds no light.
     #[default]
     Absent,
     /// All dark (an empty `DataLayer`).
     Dark,
+    /// All at level 15.
+    Full,
     Dense(Arc<[u8; LIGHT_BYTES]>),
 }
 
@@ -127,6 +132,7 @@ impl LightPlane {
         match self {
             LightPlane::Absent => None,
             LightPlane::Dark => Some(0),
+            LightPlane::Full => Some(15),
             LightPlane::Dense(a) => {
                 let i = ((y << 8) | (z << 4) | x) as usize;
                 Some(a[i >> 1] >> ((i & 1) * 4) & 15)
@@ -134,9 +140,56 @@ impl LightPlane {
         }
     }
 
+    /// Sets the light of a block of a section that holds light (`DataLayer.set`): a
+    /// plane of one level becomes an array.
+    pub(crate) fn set(&mut self, x: i32, y: i32, z: i32, level: u8) {
+        let fill = match self {
+            LightPlane::Absent => return,
+            LightPlane::Dark => Some(0),
+            LightPlane::Full => Some(0xFF),
+            LightPlane::Dense(_) => None,
+        };
+        if let Some(fill) = fill {
+            *self = LightPlane::Dense(Arc::new([fill; LIGHT_BYTES]));
+        }
+        if let LightPlane::Dense(a) = self {
+            let i = ((y << 8) | (z << 4) | x) as usize;
+            let shift = (i & 1) * 4;
+            let byte = &mut Arc::make_mut(a)[i >> 1];
+            *byte = *byte & !(15 << shift) | (level & 15) << shift;
+        }
+    }
+
+    /// A plane whose every layer is this one's bottom layer
+    /// (`SkyLightSectionStorage.repeatFirstLayer`).
+    pub(crate) fn bottom_repeated(&self) -> LightPlane {
+        match self {
+            LightPlane::Dense(a) => {
+                let mut out = [0u8; LIGHT_BYTES];
+                for slab in out.as_chunks_mut::<128>().0 {
+                    slab.copy_from_slice(&a[..128]);
+                }
+                LightPlane::Dense(Arc::new(out))
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Every block's level, as the server would send the section.
+    pub fn bytes(&self) -> Option<[u8; LIGHT_BYTES]> {
+        match self {
+            LightPlane::Absent => None,
+            LightPlane::Dark => Some([0; LIGHT_BYTES]),
+            LightPlane::Full => Some([0xFF; LIGHT_BYTES]),
+            LightPlane::Dense(a) => Some(**a),
+        }
+    }
+
     pub fn shares(&self, other: &LightPlane) -> bool {
         match (self, other) {
-            (LightPlane::Absent, LightPlane::Absent) | (LightPlane::Dark, LightPlane::Dark) => true,
+            (LightPlane::Absent, LightPlane::Absent)
+            | (LightPlane::Dark, LightPlane::Dark)
+            | (LightPlane::Full, LightPlane::Full) => true,
             (LightPlane::Dense(a), LightPlane::Dense(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -179,6 +232,9 @@ pub struct BlockEntityRecord {
 pub struct Column {
     generation: u64,
     sections: Vec<SectionPlanes>,
+    /// How many blocks of each section aren't air (`nonEmptyBlockCount`): the server's
+    /// count, kept up by block changes.
+    non_air: Vec<u16>,
     light: Vec<LightPlanes>,
     heights: Option<Arc<[i16; 256]>>,
     block_entities: Arc<Vec<BlockEntityRecord>>,
@@ -224,6 +280,19 @@ impl Column {
     /// The stamp of the last change to the block entities' data.
     pub fn block_entities_rev(&self) -> u64 {
         self.block_entities_rev
+    }
+
+    /// The state the light engine sees at a block of the chunk
+    /// (`LevelChunk.getBlockState`): air outside the level and in a section counted as
+    /// all air.
+    fn light_state(&self, min_y: i32, x: i32, y: i32, z: i32) -> u32 {
+        let i = (y - min_y) >> 4;
+        match usize::try_from(i).ok().filter(|i| *i < self.sections.len()) {
+            Some(i) if self.non_air[i] != 0 => {
+                u32::from(self.sections[i].blocks.get(x, (y - min_y) & 15, z))
+            }
+            _ => 0,
+        }
     }
 
     /// The block light at a block of light section `light` (`BlockLightSectionStorage`:
@@ -305,6 +374,11 @@ pub struct Level {
     motion_blocking: Option<Arc<Vec<u64>>>,
     /// What changed since the level was last published, when something publishes it.
     changes: Option<Box<Changes>>,
+    /// The level's light as the client computes it.
+    light: LightEngine,
+    /// What each block state does to light. Without it no light is computed: the
+    /// chunks have the server's, which goes stale where blocks change.
+    light_table: Option<Arc<LightTable>>,
     /// The moving pistons and shulker boxes, and their tickers.
     pub block_entities: BlockEntities,
     /// `PistonMovingBlockEntity.NOCLIP`: while a piston moves an entity, the way it
@@ -332,6 +406,8 @@ impl Level {
             stamp: 0,
             motion_blocking: None,
             changes: None,
+            light: LightEngine::new(min_y >> 4, height >> 4, true),
+            light_table: None,
             block_entities: BlockEntities::default(),
             noclip: None,
             set_log: None,
@@ -361,8 +437,18 @@ impl Level {
         self.has_skylight
     }
 
+    /// Says whether the dimension has sky light, before any chunk is loaded.
     pub fn set_has_skylight(&mut self, has: bool) {
         self.has_skylight = has;
+        if self.light.has_skylight() != has {
+            self.light = LightEngine::new(self.min_y >> 4, self.height >> 4, has);
+        }
+    }
+
+    /// What each block state does to light: with it the level computes light after
+    /// block changes, as the game's client does ([`Level::run_light_updates`]).
+    pub fn set_light_table(&mut self, table: Arc<LightTable>) {
+        self.light_table = Some(table);
     }
 
     /// Which block states count in the motion-blocking heightmap: a bit per state id
@@ -493,13 +579,21 @@ impl Level {
             self.note_column(x, z, dirty::UNLOADED);
         }
         self.block_entities.clear_chunk(x, z);
+        self.light.forget(x, z);
     }
 
-    fn insert_column(&mut self, x: i32, z: i32, sections: Vec<(BlockPlane, BiomePlane)>) {
+    fn insert_column(
+        &mut self,
+        x: i32,
+        z: i32,
+        sections: Vec<(BlockPlane, BiomePlane)>,
+        non_air: Vec<u16>,
+    ) {
         let stamp = self.next_stamp();
         let n = sections.len();
         let column = Column {
             generation: stamp,
+            non_air,
             sections: sections
                 .into_iter()
                 .map(|(blocks, biomes)| SectionPlanes {
@@ -531,8 +625,102 @@ impl Level {
             x,
             z,
             vec![(BlockPlane::Uniform(0), BiomePlane::Uniform(biome)); n],
+            vec![0; n],
         );
         self.scan_heights(x, z);
+        self.light_chunk(x, z, &LightData::default());
+    }
+
+    /// A chunk's blocks are in place: its sky sources are found, its light from the
+    /// server waits for the sections that will hold it, light is on for it, and every
+    /// section says whether it has blocks (the client's queued light job for a chunk).
+    fn light_chunk(&mut self, x: i32, z: i32, data: &LightData) {
+        let Some(c) = self.chunks.get(&(x, z)) else {
+            return;
+        };
+        let sources = self
+            .light_table
+            .as_ref()
+            .filter(|_| self.has_skylight)
+            .map(|table| sky_sources(c, table, self.min_y));
+        let empty: Vec<bool> = c.non_air.iter().map(|n| *n == 0).collect();
+        self.light.set_sources(x, z, sources);
+        self.light.queue(x, z, data);
+        self.light.set_lit(x, z, true);
+        let min_section = self.min_y >> 4;
+        for (i, empty) in empty.into_iter().enumerate() {
+            self.light
+                .set_section_empty([x, min_section + i as i32, z], empty);
+        }
+        // The chunk's planes were made anew: all of them are to be filled.
+        self.light.refresh(x, z);
+    }
+
+    /// One frame's light (`ClientLevel.update`): the light the server sent since the
+    /// last run is put in place, and what block changes did to light is computed. The
+    /// chunks' light planes follow, with new stamps, and the sections whose light
+    /// changed are noted for drawing, as the game marks them for meshing.
+    pub fn run_light_updates(&mut self) {
+        if !self.light.has_work() {
+            return;
+        }
+        let outcome = {
+            let states = ChunkStates {
+                chunks: &self.chunks,
+                min_y: self.min_y,
+            };
+            self.light.run(&states, self.light_table.as_deref())
+        };
+        let (min_section, count) = self.section_range();
+        let mut stamp = None;
+        let mut relit = Vec::new();
+        for s in &outcome.changed {
+            let Some(c) = self.chunks.get_mut(&(s[0], s[2])) else {
+                continue;
+            };
+            let Some(i) = usize::try_from(s[1] - (min_section - 1))
+                .ok()
+                .filter(|i| *i < c.light.len())
+            else {
+                continue;
+            };
+            let (sky, block) = (self.light.sky_plane(*s), self.light.block_plane(*s));
+            if c.light[i].sky.shares(&sky) && c.light[i].block.shares(&block) {
+                continue;
+            }
+            let stamp = *stamp.get_or_insert_with(|| {
+                self.stamp += 1;
+                self.stamp
+            });
+            let l = &mut Arc::make_mut(c).light[i];
+            l.sky = sky;
+            l.block = block;
+            l.rev = stamp;
+            relit.push(*s);
+            if let Some(ch) = &mut self.changes {
+                ch.column_changed(s[0], s[2]);
+            }
+        }
+        if let Some(ch) = &mut self.changes {
+            // `onLightUpdate`: a section of its own, with no halo around it. A chunk
+            // noted as a whole (it loaded, or one next to it did) has its sections
+            // covered already.
+            for s in &outcome.touched {
+                if s[1] < min_section
+                    || s[1] >= min_section + count
+                    || ch.column_marked(s[0], s[2])
+                    || !self.chunks.contains_key(&(s[0], s[2]))
+                {
+                    continue;
+                }
+                let flag = if relit.binary_search(s).is_ok() {
+                    dirty::LIGHT
+                } else {
+                    dirty::NEIGHBOUR
+                };
+                ch.mark_section(*s, flag);
+            }
+        }
     }
 
     /// Reads a chunk's sections (`LevelChunkSection.read`, one per 16 blocks of the
@@ -572,8 +760,11 @@ impl Level {
         let state_bits = global_bits(ruthenium_data::v26_3::blocks::STATE_COUNT);
         let mut r = Reader::new(packet.data);
         let mut sections = Vec::with_capacity(n);
+        let mut non_air = Vec::with_capacity(n);
         for _ in 0..n {
-            r.bytes(4)?; // non-empty block count, fluid count
+            // The non-air block count, then the fluid count.
+            let counts = r.bytes(4)?;
+            non_air.push(i16::from_be_bytes([counts[0], counts[1]]).max(0) as u16);
             let blocks = read_states(&mut r, state_bits)?;
             sections.push((blocks, read_biomes(&mut r, biome_bits)?));
         }
@@ -582,7 +773,7 @@ impl Level {
             .iter()
             .find(|(kind, _)| *kind == HEIGHTMAP_MOTION_BLOCKING)
             .and_then(|(_, longs)| unpack_heights(longs, self.min_y, self.height));
-        self.insert_column(x, z, sections);
+        self.insert_column(x, z, sections, non_air);
         match heights {
             Some(h) => {
                 if let Some(c) = self.chunks.get_mut(&(x, z)) {
@@ -638,59 +829,32 @@ impl Level {
                 .collect();
             Arc::make_mut(c).block_entities = Arc::new(records);
         }
-        self.apply_light(x, z, packet.light, false);
+        self.light_chunk(x, z, packet.light);
         Ok(())
     }
 
-    /// New light for some of a chunk's light sections (`applyLightData`): a section in
-    /// a mask takes the next array, a section in an empty mask goes dark, the others
-    /// keep what they had. Nothing where no chunk is loaded.
+    /// New light for some of a chunk's light sections (`applyLightData`), which the
+    /// server sends for chunks on the edge of the view: it waits for
+    /// [`Level::run_light_updates`], where a section in a mask takes the next array, a
+    /// section in an empty mask goes dark, and the others keep what they had. The
+    /// sections named are noted for drawing now, with the sections around them.
     pub fn update_light(&mut self, x: i32, z: i32, light: &LightData) {
-        self.apply_light(x, z, light, true);
-    }
-
-    fn apply_light(&mut self, x: i32, z: i32, light: &LightData, note: bool) {
-        let Some(count) = self.chunks.get(&(x, z)).map(|c| c.light.len()) else {
-            return;
+        self.light.queue(x, z, light);
+        self.light.set_lit(x, z, true);
+        let named = |i: usize| {
+            [
+                &light.sky_mask,
+                &light.empty_sky_mask,
+                &light.block_mask,
+                &light.empty_block_mask,
+            ]
+            .into_iter()
+            .any(|mask| LightData::bit(mask, i))
         };
-        let (mut sky, mut block) = (light.sky.iter(), light.block.iter());
-        let pick = |mask: &[u64],
-                    empty: &[u64],
-                    arrays: &mut std::slice::Iter<'_, Arc<[u8; LIGHT_BYTES]>>,
-                    i: usize| {
-            if LightData::bit(mask, i) {
-                // A mask bit without its array: the packet is short; the section keeps
-                // what it had.
-                arrays.next().map(|a| LightPlane::Dense(a.clone()))
-            } else if LightData::bit(empty, i) {
-                Some(LightPlane::Dark)
-            } else {
-                None
-            }
-        };
-        for i in 0..count {
-            let new_sky = pick(&light.sky_mask, &light.empty_sky_mask, &mut sky, i);
-            let new_block = pick(&light.block_mask, &light.empty_block_mask, &mut block, i);
-            if new_sky.is_none() && new_block.is_none() {
-                continue;
-            }
-            let stamp = self.next_stamp();
-            let Some(c) = self.chunks.get_mut(&(x, z)) else {
-                return;
-            };
-            let l = &mut Arc::make_mut(c).light[i];
-            if let Some(p) = new_sky {
-                l.sky = p;
-            }
-            if let Some(p) = new_block {
-                l.block = p;
-            }
-            l.rev = stamp;
-            if note {
+        for i in 0..(self.height >> 4) as usize + 2 {
+            if named(i) {
                 // `setSectionDirtyWithNeighbors`.
                 self.note_section(x, i as i32 - 1, z, dirty::LIGHT, None);
-            } else if let Some(ch) = &mut self.changes {
-                ch.column_changed(x, z);
             }
         }
     }
@@ -969,26 +1133,38 @@ impl Level {
         self.put_block(x, y, z, state, false);
     }
 
-    fn put_block(&mut self, x: i32, y: i32, z: i32, state: u32, urgent: bool) {
+    /// Whether the block changed.
+    fn put_block(&mut self, x: i32, y: i32, z: i32, state: u32, urgent: bool) -> bool {
         if y < self.min_y || y >= self.min_y + self.height {
-            return;
+            return false;
         }
         let min_y = self.min_y;
         let old = self.block(x, y, z);
-        if old == state || !self.chunks.contains_key(&(x >> 4, z >> 4)) {
-            return;
+        let s = ((y - min_y) >> 4) as usize;
+        let (was_air, now_air) = (is_air(old), is_air(state));
+        let Some(was_empty) = self
+            .chunks
+            .get(&(x >> 4, z >> 4))
+            .map(|c| c.non_air[s] == 0)
+        else {
+            return false;
+        };
+        // `LevelChunk.setBlockState`: air into a section that is all air changes nothing.
+        if old == state || (was_empty && now_air) {
+            return false;
         }
         let stamp = self.next_stamp();
         let table = self.motion_blocking.clone();
         let Some(c) = self.chunks.get_mut(&(x >> 4, z >> 4)) else {
-            return;
+            return false;
         };
         let c = Arc::make_mut(c);
-        let s = ((y - min_y) >> 4) as usize;
         c.sections[s]
             .blocks
             .set(x & 15, (y - min_y) & 15, z & 15, state as u16);
         c.sections[s].blocks_rev = stamp;
+        c.non_air[s] = (c.non_air[s] + u16::from(!now_air)).saturating_sub(u16::from(!was_air));
+        let is_empty = c.non_air[s] == 0;
         Self::update_height(
             c,
             table.as_deref().map(Vec::as_slice),
@@ -1012,6 +1188,31 @@ impl Level {
             };
         self.note_section(x >> 4, s as i32, z >> 4, flags, Some([x, y - min_y, z]));
         self.block_entities.on_block_changed([x, y, z], old, state);
+        if was_empty != is_empty {
+            self.light
+                .set_section_empty([x >> 4, y >> 4, z >> 4], is_empty);
+        }
+        if let Some(table) = self.light_table.clone()
+            && table.differ(old, state)
+        {
+            self.update_sky_source(&table, x, y, z);
+            self.light.check([x, y, z]);
+        }
+        true
+    }
+
+    /// `ChunkSkyLightSources.update` for the column of blocks a changed block is in.
+    fn update_sky_source(&mut self, table: &LightTable, x: i32, y: i32, z: i32) {
+        let (Some(current), Some(c)) =
+            (self.light.source(x, z), self.chunks.get(&(x >> 4, z >> 4)))
+        else {
+            return;
+        };
+        let min_y = self.min_y;
+        let state = |y: i32| c.light_state(min_y, x & 15, y, z & 15);
+        if let Some(new) = light::updated_source(table, current, y, min_y, state) {
+            self.light.set_source(x, z, new);
+        }
     }
 
     /// Sets a block as `LevelChunk.setBlockState` does: the state it replaced, or `None`
@@ -1023,11 +1224,7 @@ impl Level {
             return None;
         }
         let old = self.block(x, y, z);
-        if old == state {
-            return None;
-        }
-        self.put_block(x, y, z, state, true);
-        Some(old)
+        self.put_block(x, y, z, state, true).then_some(old)
     }
 
     /// The block collision shapes that `box` could meet, in the order the game's
@@ -1186,6 +1383,59 @@ impl Level {
     }
 }
 
+/// The loaded chunks' blocks as the light engine reads them.
+struct ChunkStates<'a> {
+    chunks: &'a HashMap<(i32, i32), Arc<Column>>,
+    min_y: i32,
+}
+
+impl BlockSource for ChunkStates<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        let c = self.chunks.get(&(x >> 4, z >> 4))?;
+        Some(c.light_state(self.min_y, x & 15, y, z & 15))
+    }
+}
+
+/// A chunk's sky sources (`ChunkSkyLightSources.fillFrom`): for each column of blocks,
+/// looking down from the top of the highest section that isn't all air.
+fn sky_sources(c: &Column, table: &LightTable, min_y: i32) -> Box<SkySources> {
+    let mut out = Box::new([light::OPEN_BELOW; 256]);
+    let Some(top) = c.non_air.iter().rposition(|n| *n != 0) else {
+        return out;
+    };
+    let from = min_y + (top as i32 + 1) * 16;
+    for (i, lowest) in out.iter_mut().enumerate() {
+        let (x, z) = ((i & 15) as i32, (i >> 4) as i32);
+        *lowest = light::lowest_source(table, from, min_y, 0, |y| {
+            let s = ((y - min_y) >> 4) as usize;
+            if c.non_air[s] == 0 {
+                Err(min_y + s as i32 * 16)
+            } else {
+                Ok(u32::from(c.sections[s].blocks.get(x, (y - min_y) & 15, z)))
+            }
+        });
+    }
+    out
+}
+
+/// `isAir`: air, cave air and void air.
+fn is_air(state: u32) -> bool {
+    use ruthenium_data::v26_3::blocks::{BlockState, STATE_COUNT};
+    static AIR: std::sync::LazyLock<Vec<u32>> = std::sync::LazyLock::new(|| {
+        (0..STATE_COUNT as u32)
+            .filter(|id| {
+                BlockState::from_id(*id).is_some_and(|s| {
+                    matches!(
+                        s.block().name(),
+                        "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                    )
+                })
+            })
+            .collect()
+    });
+    AIR.contains(&state)
+}
+
 /// Whether two states are of one block.
 fn same_block(a: u32, b: u32) -> bool {
     use ruthenium_data::v26_3::blocks::BlockState;
@@ -1301,7 +1551,10 @@ pub(crate) mod testing {
     pub fn chunk_data(sections: usize, fill: impl Fn(usize) -> u16) -> Vec<u8> {
         let mut data = Vec::new();
         for i in 0..sections {
-            data.extend([0, 0, 0, 0, 0]);
+            // The non-air count (state 0 is air), the fluid count, a single state.
+            let count: i16 = if fill(i) == 0 { 0 } else { 4096 };
+            data.extend(count.to_be_bytes());
+            data.extend([0, 0, 0]);
             wire::write_varint(&mut data, i32::from(fill(i)));
             data.extend([0, 0]);
         }
@@ -1377,6 +1630,12 @@ mod tests {
             light: &l,
         };
         level.load_chunk_packet(0, 0, packet, 6).unwrap();
+        // The light is in place after the frame's run.
+        assert!(matches!(
+            level.column(0, 0).unwrap().light()[1].sky,
+            LightPlane::Absent
+        ));
+        level.run_light_updates();
         let c = level.column(0, 0).unwrap().clone();
         assert_eq!(c.light().len(), 6);
         assert!(matches!(c.light()[1].sky, LightPlane::Dark));
@@ -1402,6 +1661,8 @@ mod tests {
         // the block light of section 0 isn't named and stays.
         let before = level.stamp();
         level.update_light(0, 0, &light(&[(1, Some(3)), (2, None)], &[]));
+        assert_eq!(level.sky_light(3, -10, 3), 0);
+        level.run_light_updates();
         assert_eq!(level.sky_light(3, -10, 3), 3);
         assert_eq!(level.sky_light(3, 5, 3), 0);
         assert_eq!(level.block_light(3, -17, 3), 5);
@@ -1411,9 +1672,11 @@ mod tests {
         assert!(after.light()[0].block.shares(&c.light()[0].block));
         // The copy taken before the update still reads the old light.
         assert_eq!(c.sky_light(true, 2, 3, 5, 3), 9);
-        // Light for a chunk that isn't loaded goes nowhere.
+        // Light for a chunk that isn't loaded waits, and nothing reads it.
         level.update_light(7, 7, &light(&[(1, Some(3))], &[]));
+        level.run_light_updates();
         assert!(!level.has_chunk(7, 7));
+        assert_eq!(level.sky_light(115, -10, 115), 15);
 
         // A dimension without sky light is dark whatever was sent.
         level.set_has_skylight(false);

@@ -50,6 +50,7 @@ use crate::interact::{self, GameMode, UseKeys};
 use crate::inventory::Hand;
 use crate::item::Items;
 use crate::level_load::LevelLoad;
+use crate::light::LightTable;
 use crate::pick;
 use crate::player::{Env, Keys, LocalPlayer, Others, Pose};
 use crate::predict::Predictions;
@@ -559,6 +560,9 @@ struct Game {
     /// Which block states count in the motion-blocking heightmap, by the tags the
     /// server sent.
     motion_blocking: Option<Arc<Vec<u64>>>,
+    /// What each block state does to light, from the prepared game: with it the
+    /// level computes light after block changes.
+    light_table: Option<Arc<LightTable>>,
     /// The keys the next ticks read.
     keys: Keys,
     /// Hotbar key presses not yet read (`KeyMapping.clickCount`).
@@ -694,6 +698,9 @@ impl Game {
         events: Sender<SessionEvent>,
         publisher: ScenePublisher,
     ) -> Game {
+        let light_table = physics
+            .as_ref()
+            .map(|p| Arc::new(LightTable::of(&p.blocks)));
         Game {
             connection,
             known_packs,
@@ -723,6 +730,7 @@ impl Game {
             input_sequence: 0,
             input_at: None,
             motion_blocking: None,
+            light_table,
             keys: Keys::default(),
             hotbar_clicks: [0; 9],
             use_keys: UseKeys::default(),
@@ -1150,6 +1158,9 @@ impl Game {
         level.set_has_skylight(t.has_skylight);
         if let Some(states) = &self.motion_blocking {
             level.set_motion_blocking(states.clone());
+        }
+        if let Some(table) = &self.light_table {
+            level.set_light_table(table.clone());
         }
         level.track_changes(DEFAULT_DIRTY_CAPACITY);
         level.weather = Weather::new(t.has_skylight, t.has_ceiling, &spawn.dimension);
@@ -2485,8 +2496,12 @@ mod tests {
         let keys = r.dirty();
         // The server's changes are not the player's own.
         assert_eq!(keys[&[0, 0, 0]], dirty::BLOCKS | dirty::LIGHT);
-        assert_eq!(keys[&[1, 1, 0]], dirty::BLOCKS | dirty::NEIGHBOUR);
-        assert_eq!(keys[&[0, 1, 0]], dirty::NEIGHBOUR);
+        // A section's first blocks: it and the sections around it hold light now.
+        assert_eq!(
+            keys[&[1, 1, 0]],
+            dirty::BLOCKS | dirty::LIGHT | dirty::NEIGHBOUR
+        );
+        assert_eq!(keys[&[0, 1, 0]], dirty::LIGHT | dirty::NEIGHBOUR);
 
         // A block entity's new data.
         let mut sign = Compound::new();

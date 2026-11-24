@@ -15,6 +15,12 @@
 //! A death is printed, and Respawn pressed as soon as the death screen's buttons work;
 //! the script goes on (it doesn't start over) once the player is back.
 //!
+//! `--light-out` writes the light of every loaded chunk when the stay ends, and
+//! `--light-against` compares it with a file an earlier run wrote. That is the check of
+//! the light the client computes: change blocks on the server while one run is joined,
+//! join again, and the light the server then sends must be what the first run had
+//! (keep the chunks loaded on the server and the world still in between).
+//!
 //! `--route` plays a route file written by `cargo xtask bench dedicated` instead: input
 //! keyed by client tick (see [`Route`]). The client waits until a benchmark controller
 //! has put the player at the route's start, plays every tick's input, records where the
@@ -762,6 +768,8 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut data_dir = None;
     let mut script = None;
     let mut route = None;
+    let mut light_out = None;
+    let mut light_against = None;
     let mut route_out = None;
     let mut expected = Expected::default();
     let mut it = args.iter();
@@ -785,6 +793,14 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                 let path = it.next().ok_or("--route needs a file")?;
                 let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
                 route = Some(Route::parse(&text).map_err(|e| format!("{path}: {e}"))?);
+            }
+            "--light-out" => {
+                light_out = Some(PathBuf::from(it.next().ok_or("--light-out needs a file")?));
+            }
+            "--light-against" => {
+                let path = it.next().ok_or("--light-against needs a file")?;
+                let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+                light_against = Some((path.clone(), text));
             }
             "--route-out" => {
                 route_out = Some(PathBuf::from(it.next().ok_or("--route-out needs a file")?));
@@ -849,6 +865,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let stay = Duration::from_secs_f64(seconds);
     let mut playing = false;
     let mut leaving = false;
+    let mut light_same = true;
     let mut next_frame = Instant::now();
     loop {
         let mut closed = None;
@@ -904,7 +921,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
             }
         }
         if let Some(c) = closed {
-            let ok = playing && (leaving || crate::join::left_on_purpose(&c));
+            let ok = playing && light_same && (leaving || crate::join::left_on_purpose(&c));
             return Ok(if ok {
                 ExitCode::SUCCESS
             } else {
@@ -918,6 +935,22 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
         session.frame();
         if !leaving && started.elapsed() >= stay {
             leaving = true;
+            if light_out.is_some() || light_against.is_some() {
+                let dump = light_dump(&session);
+                if let Some(path) = &light_out {
+                    std::fs::write(path, &dump).map_err(|e| format!("{}: {e}", path.display()))?;
+                    println!("light written to {}", path.display());
+                }
+                if let Some((path, other)) = &light_against {
+                    let min_y = session.scene().with_terrain(|t| t.dims().min_section * 16);
+                    let differences = light_differences(&dump, other, min_y)?;
+                    for d in differences.iter().take(40) {
+                        println!("light: {d}");
+                    }
+                    println!("light: {} layers differ from {path}", differences.len());
+                    light_same = differences.is_empty();
+                }
+            }
             session.disconnect();
         }
         next_frame += FRAME;
@@ -930,9 +963,150 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     }
 }
 
+/// The light of every published chunk as text (`--light-out`): a line per light
+/// section, `x z index sky block`, each layer as `-` (the section holds none), `u`
+/// and a level (all of it at that level) or its 2048 bytes in hex.
+fn light_dump(session: &Session) -> String {
+    use std::fmt::Write as _;
+    fn layer(p: &ruthenium_sim::world::LightPlane) -> String {
+        match p.bytes() {
+            None => "-".into(),
+            Some(b) if b.iter().all(|v| *v == b[0]) && b[0] >> 4 == b[0] & 15 => {
+                format!("u{}", b[0] & 15)
+            }
+            Some(b) => b.iter().map(|v| format!("{v:02x}")).collect(),
+        }
+    }
+    let mut out = String::new();
+    if let Some(c) = session.camera() {
+        let p = c.frame.player.position;
+        let _ = writeln!(out, "# player {:.3} {:.3} {:.3}", p[0], p[1], p[2]);
+    }
+    session.scene().with_terrain(|t| {
+        let mut columns: Vec<_> = t.columns().collect();
+        columns.sort_by_key(|(key, _)| *key);
+        for ((x, z), c) in columns {
+            for (i, l) in c.light().iter().enumerate() {
+                let _ = writeln!(out, "{x} {z} {i} {} {}", layer(&l.sky), layer(&l.block));
+            }
+        }
+    });
+    out
+}
+
+/// A layer of a light dump as 2048 bytes, `None` for a section that holds none.
+fn dumped_layer(text: &str) -> Result<Option<Vec<u8>>, String> {
+    if text == "-" {
+        return Ok(None);
+    }
+    if let Some(level) = text.strip_prefix('u') {
+        let v: u8 = level.parse().map_err(|_| format!("bad level {level}"))?;
+        return Ok(Some(vec![v & 15 | v << 4; 2048]));
+    }
+    if text.len() != 4096 || !text.is_ascii() {
+        return Err(format!("a layer of {} characters", text.len()));
+    }
+    (0..2048)
+        .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<u8>, String>>()
+        .map(Some)
+}
+
+/// Where two light dumps differ (`--light-against`), a line per layer, compared level
+/// by level: light computed here after block changes against the light the server
+/// sends for the same chunks after a rejoin must be the same. `min_y` is the y of
+/// the level's lowest block.
+fn light_differences(ours: &str, theirs: &str, min_y: i32) -> Result<Vec<String>, String> {
+    type Layers<'a> = HashMap<[i32; 3], (&'a str, &'a str)>;
+    fn read(text: &str) -> Result<Layers<'_>, String> {
+        let mut out = HashMap::new();
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [x, z, i, sky, block] = f[..] else {
+                return Err(format!("bad line: {line}"));
+            };
+            let n = |s: &str| s.parse::<i32>().map_err(|_| format!("bad line: {line}"));
+            out.insert([n(x)?, n(z)?, n(i)?], (sky, block));
+        }
+        Ok(out)
+    }
+    let (a, b) = (read(ours)?, read(theirs)?);
+    let mut keys: Vec<[i32; 3]> = a.keys().chain(b.keys()).copied().collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut out = Vec::new();
+    for key in keys {
+        let [x, z, i] = key;
+        let (Some(ours), Some(theirs)) = (a.get(&key), b.get(&key)) else {
+            // A chunk only one run had loaded says nothing.
+            continue;
+        };
+        for (name, ours, theirs) in [("sky", ours.0, theirs.0), ("block", ours.1, theirs.1)] {
+            if ours == theirs {
+                continue;
+            }
+            let at = format!("chunk {x} {z}, light section {i}, {name} light");
+            match (dumped_layer(ours)?, dumped_layer(theirs)?) {
+                (None, None) => {}
+                (Some(_), None) => out.push(format!("{at}: held here only")),
+                (None, Some(_)) => out.push(format!("{at}: held there only")),
+                (Some(p), Some(q)) => {
+                    let level = |l: &[u8], j: usize| l[j >> 1] >> ((j & 1) * 4) & 15;
+                    let differing: Vec<usize> = (0..4096)
+                        .filter(|j| level(&p, *j) != level(&q, *j))
+                        .collect();
+                    if let Some(&j) = differing.first() {
+                        let pos = [
+                            x * 16 + (j & 15) as i32,
+                            min_y + (i - 1) * 16 + (j >> 8) as i32,
+                            z * 16 + (j >> 4 & 15) as i32,
+                        ];
+                        out.push(format!(
+                            "{at}: {} levels differ, the first at {} {} {}: {} here, {} there",
+                            differing.len(),
+                            pos[0],
+                            pos[1],
+                            pos[2],
+                            level(&p, j),
+                            level(&q, j)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn light_dumps_are_compared_level_by_level() {
+        // An array of one level is the same light as the level alone.
+        let fives = "55".repeat(2048);
+        let ours = format!("# player 0 0 0\n0 0 1 u15 {fives}\n0 0 2 - u0\n1 0 1 u15 u0\n");
+        let same = format!("0 0 1 {} u5\n0 0 2 - u0\n", "ff".repeat(2048));
+        assert_eq!(
+            light_differences(&ours, &same, -64).unwrap(),
+            Vec::<String>::new()
+        );
+        // One level of 4096: the block at x 1, y 2, z 3 of the section (index 561, the
+        // high half of byte 280).
+        let mut other = vec![0x55u8; 2048];
+        other[280] = 0x75;
+        let hex: String = other.iter().map(|v| format!("{v:02x}")).collect();
+        let theirs = format!("0 0 1 u15 {hex}\n0 0 2 u15 u0\n");
+        assert_eq!(
+            light_differences(&ours, &theirs, -64).unwrap(),
+            [
+                "chunk 0 0, light section 1, block light: 1 levels differ, the first at 1 -62 3: 5 here, 7 there",
+                "chunk 0 0, light section 2, sky light: held there only",
+            ]
+        );
+        assert!(light_differences("0 0 1 u15", &theirs, -64).is_err());
+    }
 
     #[test]
     fn reads_scripts() {

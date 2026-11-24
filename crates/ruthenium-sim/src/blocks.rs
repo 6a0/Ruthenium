@@ -328,6 +328,11 @@ impl Blocks {
         )
     }
 
+    /// A shape of the table the states' shapes are in, by its index there.
+    pub(crate) fn shape_at(&self, index: u32) -> &Shape {
+        &self.shapes[index as usize]
+    }
+
     /// `getLightDampening`: how much light the state takes away.
     pub fn light_dampening(&self, id: u32) -> u8 {
         self.state(id).light_dampening

@@ -196,7 +196,7 @@ mod tests {
             coords: [vec![0.0, 1.0], vec![0.0, 1.0], vec![0.0, 1.0]],
             full: vec![full],
         };
-        let state = |light_dampening, occlusion| StatePhysics {
+        let state = |light_dampening, occlusion: [u32; 2]| StatePhysics {
             shape: 0,
             flags: 0,
             friction: 0.6,
@@ -211,7 +211,9 @@ mod tests {
             interaction: 0,
             destroy_time: 0.0,
             light_dampening,
-            occlusion,
+            light_emission: 0,
+            light_shape: false,
+            occlusion: [occlusion[0], occlusion[1], 0, 0, 0, 0],
         };
         let blocks = Blocks::new(&BlockPhysics {
             shapes: vec![cube(false), cube(true)],
