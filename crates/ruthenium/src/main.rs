@@ -103,6 +103,10 @@ With no command, opens the game window. Options:
                          first (default); one draw each, a buffer page at a time; or
                          a page's draws in one call that reads them as commands
                          (multi-draw indirect, where the GPU has it)
+  --terrain-culling <graph|frustum>
+                         what of the world is meshed and drawn: what can be seen
+                         from the camera through the sections' open faces (graph, the
+                         default), or everything loaded inside the view (frustum)
   --route <file>         with --join: play a route file from cargo xtask bench
                          dedicated once in the world, measure the frames of its
                          capture (for --bench-out, with every frame interval and what

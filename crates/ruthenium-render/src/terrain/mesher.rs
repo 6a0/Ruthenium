@@ -18,6 +18,7 @@ use ruthenium_sim::blocks::{offset as block_offset, seed};
 use ruthenium_sim::scene::{HALO_SIDE, Neighbourhood};
 
 use super::table::{BlockTable, ShapeKind, StateInfo, sticks_out};
+use super::visibility::Connectivity;
 use crate::terrain_vertex::{Vertex, position_code, position_of, uv_code};
 
 /// The six directions' steps, by `Direction` ordinal: down, up, north, south, west,
@@ -60,6 +61,9 @@ pub struct SectionMesh {
     /// Corners and texture coordinates outside what a vertex can hold (they were moved
     /// to the nearest value it can).
     pub out_of_range: u32,
+    /// Which of the section's faces can be seen from which, through its blocks that
+    /// are not solid.
+    pub connectivity: Connectivity,
 }
 
 impl SectionMesh {
@@ -189,6 +193,9 @@ impl Mesher {
         cutout.clear();
         let mut parts: Vec<&ModelPart> = Vec::with_capacity(8);
         let (mut min, mut max) = ([f32::MAX; 3], [f32::MIN; 3]);
+        // The blocks nothing is seen through (`SectionCompiler.java:78`), in the planes'
+        // order.
+        let mut solid = [0u64; 64];
 
         // `LightCoordsUtil.getLightCoords` of the state at a place: block and sky light
         // there, the block light not below what the state gives off itself.
@@ -211,6 +218,10 @@ impl Mesher {
                         continue;
                     }
                     let state = *table.state(id);
+                    if state.flags & StateInfo::SOLID_RENDER != 0 {
+                        let i = (x | z << 4 | y << 8) as usize;
+                        solid[i >> 6] |= 1 << (i & 63);
+                    }
                     if state.flags & StateInfo::DRAWN == 0 {
                         continue;
                     }
@@ -334,6 +345,7 @@ impl Mesher {
         if out.quads() > 0 {
             out.bounds = Some([min, max]);
         }
+        out.connectivity = Connectivity::of(&solid);
         out
     }
 }
@@ -646,5 +658,35 @@ mod tests {
             ..OPTIONS
         };
         assert_ne!(mesher.mesh(&n, &nether), first);
+    }
+
+    #[test]
+    fn a_mesh_says_which_faces_its_solid_blocks_leave_connected() {
+        // A stone floor across the section: above it and below it are apart.
+        let mut world = World::new(&[(0, 0)]);
+        for z in 0..16 {
+            for x in 0..16 {
+                world.set(x, 8, z, testing::stone());
+            }
+        }
+        let m = mesh(&mut world, [0, 0, 0]);
+        let c = m.connectivity;
+        assert!(!c.sees(0, 1) && !c.sees(1, 0));
+        assert!(c.sees(0, 2) && c.sees(1, 2) && c.sees(4, 5));
+        // One block of it missing, and one that is no solid block for this: glass.
+        world.set(3, 8, 3, testing::glass());
+        assert_eq!(mesh(&mut world, [0, 0, 0]).connectivity, Connectivity::ALL);
+        world.set(3, 8, 3, testing::stone());
+        assert_eq!(mesh(&mut world, [0, 0, 0]).connectivity, c);
+        // A section of nothing but stone, and one of air.
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    world.set(x, y, z, testing::stone());
+                }
+            }
+        }
+        assert_eq!(mesh(&mut world, [0, 0, 0]).connectivity, Connectivity::NONE);
+        assert_eq!(mesh(&mut world, [0, 1, 0]).connectivity, Connectivity::ALL);
     }
 }

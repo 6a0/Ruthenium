@@ -158,6 +158,9 @@ pub struct Options {
     /// How the terrain's sections are drawn (default: one direct draw each, nearest
     /// first).
     pub terrain_draws: Option<TerrainDraws>,
+    /// Whether only what can be seen from the camera is meshed and drawn (cave
+    /// culling: the default) or everything loaded inside the view.
+    pub terrain_culling: Option<bool>,
 }
 
 impl Options {
@@ -209,6 +212,7 @@ impl Options {
             route_out: None,
             expected: Expected::default(),
             terrain_draws: None,
+            terrain_culling: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -368,6 +372,13 @@ impl Options {
                         TerrainDraws::parse(&v)
                             .ok_or(format!("--terrain-draws: not direct, paged or mdi: {v}"))?,
                     );
+                }
+                "--terrain-culling" => {
+                    o.terrain_culling = Some(match value("graph or frustum")?.as_str() {
+                        "graph" => true,
+                        "frustum" => false,
+                        v => return Err(format!("--terrain-culling: not graph or frustum: {v}")),
+                    });
                 }
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
                 "--screen" => o.screen = Some(value("a screen name")?),
@@ -619,6 +630,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     renderer.overlay_mut().set_visible(applied.frame_stats);
     if let Some(draws) = opts.terrain_draws {
         renderer.set_terrain_draws(draws);
+    }
+    if let Some(culling) = opts.terrain_culling {
+        renderer.set_terrain_culling(culling);
     }
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
@@ -1023,6 +1037,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         let world = world.as_ref().map(|w| WorldFrame {
             scene: &w.scene,
             camera: w.camera,
+            view_distance: w.view_distance,
             environment: &w.environment,
         });
         let report = renderer.render(&BACKGROUND, world, gui)?;
@@ -1238,6 +1253,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             });
             json!({
                 "draws": renderer.terrain_draws().name(),
+                "culling": if renderer.terrain_culling() { "graph" } else { "frustum" },
                 "mesh_workers": menu.mesh_workers(),
                 "envelope_bytes": ruthenium_render::terrain::POOL_ENVELOPE,
                 "at_capture_start": at_start,
@@ -1429,6 +1445,8 @@ fn terrain_state(renderer: &Renderer) -> Terrain {
             "sections are still being built: {} wait for a mesh, {} are with a worker, {} on their way to the GPU",
             s.dirty, s.jobs_out, s.pending
         ))
+    } else if s.graph_behind {
+        Some("what the new meshes let the camera see is still being worked out".into())
     } else {
         None
     };
@@ -1466,6 +1484,13 @@ fn terrain_json(s: &ruthenium_render::WorldStats) -> Value {
         "meshes_dropped": s.dropped,
         "sections_overflowed": s.overflowed,
         "mesh_bytes": s.mesh_bytes,
+        "culling": s.culling,
+        "reached": s.reached,
+        "hidden_meshes": s.hidden,
+        "graph_updates": s.graph_updates,
+        "graph_walks": s.graph_walks,
+        "graph_micros": s.graph_micros,
+        "slowest_graph_micros": s.slowest_graph_micros,
         "tested": s.tested,
         "visible": s.visible,
         "quads": s.quads,

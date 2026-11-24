@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 
 use ruthenium_data::v26_3::registries::MobEffect;
+use ruthenium_protocol::packets::ClientInformation;
 use ruthenium_render::{CameraPose, WorldStats};
 use ruthenium_sim::environment::Environment;
 use ruthenium_sim::input::{self, HeldKeys, KeyBinds, MouseMotion, MouseOptions, ScrollWheel};
@@ -167,6 +168,8 @@ const FOV: f32 = 70.0;
 pub struct WorldView {
     pub scene: Scene,
     pub camera: CameraPose,
+    /// The render distance in chunks, as the server was told it.
+    pub view_distance: i32,
     pub environment: Arc<Environment>,
 }
 
@@ -189,6 +192,8 @@ pub fn world_view(session: &Session, now: Instant) -> Option<WorldView> {
             x_rot: camera.x_rot,
             fov: FOV,
         },
+        // What every session tells its server (`crate::join`).
+        view_distance: i32::from(ClientInformation::default().view_distance),
         environment: f.environment.clone(),
     })
 }
@@ -201,8 +206,21 @@ pub fn terrain_lines(s: &WorldStats) -> String {
     } else {
         s.mesh_micros as f64 / s.tracker.jobs as f64
     };
+    let culling = if s.culling {
+        format!(
+            "Reached from the camera: {} sections ({} meshes are of sections that are not); {} answers from the graph, {} of them walks from the camera, the longest {:.2} ms\n",
+            s.reached,
+            s.hidden,
+            s.graph_updates,
+            s.graph_walks,
+            f64::from(s.slowest_graph_micros) / 1000.0,
+        )
+    } else {
+        "No cave culling: every loaded section is meshed\n".to_owned()
+    };
     format!(
         "Terrain: {} sections with a mesh of {} ({} waiting, {} jobs out, {} on their way); drawn {} of {} tested, {} quads in {} draws with {} buffer binds\n\
+         {culling}\
          Meshed {} times ({} for the player's changes, {} stale, {} waits for neighbours), {:.2} ms a section, slowest {:.2} ms; to the screen in at most {:.1} ms\n\
          Pages {:.1} MiB holding {:.1} MiB ({:.0} planned); left out: {} translucent quads, {} meshes for memory, {} sections a frame's data had no room for",
         s.meshed,

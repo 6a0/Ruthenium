@@ -114,6 +114,9 @@ pub struct WorldFrame<'a> {
     /// What the game thread publishes: the level, to mesh from.
     pub scene: &'a Scene,
     pub camera: CameraPose,
+    /// How many chunks far the world is drawn: the render distance the server was
+    /// told.
+    pub view_distance: i32,
     /// The dimension's own look: how faces are shaded, its light and its sky.
     pub environment: &'a Environment,
 }
@@ -157,6 +160,7 @@ pub struct Renderer {
     depth: Option<DepthTarget>,
     /// How the terrain's sections are to be drawn, for the world once it is loaded.
     terrain_draws: TerrainDraws,
+    terrain_culling: bool,
     /// The terrain's part of the last frame.
     world_times: WorldTimes,
     /// The number of the last frame recorded.
@@ -251,6 +255,7 @@ impl Renderer {
             world: None,
             depth: None,
             terrain_draws: TerrainDraws::default(),
+            terrain_culling: true,
             world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
@@ -288,10 +293,27 @@ impl Renderer {
                 &mut self.uploads,
                 assets,
                 workers,
+                self.terrain_culling,
             )?);
             self.set_terrain_draws(self.terrain_draws);
         }
         Ok(())
+    }
+
+    /// Whether only what can be seen from the camera through the sections' open faces
+    /// is meshed and drawn (cave culling, on unless said otherwise), or everything
+    /// loaded that is inside the view. Takes effect when the world's assets are loaded
+    /// ([`Self::load_world`]).
+    pub fn set_terrain_culling(&mut self, culling: bool) {
+        self.terrain_culling = culling;
+    }
+
+    /// Whether the terrain is drawn with cave culling (what was asked for until a
+    /// world is loaded).
+    pub fn terrain_culling(&self) -> bool {
+        self.world
+            .as_ref()
+            .map_or(self.terrain_culling, |w| w.stats().culling)
     }
 
     /// Asks for the terrain's sections to be drawn this way. A GPU that cannot draw
@@ -688,11 +710,11 @@ impl Renderer {
         let view = match (&world, surface, &mut self.world) {
             (Some(w), Some(s), Some(renderer)) => {
                 let started = std::time::Instant::now();
-                let section = w.camera.position.map(|c| (c.floor() as i32) >> 4);
                 renderer.set_shades(w.environment.cardinal_light.shades());
                 renderer.update(
                     w.scene,
-                    section,
+                    &w.camera,
+                    w.view_distance,
                     &mut self.textures,
                     &mut self.uploads,
                     LightmapInputs::of(w.environment),

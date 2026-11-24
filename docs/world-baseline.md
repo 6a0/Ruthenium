@@ -1,8 +1,8 @@
 # Ruthenium world baseline
 
-What Ruthenium's world renderer costs on the routes the vanilla client was measured on, and where its frame time, memory and latency go. It is a first measurement of an unfinished renderer: read [what the scene leaves out](#what-ruthenium-draws-and-what-it-does-not) before any ratio. The vanilla numbers are the dedicated-server runs of [baseline.md](baseline.md); the menus' own cost is in [menu-baseline.md](menu-baseline.md).
+What Ruthenium's world renderer costs on the routes the vanilla client was measured on, and where its frame time, memory and latency go. It measures an unfinished renderer: read [what the scene leaves out](#what-ruthenium-draws-and-what-it-does-not) before any ratio. The vanilla numbers are the dedicated-server runs of [baseline.md](baseline.md); the menus' own cost is in [menu-baseline.md](menu-baseline.md).
 
-Recorded on 2026-11-24 from the working tree on top of `d447d22`, in release.
+There are two measurements here, both of 2026-11-24 and in release. The first, from the working tree on top of `d447d22`, is of a renderer that meshed every loaded section and drew every one inside the view: everything from [Against vanilla](#against-vanilla) on, where nothing else is said. The second, on top of `50564e0`, is of [cave culling](#cave-culling), which is the default since.
 
 ## Machine and conditions
 
@@ -24,9 +24,80 @@ The Intel iGPU needs the laptop's Hybrid mode. Nothing here ran on it, on AMD or
 
 Medians of 3 runs throughout.
 
+## Cave culling
+
+Only what can be seen from the camera is meshed and drawn, as vanilla's cave culling decides it. Every mesh says which of its section's six faces can be seen from which, through the blocks in it that are not solid. A walk from the camera's section through those faces, breadth first, finds the sections that are reached: it never turns back in a direction opposite to one it has travelled, a section with blocks lets nothing through until it has a mesh, a section of air needs none, and more than three sections from the camera a step is only taken if the sections on the straight line back to the camera were reached before it. The walk runs on a thread of its own and starts again when the camera enters another 8-block cell. `--terrain-culling frustum` turns it off: every loaded section is then meshed, and drawn if it is inside the view, which is the renderer the sections after this one measured.
+
+Recorded on 2026-11-24 from the working tree on top of `50564e0`, on the same machine with the same options, in three variants: the default, the frustum alone, and the default with one frame of GPU work in hand. Of 54 runs, 18 ran while a viewer was connected to the streamed desktop and are left out ([below](#a-viewer-on-the-streamed-desktop)); the other 36, three for every scene and variant, had no video encoding session before or after them. Every run recorded the baseline's position on each of its 1440 ticks. Medians of 3, as average FPS / 1% low / 0.1% low:
+
+| Scene | Vanilla | Cave culling (default) | × vanilla | Frustum only | × vanilla | Culling, one frame ahead | × vanilla |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| idle | 1456 / 896 / 638 | 3149 / 1694 / 1374 | 2.16 / 1.89 / 2.15 | 1840 / 1243 / 1013 | 1.26 / 1.39 / 1.59 | 3709 / 1763 / 1418 | 2.55 / 1.97 / 2.22 |
+| spin | 1532 / 903 / 633 | 3328 / 1747 / 1415 | 2.17 / 1.93 / 2.24 | 2128 / 1354 / 1085 | 1.39 / 1.50 / 1.71 | 3948 / 1852 / 1528 | 2.58 / 2.05 / 2.41 |
+| walk | 1410 / 807 / 512 | 3167 / 1655 / 1341 | 2.25 / 2.05 / 2.62 | 1845 / 1212 / 965 | 1.31 / 1.50 / 1.88 | 3769 / 1572 / 1043 | 2.67 / 1.95 / 2.04 |
+| fly | 1569 / 802 / 404 | 4287 / 1784 / 1303 | 2.73 / 2.22 / 3.23 | 3332 / 1572 / 1114 | 2.12 / 1.96 / 2.76 | 5146 / 1739 / 1262 | 3.28 / 2.17 / 3.12 |
+
+The frustum-only numbers are those of the first measurement again (idle 1849 / 1247 / 1022 and fly 3358 / 1567 / 1147 there, with no viewer).
+
+**Against the targets** of 1.5 times vanilla's average and twice its lows, at the default options: the average is met in every scene (2.16 to 2.73), the 0.1% low in every scene (2.15 to 3.23), and the 1% low in walk (2.05) and fly (2.22), with idle at 1.89 and spin at 1.93. One frame ahead adds 18 to 20% to the averages and moves the 1% lows by less than the runs differ among themselves. The scene is as incomplete as before: [what it leaves out](#what-ruthenium-draws-and-what-it-does-not) has yet to be drawn, and no ratio here is a result until it is.
+
+**Run to run.** At the default, two of a scene's three runs agree within 1% on average FPS and on the 1% low. In idle the third does too; in spin, walk and fly it was 1 to 6% lower on the average and 8 to 31% on the 1% low (fly: 1230 against 1784 and 1801), with no encoding session recorded. For walk and fly that run is the single one of the last campaign.
+
+### The same pixels
+
+The frame after each route's end is the same file byte for byte with and without cave culling, in all four scenes and all 54 runs. So is the picture at eight places looked at by hand against a vanilla 26.3 server on the benchmark world, each with culling and without: in a room dug at y -30 looking down a lit tunnel 46 blocks long, at the tunnel's corner into a side branch, under a shaft dug to the surface looking up, on the surface beside the shaft's mouth, as a spectator in a natural cave, as a spectator inside solid stone (where culling is off, as in vanilla, and the culled client draws the very sections the other does), in a room dug in the Nether's warped forest, and after leaving and joining again in one process. A first picture in the Nether differed: it was taken while 48 sections of the culled client were still on their way to a mesh.
+
+Underground the difference is largest: joined in the tunnel, the client holds 754 meshes in 32 MiB of buffer pages where it held 4,024 in 124 MiB, and draws 139 sections where it drew 994.
+
+### What a frame draws and costs
+
+At the capture's end, with the frustum alone in brackets. Times are medians in milliseconds; work is the main thread's own.
+
+| Scene | Sections drawn | Quads in view | Draws | Work | Of it terrain draws | GPU |
+|---|---:|---:|---:|---:|---:|---:|
+| idle | 405 (925) | 291,723 (522,119) | 722 (1,425) | 0.052 (0.141) | 0.039 (0.102) | 0.206 (0.310) |
+| spin | 405 (927) | 292,361 (523,789) | 722 (1,428) | 0.052 (0.130) | 0.039 (0.101) | 0.194 (0.262) |
+| walk | 404 (893) | 364,355 (541,856) | 706 (1,396) | 0.054 (0.153) | 0.040 (0.115) | 0.200 (0.304) |
+| fly | 361 (473) | 316,292 (349,543) | 638 (777) | 0.045 (0.080) | 0.031 (0.065) | 0.120 (0.144) |
+
+- **The main thread's work falls to about a third** in idle, spin and walk: a frame tests the 1,400 to 2,400 meshes of reached sections against the view instead of 4,000 to 4,500, and records half the draws. Its P99 is 0.14 to 0.16 ms (0.24 to 0.31).
+- **The GPU's time falls by a quarter to a third** in idle, spin and walk and by a sixth in flight, where less is hidden. These scenes are still bound by it: with the GPU waited for, a frame is the main thread's work and then the GPU's.
+- **The walk** reaches about 8,000 of the 15,288 loaded sections at the spawn and 10,700 at the fly route's end; most are air. It is not on a frame's path. Over the 60 s of walk its thread answered 400 times, 72 of them with a walk from the camera, in 0.16 s altogether; in flight 2,966 times, 163 of them from the camera, in 0.47 s. The longest walk from the camera took 4.4 ms.
+
+### Meshing, uploads and latency
+
+Over the 60 s capture, with the frustum alone in brackets:
+
+| Scene | Meshes installed | Of them first meshes | MiB uploaded | Meshing, ms a section | First mesh, P50 / P99 | A change from the server, P50 / P99 |
+|---|---:|---:|---:|---:|---:|---:|
+| idle | 0 (1,337) | 0 (0) | 0 (29) | | | none (1.7 / 3.2 ms) |
+| walk | 1,714 (18,548) | 849 (5,160) | 85 (258) | 0.23 (0.13) | 1.8 / 5.8 ms, 4 / 15 frames (12.7 / 41 ms, 20 / 62 frames) | 2.0 / 6.2 ms, 5 / 17 frames (9.9 / 45 ms, 16 / 73 frames) |
+| fly | 9,401 (56,125) | 8,571 (48,944) | 408 (711) | 0.22 (0.10) | 1.5 / 5.1 ms, 4 / 12 frames (7.1 / 22 ms, 19 / 46 frames) | 1.2 / 2.8 ms, 4 / 9 frames (1.7 / 6.0 ms, 4 / 13 frames) |
+
+- **The idle scene is idle now.** The 22 sections a second that were meshed again there are all sections nothing can be seen of. A change in such a section waits, and is meshed when the section is reached.
+- **A tenth to a sixth of the meshing, and a third to three fifths of the uploads.** The sections left out are the cheap ones, which is why a section now takes 0.22 ms to mesh on average and not 0.10.
+- **A section is on screen sooner**, because the workers are no longer busy with what is hidden. With culling a first mesh, and a change in a section that was not reached, count from the moment the section is reached, so the two columns do not wait for quite the same thing.
+- **Staging** on the render thread: P99 0.013 ms in flight (0.053), P99.9 0.15 ms (0.18), the worst frame of any run 0.85 ms (0.98).
+
+### Memory
+
+| Scene | Sections with a mesh | Buffer pages, MiB | Of it meshes | GPU memory of the process, MiB | Process RSS at most, MiB |
+|---|---:|---:|---:|---:|---:|
+| idle, spin | 1,409 (4,037) | 64 (128) | 61 (124) | 140 (204) | 369 (379) |
+| walk | 2,001 (4,499) | 92 (152) | 86 (141) | 168 (228) | 372 (382) |
+| fly, at its end | 2,976 (4,515) | 156 (196) | 151 (183) | 236 at most (272) | 374 (379) |
+
+- **Inside the 108 MiB planned for the terrain at the spawn and on the walk, not over the fly route's densest stretch**, where the meshes take 151 MiB: seen from the air, a jungle is that much at 64 bytes a quad. No mesh was refused in any run.
+- **Meshes of sections that are reached no longer are kept**, as vanilla keeps them, and not drawn: 523 of the 2,001 at the walk's end and 566 of the 2,976 at the fly route's.
+- **Fragmentation is as before**: 24 to 102 allocations found no room in a walk run and 78 to 110 in a fly run, each with enough free bytes in total; in flight the pool added 19 or 20 pages and released 4.
+
+### A viewer on the streamed desktop
+
+In 17 of the 18 runs left out, a video encoding session was open before and after the run, and about 40 times a second (33 to 49) a frame waited 2.9 ms for the GPU, which took 0.2 ms for its own work: an eighth of the time. (In the eighteenth the session ended during the run, which had no such waits.) Average FPS was 11 to 15% lower and the 1% low was 330 to 357 FPS in idle, spin and walk whatever the variant. That is what the two unexplained runs of the first measurement showed. A session alone does not tell: the first measurement's runs with one had a wait of that length once in ten seconds. A run's own frame intervals do, and a result should only be taken from runs without such waits.
+
 ## Against vanilla
 
-The first set: every scene, with the options as they are by default, with the sections drawn by multi-draw indirect, and with the GPU allowed one frame of work in hand when the next frame samples its input.
+The first measurement, without cave culling. The first set: every scene, with the options as they are by default, with the sections drawn by multi-draw indirect, and with the GPU allowed one frame of work in hand when the next frame samples its input.
 
 | Scene | Vanilla avg / 1% low / 0.1% low | Default | × vanilla | Indirect draws | × vanilla | One frame ahead | × vanilla |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -59,7 +130,7 @@ Idle, spin and walk are bound by the GPU: it takes 0.26 to 0.31 ms for the half 
 A ratio above compares two different pictures.
 
 - **Left out:** water and lava, translucent blocks, block entities, entities and the player's hand, the sky, clouds, fog and the fade-in of new chunks, smooth lighting and ambient occlusion, biome colours, animated textures, the time of day, particles and every part of the HUD but the crosshair. Vanilla draws all of them in its runs.
-- **Drawn in excess:** every loaded section that has anything to draw gets a mesh, and every one of those inside the view's frustum is drawn, hidden or not. Vanilla builds and draws only what its occlusion graph reaches. At the spawn that is 925 sections and 522,119 quads in view, of 4,037 with a mesh among 15,288 loaded.
+- **Drawn in excess, in the first measurement:** every loaded section that had anything to draw got a mesh, and every one of those inside the view's frustum was drawn, hidden or not: at the spawn 925 sections and 522,119 quads in view, of 4,037 with a mesh among 15,288 loaded. Vanilla builds and draws only what its occlusion graph reaches, and with [cave culling](#cave-culling) so does Ruthenium, by the same rules: 405 sections and 291,723 quads, of 1,409 with a mesh. One difference remains: Ruthenium meshes what the walk reaches behind the camera too, where vanilla builds a section when it is first inside the view.
 - **The same pixels whichever way the sections are drawn.** The frame after the route's end, captured with `--screenshot`, is the same file byte for byte with direct, paged and indirect draws, at the spawn and at the end of the fly route.
 
 ## Where a frame's time goes
@@ -131,7 +202,11 @@ Two runs before those fixes also showed frames waiting 2.5 ms for the GPU about 
 ## Not measured yet
 
 - **The Intel iGPU, AMD and Macs.** Every number here is one discrete NVIDIA GPU's. Which way of drawing is fastest, and whether a frame ahead pays, may differ where the GPU is slow and memory is shared.
-- **The whole picture.** Everything [left out](#what-ruthenium-draws-and-what-it-does-not) has yet to be drawn, and what is hidden has yet to be left out. No ratio here is a result until both are done; the comparison of images with vanilla's waits for the same.
+- **The whole picture.** Everything [left out](#what-ruthenium-draws-and-what-it-does-not) has yet to be drawn. No ratio here is a result until it is; the comparison of images with vanilla's waits for the same.
+- **Whether vanilla draws the same sections.** Cave culling follows vanilla's rules, but the vanilla runs did not record how many sections they drew, and the walk's order of work differs once meshes arrive.
+- **The picture in motion with cave culling.** The pictures compared are of scenes at rest. What a moving camera can miss is a section between being reached and having its mesh, 5 to 6 ms at P99 on these routes.
+- **The walk on a slow processor**, where its 4 ms would be longer, and whether meshing what is inside the view first would show.
+- **Releasing the meshes of sections that are no longer reached**, which the fly route's 151 MiB may need.
 - **Input-to-photon latency**, and so what a frame ahead costs on screen. It needs a hardware rig.
 - **Pacing with VSync and with a frame limiter** in the world, and the per-frame upload budget derived from the frame's pace, which the client does not report to the upload ring yet.
 - **The same runs with nothing else on the GPU**, and what a viewer on the streamed desktop costs the vanilla client.
@@ -147,6 +222,9 @@ cargo xtask bench dedicated --accept-eula --client vanilla   # the vanilla runs 
 cargo xtask bench dedicated --accept-eula --client ruthenium \
     --variant ruthenium --variant 'mdi=--terrain-draws mdi' --variant 'fa1=--frames-ahead 1' \
     --baseline cache/bench/results/<the vanilla runs>       # 4 scenes × 3 variants × 3, about 50 minutes
+cargo xtask bench dedicated --accept-eula --client ruthenium \
+    --variant graph --variant 'frustum=--terrain-culling frustum' --variant 'fa1=--frames-ahead 1' \
+    --baseline cache/bench/results/<the vanilla runs>       # cave culling against the frustum alone
 cargo xtask bench dedicated --accept-eula --client ruthenium,headless --scene dig
 cargo xtask bench report <folder> --baseline <folder>       # the tables again
 ```

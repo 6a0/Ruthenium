@@ -53,6 +53,10 @@ impl StateInfo {
     pub const COLLISION_FULL: u8 = 8;
     /// In the `bars` block tag.
     pub const BARS: u8 = 16;
+    /// `isSolidRender`: nothing is seen through it.
+    pub const SOLID_RENDER: u8 = 32;
+    /// `isAir`.
+    pub const AIR: u8 = 64;
 }
 
 /// How a block is moved by its position (`BlockBehaviour.OffsetType`).
@@ -150,6 +154,12 @@ impl BlockTable {
             if b.flags & StateBehaviour::COLLISION_FULL_BLOCK != 0 {
                 flags |= StateInfo::COLLISION_FULL;
             }
+            if b.flags & StateBehaviour::SOLID_RENDER != 0 {
+                flags |= StateInfo::SOLID_RENDER;
+            }
+            if b.flags & StateBehaviour::AIR != 0 {
+                flags |= StateInfo::AIR;
+            }
             let mut connects = 0;
             if r.skip == SkipRule::Bars {
                 if in_bars_tag(block.name()) {
@@ -229,6 +239,17 @@ impl BlockTable {
     /// A state's entry; air's for an id the table doesn't have.
     pub(crate) fn state(&self, id: u32) -> &StateInfo {
         self.states.get(id as usize).unwrap_or(&self.states[0])
+    }
+
+    /// `isAir` of a state: a section of nothing else has nothing to draw and hides
+    /// nothing.
+    pub(crate) fn is_air(&self, id: u16) -> bool {
+        self.state(u32::from(id)).flags & StateInfo::AIR != 0
+    }
+
+    /// `isSolidRender` of a state.
+    pub(crate) fn is_solid(&self, id: u16) -> bool {
+        self.state(u32::from(id)).flags & StateInfo::SOLID_RENDER != 0
     }
 
     /// How many distinct model parts the states are drawn from.

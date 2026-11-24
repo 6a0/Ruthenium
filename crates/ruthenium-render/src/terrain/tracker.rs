@@ -19,11 +19,27 @@
 //! - One job per section at a time. A change that arrives while a section is being
 //!   meshed keeps it dirty, and it is meshed again afterwards.
 //! - The player's own changes go first, then what is nearest the camera.
+//!
+//! With cave culling ([`Tracker::culled`]) it also keeps what the visibility graph
+//! says is reached from the camera, and only those sections are meshed and drawn:
+//! - It tells the graph what it learns ([`Event`]s): the chunks that come and go, and
+//!   every section's connectivity, as its mesh gives it. A new mesh's connectivity is
+//!   added to the old one's as soon as its result is taken (what it opens is reached a
+//!   few frames sooner) and replaces it when the mesh is drawn.
+//! - A section of nothing but air needs no job: it has nothing to draw and connects
+//!   everything.
+//! - A dirty section the graph does not reach waits, dirty, until it does. The player's
+//!   own changes are meshed wherever they are.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 use ruthenium_sim::scene::{Around, Neighbourhood, Scene, SectionKey, Stamp, WHOLE_COLUMN, dirty};
+use ruthenium_sim::world::{BlockPlane, Column};
+
+use super::table::BlockTable;
+use super::visibility::{Connectivity, Delta, Event};
 
 /// New dirty sections after which the order of work is worked out again.
 const RESORT_AFTER: usize = 256;
@@ -45,6 +61,24 @@ struct Entry {
     /// known.
     since: Option<Since>,
     in_flight: Option<Since>,
+    /// The visibility graph reaches it from the camera (always, without culling).
+    reached: bool,
+    /// It was nothing but air when last looked at: no mesh, and no job for one.
+    empty: bool,
+    /// What the graph was last told its faces connect.
+    connectivity: Option<Connectivity>,
+    /// The batch of events that tells the graph of this load of its chunk: what the
+    /// graph said before it had that batch is of another chunk.
+    born: u64,
+}
+
+/// A mesh to draw.
+#[derive(Debug)]
+struct Slot<M> {
+    key: SectionKey,
+    /// Its section is reached.
+    shown: bool,
+    mesh: M,
 }
 
 /// A moment on the render thread: the time and the number of the frame being recorded.
@@ -101,10 +135,20 @@ pub(crate) struct Job {
 pub(crate) struct Tracker<M> {
     epoch: u64,
     sections: HashMap<SectionKey, Entry>,
-    /// Every mesh to draw with its section, in no order: what a frame goes through.
-    meshes: Vec<(SectionKey, M)>,
-    /// Sections whose `dirty` is set.
+    /// Every mesh with its section, in no order: what a frame goes through.
+    meshes: Vec<Slot<M>>,
+    /// Sections whose `dirty` is set and that are reached: the ones waiting for a job.
     dirty_count: usize,
+    /// Sections that are reached.
+    reached: usize,
+    /// With cave culling: the block states, to know air by.
+    table: Option<Arc<BlockTable>>,
+    /// What the graph has yet to be told, the level it was last told of (its epoch and
+    /// its sections' range), and the number of the batch the events being gathered go
+    /// in.
+    events: Vec<Event>,
+    announced: Option<(u64, (i32, i32))>,
+    batch: u64,
     urgent: VecDeque<SectionKey>,
     /// Dirty sections, the nearest to the camera last.
     queue: Vec<SectionKey>,
@@ -132,12 +176,28 @@ fn distance(a: SectionKey, b: SectionKey) -> i64 {
 }
 
 impl<M> Tracker<M> {
+    /// A tracker of sections that are all meshed and drawn, reached or not.
     pub fn new() -> Tracker<M> {
+        Tracker::with(None)
+    }
+
+    /// A tracker of sections that are meshed and drawn only where the visibility graph
+    /// reaches them: see the module docs.
+    pub fn culled(table: Arc<BlockTable>) -> Tracker<M> {
+        Tracker::with(Some(table))
+    }
+
+    fn with(table: Option<Arc<BlockTable>>) -> Tracker<M> {
         Tracker {
             epoch: 0,
             sections: HashMap::new(),
             meshes: Vec::new(),
             dirty_count: 0,
+            reached: 0,
+            table,
+            events: Vec::new(),
+            announced: None,
+            batch: 0,
             urgent: VecDeque::new(),
             queue: Vec::new(),
             fresh: Vec::new(),
@@ -155,7 +215,9 @@ impl<M> Tracker<M> {
     }
 
     /// Says what moment it is: the changes [`Self::sync`] takes in from here on are
-    /// known since then, which is what a job's [`Job::since`] says.
+    /// known since then, which is what a job's [`Job::since`] says. With cave culling a
+    /// change in a section that nothing reaches counts from the moment the section is
+    /// reached ([`Self::reach`]).
     pub fn set_clock(&mut self, now: Since) {
         self.now = now;
     }
@@ -164,32 +226,132 @@ impl<M> Tracker<M> {
         self.stats
     }
 
-    /// Sections of loaded chunks, sections with a mesh to draw, and sections waiting
-    /// for a mesh.
+    /// Sections of loaded chunks, sections with a mesh, and sections waiting for a
+    /// mesh (with cave culling: the reached ones among the dirty).
     pub fn counts(&self) -> (usize, usize, usize) {
         (self.sections.len(), self.meshes.len(), self.dirty_count)
     }
 
-    /// Every mesh to draw.
+    /// Sections the visibility graph reaches (all of them, without culling).
+    pub fn reached(&self) -> usize {
+        self.reached
+    }
+
+    /// Every mesh to draw: those of reached sections.
     pub fn meshes(&self) -> impl Iterator<Item = (SectionKey, &M)> + '_ {
-        self.meshes.iter().map(|(k, m)| (*k, m))
+        self.meshes
+            .iter()
+            .filter(|s| s.shown)
+            .map(|s| (s.key, &s.mesh))
+    }
+
+    /// Every mesh there is, drawn or not.
+    pub fn all_meshes(&self) -> impl Iterator<Item = &M> + '_ {
+        self.meshes.iter().map(|s| &s.mesh)
+    }
+
+    /// Says which batch the events gathered from here on are sent in.
+    pub fn set_batch(&mut self, batch: u64) {
+        self.batch = batch;
+    }
+
+    /// Whether the graph has yet to be told something.
+    pub fn has_events(&self) -> bool {
+        !self.events.is_empty()
+    }
+
+    /// What the graph has to be told since the last call, in order.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Takes in what the graph says changed in what it reaches.
+    pub fn reach(&mut self, delta: &Delta) {
+        for (keys, reached) in [(&delta.added, true), (&delta.removed, false)] {
+            for key in keys {
+                let Some(e) = self.sections.get_mut(key) else {
+                    continue;
+                };
+                // Said of a chunk that was at this place before.
+                if delta.seq < e.born || e.reached == reached {
+                    continue;
+                }
+                e.reached = reached;
+                if let Some(index) = e.mesh {
+                    self.meshes[index as usize].shown = reached;
+                }
+                if reached {
+                    self.reached += 1;
+                } else {
+                    self.reached -= 1;
+                }
+                if e.dirty != 0 {
+                    if reached {
+                        // Only now does its change wait to be shown.
+                        e.since = Some(self.now);
+                        self.dirty_count += 1;
+                        self.unsorted += 1;
+                        self.fresh.push(*key);
+                    } else {
+                        self.dirty_count -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// What a mesh says its section's faces connect. `shown`: the mesh is the one
+    /// drawn now. Until then what it connects is added to what the mesh before it did.
+    pub fn connect(&mut self, key: SectionKey, connectivity: Connectivity, shown: bool) {
+        if self.table.is_none() {
+            return;
+        }
+        let Some(e) = self.sections.get_mut(&key) else {
+            return;
+        };
+        let next = match e.connectivity {
+            Some(old) if !shown => old.union(connectivity),
+            _ => connectivity,
+        };
+        if e.connectivity != Some(next) {
+            e.connectivity = Some(next);
+            self.events.push(Event::Section {
+                key,
+                connectivity: next,
+            });
+        }
     }
 
     /// Takes the mesh at `index` out; the mesh that takes its place is told where it
     /// is now.
     fn take_mesh(&mut self, index: u32) -> M {
-        let (_, mesh) = self.meshes.swap_remove(index as usize);
-        if let Some((moved, _)) = self.meshes.get(index as usize)
-            && let Some(e) = self.sections.get_mut(moved)
+        let slot = self.meshes.swap_remove(index as usize);
+        if let Some(moved) = self.meshes.get(index as usize)
+            && let Some(e) = self.sections.get_mut(&moved.key)
         {
             e.mesh = Some(index);
         }
-        mesh
+        slot.mesh
+    }
+
+    /// A section's entry, made if it has none: reached at once without culling.
+    fn entry(&mut self, key: SectionKey) -> &mut Entry {
+        let (always, born) = (self.table.is_none(), self.batch);
+        let reached = &mut self.reached;
+        self.sections.entry(key).or_insert_with(|| {
+            *reached += usize::from(always);
+            Entry {
+                reached: always,
+                born,
+                ..Entry::default()
+            }
+        })
     }
 
     fn mark(&mut self, key: SectionKey, flags: u8) {
-        let e = self.sections.entry(key).or_default();
-        if e.dirty == 0 {
+        self.entry(key);
+        let e = self.sections.get_mut(&key).expect("just made");
+        if e.dirty == 0 && e.reached {
             self.dirty_count += 1;
             self.unsorted += 1;
             self.fresh.push(key);
@@ -207,8 +369,11 @@ impl<M> Tracker<M> {
     /// Forgets everything; the meshes go to `removed`.
     pub fn clear(&mut self, removed: &mut Vec<M>) {
         self.sections.clear();
-        removed.extend(self.meshes.drain(..).map(|(_, m)| m));
+        removed.extend(self.meshes.drain(..).map(|s| s.mesh));
         self.dirty_count = 0;
+        self.reached = 0;
+        // The graph is told of the level anew before anything else of it.
+        self.announced = None;
         self.urgent.clear();
         self.queue.clear();
         self.fresh.clear();
@@ -224,30 +389,102 @@ impl<M> Tracker<M> {
             let Some(e) = self.sections.remove(&[x, y, z]) else {
                 continue;
             };
-            self.dirty_count -= usize::from(e.dirty != 0);
+            self.dirty_count -= usize::from(e.dirty != 0 && e.reached);
+            self.reached -= usize::from(e.reached);
             if let Some(index) = e.mesh {
                 removed.push(self.take_mesh(index));
             }
         }
+        if self.table.is_some() {
+            self.events.push(Event::Unloaded { x, z });
+        }
     }
 
-    /// Marks the sections of a chunk that have a mesh dirty if the level no longer is
-    /// what their mesh was made from (a chunk around them that has left since is no
-    /// reason to mesh them again), and those without a mesh as wanting their first. The
-    /// level around the chunk is read once for all of them.
-    fn mark_stale_in_column(&mut self, scene: &Scene, x: i32, z: i32, flags: u8) {
+    /// Whether a section of a chunk (by its place from the level's lowest) is nothing
+    /// but air, as far as that can be told without looking at every block.
+    fn is_air(&self, column: Option<&Arc<Column>>, index: usize) -> bool {
+        let (Some(table), Some(column)) = (&self.table, column) else {
+            return false;
+        };
+        column
+            .sections()
+            .get(index)
+            .is_some_and(|p| matches!(p.blocks, BlockPlane::Uniform(s) if table.is_air(s)))
+    }
+
+    /// A section turned out to be nothing but air: it has nothing to draw, needs no
+    /// job and connects everything.
+    fn set_empty(&mut self, key: SectionKey, removed: &mut Vec<M>) {
+        let e = self.entry(key);
+        e.empty = true;
+        e.stamp = None;
+        e.since = None;
+        e.connectivity = Some(Connectivity::ALL);
+        let waiting = std::mem::take(&mut e.dirty) != 0 && e.reached;
+        let mesh = e.mesh.take();
+        self.dirty_count -= usize::from(waiting);
+        if let Some(index) = mesh {
+            removed.push(self.take_mesh(index));
+        }
+    }
+
+    /// Goes through a loaded chunk's sections. `anew`: it is another load of the chunk,
+    /// and all of them are marked dirty. Otherwise those that have a mesh are marked if
+    /// the level no longer is what their mesh was made from (a chunk around them that
+    /// has left since is no reason to mesh them again), and those without a mesh as
+    /// wanting their first; the level around the chunk is read once for all of them.
+    /// With cave culling, sections of air are set aside and the graph is told of the
+    /// chunk.
+    fn refresh_column(
+        &mut self,
+        scene: &Scene,
+        x: i32,
+        z: i32,
+        flags: u8,
+        anew: bool,
+        removed: &mut Vec<M>,
+    ) {
         let mut around = std::mem::take(&mut self.around);
-        scene.around(x, z, &mut around);
+        if !anew {
+            scene.around(x, z, &mut around);
+        }
+        let culled = self.table.is_some();
+        let column = if culled {
+            scene.with_terrain(|t| t.column(x, z).cloned())
+        } else {
+            None
+        };
         let (lowest, count) = self.range;
-        for y in lowest..lowest + count {
+        let mut known = Vec::with_capacity(if culled { count as usize } else { 0 });
+        for (index, y) in (lowest..lowest + count).enumerate() {
             let key = [x, y, z];
-            let stale = match self.sections.get(&key).and_then(|e| e.stamp.as_ref()) {
-                Some(stamp) => !around.is_current_where_loaded(stamp),
-                None => true,
-            };
+            if self.is_air(column.as_ref(), index) {
+                self.set_empty(key, removed);
+                known.push(Some(Connectivity::ALL));
+                continue;
+            }
+            let entry = self.sections.get_mut(&key);
+            let stale = anew
+                || match entry.as_ref().and_then(|e| e.stamp.as_ref()) {
+                    Some(stamp) => !around.is_current_where_loaded(stamp),
+                    None => true,
+                };
+            if let Some(e) = entry {
+                e.empty = false;
+            }
             if stale {
                 self.mark(key, flags);
             }
+            if culled {
+                known.push(self.sections.get(&key).and_then(|e| e.connectivity));
+            }
+        }
+        if culled {
+            self.events.push(Event::Chunk {
+                x,
+                z,
+                sections: known,
+            });
         }
         self.around = around;
     }
@@ -266,6 +503,14 @@ impl<M> Tracker<M> {
         if drained.rescan.is_some() || !keys.is_empty() {
             let dims = scene.with_terrain(|t| t.dims());
             self.range = (dims.min_section, dims.sections);
+            let level = Some((self.epoch, self.range));
+            if self.table.is_some() && self.announced != level {
+                self.announced = level;
+                self.events.push(Event::Level {
+                    lowest: self.range.0,
+                    count: self.range.1,
+                });
+            }
         }
         if drained.rescan.is_some() {
             self.stats.rescans += 1;
@@ -283,7 +528,7 @@ impl<M> Tracker<M> {
                 self.remove_column(x, z, removed);
             }
             for (x, z) in columns {
-                self.mark_stale_in_column(scene, x, z, dirty::LOADED);
+                self.refresh_column(scene, x, z, dirty::LOADED, false, removed);
             }
         }
         if !keys.is_empty() {
@@ -296,18 +541,24 @@ impl<M> Tracker<M> {
                         self.remove_column(x, z, removed);
                         continue;
                     }
-                    if flags & (dirty::LOADED | dirty::UNLOADED) != 0 {
-                        // Another load of the chunk: whatever was made of the one
-                        // before is of a chunk that is gone.
-                        for y in lowest..lowest + count {
-                            self.mark([x, y, z], flags & !dirty::UNLOADED);
-                        }
-                    } else {
-                        self.mark_stale_in_column(scene, x, z, flags);
-                    }
+                    // Another load of the chunk: whatever was made of the one before
+                    // is of a chunk that is gone.
+                    let anew = flags & (dirty::LOADED | dirty::UNLOADED) != 0;
+                    self.refresh_column(scene, x, z, flags & !dirty::UNLOADED, anew, removed);
                 } else if (lowest..lowest + count).contains(&key[1])
                     && (self.sections.contains_key(&key) || present(x, z))
                 {
+                    if self.sections.get(&key).is_some_and(|e| e.empty) {
+                        // Whatever changed in a section of air shows only if it is one
+                        // no longer.
+                        let column = scene.with_terrain(|t| t.column(x, z).cloned());
+                        if self.is_air(column.as_ref(), (key[1] - lowest) as usize) {
+                            continue;
+                        }
+                        if let Some(e) = self.sections.get_mut(&key) {
+                            e.empty = false;
+                        }
+                    }
                     self.mark(key, flags);
                 }
             }
@@ -356,11 +607,17 @@ impl<M> Tracker<M> {
             if e.dirty == 0 || e.meshing {
                 continue;
             }
+            // Nothing reaches it: it comes back into the order of work when something
+            // does. The player's own change is meshed wherever it is.
+            if !e.reached && !urgent {
+                continue;
+            }
+            let counted = usize::from(e.reached);
             let Some(neighbourhood) = scene.pin(key) else {
                 // Its chunk is gone; the key that says so is on its way.
                 e.dirty = 0;
                 e.since = None;
-                self.dirty_count -= 1;
+                self.dirty_count -= counted;
                 continue;
             };
             let surrounded =
@@ -369,7 +626,7 @@ impl<M> Tracker<M> {
                 // It is marked again when a chunk next to its own arrives.
                 e.dirty = 0;
                 e.since = None;
-                self.dirty_count -= 1;
+                self.dirty_count -= counted;
                 self.stats.waits_for_neighbours += 1;
                 continue;
             }
@@ -389,7 +646,7 @@ impl<M> Tracker<M> {
             }
             self.stats.causes[0] += u64::from(first);
             e.dirty = 0;
-            self.dirty_count -= 1;
+            self.dirty_count -= counted;
             e.meshing = true;
             let since = e.since.take().unwrap_or(self.now);
             e.in_flight = Some(since);
@@ -457,16 +714,21 @@ impl<M> Tracker<M> {
             self.fresh.push(key);
         }
         match (e.mesh, mesh) {
-            (Some(index), Some(mesh)) => {
-                Some(std::mem::replace(&mut self.meshes[index as usize].1, mesh))
-            }
+            (Some(index), Some(mesh)) => Some(std::mem::replace(
+                &mut self.meshes[index as usize].mesh,
+                mesh,
+            )),
             (Some(index), None) => {
                 e.mesh = None;
                 Some(self.take_mesh(index))
             }
             (None, Some(mesh)) => {
                 e.mesh = Some(self.meshes.len() as u32);
-                self.meshes.push((key, mesh));
+                self.meshes.push(Slot {
+                    key,
+                    shown: e.reached,
+                    mesh,
+                });
                 None
             }
             (None, None) => None,
@@ -857,5 +1119,354 @@ mod tests {
         // An empty mesh is a mesh: nothing is dirty any more, and nothing is drawn.
         assert_eq!(t.counts().2, 0);
         assert_eq!(t.meshes().count(), 0);
+    }
+
+    use super::super::mesher::{MeshOptions, Mesher};
+    use super::super::visibility::{Batch, Camera, Graph};
+
+    /// A tracker with cave culling and its graph, which answers at once.
+    struct Culled {
+        t: Tracker<SectionKey>,
+        graph: Graph,
+        mesher: Mesher,
+        seq: u64,
+        camera: SectionKey,
+        removed: Vec<SectionKey>,
+    }
+
+    impl Culled {
+        fn new(camera: SectionKey) -> Culled {
+            let table = testing::table();
+            let mut t = Tracker::culled(table.clone());
+            t.set_batch(1);
+            Culled {
+                t,
+                graph: Graph::new(),
+                mesher: Mesher::new(table),
+                seq: 0,
+                camera,
+                removed: Vec::new(),
+            }
+        }
+
+        /// Sends the graph what the tracker has for it and takes in its answer.
+        fn tell(&mut self) {
+            self.seq += 1;
+            self.graph.take(Batch {
+                seq: self.seq,
+                camera: Camera {
+                    position: self.camera.map(|s| f64::from(s * 16) + 8.5),
+                    smart: true,
+                    view_distance: 8,
+                },
+                events: self.t.take_events(),
+            });
+            let delta = self.graph.settle();
+            self.t.reach(&delta);
+            self.t.set_batch(self.seq + 1);
+        }
+
+        /// Publishes the level and takes in what changed.
+        fn sync(&mut self, world: &mut World) {
+            world.publish();
+            self.t.sync(&world.scene, &mut self.removed);
+            self.tell();
+        }
+
+        /// Runs jobs, really meshing, until there are none: each result's connectivity
+        /// goes to the graph as its mesh is on its way and again as it is drawn.
+        fn mesh_all(&mut self, world: &World) -> Vec<SectionKey> {
+            let options = MeshOptions {
+                shades: [1.0; 6],
+                cutout_leaves: true,
+            };
+            let mut done = Vec::new();
+            while let Some(job) = self.t.next_job(&world.scene, self.camera) {
+                let key = job.neighbourhood.section();
+                let mesh = self.mesher.mesh(&job.neighbourhood, &options);
+                let stamp = job.neighbourhood.stamp().clone();
+                assert!(self.t.accept(&world.scene, &stamp));
+                self.t.connect(key, mesh.connectivity, false);
+                self.tell();
+                self.t.install(stamp, (mesh.quads() > 0).then_some(key));
+                self.t.connect(key, mesh.connectivity, true);
+                self.tell();
+                done.push(key);
+            }
+            done.sort_unstable();
+            done
+        }
+
+        fn drawn(&self) -> Vec<SectionKey> {
+            let mut keys: Vec<SectionKey> = self.t.meshes().map(|(k, _)| k).collect();
+            keys.sort_unstable();
+            keys
+        }
+    }
+
+    fn fill(world: &mut World, section: SectionKey, state: u32) {
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    world.set(
+                        section[0] * 16 + x,
+                        section[1] * 16 + y,
+                        section[2] * 16 + z,
+                        state,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Five by five chunks; in the middle three by three, a layer of stone sections at
+    /// section y 0 with a block in each section under it.
+    fn roofed() -> (World, Vec<SectionKey>, Vec<SectionKey>) {
+        let chunks: Vec<(i32, i32)> = (-2..=2)
+            .flat_map(|z| (-2..=2).map(move |x| (x, z)))
+            .collect();
+        let mut world = World::new(&chunks);
+        let (mut roof, mut under) = (Vec::new(), Vec::new());
+        for z in -1..=1 {
+            for x in -1..=1 {
+                fill(&mut world, [x, 0, z], testing::stone());
+                world.set(x * 16 + 5, -10, z * 16 + 5, testing::stone());
+                roof.push([x, 0, z]);
+                under.push([x, -1, z]);
+            }
+        }
+        roof.sort_unstable();
+        under.sort_unstable();
+        (world, roof, under)
+    }
+
+    #[test]
+    fn air_needs_no_mesh_and_lets_the_camera_see_everything() {
+        let mut world = World::new(&surrounded());
+        let mut c = Culled::new([0, 1, 0]);
+        c.sync(&mut world);
+        // Nothing to mesh, and everything loaded is reached.
+        assert!(c.mesh_all(&world).is_empty());
+        assert_eq!(c.t.counts(), (36, 0, 0));
+        assert_eq!(c.t.reached(), 36);
+        assert_eq!(c.t.stats().jobs, 0);
+        // Its first block gives a section a mesh; light changing around it in sections
+        // that are still air gives them none.
+        world.set(3, 3, 3, testing::stone());
+        c.sync(&mut world);
+        assert_eq!(c.mesh_all(&world), vec![[0, 0, 0]]);
+        assert_eq!(c.drawn(), vec![[0, 0, 0]]);
+        // The block goes again: the section's mesh does too.
+        world.set(3, 3, 3, 0);
+        c.sync(&mut world);
+        assert_eq!(c.mesh_all(&world), vec![[0, 0, 0]]);
+        assert!(c.drawn().is_empty());
+        assert_eq!(c.t.reached(), 36);
+        // A chunk sent again with nothing in it where a mesh was: the mesh goes at
+        // once, with no job.
+        world.set(3, 3, 3, testing::stone());
+        c.sync(&mut world);
+        c.mesh_all(&world);
+        assert_eq!(c.drawn(), vec![[0, 0, 0]]);
+        let jobs = c.t.stats().jobs;
+        assert!(c.removed.is_empty());
+        world.load(0, 0);
+        c.sync(&mut world);
+        assert_eq!(c.removed, vec![[0, 0, 0]]);
+        assert!(c.mesh_all(&world).is_empty() && c.drawn().is_empty());
+        assert_eq!((c.t.stats().jobs, c.t.reached()), (jobs, 36));
+    }
+
+    #[test]
+    fn what_a_solid_layer_hides_is_not_meshed_until_it_opens() {
+        let (mut world, roof, under) = roofed();
+        let mut c = Culled::new([0, 1, 0]);
+        c.sync(&mut world);
+        // The roof is seen from above and meshed; under it nothing is reached, from
+        // the sides neither (the walk would have to turn back).
+        assert_eq!(c.mesh_all(&world), roof);
+        assert_eq!(c.drawn(), roof);
+        assert_eq!(c.t.counts().2, 0, "nothing reached waits for a mesh");
+        // The same world without culling meshes what is under it too.
+        let (mut same, ..) = roofed();
+        same.publish();
+        let mut plain: Tracker<SectionKey> = Tracker::new();
+        plain.sync(&same.scene, &mut Vec::new());
+        let all = mesh_all(&mut plain, &same);
+        assert!(under.iter().all(|k| all.contains(k)));
+
+        // A change under the roof waits, dirty.
+        let at = Instant::now();
+        c.t.set_clock(Since { at, frame: 3 });
+        world.set(21, -12, 5, testing::stone());
+        c.sync(&mut world);
+        assert!(c.mesh_all(&world).is_empty());
+        assert_eq!(c.t.counts().2, 0);
+        // It counts as waiting to be shown from the moment it is reached.
+        c.t.set_clock(Since { at, frame: 40 });
+
+        // A shaft through the roof's middle section: what is under it is reached from
+        // there on, and meshed.
+        for y in 0..16 {
+            world.set(8, y, 8, 0);
+        }
+        c.sync(&mut world);
+        let shaft = c.t.next_job(&world.scene, c.camera).unwrap();
+        assert_eq!(shaft.neighbourhood.section(), [0, 0, 0]);
+        let mesh = c.mesher.mesh(
+            &shaft.neighbourhood,
+            &MeshOptions {
+                shades: [1.0; 6],
+                cutout_leaves: true,
+            },
+        );
+        c.t.set_clock(Since { at, frame: 41 });
+        c.t.connect([0, 0, 0], mesh.connectivity, false);
+        c.tell();
+        c.t.install(shaft.neighbourhood.stamp().clone(), Some([0, 0, 0]));
+        // The section right under the shaft, known to wait since it was reached; the
+        // others follow when its mesh says what it connects.
+        let below = c.t.next_job(&world.scene, c.camera).unwrap();
+        assert_eq!(below.neighbourhood.section(), [0, -1, 0]);
+        assert_eq!((below.first, below.since.frame), (true, 41));
+        assert!(c.t.next_job(&world.scene, c.camera).is_none());
+        c.t.give_up([0, -1, 0]);
+        assert_eq!(c.mesh_all(&world), under);
+        let mut both = [roof.clone(), under.clone()].concat();
+        both.sort_unstable();
+        assert_eq!(c.drawn(), both);
+
+        // The shaft is filled again: the meshes under the roof stay, and are not drawn.
+        for y in 0..16 {
+            world.set(8, y, 8, testing::stone());
+        }
+        c.sync(&mut world);
+        assert_eq!(c.mesh_all(&world), vec![[0, 0, 0]]);
+        assert_eq!(c.drawn(), roof);
+        assert_eq!(c.t.counts().1, 18);
+        assert_eq!(c.t.all_meshes().count(), 18);
+        assert!(c.removed.is_empty());
+    }
+
+    #[test]
+    fn a_new_mesh_opens_at_once_and_closes_when_it_is_drawn() {
+        let (mut world, _, under) = roofed();
+        let mut c = Culled::new([0, 1, 0]);
+        c.sync(&mut world);
+        c.mesh_all(&world);
+        let reached = c.t.reached();
+        // The shaft, step by step: the result alone, not yet drawn, lets the walk go on.
+        for y in 0..16 {
+            world.set(8, y, 8, 0);
+        }
+        c.sync(&mut world);
+        let job = c.t.next_job(&world.scene, c.camera).unwrap();
+        assert_eq!(job.neighbourhood.section(), [0, 0, 0]);
+        let open = c
+            .mesher
+            .mesh(
+                &job.neighbourhood,
+                &MeshOptions {
+                    shades: [1.0; 6],
+                    cutout_leaves: true,
+                },
+            )
+            .connectivity;
+        assert!(open.sees(0, 1));
+        c.t.connect([0, 0, 0], open, false);
+        c.tell();
+        assert!(c.t.reached() > reached);
+        c.t.install(job.neighbourhood.stamp().clone(), Some([0, 0, 0]));
+        c.t.connect([0, 0, 0], open, true);
+        c.tell();
+        c.mesh_all(&world);
+        let opened = c.t.reached();
+        // Filled again: until the new mesh is drawn, the old one's shaft stays open.
+        for y in 0..16 {
+            world.set(8, y, 8, testing::stone());
+        }
+        c.sync(&mut world);
+        let job = c.t.next_job(&world.scene, c.camera).unwrap();
+        c.t.connect([0, 0, 0], Connectivity::NONE, false);
+        c.tell();
+        assert_eq!(c.t.reached(), opened);
+        c.t.install(job.neighbourhood.stamp().clone(), Some([0, 0, 0]));
+        c.t.connect([0, 0, 0], Connectivity::NONE, true);
+        c.tell();
+        assert_eq!(c.t.reached(), reached);
+        assert!(under.iter().all(|k| !c.drawn().contains(k)));
+    }
+
+    #[test]
+    fn the_players_own_change_is_meshed_where_nothing_reaches_it() {
+        let (mut world, _, under) = roofed();
+        let mut c = Culled::new([0, 1, 0]);
+        c.sync(&mut world);
+        c.mesh_all(&world);
+        c.t.mark(under[4], dirty::BLOCKS | dirty::URGENT);
+        let job = c.t.next_job(&world.scene, c.camera).unwrap();
+        assert!(job.urgent);
+        assert_eq!(job.neighbourhood.section(), under[4]);
+        // It was never counted as waiting: nothing reached waited.
+        assert_eq!(c.t.counts().2, 0);
+    }
+
+    #[test]
+    fn what_the_graph_said_of_a_chunk_that_left_is_not_taken_for_its_successor() {
+        let mut world = World::new(&surrounded());
+        world.set(3, 3, 3, testing::stone());
+        let mut c = Culled::new([0, 1, 0]);
+        c.sync(&mut world);
+        // Under the section that has yet to be meshed, nothing is reached.
+        assert_eq!(c.t.reached(), 35);
+        assert_eq!(c.mesh_all(&world), vec![[0, 0, 0]]);
+        assert_eq!(c.t.reached(), 36);
+        // The chunk leaves and comes back between two answers.
+        world.level.forget_chunk(0, 0);
+        world.publish();
+        c.t.sync(&world.scene, &mut c.removed);
+        world.load(0, 0);
+        world.set(3, 3, 3, testing::stone());
+        world.publish();
+        c.t.sync(&world.scene, &mut c.removed);
+        assert_eq!(c.t.reached(), 32);
+        // An answer from before the graph heard of either is of the chunk that left.
+        c.t.reach(&Delta {
+            seq: c.seq,
+            added: vec![[0, 0, 0]],
+            ..Delta::default()
+        });
+        assert_eq!(c.t.reached(), 32);
+        // The graph's own answer puts the new one in its place: where the walk had been
+        // before the chunk left, it still is.
+        c.tell();
+        assert_eq!(c.t.reached(), 36);
+        assert_eq!(c.mesh_all(&world), vec![[0, 0, 0]]);
+        assert_eq!(c.t.reached(), 36);
+    }
+
+    #[test]
+    fn another_level_starts_the_graph_again() {
+        let (mut world, roof, _) = roofed();
+        let mut c = Culled::new([0, 1, 0]);
+        c.sync(&mut world);
+        c.mesh_all(&world);
+        world
+            .publisher
+            .begin_level(ruthenium_sim::scene::Dims::of(&world.level));
+        c.t.sync(&world.scene, &mut c.removed);
+        assert_eq!((c.t.counts(), c.t.reached()), ((0, 0, 0), 0));
+        assert_eq!(c.removed.len(), roof.len());
+        // The level is published again as the new one: told from the start.
+        let (mut world, roof, _) = roofed();
+        let (publisher, scene) = Scene::new(4096);
+        world.publisher = publisher;
+        world.scene = scene;
+        world.level.track_changes(4096);
+        world
+            .publisher
+            .begin_level(ruthenium_sim::scene::Dims::of(&world.level));
+        c.sync(&mut world);
+        assert_eq!(c.mesh_all(&world), roof);
     }
 }

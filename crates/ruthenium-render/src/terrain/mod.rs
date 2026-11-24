@@ -8,6 +8,7 @@ mod table;
 #[cfg(test)]
 mod testing;
 mod tracker;
+mod visibility;
 pub(crate) mod world;
 
 pub use camera::{CameraPose, NEAR_PLANE, View};

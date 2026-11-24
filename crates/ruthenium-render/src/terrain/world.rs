@@ -30,11 +30,12 @@ use ruthenium_gpu::{
 use ruthenium_shaders::interface::{SECTION, WORLD, WORLD_MATRIX};
 use ruthenium_sim::scene::{Scene, SectionKey, Stamp};
 
-use super::camera::View;
+use super::camera::{CameraPose, View};
 use super::lightmap::{self, LightmapInputs};
 use super::mesher::{MeshOptions, Mesher, SectionMesh};
 use super::table::BlockTable;
 use super::tracker::{Job, Since, Tracker, TrackerStats};
+use super::visibility::{Batch, Camera, Connectivity, Visibility};
 use crate::pipelines::PipelineId;
 use crate::terrain_vertex::VERTEX_BYTES;
 
@@ -45,10 +46,10 @@ const INDEX_BYTES: u64 = QUADS_PER_DRAW as u64 * 6 * 2;
 
 /// Buffer pages for vertices: their size.
 const PAGE_BYTES: u64 = 4 << 20;
-/// What the terrain's buffers are planned to take at a 12-chunk view distance. Every
-/// loaded section is meshed for now, also those underground that nothing can be seen
-/// of, and in a jungle that takes more: passing the envelope is said once and shown in
-/// the statistics, and meshes are only left out at twice it.
+/// What the terrain's buffers are planned to take at a 12-chunk view distance. Without
+/// cave culling every loaded section is meshed, also those underground that nothing can
+/// be seen of, and in a jungle that takes more: passing the envelope is said once and
+/// shown in the statistics, and meshes are only left out at twice it.
 pub const POOL_ENVELOPE: u64 = 108 << 20;
 const POOL_BUDGET: u64 = 2 * POOL_ENVELOPE;
 /// The second staging buffer, which workers write meshes into.
@@ -58,6 +59,8 @@ const WORKER_STAGING_BYTES: u64 = 8 << 20;
 const MAX_PENDING: usize = 48;
 /// Jobs out per worker.
 const JOBS_PER_WORKER: usize = 2;
+/// `GameType.SPECTATOR`'s id.
+const SPECTATOR: i32 = 3;
 
 /// How a frame's sections are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -370,6 +373,7 @@ struct Pending {
     solid_quads: u32,
     cutout_quads: u32,
     bounds: [[f32; 3]; 2],
+    connectivity: Connectivity,
     since: Instant,
     stage: Stage,
 }
@@ -420,10 +424,25 @@ pub struct WorldStats {
     pub binds: u32,
     /// Sections a frame could not draw because its data had no room for their records.
     pub overflowed: u64,
-    /// The bytes of the meshes that are drawn: what the pool's payload comes to but
-    /// for the quad indices and the meshes on their way in or out.
+    /// The bytes of the meshes there are: what the pool's payload comes to but for the
+    /// quad indices and the meshes on their way in or out.
     pub mesh_bytes: u64,
     pub pool: PoolStats,
+    /// Cave culling is on: only what the visibility graph reaches from the camera is
+    /// meshed and drawn.
+    pub culling: bool,
+    /// Sections the graph reaches (every section without culling), and meshes of
+    /// sections it reached once and does not now.
+    pub reached: usize,
+    pub hidden: usize,
+    /// The graph has yet to answer something it was told.
+    pub graph_behind: bool,
+    /// The graph's answers so far, of them walks from the camera, and the time its
+    /// walks took: in all, and the longest one, in microseconds.
+    pub graph_updates: u64,
+    pub graph_walks: u64,
+    pub graph_micros: u64,
+    pub slowest_graph_micros: u32,
 }
 
 /// See the module docs.
@@ -438,6 +457,13 @@ pub(crate) struct WorldRenderer {
     indices_upload: Option<UploadTicket>,
     indices_ready: bool,
     tracker: Tracker<MeshRange>,
+    table: Arc<BlockTable>,
+    /// Cave culling: the graph on its thread, the batches sent to it and the last one
+    /// it answered, and the camera's cell and options when one was last sent.
+    visibility: Option<Visibility>,
+    batches: u64,
+    settled: u64,
+    cell: Option<([i64; 3], bool, i32)>,
     /// Counts the times everything was forgotten: a result of an earlier count is of
     /// a session that is over, whose stamps mean nothing in this one.
     session: u64,
@@ -549,14 +575,15 @@ pub(crate) fn write_section(bytes: &mut [u8], origin: [i32; 3], visibility: f32)
 
 impl WorldRenderer {
     /// Creates the atlas texture and the vertex pool's first page, and starts `workers`
-    /// meshing threads. Not on a frame's path: behind the screen that says the world is
-    /// loading.
+    /// meshing threads, and with `culling` the visibility graph's. Not on a frame's
+    /// path: behind the screen that says the world is loading.
     pub fn new(
         gpu: &Arc<Gpu>,
         textures: &mut TextureTable,
         uploads: &mut UploadRing,
         assets: WorldAssets,
         workers: usize,
+        culling: bool,
     ) -> Result<WorldRenderer, Error> {
         uploads.enable_worker_staging(WORKER_STAGING_BYTES)?;
         let mut pool = BufferPool::new(
@@ -595,9 +622,18 @@ impl WorldRenderer {
             indices,
             indices_upload: None,
             indices_ready: false,
-            tracker: Tracker::new(),
+            tracker: if culling {
+                Tracker::culled(assets.table.clone())
+            } else {
+                Tracker::new()
+            },
+            visibility: culling.then(Visibility::start),
+            batches: 0,
+            settled: 0,
+            cell: None,
             session: 0,
             workers: Workers::start(&assets.table, workers),
+            table: assets.table,
             jobs_out: 0,
             pending: Vec::new(),
             removed: Vec::new(),
@@ -629,6 +665,9 @@ impl WorldRenderer {
     /// this comes before the ring goes.
     pub fn stop_workers(&mut self) {
         self.workers.stop();
+        if let Some(v) = &mut self.visibility {
+            v.stop();
+        }
     }
 
     /// Asks for the sections to be drawn this way; a GPU without multi-draw indirect
@@ -681,10 +720,15 @@ impl WorldRenderer {
             pending: self.pending.len(),
             mesh_bytes: self
                 .tracker
-                .meshes()
-                .map(|(_, m)| u64::from(m.solid_quads + m.cutout_quads) * 4 * VERTEX_BYTES as u64)
+                .all_meshes()
+                .map(|m| u64::from(m.solid_quads + m.cutout_quads) * 4 * VERTEX_BYTES as u64)
                 .sum(),
             pool: self.pool.stats(),
+            culling: self.visibility.is_some(),
+            reached: self.tracker.reached(),
+            hidden: meshed - self.tracker.meshes().count(),
+            graph_behind: self.visibility.is_some()
+                && (self.settled != self.batches || self.tracker.has_events()),
             ..self.stats
         }
     }
@@ -705,7 +749,13 @@ impl WorldRenderer {
                 }
             }
         }
-        self.tracker = Tracker::new();
+        self.tracker = if self.visibility.is_some() {
+            Tracker::culled(self.table.clone())
+        } else {
+            Tracker::new()
+        };
+        // The next frame tells the graph where the camera is, whatever it knew.
+        self.cell = None;
         self.session += 1;
     }
 
@@ -757,17 +807,39 @@ impl WorldRenderer {
     /// The part of a frame's work that stages uploads: before the frame's
     /// `UploadRing::record`. Takes in what changed in the level, takes finished meshes
     /// from the workers, moves results towards their pages and hands out new jobs.
-    /// `frame` is the frame being recorded, `camera` the section the camera is in.
+    /// `frame` is the frame being recorded, `camera` where the world is seen from and
+    /// `view_distance` how many chunks far.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         scene: &Scene,
-        camera: SectionKey,
+        camera: &CameraPose,
+        view_distance: i32,
         textures: &mut TextureTable,
         uploads: &mut UploadRing,
         lightmap: LightmapInputs,
         frame: u64,
     ) {
         profiling::scope!("world_update");
+        let block = camera.position.map(|c| c.floor() as i32);
+        let section: SectionKey = block.map(|b| b >> 4);
+        self.tracker.set_clock(Since {
+            at: Instant::now(),
+            frame,
+        });
+        // What the graph reaches now, before work is handed out by it.
+        if let Some(v) = &self.visibility {
+            while let Some(delta) = v.poll() {
+                self.tracker.reach(&delta);
+                self.settled = delta.seq;
+                self.stats.graph_updates += 1;
+                self.stats.graph_walks += u64::from(delta.full);
+                self.stats.graph_micros += u64::from(delta.micros);
+                self.stats.slowest_graph_micros = self.stats.slowest_graph_micros.max(delta.micros);
+            }
+        }
+        // What this frame learns goes to the graph in one batch, at its end.
+        self.tracker.set_batch(self.batches + 1);
         self.update_lightmap(textures, uploads, lightmap);
         self.pool.maintain(&uploads.completed());
         let reserved = self.pool.stats().reserved_bytes;
@@ -786,10 +858,6 @@ impl WorldRenderer {
                 .upload_buffer(range.buffer, range.offset, &quad_indices())
                 .ok();
         }
-        self.tracker.set_clock(Since {
-            at: Instant::now(),
-            frame,
-        });
         self.tracker.sync(scene, &mut self.removed);
         for m in self.removed.drain(..) {
             self.pool.retire(m.handle, Users::until_frame(frame));
@@ -805,6 +873,7 @@ impl WorldRenderer {
             if !self.tracker.accept(scene, &done.stamp) {
                 continue;
             }
+            let key = done.stamp.section;
             let Some(bounds) = done.mesh.bounds else {
                 // Nothing to draw there: that is its mesh.
                 self.note_installed(&done.mesh, 0, Instant::now());
@@ -812,8 +881,12 @@ impl WorldRenderer {
                 if let Some(old) = self.tracker.install(done.stamp, None) {
                     self.pool.retire(old.handle, Users::until_frame(frame));
                 }
+                self.tracker.connect(key, done.mesh.connectivity, true);
                 continue;
             };
+            // What the mesh opens is reached while it is on its way to the GPU; what
+            // it closes stays reached until it is drawn.
+            self.tracker.connect(key, done.mesh.connectivity, false);
             self.stats.translucent_quads += u64::from(done.mesh.translucent_quads);
             self.stats.out_of_range += u64::from(done.mesh.out_of_range);
             self.pending.push(Pending {
@@ -825,6 +898,7 @@ impl WorldRenderer {
                 solid_quads: done.mesh.solid_quads,
                 cutout_quads: done.mesh.cutout_quads,
                 bounds,
+                connectivity: done.mesh.connectivity,
                 since: Instant::now(),
                 stage: Stage::Waiting(done.mesh.vertices),
             });
@@ -841,7 +915,7 @@ impl WorldRenderer {
 
         let limit = self.workers.threads.len() * JOBS_PER_WORKER;
         while self.jobs_out < limit && self.jobs_out + self.pending.len() < MAX_PENDING {
-            let Some(job) = self.tracker.next_job(scene, camera) else {
+            let Some(job) = self.tracker.next_job(scene, section) else {
                 break;
             };
             self.jobs_out += 1;
@@ -850,6 +924,33 @@ impl WorldRenderer {
                 options: self.options,
                 session: self.session,
             });
+        }
+
+        if let Some(v) = &self.visibility {
+            // A spectator inside a solid block sees through everything.
+            let inside = || {
+                scene
+                    .with_terrain(|t| t.probe(block))
+                    .is_some_and(|p| self.table.is_solid(p.block))
+            };
+            let spectator = scene
+                .frame()
+                .is_some_and(|f| f.player.game_type == SPECTATOR);
+            let camera = Camera {
+                position: camera.position,
+                smart: !(spectator && inside()),
+                view_distance,
+            };
+            let cell = camera.cell();
+            if self.tracker.has_events() || self.cell != Some(cell) {
+                self.cell = Some(cell);
+                self.batches += 1;
+                v.send(Batch {
+                    seq: self.batches,
+                    camera,
+                    events: self.tracker.take_events(),
+                });
+            }
         }
     }
 
@@ -989,10 +1090,12 @@ impl WorldRenderer {
                 .slowest_install_ms
                 .max(p.since.elapsed().as_secs_f32() * 1e3);
             self.note_latency(p.urgent, p.first, p.known, frame);
+            let key = p.stamp.section;
             if let Some(old) = self.tracker.install(p.stamp, Some(mesh)) {
                 // Frames up to the one before this may have drawn it.
                 self.pool.retire(old.handle, Users::until_frame(frame));
             }
+            self.tracker.connect(key, p.connectivity, true);
         }
     }
 

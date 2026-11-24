@@ -239,6 +239,10 @@ pub(crate) fn table() -> Arc<BlockTable> {
         ],
     };
     let full = StateBehaviour::COLLISION_FULL_BLOCK;
+    behaviour.states[0].flags |= StateBehaviour::AIR;
+    for id in [stone(), glowstone(), magma()] {
+        behaviour.states[id as usize].flags |= StateBehaviour::SOLID_RENDER;
+    }
     for (id, occlusion, collision_full) in [
         (stone(), [1; 6], true),
         (glowstone(), [1; 6], true),
