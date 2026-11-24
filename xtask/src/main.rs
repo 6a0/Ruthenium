@@ -4,6 +4,7 @@
 
 mod bench;
 mod bench_ab;
+mod bench_dedicated;
 mod bench_menu;
 mod check_content;
 mod codegen;
@@ -19,6 +20,8 @@ mod launch_pins;
 mod mods;
 mod moltenvk;
 mod pin_version;
+mod routes;
+mod server;
 mod shaders;
 mod trace;
 
@@ -58,7 +61,23 @@ tasks:
       Baseline measurements of vanilla 26.3, run from the player's own install
       with Fabric Loader and tools/java/bench (needs a display; see
       docs/baseline.md). setup creates the benchmark world, run measures every
-      scene on every backend, report prints Markdown tables for a results folder.
+      scene on every backend, report prints Markdown tables for a results folder
+      (dedicated-server runs next to the integrated-server ones of --compare
+      <folder>, by default the newest other folder that has any).
+  bench dedicated --accept-eula [--client vanilla,ruthenium] [--backend vulkan,opengl]
+        [--scene idle,spin,walk,fly] [--reps N] [--headless-reps N] [--warmup S]
+        [--duration S] [--gpu <name>] [--server-jar <server.jar>] [--bin <ruthenium>]
+        [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]...
+        [--results <folder>] [--compare <folder>] [--timeout S] [--width W]
+        [--height H] [--any-drawable] [--screenshot] [--keep-worlds]
+      The world scenes on a vanilla 26.3 dedicated server (a server.jar you
+      supply, by default reference/26.3/jars/server.jar), started per trial on a
+      fresh copy of the benchmark world, in offline mode on 127.0.0.1, and stopped
+      afterwards. Both clients play the same tick-keyed routes: the vanilla client
+      is measured as in bench run, Ruthenium joins headless through its
+      development join path and must record the same positions and loaded chunks.
+      Needs Mojang's EULA accepted, which only --accept-eula says. Everything is
+      kept under cache/bench.
   bench ab [--a <rev>|work] [--b <rev>|work] [--a-args '<options>']
            [--b-args '<options>'] [--rounds N] [--duration S] [--gpu <name>]
            [-- <ruthenium options>]

@@ -11,6 +11,7 @@ import java.lang.management.MemoryUsage;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.DisconnectedScreen;
 import net.minecraft.client.gui.screens.TitleScreen;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
@@ -32,9 +33,14 @@ import net.minecraft.world.level.levelgen.presets.WorldPresets;
  * path). World scenes are started with {@code --quickPlaySingleplayer} on a fresh copy of the world
  * made by {@code setup}.
  *
+ * <p>With {@code ruthenium.bench.route} (cargo xtask bench dedicated), the scene is a {@link Route}
+ * played on a dedicated server the client joined with {@code --quickPlayMultiplayer}: a controller
+ * on the server sets the scene up, {@link RouteRun} drives the player by client tick, and frame
+ * intervals are measured over the route's capture ticks instead of over a time.
+ *
  * <p>Configuration comes from system properties set by cargo xtask bench: {@code
- * ruthenium.bench.scene}, {@code .out}, {@code .warmup}, {@code .duration} (seconds), {@code .world}
- * and {@code .seed}.
+ * ruthenium.bench.scene}, {@code .out}, {@code .warmup}, {@code .duration} (seconds), {@code .world},
+ * {@code .seed} and {@code .route} (a route file).
  */
 public final class Bench {
     private static final long SECOND = 1_000_000_000L;
@@ -48,7 +54,7 @@ public final class Bench {
 
     private static Bench active;
 
-    private enum Phase { STARTING, LOADING_WORLD, SETTLING, WARMUP, MEASURING, PREGENERATING, SAVING, DONE }
+    private enum Phase { STARTING, LOADING_WORLD, SETTLING, WARMUP, MEASURING, ROUTE, PREGENERATING, SAVING, DONE }
 
     private final String scene;
     private final Path out;
@@ -56,6 +62,9 @@ public final class Bench {
     private final long durationNs;
     private final String worldName;
     private final long seed;
+    /** The route to play on a dedicated server, or null for the integrated-server scenes. */
+    private final RouteRun routeRun;
+    private boolean capturing;
     private final long jvmStartEpochMs = ManagementFactory.getRuntimeMXBean().getStartTime();
 
     private Phase phase = Phase.STARTING;
@@ -84,6 +93,8 @@ public final class Bench {
         this.durationNs = (long) (Double.parseDouble(System.getProperty("ruthenium.bench.duration", "60")) * SECOND);
         this.worldName = System.getProperty("ruthenium.bench.world", "ruthenium-bench");
         this.seed = Long.parseLong(System.getProperty("ruthenium.bench.seed", "0"));
+        String route = System.getProperty("ruthenium.bench.route");
+        this.routeRun = route == null ? null : new RouteRun(Route.load(Path.of(route)));
     }
 
     static void init() {
@@ -109,6 +120,13 @@ public final class Bench {
             } finally {
                 inFrame = false;
             }
+        }
+    }
+
+    /** The end of a client tick: a route is keyed by these. */
+    public static void onTickEnd(Minecraft mc) {
+        if (active != null && active.routeRun != null && active.phase == Phase.ROUTE) {
+            active.routeRun.tick(mc);
         }
     }
 
@@ -139,15 +157,25 @@ public final class Bench {
                     createWorld(mc);
                 } else if (isWorld() && !scene.equals("setup") && mc.level != null) {
                     enter(Phase.LOADING_WORLD, now);
+                } else if (routeRun != null && mc.gui.screen() instanceof DisconnectedScreen) {
+                    routeRun.fail("the client could not join the server");
+                    write(mc);
+                    enter(Phase.DONE, now);
+                    mc.stop();
                 }
             }
             case LOADING_WORLD -> {
                 if (mc.level != null && mc.player != null && mc.gui.screen() == null && mc.gui.overlay() == null) {
                     worldReadyEpochMs = System.currentTimeMillis();
-                    startWorldScene(mc);
-                    enter(Phase.SETTLING, now);
+                    if (routeRun != null) {
+                        enter(Phase.ROUTE, now);
+                    } else {
+                        startWorldScene(mc);
+                        enter(Phase.SETTLING, now);
+                    }
                 }
             }
+            case ROUTE -> route(mc, now);
             case SETTLING -> {
                 keepFlying(mc);
                 if (settled(mc, now, 3 * SECOND, 5 * SECOND, 120 * SECOND)) {
@@ -205,6 +233,47 @@ public final class Bench {
             }
             case DONE -> {
             }
+        }
+    }
+
+    /**
+     * A frame of a route: the route's ticks say when the capture starts and ends, and this records
+     * the frame intervals in between.
+     */
+    private void route(Minecraft mc, long now) {
+        if (mc.level == null || mc.player == null) {
+            routeRun.fail("the connection to the server closed");
+        }
+        routeRun.setRendered(settled(mc, now, 3 * SECOND, 5 * SECOND, 120 * SECOND));
+        if (capturing) {
+            if (frames == intervals.length) {
+                intervals = java.util.Arrays.copyOf(intervals, frames * 2);
+                renderCpu = java.util.Arrays.copyOf(renderCpu, frames * 2);
+            }
+            intervals[frames] = now - lastFrameNs;
+            renderCpu[frames] = mc.getFrameTimeNs();
+            frames++;
+            lastFrameNs = now;
+            if (!routeRun.capturing()) {
+                measureEndEpochMs = System.currentTimeMillis();
+                capturing = false;
+            }
+        } else if (routeRun.capturing()) {
+            measureStartEpochMs = System.currentTimeMillis();
+            long[] gc = gc();
+            gcCountStart = gc[0];
+            gcTimeStart = gc[1];
+            lastFrameNs = now;
+            capturing = true;
+            if (Boolean.getBoolean("ruthenium.bench.screenshot")) {
+                net.minecraft.client.Screenshot.grab(
+                        mc.gameDirectory, "ruthenium-bench-" + scene + ".png", mc.gameRenderer.mainRenderTarget(), 1, msg -> {});
+            }
+        }
+        if (routeRun.finished()) {
+            write(mc);
+            enter(Phase.DONE, now);
+            mc.stop();
         }
     }
 
@@ -388,6 +457,9 @@ public final class Bench {
         }
         o.add("frameIntervalsNs", iv);
         o.add("renderCpuNs", rc);
+        if (routeRun != null) {
+            o.add("routeRun", routeRun.toJson());
+        }
         try {
             Files.createDirectories(out.toAbsolutePath().getParent());
             Files.writeString(out, new GsonBuilder().create().toJson(o));

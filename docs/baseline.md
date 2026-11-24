@@ -22,7 +22,7 @@ The laptop has a GPU switch. The NVIDIA results were measured in its Discrete GP
 - **World.** Seed 20261121, default world type, created by `cargo xtask bench setup`. Spawn is at the edge of a jungle by water. Time is fixed at noon, weather is clear, and mob spawning is off. Every world run starts from a fresh copy of the same template, loaded with `--quickPlaySingleplayer`.
 - **Scenes.** Each world scene waits for the world to load and all queued chunk sections to be built, then warms up for 10 s and measures for 60 s.
   - `menu`: the title screen. Vanilla caps menus without a world at 60 FPS, so this measures pacing at 60 FPS, not throughput.
-  - `idle`: standing at spawn, looking north.
+  - `idle`: standing at spawn, looking south (yaw 0, as the world template saved the player).
   - `spin`: turning on the spot at 36° per second, which exercises culling and the visible-section set.
   - `fly`: creative sprint-flight south at about 21 blocks per second, 40 blocks above spawn, over terrain that setup had already generated. This exercises chunk loading and section meshing.
 - **Frame time** is the interval between the ends of consecutive frames, after submit, present and the frame limiter. **1% / 0.1% low** = 1000 / P99 and 1000 / P99.9 of frame time in milliseconds (nearest rank, the PresentMon / CapFrameX convention). Present-to-display timing is not measured.
@@ -111,10 +111,63 @@ The plan estimated vanilla's RSS at 1.5–3 GB. Measured with the official launc
 
 Vanilla's Vulkan backend is already 15–25% faster than its OpenGL backend here, with better lows. Ruthenium is compared against Vulkan, the faster of the two, as the plan says.
 
+## Dedicated-server runs: method
+
+Ruthenium only joins servers, so its world renderer will be measured on a dedicated server. Comparing that with the numbers above would mix two protocols, so vanilla gets a second baseline, measured the same way Ruthenium will be: `cargo xtask bench dedicated`. The NVIDIA results are [below](#dedicated-server-runs-results); the Intel iGPU runs wait for the laptop's Hybrid mode (in Discrete mode, which it is in now, the iGPU is not visible). The tables above stay the published integrated-server numbers.
+
+What is the same: the game and how it is launched, the options (Fancy, render and simulation distance 12, VSync off), the world template and its seed, noon, clear weather, no mob spawning, a 10 s warm-up and a 60 s capture, 3 repetitions, frame time as the interval between frame ends, and the memory, clock and temperature samples.
+
+What differs, and why:
+
+- **The server.** A vanilla 26.3 dedicated server (a `server.jar` supplied locally and checked by SHA-1, never downloaded by the task) runs as its own process on the same machine, with Mojang's Java runtime and `-Xms1G -Xmx2G`, in offline mode, bound to 127.0.0.1 on a free port, white-list off. The client joins with `--quickPlayMultiplayer`. Packets cross loopback TCP with the server's default compression instead of the in-memory connection of an integrated server, and the server no longer shares the client's heap and garbage collector. It still shares the CPU: its process's memory and CPU time are sampled, and its own tick-time query (`tick query`: average and percentiles of the last 100 ticks) is recorded every 5 s.
+- **The world copy.** Every run gets a fresh copy of the template in a folder of its own under `cache/bench/dedicated`, identified by a SHA-256 over its files. The server is stopped after the run and the copy deleted; if the task fails, times out or is killed, the server is killed with it.
+- **The controller.** The scene is set up from outside, over RCON on loopback: the same game rules, time and weather as the integrated scenes fix, the world spawn at the scene's spawn, and, once the player is on the server, the player on a team with collisions off, teleported to the route's start and put in creative mode (through spectator mode on the `fly` route, which leaves it flying). The team keeps wandering mobs from pushing the player off its route; the mobs themselves stay, as in the integrated scenes. One rule is added: random ticks are off (`random_tick_speed 0`), so nothing grows or decays while a route runs. With them on, one vanilla `walk` run of the first three met a vine that had grown into its path and climbed it, where the other two and Ruthenium walked through.
+- **Routes keyed by client tick.** One route file per run is read by the vanilla bench mod and by Ruthenium alike. Tick 0 is the first tick after the player has stood at the start for a second with every chunk the server sends at that distance loaded (637 at distance 12) and, in vanilla, every section built for 3 s. The warm-up is 200 ticks and the capture the next 1200, so the measured window is 60 s of ticks, not 60 s of wall clock; a client that falls behind its ticks measures longer.
+  - `idle` and `fly` are the integrated scenes. `fly` starts exactly 40 blocks above the spawn; the integrated scene had dropped 0.19 blocks before flight came on.
+  - `spin` turns 1.8° before every tick (36° a second, as before). The integrated scene turned every frame; here the game interpolates the camera between ticks.
+  - `walk` is new: forward with jump held and 0.6° a tick, a circle of about 21 blocks' radius where the ground allows, so the route stays near the spawn however long it runs. It has no integrated counterpart.
+- **The screen.** The toast a server without signed chat brings up and the chat lines of the join are cleared when the route starts.
+- **Checks.** Each client records its position and rotation after every tick and the loaded chunks at tick 0, every 100 ticks and at rest after the route. Two checksums come out of that: one over the positions, one over the chunks at the start and at rest. The task fails if a run's turns, marks or loaded chunks are not what the route says, if the drawable is not 1920 × 1080 pixels (a scaled desktop gives the window more), or if two runs of a scene differ. Ruthenium plays the same routes headless through its development join path (`ruthenium connect --route`) and has to come out with the same checksums as vanilla.
+
+**Label every ratio.** A dedicated-server row and an integrated-server row differ in the server's place, the connection, how the camera is driven and what the capture counts. `bench report` prints the two next to each other with the server named in the first column. A ratio of a dedicated-server client to an integrated-server row has to say that it crosses the two. Ruthenium's world-renderer runs are to be paired with the dedicated rows of the same device; the integrated rows above stay the published numbers next to them.
+
+## Dedicated-server runs: results
+
+Recorded on 2026-11-24 with `cargo xtask bench dedicated --accept-eula --width 960 --height 540` on the RTX 4060 Laptop GPU (Discrete mode, driver 620.70.06), firmware profile `performance`, on AC. The desktop was at scale 2, so the window was 960 × 540 points, which is the 1920 × 1080 pixels of the runs above (the task checks the drawable). Variable refresh was off, and the desktop was being streamed by Sunshine (one NVENC session) throughout, as it usually is on this machine. Medians of 3 runs of 1200 ticks (60 s) each:
+
+| Backend | Scene | Avg FPS | Median ms | 1% low FPS | 0.1% low FPS | Max ms | RSS MiB (mean / max) | VRAM MiB (mean / max) | CPU / GPU °C max |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Vulkan | idle | 1456 | 0.65 | 896 | 638 | 3.1 | 4713 / 4868 | 653 / 653 | 94 / 79 |
+| Vulkan | spin | 1532 | 0.61 | 903 | 633 | 3.9 | 4792 / 4892 | 653 / 653 | 96 / 82 |
+| Vulkan | walk | 1410 | 0.66 | 807 | 512 | 4.7 | 4778 / 4905 | 654 / 655 | 98 / 82 |
+| Vulkan | fly | 1569 | 0.57 | 802 | 404 | 6.6 | 4751 / 4994 | 664 / 783 | 98 / 84 |
+
+**Run to run.** Average FPS of the three repetitions agrees within 1% in every scene (idle 1451 to 1460, spin 1529 to 1533, walk 1409 to 1411, fly 1564 to 1574); the 0.1% lows spread more, most in `fly` (378 to 428).
+
+**The same scene every time.** In each scene the three vanilla runs and Ruthenium's headless run of the same route recorded the same position on every one of the 1440 ticks and the same 637 chunks at the start and at rest:
+
+| Scene | Route | Positions | Chunks at the start and at rest |
+|---|---|---|---|
+| idle | `58bb70b9655f6c8a` | `8dd4897dc82ac8e5` | `3ece8aa2b6b39475` |
+| spin | `68e62776d02d19e7` | `4947001eb2c13686` | `3ece8aa2b6b39475` |
+| walk | `56b6a6d9b0d66667` | `692b320eba9f2520` | `acfad72fca46ca6d` |
+| fly | `4eccd90811443043` | `ba30c8310240c0a6` | `b4da7fbbf26ad726` |
+
+The world copy is `fcc0c49f13fb9049…` (SHA-256 over the template's files) in every run. On the move, at most 27 chunks (`walk`) and 24 (`fly`) of what the server would send at the player's position had yet to arrive at a mark.
+
+**The server.** It ticked in 1.0 to 1.4 ms on average (its own `tick query`, worst P99 of a 100-tick window 24 ms) and used 6 to 11% of one core in `idle`, `spin` and `walk` and 28 to 29% in `fly`, where it streams chunks. The scene was ready (every chunk loaded, every section built for 3 s) 13.2 to 13.4 s after the JVM started.
+
+**Against the integrated-server runs above** (another protocol: the server inside the client, scenes driven by time, recorded three days earlier): the dedicated-server client averages 18 to 20% more frames in `idle` and `spin` and 13% more in `fly`, with 1% lows 9 to 12% higher. That is the server's work leaving the client's process, not a faster renderer, which is why Ruthenium's world runs are to be paired with these rows and not with those.
+
+**A first recording was discarded** for one reason: with random ticks on, the first of its three `walk` runs diverged from the other two (and from Ruthenium's) at tick 625, where a vine had grown into the route and the player, with jump held, climbed it. The controller now switches random ticks off (see the method). The average FPS of that recording was within 1% of the one above in every scene.
+
+**Thermals.** As in the integrated runs, the CPU package reached 94 to 98 °C in every scene.
+
 ## Not measured yet
 
 - **Input-to-photon latency.** It needs a hardware rig (PresentMon on Windows, NVIDIA Reflex Latency Analyzer, or a photodiode).
 - **The standard PvP benchmark** (spawn + sprint + bridge + 8-player fight replay). It needs a server-side replay; the golden-trace and packet-replay tools come first.
+- **The dedicated-server baseline on the Intel iGPU** (method above): it needs the laptop's Hybrid mode.
 - **Other devices** in the lab, a pure-vanilla launch time without Fabric Loader, and NVIDIA in Hybrid mode (where its frames are copied to the iGPU-driven panel).
 
 ## Reproducing
@@ -124,6 +177,10 @@ cargo xtask bench setup          # once: creates cache/bench/world
 cargo xtask bench run            # 3 × {opengl, vulkan} × {menu, idle, spin, fly}, about 35 minutes
 cargo xtask bench run --gpu intel   # the same on the iGPU of a hybrid laptop (auto, nvidia, intel)
 cargo xtask bench report         # Markdown tables for the latest results folder
+cargo xtask bench dedicated --accept-eula   # vulkan × {idle, spin, walk, fly} × 3 on a dedicated server, then Ruthenium's headless check of each route; about 25 minutes
+cargo xtask bench report <folder> --compare <folder>   # a dedicated-server folder next to an integrated-server one
 ```
+
+`bench dedicated` needs the 26.3 `server.jar` (`--server-jar`, by default the local reference copy) and `--accept-eula`, which says you accept [Mojang's EULA](https://aka.ms/MinecraftEULA) for the server it starts; it refuses to run without it. `--gpu`, `--backend`, `--reps`, `--warmup` and `--duration` work as for `bench run`. Its runs go to the same results folders, with the route, the client's record of it and the server's side (world copy, controller commands, tick times, samples) in each file; trial folders and server logs are under `cache/bench/dedicated`.
 
 Close other games first, plug in, and check the power profile. Each run writes its frame intervals and samples to `cache/bench/results/<run>/<backend>-<scene>-<rep>.json`, with `machine.json` alongside. `--screenshot` saves one screenshot per scene into `cache/bench/game/screenshots`, to confirm what was measured.

@@ -113,11 +113,16 @@ commands:
       on another device), list the accounts signed in, check one by signing in
       again from its saved sign-in, or sign one out. Saved sign-ins live in the
       system's credential store.
-  connect <address> [--seconds <s>] [--data-dir <folder>]
+  connect <address> [--seconds <s>] [--data-dir <folder>] [--script '<steps>']
+          [--route <file> [--route-out <file>] [--expect-positions <checksum>]
+           [--expect-footprint <checksum>]]
       Join a server without a window, print each step, and disconnect after
       <s> seconds (default 10). Joins as the signed-in account; development
       builds with the dev-offline feature join offline-mode servers on this
-      machine or the local network as an offline player.";
+      machine or the local network as an offline player. --script plays timed
+      input. --route plays a tick-keyed route file from cargo xtask bench
+      dedicated instead, leaves when it ends, and fails unless the start, every
+      tick and the loaded chunks are what the route and the checksums say.";
 
 fn main() -> ExitCode {
     let started = Instant::now();

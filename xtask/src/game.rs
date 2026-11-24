@@ -5,7 +5,8 @@
 //! ruthenium-prepare), with Mojang's Java runtime from that launcher, the
 //! launcher's own JVM arguments, and Fabric Loader for Ruthenium's development
 //! mods. It runs in offline developer mode (`--offlineDeveloperMode`), so it
-//! is limited to singleplayer and never touches the player's account.
+//! never touches the player's account: it plays singleplayer, or joins the
+//! offline-mode server `cargo xtask bench dedicated` starts on this machine.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

@@ -12,6 +12,8 @@
 //! - `bench run` runs each scene on each backend, every world run on a
 //!   fresh copy of the template, and writes one JSON file per run.
 //! - `bench report` turns a results folder into Markdown tables.
+//! - `bench dedicated` runs the world scenes against a dedicated server instead
+//!   (see [`crate::bench_dedicated`]).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -28,20 +30,20 @@ const SCENES: &[&str] = &["menu", "idle", "spin", "fly"];
 const BACKENDS: &[&str] = &["opengl", "vulkan"];
 
 #[derive(Debug)]
-struct Options {
-    backends: Vec<String>,
-    scenes: Vec<String>,
-    reps: u32,
-    warmup: f64,
-    duration: f64,
-    width: u32,
-    height: u32,
-    seed: i64,
-    java: Option<PathBuf>,
-    results: Option<PathBuf>,
-    screenshot: bool,
-    render_distance: u32,
-    gpu: Gpu,
+pub(crate) struct Options {
+    pub backends: Vec<String>,
+    pub scenes: Vec<String>,
+    pub reps: u32,
+    pub warmup: f64,
+    pub duration: f64,
+    pub width: u32,
+    pub height: u32,
+    pub seed: i64,
+    pub java: Option<PathBuf>,
+    pub results: Option<PathBuf>,
+    pub screenshot: bool,
+    pub render_distance: u32,
+    pub gpu: Gpu,
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
@@ -98,10 +100,13 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("setup") => parse(&args[1..]).and_then(|o| setup(root, &o)),
         Some("run") => parse(&args[1..]).and_then(|o| run_all(root, &o)),
-        Some("report") => report(root, args.get(1).map(PathBuf::from)),
+        Some("report") => parse_report(&args[1..]).and_then(|(dir, with)| report(root, dir, with)),
+        Some("dedicated") => crate::bench_dedicated::run(root, &args[1..]),
+        // Internal: keeps a dedicated server from outliving the task that started it.
+        Some("supervise") => crate::server::supervise(&args[1..]),
         Some("ab") => crate::bench_ab::run(root, &args[1..]),
         Some("menu") => crate::bench_menu::run(root, &args[1..]),
-        _ => Err("usage: cargo xtask bench <setup|run|report|ab|menu> [options]".into()),
+        _ => Err("usage: cargo xtask bench <setup|run|report|dedicated|ab|menu> [options]".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -112,7 +117,23 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
     }
 }
 
-fn bench_dir(root: &Path) -> PathBuf {
+/// `bench report [folder] [--compare <folder>]`.
+fn parse_report(args: &[String]) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    let (mut dir, mut compare) = (None, None);
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--compare" {
+            compare = Some(PathBuf::from(it.next().ok_or("--compare needs a folder")?));
+        } else if dir.is_none() && !arg.starts_with("--") {
+            dir = Some(PathBuf::from(arg));
+        } else {
+            return Err(format!("unknown argument {arg:?}"));
+        }
+    }
+    Ok((dir, compare))
+}
+
+pub(crate) fn bench_dir(root: &Path) -> PathBuf {
     root.join("cache/bench")
 }
 
@@ -121,7 +142,7 @@ fn bench_dir(root: &Path) -> PathBuf {
 /// (the plan's gates) instead of Fancy's 16. Otherwise only what a repeatable
 /// measurement needs: no VSync or frame cap, no pausing or throttling when the
 /// window loses focus, sound muted, no first-launch screens.
-fn options(backend: &str, render_distance: u32) -> Vec<(&'static str, String)> {
+pub(crate) fn options(backend: &str, render_distance: u32) -> Vec<(&'static str, String)> {
     let fancy = [
         ("ao", "true"),
         ("biomeBlendRadius", "2"),
@@ -161,7 +182,7 @@ fn options(backend: &str, render_distance: u32) -> Vec<(&'static str, String)> {
     o
 }
 
-fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
     for entry in std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
@@ -175,20 +196,26 @@ fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-struct Run<'a> {
-    scene: &'a str,
-    backend: &'a str,
-    out: PathBuf,
-    quick_play: bool,
+pub(crate) struct Run<'a> {
+    pub scene: &'a str,
+    pub backend: &'a str,
+    pub out: PathBuf,
+    pub quick_play: bool,
+    /// A dedicated server's address and the route file to play there: the client joins
+    /// it instead of loading a world of its own.
+    pub dedicated: Option<(String, PathBuf)>,
+    /// Called with every resource sample, twice a second, while the client runs; an
+    /// error stops the client.
+    pub watch: Option<&'a mut dyn FnMut() -> Result<(), String>>,
 }
 
 /// One client launch. Returns the mod's JSON plus resource samples.
-fn launch(
+pub(crate) fn launch(
     root: &Path,
     game: &game::Game,
     jar: &Path,
     o: &Options,
-    run: &Run<'_>,
+    run: &mut Run<'_>,
 ) -> Result<Value, String> {
     let game_dir = bench_dir(root).join("game");
     game::write_options(&game_dir, &options(run.backend, o.render_distance))?;
@@ -201,18 +228,24 @@ fn launch(
         game_args = vec!["--quickPlaySingleplayer".into(), WORLD.into()];
     }
     let out = std::path::absolute(&run.out).map_err(|e| e.to_string())?;
+    let mut jvm_args = vec![
+        format!("-Druthenium.bench.scene={}", run.scene),
+        format!("-Druthenium.bench.out={}", out.display()),
+        format!("-Druthenium.bench.warmup={}", o.warmup),
+        format!("-Druthenium.bench.duration={}", o.duration),
+        format!("-Druthenium.bench.world={WORLD}"),
+        format!("-Druthenium.bench.seed={}", o.seed),
+        format!("-Druthenium.bench.screenshot={}", o.screenshot),
+    ];
+    if let Some((address, route)) = &run.dedicated {
+        let route = std::path::absolute(route).map_err(|e| e.to_string())?;
+        jvm_args.push(format!("-Druthenium.bench.route={}", route.display()));
+        game_args = vec!["--quickPlayMultiplayer".into(), address.clone()];
+    }
     let launch = game::Launch {
         game_dir: game_dir.clone(),
         mods: vec![jar.to_owned()],
-        jvm_args: vec![
-            format!("-Druthenium.bench.scene={}", run.scene),
-            format!("-Druthenium.bench.out={}", out.display()),
-            format!("-Druthenium.bench.warmup={}", o.warmup),
-            format!("-Druthenium.bench.duration={}", o.duration),
-            format!("-Druthenium.bench.world={WORLD}"),
-            format!("-Druthenium.bench.seed={}", o.seed),
-            format!("-Druthenium.bench.screenshot={}", o.screenshot),
-        ],
+        jvm_args,
         game_args,
         env: o.gpu.env()?,
         width: o.width,
@@ -235,6 +268,13 @@ fn launch(
                 run.scene,
                 game_dir.join("launch.log").display()
             ));
+        }
+        if let Some(watch) = run.watch.as_mut()
+            && let Err(e) = watch()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
         }
         let (rss, g) = (rss_kib(pid), o.gpu.sample(pid));
         samples.push(json!([
@@ -278,7 +318,7 @@ fn launch(
     Ok(v)
 }
 
-fn epoch_ms() -> u64 {
+pub(crate) fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
@@ -318,7 +358,7 @@ pub(crate) fn cpu_mhz() -> Option<f64> {
     mean(&mhz).map(|m| m.round())
 }
 
-fn prepare(root: &Path, o: &Options) -> Result<(game::Game, PathBuf), String> {
+pub(crate) fn prepare(root: &Path, o: &Options) -> Result<(game::Game, PathBuf), String> {
     o.gpu.env()?; // fail before any results are written if the GPU isn't there
     let game = game::locate(o.java.as_deref())?;
     println!("bench: {} from {}", game.java_description, game.launcher);
@@ -340,11 +380,13 @@ fn setup(root: &Path, o: &Options) -> Result<(), String> {
         &game,
         &jar,
         o,
-        &Run {
+        &mut Run {
             scene: "setup",
             backend: "opengl",
             out,
             quick_play: false,
+            dedicated: None,
+            watch: None,
         },
     )?;
     let template = bench_dir(root).join("world");
@@ -375,13 +417,15 @@ fn run_all(root: &Path, o: &Options) -> Result<(), String> {
         for backend in &o.backends {
             for scene in &o.scenes {
                 let out = dir.join(format!("{backend}-{scene}-{rep}.json"));
-                let run = Run {
+                let mut run = Run {
                     scene,
                     backend,
                     out,
                     quick_play: scene != "menu",
+                    dedicated: None,
+                    watch: None,
                 };
-                let v = launch(root, &game, &jar, o, &run)?;
+                let v = launch(root, &game, &jar, o, &mut run)?;
                 let s = summarize(&v);
                 println!(
                     "bench: {backend:<6} {scene:<4} #{rep}: {:.0} fps avg, 1% low {:.0}, 0.1% low {:.0}, RSS {} MiB, VRAM {} MiB ({})",
@@ -396,7 +440,7 @@ fn run_all(root: &Path, o: &Options) -> Result<(), String> {
         }
     }
     println!("bench: results in {}", dir.display());
-    report(root, Some(dir))
+    report(root, Some(dir), None)
 }
 
 fn command_line(cmd: &str, args: &[&str]) -> Option<String> {
@@ -411,7 +455,7 @@ fn read_trim(path: &str) -> Option<String> {
 }
 
 /// What the numbers depend on, recorded next to them.
-fn machine(game: &game::Game, o: &Options) -> Value {
+pub(crate) fn machine(game: &game::Game, o: &Options) -> Value {
     json!({
         "cpu": command_line("sh", &["-c", "grep -m1 'model name' /proc/cpuinfo | cut -d: -f2"]),
         "cpus": std::thread::available_parallelism().map(|n| n.get()).ok(),
@@ -451,7 +495,7 @@ fn mean(v: &[f64]) -> Option<f64> {
 
 /// Frame-time statistics. 1% and 0.1% lows are 1000 / P99 and 1000 / P99.9 of
 /// the frame time in milliseconds (the PresentMon / CapFrameX convention).
-fn summarize(v: &Value) -> Value {
+pub(crate) fn summarize(v: &Value) -> Value {
     let ms: Vec<f64> = v["frameIntervalsNs"]
         .as_array()
         .map(|a| {
@@ -536,7 +580,7 @@ fn summarize(v: &Value) -> Value {
 
 /// A whole number, or a dash for a value that wasn't measured (an
 /// integrated GPU has no temperature sensor of its own).
-fn dash(x: f64) -> String {
+pub(crate) fn dash(x: f64) -> String {
     if x.is_nan() {
         "–".into()
     } else {
@@ -544,7 +588,7 @@ fn dash(x: f64) -> String {
     }
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
+pub(crate) fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
     if v.is_empty() {
         f64::NAN
@@ -553,24 +597,14 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-/// Prints Markdown: one row per backend and scene (median over repetitions),
-/// then every run.
-fn report(root: &Path, dir: Option<PathBuf>) -> Result<(), String> {
-    let dir = match dir {
-        Some(d) => d,
-        None => {
-            let results = bench_dir(root).join("results");
-            let mut runs: Vec<PathBuf> = std::fs::read_dir(&results)
-                .map_err(|e| format!("{}: {e}", results.display()))?
-                .flatten()
-                .map(|e| e.path())
-                .collect();
-            runs.sort();
-            runs.pop().ok_or("no results yet")?
-        }
-    };
-    let mut rows: Vec<(String, String, u32, Value, Value)> = Vec::new();
-    for entry in std::fs::read_dir(&dir)
+/// A run in a results folder: backend, scene, repetition, summary and the run's file.
+pub(crate) type Row = (String, String, u32, Value, Value);
+
+/// The client runs in a results folder (`<backend>-<scene>-<rep>.json` with frame
+/// intervals), sorted by backend, scene and repetition.
+pub(crate) fn load_rows(dir: &Path) -> Result<Vec<Row>, String> {
+    let mut rows: Vec<Row> = Vec::new();
+    for entry in std::fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .flatten()
     {
@@ -587,10 +621,14 @@ fn report(root: &Path, dir: Option<PathBuf>) -> Result<(), String> {
         };
         let text = std::fs::read_to_string(entry.path()).map_err(|e| e.to_string())?;
         let v: Value = serde_json::from_str(&text).map_err(|e| format!("{name}: {e}"))?;
+        // A headless route check has no frames to summarise.
+        if !v["frameIntervalsNs"].is_array() {
+            continue;
+        }
         rows.push((backend.into(), scene.into(), rep, summarize(&v), v));
     }
     rows.sort_by(|a, b| {
-        let key = |r: &(String, String, u32, Value, Value)| {
+        let key = |r: &Row| {
             (
                 r.0.clone(),
                 SCENES.iter().position(|s| *s == r.1).unwrap_or(9),
@@ -599,6 +637,40 @@ fn report(root: &Path, dir: Option<PathBuf>) -> Result<(), String> {
         };
         key(a).cmp(&key(b))
     });
+    Ok(rows)
+}
+
+/// The results folders, oldest name first.
+pub(crate) fn result_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let results = bench_dir(root).join("results");
+    let mut runs: Vec<PathBuf> = std::fs::read_dir(&results)
+        .map_err(|e| format!("{}: {e}", results.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    runs.sort();
+    Ok(runs)
+}
+
+/// Prints Markdown: one row per backend and scene (median over repetitions),
+/// then every run. A folder of dedicated-server runs is printed by
+/// [`crate::bench_dedicated::report`], next to the integrated-server runs of `compare`.
+pub(crate) fn report(
+    root: &Path,
+    dir: Option<PathBuf>,
+    compare: Option<PathBuf>,
+) -> Result<(), String> {
+    let dir = match dir {
+        Some(d) => d,
+        None => result_dirs(root)?.pop().ok_or("no results yet")?,
+    };
+    let rows = load_rows(&dir)?;
+    if crate::bench_dedicated::is_dedicated(&dir) {
+        return crate::bench_dedicated::report(root, &dir, &rows, compare);
+    }
+    if compare.is_some() {
+        return Err("--compare is for a folder of dedicated-server runs".into());
+    }
     let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or(f64::NAN);
     let mut devices: Vec<String> = rows
         .iter()

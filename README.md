@@ -66,13 +66,14 @@ After `prepare`, `cargo run -p ruthenium -- assets` builds the game's sprite atl
 
 ## Measuring vanilla
 
-Two development tools run the vanilla 26.3 client from your own install (offline developer mode, singleplayer only; your account is never used):
+Two development tools run the vanilla 26.3 client from your own install (offline developer mode, in singleplayer or on a local server the tool starts itself; your account is never used):
 
 ```sh
 cargo xtask trace          # record golden traces of scripted scenarios (docs/golden-traces.md)
 cargo xtask bench setup    # create the benchmark world, then:
 cargo xtask bench run      # frame times, memory and launch time on OpenGL and Vulkan (docs/baseline.md)
 cargo xtask bench run --gpu intel   # on a hybrid laptop: pin the game to one GPU (auto, nvidia, intel)
+cargo xtask bench dedicated --accept-eula   # the world scenes on a local dedicated server (needs the 26.3 server.jar; docs/baseline.md)
 ```
 
 They load Fabric Loader and Ruthenium's own small development mods (`tools/java/`). They need JDK 25 to compile the mods and a desktop session, since a game window opens.
