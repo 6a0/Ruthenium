@@ -837,6 +837,29 @@ pub(crate) enum Inside {
     Honey,
 }
 
+/// `Entity.turn` on a rotation: the mouse's turn for one frame (from
+/// [`crate::input::turn_amount`]) added in floats, the pitch kept within straight down
+/// and straight up, a value that isn't finite dropped (`setXRot`, `setYRot`). Returns
+/// the new yaw and pitch.
+pub fn turned(y_rot: f32, x_rot: f32, xo: f64, yo: f64) -> (f32, f32) {
+    let set_x = |old: f32, new: f32| {
+        if new.is_finite() {
+            (new % 360.0).clamp(-90.0, 90.0)
+        } else {
+            old
+        }
+    };
+    let x_delta = yo as f32 * 0.15;
+    let y_delta = xo as f32 * 0.15;
+    let x = set_x(x_rot, x_rot + x_delta);
+    let y = if (y_rot + y_delta).is_finite() {
+        y_rot + y_delta
+    } else {
+        y_rot
+    };
+    (y, set_x(x, mth_clamp(x, -90.0, 90.0)))
+}
+
 impl LocalPlayer {
     /// A new player (`handleLogin` turns it to face -180).
     pub fn new() -> LocalPlayer {
@@ -1573,25 +1596,7 @@ impl LocalPlayer {
     /// `Entity.turn`: the mouse's turn for one frame (from [`crate::input::turn_amount`]),
     /// in floats.
     pub fn turn(&mut self, xo: f64, yo: f64) {
-        let x_delta = yo as f32 * 0.15;
-        let y_delta = xo as f32 * 0.15;
-        self.set_x_rot(self.x_rot + x_delta);
-        self.set_y_rot(self.y_rot + y_delta);
-        self.set_x_rot(mth_clamp(self.x_rot, -90.0, 90.0));
-    }
-
-    /// `Entity.setXRot`: a value that isn't finite is dropped.
-    fn set_x_rot(&mut self, x_rot: f32) {
-        if x_rot.is_finite() {
-            self.x_rot = (x_rot % 360.0).clamp(-90.0, 90.0);
-        }
-    }
-
-    /// `Entity.setYRot`.
-    fn set_y_rot(&mut self, y_rot: f32) {
-        if y_rot.is_finite() {
-            self.y_rot = y_rot;
-        }
+        (self.y_rot, self.x_rot) = turned(self.y_rot, self.x_rot, xo, yo);
     }
 
     /// The chunk the camera (the player's block position) is in.

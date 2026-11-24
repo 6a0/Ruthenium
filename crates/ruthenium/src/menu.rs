@@ -1890,9 +1890,13 @@ impl Menu {
         match &mut self.screen {
             Screen::Game => {
                 let view = self.session.as_ref().and_then(Session::view);
+                let world = self.session.as_ref().and_then(crate::ingame::scene_line);
                 crate::ingame::draw_hud(
-                    view.as_ref(),
-                    &self.server_name,
+                    crate::ingame::HudText {
+                        view: view.as_ref(),
+                        world: world.as_deref(),
+                        server: &self.server_name,
+                    },
                     &scale,
                     &self.fonts,
                     atlas,

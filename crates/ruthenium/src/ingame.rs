@@ -152,15 +152,67 @@ fn wrap_degrees(v: f32) -> f32 {
 
 /// The readout: where the player is and what it's doing, a crosshair, and how to get
 /// to the menu.
+/// What the game thread has published for drawing and how the handoff to it fares, as
+/// a line for the HUD while there is no world to look at: the camera as drawing would
+/// take it (the latest frame, turned by the mouse's moves the game thread has yet to
+/// take in), the published chunks, and the queues' worst moments.
+pub fn scene_line(session: &Session) -> Option<String> {
+    let camera = session.camera()?;
+    let f = &camera.frame;
+    let scene = session.scene();
+    let feet = f.player.position.map(|v| v.floor() as i32);
+    let (chunks, light) = scene.with_terrain(|t| (t.len(), t.probe(feet)));
+    let light = light.map_or_else(
+        || "no chunk here".to_owned(),
+        |p| format!("light {} sky, {} block", p.sky_light, p.block_light),
+    );
+    let dirty = scene.queue_stats();
+    let handoff = session.handoff_stats();
+    // From the main thread handing the frame's input over to the game thread having
+    // published a frame with it.
+    let input_to_frame = f.input_at.map_or(0.0, |at| {
+        f.published.saturating_duration_since(at).as_secs_f64() * 1000.0
+    });
+    Some(format!(
+        "Published: {chunks} chunks ({light}), level {}, frame {} with input {} ({} turns ahead, camera {:.1} / {:.1}), {} entities\n\
+         Input to frame {input_to_frame:.2} ms; input queue at most {} frames, oldest {:.1} ms, {} waits; dirty queue at most {}, {} rescans",
+        f.epoch,
+        f.sequence,
+        f.input_sequence,
+        camera.turns_ahead,
+        wrap_degrees(camera.y_rot),
+        camera.x_rot,
+        f.entities.len(),
+        handoff.high_water,
+        handoff.oldest_age.as_secs_f64() * 1000.0,
+        handoff.stalls,
+        dirty.high_water,
+        dirty.overflows,
+    ))
+}
+
+/// What the HUD's text says: the player as of its last tick, the published scene
+/// ([`scene_line`]) and the server's name.
+#[derive(Debug, Clone, Copy)]
+pub struct HudText<'a> {
+    pub view: Option<&'a PlayerView>,
+    pub world: Option<&'a str>,
+    pub server: &'a str,
+}
+
 pub fn draw_hud(
-    view: Option<&PlayerView>,
-    server: &str,
+    hud: HudText<'_>,
     scale: &UiScale,
     fonts: &Fonts,
     atlas: Option<&GlyphAtlas>,
     shapes: &mut ShapeList,
     text: &mut TextList,
 ) {
+    let HudText {
+        view,
+        world,
+        server,
+    } = hud;
     let (cx, cy) = (scale.width / 2.0, scale.height / 2.0);
     let white = [1.0, 1.0, 1.0, 0.9];
     shapes.rounded(
@@ -275,6 +327,9 @@ pub fn draw_hud(
             }
             lines.push((hands, body));
             lines.push((format!("{} ({} chunks)", v.dimension, v.chunks), body));
+            for line in world.into_iter().flat_map(str::lines) {
+                lines.push((line.to_owned(), body));
+            }
         }
         None => lines.push(("Joining...".into(), body)),
     }

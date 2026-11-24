@@ -232,6 +232,25 @@ impl Connection {
         })
     }
 
+    /// A connection with nothing behind it, and its other end: whatever is put into
+    /// the [`Remote`] arrives as the connection's events, and what the connection is
+    /// told to send can be read back there. For driving a session without a server.
+    pub fn detached() -> (Connection, Remote) {
+        let (commands, rx) = mpsc::unbounded_channel();
+        let (tx, events) = std_mpsc::channel();
+        (
+            Connection {
+                commands,
+                events,
+                thread: None,
+            },
+            Remote {
+                events: tx,
+                commands: rx,
+            },
+        )
+    }
+
     /// Sends a packet (its id and fields) in the current protocol.
     pub fn send(&self, packet: Vec<u8>) {
         let _ = self.commands.send(Command::Send(packet));
@@ -251,6 +270,46 @@ impl Connection {
     /// What happened, in order; the last is [`Event::Closed`].
     pub fn events(&self) -> &std_mpsc::Receiver<Event> {
         &self.events
+    }
+}
+
+/// The far end of a [`Connection::detached`].
+pub struct Remote {
+    events: std_mpsc::Sender<Event>,
+    commands: mpsc::UnboundedReceiver<Command>,
+}
+
+impl std::fmt::Debug for Remote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Remote").finish_non_exhaustive()
+    }
+}
+
+/// What a detached connection was told to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Sent {
+    Packet(Vec<u8>),
+    Switch { to: Protocol, ack: Vec<u8> },
+    Close,
+}
+
+impl Remote {
+    /// Makes the connection report `event`.
+    pub fn event(&self, event: Event) {
+        let _ = self.events.send(event);
+    }
+
+    /// What the connection was told to send or do since the last call, in order.
+    pub fn sent(&mut self) -> Vec<Sent> {
+        let mut out = Vec::new();
+        while let Ok(c) = self.commands.try_recv() {
+            out.push(match c {
+                Command::Send(p) => Sent::Packet(p),
+                Command::Switch { to, ack } => Sent::Switch { to, ack },
+                Command::Close => Sent::Close,
+            });
+        }
+        out
     }
 }
 

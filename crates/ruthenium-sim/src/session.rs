@@ -26,11 +26,11 @@
 //! and server links (ignored), and anything in play beyond pings, cookies and the switch
 //! back to configuration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ruthenium_net::connection::{
     Closed, ConnectOptions, Connection, Event, Local, Protocol, Reason, Stage,
@@ -43,6 +43,8 @@ use crate::blocks::{BlockTags, Blocks};
 use crate::clock::{self, TickClock};
 use crate::effect::Effect;
 use crate::entity::{Entities, EntityTypes, Local as LocalInfo, PlayerInfos, Teams, TickContext};
+use crate::environment::{Clocks, Environment, LocalRegistries};
+use crate::handoff::{Handoff, HandoffStats, Item, Limits, Take, Taken};
 use crate::input::next_scroll_selection;
 use crate::interact::{self, GameMode, UseKeys};
 use crate::inventory::Hand;
@@ -51,8 +53,11 @@ use crate::level_load::LevelLoad;
 use crate::pick;
 use crate::player::{Env, Keys, LocalPlayer, Others, Pose};
 use crate::predict::Predictions;
+use crate::scene::{
+    DEFAULT_DIRTY_CAPACITY, Dims, EntityRecord, Frame, MAX_ENTITIES, Scene, ScenePublisher,
+};
 use crate::weather::Weather;
-use crate::world::{BiomeInfo, Level, global_bits};
+use crate::world::{BiomeInfo, ChunkPacket, Level, global_bits};
 
 #[derive(Debug)]
 pub struct SessionOptions {
@@ -85,6 +90,9 @@ pub struct Physics {
     /// Vanilla's biomes' climates by name, for servers that send them as known-pack
     /// entries without data.
     pub biomes: HashMap<String, crate::biome::Climate>,
+    /// Vanilla's dimension types, timelines, world clocks and biomes as their files
+    /// define them, for the environment of a server that names them without data.
+    pub registries: Arc<LocalRegistries>,
 }
 
 /// What movement needs from a dimension type.
@@ -143,15 +151,25 @@ pub enum SessionEvent {
     Closed(Closed),
 }
 
+/// What the menus ask of the session, taken in order with the frames.
+#[derive(Debug)]
 enum Command {
     CodeOfConduct(bool),
-    Disconnect,
     /// The death screen's Respawn (or Spectate World) button.
     Respawn,
     /// The bed screen's Leave Bed button.
     LeaveBed,
-    /// One frame of the main thread, with its input.
-    Frame(FrameInput),
+}
+
+/// The local camera for drawing: the latest frame, and where the player looks once
+/// the turns the game thread hasn't taken in yet are applied to it.
+#[derive(Debug, Clone)]
+pub struct Camera {
+    pub frame: Arc<Frame>,
+    pub y_rot: f32,
+    pub x_rot: f32,
+    /// Turns applied on top of the frame's rotation.
+    pub turns_ahead: usize,
 }
 
 /// What the player did during one frame on the main thread.
@@ -206,6 +224,11 @@ pub struct PlayerView {
     /// The block being broken and how far (`destroyProgress`, 0 to 1).
     pub breaking: Option<([i32; 3], f32)>,
     pub chunks: usize,
+    /// The frames and the client ticks the game thread has run since the session began,
+    /// for tools that key input by tick. The view is set last in a frame: when it shows
+    /// a frame count, what that frame published ([`Session::scene`]) is there too.
+    pub frames: u64,
+    pub ticks: u64,
     /// Other entities the client tracks.
     pub entities: usize,
     /// Whether the player has loaded into the level.
@@ -214,13 +237,22 @@ pub struct PlayerView {
 
 /// A session on the game thread. Dropping it disconnects.
 pub struct Session {
-    commands: Sender<Command>,
+    /// The frames' input and the controls, numbered, on their way to the game thread.
+    handoff: Arc<Handoff<FrameInput, Command>>,
     events: Receiver<SessionEvent>,
     /// The input of the frame under way, sent with [`Session::frame`].
     input: Mutex<FrameInput>,
     view: Arc<Mutex<Option<PlayerView>>>,
+    /// What the game thread publishes for drawing.
+    scene: Scene,
+    /// The turns handed over, each with its frame's number, until a published frame
+    /// has them in its rotation.
+    turns: Mutex<VecDeque<(u64, f64, f64)>>,
     thread: Option<JoinHandle<()>>,
 }
+
+/// Turns kept for [`Session::camera`] at most (the oldest go first).
+const MAX_PENDING_TURNS: usize = 8192;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -235,27 +267,38 @@ impl std::fmt::Debug for Session {
 impl Session {
     pub fn start(options: SessionOptions) -> std::io::Result<Session> {
         let connection = Connection::open(options.connect)?;
-        let (commands, command_rx) = channel();
+        Session::with_connection(connection, options.known_packs, options.physics)
+    }
+
+    /// A session on a connection that is already open.
+    fn with_connection(
+        connection: Connection,
+        known_packs: Vec<KnownPack>,
+        physics: Option<Physics>,
+    ) -> std::io::Result<Session> {
+        let handoff = Arc::new(Handoff::new(Limits::default()));
+        let (publisher, scene) = Scene::new(DEFAULT_DIRTY_CAPACITY);
         let (tx, events) = channel();
-        let known_packs = options.known_packs;
-        let physics = options.physics;
         if physics.is_none() {
             eprintln!("[session] no prepared game: the player won't move or send movement");
         }
         let view = Arc::new(Mutex::new(None));
         let game_view = view.clone();
+        let game_handoff = handoff.clone();
         let thread = std::thread::Builder::new()
             .name("game".into())
             .spawn(move || {
-                let mut game = Game::new(connection, known_packs, physics, tx);
+                let mut game = Game::new(connection, known_packs, physics, tx, publisher);
                 game.view = game_view;
-                game.run(&command_rx);
+                game.run(&game_handoff);
             })?;
         Ok(Session {
-            commands,
+            handoff,
             events,
             input: Mutex::default(),
             view,
+            scene,
+            turns: Mutex::default(),
             thread: Some(thread),
         })
     }
@@ -266,31 +309,37 @@ impl Session {
     }
 
     pub fn answer_code_of_conduct(&self, accept: bool) {
-        let _ = self.commands.send(Command::CodeOfConduct(accept));
+        self.handoff.push_control(Command::CodeOfConduct(accept));
     }
 
-    /// Disconnects; a [`SessionEvent::Closed`] follows.
+    /// Disconnects; a [`SessionEvent::Closed`] follows. It doesn't wait its turn behind
+    /// queued frames.
     pub fn disconnect(&self) {
-        let _ = self.commands.send(Command::Disconnect);
+        self.handoff.close();
     }
 
     /// Asks the server to bring the dead player back (`LocalPlayer.respawn`: the death
     /// screen's Respawn button); [`SessionEvent::Respawned`] follows.
     pub fn respawn(&self) {
-        let _ = self.commands.send(Command::Respawn);
+        self.handoff.push_control(Command::Respawn);
     }
 
     /// Asks the server to wake the player (the bed screen's Leave Bed);
     /// [`SessionEvent::WokeUp`] follows once it does.
     pub fn leave_bed(&self) {
-        let _ = self.commands.send(Command::LeaveBed);
+        self.handoff.push_control(Command::LeaveBed);
     }
 
     /// Ends the main thread's frame: the game thread runs it (`Minecraft.runTick`) with
     /// the input given since the last one. Call it once every frame the client runs,
     /// also while the window is hidden or no screen of the session shows; packets wait
-    /// for it.
-    pub fn frame(&self) {
+    /// for it. Returns the frame's number in the handoff: a published
+    /// [`Frame::input_sequence`] at or past it has this input in it.
+    ///
+    /// The game thread takes frames in order, each as its own, and at most
+    /// [`Limits::frames`] wait: past that this call waits for room
+    /// ([`Session::handoff_stats`] counts it).
+    pub fn frame(&self) -> u64 {
         let mut input = lock(&self.input);
         let (keys, use_down, attack_down, screen_open) = (
             input.keys,
@@ -304,7 +353,68 @@ impl Session {
         input.attack_down = attack_down;
         input.screen_open = screen_open;
         drop(input);
-        let _ = self.commands.send(Command::Frame(frame));
+        let events = frame.scrolls.len() + frame.turns.len();
+        let turns = frame.turns.clone();
+        let sequence = self.handoff.push_frame(frame, events);
+        let mut log = lock(&self.turns);
+        // Without a published frame nothing reads the log.
+        match self.scene.frame() {
+            Some(f) => {
+                while log.front().is_some_and(|t| t.0 <= f.input_sequence) {
+                    log.pop_front();
+                }
+            }
+            None => log.clear(),
+        }
+        log.extend(turns.into_iter().map(|(xo, yo)| (sequence, xo, yo)));
+        while log.len() > MAX_PENDING_TURNS {
+            log.pop_front();
+        }
+        sequence
+    }
+
+    /// What the game thread publishes for drawing: the terrain, the frames and the
+    /// dirty queue.
+    pub fn scene(&self) -> &Scene {
+        &self.scene
+    }
+
+    /// The latest frame with the camera turned as far as the mouse has: the frame's
+    /// rotation, then every turn the game thread had not taken in when it published the
+    /// frame, in the order they were made (those of the frame under way last). Movement
+    /// and everything else come from the frame alone.
+    pub fn camera(&self) -> Option<Camera> {
+        let frame = self.scene.frame()?;
+        let (mut y_rot, mut x_rot) = (frame.player.y_rot, frame.player.x_rot);
+        let mut turns_ahead = 0;
+        {
+            let log = lock(&self.turns);
+            for &(_, xo, yo) in log.iter().filter(|t| t.0 > frame.input_sequence) {
+                (y_rot, x_rot) = crate::player::turned(y_rot, x_rot, xo, yo);
+                turns_ahead += 1;
+            }
+        }
+        for &(xo, yo) in &lock(&self.input).turns {
+            (y_rot, x_rot) = crate::player::turned(y_rot, x_rot, xo, yo);
+            turns_ahead += 1;
+        }
+        Some(Camera {
+            frame,
+            y_rot,
+            x_rot,
+            turns_ahead,
+        })
+    }
+
+    /// Frames handed over that the game thread has not taken yet.
+    pub fn frames_waiting(&self) -> usize {
+        self.handoff.waiting()
+    }
+
+    /// How the handoff to the game thread has fared: the most frames that waited, the
+    /// oldest input it took, and the times this thread had to wait for room.
+    pub fn handoff_stats(&self) -> HandoffStats {
+        self.handoff.stats()
     }
 
     /// The movement keys held from now on (`Keys::default()` while a screen is open).
@@ -375,7 +485,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.disconnect();
+        self.handoff.drop_session();
         drop(self.thread.take());
     }
 }
@@ -434,8 +544,21 @@ struct Game {
     /// The block transformers of the configuration's registry.
     transformers: crate::use_on::Transformers,
     clock: TickClock,
+    /// The frames and the ticks run so far (see [`PlayerView`]).
+    frames: u64,
+    ticks: u64,
     started: Instant,
+    /// Tests set the millisecond clock by hand.
+    manual_ms: Option<i64>,
     view: Arc<Mutex<Option<PlayerView>>>,
+    /// Where the level and each frame are published for drawing.
+    publisher: ScenePublisher,
+    /// The number of the last frame input taken in, and when it was handed over.
+    input_sequence: u64,
+    input_at: Option<Instant>,
+    /// Which block states count in the motion-blocking heightmap, by the tags the
+    /// server sent.
+    motion_blocking: Option<Arc<Vec<u64>>>,
     /// The keys the next ticks read.
     keys: Keys,
     /// Hotbar key presses not yet read (`KeyMapping.clickCount`).
@@ -503,15 +626,38 @@ struct World {
     /// The level's game time: the server's (`set_time`), counted on by the ticks
     /// (`tickTime`). Pistons tell ticks apart by it; camels time sitting and getting up.
     game_time: i64,
+    /// The world clocks (`ClientClockManager`): the play listener's, so they stay
+    /// through a respawn.
+    clocks: Clocks,
+    /// What the dimension looks like, for drawing.
+    environment: Arc<Environment>,
+    /// The dimension's name again, shared with the published frames.
+    dimension_name: Arc<str>,
+    /// Client ticks run in this level.
+    ticks: u64,
+    /// Times the player was put somewhere (a teleport, a respawn).
+    placements: u64,
 }
 
 impl World {
+    /// The end of a client tick: unless the server froze the game, the border moves
+    /// and the game time and the world clocks go on by one (`tickTime`).
+    fn tick_time(&mut self) {
+        if !self.frozen {
+            self.level.border.tick();
+            self.game_time += 1;
+            self.clocks.tick(self.game_time);
+        }
+        self.ticks += 1;
+    }
+
     fn new(
         spawn: &play::SpawnInfo,
         now: i64,
         level: Level,
         biome_bits: u32,
         entities: Entities,
+        environment: Arc<Environment>,
     ) -> World {
         // `handleLogin`: the game mode's abilities.
         let mut player = LocalPlayer::new();
@@ -531,6 +677,11 @@ impl World {
             tick_rate: 20.0,
             frozen: false,
             game_time: 0,
+            clocks: Clocks::default(),
+            environment,
+            dimension_name: Arc::from(spawn.dimension.as_str()),
+            ticks: 0,
+            placements: 0,
         }
     }
 }
@@ -541,6 +692,7 @@ impl Game {
         known_packs: Vec<KnownPack>,
         physics: Option<Physics>,
         events: Sender<SessionEvent>,
+        publisher: ScenePublisher,
     ) -> Game {
         Game {
             connection,
@@ -562,8 +714,15 @@ impl Game {
             recipe_sets: crate::item::RecipeSets::new(),
             transformers: crate::use_on::Transformers::default(),
             clock: TickClock::new(0),
+            frames: 0,
+            ticks: 0,
             started: Instant::now(),
+            manual_ms: None,
             view: Arc::default(),
+            publisher,
+            input_sequence: 0,
+            input_at: None,
+            motion_blocking: None,
             keys: Keys::default(),
             hotbar_clicks: [0; 9],
             use_keys: UseKeys::default(),
@@ -583,46 +742,66 @@ impl Game {
         let _ = self.events.send(e);
     }
 
-    fn run(&mut self, commands: &Receiver<Command>) {
-        loop {
-            let Ok(c) = commands.recv() else {
-                // The session was dropped (after asking to disconnect): no more frames.
+    fn run(&mut self, handoff: &Handoff<FrameInput, Command>) {
+        while self.step(handoff.take()) {}
+        // A main thread waiting for room in the queue goes on.
+        handoff.end();
+        self.publisher.end_level();
+    }
+
+    /// One thing from the handoff, in its order; false once the session has ended.
+    fn step(&mut self, take: Take<FrameInput, Command>) -> bool {
+        match take {
+            // The session was dropped: no more frames.
+            Take::Dropped => {
                 self.connection.close();
-                return;
-            };
-            match c {
-                Command::Frame(input) => {
-                    if !self.frame(input) {
-                        return;
-                    }
-                }
-                Command::Disconnect => self.connection.close(),
-                Command::Respawn => {
-                    if self.world.is_some() {
-                        self.connection
-                            .send(play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN));
-                    }
-                }
-                // `InBedChatScreen.sendWakeUp`: only while the screen is open; it stays
-                // open until the server wakes the player.
-                Command::LeaveBed => {
-                    if self.bed_screen
-                        && let Some(w) = &self.world
-                    {
-                        self.connection.send(w.player.stop_sleeping_packet());
-                    }
-                }
-                Command::CodeOfConduct(accept) if self.waiting_for_code_of_conduct => {
-                    self.waiting_for_code_of_conduct = false;
-                    if accept {
-                        self.connection.send(cfg::accept_code_of_conduct());
-                    } else {
-                        // Vanilla disconnects with "multiplayer.disconnect.code_of_conduct".
-                        self.connection.close();
-                    }
-                }
-                Command::CodeOfConduct(_) => {}
+                false
             }
+            Take::Closing => {
+                self.connection.close();
+                true
+            }
+            Take::Item(Taken { sequence, at, item }) => match item {
+                Item::Frame(input) => {
+                    self.input_sequence = sequence;
+                    self.input_at = Some(at);
+                    self.frame(input)
+                }
+                Item::Control(c) => {
+                    self.control(c);
+                    true
+                }
+            },
+        }
+    }
+
+    fn control(&mut self, c: Command) {
+        match c {
+            Command::Respawn => {
+                if self.world.is_some() {
+                    self.connection
+                        .send(play::client_command(play::CLIENT_COMMAND_PERFORM_RESPAWN));
+                }
+            }
+            // `InBedChatScreen.sendWakeUp`: only while the screen is open; it stays
+            // open until the server wakes the player.
+            Command::LeaveBed => {
+                if self.bed_screen
+                    && let Some(w) = &self.world
+                {
+                    self.connection.send(w.player.stop_sleeping_packet());
+                }
+            }
+            Command::CodeOfConduct(accept) if self.waiting_for_code_of_conduct => {
+                self.waiting_for_code_of_conduct = false;
+                if accept {
+                    self.connection.send(cfg::accept_code_of_conduct());
+                } else {
+                    // Vanilla disconnects with "multiplayer.disconnect.code_of_conduct".
+                    self.connection.close();
+                }
+            }
+            Command::CodeOfConduct(_) => {}
         }
     }
 
@@ -652,14 +831,107 @@ impl Game {
         for _ in 0..ticks {
             self.tick();
         }
+        self.frames += 1;
+        self.ticks += u64::from(ticks);
         // `handleAccumulatedMovement`, without a player nothing turns.
         if let Some(w) = &mut self.world {
             for &(xo, yo) in &input.turns {
                 w.player.turn(xo, yo);
             }
         }
+        self.publish();
         self.update_view();
         true
+    }
+
+    /// Publishes the level's changes and the frame for drawing (vanilla's extract, on
+    /// the game thread: the cost follows what changed and how many entities there are).
+    fn publish(&mut self) {
+        let Some(w) = &mut self.world else {
+            return;
+        };
+        self.publisher.publish_level(&mut w.level);
+        let now = Instant::now();
+        let ms_per_tick = clock::ms_per_tick(w.tick_rate, !w.frozen);
+        // The tick under way began this long before the clock's last reading.
+        let into_tick = Duration::from_secs_f64(
+            f64::from(self.clock.partial_tick()) * f64::from(ms_per_tick) / 1000.0,
+        );
+        let read = self.started + Duration::from_millis(self.clock.last_ms().max(0) as u64);
+        let tick_start = read.checked_sub(into_tick).unwrap_or(read);
+        let (input_sequence, input_at) = (self.input_sequence, self.input_at);
+        let w = &*w;
+        self.publisher.publish_frame(
+            || Frame::new(now, w.environment.clone(), w.dimension_name.clone()),
+            |f| {
+                f.input_sequence = input_sequence;
+                f.input_at = input_at;
+                f.published = now;
+                f.ticks = w.ticks;
+                f.tick_start = tick_start;
+                f.ms_per_tick = ms_per_tick;
+                f.frozen = w.frozen;
+                f.game_time = w.game_time;
+                w.clocks.samples(&mut f.clocks);
+                f.rain = w.level.weather.rain;
+                f.thunder = w.level.weather.thunder;
+                if !Arc::ptr_eq(&f.dimension, &w.dimension_name) {
+                    f.dimension = w.dimension_name.clone();
+                }
+                if !Arc::ptr_eq(&f.environment, &w.environment) {
+                    f.environment = w.environment.clone();
+                }
+                f.terrain_stamp = w.level.stamp();
+                let p = &w.player;
+                let s = &mut f.player;
+                s.entity_id = p.entity_id;
+                s.position = p.position;
+                s.old_position = p.old_position;
+                s.y_rot = p.y_rot;
+                s.x_rot = p.x_rot;
+                s.old_rot = p.old_rot;
+                s.eye_height = (p.eye_position()[1] - p.position[1]) as f32;
+                s.pose = p.pose;
+                s.on_ground = p.on_ground;
+                s.sprinting = p.sprinting;
+                s.flying = p.abilities.flying;
+                s.game_type = p.game_type();
+                s.health = p.health;
+                s.food = p.food;
+                s.selected_slot = p.inventory.selected;
+                s.attack_strength = p.attack_strength_scale(0.0);
+                s.breaking = w
+                    .game_mode
+                    .is_destroying
+                    .then_some((w.game_mode.destroy_pos, w.game_mode.destroy_progress));
+                s.effects.clear();
+                s.effects
+                    .extend(p.effects.iter().map(|e| (e.id, e.amplifier, e.duration)));
+                s.vehicle = p.riding.as_ref().map(|r| r.vehicle);
+                s.placements = w.placements;
+                f.entities.clear();
+                f.entities_dropped = 0;
+                for e in w.entities.iter() {
+                    if f.entities.len() == MAX_ENTITIES {
+                        f.entities_dropped += 1;
+                        continue;
+                    }
+                    f.entities.push(EntityRecord {
+                        id: e.id,
+                        uuid: e.uuid,
+                        entity_type: e.entity_type,
+                        position: e.position,
+                        old_position: e.old_position,
+                        y_rot: e.y_rot,
+                        x_rot: e.x_rot,
+                        on_ground: e.on_ground,
+                        pose: e.pose,
+                        baby: e.baby,
+                        vehicle: e.vehicle,
+                    });
+                }
+            },
+        );
     }
 
     /// The frame's events (`runAllTasks`, after the packets): keys and scrolls apply
@@ -757,6 +1029,8 @@ impl Game {
                 .is_destroying
                 .then_some((w.game_mode.destroy_pos, w.game_mode.destroy_progress)),
             chunks: w.level.chunk_count(),
+            frames: self.frames,
+            ticks: self.ticks,
             entities: w.entities.len(),
             loaded: w.loaded,
         });
@@ -765,7 +1039,8 @@ impl Game {
 
     /// Vanilla's millisecond clock (`Util.getMillis`).
     fn millis(&self) -> i64 {
-        self.started.elapsed().as_millis() as i64
+        self.manual_ms
+            .unwrap_or_else(|| self.started.elapsed().as_millis() as i64)
     }
 
     fn ms_per_tick(&self) -> f32 {
@@ -872,6 +1147,11 @@ impl Game {
             .collect();
         let mut level = Level::new(t.min_y, t.height);
         level.set_fast_lava(t.fast_lava);
+        level.set_has_skylight(t.has_skylight);
+        if let Some(states) = &self.motion_blocking {
+            level.set_motion_blocking(states.clone());
+        }
+        level.track_changes(DEFAULT_DIRTY_CAPACITY);
         level.weather = Weather::new(t.has_skylight, t.has_ceiling, &spawn.dimension);
         level.biomes = BiomeInfo {
             climates: Arc::new(climates),
@@ -880,6 +1160,41 @@ impl Game {
             empty_chunk_biome: 0,
         };
         (level, global_bits(biomes.len()))
+    }
+
+    /// What a dimension type's levels look like, from the configuration's registries.
+    fn environment(&self, dimension_type: i32) -> Arc<Environment> {
+        let none = LocalRegistries::new();
+        let local = self.physics.as_ref().map_or(&none, |p| &*p.registries);
+        Arc::new(Environment::resolve(
+            &self.configured.registries,
+            &self.configured.tags,
+            local,
+            dimension_type,
+        ))
+    }
+
+    /// Which block states count in the motion-blocking heightmap
+    /// (`Heightmap.Types.MOTION_BLOCKING`): those in the `blocks_motion_in_heightmap`
+    /// tag and those with a fluid. Made again when the server sends tags.
+    fn refresh_motion_blocking(&mut self) {
+        let Some(physics) = &self.physics else {
+            return;
+        };
+        let count = ruthenium_data::v26_3::blocks::STATE_COUNT;
+        let mut bits = vec![0u64; count.div_ceil(64)];
+        for state in 0..count as u32 {
+            if self.tags.is(state, "minecraft:blocks_motion_in_heightmap")
+                || !physics.blocks.fluid(state).is_empty()
+            {
+                bits[(state / 64) as usize] |= 1 << (state % 64);
+            }
+        }
+        let bits = Arc::new(bits);
+        if let Some(w) = &mut self.world {
+            w.level.set_motion_blocking(bits.clone());
+        }
+        self.motion_blocking = Some(bits);
     }
 
     /// The block transformers the configuration's registry lists: each entry's own
@@ -949,6 +1264,7 @@ impl Game {
             });
             self.tags.set(tag, names);
         }
+        self.refresh_motion_blocking();
     }
 
     /// One client tick (`Minecraft.tick`), for the parts there are so far.
@@ -1030,6 +1346,7 @@ impl Game {
                 attack_down: self.use_keys.attack_down,
                 ..UseKeys::default()
             };
+            w.tick_time();
             self.connection.send(play::client_tick_end());
             return;
         };
@@ -1147,10 +1464,7 @@ impl Game {
             }
         }
         // `level.tick`: the world border, then the game time.
-        if !w.frozen {
-            w.level.border.tick();
-            w.game_time += 1;
-        }
+        w.tick_time();
         self.connection.send(play::client_tick_end());
     }
 
@@ -1284,6 +1598,7 @@ impl Game {
                 self.phase = Phase::Configuration;
                 self.collecting = Configured::default();
                 self.world = None;
+                self.publisher.end_level();
                 self.death_screen = None;
                 self.players = PlayerInfos::default();
                 self.teams = Teams::default();
@@ -1300,7 +1615,10 @@ impl Game {
                 );
                 let (level, biome_bits) = self.new_level(&login.spawn);
                 let entities = self.new_entities(login.player_id);
-                let mut world = World::new(&login.spawn, now, level, biome_bits, entities);
+                let environment = self.environment(login.spawn.dimension_type);
+                self.publisher.begin_level(Dims::of(&level));
+                let mut world =
+                    World::new(&login.spawn, now, level, biome_bits, entities, environment);
                 world.player.entity_id = login.player_id;
                 world.player.show_death_screen = login.show_death_screen;
                 self.hardcore = login.hardcore;
@@ -1318,16 +1636,23 @@ impl Game {
                     .player
                     .entity_id;
                 let entities = self.new_entities(id);
+                let environment = self.environment(spawn.dimension_type);
                 let w = self.world.as_mut().ok_or("a respawn before the login")?;
                 if spawn.dimension != w.dimension {
+                    // Another level: what was published of the old one is void.
+                    self.publisher.begin_level(Dims::of(&level));
                     w.level = level;
                     w.predictions = Predictions::new();
                     w.entities = entities;
                     w.biome_bits = biome_bits;
                     w.dimension = spawn.dimension.clone();
+                    w.dimension_name = Arc::from(spawn.dimension.as_str());
+                    w.environment = environment;
+                    w.ticks = 0;
                 } else {
                     w.entities.local_respawned();
                 }
+                w.placements += 1;
                 // `handleRespawn`: a new player, with what the server says to keep, in
                 // the new game mode; not loaded until the level is ready.
                 w.player = w.player.respawned(data_to_keep);
@@ -1344,6 +1669,7 @@ impl Game {
             play::Clientbound::PlayerPosition(t) => {
                 let w = self.world.as_mut().ok_or("a teleport before the login")?;
                 w.player.teleport(&t);
+                w.placements += 1;
                 let p = &w.player;
                 eprintln!(
                     "[session] teleport {} to {:.3} {:.3} {:.3} (relative bits {:#x})",
@@ -1379,12 +1705,40 @@ impl Game {
                     }
                 }
             }
-            play::Clientbound::LevelChunk { x, z, data } => {
+            // `handleLevelChunkWithLight`. Vanilla queues the chunk's light and applies
+            // it with a later frame; here it comes with the chunk, so the chunk is never
+            // seen without its light.
+            play::Clientbound::LevelChunk {
+                x,
+                z,
+                heightmaps,
+                data,
+                block_entities,
+                light,
+            } => {
                 if let Some(w) = &mut self.world {
-                    if let Err(e) = w.level.load_chunk(x, z, &data, w.biome_bits) {
+                    let packet = ChunkPacket {
+                        heightmaps: &heightmaps,
+                        data: &data,
+                        block_entities: &block_entities,
+                        light: &light,
+                    };
+                    if let Err(e) = w.level.load_chunk_packet(x, z, packet, w.biome_bits) {
                         return Err(format!("chunk {x} {z}: {e}"));
                     }
                     w.entities.chunk_loaded(x, z);
+                }
+            }
+            // `handleLightUpdatePacket`: the server's light after a block changed.
+            play::Clientbound::LightUpdate { x, z, light } => {
+                if let Some(w) = &mut self.world {
+                    w.level.update_light(x, z, &light);
+                }
+            }
+            // `handleBlockEntityData`: kept for drawing.
+            play::Clientbound::BlockEntityData { pos, kind, tag } => {
+                if let Some(w) = &mut self.world {
+                    w.level.set_block_entity_data(pos, kind, tag);
                 }
             }
             play::Clientbound::ChunksBiomes { chunks } => {
@@ -1797,10 +2151,12 @@ impl Game {
                     w.entities.set_equipment(entity_id, &slots);
                 }
             }
-            // `handleSetTime` (`setTimeFromServer`; the clocks aren't kept).
-            play::Clientbound::SetTime { game_time } => {
+            // `handleSetTime`: the game time, then the clocks tick up to it and take
+            // the server's values.
+            play::Clientbound::SetTime { game_time, clocks } => {
                 if let Some(w) = &mut self.world {
                     w.game_time = game_time;
+                    w.clocks.handle_updates(game_time, &clocks);
                 }
             }
             // The world border's packets.
@@ -1886,4 +2242,668 @@ fn log_closed(c: &Closed) {
         Reason::Local(l) => l.to_string(),
     };
     eprintln!("[session] closed: {why}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scene::{SectionKey, WHOLE_COLUMN, dirty};
+    use crate::world::testing::{chunk_data, light};
+    use ruthenium_net::connection::{Remote, Sent};
+    use ruthenium_protocol::nbt::{Compound, Tag};
+    use ruthenium_protocol::packets::play::{ChunkBlockEntity, ClockState, LightData};
+
+    fn dimension_type(min_y: i32, height: i32, skylight: bool, nether: bool) -> Tag {
+        let mut attributes = Compound::new();
+        attributes.put(
+            "minecraft:visual/sky_color",
+            Tag::String(if nether { "#330808" } else { "#78a7ff" }.into()),
+        );
+        let mut d = Compound::new();
+        d.put("min_y", Tag::Int(min_y));
+        d.put("height", Tag::Int(height));
+        d.put("has_skylight", Tag::Byte(skylight.into()));
+        d.put("has_ceiling", Tag::Byte(nether.into()));
+        d.put("ambient_light", Tag::Float(if nether { 0.1 } else { 0.0 }));
+        if nether {
+            d.put("cardinal_light", Tag::String("nether".into()));
+        } else {
+            d.put("default_clock", Tag::String("minecraft:overworld".into()));
+        }
+        d.put("attributes", Tag::Compound(attributes));
+        Tag::Compound(d)
+    }
+
+    fn entry(id: &str, data: Option<Tag>) -> RegistryEntry {
+        RegistryEntry {
+            id: id.into(),
+            data,
+        }
+    }
+
+    fn spawn(dimension_type: i32, dimension: &str) -> play::SpawnInfo {
+        play::SpawnInfo {
+            dimension_type,
+            dimension: dimension.into(),
+            seed: 0,
+            game_type: play::CREATIVE,
+            previous_game_type: None,
+            is_debug: false,
+            is_flat: true,
+            last_death: None,
+            portal_cooldown: 0,
+            sea_level: 0,
+        }
+    }
+
+    fn login() -> play::Clientbound {
+        play::Clientbound::Login(Box::new(play::Login {
+            player_id: 7,
+            hardcore: false,
+            levels: vec!["minecraft:overworld".into()],
+            max_players: 20,
+            chunk_radius: 2,
+            simulation_distance: 2,
+            reduced_debug_info: false,
+            show_death_screen: true,
+            limited_crafting: false,
+            spawn: spawn(0, "minecraft:overworld"),
+            online_mode: false,
+            enforces_secure_chat: false,
+        }))
+    }
+
+    /// A chunk of the 4-section test level: stone in its bottom section, sky light 15
+    /// above it, a sign's data at (x 2, y 5, z 3) of the chunk.
+    fn chunk(x: i32, z: i32) -> play::Clientbound {
+        let mut sign = Compound::new();
+        sign.put("text", Tag::String("hello".into()));
+        play::Clientbound::LevelChunk {
+            x,
+            z,
+            heightmaps: Vec::new(),
+            data: chunk_data(4, |i| if i == 0 { 1 } else { 0 }),
+            block_entities: vec![ChunkBlockEntity {
+                xz: 0x23,
+                y: 5,
+                kind: 7,
+                tag: Some(Tag::Compound(sign)),
+            }],
+            light: light(
+                &[(1, None), (2, Some(15)), (3, Some(15)), (4, Some(15))],
+                &[(2, Some(3))],
+            ),
+        }
+    }
+
+    /// A game thread's state driven by hand: packets in, frames one at a time on a
+    /// clock the test sets.
+    struct Rig {
+        game: Game,
+        remote: Remote,
+        scene: Scene,
+        _events: Receiver<SessionEvent>,
+        ms: i64,
+    }
+
+    fn rig(physics: Option<Physics>) -> Rig {
+        let (connection, remote) = Connection::detached();
+        let (publisher, scene) = Scene::new(DEFAULT_DIRTY_CAPACITY);
+        let (tx, events) = channel();
+        let mut game = Game::new(connection, Vec::new(), physics, tx, publisher);
+        game.manual_ms = Some(0);
+        game.configured.registries = vec![
+            (
+                crate::environment::DIMENSION_TYPE.into(),
+                vec![
+                    entry(
+                        "minecraft:overworld",
+                        Some(dimension_type(-16, 64, true, false)),
+                    ),
+                    entry(
+                        "minecraft:the_nether",
+                        Some(dimension_type(0, 128, false, true)),
+                    ),
+                ],
+            ),
+            (
+                crate::environment::WORLD_CLOCK.into(),
+                vec![
+                    entry("minecraft:overworld", None),
+                    entry("minecraft:the_end", None),
+                ],
+            ),
+            (
+                crate::environment::BIOME.into(),
+                vec![entry("minecraft:plains", None)],
+            ),
+        ];
+        Rig {
+            game,
+            remote,
+            scene,
+            _events: events,
+            ms: 0,
+        }
+    }
+
+    impl Rig {
+        fn packet(&self, p: play::Clientbound) {
+            self.remote.event(Event::Play(p));
+        }
+
+        /// One frame of the game thread, `ms` after the last, with `input`.
+        fn frame_with(&mut self, ms: i64, input: FrameInput) -> Arc<Frame> {
+            self.ms += ms;
+            self.game.manual_ms = Some(self.ms);
+            self.game.input_sequence += 1;
+            assert!(self.game.frame(input));
+            self.scene.frame().expect("a frame is published in a level")
+        }
+
+        fn frame(&mut self, ms: i64) -> Arc<Frame> {
+            self.frame_with(ms, FrameInput::default())
+        }
+
+        fn dirty(&self) -> HashMap<SectionKey, u8> {
+            let mut out = Vec::new();
+            self.scene.drain_dirty(&mut out);
+            out.into_iter().collect()
+        }
+    }
+
+    #[test]
+    fn world_updates_reach_the_scene_in_the_frame_that_handled_them() {
+        let mut r = rig(None);
+        // No level: nothing is published.
+        r.game.manual_ms = Some(0);
+        assert!(r.game.frame(FrameInput::default()));
+        assert!(r.scene.frame().is_none());
+
+        r.packet(login());
+        let f = r.frame(10);
+        assert_eq!((f.epoch, f.sequence, f.input_sequence), (1, 1, 1));
+        assert_eq!(&*f.dimension, "minecraft:overworld");
+        assert_eq!(f.environment.dimension_type, "minecraft:overworld");
+        assert_eq!(
+            f.environment.attributes["minecraft:visual/sky_color"],
+            "#78a7ff"
+        );
+        assert_eq!(f.environment.default_clock, Some(0));
+        assert_eq!(f.player.entity_id, 7);
+        assert!(
+            r.scene
+                .with_terrain(|t| t.is_empty() && t.dims().sections == 4)
+        );
+        r.dirty();
+
+        // Chunks arrive: blocks, light, block entity data, all in the same frame.
+        for (x, z) in [(0, 0), (1, 0)] {
+            r.packet(chunk(x, z));
+        }
+        let f = r.frame(10);
+        assert_eq!(f.terrain_stamp, r.scene.with_terrain(|t| t.stamp()));
+        let n = r.scene.pin([0, 0, 0]).unwrap();
+        assert_eq!((n.block(3, -1, 3), n.block(3, 0, 3)), (1, 0));
+        assert_eq!((n.sky_light(3, 0, 3), n.sky_light(3, -1, 3)), (15, 0));
+        assert_eq!((n.block_light(3, 0, 3), n.block_light(19, 0, 3)), (3, 3));
+        let records = n.column(0, 0).unwrap().block_entities();
+        assert_eq!(
+            (records.len(), records[0].pos, records[0].kind),
+            (1, [2, 5, 3], 7)
+        );
+        let keys = r.dirty();
+        assert_eq!(
+            keys[&[0, WHOLE_COLUMN, 0]],
+            dirty::LOADED | dirty::NEIGHBOUR
+        );
+        assert_eq!(keys[&[-1, WHOLE_COLUMN, 0]], dirty::NEIGHBOUR);
+
+        // The server's light after a change, a block update, and a section's updates.
+        r.packet(play::Clientbound::LightUpdate {
+            x: 0,
+            z: 0,
+            light: light(&[(2, Some(9))], &[]),
+        });
+        r.packet(play::Clientbound::BlockUpdate {
+            pos: [8, 8, 8],
+            state: 1,
+        });
+        r.packet(play::Clientbound::SectionBlocksUpdate {
+            section: [1, 1, 0],
+            changes: vec![(8 << 8 | 8 << 4 | 2, 1), (9 << 8 | 8 << 4 | 2, 1)],
+        });
+        r.frame(10);
+        let after = r.scene.pin([0, 0, 0]).unwrap();
+        assert_eq!((after.sky_light(3, 0, 3), after.block(8, 8, 8)), (9, 1));
+        // The pin from the frame before still has what it had.
+        assert_eq!((n.sky_light(3, 0, 3), n.block(8, 8, 8)), (15, 0));
+        assert!(!r.scene.is_current(n.stamp()));
+        // x 8, y 2 (18 in the level), z 8 of section (1, 1, 0).
+        assert_eq!(r.scene.pin([1, 1, 0]).unwrap().block(8, 2, 8), 1);
+        assert_eq!(r.scene.pin([1, 1, 0]).unwrap().block(9, 2, 8), 1);
+        let keys = r.dirty();
+        // The server's changes are not the player's own.
+        assert_eq!(keys[&[0, 0, 0]], dirty::BLOCKS | dirty::LIGHT);
+        assert_eq!(keys[&[1, 1, 0]], dirty::BLOCKS | dirty::NEIGHBOUR);
+        assert_eq!(keys[&[0, 1, 0]], dirty::NEIGHBOUR);
+
+        // A block entity's new data.
+        let mut sign = Compound::new();
+        sign.put("text", Tag::String("bye".into()));
+        r.packet(play::Clientbound::BlockEntityData {
+            pos: [2, 5, 3],
+            kind: 7,
+            tag: Some(Tag::Compound(sign.clone())),
+        });
+        r.frame(10);
+        let c = r.scene.with_terrain(|t| t.column(0, 0).cloned()).unwrap();
+        assert_eq!(
+            c.block_entities()[0].tag.as_deref(),
+            Some(&Tag::Compound(sign))
+        );
+        assert_eq!(r.dirty()[&[0, 0, 0]], dirty::BLOCK_ENTITIES);
+
+        // The time, with the day's clock; the ticks then count both on.
+        r.packet(play::Clientbound::SetTime {
+            game_time: 5000,
+            clocks: vec![(
+                0,
+                ClockState {
+                    total_ticks: 6000,
+                    partial_tick: 0.0,
+                    rate: 1.0,
+                },
+            )],
+        });
+        // No time passes in this frame: no tick runs in it.
+        let f = r.frame(0);
+        assert_eq!((f.game_time, f.clocks[0].total_ticks), (5000, 6000));
+        let ticks = f.ticks;
+        // 150 ms later three ticks have run.
+        let f = r.frame(150);
+        assert_eq!(f.ticks, ticks + 3);
+        assert_eq!((f.game_time, f.clocks[0].total_ticks), (5003, 6003));
+        // Time stopped (the clock's rate 0): the game time goes on, the clock stays.
+        r.packet(play::Clientbound::SetTime {
+            game_time: 5003,
+            clocks: vec![(
+                0,
+                ClockState {
+                    total_ticks: 6003,
+                    partial_tick: 0.0,
+                    rate: 0.0,
+                },
+            )],
+        });
+        let f = r.frame(100);
+        assert_eq!((f.game_time, f.clocks[0].total_ticks), (5005, 6003));
+
+        // A teleport is a placement: nothing interpolates across it.
+        let placements = f.player.placements;
+        r.packet(play::Clientbound::PlayerPosition(play::PlayerPosition {
+            id: 1,
+            position: [8.5, 0.0, 8.5],
+            delta: [0.0; 3],
+            y_rot: 90.0,
+            x_rot: 10.0,
+            relatives: 0,
+        }));
+        let f = r.frame(10);
+        assert_eq!(f.player.placements, placements + 1);
+        assert_eq!((f.player.position, f.player.y_rot), ([8.5, 0.0, 8.5], 90.0));
+
+        // A chunk leaves: it is gone from the terrain in that frame.
+        r.packet(play::Clientbound::ForgetLevelChunk { x: 1, z: 0 });
+        r.frame(10);
+        assert!(
+            r.scene
+                .with_terrain(|t| t.column(1, 0).is_none() && t.len() == 1)
+        );
+        assert!(r.scene.pin([1, 0, 0]).is_none());
+        let keys = r.dirty();
+        assert_eq!(keys[&[1, WHOLE_COLUMN, 0]], dirty::UNLOADED);
+        assert_eq!(keys[&[0, WHOLE_COLUMN, 0]], dirty::NEIGHBOUR);
+        // Light for the chunk that left goes nowhere.
+        r.packet(play::Clientbound::LightUpdate {
+            x: 1,
+            z: 0,
+            light: LightData::default(),
+        });
+        r.frame(10);
+        assert!(r.dirty().is_empty());
+
+        // Another dimension: a new epoch, its own environment, nothing of the old
+        // level left; the clocks stay, as vanilla's listener keeps them.
+        let old = r.scene.pin([0, 0, 0]).unwrap();
+        r.packet(play::Clientbound::Respawn {
+            spawn: Box::new(spawn(1, "minecraft:the_nether")),
+            data_to_keep: 0,
+        });
+        let f = r.frame(10);
+        assert_eq!(f.epoch, 2);
+        assert_eq!(&*f.dimension, "minecraft:the_nether");
+        assert!(!f.environment.has_skylight);
+        assert_eq!(
+            f.environment.cardinal_light,
+            crate::environment::CardinalLight::Nether
+        );
+        assert_eq!(f.clocks[0].total_ticks, 6003);
+        assert_eq!(f.ticks, 0);
+        assert!(
+            r.scene
+                .with_terrain(|t| t.is_empty() && t.dims().sections == 8)
+        );
+        assert!(!r.scene.is_current(old.stamp()));
+        let mut out = Vec::new();
+        let drained = r.scene.drain_dirty(&mut out);
+        assert_eq!(drained.epoch, 2);
+        assert!(drained.rescan.is_some() && out.is_empty());
+        // A respawn in the same dimension keeps the level and its epoch.
+        r.packet(play::Clientbound::Respawn {
+            spawn: Box::new(spawn(1, "minecraft:the_nether")),
+            data_to_keep: 0,
+        });
+        assert_eq!(r.frame(10).epoch, 2);
+
+        // Back to configuration: the level is gone.
+        r.packet(play::Clientbound::StartConfiguration);
+        r.game.manual_ms = Some(r.ms + 10);
+        assert!(r.game.frame(FrameInput::default()));
+        assert!(r.scene.frame().is_none());
+        assert!(r.scene.with_terrain(|t| t.is_empty() && t.epoch() == 3));
+    }
+
+    /// Frame `i` of a scripted run: turns every frame, with scrolls, hotbar keys, use
+    /// and attack clicks and releases, and movement keys spread through it.
+    fn scripted(i: u32) -> FrameInput {
+        let mut input = FrameInput {
+            keys: Keys {
+                forward: i % 40 < 25,
+                jump: i % 17 == 3,
+                left: i.is_multiple_of(9),
+                ..Keys::default()
+            },
+            use_down: (20..26).contains(&(i % 50)),
+            attack_down: (30..45).contains(&(i % 50)),
+            ..FrameInput::default()
+        };
+        input.use_clicks = u32::from(i % 50 == 20);
+        input.attack_clicks = u32::from(i % 50 == 30) + u32::from(i % 50 == 31);
+        input.swap_clicks = u32::from(i % 37 == 5);
+        if i % 13 == 4 {
+            input.hotbar_clicks[(i % 9) as usize] = 1;
+        }
+        if i % 11 == 6 {
+            input.scrolls = vec![1, -1, -1];
+        }
+        input.turns = (0..i % 3)
+            .map(|k| {
+                (
+                    f64::from(i % 7) - 3.0 + f64::from(k),
+                    2.0 - f64::from(i % 5),
+                )
+            })
+            .collect();
+        input
+    }
+
+    /// Where the game thread's clock stands when it runs frame `n` (from 1): uneven,
+    /// with a stall long enough for ten ticks to run at once.
+    fn clock_at(n: u64) -> i64 {
+        let stall = if n >= 60 { 700 } else { 0 };
+        (n * 16 + (n % 5) * 3) as i64 + stall
+    }
+
+    const SCRIPT_FRAMES: u32 = 150;
+    /// The frame after which the death screen's Respawn button is pressed.
+    const RESPAWN_AFTER: u32 = 90;
+
+    fn start(physics: Option<Physics>) -> Rig {
+        let mut r = rig(physics);
+        r.packet(login());
+        for x in -1..=1 {
+            for z in -1..=1 {
+                r.packet(chunk(x, z));
+            }
+        }
+        r.packet(play::Clientbound::PlayerPosition(play::PlayerPosition {
+            id: 1,
+            position: [8.5, 0.0, 8.5],
+            delta: [0.0; 3],
+            y_rot: 0.0,
+            x_rot: 0.0,
+            relatives: 0,
+        }));
+        // The server says the chunks are on their way: the player is let in at the
+        // first tick that finds its chunk there.
+        r.packet(play::Clientbound::GameEvent {
+            event: GAME_EVENT_LEVEL_CHUNKS_LOAD_START,
+            param: 0.0,
+        });
+        r.game.manual_ms = Some(0);
+        assert!(r.game.frame(FrameInput::default()));
+        r.remote.sent();
+        r
+    }
+
+    /// What a run left behind: every packet sent, and the player.
+    fn outcome(r: &mut Rig) -> (Vec<Sent>, [f64; 3], (f32, f32), i32, u64) {
+        let f = r.scene.frame().unwrap();
+        (
+            r.remote.sent(),
+            f.player.position,
+            (f.player.y_rot, f.player.x_rot),
+            f.player.selected_slot,
+            f.ticks,
+        )
+    }
+
+    /// The prepared game's data, when the tests are told where it is.
+    fn physics() -> Option<Physics> {
+        let game = std::path::PathBuf::from(std::env::var_os("RUTHENIUM_GAME_DIR")?);
+        // Told where the game is, its exports have to be there: a silent skip would
+        // pass for a run.
+        let exports = game.join("versions/26.3/exports");
+        let blocks = Blocks::load(&exports).expect("the prepared game's block exports");
+        let entity_types = EntityTypes::load(&exports).expect("its entity types");
+        let items = Items::load(&exports, &game.join("versions/26.3/generated/reports"))
+            .expect("its items");
+        Some(Physics {
+            blocks: Arc::new(blocks),
+            entity_types: Arc::new(entity_types),
+            dimension_types: HashMap::new(),
+            items: Arc::new(items),
+            block_transformers: Arc::default(),
+            enchantments: Arc::default(),
+            biomes: HashMap::new(),
+            registries: Arc::default(),
+        })
+    }
+
+    /// The same scripted frames reach the game thread directly, one by one, and
+    /// through a handoff of three frames with the main thread held back by it: the
+    /// game thread must see the same input at the same frame boundaries either way.
+    fn backlog_changes_nothing(physics: Option<Physics>) {
+        // Directly: no queue at all.
+        let mut direct = start(physics.clone());
+        for i in 0..SCRIPT_FRAMES {
+            direct.game.manual_ms = Some(clock_at(u64::from(i) + 1));
+            direct.game.input_sequence += 1;
+            assert!(direct.game.frame(scripted(i)));
+            if i == RESPAWN_AFTER {
+                direct.game.control(Command::Respawn);
+            }
+        }
+        let expected = outcome(&mut direct);
+        assert_eq!(expected.4, direct.scene.frame().unwrap().ticks);
+        // Ticks ran, some of them ten at once after the stall.
+        assert!(expected.4 > 50, "the script ran {} ticks", expected.4);
+
+        // Through the handoff, the main thread faster than the game thread.
+        let mut queued = start(physics);
+        let handoff: Arc<Handoff<FrameInput, Command>> = Arc::new(Handoff::new(Limits {
+            frames: 3,
+            events: 8,
+        }));
+        let main = {
+            let handoff = handoff.clone();
+            std::thread::spawn(move || {
+                for i in 0..SCRIPT_FRAMES {
+                    let input = scripted(i);
+                    let events = input.scrolls.len() + input.turns.len();
+                    handoff.push_frame(input, events);
+                    if i == RESPAWN_AFTER {
+                        handoff.push_control(Command::Respawn);
+                    }
+                }
+            })
+        };
+        let mut frames = 0_u64;
+        let mut last_sequence = 0;
+        while frames < u64::from(SCRIPT_FRAMES) {
+            let take = handoff.take();
+            if let Take::Item(t) = &take {
+                assert!(t.sequence > last_sequence, "out of order");
+                last_sequence = t.sequence;
+                if matches!(t.item, Item::Frame(_)) {
+                    frames += 1;
+                    queued.game.manual_ms = Some(clock_at(frames));
+                }
+            }
+            assert!(queued.game.step(take));
+            if frames.is_multiple_of(20) {
+                // The game thread falls behind: frames pile up to the limit.
+                std::thread::sleep(Duration::from_millis(3));
+            }
+        }
+        main.join().unwrap();
+        let stats = handoff.stats();
+        assert!(stats.stalls > 0 && stats.high_water == 3, "{stats:?}");
+        // The published frame knows the last input it has: the frames and the one
+        // control took a number each.
+        let f = queued.scene.frame().unwrap();
+        assert_eq!(f.input_sequence, u64::from(SCRIPT_FRAMES) + 1);
+        let got = outcome(&mut queued);
+        assert_eq!(got.0.len(), expected.0.len());
+        for (i, (a, b)) in got.0.iter().zip(&expected.0).enumerate() {
+            assert_eq!(a, b, "packet {i} differs");
+        }
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn a_backlog_changes_no_input_boundary() {
+        backlog_changes_nothing(None);
+    }
+
+    /// With the prepared game (`RUTHENIUM_GAME_DIR`), the same with a player that
+    /// moves, breaks and uses blocks; skipped without it.
+    #[test]
+    fn a_backlog_changes_no_input_boundary_with_physics() {
+        let Some(physics) = physics() else {
+            eprintln!("RUTHENIUM_GAME_DIR not set; skipped");
+            return;
+        };
+        backlog_changes_nothing(Some(physics));
+        // The player did move: the run is not trivially equal.
+        let mut r = start(self::physics());
+        for i in 0..SCRIPT_FRAMES {
+            r.game.manual_ms = Some(clock_at(u64::from(i) + 1));
+            assert!(r.game.frame(scripted(i)));
+        }
+        let (sent, position, ..) = outcome(&mut r);
+        assert_ne!(position, [8.5, 0.0, 8.5]);
+        assert!(sent.len() > 100, "{} packets", sent.len());
+    }
+
+    #[test]
+    fn the_camera_runs_ahead_of_the_frames_by_the_turns_not_yet_taken() {
+        let (connection, remote) = Connection::detached();
+        let session = Session::with_connection(connection, Vec::new(), None).unwrap();
+        assert!(session.camera().is_none());
+        remote.event(Event::Play(login()));
+        let wait = |until: &dyn Fn() -> bool| {
+            for _ in 0..2000 {
+                if until() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("the game thread did not get there");
+        };
+        let first = session.frame();
+        wait(&|| {
+            session
+                .scene()
+                .frame()
+                .is_some_and(|f| f.input_sequence >= first)
+        });
+        let before = session.camera().unwrap();
+        assert_eq!(before.turns_ahead, 0);
+        let (y0, x0) = (before.frame.player.y_rot, before.frame.player.x_rot);
+        assert_eq!((before.y_rot, before.x_rot), (y0, x0));
+
+        // The mouse moves: the camera has the turn at once, before any frame has it.
+        session.turn(100.0, -50.0);
+        session.turn(20.0, 0.0);
+        let ahead = session.camera().unwrap();
+        assert_eq!(ahead.turns_ahead, 2);
+        let (y, x) = crate::player::turned(y0, x0, 100.0, -50.0);
+        assert_eq!(
+            (ahead.y_rot, ahead.x_rot),
+            crate::player::turned(y, x, 20.0, 0.0)
+        );
+        assert_ne!((ahead.y_rot, ahead.x_rot), (y0, x0));
+        assert_eq!(ahead.frame.player.y_rot, y0);
+        // Handed over, and until the game thread publishes a frame with it, the camera
+        // is where it was; afterwards the frame itself has the same rotation.
+        let sequence = session.frame();
+        assert!(sequence > first);
+        let between = session.camera().unwrap();
+        assert_eq!((between.y_rot, between.x_rot), (ahead.y_rot, ahead.x_rot));
+        wait(&|| {
+            session
+                .scene()
+                .frame()
+                .is_some_and(|f| f.input_sequence >= sequence)
+        });
+        let after = session.camera().unwrap();
+        assert_eq!(after.turns_ahead, 0);
+        // The turns a published frame has are let go at the next frame's handover.
+        assert_eq!(lock(&session.turns).len(), 2);
+        let third = session.frame();
+        assert!(lock(&session.turns).is_empty());
+        wait(&|| {
+            session
+                .scene()
+                .frame()
+                .is_some_and(|f| f.input_sequence >= third)
+        });
+        assert_eq!((after.y_rot, after.x_rot), (ahead.y_rot, ahead.x_rot));
+        assert_eq!(after.frame.player.y_rot, ahead.y_rot);
+        assert!(after.frame.input_at.is_some());
+        assert!(after.frame.published >= after.frame.input_at.unwrap());
+        // Looking straight up stops there.
+        session.turn(0.0, -550.0);
+        session.turn(0.0, -100.0);
+        assert_eq!(session.camera().unwrap().x_rot, -90.0);
+
+        // Closing reaches the game thread; dropping the session ends it.
+        let mut remote = remote;
+        session.disconnect();
+        wait(&|| true);
+        let stats = session.handoff_stats();
+        assert_eq!((stats.frames, stats.stalls), (3, 0));
+        drop(session);
+        let mut closed = false;
+        for _ in 0..2000 {
+            closed |= remote.sent().contains(&Sent::Close);
+            if closed {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(closed);
+    }
 }

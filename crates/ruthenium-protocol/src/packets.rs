@@ -1042,6 +1042,94 @@ pub mod play {
         Ok(e)
     }
 
+    /// Bytes of one section's light: a nibble per block, x fastest, then z, then y
+    /// (`DataLayer`).
+    pub const LIGHT_BYTES: usize = 2048;
+
+    /// The most bytes a light mask may have: enough for the tallest level's light
+    /// sections (4064 blocks: 256 of them) several times over.
+    const MAX_MASK_BYTES: usize = 128;
+
+    /// The light of some of a chunk's sections (`ClientboundLightUpdatePacketData`).
+    /// Light sections start one below the level's lowest section and end one above its
+    /// highest; bit `i` of a mask is light section `i`. A section in a mask has an array
+    /// in the matching list, in order; a section in an empty mask is all dark; a section
+    /// in neither is left as it was.
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub struct LightData {
+        pub sky_mask: Vec<u64>,
+        pub block_mask: Vec<u64>,
+        pub empty_sky_mask: Vec<u64>,
+        pub empty_block_mask: Vec<u64>,
+        pub sky: Vec<std::sync::Arc<[u8; LIGHT_BYTES]>>,
+        pub block: Vec<std::sync::Arc<[u8; LIGHT_BYTES]>>,
+    }
+
+    impl LightData {
+        fn read(r: &mut Reader<'_>) -> Result<LightData, WireError> {
+            // Each mask is a `BitSet` as its bytes (`BitSet.toByteArray`): bit `i` is
+            // bit `i % 8` of byte `i / 8`.
+            let mut masks: [Vec<u64>; 4] = Default::default();
+            for mask in &mut masks {
+                for (i, b) in r.byte_array(MAX_MASK_BYTES)?.iter().enumerate() {
+                    if i % 8 == 0 {
+                        mask.push(0);
+                    }
+                    mask[i / 8] |= u64::from(*b) << (i % 8 * 8);
+                }
+            }
+            let arrays = |r: &mut Reader<'_>| -> Result<_, WireError> {
+                let n = r.count(4096)?;
+                let mut out = Vec::with_capacity(n.min(64));
+                for _ in 0..n {
+                    let bytes: [u8; LIGHT_BYTES] = r
+                        .byte_array(LIGHT_BYTES)?
+                        .try_into()
+                        .map_err(|_| WireError::Invalid("light section size"))?;
+                    out.push(std::sync::Arc::new(bytes));
+                }
+                Ok(out)
+            };
+            let sky = arrays(r)?;
+            let block = arrays(r)?;
+            let [sky_mask, block_mask, empty_sky_mask, empty_block_mask] = masks;
+            Ok(LightData {
+                sky_mask,
+                block_mask,
+                empty_sky_mask,
+                empty_block_mask,
+                sky,
+                block,
+            })
+        }
+
+        /// Whether bit `i` of a mask is set (`BitSet.get`).
+        pub fn bit(mask: &[u64], i: usize) -> bool {
+            mask.get(i / 64).is_some_and(|w| w >> (i % 64) & 1 == 1)
+        }
+    }
+
+    /// A block entity a chunk packet lists (`BlockEntityInfo`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ChunkBlockEntity {
+        /// The position in the chunk: x in the high nibble, z in the low.
+        pub xz: u8,
+        pub y: i16,
+        /// The block entity type's registry id.
+        pub kind: i32,
+        /// What the type sends clients (`getUpdateTag`), if anything.
+        pub tag: Option<crate::nbt::Tag>,
+    }
+
+    /// A world clock as the server sends it (`ClockNetworkState`).
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    pub struct ClockState {
+        pub total_ticks: i64,
+        pub partial_tick: f32,
+        /// Clock ticks per game tick; 0 while the clock is stopped.
+        pub rate: f32,
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub enum Clientbound {
         Common(Common),
@@ -1061,12 +1149,31 @@ pub mod play {
         ChunkBatchFinished {
             batch_size: i32,
         },
-        /// A chunk: its position and its sections' data (`ClientboundLevelChunkPacketData`'s
-        /// buffer); heightmaps, block entities and light are skipped.
+        /// A chunk (`ClientboundLevelChunkWithLightPacket`): its position, the heightmaps
+        /// the server sends clients (each a type id and its packed heights), its
+        /// sections' data (`ClientboundLevelChunkPacketData`'s buffer), the block
+        /// entities in it and its light.
         LevelChunk {
             x: i32,
             z: i32,
+            heightmaps: Vec<(i32, Vec<i64>)>,
             data: Vec<u8>,
+            block_entities: Vec<ChunkBlockEntity>,
+            light: LightData,
+        },
+        /// `ClientboundLightUpdatePacket`: new light for some of a chunk's sections.
+        LightUpdate {
+            x: i32,
+            z: i32,
+            light: LightData,
+        },
+        /// `ClientboundBlockEntityDataPacket`: a block entity's data as its type sends
+        /// it to clients (a sign's text, a banner's patterns, a skull's profile).
+        BlockEntityData {
+            pos: [i32; 3],
+            /// The block entity type's registry id.
+            kind: i32,
+            tag: Option<crate::nbt::Tag>,
         },
         BlockUpdate {
             pos: [i32; 3],
@@ -1263,10 +1370,11 @@ pub mod play {
             entity_id: i32,
             slots: Vec<(u8, ItemStack)>,
         },
-        /// `ClientboundSetTimePacket`: the level's game time (the clocks' updates that
-        /// follow aren't read).
+        /// `ClientboundSetTimePacket`: the level's game time and the world clocks that
+        /// changed, each by its id in the `world_clock` registry.
         SetTime {
             game_time: i64,
+            clocks: Vec<(i32, ClockState)>,
         },
         /// `ClientboundInitializeBorderPacket`: the whole world border.
         InitializeBorder {
@@ -1372,15 +1480,47 @@ pub mod play {
                     let (x, z) = (r.i32()?, r.i32()?);
                     // Heightmaps: (type, long array) pairs.
                     let n = r.count(16)?;
+                    let mut heightmaps = Vec::with_capacity(n);
                     for _ in 0..n {
-                        r.varint()?;
+                        let kind = r.varint()?;
                         let longs = r.count(4096)?;
-                        r.bytes(longs * 8)?;
+                        let mut heights = Vec::with_capacity(longs);
+                        for _ in 0..longs {
+                            heights.push(r.i64()?);
+                        }
+                        heightmaps.push((kind, heights));
                     }
                     let data = r.byte_array(2 << 20)?.to_vec();
-                    r.rest();
-                    Clientbound::LevelChunk { x, z, data }
+                    let n = r.count(1 << 16)?;
+                    let mut block_entities = Vec::with_capacity(n.min(1024));
+                    for _ in 0..n {
+                        block_entities.push(ChunkBlockEntity {
+                            xz: r.u8()?,
+                            y: r.u16()? as i16,
+                            kind: r.varint()?,
+                            tag: r.nbt()?,
+                        });
+                    }
+                    let light = LightData::read(&mut r)?;
+                    Clientbound::LevelChunk {
+                        x,
+                        z,
+                        heightmaps,
+                        data,
+                        block_entities,
+                        light,
+                    }
                 }
+                C::LightUpdate => Clientbound::LightUpdate {
+                    x: r.varint()?,
+                    z: r.varint()?,
+                    light: LightData::read(&mut r)?,
+                },
+                C::BlockEntityData => Clientbound::BlockEntityData {
+                    pos: unpack_block_pos(r.i64()?),
+                    kind: r.varint()?,
+                    tag: r.nbt()?,
+                },
                 C::ChunksBiomes => {
                     let n = r.count(1 << 16)?;
                     let mut chunks = Vec::with_capacity(n.min(1024));
@@ -1721,8 +1861,19 @@ pub mod play {
                 }
                 C::SetTime => {
                     let game_time = r.i64()?;
-                    r.rest();
-                    Clientbound::SetTime { game_time }
+                    let n = r.count(1024)?;
+                    let mut clocks = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        clocks.push((
+                            r.varint()?,
+                            ClockState {
+                                total_ticks: r.varlong()?,
+                                partial_tick: r.f32()?,
+                                rate: r.f32()?,
+                            },
+                        ));
+                    }
+                    Clientbound::SetTime { game_time, clocks }
                 }
                 C::InitializeBorder => Clientbound::InitializeBorder {
                     center: [r.f64()?, r.f64()?],
@@ -2110,6 +2261,166 @@ mod tests {
         assert_eq!(
             configuration::Clientbound::decode(15, &b).unwrap(),
             configuration::Clientbound::SelectKnownPacks(vec![KnownPack::vanilla("core", "26.3")])
+        );
+    }
+
+    #[test]
+    fn chunks_keep_heightmaps_block_entities_and_light() {
+        let mut sign = crate::nbt::Compound::new();
+        sign.put("is_waxed", crate::nbt::Tag::Byte(1));
+        let sign = crate::nbt::Tag::Compound(sign);
+        let mut b = Vec::new();
+        wire::write_i32(&mut b, 3);
+        wire::write_i32(&mut b, -7);
+        // One heightmap (motion blocking) of two longs.
+        wire::write_varint(&mut b, 1);
+        wire::write_varint(&mut b, 4);
+        wire::write_varint(&mut b, 2);
+        wire::write_i64(&mut b, 0x0102);
+        wire::write_i64(&mut b, -1);
+        wire::write_byte_array(&mut b, &[9, 8, 7]);
+        // Two block entities: one with data, one without (the end tag).
+        wire::write_varint(&mut b, 2);
+        b.extend([0xA5]);
+        wire::write_u16(&mut b, (-12_i16) as u16);
+        wire::write_varint(&mut b, 7);
+        crate::nbt::write_network(&mut b, &sign).unwrap();
+        b.extend([0x10]);
+        wire::write_u16(&mut b, 70);
+        wire::write_varint(&mut b, 1);
+        b.push(0);
+        // Light: sky sections 1 and 3, block section 2, sky section 0 empty.
+        // (Each mask as the bytes of a `BitSet`; an empty one has none.)
+        let mut light = Vec::new();
+        for mask in [&[0b1010_u8][..], &[0b100], &[0b1], &[]] {
+            wire::write_byte_array(&mut light, mask);
+        }
+        wire::write_varint(&mut light, 2);
+        wire::write_byte_array(&mut light, &[0x11; play::LIGHT_BYTES]);
+        wire::write_byte_array(&mut light, &[0x22; play::LIGHT_BYTES]);
+        wire::write_varint(&mut light, 1);
+        wire::write_byte_array(&mut light, &[0x33; play::LIGHT_BYTES]);
+        b.extend(&light);
+        let play::Clientbound::LevelChunk {
+            x,
+            z,
+            heightmaps,
+            data,
+            block_entities,
+            light: l,
+        } = play::Clientbound::decode(46, &b).unwrap()
+        else {
+            panic!("not a chunk");
+        };
+        assert_eq!((x, z), (3, -7));
+        assert_eq!(heightmaps, vec![(4, vec![0x0102, -1])]);
+        assert_eq!(data, [9, 8, 7]);
+        assert_eq!(
+            block_entities,
+            vec![
+                play::ChunkBlockEntity {
+                    xz: 0xA5,
+                    y: -12,
+                    kind: 7,
+                    tag: Some(sign.clone()),
+                },
+                play::ChunkBlockEntity {
+                    xz: 0x10,
+                    y: 70,
+                    kind: 1,
+                    tag: None,
+                },
+            ]
+        );
+        assert!(play::LightData::bit(&l.sky_mask, 1) && play::LightData::bit(&l.sky_mask, 3));
+        assert!(!play::LightData::bit(&l.sky_mask, 2) && !play::LightData::bit(&l.sky_mask, 64));
+        assert!(play::LightData::bit(&l.empty_sky_mask, 0));
+        assert!(l.empty_block_mask.is_empty());
+        // A mask longer than a byte, as a tall level's: bit 9 is in the second byte,
+        // bit 70 in the ninth.
+        let mut tall = Vec::new();
+        wire::write_varint(&mut tall, 0);
+        wire::write_varint(&mut tall, 0);
+        wire::write_byte_array(&mut tall, &[0, 0b10, 0, 0, 0, 0, 0, 0, 0b0100_0000]);
+        for _ in 0..3 {
+            wire::write_byte_array(&mut tall, &[]);
+        }
+        wire::write_varint(&mut tall, 2);
+        wire::write_byte_array(&mut tall, &[0; play::LIGHT_BYTES]);
+        wire::write_byte_array(&mut tall, &[0; play::LIGHT_BYTES]);
+        wire::write_varint(&mut tall, 0);
+        let play::Clientbound::LightUpdate { light: t, .. } =
+            play::Clientbound::decode(49, &tall).unwrap()
+        else {
+            panic!("not a light update");
+        };
+        assert!(play::LightData::bit(&t.sky_mask, 9) && play::LightData::bit(&t.sky_mask, 70));
+        assert_eq!(t.sky_mask.iter().map(|w| w.count_ones()).sum::<u32>(), 2);
+        assert_eq!((l.sky.len(), l.block.len()), (2, 1));
+        assert_eq!((l.sky[1][0], l.block[0][2047]), (0x22, 0x33));
+
+        // The same light as an update of its own.
+        let mut u = Vec::new();
+        wire::write_varint(&mut u, 3);
+        wire::write_varint(&mut u, -7);
+        u.extend(&light);
+        assert_eq!(
+            play::Clientbound::decode(49, &u).unwrap(),
+            play::Clientbound::LightUpdate {
+                x: 3,
+                z: -7,
+                light: l,
+            }
+        );
+        // A light array of the wrong size is refused.
+        let mut bad = Vec::new();
+        wire::write_varint(&mut bad, 0);
+        wire::write_varint(&mut bad, 0);
+        for _ in 0..4 {
+            wire::write_varint(&mut bad, 0);
+        }
+        wire::write_varint(&mut bad, 1);
+        wire::write_byte_array(&mut bad, &[0; 100]);
+        wire::write_varint(&mut bad, 0);
+        assert!(play::Clientbound::decode(49, &bad).is_err());
+
+        // A block entity's data, and the time with one clock.
+        let mut e = Vec::new();
+        let (px, py, pz) = (-3_i64, 64_i64, 100_i64);
+        wire::write_i64(
+            &mut e,
+            (px & 0x3FF_FFFF) << 38 | (pz & 0x3FF_FFFF) << 12 | (py & 0xFFF),
+        );
+        wire::write_varint(&mut e, 7);
+        crate::nbt::write_network(&mut e, &sign).unwrap();
+        assert_eq!(
+            play::Clientbound::decode(6, &e).unwrap(),
+            play::Clientbound::BlockEntityData {
+                pos: [-3, 64, 100],
+                kind: 7,
+                tag: Some(sign),
+            }
+        );
+        let mut t = Vec::new();
+        wire::write_i64(&mut t, 123_456);
+        wire::write_varint(&mut t, 1);
+        wire::write_varint(&mut t, 0);
+        wire::write_varint(&mut t, 255); // the clock's ticks, a varlong
+        wire::write_f32(&mut t, 0.25);
+        wire::write_f32(&mut t, 1.0);
+        assert_eq!(
+            play::Clientbound::decode(115, &t).unwrap(),
+            play::Clientbound::SetTime {
+                game_time: 123_456,
+                clocks: vec![(
+                    0,
+                    play::ClockState {
+                        total_ticks: 255,
+                        partial_tick: 0.25,
+                        rate: 1.0,
+                    }
+                )],
+            }
         );
     }
 

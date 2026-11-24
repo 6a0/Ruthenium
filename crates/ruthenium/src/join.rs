@@ -106,6 +106,7 @@ impl GameData {
                     block_transformers: Arc::new(block_transformers(&jar)),
                     enchantments: Arc::new(enchantments(&jar)),
                     biomes: biomes(&jar),
+                    registries: Arc::new(local_registries(&jar)),
                 })
             }
             Err(e) => {
@@ -119,6 +120,46 @@ impl GameData {
             physics,
         }
     }
+}
+
+/// Vanilla's definitions of what a level looks like, as the jar's data pack has them:
+/// dimension types, timelines, world clocks, and each biome's attributes and effects
+/// (a biome's world generation is left out). A server that names these without sending
+/// them means these.
+fn local_registries(jar: &Zip) -> ruthenium_sim::environment::LocalRegistries {
+    use ruthenium_sim::environment::{BIOME, DIMENSION_TYPE, TIMELINE, WORLD_CLOCK};
+    let mut out = ruthenium_sim::environment::LocalRegistries::new();
+    for (registry, dir) in [
+        (DIMENSION_TYPE, "data/minecraft/dimension_type/"),
+        (TIMELINE, "data/minecraft/timeline/"),
+        (WORLD_CLOCK, "data/minecraft/world_clock/"),
+        (BIOME, "data/minecraft/worldgen/biome/"),
+    ] {
+        let entries = out.entry(registry.to_owned()).or_default();
+        for i in jar.with_prefix(dir) {
+            let Some(name) = jar
+                .name(i)
+                .strip_prefix(dir)
+                .and_then(|n| n.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let Some(mut v) = jar
+                .read(i)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            else {
+                continue;
+            };
+            if registry == BIOME
+                && let Some(o) = v.as_object_mut()
+            {
+                o.retain(|k, _| k == "attributes" || k == "effects");
+            }
+            entries.insert(format!("minecraft:{name}"), v);
+        }
+    }
+    out
 }
 
 /// Vanilla's dimension types from the jar's data pack: heights and fast lava, by name.

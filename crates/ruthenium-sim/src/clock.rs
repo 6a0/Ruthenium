@@ -33,6 +33,17 @@ impl TickClock {
         (ticks.max(0) as u32).min(MAX_TICKS_AT_ONCE)
     }
 
+    /// How far into the current tick the clock's last reading was, 0 to 1 (vanilla's
+    /// partial tick for that frame).
+    pub fn partial_tick(&self) -> f32 {
+        self.residual.clamp(0.0, 1.0)
+    }
+
+    /// The clock's last reading.
+    pub fn last_ms(&self) -> i64 {
+        self.last_ms
+    }
+
     /// The millisecond at which the next tick falls due.
     pub fn next_tick_ms(&self, ms_per_tick: f32) -> i64 {
         let need = ((1.0 - self.residual) * ms_per_tick).max(0.0);
