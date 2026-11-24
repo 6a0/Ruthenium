@@ -1,6 +1,8 @@
 //! Ruthenium: composition root.
 
 #![forbid(unsafe_code)]
+// The run summaries are large `json!` literals.
+#![recursion_limit = "256"]
 
 mod account;
 mod assets_cmd;
@@ -12,6 +14,7 @@ mod ingame;
 mod join;
 mod menu;
 mod prepare_cmd;
+mod route;
 mod servers;
 mod settings;
 mod telemetry;
@@ -95,6 +98,21 @@ With no command, opens the game window. Options:
   --join <address>       join this server at once (development)
   --mesh-workers <n>     threads that mesh the world (default: by the machine's size)
   --rejoin-after <s>     with --join: leave after this long and join again (development)
+  --terrain-draws <direct|paged|mdi>
+                         how the world's sections are drawn: one draw each, nearest
+                         first (default); one draw each, a buffer page at a time; or
+                         a page's draws in one call that reads them as commands
+                         (multi-draw indirect, where the GPU has it)
+  --route <file>         with --join: play a route file from cargo xtask bench
+                         dedicated once in the world, measure the frames of its
+                         capture (for --bench-out, with every frame interval and what
+                         the terrain did), and quit when it ends; the run fails unless
+                         every tick is the route's. The keyboard and the mouse do
+                         nothing in the world meanwhile. With --screenshot, the
+                         picture is of the frame after the route's end
+  --route-out <file>     write the route's record (positions, chunks, checksums)
+  --expect-positions <checksum> | --expect-footprint <checksum>
+                         fail unless the route's record ends with these checksums
 The options above that change a setting override it for the run; it is saved with
 them if a setting changes. In the window, F3 toggles the frame-stats overlay and F11
 fullscreen.

@@ -1,7 +1,15 @@
 //! `cargo xtask bench dedicated`: the world scenes on a vanilla dedicated server, for
-//! the vanilla client (frame times, as `bench run` measures them) and for Ruthenium
-//! (headless for now: it has no world renderer, so its side checks that it joins,
-//! follows the route and holds the same chunks).
+//! the vanilla client (frame times, as `bench run` measures them) and for Ruthenium:
+//! in its window (`--client ruthenium`: the same frame times, and what its terrain,
+//! uploads and main thread did), and without one (`--client headless`, which checks
+//! that it joins, follows the route and holds the same chunks).
+//!
+//! The windowed client runs once per variant: `--variant <label>=<options>` names a
+//! set of client options (`--variant mdi=--terrain-draws mdi`), and the variants of a
+//! repetition run one after the other, so that they meet the same machine. `--baseline
+//! <folder>` names recorded vanilla runs of the same routes: each variant's rows are
+//! printed next to them with the ratio, and a route that is not the baseline's fails
+//! the task.
 //!
 //! Every trial gets a folder of its own under `cache/bench/dedicated`: a fresh copy of
 //! the world template, a server started on it (see [`crate::server`]) and the route file
@@ -16,8 +24,9 @@
 //! Results go to `cache/bench/results/<run>` as `bench run` writes them
 //! (`<backend>-<scene>-<rep>.json` with the frame intervals and samples), each with the
 //! route, the client's record of it, the options, and the server's side: world copy,
-//! controller commands, tick times, process samples. Ruthenium's records are
-//! `headless-<scene>-<rep>.json`. At the end every record of a scene must be the same
+//! controller commands, tick times, process samples. The windowed client's are
+//! `<variant>-<scene>-<rep>.json`, with its own summary under `ruthenium`; the
+//! headless records are `headless-<scene>-<rep>.json`. At the end every record of a scene must be the same
 //! run: same positions tick for tick, same chunks at the start and the end.
 
 use std::path::{Path, PathBuf};
@@ -33,7 +42,7 @@ use crate::gpu::Gpu;
 use crate::routes::{self, Checked, Route};
 use crate::server::{self, Server};
 
-const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,ruthenium] [--backend vulkan,opengl] [--scene idle,spin,walk,fly] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--keep-worlds]";
+const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--keep-worlds]";
 /// The view and simulation distance of the server and the render distance of the
 /// clients, as in the integrated-server scenes.
 const VIEW_DISTANCE: i32 = 12;
@@ -47,10 +56,18 @@ const BACKENDS: &[&str] = &["opengl", "vulkan"];
 /// pixels.
 const DRAWABLE: (u32, u32) = (1920, 1080);
 
+/// The windowed client's options when no variant is given, under this label.
+const DEFAULT_VARIANT: &str = "ruthenium";
+
 #[derive(Debug)]
 struct Options {
     vanilla: bool,
     headless: bool,
+    /// Run Ruthenium in its window, once for each of these: a label and client options.
+    windowed: bool,
+    variants: Vec<(String, Vec<String>)>,
+    /// Recorded vanilla runs of the same routes to print the windowed runs next to.
+    baseline: Option<PathBuf>,
     backends: Vec<String>,
     scenes: Vec<String>,
     reps: u32,
@@ -82,6 +99,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
         vanilla: true,
         headless: true,
+        windowed: false,
+        variants: Vec::new(),
+        baseline: None,
         backends: vec!["vulkan".into()],
         scenes: routes::SCENES.iter().map(|s| s.to_string()).collect(),
         reps: 3,
@@ -122,13 +142,38 @@ fn parse(args: &[String]) -> Result<Options, String> {
                         let clients = list(value);
                         if let Some(c) = clients
                             .iter()
-                            .find(|c| !matches!(c.as_str(), "vanilla" | "ruthenium"))
+                            .find(|c| !matches!(c.as_str(), "vanilla" | "headless" | "ruthenium"))
                         {
-                            return Err(format!("unknown client {c:?} (vanilla, ruthenium)"));
+                            return Err(format!(
+                                "unknown client {c:?} (vanilla, headless, ruthenium)"
+                            ));
                         }
                         o.vanilla = clients.iter().any(|c| c == "vanilla");
-                        o.headless = clients.iter().any(|c| c == "ruthenium");
+                        o.headless = clients.iter().any(|c| c == "headless");
+                        o.windowed = clients.iter().any(|c| c == "ruthenium");
                     }
+                    "--variant" => {
+                        let (label, options) = value.split_once('=').unwrap_or((value, ""));
+                        // A label is a file name's first part and a column's name.
+                        let plain = !label.is_empty()
+                            && label
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+                        if !plain
+                            || label == "headless"
+                            || BACKENDS.contains(&label)
+                            || o.variants.iter().any(|v| v.0 == label)
+                        {
+                            return Err(format!(
+                                "--variant: {label:?} is not a new label of lowercase letters, digits and underscores"
+                            ));
+                        }
+                        o.variants.push((
+                            label.to_owned(),
+                            options.split_whitespace().map(str::to_owned).collect(),
+                        ));
+                    }
+                    "--baseline" => o.baseline = Some(PathBuf::from(value)),
                     "--backend" => o.backends = list(value),
                     "--scene" => o.scenes = list(value),
                     "--reps" => o.reps = (num(value)? as u32).max(1),
@@ -164,7 +209,12 @@ fn parse(args: &[String]) -> Result<Options, String> {
     if let Some(b) = o.backends.iter().find(|b| !BACKENDS.contains(&b.as_str())) {
         return Err(format!("unknown backend {b:?} (opengl, vulkan)"));
     }
-    let known = |s: &str| routes::SCENES.contains(&s);
+    if o.variants.is_empty() {
+        o.variants.push((DEFAULT_VARIANT.to_owned(), Vec::new()));
+    } else if !o.windowed {
+        return Err("--variant is for the windowed client: add ruthenium to --client".into());
+    }
+    let known = |s: &str| routes::SCENES.contains(&s) || s == routes::DIG;
     if let Some(s) = o
         .scenes
         .iter()
@@ -172,8 +222,15 @@ fn parse(args: &[String]) -> Result<Options, String> {
         .find(|s| !known(s))
     {
         return Err(format!(
-            "unknown scene {s:?} ({})",
-            routes::SCENES.join(", ")
+            "unknown scene {s:?} ({}, {})",
+            routes::SCENES.join(", "),
+            routes::DIG
+        ));
+    }
+    if o.vanilla && o.scenes.iter().any(|s| s == routes::DIG) {
+        return Err(format!(
+            "the vanilla bench client cannot play the {} scene: leave it or vanilla out",
+            routes::DIG
         ));
     }
     Ok(o)
@@ -488,6 +545,204 @@ impl Harness<'_> {
         Ok((checked, drawable))
     }
 
+    /// One measured run of Ruthenium in its window on a server of its own: the client
+    /// plays the route, measures the frames of its capture and fails by itself if the
+    /// run isn't the route's. Returns the checked record and the drawable's size.
+    fn windowed_run(
+        &self,
+        binary: &Path,
+        data_dir: &Path,
+        variant: &(String, Vec<String>),
+        scene: &str,
+        rep: u32,
+    ) -> Result<(Checked, (u64, u64)), String> {
+        let (name, options) = variant;
+        let label = format!("{name}-{scene}-{rep}");
+        let mut trial = self.start_trial(&label, scene)?;
+        let record = trial.dir.join("route-run.json");
+        let summary = trial.dir.join("bench.json");
+        let log_path = trial.dir.join("client.log");
+        let log =
+            std::fs::File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
+        let mut command = Command::new(binary);
+        command
+            .arg("--data-dir")
+            .arg(data_dir)
+            .arg("--join")
+            .arg(trial.server.address())
+            .arg("--window-size")
+            .arg(format!("{}x{}", self.o.width, self.o.height))
+            .args(["--no-vsync", "--no-validation"])
+            .arg("--route")
+            .arg(&trial.route_file)
+            .arg("--route-out")
+            .arg(&record)
+            .arg("--bench-out")
+            .arg(&summary)
+            .args(options);
+        if self.o.screenshot {
+            // The frame after the route's end, next to the run's file.
+            command
+                .arg("--screenshot")
+                .arg(self.results.join(format!("{label}.png")));
+        }
+        if let Some((_, positions, footprint)) = self.o.expect.iter().find(|e| e.0 == scene) {
+            command.args(["--expect-positions", positions]);
+            if let Some(f) = footprint {
+                command.args(["--expect-footprint", f]);
+            }
+        }
+        for (key, value) in self.o.gpu.env()? {
+            match value {
+                Some(v) => command.env(key, v),
+                None => command.env_remove(key),
+            };
+        }
+        let child = command
+            .env("RUTHENIUM_OFFLINE_NAME", PLAYER)
+            .current_dir(self.root)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log)
+            .spawn()
+            .map_err(|e| format!("running {}: {e}", binary.display()))?;
+        let mut client = Client(child);
+        let pid = client.0.id();
+        let limit = Duration::from_secs_f64(trial.route.total() as f64 / 20.0 + self.o.timeout);
+        let started = Instant::now();
+        let mut samples = Vec::new();
+        let encoding_before = video_encoding();
+        let status = loop {
+            if let Some(status) = client.0.try_wait().map_err(|e| e.to_string())? {
+                break status;
+            }
+            if started.elapsed() > limit {
+                return Err(format!("{label} timed out; see {}", log_path.display()));
+            }
+            trial.watch()?;
+            // The columns of `bench run`'s samples.
+            let g = self.o.gpu.sample(pid);
+            samples.push(json!([
+                bench::epoch_ms(),
+                bench::rss_kib(pid),
+                g.mem_mib,
+                bench::cpu_temp_c(),
+                bench::cpu_mhz(),
+                g.temp_c,
+                g.reasons,
+                g.clock_mhz
+            ]));
+            std::thread::sleep(Duration::from_millis(500));
+        };
+        let read = |path: &Path| -> Value {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or(Value::Null)
+        };
+        let run = read(&record);
+        let mut own = read(&summary);
+        let route = trial.route.clone();
+        let server = trial.finish(self)?;
+        let intervals = own["frame_intervals_ns"].take();
+        // The client's own copy of the record is the one archived as `routeRun`.
+        own["route_run"] = Value::Null;
+        let markers = &run["markers"];
+        let v = json!({
+            "format": "ruthenium-bench-windowed/1",
+            "client": "ruthenium",
+            "scene": scene,
+            "variant": { "label": name, "options": options },
+            "binary": binary.display().to_string(),
+            "exit": status.to_string(),
+            // Someone watching the desktop through a streaming host takes GPU time.
+            "videoEncoding": { "before": encoding_before, "after": video_encoding() },
+            "backendRequested": name,
+            "gpuRequested": self.o.gpu.name(),
+            "device": {
+                "backend": "Ruthenium, Vulkan",
+                "name": own["gpu"],
+                "driver": own["device"]["driver"],
+                "vendor": vendor_name(own["device"]["vendor_id"].as_u64()),
+            },
+            "framebufferWidth": own["swapchain"]["width"],
+            "framebufferHeight": own["swapchain"]["height"],
+            "renderDistance": VIEW_DISTANCE,
+            "frameIntervalsNs": intervals,
+            "jvmStartEpochMs": own["started_epoch_ms"],
+            "measureStartEpochMs": markers["captureStartEpochMs"],
+            "measureEndEpochMs": markers["captureEndEpochMs"],
+            "worldReadyEpochMs": markers["sceneReadyEpochMs"],
+            "samples": samples,
+            "routeRun": run,
+            "route": route.json(),
+            "server": server,
+            "ruthenium": own,
+        });
+        let out = self.results.join(format!("{label}.json"));
+        std::fs::write(&out, v.to_string()).map_err(|e| format!("{}: {e}", out.display()))?;
+        let output = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if output.contains("no block physics") {
+            return Err(format!(
+                "{label}: the data folder {} has no block physics, so the player can't move: run `cargo xtask exporters` and `ruthenium prepare --data-dir` on it",
+                data_dir.display()
+            ));
+        }
+        if !status.success() {
+            let last: Vec<&str> = output.lines().rev().take(6).collect();
+            return Err(format!(
+                "{label}: ruthenium failed ({status}); see {}:\n{}",
+                log_path.display(),
+                last.into_iter().rev().collect::<Vec<_>>().join("\n")
+            ));
+        }
+        let (vendor, device) = (
+            v["device"]["vendor"].as_str().unwrap_or(""),
+            v["device"]["name"].as_str().unwrap_or(""),
+        );
+        if !self.o.gpu.matches(vendor, device) {
+            return Err(format!(
+                "{label}: asked for the {} GPU, but the client used {device:?} ({vendor})",
+                self.o.gpu.name()
+            ));
+        }
+        self.check_spawn(&label, &v["server"])?;
+        let checked = routes::check(&route, &v["routeRun"]).map_err(|e| format!("{label}: {e}"))?;
+        left_out(&v).map_err(|e| format!("{label}: {e}"))?;
+        let s = bench::summarize(&v);
+        let phase = |name: &str, k: &str| {
+            v["ruthenium"]["phases"][name][k]
+                .as_f64()
+                .unwrap_or(f64::NAN)
+        };
+        let terrain = &v["ruthenium"]["world"]["at_capture_end"]["terrain"];
+        println!(
+            "bench: {name:<10} {scene:<4} #{rep}: {:.0} fps avg, 1% low {:.0}, 0.1% low {:.0}; main thread {:.3} ms a frame (P99 {:.3}), GPU {:.3} ms; {} quads in {} draws; pages {:.0} MiB; server tick {} ms avg; positions {}, footprint {}",
+            s["avgFps"].as_f64().unwrap_or(0.0),
+            s["low1Fps"].as_f64().unwrap_or(0.0),
+            s["low01Fps"].as_f64().unwrap_or(0.0),
+            phase("work", "p50"),
+            phase("work", "p99"),
+            v["ruthenium"]["gpu_time"]["p50"]
+                .as_f64()
+                .unwrap_or(f64::NAN),
+            terrain["quads"].as_u64().unwrap_or(0),
+            terrain["draws"].as_u64().unwrap_or(0),
+            terrain["pool"]["reserved_bytes"]
+                .as_f64()
+                .unwrap_or(f64::NAN)
+                / f64::from(1 << 20),
+            tick_health(&v).0,
+            checked.positions,
+            checked.footprint,
+        );
+        let drawable = (
+            v["framebufferWidth"].as_u64().unwrap_or(0),
+            v["framebufferHeight"].as_u64().unwrap_or(0),
+        );
+        Ok((checked, drawable))
+    }
+
     /// One headless run of Ruthenium on a server of its own: `ruthenium connect` with
     /// the route, which fails by itself if the run isn't the route's.
     fn headless_run(
@@ -591,8 +846,77 @@ impl Harness<'_> {
     }
 }
 
-/// The Ruthenium binary for the headless runs (built with the development join path
-/// unless given) and its data folder, prepared from the player's install.
+/// The NVIDIA GPU's video encoding sessions now and their average frame rate (none
+/// without `nvidia-smi`): a desktop streamed to someone shares the GPU with the run.
+fn video_encoding() -> Value {
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=encoder.stats.sessionCount,encoder.stats.averageFps",
+            "--format=csv,noheader,nounits",
+        ])
+        .stderr(Stdio::null())
+        .output();
+    let Ok(out) = out else {
+        return Value::Null;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut numbers = text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split(',')
+        .map(|n| n.trim().parse::<f64>().ok());
+    match (numbers.next().flatten(), numbers.next().flatten()) {
+        (Some(sessions), Some(fps)) => json!({ "sessions": sessions, "averageFps": fps }),
+        _ => Value::Null,
+    }
+}
+
+/// A PCI vendor id as the bench mod names GPU vendors, for [`Gpu::matches`].
+fn vendor_name(id: Option<u64>) -> &'static str {
+    match id {
+        Some(0x10de) => "NVIDIA",
+        Some(0x8086) => "Intel",
+        Some(0x1002) => "AMD",
+        Some(0x106b) => "Apple",
+        _ => "",
+    }
+}
+
+/// Fails if a windowed run left out part of the scene: a mesh that found no room in the
+/// terrain's memory, sections a frame's data had no room for, or frames held back
+/// because the window was hidden. Such a run drew less than it was measured for.
+fn left_out(v: &Value) -> Result<(), String> {
+    let world = &v["ruthenium"]["world"];
+    let (start, end) = (
+        &world["at_capture_start"]["terrain"],
+        &world["at_capture_end"]["terrain"],
+    );
+    if !end.is_object() {
+        return Err("the client recorded no terrain at the capture's end".into());
+    }
+    let during = |key: &str| {
+        end[key]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(start[key].as_u64().unwrap_or(0))
+    };
+    let (dropped, overflowed) = (
+        end["meshes_dropped"].as_u64().unwrap_or(0),
+        during("sections_overflowed"),
+    );
+    let throttled = v["ruthenium"]["throttled_frames"].as_u64().unwrap_or(0);
+    if dropped > 0 || overflowed > 0 || throttled > 0 {
+        return Err(format!(
+            "the run drew less than its scene: {dropped} meshes found no room in the terrain's memory, {overflowed} sections were left out of frames for want of frame data, {throttled} frames were held back behind a hidden window"
+        ));
+    }
+    Ok(())
+}
+
+/// The Ruthenium binary (built with the development join path unless given: optimised
+/// for the windowed runs, which are measured) and its data folder, prepared from the
+/// player's install.
 fn ruthenium(root: &Path, o: &Options) -> Result<(PathBuf, PathBuf), String> {
     let run = |command: &mut Command, what: &str| {
         let status = command.status().map_err(|e| format!("{what}: {e}"))?;
@@ -609,9 +933,16 @@ fn ruthenium(root: &Path, o: &Options) -> Result<(PathBuf, PathBuf), String> {
             build
                 .current_dir(root)
                 .args(["build", "-p", "ruthenium", "--features", "dev-offline"]);
+            if o.windowed {
+                build.arg("--release");
+            }
             run(&mut build, "cargo build")?;
-            root.join("target/debug")
-                .join(format!("ruthenium{}", std::env::consts::EXE_SUFFIX))
+            root.join(if o.windowed {
+                "target/release"
+            } else {
+                "target/debug"
+            })
+            .join(format!("ruthenium{}", std::env::consts::EXE_SUFFIX))
         }
     };
     let data_dir = match &o.data_dir {
@@ -680,7 +1011,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
     } else {
         (game::locate(o.java.as_deref())?, None)
     };
-    let headless = if o.headless {
+    let ours = if o.headless || o.windowed {
         Some(ruthenium(root, &o)?)
     } else {
         None
@@ -739,11 +1070,59 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
             }
         }
     }
-    if let Some((binary, data_dir)) = &headless {
+    let expected = (u64::from(DRAWABLE.0), u64::from(DRAWABLE.1));
+    if let Some((binary, data_dir)) = ours.as_ref().filter(|_| o.windowed) {
+        // A repetition's variants one after the other, scene by scene: what the
+        // machine does over the minutes is spread over all of them.
+        for rep in 1..=o.reps {
+            for scene in &o.scenes {
+                for variant in &o.variants {
+                    let (checked, drawable) =
+                        harness.windowed_run(binary, data_dir, variant, scene, rep)?;
+                    records.push((scene.clone(), format!("{} #{rep}", variant.0), checked));
+                    if drawable != expected && !o.any_drawable {
+                        wrong.push(format!(
+                            "{} {scene} #{rep} drew {} x {} pixels, not the {} x {} of the gates and the baseline: the desktop scales the window. Set the display scale to 1, or pass --width and --height that come to that many pixels (or --any-drawable to let it through)",
+                            variant.0, drawable.0, drawable.1, DRAWABLE.0, DRAWABLE.1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((binary, data_dir)) = ours.as_ref().filter(|_| o.headless) {
         for rep in 1..=o.headless_reps {
             for scene in &o.scenes {
                 let checked = harness.headless_run(binary, data_dir, scene, rep)?;
                 records.push((scene.clone(), format!("headless #{rep}"), checked));
+            }
+        }
+    }
+    // The baseline's runs of the same scenes must be the same routes, tick for tick.
+    if let Some(dir) = &o.baseline {
+        for scene in &o.scenes {
+            let route = harness.route(scene)?;
+            let Some(first) = records.iter().find(|r| &r.0 == scene) else {
+                continue;
+            };
+            let rows = bench::load_rows(dir)?;
+            let Some(row) = rows.iter().find(|r| &r.1 == scene) else {
+                wrong.push(format!(
+                    "{scene}: the baseline {} has no run of it",
+                    dir.display()
+                ));
+                continue;
+            };
+            let same = routes::check(&route, &row.4["routeRun"])
+                .and_then(|theirs| routes::compare(&first.2, &theirs));
+            if let Err(e) = same {
+                wrong.push(format!(
+                    "{scene}: {} is not the run the baseline {} measured ({} {scene} #{}): {e}",
+                    first.1,
+                    dir.display(),
+                    row.0,
+                    row.2
+                ));
             }
         }
     }
@@ -791,7 +1170,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         }
     }
     println!("bench: results in {}", results.display());
-    bench::report(root, Some(results), o.compare.clone())?;
+    bench::report(root, Some(results), o.compare.clone(), o.baseline.clone())?;
     if wrong.is_empty() {
         Ok(())
     } else {
@@ -872,6 +1251,7 @@ pub(crate) fn report(
     dir: &Path,
     rows: &[Row],
     compare: Option<PathBuf>,
+    baseline: Option<PathBuf>,
 ) -> Result<(), String> {
     let scene_order = |s: &str| routes::SCENES.iter().position(|x| *x == s).unwrap_or(9);
     let mut rows: Vec<&Row> = rows.iter().collect();
@@ -1056,17 +1436,22 @@ pub(crate) fn report(
     }
 
     println!(
-        "\n| Run | Avg FPS | 1% low | 0.1% low | Max ms | RSS mean MiB | VRAM mean MiB | Scene ready s | Server tick ms (avg / worst P99) | Server CPU % of a core |"
+        "\n| Run | Avg FPS | 1% low | 0.1% low | Max ms | RSS mean MiB | VRAM mean MiB | Scene ready s | Server tick ms (avg / worst P99) | Server CPU % of a core | Video encoding sessions (before / after) |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
     for (backend, scene, rep, s, v) in rows.iter().copied() {
         let (average, worst, cpu) = tick_health(v);
         let ready = v["routeRun"]["markers"]["sceneReadyEpochMs"]
             .as_f64()
             .unwrap_or(f64::NAN)
             - v["jvmStartEpochMs"].as_f64().unwrap_or(f64::NAN);
+        let encoding = |when: &str| {
+            v["videoEncoding"][when]["sessions"]
+                .as_f64()
+                .map_or_else(|| "–".to_owned(), |n| format!("{n:.0}"))
+        };
         println!(
-            "| {backend} {scene} #{rep} | {:.0} | {:.0} | {:.0} | {:.1} | {:.0} | {:.0} | {:.1} | {average} / {worst} | {cpu} |",
+            "| {backend} {scene} #{rep} | {:.0} | {:.0} | {:.0} | {:.1} | {:.0} | {:.0} | {:.1} | {average} / {worst} | {cpu} | {} / {} |",
             f(s, "avgFps"),
             f(s, "low1Fps"),
             f(s, "low01Fps"),
@@ -1074,15 +1459,251 @@ pub(crate) fn report(
             f(s, "rssMeanMiB"),
             f(s, "vramMeanMiB"),
             ready / 1000.0,
+            encoding("before"),
+            encoding("after"),
         );
     }
     for (scene, rep, v) in &headless {
         let (average, worst, cpu) = tick_health(v);
         println!(
-            "| headless {scene} #{rep} | – | – | – | – | – | – | – | {average} / {worst} | {cpu} |"
+            "| headless {scene} #{rep} | – | – | – | – | – | – | – | {average} / {worst} | {cpu} | – |"
         );
     }
+    windowed_report(&rows, baseline.as_deref())?;
     println!("\n(results: {})", dir.display());
+    Ok(())
+}
+
+/// A number deep in a run's file, or NaN.
+fn at(v: &Value, path: &[&str]) -> f64 {
+    path.iter()
+        .fold(v, |v, key| &v[*key])
+        .as_f64()
+        .unwrap_or(f64::NAN)
+}
+
+/// Ruthenium's windowed runs: each variant and scene's median next to the baseline's
+/// vanilla runs of the same route, where the main thread's and the GPU's time went,
+/// what was drawn and what it took, and how long changes took to show.
+fn windowed_report(rows: &[&Row], baseline: Option<&Path>) -> Result<(), String> {
+    let ours: Vec<&Row> = rows
+        .iter()
+        .copied()
+        .filter(|r| r.4["client"] == "ruthenium")
+        .collect();
+    if ours.is_empty() {
+        return Ok(());
+    }
+    let theirs = match baseline {
+        Some(dir) => bench::load_rows(dir)?
+            .into_iter()
+            .filter(|r| r.4["client"] != "ruthenium")
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut groups: Vec<(&str, &str)> = ours.iter().map(|r| (r.0.as_str(), r.1.as_str())).collect();
+    groups.dedup();
+    let median = |group: &[&Row], value: &dyn Fn(&Row) -> f64| {
+        bench::median(group.iter().map(|r| value(r)).collect())
+    };
+    let summary = |key: &'static str| move |r: &Row| r.3[key].as_f64().unwrap_or(f64::NAN);
+    let own = |path: &'static [&'static str]| move |r: &Row| at(&r.4["ruthenium"], path);
+    let mib = |bytes: f64| bytes / f64::from(1 << 20);
+
+    match baseline {
+        Some(dir) => println!(
+            "\nRuthenium in its window, next to the vanilla runs of the same routes in {} (each ratio is Ruthenium's median over vanilla's). Ruthenium draws less than vanilla does here: see what its scene leaves out before reading a ratio as a result.",
+            dir.display()
+        ),
+        None => println!("\nRuthenium in its window (no baseline was given to print next to it)."),
+    }
+    println!(
+        "\n| Variant | Scene | Avg FPS | × vanilla | 1% low | × vanilla | 0.1% low | × vanilla | Median ms | Max ms | Runs |"
+    );
+    println!("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (variant, scene) in &groups {
+        let group: Vec<&Row> = ours
+            .iter()
+            .copied()
+            .filter(|r| r.0 == *variant && r.1 == *scene)
+            .collect();
+        let vanilla: Vec<&Row> = theirs.iter().filter(|r| r.1 == *scene).collect();
+        let ratio = |key: &'static str| {
+            if vanilla.is_empty() {
+                "–".to_owned()
+            } else {
+                format!(
+                    "{:.2}",
+                    median(&group, &summary(key)) / median(&vanilla, &summary(key))
+                )
+            }
+        };
+        println!(
+            "| {variant} | {scene} | {:.0} | {} | {:.0} | {} | {:.0} | {} | {:.3} | {:.1} | {} |",
+            median(&group, &summary("avgFps")),
+            ratio("avgFps"),
+            median(&group, &summary("low1Fps")),
+            ratio("low1Fps"),
+            median(&group, &summary("low01Fps")),
+            ratio("low01Fps"),
+            median(&group, &summary("medianMs")),
+            median(&group, &summary("maxMs")),
+            group.len()
+        );
+    }
+
+    println!(
+        "\nWhere a frame's time goes, medians over a variant's runs of each run's median (or the percentile named; the stage's maximum is the worst frame of any run), in milliseconds. Work is the main thread's own (events, the game's frame, the GUI, recording and submitting); the terrain's two parts are inside recording."
+    );
+    println!(
+        "\n| Variant | Scene | Work | Work P99 | Events | Game | GUI | Record | Terrain stage | Stage P99 | Stage P99.9 | Stage max | Terrain draw | Submit | Governor | Acquire | Present | GPU | GPU P99 |"
+    );
+    println!(
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+    );
+    for (variant, scene) in &groups {
+        let group: Vec<&Row> = ours
+            .iter()
+            .copied()
+            .filter(|r| r.0 == *variant && r.1 == *scene)
+            .collect();
+        let m = |path: &'static [&'static str]| median(&group, &own(path));
+        println!(
+            "| {variant} | {scene} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.2} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |",
+            m(&["phases", "work", "p50"]),
+            m(&["phases", "work", "p99"]),
+            m(&["phases", "events", "p50"]),
+            m(&["phases", "game", "p50"]),
+            m(&["phases", "gui", "p50"]),
+            m(&["phases", "record", "p50"]),
+            m(&["phases", "world_stage", "p50"]),
+            m(&["phases", "world_stage", "p99"]),
+            m(&["phases", "world_stage", "p999"]),
+            // The worst frame of any run.
+            group
+                .iter()
+                .map(|r| at(&r.4["ruthenium"], &["phases", "world_stage", "max"]))
+                .fold(f64::NAN, f64::max),
+            m(&["phases", "world_draw", "p50"]),
+            m(&["phases", "submit", "p50"]),
+            m(&["phases", "governor", "p50"]),
+            m(&["phases", "acquire", "p50"]),
+            m(&["phases", "present", "p50"]),
+            m(&["gpu_time", "p50"]),
+            m(&["gpu_time", "p99"]),
+        );
+    }
+
+    println!(
+        "\nWhat was drawn at the capture's end and what the terrain holds (medians over runs). Translucent quads are those Ruthenium leaves out for now; the pages are its vertex buffers."
+    );
+    println!(
+        "\n| Variant | Scene | Drawn as | Sections drawn / with a mesh / loaded | Quads | Draws / calls / binds | Translucent quads left out | Pages MiB (payload, free, largest free) | Allocations failed (with room) | RSS MiB | VRAM MiB |"
+    );
+    println!("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (variant, scene) in &groups {
+        let group: Vec<&Row> = ours
+            .iter()
+            .copied()
+            .filter(|r| r.0 == *variant && r.1 == *scene)
+            .collect();
+        let end = |key: &'static str| {
+            median(&group, &|r: &Row| {
+                at(
+                    &r.4["ruthenium"]["world"]["at_capture_end"]["terrain"],
+                    &[key],
+                )
+            })
+        };
+        let pool = |key: &'static str| {
+            median(&group, &|r: &Row| {
+                at(
+                    &r.4["ruthenium"]["world"]["at_capture_end"]["terrain"]["pool"],
+                    &[key],
+                )
+            })
+        };
+        println!(
+            "| {variant} | {scene} | {} | {:.0} / {:.0} / {:.0} | {:.0} | {:.0} / {:.0} / {:.0} | {:.0} | {:.0} ({:.0}, {:.1}, {:.2}) | {:.0} ({:.0}) | {:.0} | {:.0} |",
+            group[0].4["ruthenium"]["world"]["draws"]
+                .as_str()
+                .unwrap_or("?"),
+            end("visible"),
+            end("meshed"),
+            end("sections"),
+            end("quads"),
+            end("draws"),
+            end("calls"),
+            end("binds"),
+            end("translucent_quads_left_out"),
+            mib(pool("reserved_bytes")),
+            mib(pool("payload_bytes")),
+            mib(pool("free_bytes")),
+            mib(pool("largest_free")),
+            pool("failures"),
+            pool("failures_with_space"),
+            median(&group, &summary("rssMeanMiB")),
+            median(&group, &summary("vramMeanMiB")),
+        );
+    }
+
+    println!(
+        "\nMeshing and uploads over the capture, and from a change to the frame that shows it (the worst run of a variant: P99 in milliseconds and in frames). A first mesh counts from when the chunks around its section were there."
+    );
+    println!(
+        "\n| Variant | Scene | Meshes installed | MiB uploaded | Stale results | Slices refused | Budget refusals | First mesh ms / frames | Server's change ms / frames | Own change ms / frames (n) | Input queue most | Oldest input ms | Main thread waits |"
+    );
+    println!("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (variant, scene) in &groups {
+        let group: Vec<&Row> = ours
+            .iter()
+            .copied()
+            .filter(|r| r.0 == *variant && r.1 == *scene)
+            .collect();
+        let worst = |value: &dyn Fn(&Row) -> f64| {
+            group
+                .iter()
+                .map(|r| value(r))
+                .filter(|x| !x.is_nan())
+                .fold(f64::NAN, f64::max)
+        };
+        let during = |part: &'static str, key: &'static str| {
+            median(&group, &|r: &Row| {
+                let w = &r.4["ruthenium"]["world"];
+                at(&w["at_capture_end"][part], &[key]) - at(&w["at_capture_start"][part], &[key])
+            })
+        };
+        let latency = |kind: &'static str| {
+            let of = |key: &'static str| {
+                worst(&|r: &Row| at(&r.4["ruthenium"]["world"]["latency"][kind], &[key]))
+            };
+            if of("samples").is_nan() || of("samples") == 0.0 {
+                "–".to_owned()
+            } else {
+                format!("{:.1} / {:.0}", of("p99_ms"), of("p99_frames"))
+            }
+        };
+        let session =
+            |key: &'static str| worst(&|r: &Row| at(&r.4["ruthenium"]["world"]["session"], &[key]));
+        println!(
+            "| {variant} | {scene} | {:.0} | {:.1} | {:.0} | {:.0} | {:.0} | {} | {} | {} ({:.0}) | {:.0} | {:.1} | {:.0} |",
+            during("terrain", "installed"),
+            mib(during("uploads", "gpu_copy_bytes")),
+            during("terrain", "stale_results"),
+            during("uploads", "reservations_refused"),
+            during("uploads", "budget_refusals"),
+            latency("first_mesh"),
+            latency("server_change"),
+            latency("own_change"),
+            worst(&|r: &Row| at(
+                &r.4["ruthenium"]["world"]["latency"]["own_change"],
+                &["samples"]
+            )),
+            session("input_queue_high_water"),
+            session("oldest_input_ms"),
+            session("main_thread_waits"),
+        );
+    }
     Ok(())
 }
 
@@ -1093,7 +1714,7 @@ mod tests {
     #[test]
     fn options_default_to_the_baseline() {
         let o = parse(&["--accept-eula".into()]).unwrap();
-        assert!(o.accept_eula && o.vanilla && o.headless);
+        assert!(o.accept_eula && o.vanilla && o.headless && !o.windowed);
         assert_eq!(
             (o.reps, o.headless_reps, o.warmup, o.duration),
             (3, 1, 10.0, 60.0)
@@ -1118,7 +1739,8 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         let o = parse(&args).unwrap();
-        assert!(!o.vanilla && o.headless);
+        assert!(!o.vanilla && !o.headless && o.windowed);
+        assert_eq!(o.variants, [("ruthenium".to_owned(), Vec::<String>::new())]);
         assert_eq!(
             o.expect[0],
             ("fly".into(), "00ff".into(), Some("11aa".into()))
@@ -1126,6 +1748,48 @@ mod tests {
         assert_eq!(o.expect[1], ("idle".into(), "22bb".into(), None));
         assert!(parse(&["--scene".into(), "menu".into()]).is_err());
         assert!(parse(&["--client".into(), "bedrock".into()]).is_err());
+
+        let words = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = parse(&words(&[
+            "--client",
+            "ruthenium,headless",
+            "--variant",
+            "direct",
+            "--variant",
+            "mdi=--terrain-draws mdi --frames-ahead 1",
+            "--scene",
+            "fly,dig",
+        ]))
+        .unwrap();
+        assert!(o.windowed && o.headless && !o.vanilla);
+        assert_eq!(o.variants[0], ("direct".to_owned(), Vec::<String>::new()));
+        assert_eq!(
+            o.variants[1],
+            (
+                "mdi".to_owned(),
+                words(&["--terrain-draws", "mdi", "--frames-ahead", "1"])
+            )
+        );
+        // A label is one plain word that names nothing else; variants need the window;
+        // vanilla cannot dig.
+        for bad in ["a-b", "vulkan", "headless", "", "Mdi"] {
+            let args = words(&["--client", "ruthenium", "--variant", bad]);
+            assert!(parse(&args).is_err(), "{bad:?}");
+        }
+        assert!(
+            parse(&words(&[
+                "--client",
+                "ruthenium",
+                "--variant",
+                "a",
+                "--variant",
+                "a"
+            ]))
+            .is_err()
+        );
+        assert!(parse(&words(&["--client", "headless", "--variant", "a"])).is_err());
+        assert!(parse(&words(&["--scene", "dig"])).is_err());
+        assert!(parse(&words(&["--client", "headless", "--scene", "dig"])).is_ok());
     }
 
     #[test]

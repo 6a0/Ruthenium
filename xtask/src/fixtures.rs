@@ -5,7 +5,8 @@
 //! - the colour fixture and the upload check, which also writes the adapter report;
 //! - the terrain check: a made-up scene drawn with the real terrain pipelines (vertex
 //!   layout, quad indices, pooled ranges, frame records, depth) and read back pixel by
-//!   pixel;
+//!   pixel, with direct draws and again with draws read as commands from the frame's
+//!   data;
 //! - the streaming check (a texture larger than the upload ring in tiles, worker-written
 //!   blocks, pooled ranges) on the copy queue the GPU has and, if that is a transfer
 //!   queue, once more with every upload on the graphics queue;
@@ -147,6 +148,18 @@ fn run_inner(root: &Path, args: &[String]) -> Result<bool, String> {
     check(
         "terrain pipeline",
         launch(&binary, &o, "terrain", &o.seconds, &["--exercise-terrain"]),
+    );
+    // The same scene drawn as commands read from the frame's data (a GPU without
+    // multi-draw indirect says so and draws it directly again).
+    check(
+        "terrain pipeline, indirect draws",
+        launch(
+            &binary,
+            &o,
+            "terrain-mdi",
+            &o.seconds,
+            &["--exercise-terrain", "--terrain-draws", "mdi"],
+        ),
     );
     let streamed = check(
         "streaming, the GPU's copy queue",

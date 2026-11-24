@@ -178,6 +178,7 @@ cargo xtask bench run            # 3 × {opengl, vulkan} × {menu, idle, spin, f
 cargo xtask bench run --gpu intel   # the same on the iGPU of a hybrid laptop (auto, nvidia, intel)
 cargo xtask bench report         # Markdown tables for the latest results folder
 cargo xtask bench dedicated --accept-eula   # vulkan × {idle, spin, walk, fly} × 3 on a dedicated server, then Ruthenium's headless check of each route; about 25 minutes
+cargo xtask bench dedicated --accept-eula --client ruthenium --baseline <folder>   # Ruthenium in its window on the same routes: see world-baseline.md
 cargo xtask bench report <folder> --compare <folder>   # a dedicated-server folder next to an integrated-server one
 ```
 

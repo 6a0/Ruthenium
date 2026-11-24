@@ -43,12 +43,12 @@ pub use device::{
     MIN_TEXTURE_SLOTS, OptionalFeatures, PortabilitySubset, PretendSrgb, Rejected,
     SwapchainMaintenance, TextureTableLimits, TextureTablePath, VertexAttribute, VertexLayoutCheck,
 };
-pub use encoder::{Encoder, Pass};
+pub use encoder::{Encoder, MAX_INDIRECT_DRAWS, Pass};
 pub use frame::{
     ACQUIRE_TIMEOUT, Acquired, FrameCounters, FrameCtx, FrameLoop, FrameTimings, GpuTime, GpuZone,
     MAX_FRAME_WAITS, MAX_FRAMES_IN_FLIGHT, MAX_GPU_ZONES, Presented, SwapchainInfo, Target,
 };
-pub use frame_data::{FRAME_DATA_SET, FrameData};
+pub use frame_data::{DRAW_COMMAND_BYTES, FRAME_DATA_SET, FrameData};
 pub use instance::{Instance, InstanceDesc, Validation, validation_messages};
 pub use memory::{HeapReport, MemoryReport, texel_bytes};
 pub use pipeline::{

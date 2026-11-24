@@ -255,10 +255,15 @@ impl Terrain {
     }
 
     fn dep(&self, section: SectionKey) -> Dep {
-        let Some(c) = self.columns.get(&(section[0], section[2])) else {
+        self.dep_in(self.columns.get(&(section[0], section[2])), section[1])
+    }
+
+    /// The state of the section at `y` of a chunk (none: no chunk is loaded there).
+    fn dep_in(&self, column: Option<&Arc<Column>>, y: i32) -> Dep {
+        let Some(c) = column else {
             return Dep::default();
         };
-        let i = section[1] - self.dims.min_section;
+        let i = y - self.dims.min_section;
         let planes = usize::try_from(i).ok().and_then(|i| c.sections().get(i));
         Dep {
             generation: c.generation(),
@@ -338,6 +343,40 @@ pub struct Dep {
     pub blocks: u64,
     pub light: u64,
     pub biomes: u64,
+}
+
+/// The states of all sections of the 3 × 3 chunks around one chunk, as published at
+/// one moment ([`Scene::around`]): for judging the stamps of that chunk's sections
+/// without a look-up for each of the 27 sections each of them depends on.
+#[derive(Debug, Clone, Default)]
+pub struct Around {
+    epoch: u64,
+    at: (i32, i32),
+    /// The y of the first layer.
+    lowest: i32,
+    /// Bottom up, each layer's nine chunks at `(dx + 1) + 3 * (dz + 1)`.
+    layers: Vec<[Dep; 9]>,
+}
+
+impl Around {
+    /// [`Scene::is_current_where_loaded`] for a stamp of a section of this chunk, as
+    /// of the moment the states were read.
+    pub fn is_current_where_loaded(&self, stamp: &Stamp) -> bool {
+        if stamp.epoch != self.epoch || (stamp.section[0], stamp.section[2]) != self.at {
+            return false;
+        }
+        stamp.deps.iter().enumerate().all(|(i, was)| {
+            let layer = stamp.section[1] + i as i32 / 9 - 1 - self.lowest;
+            // A section's stamp reaches one layer past the level's both ends at most.
+            usize::try_from(layer)
+                .ok()
+                .and_then(|l| self.layers.get(l))
+                .is_some_and(|l| {
+                    let now = l[i % 9];
+                    now == *was || (now.generation == 0 && was.generation != 0)
+                })
+        })
+    }
 }
 
 /// Everything a result made from a [`Neighbourhood`] depends on: the level, the
@@ -775,6 +814,41 @@ impl Scene {
         t.epoch == stamp.epoch && t.stamp_of(stamp.section) == *stamp
     }
 
+    /// Whether everything `stamp` was made from that is still there is what is
+    /// published: as [`Self::is_current`], but for chunks around the section that have
+    /// left since. What was read of a chunk that is gone cannot be wrong until the chunk
+    /// is back, and then it is another load of it, which shows. The game does not build
+    /// a section again either when a chunk next to it leaves.
+    pub fn is_current_where_loaded(&self, stamp: &Stamp) -> bool {
+        let t = self.terrain();
+        t.epoch == stamp.epoch
+            && t.stamp_of(stamp.section)
+                .deps
+                .iter()
+                .zip(&stamp.deps)
+                .all(|(now, was)| now == was || (now.generation == 0 && was.generation != 0))
+    }
+
+    /// Reads the state of every section of the 3 × 3 chunks around chunk `x`, `z` into
+    /// `out`, under one lock: what [`Around::is_current_where_loaded`] compares the
+    /// stamps of that chunk's sections with.
+    pub fn around(&self, x: i32, z: i32, out: &mut Around) {
+        let t = self.terrain();
+        out.epoch = t.epoch;
+        out.at = (x, z);
+        // One layer below the lowest section and one above the highest: what the
+        // lowest and the highest sections' stamps reach.
+        let lowest = t.dims.min_section - 1;
+        out.lowest = lowest;
+        let columns: [Option<&Arc<Column>>; 9] =
+            std::array::from_fn(|c| t.column(x + c as i32 % 3 - 1, z + c as i32 / 3 - 1));
+        out.layers.clear();
+        out.layers.extend(
+            (0..t.dims.sections + 2)
+                .map(|layer| std::array::from_fn(|c| t.dep_in(columns[c], lowest + layer))),
+        );
+    }
+
     /// Moves every waiting dirty key into `out` (appended, in no order) and says
     /// whether a rescan is due first. The keys are of the level `epoch`; a reader still
     /// holding another level's data drops that data.
@@ -1094,6 +1168,58 @@ mod tests {
         publisher.publish_level(&mut level);
         assert!(!scene.is_current(bottom.stamp()));
         assert_eq!(scene.pin([0, -1, 0]).unwrap().block_light(3, -1, 3), 9);
+    }
+
+    #[test]
+    fn a_chunks_sections_are_judged_together_as_one_by_one() {
+        let mut level = Level::new(-16, 64);
+        level.track_changes(4096);
+        let (mut publisher, scene) = Scene::new(4096);
+        publisher.begin_level(Dims::of(&level));
+        for z in -1..=1 {
+            for x in -1..=1 {
+                level.add_empty_chunk(x, z);
+            }
+        }
+        publisher.publish_level(&mut level);
+        let stamps: Vec<Stamp> = (-1..3)
+            .map(|y| scene.pin([0, y, 0]).unwrap().stamp().clone())
+            .collect();
+        let mut around = Around::default();
+        let mut judge = |scene: &Scene| -> Vec<(bool, bool)> {
+            scene.around(0, 0, &mut around);
+            stamps
+                .iter()
+                .map(|s| {
+                    (
+                        around.is_current_where_loaded(s),
+                        scene.is_current_where_loaded(s),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(judge(&scene), [(true, true); 4]);
+        // A chunk next door leaves: nothing that is there has changed.
+        level.forget_chunk(1, -1);
+        publisher.publish_level(&mut level);
+        assert_eq!(judge(&scene), [(true, true); 4]);
+        assert!(!scene.is_current(&stamps[0]));
+        // A block in the lowest section of a neighbour: the sections that reach it.
+        level.set_block(-3, -10, 5, 1);
+        publisher.publish_level(&mut level);
+        // (The light it changes reaches one section further up than the block.)
+        assert_eq!(
+            judge(&scene),
+            [(false, false), (false, false), (false, false), (true, true)]
+        );
+        // The chunk comes back, as another load: everything that read it is stale.
+        level.add_empty_chunk(1, -1);
+        publisher.publish_level(&mut level);
+        assert_eq!(judge(&scene), [(false, false); 4]);
+        // A stamp of another chunk's section is not this chunk's to judge.
+        let other = scene.pin([1, 0, 0]).unwrap().stamp().clone();
+        scene.around(0, 0, &mut around);
+        assert!(!around.is_current_where_loaded(&other));
     }
 
     #[test]

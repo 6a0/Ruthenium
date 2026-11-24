@@ -27,13 +27,16 @@
 use std::sync::Arc;
 
 use ruthenium_gpu::{
-    Arrival, BufferPool, DepthTarget, Encoder, Error, FrameData, Gpu, Pipelines, PoolConfig,
-    RangeHandle, Readback, TextureDesc, TextureId, TextureTable, UploadRing, UploadTicket, vk,
+    Arrival, BufferPool, DRAW_COMMAND_BYTES, DepthTarget, Encoder, Error, FrameData, Gpu,
+    Pipelines, PoolConfig, RangeHandle, Readback, TextureDesc, TextureId, TextureTable, UploadRing,
+    UploadTicket, vk,
 };
 use ruthenium_shaders::interface::{SECTION, WORLD, WORLD_MATRIX};
 
 use crate::pipelines::PipelineId;
-use crate::terrain::world::{SECTION_BYTES, quad_indices, terrain_push, write_section};
+use crate::terrain::world::{
+    SECTION_BYTES, draw_command, quad_indices, terrain_push, write_section,
+};
 use crate::terrain_vertex::{VERTEX_BYTES, Vertex, position_code, uv_code};
 
 /// Pixels per block, and the scene's size in blocks.
@@ -553,6 +556,7 @@ impl TerrainCheck {
         uploads: &UploadRing,
         frame_data: &mut FrameData,
         pipelines: &Pipelines,
+        indirect: bool,
     ) -> Result<(), Error> {
         if let Some((drawn, pixels)) = self.target.take(completed) {
             let ok = compare(&self.scene.probes, drawn, pixels, self.report.mismatches);
@@ -635,6 +639,46 @@ impl TerrainCheck {
         }
         let push = terrain_push(world, matrix_at, sections);
         let first = (vertices.offset / VERTEX_BYTES as u64) as u32;
+        // The scene's draws: pipeline, instance, quads and first quad.
+        let mut draws = Vec::with_capacity(self.scene.quads.len());
+        let mut quad = 0;
+        for (i, &quads) in self.scene.quads.iter().enumerate() {
+            let (pipeline, instance) = match i {
+                3 => (PipelineId::TerrainCutout, 0),
+                section => (PipelineId::TerrainSolid, section as u32),
+            };
+            if quads > 0 {
+                draws.push((pipeline, instance, quads, quad));
+            }
+            quad += quads;
+        }
+        // Drawn indirectly, each pipeline's draws are commands in the frame's data,
+        // after a gap that changes like the records'.
+        let mut calls = Vec::new();
+        if indirect {
+            for pipeline in [PipelineId::TerrainSolid, PipelineId::TerrainCutout] {
+                let commands: Vec<u8> = draws
+                    .iter()
+                    .filter(|d| d.0 == pipeline)
+                    .flat_map(|&(_, instance, quads, quad)| {
+                        draw_command(quads * 6, (first + quad * 4) as i32, instance)
+                    })
+                    .collect();
+                if commands.is_empty() {
+                    continue;
+                }
+                let count = commands.len() as u32 / DRAW_COMMAND_BYTES;
+                if !gap(frame_data, 5) {
+                    return Ok(());
+                }
+                let Some((offset, bytes)) = frame_data.alloc_draw_commands(count) else {
+                    return Ok(());
+                };
+                bytes.copy_from_slice(&commands);
+                calls.push((pipeline, offset, count));
+            }
+        }
+        let commands = frame_data.buffer();
         let mut pass = encoder.readback_pass_with_depth(pipelines, &mut self.target, &self.depth);
         // SAFETY: the push constants are terrain.vert's and the records they point at
         // were written just above; the textures are the check's own and have arrived,
@@ -643,23 +687,36 @@ impl TerrainCheck {
         unsafe {
             pass.bind_index_buffer(indices.buffer, indices.offset);
             pass.bind_vertex_buffer(vertices.buffer, 0);
-            let mut quad = 0;
-            for (i, &quads) in self.scene.quads.iter().enumerate() {
-                let (pipeline, instance) = match i {
-                    3 => (PipelineId::TerrainCutout, 0),
-                    section => (PipelineId::TerrainSolid, section as u32),
-                };
-                if quads > 0 {
+            // The push constants go with the first draw and stay.
+            let mut first_draw = true;
+            let mut constants = || -> &[u8] {
+                if std::mem::take(&mut first_draw) {
+                    &push
+                } else {
+                    &[]
+                }
+            };
+            if indirect {
+                for &(pipeline, offset, count) in &calls {
+                    pass.draw_indexed_indirect(
+                        pipeline.index(),
+                        constants(),
+                        commands,
+                        offset,
+                        count,
+                    );
+                }
+            } else {
+                for &(pipeline, instance, quads, quad) in &draws {
                     pass.draw_indexed(
                         pipeline.index(),
-                        if quad == 0 { &push } else { &[] },
+                        constants(),
                         quads * 6,
                         0,
                         (first + quad * 4) as i32,
                         instance,
                     );
                 }
-                quad += quads;
             }
         }
         pass.finish();

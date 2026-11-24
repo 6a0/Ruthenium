@@ -7,6 +7,8 @@
 //!
 //! Rules it keeps:
 //! - A section's chunk left: its mesh goes at once (no geometry outlives its chunk).
+//! - A chunk next to a section's own left: its mesh stays as it is, as in vanilla. It is
+//!   made again when that chunk is back, which is another load of it.
 //! - A new level (another epoch) empties everything.
 //! - The dirty queue overflowed, or a level began: every section is compared with the
 //!   level again, by its stamp.
@@ -19,37 +21,37 @@
 //! - The player's own changes go first, then what is nearest the camera.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
-use ruthenium_sim::scene::{Neighbourhood, Scene, SectionKey, Stamp, WHOLE_COLUMN, dirty};
+use ruthenium_sim::scene::{Around, Neighbourhood, Scene, SectionKey, Stamp, WHOLE_COLUMN, dirty};
 
 /// New dirty sections after which the order of work is worked out again.
 const RESORT_AFTER: usize = 256;
 
-/// A section the tracker knows.
-#[derive(Debug)]
-struct Entry<M> {
-    /// The mesh drawn (`None`: nothing to draw, or no mesh yet) and what it was made
-    /// from (`None`: never meshed).
-    mesh: Option<M>,
-    stamp: Option<Stamp>,
+/// A section the tracker knows. Kept small: every pass over the sections reads these.
+#[derive(Debug, Default)]
+struct Entry {
+    /// Where the mesh drawn is among the meshes (`None`: nothing to draw, or no mesh
+    /// yet) and what it was made from (`None`: never meshed).
+    mesh: Option<u32>,
+    stamp: Option<Box<Stamp>>,
     /// Why it has to be meshed (again); 0: it doesn't.
     dirty: u8,
     /// A job for it is under way.
     meshing: bool,
     /// It waits in the urgent queue.
     urgent: bool,
+    /// Since when it has been dirty, and since when the change its job is for was
+    /// known.
+    since: Option<Since>,
+    in_flight: Option<Since>,
 }
 
-impl<M> Default for Entry<M> {
-    fn default() -> Entry<M> {
-        Entry {
-            mesh: None,
-            stamp: None,
-            dirty: 0,
-            meshing: false,
-            urgent: false,
-        }
-    }
+/// A moment on the render thread: the time and the number of the frame being recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Since {
+    pub at: Instant,
+    pub frame: u64,
 }
 
 /// Counters since the tracker was made.
@@ -67,7 +69,20 @@ pub struct TrackerStats {
     pub waits_for_neighbours: u64,
     /// Levels entered.
     pub epochs: u64,
+    /// Jobs by why their section was dirty, a job counted once for each reason: a
+    /// first mesh, blocks, light, biomes, block entities, something next to it.
+    pub causes: [u64; 6],
 }
+
+/// The names of [`TrackerStats::causes`], in order.
+pub const CAUSES: [&str; 6] = [
+    "first",
+    "blocks",
+    "light",
+    "biomes",
+    "block_entities",
+    "neighbour",
+];
 
 /// A section to mesh.
 #[derive(Debug)]
@@ -75,24 +90,39 @@ pub(crate) struct Job {
     pub neighbourhood: Neighbourhood,
     /// The player's own change: its upload is urgent too.
     pub urgent: bool,
+    /// The section has never had a mesh.
+    pub first: bool,
+    /// When the tracker learned of the change the job is for ([`Tracker::set_clock`]).
+    pub since: Since,
 }
 
 /// See the module docs.
 #[derive(Debug)]
 pub(crate) struct Tracker<M> {
     epoch: u64,
-    sections: HashMap<SectionKey, Entry<M>>,
+    sections: HashMap<SectionKey, Entry>,
+    /// Every mesh to draw with its section, in no order: what a frame goes through.
+    meshes: Vec<(SectionKey, M)>,
     /// Sections whose `dirty` is set.
     dirty_count: usize,
     urgent: VecDeque<SectionKey>,
     /// Dirty sections, the nearest to the camera last.
     queue: Vec<SectionKey>,
+    /// Sections that became dirty (or free for a job again) since the queue was last
+    /// put in order.
+    fresh: Vec<SectionKey>,
+    /// The sections of a chunk, by y: from the level's lowest section, so many.
+    range: (i32, i32),
+    /// Scratch of [`Self::sync`].
+    around: Around,
     /// The camera's section when the queue was last sorted, and how many sections
     /// became dirty since.
     sorted_for: Option<SectionKey>,
     unsorted: usize,
     keys: Vec<(SectionKey, u8)>,
     stats: TrackerStats,
+    /// The moment changes taken in now are known from.
+    now: Since,
 }
 
 fn distance(a: SectionKey, b: SectionKey) -> i64 {
@@ -106,14 +136,28 @@ impl<M> Tracker<M> {
         Tracker {
             epoch: 0,
             sections: HashMap::new(),
+            meshes: Vec::new(),
             dirty_count: 0,
             urgent: VecDeque::new(),
             queue: Vec::new(),
+            fresh: Vec::new(),
+            range: (0, 0),
+            around: Around::default(),
             sorted_for: None,
             unsorted: 0,
             keys: Vec::new(),
             stats: TrackerStats::default(),
+            now: Since {
+                at: Instant::now(),
+                frame: 0,
+            },
         }
+    }
+
+    /// Says what moment it is: the changes [`Self::sync`] takes in from here on are
+    /// known since then, which is what a job's [`Job::since`] says.
+    pub fn set_clock(&mut self, now: Since) {
+        self.now = now;
     }
 
     pub fn stats(&self) -> TrackerStats {
@@ -123,18 +167,24 @@ impl<M> Tracker<M> {
     /// Sections of loaded chunks, sections with a mesh to draw, and sections waiting
     /// for a mesh.
     pub fn counts(&self) -> (usize, usize, usize) {
-        (
-            self.sections.len(),
-            self.sections.values().filter(|e| e.mesh.is_some()).count(),
-            self.dirty_count,
-        )
+        (self.sections.len(), self.meshes.len(), self.dirty_count)
     }
 
     /// Every mesh to draw.
     pub fn meshes(&self) -> impl Iterator<Item = (SectionKey, &M)> + '_ {
-        self.sections
-            .iter()
-            .filter_map(|(k, e)| e.mesh.as_ref().map(|m| (*k, m)))
+        self.meshes.iter().map(|(k, m)| (*k, m))
+    }
+
+    /// Takes the mesh at `index` out; the mesh that takes its place is told where it
+    /// is now.
+    fn take_mesh(&mut self, index: u32) -> M {
+        let (_, mesh) = self.meshes.swap_remove(index as usize);
+        if let Some((moved, _)) = self.meshes.get(index as usize)
+            && let Some(e) = self.sections.get_mut(moved)
+        {
+            e.mesh = Some(index);
+        }
+        mesh
     }
 
     fn mark(&mut self, key: SectionKey, flags: u8) {
@@ -142,6 +192,10 @@ impl<M> Tracker<M> {
         if e.dirty == 0 {
             self.dirty_count += 1;
             self.unsorted += 1;
+            self.fresh.push(key);
+        }
+        if e.since.is_none() {
+            e.since = Some(self.now);
         }
         e.dirty |= flags.max(1);
         if flags & dirty::URGENT != 0 && !e.urgent {
@@ -152,37 +206,50 @@ impl<M> Tracker<M> {
 
     /// Forgets everything; the meshes go to `removed`.
     pub fn clear(&mut self, removed: &mut Vec<M>) {
-        removed.extend(self.sections.drain().filter_map(|(_, e)| e.mesh));
+        self.sections.clear();
+        removed.extend(self.meshes.drain(..).map(|(_, m)| m));
         self.dirty_count = 0;
         self.urgent.clear();
         self.queue.clear();
+        self.fresh.clear();
         self.sorted_for = None;
         self.unsorted = 0;
     }
 
+    /// Forgets a chunk's sections: by their keys, not by going through every section
+    /// there is, as chunks leave by the row.
     fn remove_column(&mut self, x: i32, z: i32, removed: &mut Vec<M>) {
-        let mut gone = 0;
-        self.sections.retain(|k, e| {
-            if k[0] != x || k[2] != z {
-                return true;
+        let (lowest, count) = self.range;
+        for y in lowest..lowest + count {
+            let Some(e) = self.sections.remove(&[x, y, z]) else {
+                continue;
+            };
+            self.dirty_count -= usize::from(e.dirty != 0);
+            if let Some(index) = e.mesh {
+                removed.push(self.take_mesh(index));
             }
-            gone += usize::from(e.dirty != 0);
-            removed.extend(e.mesh.take());
-            false
-        });
-        self.dirty_count -= gone;
+        }
     }
 
-    /// Marks a section that has a mesh dirty if the level no longer is what the mesh
-    /// was made from, and one without a mesh as wanting its first.
-    fn mark_if_stale(&mut self, scene: &Scene, key: SectionKey, flags: u8) {
-        let stale = match self.sections.get(&key).and_then(|e| e.stamp.as_ref()) {
-            Some(stamp) => !scene.is_current(stamp),
-            None => true,
-        };
-        if stale {
-            self.mark(key, flags);
+    /// Marks the sections of a chunk that have a mesh dirty if the level no longer is
+    /// what their mesh was made from (a chunk around them that has left since is no
+    /// reason to mesh them again), and those without a mesh as wanting their first. The
+    /// level around the chunk is read once for all of them.
+    fn mark_stale_in_column(&mut self, scene: &Scene, x: i32, z: i32, flags: u8) {
+        let mut around = std::mem::take(&mut self.around);
+        scene.around(x, z, &mut around);
+        let (lowest, count) = self.range;
+        for y in lowest..lowest + count {
+            let key = [x, y, z];
+            let stale = match self.sections.get(&key).and_then(|e| e.stamp.as_ref()) {
+                Some(stamp) => !around.is_current_where_loaded(stamp),
+                None => true,
+            };
+            if stale {
+                self.mark(key, flags);
+            }
         }
+        self.around = around;
     }
 
     /// Takes in what changed in the level since the last call. Meshes that must not
@@ -196,14 +263,14 @@ impl<M> Tracker<M> {
             self.epoch = drained.epoch;
             self.stats.epochs += 1;
         }
+        if drained.rescan.is_some() || !keys.is_empty() {
+            let dims = scene.with_terrain(|t| t.dims());
+            self.range = (dims.min_section, dims.sections);
+        }
         if drained.rescan.is_some() {
             self.stats.rescans += 1;
-            let (dims, columns) = scene.with_terrain(|t| {
-                (
-                    t.dims(),
-                    t.columns().map(|(k, _)| k).collect::<Vec<(i32, i32)>>(),
-                )
-            });
+            let columns =
+                scene.with_terrain(|t| t.columns().map(|(k, _)| k).collect::<Vec<(i32, i32)>>());
             // What is tracked of chunks that are gone.
             let loaded: std::collections::HashSet<(i32, i32)> = columns.iter().copied().collect();
             let gone: Vec<(i32, i32)> = self
@@ -216,13 +283,11 @@ impl<M> Tracker<M> {
                 self.remove_column(x, z, removed);
             }
             for (x, z) in columns {
-                for y in dims.min_section..dims.min_section + dims.sections {
-                    self.mark_if_stale(scene, [x, y, z], dirty::LOADED);
-                }
+                self.mark_stale_in_column(scene, x, z, dirty::LOADED);
             }
         }
         if !keys.is_empty() {
-            let dims = scene.with_terrain(|t| t.dims());
+            let (lowest, count) = self.range;
             let present = |x: i32, z: i32| scene.with_terrain(|t| t.column(x, z).is_some());
             for &(key, flags) in &keys {
                 let (x, z) = (key[0], key[2]);
@@ -231,16 +296,16 @@ impl<M> Tracker<M> {
                         self.remove_column(x, z, removed);
                         continue;
                     }
-                    for y in dims.min_section..dims.min_section + dims.sections {
-                        if flags & (dirty::LOADED | dirty::UNLOADED) != 0 {
-                            // Another load of the chunk: whatever was made of the one
-                            // before is of a chunk that is gone.
+                    if flags & (dirty::LOADED | dirty::UNLOADED) != 0 {
+                        // Another load of the chunk: whatever was made of the one
+                        // before is of a chunk that is gone.
+                        for y in lowest..lowest + count {
                             self.mark([x, y, z], flags & !dirty::UNLOADED);
-                        } else {
-                            self.mark_if_stale(scene, [x, y, z], flags);
                         }
+                    } else {
+                        self.mark_stale_in_column(scene, x, z, flags);
                     }
-                } else if (dims.min_section..dims.min_section + dims.sections).contains(&key[1])
+                } else if (lowest..lowest + count).contains(&key[1])
                     && (self.sections.contains_key(&key) || present(x, z))
                 {
                     self.mark(key, flags);
@@ -251,16 +316,16 @@ impl<M> Tracker<M> {
     }
 
     fn sort(&mut self, camera: SectionKey) {
-        self.queue.clear();
-        self.queue.extend(
-            self.sections
-                .iter()
-                .filter(|(_, e)| e.dirty != 0 && !e.meshing)
-                .map(|(k, _)| *k),
-        );
+        // What waited already and what has become dirty since, without those that are
+        // dirty no more or have a job out (they come back when it ends).
+        self.queue.append(&mut self.fresh);
+        let sections = &self.sections;
+        self.queue
+            .retain(|k| sections.get(k).is_some_and(|e| e.dirty != 0 && !e.meshing));
         // The nearest last, where they are taken from; ties in a fixed order.
         self.queue
             .sort_unstable_by_key(|k| (std::cmp::Reverse(distance(*k, camera)), *k));
+        self.queue.dedup();
         self.sorted_for = Some(camera);
         self.unsorted = 0;
     }
@@ -294,6 +359,7 @@ impl<M> Tracker<M> {
             let Some(neighbourhood) = scene.pin(key) else {
                 // Its chunk is gone; the key that says so is on its way.
                 e.dirty = 0;
+                e.since = None;
                 self.dirty_count -= 1;
                 continue;
             };
@@ -302,26 +368,47 @@ impl<M> Tracker<M> {
             if e.stamp.is_none() && !surrounded {
                 // It is marked again when a chunk next to its own arrives.
                 e.dirty = 0;
+                e.since = None;
                 self.dirty_count -= 1;
                 self.stats.waits_for_neighbours += 1;
                 continue;
             }
+            let first = e.stamp.is_none();
+            for (cause, flag) in [
+                dirty::BLOCKS,
+                dirty::LIGHT,
+                dirty::BIOMES,
+                dirty::BLOCK_ENTITIES,
+                dirty::NEIGHBOUR,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                // A first mesh is that, whatever else has happened to the section.
+                self.stats.causes[cause + 1] += u64::from(!first && e.dirty & flag != 0);
+            }
+            self.stats.causes[0] += u64::from(first);
             e.dirty = 0;
             self.dirty_count -= 1;
             e.meshing = true;
+            let since = e.since.take().unwrap_or(self.now);
+            e.in_flight = Some(since);
             self.stats.jobs += 1;
             self.stats.urgent_jobs += u64::from(urgent);
             return Some(Job {
                 neighbourhood,
                 urgent,
+                first,
+                since,
             });
         }
     }
 
-    /// Whether a job's result may still be shown: the level is what it was made from.
-    /// A stale result's section is free for its next job at once, and dirty.
+    /// Whether a job's result may still be shown: the level is what it was made from,
+    /// but for chunks around the section that have left meanwhile. A stale result's
+    /// section is free for its next job at once, and dirty.
     pub fn accept(&mut self, scene: &Scene, stamp: &Stamp) -> bool {
-        if stamp.epoch == self.epoch && scene.is_current(stamp) {
+        if stamp.epoch == self.epoch && scene.is_current_where_loaded(stamp) {
             return true;
         }
         self.stats.stale += 1;
@@ -334,9 +421,17 @@ impl<M> Tracker<M> {
     pub fn give_up(&mut self, key: SectionKey) {
         if let Some(e) = self.sections.get_mut(&key) {
             e.meshing = false;
+            // The change the job was for is still to be shown.
+            if let Some(since) = e.in_flight.take() {
+                e.since = Some(since);
+            }
+            let waiting = e.dirty != 0;
             self.mark(key, dirty::BLOCKS);
             // It was left out of the order of work while its job was out.
             self.unsorted += 1;
+            if waiting {
+                self.fresh.push(key);
+            }
         }
     }
 
@@ -347,14 +442,35 @@ impl<M> Tracker<M> {
         let Some(e) = self.sections.get_mut(&stamp.section) else {
             return mesh;
         };
+        let key = stamp.section;
         e.meshing = false;
-        e.stamp = Some(stamp);
+        e.in_flight = None;
+        // The stamp's place is kept from one mesh to the next.
+        match &mut e.stamp {
+            Some(kept) => **kept = stamp,
+            None => e.stamp = Some(Box::new(stamp)),
+        }
         if e.dirty != 0 {
             // It changed again meanwhile, and was left out of the order of work while
             // its job was out.
             self.unsorted += 1;
+            self.fresh.push(key);
         }
-        std::mem::replace(&mut e.mesh, mesh)
+        match (e.mesh, mesh) {
+            (Some(index), Some(mesh)) => {
+                Some(std::mem::replace(&mut self.meshes[index as usize].1, mesh))
+            }
+            (Some(index), None) => {
+                e.mesh = None;
+                Some(self.take_mesh(index))
+            }
+            (None, Some(mesh)) => {
+                e.mesh = Some(self.meshes.len() as u32);
+                self.meshes.push((key, mesh));
+                None
+            }
+            (None, None) => None,
+        }
     }
 }
 
@@ -506,6 +622,155 @@ mod tests {
         t.sync(&world.scene, &mut removed);
         assert_eq!(mesh_all(&mut t, &world).len(), 4);
         assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn a_chunk_leaving_next_door_is_no_reason_to_mesh_again_but_its_return_is() {
+        let mut world = World::new(&surrounded());
+        world.publish();
+        let mut t: Tracker<SectionKey> = Tracker::new();
+        let mut removed = Vec::new();
+        t.sync(&world.scene, &mut removed);
+        assert_eq!(mesh_all(&mut t, &world).len(), 4);
+        let jobs = t.stats().jobs;
+        // The chunk to the east leaves: the meshes made with it stay as they are.
+        world.level.forget_chunk(1, 0);
+        world.publish();
+        t.sync(&world.scene, &mut removed);
+        assert!(mesh_all(&mut t, &world).is_empty());
+        assert_eq!((t.stats().jobs, t.counts().1), (jobs, 4));
+        // A result that was on its way when the chunk left is still good.
+        world.set(3, 3, 3, 1);
+        world.publish();
+        t.sync(&world.scene, &mut removed);
+        let job = t.next_job(&world.scene, CAMERA).unwrap();
+        world.level.forget_chunk(-1, 0);
+        world.publish();
+        t.sync(&world.scene, &mut removed);
+        let stamp = job.neighbourhood.stamp().clone();
+        assert!(t.accept(&world.scene, &stamp));
+        t.install(stamp, Some([0, 0, 0]));
+        assert_eq!(t.stats().stale, 0);
+        mesh_all(&mut t, &world);
+        // The eastern chunk comes back, which is another load of it: what was made
+        // with the one before is made again.
+        let jobs = t.stats().jobs;
+        world.load(1, 0);
+        world.publish();
+        t.sync(&world.scene, &mut removed);
+        let again = mesh_all(&mut t, &world);
+        assert_eq!(again.len(), 4, "{again:?}");
+        assert_eq!(t.stats().jobs, jobs + 4);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn the_meshes_to_draw_stay_those_of_the_sections_that_have_one() {
+        let chunks: Vec<(i32, i32)> = (-2..=2)
+            .flat_map(|z| (-2..=2).map(move |x| (x, z)))
+            .collect();
+        let mut world = World::new(&chunks);
+        world.publish();
+        let mut t: Tracker<SectionKey> = Tracker::new();
+        let mut removed = Vec::new();
+        t.sync(&world.scene, &mut removed);
+        // The nine chunks in the middle have all their neighbours.
+        assert_eq!(mesh_all(&mut t, &world).len(), 9 * 4);
+        let drawn = |t: &Tracker<SectionKey>| {
+            let mut keys: Vec<SectionKey> = t
+                .meshes()
+                .map(|(key, mesh)| {
+                    assert_eq!(key, *mesh, "a mesh under another section's key");
+                    key
+                })
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        assert_eq!(drawn(&t).len(), 36);
+        // Chunks leave from the middle of the list, one by one; a section's mesh goes
+        // for nothing to draw; another comes back.
+        for (gone, left) in [((0, 0), 32), ((-1, 1), 28), ((1, -1), 24)] {
+            world.level.forget_chunk(gone.0, gone.1);
+            world.publish();
+            t.sync(&world.scene, &mut removed);
+            let keys = drawn(&t);
+            assert_eq!(keys.len(), left);
+            assert!(keys.iter().all(|k| (k[0], k[2]) != gone));
+            assert_eq!(t.counts().1, left);
+        }
+        assert_eq!(removed.len(), 12);
+        // (Whatever the leaving chunks changed in the light next to them.)
+        mesh_all(&mut t, &world);
+        assert_eq!(drawn(&t).len(), 24);
+        world.set(-13, 3, -13, 1);
+        world.publish();
+        t.sync(&world.scene, &mut removed);
+        // The changed section's job, among whatever else the change made dirty (light
+        // reaches further than the block).
+        let job = loop {
+            let job = t.next_job(&world.scene, CAMERA).unwrap();
+            if job.neighbourhood.section() == [-1, 0, -1] {
+                break job;
+            }
+            let stamp = job.neighbourhood.stamp().clone();
+            t.install(stamp, Some(job.neighbourhood.section()));
+        };
+        let stamp = job.neighbourhood.stamp().clone();
+        assert!(!job.first);
+        assert_eq!(t.install(stamp, None), Some([-1, 0, -1]));
+        let keys = drawn(&t);
+        assert_eq!(keys.len(), 23);
+        assert!(!keys.contains(&[-1, 0, -1]));
+        // Why the jobs were handed out: 36 first meshes, and a changed block.
+        let causes = t.stats().causes;
+        assert_eq!(causes[0], 36);
+        assert!(causes[1] >= 1);
+    }
+
+    #[test]
+    fn a_job_says_since_when_its_change_was_known() {
+        let mut world = World::new(&surrounded());
+        world.publish();
+        let mut t: Tracker<SectionKey> = Tracker::new();
+        let mut removed = Vec::new();
+        let at = Instant::now();
+        t.set_clock(Since { at, frame: 7 });
+        t.sync(&world.scene, &mut removed);
+        t.set_clock(Since { at, frame: 9 });
+        let job = t.next_job(&world.scene, CAMERA).unwrap();
+        assert!(job.first);
+        assert_eq!(job.since.frame, 7, "known since the frame it was taken in");
+        let stamp = job.neighbourhood.stamp().clone();
+        // The level changes under the job: its result is thrown away, and the next job
+        // for the section still counts from the first change.
+        world.set(3, job.neighbourhood.section()[1] * 16 + 3, 3, 1);
+        world.publish();
+        t.set_clock(Since { at, frame: 12 });
+        t.sync(&world.scene, &mut removed);
+        assert!(!t.accept(&world.scene, &stamp));
+        let key = stamp.section;
+        let again = loop {
+            let job = t.next_job(&world.scene, CAMERA).unwrap();
+            if job.neighbourhood.section() == key {
+                break job;
+            }
+        };
+        assert_eq!(again.since.frame, 7);
+        // Once shown, a later change counts from when it came.
+        let stamp = again.neighbourhood.stamp().clone();
+        t.install(stamp, Some(key));
+        world.set(3, key[1] * 16 + 4, 3, 1);
+        world.publish();
+        t.set_clock(Since { at, frame: 20 });
+        t.sync(&world.scene, &mut removed);
+        let later = loop {
+            let job = t.next_job(&world.scene, CAMERA).unwrap();
+            if job.neighbourhood.section() == key {
+                break job;
+            }
+        };
+        assert_eq!((later.since.frame, later.first), (20, false));
     }
 
     #[test]

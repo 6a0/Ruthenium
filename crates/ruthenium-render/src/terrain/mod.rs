@@ -15,5 +15,7 @@ pub use lightmap::LightmapInputs;
 pub(crate) use lightmap::colour_attribute;
 pub use mesher::{MeshOptions, Mesher, SectionMesh};
 pub use table::BlockTable;
-pub use tracker::TrackerStats;
-pub use world::{POOL_ENVELOPE, WorldAssets, WorldStats};
+pub use tracker::{CAUSES, TrackerStats};
+pub use world::{
+    LatencySummary, POOL_ENVELOPE, TerrainDraws, WorldAssets, WorldLatencies, WorldStats,
+};

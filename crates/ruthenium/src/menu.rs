@@ -44,6 +44,7 @@ use ruthenium_sim::session::{Session, SessionEvent};
 use crate::account::{AccountStatus, Accounts, Stage, failure_lines};
 use crate::ingame::InGame;
 use crate::join::Joiner;
+use crate::route::RoutePlayer;
 use crate::servers::{Servers, valid_address};
 use crate::settings::{FRAME_STATS, FULLSCREEN, Settings, SettingsFile};
 
@@ -348,6 +349,8 @@ pub struct Menu {
     forget_world: bool,
     /// Meshing threads to start with the world's assets.
     mesh_workers: usize,
+    /// The route played once the session is in the world (`--route`).
+    route: Option<RoutePlayer>,
 }
 
 impl std::fmt::Debug for Menu {
@@ -454,7 +457,36 @@ impl Menu {
             game: InGame::default(),
             forget_world: false,
             mesh_workers: default_mesh_workers(),
+            route: None,
         }
+    }
+
+    /// Has `route` played by the session that is joined next: from then on input in
+    /// the world is the route's, the mouse is not grabbed and nothing pauses the game.
+    pub fn set_route(&mut self, route: RoutePlayer) {
+        self.game.set_scripted();
+        self.route = Some(route);
+    }
+
+    pub fn route(&self) -> Option<&RoutePlayer> {
+        self.route.as_ref()
+    }
+
+    /// Threads that mesh the world's sections.
+    pub fn mesh_workers(&self) -> usize {
+        self.mesh_workers
+    }
+
+    /// How the handoff to the game thread and the queue of changed sections have fared,
+    /// while there is a session.
+    pub fn session_stats(
+        &self,
+    ) -> Option<(
+        ruthenium_sim::handoff::HandoffStats,
+        ruthenium_sim::scene::QueueStats,
+    )> {
+        let s = self.session.as_ref()?;
+        Some((s.handoff_stats(), s.scene().queue_stats()))
     }
 
     /// Sets how many threads mesh the world's sections.
@@ -617,21 +649,30 @@ impl Menu {
 
     /// The game's part of the frame, every frame the client runs (also while the window
     /// is hidden): the mouse's turn, then the session's frame (`runTick`: packets, the
-    /// frame's input, ticks, the turn).
-    pub fn game_frame(&mut self) {
-        if matches!(self.screen, Screen::Game) {
+    /// frame's input, ticks, the turn). A route takes its step first; `terrain` tells
+    /// it what is drawn when it has to know.
+    pub fn game_frame(&mut self, terrain: &dyn Fn() -> Option<crate::route::Terrain>) {
+        let in_world = matches!(self.screen, Screen::Game);
+        if in_world {
             self.game
                 .frame(&self.settings.settings.mouse, self.session.as_ref());
         }
         if let Some(s) = &self.session {
-            s.set_screen_open(!matches!(self.screen, Screen::Game));
+            if let Some(r) = &mut self.route {
+                if r.running() && !in_world {
+                    r.fail("a screen opened over the world while the route played".into());
+                }
+                r.step(s, s.view().as_ref(), terrain);
+            }
+            s.set_screen_open(!in_world);
             s.frame();
         }
     }
 
-    /// Whether the mouse should be grabbed: in the world, the window focused.
+    /// Whether the mouse should be grabbed: in the world, the window focused, and the
+    /// input not a route's.
     pub fn wants_mouse_grab(&self) -> bool {
-        matches!(self.screen, Screen::Game) && self.game.focused()
+        matches!(self.screen, Screen::Game) && self.game.focused() && self.route.is_none()
     }
 
     /// The window gained or lost focus.
@@ -697,6 +738,9 @@ impl Menu {
                     hardcore,
                     score,
                 } if !self.leaving => {
+                    if let Some(r) = &mut self.route {
+                        r.fail("the player died".into());
+                    }
                     let lang = self.joiner.as_mut().map(|j| j.data());
                     let empty = std::collections::HashMap::new();
                     let lang = lang.as_ref().map_or(&empty, |d| &d.lang);
@@ -756,11 +800,17 @@ impl Menu {
                     self.forget_world = true;
                     if self.leaving || crate::join::left_on_purpose(&c) {
                         self.leaving = false;
+                        if let Some(r) = &mut self.route {
+                            r.fail("the session was left".into());
+                        }
                     } else {
                         let lang = self.joiner.as_mut().map(|j| j.data());
                         let empty = std::collections::HashMap::new();
                         let (title, reason) =
                             crate::join::closed_text(&c, lang.as_ref().map_or(&empty, |d| &d.lang));
+                        if let Some(r) = &mut self.route {
+                            r.fail(format!("{title}: {reason}"));
+                        }
                         self.session_form(
                             FormKind::Disconnected,
                             &title,
@@ -1930,10 +1980,15 @@ impl Menu {
         let mut settings_ev = None;
         match &mut self.screen {
             Screen::Game => {
-                let view = self.session.as_ref().and_then(Session::view);
-                let world = self.session.as_ref().and_then(crate::ingame::scene_line);
-                let terrain = renderer
-                    .world_stats()
+                let drawn = renderer.world_ready();
+                let debug = self.settings.settings.frame_stats;
+                // Over a drawn world the readout only shows with the statistics: its
+                // text is not put together for nothing every frame.
+                let session = self.session.as_ref().filter(|_| !drawn || debug);
+                let view = session.and_then(Session::view);
+                let world = session.and_then(crate::ingame::scene_line);
+                let terrain = session
+                    .and_then(|_| renderer.world_stats())
                     .map(|s| crate::ingame::terrain_lines(&s));
                 crate::ingame::draw_hud(
                     crate::ingame::HudText {
@@ -1941,8 +1996,8 @@ impl Menu {
                         world: world.as_deref(),
                         terrain: terrain.as_deref(),
                         server: &self.server_name,
-                        drawn: renderer.world_ready(),
-                        debug: self.settings.settings.frame_stats,
+                        drawn,
+                        debug,
                     },
                     &scale,
                     &self.fonts,
@@ -2143,7 +2198,7 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             m.sync_accounts();
-            m.game_frame();
+            m.game_frame(&|| None);
             m.poll_session();
             if done(m) {
                 return;

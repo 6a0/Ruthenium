@@ -23,6 +23,11 @@
 use serde_json::{Value, json};
 
 pub const SCENES: &[&str] = &["idle", "spin", "walk", "fly"];
+/// A scene only Ruthenium plays: the vanilla bench client holds no attack key.
+pub const DIG: &str = "dig";
+/// The ticks the dig route holds the attack key at most: a block every six ticks in
+/// creative mode, so some forty blocks down from the spawn and not into the void.
+const DIG_TICKS: u64 = 240;
 /// Ticks without input after the capture, before the end is recorded.
 const TAIL_TICKS: u64 = 40;
 /// Ticks between marks.
@@ -59,6 +64,10 @@ impl Route {
     ///   degrees) a tick: a circle about 21 blocks in radius where nothing is in the way,
     ///   so the route stays near the spawn however long it is.
     /// - fly: creative sprint-flight south, 40 blocks above the spawn.
+    /// - dig: standing at the spawn looking straight down, nothing held through the
+    ///   warm-up, then the attack key for the capture (twelve seconds of it at most):
+    ///   the player breaks the block under its feet and falls, again and again. Every
+    ///   break is a change the client makes itself, before the server answers.
     pub fn new(
         scene: &str,
         spawn: [f64; 3],
@@ -71,6 +80,7 @@ impl Route {
             "spin" => (&[], (12.0, 0.0), false),
             "walk" => (&["forward", "jump"], (4.0, 0.0), false),
             "fly" => (&["forward", "sprint"], (0.0, 0.0), true),
+            DIG => (&["attack"], (0.0, 0.0), false),
             other => return Err(format!("no route for the scene {other:?}")),
         };
         let warmup_ticks = (warmup * TICKS_PER_SECOND).round() as u64;
@@ -79,21 +89,32 @@ impl Route {
             return Err("the capture is shorter than a tick".into());
         }
         let height = if flying { FLY_HEIGHT } else { 0.0 };
+        let none: &'static [&'static str] = &[];
+        let segments = if scene == DIG {
+            let held = capture_ticks.min(DIG_TICKS);
+            vec![
+                (warmup_ticks, none, (0.0, 0.0)),
+                (held, keys, turn),
+                (capture_ticks - held + TAIL_TICKS, none, (0.0, 0.0)),
+            ]
+        } else {
+            vec![
+                (warmup_ticks + capture_ticks, keys, turn),
+                (TAIL_TICKS, none, (0.0, 0.0)),
+            ]
+        };
         let mut route = Route {
             name: scene.into(),
             id: String::new(),
             position: [spawn[0] + 0.5, spawn[1] + height, spawn[2] + 0.5],
             yaw: 0.0,
-            pitch: 0.0,
+            pitch: if scene == DIG { 90.0 } else { 0.0 },
             flying,
             stationary: matches!(scene, "idle" | "spin"),
             warmup_ticks,
             capture_ticks,
             view_distance,
-            segments: vec![
-                (warmup_ticks + capture_ticks, keys, turn),
-                (TAIL_TICKS, &[], (0.0, 0.0)),
-            ],
+            segments,
         };
         route.id = fnv1a(&route.json().to_string());
         Ok(route)
@@ -458,6 +479,10 @@ mod tests {
         assert_eq!(footprint((3, -2), 12).len(), f.len());
     }
 
+    /// The routes of the baseline recorded on 2026-11-24, which runs are paired with.
+    const BASELINE_FLY: &str = "4eccd90811443043";
+    const BASELINE_IDLE: &str = "58bb70b9655f6c8a";
+
     #[test]
     fn routes_have_a_stable_identity() {
         let fly = Route::new("fly", [4.0, 71.0, 2.0], 10.0, 60.0, 12).unwrap();
@@ -482,6 +507,32 @@ mod tests {
         );
         assert_eq!(fly.json()["id"], fly.id.as_str());
         assert!(Route::new("menu", [0.0; 3], 1.0, 1.0, 12).is_err());
+        // The identifiers the recorded baseline's routes have.
+        let id = |scene: &str| {
+            Route::new(scene, [4.0, 71.0, 2.0], 10.0, 60.0, 12)
+                .unwrap()
+                .id
+        };
+        assert_eq!(fly.id, BASELINE_FLY);
+        assert_eq!(id("idle"), BASELINE_IDLE);
+
+        let dig = Route::new(DIG, [4.0, 71.0, 2.0], 10.0, 60.0, 12).unwrap();
+        assert_eq!((dig.position, dig.pitch), ([4.5, 71.0, 2.5], 90.0));
+        assert_eq!(dig.total(), fly.total());
+        let held: Vec<bool> = [0, 199, 200, 439, 440, 1439]
+            .iter()
+            .map(|&t| {
+                let mut first = 0;
+                for (ticks, keys, _) in &dig.segments {
+                    if t < first + ticks {
+                        return keys.contains(&"attack");
+                    }
+                    first += ticks;
+                }
+                false
+            })
+            .collect();
+        assert_eq!(held, [false, false, true, true, false, false]);
     }
 
     /// A record as a client would write it for `route`, standing still.

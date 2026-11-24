@@ -22,7 +22,7 @@
 //! (keep the chunks loaded on the server and the world still in between).
 //!
 //! `--route` plays a route file written by `cargo xtask bench dedicated` instead: input
-//! keyed by client tick (see [`Route`]). The client waits until a benchmark controller
+//! keyed by client tick (see [`crate::route`]). The client waits until a benchmark controller
 //! has put the player at the route's start, plays every tick's input, records where the
 //! player is after each tick and which chunks are loaded at the route's marks, and
 //! fails if any of it differs from what the route says. `--route-out` gets the record
@@ -32,16 +32,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ruthenium_prepare::discover::Env;
 use ruthenium_sim::input::{self, MouseOptions};
 use ruthenium_sim::player::{Keys, Pose};
 use ruthenium_sim::session::{PlayerView, Session, SessionEvent};
-use serde_json::{Value, json};
 
 use crate::account::{AccountStatus, Accounts};
 use crate::join::{Joiner, closed_text, plain_text, stage_text};
+use crate::route::{Expected, Route, RoutePlayer};
 use crate::settings::SettingsFile;
 
 /// The frame rate without a window: vanilla's default frame limit's neighbourhood.
@@ -224,306 +224,6 @@ impl Player {
 /// within milliseconds of falling due and the next tick's input is in place long
 /// before it.
 const ROUTE_FRAME: Duration = Duration::from_millis(2);
-/// How many ticks the start conditions must hold before a route begins, and how many
-/// the position and the loaded chunks must stay unchanged before its end is recorded.
-const START_TICKS: u64 = 20;
-const SETTLE_TICKS: u64 = 40;
-/// How long joining, reaching the start and coming to rest at the end may each take.
-const JOIN_LIMIT: Duration = Duration::from_secs(60);
-const START_LIMIT: Duration = Duration::from_secs(120);
-const SETTLE_LIMIT: Duration = Duration::from_secs(30);
-/// `GameType.CREATIVE`'s id.
-const CREATIVE: i32 = 1;
-
-/// A stretch of a route: the keys held during each of its ticks, and the turn of the
-/// camera (`Entity.turn`'s amounts) applied before each of them.
-#[derive(Debug, Clone, PartialEq)]
-struct Segment {
-    ticks: u64,
-    keys: Keys,
-    turn: (f64, f64),
-}
-
-/// A route: where the player starts and what it does on every client tick from then
-/// on, read from the file that this client and the vanilla bench client are both given.
-///
-/// Tick 0 is the first tick after the start conditions have held for a second. Before
-/// tick `n` runs, its segment's turn is applied and its keys are held; after it, the
-/// position and the rotation are recorded. The loaded chunks are recorded (a mark) at
-/// tick 0, every `mark_every` ticks while the route is measured, and once more when
-/// the player and the chunks have come to rest after the last tick.
-#[derive(Debug, Clone, PartialEq)]
-struct Route {
-    id: String,
-    name: String,
-    position: [f64; 3],
-    yaw: f32,
-    pitch: f32,
-    flying: bool,
-    /// The chunks loaded at the start, sorted.
-    start_chunks: Vec<(i32, i32)>,
-    segments: Vec<Segment>,
-    warmup_ticks: u64,
-    capture_ticks: u64,
-    mark_every: u64,
-    /// The player must not move at all (the idle and spin routes).
-    stationary: bool,
-}
-
-impl Route {
-    fn parse(text: &str) -> Result<Route, String> {
-        let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        if v["format"] != "ruthenium-route/1" {
-            return Err(format!("unknown format {}", v["format"]));
-        }
-        let number = |v: &Value, what: &str| v.as_f64().ok_or_else(|| format!("no {what}"));
-        let count = |v: &Value, what: &str| v.as_u64().ok_or_else(|| format!("no {what}"));
-        let pair =
-            |v: &Value, what: &str| Ok::<_, String>((number(&v[0], what)?, number(&v[1], what)?));
-        let start = &v["start"];
-        let p = &start["position"];
-        let mut start_chunks = Vec::new();
-        for c in start["chunks"].as_array().ok_or("no start chunks")? {
-            let (x, z) = pair(c, "start chunk")?;
-            start_chunks.push((x as i32, z as i32));
-        }
-        start_chunks.sort_unstable();
-        let mut segments = Vec::new();
-        for s in v["segments"].as_array().ok_or("no segments")? {
-            let mut keys = Keys::default();
-            for k in s["keys"].as_array().ok_or("a segment without keys")? {
-                match k.as_str() {
-                    Some("forward") => keys.forward = true,
-                    Some("backward") => keys.backward = true,
-                    Some("left") => keys.left = true,
-                    Some("right") => keys.right = true,
-                    Some("jump") => keys.jump = true,
-                    Some("sneak") => keys.shift = true,
-                    Some("sprint") => keys.sprint = true,
-                    _ => return Err(format!("unknown key {k}")),
-                }
-            }
-            segments.push(Segment {
-                ticks: count(&s["ticks"], "segment ticks")?,
-                keys,
-                turn: pair(&s["turn"], "segment turn")?,
-            });
-        }
-        let route = Route {
-            id: v["id"].as_str().ok_or("no id")?.to_owned(),
-            name: v["name"].as_str().ok_or("no name")?.to_owned(),
-            position: [
-                number(&p[0], "start position")?,
-                number(&p[1], "start position")?,
-                number(&p[2], "start position")?,
-            ],
-            yaw: number(&start["yaw"], "start yaw")? as f32,
-            pitch: number(&start["pitch"], "start pitch")? as f32,
-            flying: start["flying"].as_bool().ok_or("no start flying")?,
-            start_chunks,
-            segments,
-            warmup_ticks: count(&v["warmupTicks"], "warmupTicks")?,
-            capture_ticks: count(&v["captureTicks"], "captureTicks")?,
-            mark_every: count(&v["markEvery"], "markEvery")?.max(1),
-            stationary: v["stationary"].as_bool().ok_or("no stationary")?,
-        };
-        if route.total() < route.warmup_ticks + route.capture_ticks {
-            return Err("the segments end before the capture does".into());
-        }
-        Ok(route)
-    }
-
-    fn total(&self) -> u64 {
-        self.segments.iter().map(|s| s.ticks).sum()
-    }
-
-    /// The keys held during `tick` and the turn applied before it.
-    fn input(&self, tick: u64) -> (Keys, (f64, f64)) {
-        let mut first = 0;
-        for s in &self.segments {
-            if tick < first + s.ticks {
-                return (s.keys, s.turn);
-            }
-            first += s.ticks;
-        }
-        (Keys::default(), (0.0, 0.0))
-    }
-}
-
-/// The rotation after `Entity.turn(xo, yo)`, in the game's float arithmetic.
-fn turned((yaw, pitch): (f32, f32), (xo, yo): (f64, f64)) -> (f32, f32) {
-    (
-        yaw + xo as f32 * 0.15,
-        ((pitch + yo as f32 * 0.15) % 360.0).clamp(-90.0, 90.0),
-    )
-}
-
-/// FNV-1a, 64 bits, as 16 hex digits: the checksum both clients compute.
-fn fnv1a(text: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in text.bytes() {
-        hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
-}
-
-/// One tick's record: the bits of x, y, z (doubles), then of the yaw and the pitch
-/// (floats), as 64 hex digits. The position checksum is [`fnv1a`] of all of a route's
-/// records one after the other.
-fn tick_record(position: [f64; 3], yaw: f32, pitch: f32) -> String {
-    format!(
-        "{:016x}{:016x}{:016x}{:08x}{:08x}",
-        position[0].to_bits(),
-        position[1].to_bits(),
-        position[2].to_bits(),
-        yaw.to_bits(),
-        pitch.to_bits()
-    )
-}
-
-/// Sorted chunk positions as `x,z;` each. The footprint checksum is [`fnv1a`] of the
-/// start mark's text, a `|`, and the end mark's.
-fn chunk_text(chunks: &[(i32, i32)]) -> String {
-    chunks.iter().map(|(x, z)| format!("{x},{z};")).collect()
-}
-
-/// The loaded chunks as the game thread last published them (before it showed the view
-/// of the same frame), sorted.
-fn sorted_chunks(session: &Session) -> Vec<(i32, i32)> {
-    let mut chunks: Vec<(i32, i32)> = session
-        .scene()
-        .with_terrain(|t| t.columns().map(|(at, _)| at).collect());
-    chunks.sort_unstable();
-    chunks
-}
-
-fn epoch_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
-fn same_position(a: [f64; 3], b: [f64; 3]) -> bool {
-    a.map(f64::to_bits) == b.map(f64::to_bits)
-}
-
-/// What a route run recorded, written to `--route-out` whether it passed or not.
-#[derive(Debug, Default)]
-struct RouteLog {
-    /// Where the server put the player when it joined.
-    join_position: Option<[f64; 3]>,
-    /// One [`tick_record`] per route tick.
-    ticks: Vec<String>,
-    marks: Vec<Value>,
-    /// The chunks at the first and the last mark.
-    start_chunks: Vec<(i32, i32)>,
-    end_chunks: Option<Vec<(i32, i32)>>,
-    end_position: Option<[f64; 3]>,
-    /// Epoch milliseconds of the readiness markers, by name.
-    markers: serde_json::Map<String, Value>,
-}
-
-impl RouteLog {
-    fn marker(&mut self, name: &str) {
-        self.markers.insert(name.to_owned(), json!(epoch_ms()));
-    }
-
-    fn mark(&mut self, tick: u64, v: &PlayerView, chunks: &[(i32, i32)]) {
-        let center = v.position.map(|c| (c.floor() as i32) >> 4);
-        println!(
-            "          route tick {tick}: at {:.3} {:.3} {:.3}, {} chunks",
-            v.position[0],
-            v.position[1],
-            v.position[2],
-            chunks.len()
-        );
-        self.marks.push(json!({
-            "tick": tick,
-            "epochMs": epoch_ms(),
-            "position": v.position,
-            "center": [center[0], center[2]],
-            "chunks": chunks.iter().map(|(x, z)| json!([x, z])).collect::<Vec<_>>(),
-        }));
-    }
-
-    fn positions_checksum(&self) -> String {
-        fnv1a(&self.ticks.concat())
-    }
-
-    fn footprint_checksum(&self) -> Option<String> {
-        let end = self.end_chunks.as_ref()?;
-        Some(fnv1a(&format!(
-            "{}|{}",
-            chunk_text(&self.start_chunks),
-            chunk_text(end)
-        )))
-    }
-
-    fn to_json(&self, route: &Route, error: Option<&str>) -> Value {
-        json!({
-            "format": "ruthenium-route-run/1",
-            "client": "ruthenium",
-            "route": { "id": route.id, "name": route.name },
-            "joinPosition": self.join_position,
-            "endPosition": self.end_position,
-            "ticks": self.ticks,
-            "marks": self.marks,
-            "markers": self.markers,
-            "checksums": {
-                "positions": self.positions_checksum(),
-                "footprint": self.footprint_checksum(),
-            },
-            "error": error,
-        })
-    }
-}
-
-/// The checksums a run is expected to end with (`--expect-positions`, `--expect-footprint`).
-#[derive(Debug, Default)]
-struct Expected {
-    positions: Option<String>,
-    footprint: Option<String>,
-}
-
-/// Why the player isn't at the route's start yet.
-fn not_at_start(v: &PlayerView, route: &Route, chunks: &[(i32, i32)]) -> Option<String> {
-    let p = v.position;
-    if !v.loaded {
-        Some("the player hasn't loaded into the level".into())
-    } else if v.game_type != CREATIVE {
-        Some(format!("the game mode is {}, not creative", v.game_type))
-    } else if !same_position(p, route.position) {
-        Some(format!(
-            "the player is at {} {} {}, the route starts at {} {} {}",
-            p[0], p[1], p[2], route.position[0], route.position[1], route.position[2]
-        ))
-    } else if (v.y_rot.to_bits(), v.x_rot.to_bits()) != (route.yaw.to_bits(), route.pitch.to_bits())
-    {
-        Some(format!(
-            "the player faces {} {}, the route starts facing {} {}",
-            v.y_rot, v.x_rot, route.yaw, route.pitch
-        ))
-    } else if v.flying != route.flying {
-        Some(format!(
-            "flying is {}, the route starts with {}",
-            v.flying, route.flying
-        ))
-    } else if v.on_ground == route.flying {
-        Some(format!("on the ground is {}", v.on_ground))
-    } else if chunks != route.start_chunks {
-        let loaded = chunks
-            .iter()
-            .filter(|c| route.start_chunks.binary_search(c).is_ok())
-            .count();
-        Some(format!(
-            "{loaded} of the start's {} chunks are loaded, and {} others",
-            route.start_chunks.len(),
-            chunks.len() - loaded
-        ))
-    } else {
-        None
-    }
-}
 
 /// The view once the game thread has run every frame sent so far (`None` outside a
 /// level), so that what it shows is the state the next frame's input meets.
@@ -541,36 +241,14 @@ fn synced_view(session: &Session, sent: u64) -> Result<Option<PlayerView>, Strin
     }
 }
 
-/// Plays `route` to its end and checks it; `log` holds what was recorded up to an error.
+/// Plays the route to its end, a frame every two milliseconds, each after the game
+/// thread has run the one before.
 fn play_route(
     session: &Session,
-    route: &Route,
-    expected: &Expected,
+    player: &mut RoutePlayer,
     lang: &HashMap<String, String>,
-    log: &mut RouteLog,
 ) -> Result<(), String> {
-    enum Phase {
-        Joining,
-        /// Waiting for the start conditions; they have held since this tick.
-        Waiting(Option<u64>),
-        Running,
-        /// The route's ticks are done; the position and the chunks have been as they
-        /// are since this tick.
-        Settling(u64, [f64; 3], Vec<(i32, i32)>),
-    }
     let started = Instant::now();
-    let total = route.total();
-    let mut phase = Phase::Joining;
-    let mut deadline = Instant::now() + JOIN_LIMIT;
-    // Frames sent; the session's tick count at route tick 0; route ticks done; route
-    // ticks whose input has been given; the tick whose input the last frame carried.
-    let mut sent = 0u64;
-    let mut first_tick = 0u64;
-    let mut done = 0u64;
-    let mut armed = 0u64;
-    let mut armed_last = None;
-    let mut rotation = (route.yaw, route.pitch);
-    let mut waiting_for = String::from("the server");
     loop {
         for e in session.poll() {
             let t = started.elapsed().as_secs_f64();
@@ -589,166 +267,36 @@ fn play_route(
                 _ => {}
             }
         }
-        if let Some(v) = synced_view(session, sent)? {
-            match &mut phase {
-                Phase::Joining => {
-                    if v.loaded {
-                        log.join_position = Some(v.position);
-                        log.marker("joinedEpochMs");
-                        phase = Phase::Waiting(None);
-                        deadline = Instant::now() + START_LIMIT;
-                    }
-                }
-                Phase::Waiting(since) => {
-                    let chunks = sorted_chunks(session);
-                    match not_at_start(&v, route, &chunks) {
-                        Some(why) => {
-                            waiting_for = why;
-                            *since = None;
-                        }
-                        None if v.ticks - *since.get_or_insert(v.ticks) >= START_TICKS => {
-                            println!(
-                                "{:7.3}s  at the start of the {} route ({} ticks)",
-                                started.elapsed().as_secs_f64(),
-                                route.name,
-                                total
-                            );
-                            log.marker("sceneReadyEpochMs");
-                            log.marker("warmupStartEpochMs");
-                            log.mark(0, &v, &chunks);
-                            log.start_chunks = chunks;
-                            first_tick = v.ticks;
-                            phase = Phase::Running;
-                            // Twenty ticks a second, and a margin for a slow machine.
-                            deadline = Instant::now() + Duration::from_millis(total * 75 + 30_000);
-                        }
-                        None => {}
-                    }
-                }
-                Phase::Running => {
-                    let now_done = v.ticks - first_tick;
-                    if now_done > done + 1 {
-                        return Err(format!(
-                            "{} client ticks ran in one frame at route tick {done}: the machine stalled, and input keyed by tick was missed",
-                            now_done - done
-                        ));
-                    }
-                    if now_done > done {
-                        if armed_last == Some(done) && route.input(done).1 != (0.0, 0.0) {
-                            return Err(format!(
-                                "route tick {done} ran in the frame that carried its turn: the machine stalled, and the turn came after the tick"
-                            ));
-                        }
-                        if (v.y_rot.to_bits(), v.x_rot.to_bits())
-                            != (rotation.0.to_bits(), rotation.1.to_bits())
-                        {
-                            return Err(format!(
-                                "route tick {done}: the player faces {} {}, the route says {} {}",
-                                v.y_rot, v.x_rot, rotation.0, rotation.1
-                            ));
-                        }
-                        if route.stationary && !same_position(v.position, route.position) {
-                            return Err(format!(
-                                "route tick {done}: the player moved to {} {} {} on a route that stands still",
-                                v.position[0], v.position[1], v.position[2]
-                            ));
-                        }
-                        log.ticks.push(tick_record(v.position, v.y_rot, v.x_rot));
-                        done = now_done;
-                        if done == route.warmup_ticks {
-                            log.marker("captureStartEpochMs");
-                        }
-                        if done == route.warmup_ticks + route.capture_ticks {
-                            log.marker("captureEndEpochMs");
-                        }
-                        if done.is_multiple_of(route.mark_every)
-                            && done <= route.warmup_ticks + route.capture_ticks
-                        {
-                            log.mark(done, &v, &sorted_chunks(session));
-                        }
-                    }
-                    armed_last = None;
-                    if done == total {
-                        session.set_keys(Keys::default());
-                        phase = Phase::Settling(v.ticks, v.position, sorted_chunks(session));
-                        deadline = Instant::now() + SETTLE_LIMIT;
-                    } else if armed == done {
-                        let (keys, turn) = route.input(done);
-                        session.set_keys(keys);
-                        if turn != (0.0, 0.0) {
-                            session.turn(turn.0, turn.1);
-                            rotation = turned(rotation, turn);
-                        }
-                        armed = done + 1;
-                        armed_last = Some(done);
-                    }
-                }
-                Phase::Settling(since, position, chunks) => {
-                    let now = sorted_chunks(session);
-                    if !same_position(v.position, *position) || now != *chunks {
-                        (*since, *position, *chunks) = (v.ticks, v.position, now);
-                    } else if v.ticks - *since >= SETTLE_TICKS {
-                        log.marker("routeEndEpochMs");
-                        log.mark(total, &v, chunks);
-                        log.end_position = Some(v.position);
-                        log.end_chunks = Some(std::mem::take(chunks));
-                        break;
-                    }
-                }
-            }
-        }
-        if Instant::now() > deadline {
-            return Err(match phase {
-                Phase::Joining => "the player never loaded into the level".into(),
-                Phase::Waiting(_) => format!("the route never started: {waiting_for}"),
-                Phase::Running => format!("the route stopped at tick {done} of {total}"),
-                Phase::Settling(..) => {
-                    "the player and the loaded chunks never came to rest after the route".into()
-                }
-            });
+        let view = synced_view(session, player.sent())?;
+        if player.step(session, view.as_ref(), &|| None) {
+            return player.outcome().cloned().unwrap_or(Ok(()));
         }
         session.frame();
-        sent += 1;
         std::thread::sleep(ROUTE_FRAME);
     }
-    let positions = log.positions_checksum();
-    let footprint = log.footprint_checksum().unwrap_or_default();
-    println!(
-        "{:7.3}s  the {} route ({}) ended: positions {positions}, footprint {footprint}",
-        started.elapsed().as_secs_f64(),
-        route.name,
-        route.id
-    );
-    if let Some(e) = expected.positions.as_ref().filter(|e| **e != positions) {
-        return Err(format!(
-            "the position checksum is {positions}, expected {e}"
-        ));
-    }
-    if let Some(e) = expected.footprint.as_ref().filter(|e| **e != footprint) {
-        return Err(format!(
-            "the footprint checksum is {footprint}, expected {e}"
-        ));
-    }
-    Ok(())
 }
 
 /// Joins, plays the route, writes the record and leaves. Fails if the run differed
 /// from the route in any way.
 fn run_route(
     session: &Session,
-    route: &Route,
-    expected: &Expected,
+    route: Route,
+    expected: Expected,
     out: Option<&Path>,
     lang: &HashMap<String, String>,
 ) -> Result<ExitCode, String> {
-    let mut log = RouteLog::default();
-    let result = play_route(session, route, expected, lang, &mut log);
+    let name = route.name.clone();
+    let mut player = RoutePlayer::new(route, expected);
+    let result = play_route(session, &mut player, lang);
+    if let Err(e) = &result {
+        player.fail(e.clone());
+    }
     if let Some(out) = out {
-        let record = log.to_json(route, result.as_ref().err().map(String::as_str));
-        std::fs::write(out, record.to_string()).map_err(|e| format!("{}: {e}", out.display()))?;
+        std::fs::write(out, player.record().to_string())
+            .map_err(|e| format!("{}: {e}", out.display()))?;
     }
     session.disconnect();
-    result.map_err(|e| format!("the {} route failed: {e}", route.name))?;
+    result.map_err(|e| format!("the {name} route failed: {e}"))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -858,8 +406,8 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut joiner = Joiner::new(Some(data_dir.join("game")), cache_dir);
     let data = joiner.data();
     let session = joiner.join(&address, &accounts)?;
-    if let Some(route) = &route {
-        return run_route(&session, route, &expected, route_out.as_deref(), &data.lang);
+    if let Some(route) = route {
+        return run_route(&session, route, expected, route_out.as_deref(), &data.lang);
     }
     let started = Instant::now();
     let stay = Duration::from_secs_f64(seconds);
@@ -1121,49 +669,5 @@ mod tests {
         assert_eq!((s[1].clicks, s[1].swaps, s[1].use_held), (2, 1, false));
         assert!(parse_script("w@").is_err());
         assert!(parse_script("fly@100").is_err());
-    }
-
-    const ROUTE: &str = r#"{
-        "format": "ruthenium-route/1", "id": "0123456789abcdef", "name": "walk",
-        "start": { "position": [4.5, 71.0, 2.5], "yaw": 0.0, "pitch": 0.0, "flying": false,
-                   "chunks": [[1, 0], [0, 0], [0, -1]] },
-        "segments": [ { "ticks": 3, "keys": ["forward", "jump"], "turn": [4.0, 0.0] },
-                      { "ticks": 2, "keys": [], "turn": [0.0, 0.0] } ],
-        "warmupTicks": 1, "captureTicks": 2, "markEvery": 100, "stationary": false
-    }"#;
-
-    #[test]
-    fn reads_routes() {
-        let r = Route::parse(ROUTE).unwrap();
-        assert_eq!((r.total(), r.warmup_ticks, r.capture_ticks), (5, 1, 2));
-        assert_eq!(r.start_chunks, [(0, -1), (0, 0), (1, 0)]);
-        let (keys, turn) = r.input(2);
-        assert!(keys.forward && keys.jump && !keys.sprint);
-        assert_eq!(turn, (4.0, 0.0));
-        assert_eq!(r.input(3), (Keys::default(), (0.0, 0.0)));
-        assert_eq!(r.input(99), (Keys::default(), (0.0, 0.0)));
-        assert!(
-            Route::parse(&ROUTE.replace("\"captureTicks\": 2", "\"captureTicks\": 9")).is_err()
-        );
-        assert!(Route::parse(&ROUTE.replace("jump", "fly")).is_err());
-    }
-
-    #[test]
-    fn checksums_are_fnv1a_of_the_records() {
-        assert_eq!(fnv1a(""), "cbf29ce484222325");
-        assert_eq!(fnv1a("a"), "af63dc4c8601ec8c");
-        assert_eq!(
-            tick_record([4.5, 71.0, -2.5], 1.8, 0.0),
-            "40120000000000004051c00000000000c0040000000000003fe6666600000000"
-        );
-        assert_eq!(chunk_text(&[(0, -1), (12, 3)]), "0,-1;12,3;");
-        // Turns add up in floats, as the game adds them: a tick's 12 counts are not
-        // exactly 1.8 degrees.
-        let mut rotation = (0.0f32, 0.0f32);
-        for _ in 0..200 {
-            rotation = turned(rotation, (12.0, 0.0));
-        }
-        assert_eq!(rotation, (359.9996, 0.0));
-        assert_eq!(turned((0.0, 80.0), (0.0, 100.0)), (0.0, 90.0));
     }
 }

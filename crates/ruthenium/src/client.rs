@@ -16,11 +16,13 @@ use ruthenium_gpu::{
 };
 use ruthenium_platform::{DEFAULT_SIZE, Event, Platform, Sleeper, next_deadline};
 use ruthenium_render::{
-    Background, FrameTimes, OverlayStats, Renderer, Summary, WorldFrame, create_gpu,
+    Background, FrameTimes, OverlayStats, Renderer, Summary, TerrainDraws, WorldFrame, create_gpu,
 };
 use ruthenium_ui::modern::Action;
+use serde_json::{Value, json};
 
 use crate::menu::Menu;
+use crate::route::{Expected, Route, RoutePlayer, Terrain};
 use crate::settings::{Settings, SettingsFile};
 use crate::telemetry::{FrameSample, Marks, RunInfo, Startup, Telemetry};
 
@@ -146,6 +148,16 @@ pub struct Options {
     /// Development: with `--join`, leave the server this long after the start and join
     /// it again at once, in the same run.
     pub rejoin_after: Option<Duration>,
+    /// Benchmarks: with `--join`, play this route file once in the world
+    /// ([`crate::route`]), measure the frames of its capture and quit when it ends.
+    pub route: Option<std::path::PathBuf>,
+    /// Write the route's record here.
+    pub route_out: Option<std::path::PathBuf>,
+    /// The checksums the route's record must end with.
+    pub expected: Expected,
+    /// How the terrain's sections are drawn (default: one direct draw each, nearest
+    /// first).
+    pub terrain_draws: Option<TerrainDraws>,
 }
 
 impl Options {
@@ -193,6 +205,10 @@ impl Options {
             adapter_report: None,
             mesh_workers: None,
             rejoin_after: None,
+            route: None,
+            route_out: None,
+            expected: Expected::default(),
+            terrain_draws: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -342,6 +358,17 @@ impl Options {
                             .ok_or(format!("--mesh-workers: not 1 to 64: {v}"))?,
                     );
                 }
+                "--route" => o.route = Some(value("a route file")?.into()),
+                "--route-out" => o.route_out = Some(value("a file")?.into()),
+                "--expect-positions" => o.expected.positions = Some(value("a checksum")?),
+                "--expect-footprint" => o.expected.footprint = Some(value("a checksum")?),
+                "--terrain-draws" => {
+                    let v = value("direct, paged or mdi")?;
+                    o.terrain_draws = Some(
+                        TerrainDraws::parse(&v)
+                            .ok_or(format!("--terrain-draws: not direct, paged or mdi: {v}"))?,
+                    );
+                }
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
                 "--screen" => o.screen = Some(value("a screen name")?),
                 "--select" => {
@@ -353,6 +380,16 @@ impl Options {
                 }
                 other => return Err(format!("unknown option {other}")),
             }
+        }
+        if o.route.is_some() && (o.join.is_none() || o.rejoin_after.is_some()) {
+            return Err("--route plays in the one session --join starts: give --join, and no --rejoin-after".into());
+        }
+        if o.route.is_none()
+            && (o.route_out.is_some()
+                || o.expected.positions.is_some()
+                || o.expected.footprint.is_some())
+        {
+            return Err("--route-out and --expect-... are for a --route".into());
         }
         if o.exercise_streaming && (o.exercise_uploads || o.exercise_textures) {
             return Err(
@@ -452,6 +489,13 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     if let Some(n) = opts.mesh_workers {
         menu.set_mesh_workers(n);
     }
+    if let Some(path) = &opts.route {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let route = Route::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        menu.set_route(RoutePlayer::new(route, opts.expected.clone()));
+    }
+    let started_epoch_ms =
+        crate::route::epoch_ms().saturating_sub(started.elapsed().as_millis() as u64);
     menu.set_joiner(crate::join::Joiner::new(
         data_dir.as_ref().map(|d| d.join("game")),
         ruthenium_prepare::default_cache_dir(&env),
@@ -573,6 +617,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         }
     }
     renderer.overlay_mut().set_visible(applied.frame_stats);
+    if let Some(draws) = opts.terrain_draws {
+        renderer.set_terrain_draws(draws);
+    }
     let mut mode_name = String::with_capacity(32);
     if opts.exercise_uploads {
         renderer.enable_upload_check()?;
@@ -614,7 +661,14 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut cpu = FrameTimes::new(1 << 13);
     let mut gpu_times = FrameTimes::new(1 << 13);
     // The run after warm-up, for the summary at exit.
-    let mut telemetry = Telemetry::new(opts.frame_log.is_some());
+    let mut telemetry = Telemetry::new(opts.frame_log.is_some(), opts.route.is_some());
+    // A route's capture: whether its ticks are being played, what the terrain and the
+    // uploads had done when it began and when it ended, and its frames that were held
+    // back because the window was hidden or covered.
+    let mut capturing = false;
+    let mut frames_after_route = 0u32;
+    let mut capture: [Option<Value>; 2] = [None, None];
+    let mut throttled: u64 = 0;
     let mut last_present: Option<Instant> = None;
     let mut last_report = Instant::now();
     let mut first_frame: Option<Duration> = None;
@@ -769,7 +823,29 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         }
         // The game's frame runs every time round, drawn or not, as vanilla's `runTick`.
         let t_game = Instant::now();
-        menu.game_frame();
+        menu.game_frame(&|| Some(terrain_state(&renderer)));
+        if let Some(route) = menu.route() {
+            if route.outcome().is_some() {
+                // With --screenshot, the frame after the route's end is captured (the
+                // player at rest, everything loaded with its mesh): the loop ends when
+                // the picture is written, or when it cannot be had.
+                frames_after_route += 1;
+                if opts.screenshot.is_none() || frames_after_route > 200 {
+                    break;
+                }
+                if !screenshot_requested {
+                    renderer.request_screenshot();
+                    screenshot_requested = true;
+                }
+            }
+            if route.capturing() != capturing {
+                capturing = !capturing;
+                capture[usize::from(!capturing)] = Some(capture_state(&renderer));
+                if capturing {
+                    renderer.reset_world_latencies();
+                }
+            }
+        }
         if let Some(size) = resized.take() {
             renderer.frames_mut().resize(size);
             if resize_asked && !screenshot_requested {
@@ -838,6 +914,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         }
         if !visible {
             // Nothing is shown: tick at 10 FPS without presenting.
+            throttled += u64::from(capturing);
             std::thread::sleep(HIDDEN_FRAME);
             last_present = None;
             last_input = None;
@@ -914,6 +991,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 window.set_icon(rgba, crate::menu::ICON_SIZE)
             });
             if opts.screenshot.is_some()
+                && opts.route.is_none()
                 && !screenshot_requested
                 && !resize_asked
                 && text_ready
@@ -1010,7 +1088,11 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             }
             last_present = Some(now);
         }
-        let measuring = started.elapsed() > WARMUP + first_frame.unwrap_or(Duration::MAX / 4);
+        // A route says which frames count; without one, those after the start-up.
+        let measuring = match menu.route() {
+            Some(_) => capturing,
+            None => started.elapsed() > WARMUP + first_frame.unwrap_or(Duration::MAX / 4),
+        };
         let marks = Marks {
             started,
             limiter: t_limiter,
@@ -1021,7 +1103,13 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             render: t_render,
             end: now,
         };
-        let sample = FrameSample::new(&marks, renderer.frames().timings(), presented, interval_ns);
+        let sample = FrameSample::new(
+            &marks,
+            renderer.frames().timings(),
+            renderer.world_times(),
+            presented,
+            interval_ns,
+        );
         debug_assert_eq!(sample.frame, report.frame);
         cpu.push(sample.cpu_ns);
         telemetry.frame(&sample, measuring);
@@ -1066,6 +1154,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         if occluded {
             // Covered by other windows: keep presenting (so the compositor can tell us when
             // it is visible again) but only at 10 FPS.
+            throttled += u64::from(capturing);
             std::thread::sleep(HIDDEN_FRAME);
             last_present = None;
             last_input = None;
@@ -1073,6 +1162,37 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
 
     menu.save_settings();
+    // A route's record, and how it ended.
+    let mut failed = false;
+    let route_run = menu.route().map(RoutePlayer::record);
+    if let Some(route) = menu.route() {
+        match route.outcome() {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                eprintln!("[ruthenium] the {} route failed: {e}", route.route().name);
+                failed = true;
+            }
+            None => {
+                eprintln!(
+                    "[ruthenium] the {} route was not played to its end",
+                    route.route().name
+                );
+                failed = true;
+            }
+        }
+        if throttled > 0 {
+            eprintln!(
+                "[ruthenium] {throttled} frames of the route's capture were held back: the window was hidden or covered"
+            );
+            failed = true;
+        }
+    }
+    if let (Some(path), Some(record)) = (&opts.route_out, &route_run)
+        && let Err(e) = std::fs::write(path, record.to_string())
+    {
+        eprintln!("[ruthenium] could not write {}: {e}", path.display());
+        return Ok(ExitCode::FAILURE);
+    }
     let run = telemetry.interval.summary();
     if run.samples > 0 {
         eprintln!(
@@ -1100,8 +1220,47 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         startup.first_frame_ms = first_frame.map(|d| d.as_secs_f64() * 1e3);
         startup.text_ready_ms = text_shown.map(|t| (t - started).as_secs_f64() * 1e3);
         let policy = renderer.frames().policy();
+        let world = renderer.world_stats().map(|_| {
+            let [at_start, at_end] = &capture;
+            let session = menu.session_stats().map(|(handoff, dirty)| {
+                json!({
+                    "input_frames": handoff.frames,
+                    "input_queue_high_water": handoff.high_water,
+                    "oldest_input_ms": handoff.oldest_age.as_secs_f64() * 1e3,
+                    "main_thread_waits": handoff.stalls,
+                    "main_thread_wait_ms": handoff.stall_time.as_secs_f64() * 1e3,
+                    "longest_wait_ms": handoff.longest_stall.as_secs_f64() * 1e3,
+                    "dirty_queue_high_water": dirty.high_water,
+                    "dirty_queue_overflows": dirty.overflows,
+                    "dirty_keys": dirty.queued,
+                    "dirty_keys_coalesced": dirty.coalesced,
+                })
+            });
+            json!({
+                "draws": renderer.terrain_draws().name(),
+                "mesh_workers": menu.mesh_workers(),
+                "envelope_bytes": ruthenium_render::terrain::POOL_ENVELOPE,
+                "at_capture_start": at_start,
+                "at_capture_end": at_end,
+                "at_exit": capture_state(&renderer),
+                "latency": renderer.world_latencies().map(|l| json!({
+                    "first_mesh": latency_json(&l.first),
+                    "server_change": latency_json(&l.changed),
+                    "own_change": latency_json(&l.own),
+                })),
+                "session": session,
+            })
+        });
         let json = telemetry.bench_json(&RunInfo {
-            scene: if opts.empty_window { "empty" } else { "menu" },
+            started_epoch_ms,
+            world,
+            route_run,
+            throttled_frames: throttled,
+            scene: match menu.route() {
+                Some(r) => r.route().name.as_str(),
+                None if opts.empty_window => "empty",
+                None => "menu",
+            },
             caps: renderer.gpu().caps(),
             transfer_queue: renderer.gpu().transfer_family().is_some(),
             policy,
@@ -1122,7 +1281,6 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             return Ok(ExitCode::FAILURE);
         }
     }
-    let mut failed = false;
     if let Some((c, deferred, transferred)) = renderer.upload_check() {
         eprintln!(
             "[ruthenium] upload check: {} chunks ({:.1} MiB) compared, {} mismatched; ready after {:.2} frames on average; {} texture read-backs ({} rectangles written, {} destroyed before arriving), {} mismatched, {} late; {} retries when full, {} deferred transfer submits, {} images on the transfer queue",
@@ -1250,6 +1408,130 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    })
+}
+
+/// What a route waits for and records of the terrain: whether everything loaded has
+/// its mesh on the GPU, and the numbers of the moment.
+fn terrain_state(renderer: &Renderer) -> Terrain {
+    let Some(s) = renderer.world_stats() else {
+        return Terrain {
+            pending: Some("the world's models and textures are still being prepared".into()),
+            mark: Value::Null,
+        };
+    };
+    let pending = if !renderer.world_ready() {
+        Some(
+            "the block atlas, the light map or the quad indices are on their way to the GPU".into(),
+        )
+    } else if s.dirty + s.jobs_out + s.pending > 0 {
+        Some(format!(
+            "sections are still being built: {} wait for a mesh, {} are with a worker, {} on their way to the GPU",
+            s.dirty, s.jobs_out, s.pending
+        ))
+    } else {
+        None
+    };
+    Terrain {
+        pending,
+        mark: terrain_json(&s),
+    }
+}
+
+/// The terrain's numbers of the moment.
+fn terrain_json(s: &ruthenium_render::WorldStats) -> Value {
+    json!({
+        "sections": s.sections,
+        "meshed": s.meshed,
+        "dirty": s.dirty,
+        "jobs_out": s.jobs_out,
+        "pending": s.pending,
+        "jobs": s.tracker.jobs,
+        "own_change_jobs": s.tracker.urgent_jobs,
+        "stale_results": s.tracker.stale,
+        "jobs_by_cause": ruthenium_render::terrain::CAUSES
+            .iter()
+            .zip(s.tracker.causes)
+            .map(|(name, n)| ((*name).to_owned(), json!(n)))
+            .collect::<serde_json::Map<String, Value>>(),
+        "rescans": s.tracker.rescans,
+        "installed": s.installed,
+        "installed_quads": s.installed_quads,
+        "installed_bytes": s.installed_bytes,
+        "mesh_micros": s.mesh_micros,
+        "slowest_mesh_micros": s.slowest_mesh_micros,
+        "slowest_install_ms": s.slowest_install_ms,
+        "translucent_quads_left_out": s.translucent_quads,
+        "out_of_range": s.out_of_range,
+        "meshes_dropped": s.dropped,
+        "sections_overflowed": s.overflowed,
+        "mesh_bytes": s.mesh_bytes,
+        "tested": s.tested,
+        "visible": s.visible,
+        "quads": s.quads,
+        "draws": s.draws,
+        "calls": s.calls,
+        "binds": s.binds,
+        "pool": {
+            "pages": s.pool.pages,
+            "reserved_bytes": s.pool.reserved_bytes,
+            "payload_bytes": s.pool.payload_bytes,
+            "retiring_bytes": s.pool.retiring_bytes,
+            "alignment_waste": s.pool.alignment_waste,
+            "free_bytes": s.pool.free_bytes,
+            "largest_free": s.pool.largest_free,
+            "live": s.pool.live,
+            "retiring": s.pool.retiring,
+            "failures": s.pool.failures,
+            "failures_with_space": s.pool.failures_with_space,
+            "peak_reserved_bytes": s.pool.peak_reserved_bytes,
+            "peak_payload_bytes": s.pool.peak_payload_bytes,
+            "pages_added": s.pool.pages_added,
+            "pages_released": s.pool.pages_released,
+        },
+    })
+}
+
+/// The terrain and the upload ring as they stand: taken when a route's capture begins
+/// and ends, so that what happened in between is the difference.
+fn capture_state(renderer: &Renderer) -> Value {
+    let u = renderer.upload_stats();
+    json!({
+        "terrain": renderer.world_stats().map(|s| terrain_json(&s)),
+        "uploads": {
+            "render_memcpy_bytes": u.render_memcpy_bytes,
+            "worker_write_bytes": u.worker_write_bytes,
+            "gpu_copies": u.gpu_copies,
+            "gpu_copy_bytes": u.gpu_copy_bytes,
+            "ring_occupied": u.ring_occupied,
+            "ring_peak": u.ring_peak,
+            "oldest_wait": u.oldest_wait,
+            "oldest_reservation_wait": u.oldest_reservation_wait,
+            "copy_submissions": u.copy_submissions,
+            "deferred": u.deferred,
+            "budget_refusals": u.budget_refusals,
+            "reservations": u.reservations,
+            "reservations_refused": u.reservations_refused,
+            "reservations_peak": u.reservations_peak,
+            "worker_bytes_peak": u.worker_bytes_peak,
+        },
+        "memory": {
+            "gpu_only": renderer.gpu().memory_report().gpu_only,
+            "upload": renderer.gpu().memory_report().upload,
+            "dynamic": renderer.gpu().memory_report().dynamic,
+        },
+    })
+}
+
+fn latency_json(l: &ruthenium_render::LatencySummary) -> Value {
+    json!({
+        "samples": l.samples,
+        "p50_ms": l.p50_ms,
+        "p99_ms": l.p99_ms,
+        "max_ms": l.max_ms,
+        "p50_frames": l.p50_frames,
+        "p99_frames": l.p99_frames,
+        "max_frames": l.max_frames,
     })
 }
 

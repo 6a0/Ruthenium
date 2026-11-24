@@ -35,6 +35,9 @@ pub struct InGame {
     focused: bool,
     /// Since when the window has been out of focus.
     unfocused_since: Option<Instant>,
+    /// A route plays ([`crate::route`]): the keyboard and the mouse reach nothing in the
+    /// world, and losing the focus neither lets go of keys nor pauses.
+    scripted: bool,
 }
 
 impl Default for InGame {
@@ -46,11 +49,17 @@ impl Default for InGame {
             binds: KeyBinds::DEFAULT,
             focused: true,
             unfocused_since: None,
+            scripted: false,
         }
     }
 }
 
 impl InGame {
+    /// Hands the input in the world to a route, for good.
+    pub fn set_scripted(&mut self) {
+        self.scripted = true;
+    }
+
     /// The screen closed and the mouse is grabbed again (`grabMouse`).
     pub fn enter(&mut self, session: Option<&Session>) {
         self.motion = MouseMotion::new();
@@ -60,7 +69,7 @@ impl InGame {
     /// A screen opened (`KeyMapping.releaseAll`).
     pub fn release(&mut self, session: Option<&Session>) {
         self.held.release_all();
-        if let Some(s) = session {
+        if let Some(s) = session.filter(|_| !self.scripted) {
             s.set_keys(Default::default());
             s.set_use(false);
             s.set_attack(false);
@@ -70,7 +79,9 @@ impl InGame {
     /// A mouse button went down or up in the world (SDL's numbering: 1 left, 3 right):
     /// the left one attacks, the right one uses.
     pub fn mouse_button(&mut self, button: u8, down: bool, session: Option<&Session>) {
-        let Some(s) = session else { return };
+        let Some(s) = session.filter(|_| !self.scripted) else {
+            return;
+        };
         match button {
             1 => s.set_attack(down),
             3 => s.set_use(down),
@@ -92,13 +103,16 @@ impl InGame {
 
     /// Whether the game should pause: out of focus long enough.
     pub fn should_pause(&self) -> bool {
-        self.unfocused_since
-            .is_some_and(|t| t.elapsed() > PAUSE_AFTER)
+        !self.scripted
+            && self
+                .unfocused_since
+                .is_some_and(|t| t.elapsed() > PAUSE_AFTER)
     }
 
     /// A key went down or up while in the world (not Escape).
     pub fn key(&mut self, scancode: u32, down: bool, session: Option<&Session>) {
         self.held.set(scancode, down);
+        let session = session.filter(|_| !self.scripted);
         // `KeyMapping.click`: every press, repeats too, as vanilla counts them.
         if down
             && let Some(slot) = self.binds.hotbar_slot(scancode)
@@ -125,7 +139,7 @@ impl InGame {
     /// The wheel, as SDL reports it (no natural-scrolling flip, as vanilla reads it).
     pub fn wheel(&mut self, x: f32, y: f32, session: Option<&Session>) {
         if let Some(w) = self.wheel.scrolled(f64::from(x), f64::from(y))
-            && let Some(s) = session
+            && let Some(s) = session.filter(|_| !self.scripted)
         {
             s.scroll(w);
         }
@@ -134,7 +148,7 @@ impl InGame {
     /// The frame's turn of the camera, after its events.
     pub fn frame(&mut self, mouse: &MouseOptions, session: Option<&Session>) {
         let (dx, dy) = self.motion.take();
-        if !self.focused || (dx == 0.0 && dy == 0.0) {
+        if !self.focused || self.scripted || (dx == 0.0 && dy == 0.0) {
             return;
         }
         let (xo, yo) = input::turn_amount(dx, dy, mouse);

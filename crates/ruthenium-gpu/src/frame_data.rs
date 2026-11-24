@@ -1,5 +1,6 @@
 //! Per-frame data: what the CPU writes for one frame and its shaders read (GUI and overlay
-//! quads now; later instance transforms, particles, indirect commands). One host-visible
+//! quads, the world's records; later instance transforms, particles), and the draw
+//! commands of the frame's indirect draws. One host-visible
 //! buffer, in device-local memory where the GPU has some the CPU can write (the BAR window
 //! on discrete GPUs), split into one region per frame in flight. A frame bump-allocates
 //! from its own region, which the frame that last used it has finished with, so writes
@@ -21,6 +22,10 @@ use crate::{Error, VkContext};
 
 /// Descriptor set index of the per-frame data in the shared pipeline layout.
 pub const FRAME_DATA_SET: u32 = 1;
+/// Bytes of one indexed draw command (`VkDrawIndexedIndirectCommand`): the index
+/// count, the instance count, the first index, the vertex offset and the first instance,
+/// a word each.
+pub const DRAW_COMMAND_BYTES: u32 = 20;
 
 /// Stages that read per-frame data.
 const STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
@@ -83,7 +88,7 @@ impl FrameData {
         let buffer = Buffer::new(
             &fd.gpu,
             region * MAX_FRAMES_IN_FLIGHT as u64,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
             MemoryUse::Dynamic,
         )?;
         fd.mapped = buffer.memory.mapped;
@@ -174,6 +179,24 @@ impl FrameData {
             std::slice::from_raw_parts_mut(self.mapped.add(offset as usize), bytes as usize)
         };
         Some(((start / u64::from(size)) as u32, slice))
+    }
+
+    /// Reserves `count` indexed draw commands ([`DRAW_COMMAND_BYTES`] each) for this
+    /// frame: where they start in [`Self::buffer`], in bytes, and the bytes to write
+    /// (once, front to back). `None` if this frame's region is full.
+    pub fn alloc_draw_commands(&mut self, count: u32) -> Option<(u64, &mut [u8])> {
+        let base = self.slot as u64 * self.region;
+        let (first, bytes) = self.alloc(count, DRAW_COMMAND_BYTES)?;
+        Some((
+            base + u64::from(first) * u64::from(DRAW_COMMAND_BYTES),
+            bytes,
+        ))
+    }
+
+    /// The buffer every frame's region is in: what indirect draws read their commands
+    /// from ([`Self::alloc_draw_commands`]).
+    pub fn buffer(&self) -> vk::Buffer {
+        self.buffer.as_ref().map_or(vk::Buffer::null(), |b| b.raw)
     }
 
     /// Binds this frame's region at set 1 for graphics and compute.

@@ -12,7 +12,7 @@ use ruthenium_gpu::{
     Acquired, DeviceCaps, FrameCounters, FrameTimings, GpuTime, MemoryReport, PoolStats,
     PresentPolicy, StreamCheckReport, SwapchainInfo, UploadStats,
 };
-use ruthenium_render::{FrameTimes, Summary};
+use ruthenium_render::{FrameTimes, Summary, WorldTimes};
 use serde_json::{Value, json};
 
 /// The parts of a frame on the main thread, in the order they happen.
@@ -28,7 +28,9 @@ pub const ACQUIRE: usize = 8;
 pub const SUBMIT: usize = 9;
 pub const PRESENT: usize = 10;
 pub const WORK: usize = 11;
-pub const PHASE_COUNT: usize = 12;
+pub const WORLD_STAGE: usize = 12;
+pub const WORLD_DRAW: usize = 13;
+pub const PHASE_COUNT: usize = 14;
 
 /// Their names in the summary and the frame log:
 /// - `limiter`: sleeping to the frame limiter's deadline;
@@ -39,7 +41,10 @@ pub const PHASE_COUNT: usize = 12;
 /// - `record`: the render call, less the five calls that follow;
 /// - `begin_wait`, `recreate`, `acquire`, `submit`, `present`: waiting for the frame
 ///   slot, rebuilding the swapchain, and the three Vulkan calls;
-/// - `work`: events, game, GUI, record and submit: the thread's own work, without waits.
+/// - `work`: events, game, GUI, record and submit: the thread's own work, without waits;
+/// - `world_stage`, `world_draw`: the terrain's part of `record`: taking in what
+///   changed and the finished meshes and staging their uploads; and choosing the
+///   sections in view and recording their draws.
 pub const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "limiter",
     "governor",
@@ -53,7 +58,13 @@ pub const PHASE_NAMES: [&str; PHASE_COUNT] = [
     "submit",
     "present",
     "work",
+    "world_stage",
+    "world_draw",
 ];
+
+/// Frame intervals kept one by one for a route's summary before the list has to grow:
+/// two minutes at 2,000 frames a second.
+const INTERVALS: usize = 1 << 18;
 
 /// Frames the log holds: allocated at once, so logging never allocates in a frame.
 const LOG_FRAMES: usize = 1 << 20;
@@ -97,8 +108,16 @@ fn ns(d: Duration) -> u64 {
 }
 
 impl FrameSample {
-    pub fn new(m: &Marks, t: &FrameTimings, presented: bool, interval_ns: u64) -> FrameSample {
+    pub fn new(
+        m: &Marks,
+        t: &FrameTimings,
+        world: WorldTimes,
+        presented: bool,
+        interval_ns: u64,
+    ) -> FrameSample {
         let mut phases = [0u64; PHASE_COUNT];
+        phases[WORLD_STAGE] = world.stage_ns;
+        phases[WORLD_DRAW] = world.draw_ns;
         phases[LIMITER] = ns(m.governor - m.limiter);
         phases[GOVERNOR] = ns(m.input - m.governor);
         phases[EVENTS] = ns(m.game - m.input);
@@ -145,11 +164,17 @@ pub struct Telemetry {
     log: Option<Vec<FrameSample>>,
     /// Frames the log had no room for.
     unlogged: u64,
+    /// Every measured frame interval in nanoseconds, in order, if they are kept: what a
+    /// route's summary carries, as the vanilla bench client's does.
+    intervals: Option<Vec<u64>>,
 }
 
 impl Telemetry {
-    pub fn new(log: bool) -> Telemetry {
+    /// `log`: keep a line per frame for [`Self::write_log`]. `intervals`: keep every
+    /// measured frame interval for the summary.
+    pub fn new(log: bool, intervals: bool) -> Telemetry {
         Telemetry {
+            intervals: intervals.then(|| Vec::with_capacity(INTERVALS)),
             interval: FrameTimes::unbounded(),
             cpu: FrameTimes::unbounded(),
             gpu: FrameTimes::unbounded(),
@@ -182,6 +207,9 @@ impl Telemetry {
         }
         if s.interval_ns > 0 {
             self.interval.push(s.interval_ns);
+            if let Some(list) = &mut self.intervals {
+                list.push(s.interval_ns);
+            }
         }
         self.cpu.push(s.cpu_ns);
         for (series, &v) in self.phases.iter_mut().zip(&s.phases) {
@@ -291,8 +319,8 @@ impl Telemetry {
             .collect();
         let c = &run.counters;
         let (rss, peak) = process_rss_kib();
-        let v = json!({
-            "version": 2,
+        let mut v = json!({
+            "version": 3,
             "scene": run.scene,
             "gpu": run.caps.name,
             "device": {
@@ -398,6 +426,11 @@ impl Telemetry {
                 })).collect::<Vec<_>>(),
             },
         });
+        v["started_epoch_ms"] = json!(run.started_epoch_ms);
+        v["world"] = json!(run.world);
+        v["route_run"] = json!(run.route_run);
+        v["throttled_frames"] = json!(run.throttled_frames);
+        v["frame_intervals_ns"] = json!(self.intervals);
         format!("{v}\n")
     }
 }
@@ -495,6 +528,15 @@ pub struct RunInfo<'a> {
     pub textures: ruthenium_gpu::TextureTableStats,
     /// The pipeline cache: its interface hash, bytes loaded at start-up, kept in a file.
     pub pipeline_cache: (u64, usize, bool),
+    /// When the process started, in milliseconds since the epoch.
+    pub started_epoch_ms: u64,
+    /// What the terrain, its memory, the uploads and the handoff to the game thread
+    /// did, for a run that drew a world.
+    pub world: Option<Value>,
+    /// The record of the route that was played ([`crate::route`]), if one was.
+    pub route_run: Option<Value>,
+    /// Measured frames that were held back because the window was hidden or covered.
+    pub throttled_frames: u64,
 }
 
 /// What `--adapter-report` writes: everything Ruthenium asked the GPU and what it chose
@@ -670,7 +712,15 @@ mod tests {
 
     #[test]
     fn a_frame_splits_into_its_phases() {
-        let s = FrameSample::new(&marks(Instant::now()), &timings(), true, 600_000);
+        let world = WorldTimes {
+            stage_ns: 7_000,
+            draw_ns: 90_000,
+        };
+        let s = FrameSample::new(&marks(Instant::now()), &timings(), world, true, 600_000);
+        assert_eq!(
+            (s.phases[WORLD_STAGE], s.phases[WORLD_DRAW]),
+            (7_000, 90_000)
+        );
         assert_eq!(s.frame, 7);
         assert_eq!(s.input_ns, 1_400_000);
         assert_eq!(s.cpu_ns, 600_000);
@@ -690,13 +740,21 @@ mod tests {
     #[test]
     fn statistics_start_after_warm_up_and_the_log_takes_gpu_times() {
         let started = Instant::now();
-        let mut t = Telemetry::new(true);
+        let mut t = Telemetry::new(true, true);
         for frame in 5..9 {
             let mut timing = timings();
             timing.frame = frame;
-            let s = FrameSample::new(&marks(started), &timing, frame != 6, 600_000);
+            let s = FrameSample::new(
+                &marks(started),
+                &timing,
+                WorldTimes::default(),
+                frame != 6,
+                600_000 + frame,
+            );
             t.frame(&s, frame >= 7);
         }
+        // Only measured intervals are kept, in order.
+        assert_eq!(t.intervals.as_deref(), Some(&[600_007, 600_008][..]));
         assert_eq!((t.frames, t.skipped), (4, 1));
         // The skipped frame's whole turn of the loop: limiter, governor and the rest.
         assert_eq!(t.skipped_ns, 100_000 + 300_000 + 600_000);
@@ -733,8 +791,14 @@ mod tests {
 
     #[test]
     fn the_summary_is_json_with_every_phase() {
-        let mut t = Telemetry::new(false);
-        let s = FrameSample::new(&marks(Instant::now()), &timings(), true, 600_000);
+        let mut t = Telemetry::new(false, false);
+        let s = FrameSample::new(
+            &marks(Instant::now()),
+            &timings(),
+            WorldTimes::default(),
+            true,
+            600_000,
+        );
         t.frame(&s, true);
         let caps = DeviceCaps {
             name: "A \"quoted\" GPU".into(),
@@ -756,6 +820,10 @@ mod tests {
             memory: MemoryReport::default(),
             textures: ruthenium_gpu::TextureTableStats::default(),
             pipeline_cache: (0xABCD, 0, true),
+            started_epoch_ms: 1_795_000_000_000,
+            world: Some(json!({ "draws": "mdi" })),
+            route_run: None,
+            throttled_frames: 0,
         });
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["device"]["texture_table"], "ordinary");
@@ -784,6 +852,9 @@ mod tests {
         assert_eq!(v["pipeline_cache"]["interface"], "000000000000abcd");
         assert_eq!(v["gpu"], "A \"quoted\" GPU");
         assert_eq!(v["frames_ahead"], 1);
+        assert_eq!(v["world"]["draws"], "mdi");
+        assert_eq!(v["route_run"], Value::Null);
+        assert_eq!(v["frame_intervals_ns"], Value::Null);
         assert_eq!(v["frame"]["samples"], 1);
         for name in PHASE_NAMES {
             assert_eq!(v["phases"][name]["samples"], 1, "{name}");

@@ -100,7 +100,8 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("setup") => parse(&args[1..]).and_then(|o| setup(root, &o)),
         Some("run") => parse(&args[1..]).and_then(|o| run_all(root, &o)),
-        Some("report") => parse_report(&args[1..]).and_then(|(dir, with)| report(root, dir, with)),
+        Some("report") => parse_report(&args[1..])
+            .and_then(|(dir, with, baseline)| report(root, dir, with, baseline)),
         Some("dedicated") => crate::bench_dedicated::run(root, &args[1..]),
         // Internal: keeps a dedicated server from outliving the task that started it.
         Some("supervise") => crate::server::supervise(&args[1..]),
@@ -117,20 +118,25 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
     }
 }
 
-/// `bench report [folder] [--compare <folder>]`.
-fn parse_report(args: &[String]) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
-    let (mut dir, mut compare) = (None, None);
+/// What `bench report` was given: the folder, and those of `--compare` and `--baseline`.
+type ReportFolders = (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>);
+
+/// `bench report [folder] [--compare <folder>] [--baseline <folder>]`.
+fn parse_report(args: &[String]) -> Result<ReportFolders, String> {
+    let (mut dir, mut compare, mut baseline) = (None, None, None);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         if arg == "--compare" {
             compare = Some(PathBuf::from(it.next().ok_or("--compare needs a folder")?));
+        } else if arg == "--baseline" {
+            baseline = Some(PathBuf::from(it.next().ok_or("--baseline needs a folder")?));
         } else if dir.is_none() && !arg.starts_with("--") {
             dir = Some(PathBuf::from(arg));
         } else {
             return Err(format!("unknown argument {arg:?}"));
         }
     }
-    Ok((dir, compare))
+    Ok((dir, compare, baseline))
 }
 
 pub(crate) fn bench_dir(root: &Path) -> PathBuf {
@@ -440,7 +446,7 @@ fn run_all(root: &Path, o: &Options) -> Result<(), String> {
         }
     }
     println!("bench: results in {}", dir.display());
-    report(root, Some(dir), None)
+    report(root, Some(dir), None, None)
 }
 
 fn command_line(cmd: &str, args: &[&str]) -> Option<String> {
@@ -654,11 +660,13 @@ pub(crate) fn result_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
 
 /// Prints Markdown: one row per backend and scene (median over repetitions),
 /// then every run. A folder of dedicated-server runs is printed by
-/// [`crate::bench_dedicated::report`], next to the integrated-server runs of `compare`.
+/// [`crate::bench_dedicated::report`], next to the integrated-server runs of `compare`
+/// and, for Ruthenium's runs, the recorded vanilla runs of `baseline`.
 pub(crate) fn report(
     root: &Path,
     dir: Option<PathBuf>,
     compare: Option<PathBuf>,
+    baseline: Option<PathBuf>,
 ) -> Result<(), String> {
     let dir = match dir {
         Some(d) => d,
@@ -666,10 +674,10 @@ pub(crate) fn report(
     };
     let rows = load_rows(&dir)?;
     if crate::bench_dedicated::is_dedicated(&dir) {
-        return crate::bench_dedicated::report(root, &dir, &rows, compare);
+        return crate::bench_dedicated::report(root, &dir, &rows, compare, baseline);
     }
-    if compare.is_some() {
-        return Err("--compare is for a folder of dedicated-server runs".into());
+    if compare.is_some() || baseline.is_some() {
+        return Err("--compare and --baseline are for a folder of dedicated-server runs".into());
     }
     let f = |v: &Value, k: &str| v[k].as_f64().unwrap_or(f64::NAN);
     let mut devices: Vec<String> = rows

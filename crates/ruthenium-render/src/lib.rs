@@ -24,7 +24,9 @@ pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
 pub use stats::{FrameTimes, Summary};
 pub use table_check::TableCheckReport;
-pub use terrain::{CameraPose, WorldAssets, WorldStats};
+pub use terrain::{
+    CameraPose, LatencySummary, TerrainDraws, WorldAssets, WorldLatencies, WorldStats,
+};
 pub use terrain_check::TerrainCheckReport;
 pub use terrain_vertex::{TERRAIN_VERTEX_CANDIDATES, VertexCandidate};
 
@@ -96,6 +98,16 @@ impl Background {
     }
 }
 
+/// The render thread's time for the terrain in one frame, in nanoseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorldTimes {
+    /// Taking in what changed in the level and the finished meshes, staging their
+    /// uploads, handing out jobs and putting arrived meshes in place.
+    pub stage_ns: u64,
+    /// Choosing the sections in view, writing their records and recording their draws.
+    pub draw_ns: u64,
+}
+
 /// The world as one frame draws it.
 #[derive(Debug, Clone, Copy)]
 pub struct WorldFrame<'a> {
@@ -143,6 +155,10 @@ pub struct Renderer {
     world: Option<WorldRenderer>,
     /// The depth image of the passes the world is drawn in, the size of the window.
     depth: Option<DepthTarget>,
+    /// How the terrain's sections are to be drawn, for the world once it is loaded.
+    terrain_draws: TerrainDraws,
+    /// The terrain's part of the last frame.
+    world_times: WorldTimes,
     /// The number of the last frame recorded.
     last_frame: u64,
     frame_data: FrameData,
@@ -234,6 +250,8 @@ impl Renderer {
             uploads,
             world: None,
             depth: None,
+            terrain_draws: TerrainDraws::default(),
+            world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
             overlay: Overlay::new(),
@@ -271,8 +289,55 @@ impl Renderer {
                 assets,
                 workers,
             )?);
+            self.set_terrain_draws(self.terrain_draws);
         }
         Ok(())
+    }
+
+    /// Asks for the terrain's sections to be drawn this way. A GPU that cannot draw
+    /// several commands in one call draws a page at a time instead, and says so once.
+    pub fn set_terrain_draws(&mut self, draws: TerrainDraws) {
+        self.terrain_draws = draws;
+        if let Some(w) = &mut self.world {
+            let actual = w.set_draws(draws);
+            if actual != draws {
+                eprintln!(
+                    "[render] this GPU has no multi-draw indirect with a first instance: the terrain is drawn {} instead",
+                    actual.name()
+                );
+            }
+        }
+    }
+
+    /// How the terrain's sections are drawn (what was asked for until a world is
+    /// loaded).
+    pub fn terrain_draws(&self) -> TerrainDraws {
+        self.world
+            .as_ref()
+            .map_or(self.terrain_draws, WorldRenderer::draws)
+    }
+
+    /// The terrain's part of the render thread's time in the last frame.
+    pub fn world_times(&self) -> WorldTimes {
+        self.world_times
+    }
+
+    /// From a change to the frame that shows it, for the meshes installed since the
+    /// last [`Self::reset_world_latencies`].
+    pub fn world_latencies(&self) -> Option<WorldLatencies> {
+        self.world.as_ref().map(WorldRenderer::latencies)
+    }
+
+    /// Forgets the latencies so far (a measurement begins).
+    pub fn reset_world_latencies(&mut self) {
+        if let Some(w) = &mut self.world {
+            w.reset_latencies();
+        }
+    }
+
+    /// The upload ring's counters, and how full it is now.
+    pub fn upload_stats(&self) -> ruthenium_gpu::UploadStats {
+        self.uploads.stats()
     }
 
     /// Whether the world's assets are loaded ([`Self::load_world`]).
@@ -619,8 +684,10 @@ impl Renderer {
         self.update_backdrop(wants_backdrop, surface);
         // The world's work that stages uploads, before the frame's copies are recorded:
         // what changed in the level, finished meshes, new jobs.
+        self.world_times = WorldTimes::default();
         let view = match (&world, surface, &mut self.world) {
             (Some(w), Some(s), Some(renderer)) => {
+                let started = std::time::Instant::now();
                 let section = w.camera.position.map(|c| (c.floor() as i32) >> 4);
                 renderer.set_shades(w.environment.cardinal_light.shades());
                 renderer.update(
@@ -631,6 +698,7 @@ impl Renderer {
                     LightmapInputs::of(w.environment),
                     ctx.number,
                 );
+                self.world_times.stage_ns = started.elapsed().as_nanos() as u64;
                 let aspect = s.extent.width as f32 / s.extent.height.max(1) as f32;
                 Some((View::new(&w.camera, aspect), sky_colour(w.environment)))
             }
@@ -664,7 +732,9 @@ impl Renderer {
         }
         // The meshes whose copies this frame may read take their sections' places.
         if let (Some(w), Some(renderer)) = (&world, &mut self.world) {
+            let started = std::time::Instant::now();
             renderer.install_ready(w.scene, &self.uploads, ctx.number);
+            self.world_times.stage_ns += started.elapsed().as_nanos() as u64;
         }
         // The world is drawn once everything its draws read has arrived.
         let view = view.filter(|_| {
@@ -733,6 +803,11 @@ impl Renderer {
             )?;
             self.frames.zone_end(&ctx, zone);
         }
+        // The terrain check draws as the terrain is asked to be drawn, where the GPU can.
+        let indirect_check = self.terrain_draws == TerrainDraws::Indirect && {
+            let o = gpu.caps().optional;
+            o.multi_draw_indirect && o.draw_indirect_first_instance
+        };
         if let Some(c) = &mut self.terrain_check {
             let zone = self.frames.zone_begin(&ctx, "terrain check");
             c.step(
@@ -743,6 +818,7 @@ impl Renderer {
                 &self.uploads,
                 &mut self.frame_data,
                 &self.pipelines,
+                indirect_check,
             )?;
             self.frames.zone_end(&ctx, zone);
         }
@@ -808,7 +884,9 @@ impl Renderer {
                 // copy it.
                 match (in_window, &mut self.world, backdrop) {
                     (Some((view, ..)), Some(renderer), _) => {
+                        let started = std::time::Instant::now();
                         renderer.draw(&mut pass, &mut self.frame_data, view);
+                        self.world_times.draw_ns = started.elapsed().as_nanos() as u64;
                     }
                     (_, _, Some((scene, _))) => pass.draw(
                         PipelineId::Blur.index(),

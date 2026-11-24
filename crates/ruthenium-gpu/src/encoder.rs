@@ -6,8 +6,9 @@
 //! It wraps what the menus and the world draw: full-target passes into the window, into a
 //! render-target texture of the table or into a read-back target, each with a depth
 //! attachment or without; draws that pull everything from push constants, the frame's
-//! data and the texture table; and indexed draws from a vertex buffer. Indirect draws
-//! come with their first user.
+//! data and the texture table; indexed draws from a vertex buffer; and many of those in
+//! one call, their commands read from the frame's data (multi-draw indirect, where the
+//! GPU has it).
 
 use std::sync::Arc;
 
@@ -29,6 +30,10 @@ pub(crate) const DEPTH_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2
     vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
         | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
 );
+
+/// The most draws one indirect call may issue: what every GPU with multi-draw indirect
+/// takes at least (`maxDrawIndirectCount`'s required minimum).
+pub const MAX_INDIRECT_DRAWS: u32 = (1 << 16) - 1;
 
 /// Records the passes of one frame. See the module docs.
 pub struct Encoder<'f> {
@@ -555,6 +560,56 @@ impl Pass<'_> {
                 first_index,
                 vertex_offset,
                 instance,
+            );
+        }
+    }
+
+    /// Draws `count` indexed draws in one call, their commands read from `commands` at
+    /// `offset` ([`crate::FrameData::alloc_draw_commands`]), with pipeline `pipeline` and
+    /// `push` as its push constants (none: those set last stay). Each command is one
+    /// [`Self::draw_indexed`]: its first instance is the number the shaders read.
+    ///
+    /// # Safety
+    /// As [`Self::draw_indexed`], for every command; the `count` commands were written
+    /// this frame and `commands` is alive until the frame has finished.
+    ///
+    /// # Panics
+    /// As [`Self::draw_indexed`]; or if the GPU cannot draw several commands in a call,
+    /// or commands that start at another instance than the first
+    /// ([`crate::OptionalFeatures`]); or if `count` is more than every GPU that can
+    /// takes ([`MAX_INDIRECT_DRAWS`]).
+    pub unsafe fn draw_indexed_indirect(
+        &mut self,
+        pipeline: usize,
+        push: &[u8],
+        commands: vk::Buffer,
+        offset: u64,
+        count: u32,
+    ) {
+        assert!(
+            push.len() <= PUSH_CONSTANT_BYTES as usize && push.len().is_multiple_of(4),
+            "{} bytes of push constants",
+            push.len()
+        );
+        assert!(
+            self.pipelines.has_vertex_input(pipeline),
+            "pipeline {pipeline} reads no vertex buffer"
+        );
+        let optional = self.gpu.caps().optional;
+        assert!(
+            optional.multi_draw_indirect && optional.draw_indirect_first_instance,
+            "this GPU has no multi-draw indirect with a first instance"
+        );
+        assert!(count <= MAX_INDIRECT_DRAWS, "{count} draws in one call");
+        // SAFETY: as in `draw`; the commands are the caller's guarantee.
+        unsafe {
+            self.bind(pipeline, push);
+            self.gpu.device.cmd_draw_indexed_indirect(
+                self.ctx.cmd,
+                commands,
+                offset,
+                count,
+                crate::DRAW_COMMAND_BYTES,
             );
         }
     }

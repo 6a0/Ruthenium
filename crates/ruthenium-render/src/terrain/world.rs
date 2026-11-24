@@ -23,9 +23,9 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use ruthenium_gpu::{
-    BufferPool, Error, FrameData, Gpu, Pass, PoolConfig, PoolError, PoolStats, RangeHandle,
-    Reservation, ReservationState, StagingWriter, TextureDesc, TextureId, TextureTable,
-    UploadError, UploadRing, UploadTicket, Urgency, Users, vk,
+    BufferPool, DRAW_COMMAND_BYTES, Error, FrameData, Gpu, MAX_INDIRECT_DRAWS, Pass, PoolConfig,
+    PoolError, PoolStats, RangeHandle, Reservation, ReservationState, StagingWriter, TextureDesc,
+    TextureId, TextureTable, UploadError, UploadRing, UploadTicket, Urgency, Users, vk,
 };
 use ruthenium_shaders::interface::{SECTION, WORLD, WORLD_MATRIX};
 use ruthenium_sim::scene::{Scene, SectionKey, Stamp};
@@ -34,7 +34,7 @@ use super::camera::View;
 use super::lightmap::{self, LightmapInputs};
 use super::mesher::{MeshOptions, Mesher, SectionMesh};
 use super::table::BlockTable;
-use super::tracker::{Job, Tracker, TrackerStats};
+use super::tracker::{Job, Since, Tracker, TrackerStats};
 use crate::pipelines::PipelineId;
 use crate::terrain_vertex::VERTEX_BYTES;
 
@@ -58,6 +58,121 @@ const WORKER_STAGING_BYTES: u64 = 8 << 20;
 const MAX_PENDING: usize = 48;
 /// Jobs out per worker.
 const JOBS_PER_WORKER: usize = 2;
+
+/// How a frame's sections are drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerrainDraws {
+    /// One indexed draw a section and layer, strictly nearest first: the vertex buffer
+    /// is bound again whenever the next section is in another page.
+    #[default]
+    Direct,
+    /// One indexed draw a section and layer, a buffer page at a time: the pages by
+    /// their nearest section, each page's sections nearest first.
+    Paged,
+    /// In that order, with one call a page and layer that reads the draws as commands
+    /// from the frame's data (multi-draw indirect built on the CPU).
+    Indirect,
+}
+
+impl TerrainDraws {
+    pub fn name(self) -> &'static str {
+        match self {
+            TerrainDraws::Direct => "direct",
+            TerrainDraws::Paged => "paged",
+            TerrainDraws::Indirect => "mdi",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<TerrainDraws> {
+        [
+            TerrainDraws::Direct,
+            TerrainDraws::Paged,
+            TerrainDraws::Indirect,
+        ]
+        .into_iter()
+        .find(|d| d.name() == name)
+    }
+}
+
+/// Latencies kept for a summary at most; later ones are only counted.
+const LATENCY_SAMPLES: usize = 1 << 16;
+
+/// From the render thread learning that a section changed to the first frame that draws
+/// the mesh made of the change: as time and as frames (0: the same frame).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LatencySummary {
+    pub samples: u64,
+    pub p50_ms: f32,
+    pub p99_ms: f32,
+    pub max_ms: f32,
+    pub p50_frames: u32,
+    pub p99_frames: u32,
+    pub max_frames: u32,
+}
+
+/// The latencies of the meshes installed since the last [`WorldRenderer::reset_latencies`],
+/// by what the mesh was for.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WorldLatencies {
+    /// A section's first mesh, from the moment the chunks around it were there.
+    pub first: LatencySummary,
+    /// A change that came from the server.
+    pub changed: LatencySummary,
+    /// The player's own change.
+    pub own: LatencySummary,
+}
+
+#[derive(Debug)]
+struct LatencySeries {
+    /// Microseconds and frames.
+    samples: Vec<(u32, u32)>,
+    count: u64,
+}
+
+impl LatencySeries {
+    fn new() -> LatencySeries {
+        LatencySeries {
+            samples: Vec::with_capacity(LATENCY_SAMPLES),
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, since: Since, frame: u64) {
+        self.count += 1;
+        if self.samples.len() < LATENCY_SAMPLES {
+            let micros = since.at.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+            let frames = frame.saturating_sub(since.frame).min(u64::from(u32::MAX)) as u32;
+            self.samples.push((micros, frames));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.samples.clear();
+        self.count = 0;
+    }
+
+    fn summary(&self) -> LatencySummary {
+        if self.samples.is_empty() {
+            return LatencySummary::default();
+        }
+        // Nearest rank.
+        let at = |sorted: &[u32], p: usize| sorted[(sorted.len() * p).div_ceil(100).max(1) - 1];
+        let mut micros: Vec<u32> = self.samples.iter().map(|s| s.0).collect();
+        let mut frames: Vec<u32> = self.samples.iter().map(|s| s.1).collect();
+        micros.sort_unstable();
+        frames.sort_unstable();
+        let ms = |us: u32| us as f32 / 1e3;
+        LatencySummary {
+            samples: self.count,
+            p50_ms: ms(at(&micros, 50)),
+            p99_ms: ms(at(&micros, 99)),
+            max_ms: ms(at(&micros, 100)),
+            p50_frames: at(&frames, 50),
+            p99_frames: at(&frames, 99),
+            max_frames: at(&frames, 100),
+        }
+    }
+}
 
 /// What the client prepares when a world is entered: every block state's model and
 /// rules, and the block atlas's levels as RGBA8 (level 0 first).
@@ -114,6 +229,8 @@ struct Meshed {
     stamp: Stamp,
     mesh: SectionMesh,
     urgent: bool,
+    first: bool,
+    since: Since,
     micros: u64,
 }
 
@@ -212,6 +329,8 @@ fn work(
                     stamp: job.neighbourhood.stamp().clone(),
                     mesh,
                     urgent: job.urgent,
+                    first: job.first,
+                    since: job.since,
                     micros: started.elapsed().as_micros() as u64,
                 };
                 if results.send(done).is_err() {
@@ -244,6 +363,9 @@ enum Stage {
 struct Pending {
     stamp: Stamp,
     urgent: bool,
+    first: bool,
+    /// When the change it shows was known.
+    known: Since,
     bytes: u64,
     solid_quads: u32,
     cutout_quads: u32,
@@ -288,14 +410,19 @@ pub struct WorldStats {
     /// Meshes that found no room in the pool's budget, or were larger than a page.
     pub dropped: u64,
     /// The last frame: sections tested against the view, sections drawn, their quads,
-    /// the draws issued and the vertex buffers bound.
+    /// the draws issued, the calls that issued them (as many, unless one call issues
+    /// several) and the vertex buffers bound.
     pub tested: u32,
     pub visible: u32,
     pub quads: u64,
     pub draws: u32,
+    pub calls: u32,
     pub binds: u32,
     /// Sections a frame could not draw because its data had no room for their records.
     pub overflowed: u64,
+    /// The bytes of the meshes that are drawn: what the pool's payload comes to but
+    /// for the quad indices and the meshes on their way in or out.
+    pub mesh_bytes: u64,
     pub pool: PoolStats,
 }
 
@@ -319,10 +446,40 @@ pub(crate) struct WorldRenderer {
     pending: Vec<Pending>,
     removed: Vec<MeshRange>,
     visible: Vec<Visible>,
+    /// How the sections are drawn, and whether the GPU can draw them indirectly.
+    draws: TerrainDraws,
+    indirect: bool,
+    /// Scratch of [`Self::draw`]: each page's nearest section and then its place in the
+    /// order of pages; a layer's draw commands; and the calls that read them (a vertex
+    /// buffer, its first command and how many).
+    page_order: Vec<i64>,
+    commands: Vec<u8>,
+    calls: Vec<(vk::Buffer, u32, u32)>,
+    latencies: [LatencySeries; 3],
     options: MeshOptions,
     stats: WorldStats,
     warned_dropped: bool,
     warned_envelope: bool,
+}
+
+/// The series of [`WorldLatencies`], in its fields' order.
+const FIRST: usize = 0;
+const CHANGED: usize = 1;
+const OWN: usize = 2;
+
+/// One indexed draw command of a single instance, as the GPU reads it.
+pub(crate) fn draw_command(
+    indices: u32,
+    vertex_offset: i32,
+    instance: u32,
+) -> [u8; DRAW_COMMAND_BYTES as usize] {
+    let mut out = [0u8; DRAW_COMMAND_BYTES as usize];
+    out[0..4].copy_from_slice(&indices.to_ne_bytes());
+    out[4..8].copy_from_slice(&1u32.to_ne_bytes());
+    // The first index: every draw starts at the shared quad indices' beginning.
+    out[12..16].copy_from_slice(&vertex_offset.to_ne_bytes());
+    out[16..20].copy_from_slice(&instance.to_ne_bytes());
+    out
 }
 
 impl std::fmt::Debug for WorldRenderer {
@@ -445,6 +602,19 @@ impl WorldRenderer {
             pending: Vec::new(),
             removed: Vec::new(),
             visible: Vec::new(),
+            draws: TerrainDraws::default(),
+            indirect: {
+                let o = gpu.caps().optional;
+                o.multi_draw_indirect && o.draw_indirect_first_instance
+            },
+            page_order: Vec::new(),
+            commands: Vec::new(),
+            calls: Vec::new(),
+            latencies: [
+                LatencySeries::new(),
+                LatencySeries::new(),
+                LatencySeries::new(),
+            ],
             options: MeshOptions {
                 shades: [0.5, 1.0, 0.8, 0.8, 0.6, 0.6],
                 cutout_leaves: true,
@@ -461,6 +631,45 @@ impl WorldRenderer {
         self.workers.stop();
     }
 
+    /// Asks for the sections to be drawn this way; a GPU without multi-draw indirect
+    /// draws them a page at a time instead. Returns the way they will be drawn.
+    pub fn set_draws(&mut self, draws: TerrainDraws) -> TerrainDraws {
+        self.draws = match draws {
+            TerrainDraws::Indirect if !self.indirect => TerrainDraws::Paged,
+            other => other,
+        };
+        self.draws
+    }
+
+    pub fn draws(&self) -> TerrainDraws {
+        self.draws
+    }
+
+    /// The latencies of the meshes installed since the last reset.
+    pub fn latencies(&self) -> WorldLatencies {
+        WorldLatencies {
+            first: self.latencies[FIRST].summary(),
+            changed: self.latencies[CHANGED].summary(),
+            own: self.latencies[OWN].summary(),
+        }
+    }
+
+    /// Forgets the latencies so far (a measurement begins).
+    pub fn reset_latencies(&mut self) {
+        for l in &mut self.latencies {
+            l.clear();
+        }
+    }
+
+    fn note_latency(&mut self, urgent: bool, first: bool, since: Since, frame: u64) {
+        let series = match (urgent, first) {
+            (true, _) => OWN,
+            (false, true) => FIRST,
+            (false, false) => CHANGED,
+        };
+        self.latencies[series].push(since, frame);
+    }
+
     pub fn stats(&self) -> WorldStats {
         let (sections, meshed, dirty) = self.tracker.counts();
         WorldStats {
@@ -470,6 +679,11 @@ impl WorldRenderer {
             tracker: self.tracker.stats(),
             jobs_out: self.jobs_out,
             pending: self.pending.len(),
+            mesh_bytes: self
+                .tracker
+                .meshes()
+                .map(|(_, m)| u64::from(m.solid_quads + m.cutout_quads) * 4 * VERTEX_BYTES as u64)
+                .sum(),
             pool: self.pool.stats(),
             ..self.stats
         }
@@ -572,6 +786,10 @@ impl WorldRenderer {
                 .upload_buffer(range.buffer, range.offset, &quad_indices())
                 .ok();
         }
+        self.tracker.set_clock(Since {
+            at: Instant::now(),
+            frame,
+        });
         self.tracker.sync(scene, &mut self.removed);
         for m in self.removed.drain(..) {
             self.pool.retire(m.handle, Users::until_frame(frame));
@@ -590,6 +808,7 @@ impl WorldRenderer {
             let Some(bounds) = done.mesh.bounds else {
                 // Nothing to draw there: that is its mesh.
                 self.note_installed(&done.mesh, 0, Instant::now());
+                self.note_latency(done.urgent, done.first, done.since, frame);
                 if let Some(old) = self.tracker.install(done.stamp, None) {
                     self.pool.retire(old.handle, Users::until_frame(frame));
                 }
@@ -600,6 +819,8 @@ impl WorldRenderer {
             self.pending.push(Pending {
                 stamp: done.stamp,
                 urgent: done.urgent,
+                first: done.first,
+                known: done.since,
                 bytes: done.mesh.vertices.len() as u64,
                 solid_quads: done.mesh.solid_quads,
                 cutout_quads: done.mesh.cutout_quads,
@@ -767,6 +988,7 @@ impl WorldRenderer {
                 .stats
                 .slowest_install_ms
                 .max(p.since.elapsed().as_secs_f32() * 1e3);
+            self.note_latency(p.urgent, p.first, p.known, frame);
             if let Some(old) = self.tracker.install(p.stamp, Some(mesh)) {
                 // Frames up to the one before this may have drawn it.
                 self.pool.retire(old.handle, Users::until_frame(frame));
@@ -831,10 +1053,35 @@ impl WorldRenderer {
         self.stats.visible = 0;
         self.stats.quads = 0;
         self.stats.draws = 0;
+        self.stats.calls = 0;
         self.stats.binds = 0;
-        // Nearest first: what is behind fails the depth test before it is shaded.
-        self.visible
-            .sort_unstable_by_key(|v| (v.distance, v.mesh.page, v.mesh.first_vertex));
+        match self.draws {
+            // Nearest first: what is behind fails the depth test before it is shaded.
+            TerrainDraws::Direct => self
+                .visible
+                .sort_unstable_by_key(|v| (v.distance, v.mesh.page, v.mesh.first_vertex)),
+            // A page at a time, the page with the nearest section first, and nearest
+            // first within a page.
+            TerrainDraws::Paged | TerrainDraws::Indirect => {
+                let nearest = &mut self.page_order;
+                nearest.clear();
+                for v in &self.visible {
+                    let page = v.mesh.page as usize;
+                    if nearest.len() <= page {
+                        nearest.resize(page + 1, i64::MAX);
+                    }
+                    nearest[page] = nearest[page].min(v.distance);
+                }
+                self.visible.sort_unstable_by_key(|v| {
+                    (
+                        nearest[v.mesh.page as usize],
+                        v.mesh.page,
+                        v.distance,
+                        v.mesh.first_vertex,
+                    )
+                });
+            }
+        }
         let (Some(lightmap), Some(indices)) = (self.lightmap, self.pool.resolve(self.indices))
         else {
             return;
@@ -864,11 +1111,13 @@ impl WorldRenderer {
         }
         let push = terrain_push(world, matrix, first);
         self.stats.visible = count as u32;
+        let indirect = self.draws == TerrainDraws::Indirect;
         // SAFETY: the push constants are terrain.vert's and the records they point at
         // were written just above; the atlas and the light map are textures of the
         // table that have arrived (the caller's guarantee), as have the indices; every
         // mesh drawn was installed only once its copy could be read, and draws no more
-        // vertices than were copied.
+        // vertices than were copied; the draw commands are written into this frame's
+        // data before the calls that read them.
         unsafe {
             pass.bind_index_buffer(indices.buffer, indices.offset);
             for (pipeline, cutout) in [
@@ -877,6 +1126,8 @@ impl WorldRenderer {
             ] {
                 let mut bound = None;
                 let mut pushed = false;
+                self.commands.clear();
+                self.calls.clear();
                 for (instance, v) in self.visible[..count].iter().enumerate() {
                     let (mut quads, mut first_vertex) = if cutout {
                         (
@@ -890,26 +1141,73 @@ impl WorldRenderer {
                         continue;
                     }
                     if bound != Some(v.mesh.page) {
-                        pass.bind_vertex_buffer(v.mesh.buffer, 0);
                         bound = Some(v.mesh.page);
                         self.stats.binds += 1;
+                        if indirect {
+                            let next = self.commands.len() as u32 / DRAW_COMMAND_BYTES;
+                            self.calls.push((v.mesh.buffer, next, 0));
+                        } else {
+                            pass.bind_vertex_buffer(v.mesh.buffer, 0);
+                        }
                     }
                     self.stats.quads += u64::from(quads);
                     // More quads than 16-bit indices reach: in several draws.
                     while quads > 0 {
                         let n = quads.min(QUADS_PER_DRAW);
-                        pass.draw_indexed(
-                            pipeline.index(),
-                            if pushed { &[] } else { &push },
-                            n * 6,
-                            0,
-                            first_vertex as i32,
-                            instance as u32,
-                        );
-                        pushed = true;
+                        if indirect {
+                            self.commands.extend_from_slice(&draw_command(
+                                n * 6,
+                                first_vertex as i32,
+                                instance as u32,
+                            ));
+                            if let Some(call) = self.calls.last_mut() {
+                                call.2 += 1;
+                            }
+                        } else {
+                            pass.draw_indexed(
+                                pipeline.index(),
+                                if pushed { &[] } else { &push },
+                                n * 6,
+                                0,
+                                first_vertex as i32,
+                                instance as u32,
+                            );
+                            pushed = true;
+                            self.stats.calls += 1;
+                        }
                         self.stats.draws += 1;
                         quads -= n;
                         first_vertex += n * 4;
+                    }
+                }
+                if !indirect || self.commands.is_empty() {
+                    continue;
+                }
+                let commands = self.commands.len() as u32 / DRAW_COMMAND_BYTES;
+                let Some((offset, bytes)) = frame_data.alloc_draw_commands(commands) else {
+                    // No room for the layer's commands: it is not drawn this frame.
+                    self.stats.overflowed += u64::from(commands);
+                    self.stats.draws -= commands;
+                    continue;
+                };
+                bytes.copy_from_slice(&self.commands);
+                let buffer = frame_data.buffer();
+                for &(vertices, first_command, draws) in &self.calls {
+                    pass.bind_vertex_buffer(vertices, 0);
+                    let mut done = 0;
+                    while done < draws {
+                        let n = (draws - done).min(MAX_INDIRECT_DRAWS);
+                        pass.draw_indexed_indirect(
+                            pipeline.index(),
+                            if pushed { &[] } else { &push },
+                            buffer,
+                            offset
+                                + u64::from(first_command + done) * u64::from(DRAW_COMMAND_BYTES),
+                            n,
+                        );
+                        pushed = true;
+                        self.stats.calls += 1;
+                        done += n;
                     }
                 }
             }
