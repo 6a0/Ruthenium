@@ -336,6 +336,7 @@ pub struct HudText<'a> {
     pub drawn: bool,
     /// Show the readout over a drawn world too (with the frame statistics).
     pub debug: bool,
+    pub crosshair: bool,
 }
 
 pub fn draw_hud(
@@ -353,31 +354,34 @@ pub fn draw_hud(
         server,
         drawn,
         debug,
+        crosshair,
     } = hud;
     let (cx, cy) = (scale.width / 2.0, scale.height / 2.0);
     let white = [1.0, 1.0, 1.0, 0.9];
-    shapes.rounded(
-        scale,
-        Rect {
-            x: cx - 9.0,
-            y: cy - 1.0,
-            w: 18.0,
-            h: 2.0,
-        },
-        1.0,
-        white,
-    );
-    shapes.rounded(
-        scale,
-        Rect {
-            x: cx - 1.0,
-            y: cy - 9.0,
-            w: 2.0,
-            h: 18.0,
-        },
-        1.0,
-        white,
-    );
+    if crosshair {
+        shapes.rounded(
+            scale,
+            Rect {
+                x: cx - 9.0,
+                y: cy - 1.0,
+                w: 18.0,
+                h: 2.0,
+            },
+            1.0,
+            white,
+        );
+        shapes.rounded(
+            scale,
+            Rect {
+                x: cx - 1.0,
+                y: cy - 9.0,
+                w: 2.0,
+                h: 18.0,
+            },
+            1.0,
+            white,
+        );
+    }
     let Some(atlas) = atlas else { return };
     // Over a drawn world there is only the crosshair, unless the statistics are on.
     if drawn && !debug {

@@ -31,12 +31,13 @@ use crate::player::{Env, LocalPlayer};
 use crate::predict::Predictions;
 use crate::world::Level;
 
-/// How an action went, as far as the client acts on it (`InteractionResult`; the
-/// swing is the server's to show, and isn't a packet in 26.3).
+/// The local outcome of an interaction, including who starts its swing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// `Success` (also `CONSUME` and `SUCCESS_SERVER`): the click is used up.
+    /// Successful with a predicted swing.
     Success,
+    /// Consumes the click without starting a local swing (CONSUME or SUCCESS_SERVER).
+    Consume,
     Fail,
     Pass,
     /// `TRY_WITH_EMPTY_HAND`: a block's `useItemOn` has nothing for the item, and
@@ -47,7 +48,7 @@ pub enum Outcome {
 impl Outcome {
     /// `consumesAction`.
     pub fn consumes_action(self) -> bool {
-        self == Outcome::Success
+        matches!(self, Outcome::Success | Outcome::Consume)
     }
 }
 
@@ -355,6 +356,7 @@ impl GameMode {
                 0,
             ));
             p.on_attack();
+            p.swing(Hand::Main, held.c.attack_swing());
             return true;
         }
         match *hit {
@@ -380,6 +382,7 @@ impl GameMode {
                 p.reset_attack_strength_ticker();
             }
         }
+        p.swing(Hand::Main, held.c.attack_swing());
         out.push(play::punch());
         end_attack
     }
@@ -416,6 +419,8 @@ impl GameMode {
         match *hit {
             HitResult::Block(ref b) if down && !b.miss => {
                 if !w.is_air(b.pos) && self.continue_destroy_block(p, w, b.pos, b.direction, out) {
+                    let swing = p.hand(Hand::Main).c.attack_swing();
+                    p.swing(Hand::Main, swing);
                     out.push(play::punch());
                 }
             }
@@ -670,19 +675,43 @@ impl GameMode {
                         let rideable = e.rideable_interaction(p.secondary_use());
                         let outcome =
                             self.interact(p, id, e.entity_type, e.position, location, hand, out);
-                        if outcome == Outcome::Success || rideable == Some(true) && !p.spectator {
+                        if outcome == Outcome::Success {
+                            p.swing(hand, held.c.interact_swing());
+                        }
+                        if outcome.consumes_action() || rideable == Some(true) && !p.spectator {
                             return;
                         }
                     }
                 }
-                HitResult::Block(ref b) if !b.miss => match self.use_item_on(p, w, hand, b, out) {
-                    Outcome::Success | Outcome::Fail => return,
-                    Outcome::Pass | Outcome::TryEmptyHand => {}
-                },
+                HitResult::Block(ref b) if !b.miss => {
+                    let count = held.count;
+                    match self.use_item_on(p, w, hand, b, out) {
+                        Outcome::Success => {
+                            // The hand swings, and comes up anew with what is left of
+                            // what it held (or with all of it, where nothing is used
+                            // up).
+                            p.swing(hand, held.c.interact_swing());
+                            let now = p.hand(hand);
+                            if !now.is_empty() && (now.count != count || p.abilities.instabuild) {
+                                p.first_person.item_used(hand == Hand::Off);
+                            }
+                            return;
+                        }
+                        Outcome::Consume | Outcome::Fail => return,
+                        Outcome::Pass | Outcome::TryEmptyHand => {}
+                    }
+                }
                 HitResult::Block(_) => {}
             }
-            if !held.is_empty() && self.use_item(p, w, hand, out) == Outcome::Success {
-                return;
+            if !held.is_empty() {
+                let result = self.use_item(p, w, hand, out);
+                if result.consumes_action() {
+                    if result == Outcome::Success {
+                        p.swing(hand, held.c.interact_swing());
+                    }
+                    p.first_person.item_used(hand == Hand::Off);
+                    return;
+                }
             }
         }
     }
@@ -718,7 +747,7 @@ impl GameMode {
             .map_or("", EntityType::name);
         let held = p.hand(hand);
         if name == "minecraft:armor_stand" && held.c.name != "minecraft:name_tag" {
-            return Outcome::Success;
+            return Outcome::Consume;
         }
         Outcome::Pass
     }
@@ -852,7 +881,7 @@ fn stack_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> Outcome {
     let before = p.hand(hand).copy();
     let instantly = before.c.use_duration <= 0;
     let (result, transformed) = item_use(p, w, hand);
-    if result == Outcome::Success {
+    if result.consumes_action() {
         if let Some(t) = transformed {
             p.inventory.set_hand(hand, t);
         }
@@ -869,6 +898,7 @@ fn item_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> (Outcome, Opt
     let stack = p.hand(hand).clone();
     let infinite = p.infinite_materials();
     let ok = (Outcome::Success, None);
+    let consume = (Outcome::Consume, None);
     match stack.c.class {
         Class::Plain => plain_use(p, hand, &stack),
         Class::Bow => {
@@ -876,15 +906,15 @@ fn item_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> (Outcome, Opt
                 return (Outcome::Fail, None);
             }
             p.start_using_item(hand);
-            ok
+            consume
         }
         Class::Crossbow => {
             if stack.c.charged {
                 // `performShooting` happens on the server.
-                ok
+                consume
             } else if projectile(&p.inventory, &stack).is_some() || infinite {
                 p.start_using_item(hand);
-                ok
+                consume
             } else {
                 (Outcome::Fail, None)
             }
@@ -903,11 +933,15 @@ fn item_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> (Outcome, Opt
                 return (Outcome::Fail, None);
             }
             p.start_using_item(hand);
-            ok
+            consume
         }
-        Class::Spyglass | Class::Bundle => {
+        Class::Bundle => {
             p.start_using_item(hand);
             ok
+        }
+        Class::Spyglass => {
+            p.start_using_item(hand);
+            consume
         }
         Class::Instrument => {
             if stack.c.instrument.is_none() {
@@ -918,7 +952,7 @@ fn item_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> (Outcome, Opt
                 p.cooldowns
                     .add(&stack.cooldown_group(), stack.c.use_duration);
             }
-            ok
+            consume
         }
         Class::Throwable => {
             p.inventory.hand_mut(hand).consume(1, infinite);
@@ -933,7 +967,7 @@ fn item_use(p: &mut LocalPlayer, w: &mut World<'_>, hand: Hand) -> (Outcome, Opt
                 }
             }
             p.start_using_item(hand);
-            ok
+            consume
         }
         Class::FishingRod | Class::Book | Class::EmptyMap => ok,
         Class::FireworkRocket => {
@@ -1007,7 +1041,7 @@ fn plain_use(p: &mut LocalPlayer, hand: Hand, stack: &Stack) -> (Outcome, Option
         }
         if c.ticks() > 0 {
             p.start_using_item(hand);
-            return (Outcome::Success, None);
+            return (Outcome::Consume, None);
         }
         // Consumed at once (`onConsume`).
         if let Some(food) = stack.c.food {
@@ -1015,16 +1049,16 @@ fn plain_use(p: &mut LocalPlayer, hand: Hand, stack: &Stack) -> (Outcome, Option
         }
         let infinite = p.infinite_materials();
         p.inventory.hand_mut(hand).consume(1, infinite);
-        return (Outcome::Success, None);
+        return (Outcome::Consume, None);
     }
     if let Some(e) = stack.c.equippable
         && e.swappable
     {
         return swap_with_equipment_slot(p, hand, e.slot);
     }
-    if stack.c.blocks_attacks || stack.c.kinetic_weapon {
+    if stack.c.blocks_attacks || stack.c.spear.is_some() {
         p.start_using_item(hand);
-        return (Outcome::Success, None);
+        return (Outcome::Consume, None);
     }
     (Outcome::Pass, None)
 }

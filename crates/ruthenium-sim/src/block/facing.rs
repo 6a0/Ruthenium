@@ -353,7 +353,7 @@ pub(super) fn use_item_on(
         // key, which the server judges.
         Class::VaultBlock => {
             if !stack.is_empty() && state::get(u.state, "vault_state") == Some("active") {
-                Outcome::Success
+                Outcome::Consume
             } else {
                 Outcome::TryEmptyHand
             }
@@ -369,7 +369,7 @@ pub(super) fn use_item_on(
             if stack.c.is("HangingSignItem") && u.hit.direction == Direction::Down {
                 Outcome::Pass
             } else {
-                sign_use_item()
+                sign_use_item(w, p, &stack, u.pos)
             }
         }
         Class::WallHangingSignBlock => {
@@ -377,10 +377,10 @@ pub(super) fn use_item_on(
             if stack.c.is("HangingSignItem") && !edited_side {
                 Outcome::Pass
             } else {
-                sign_use_item()
+                sign_use_item(w, p, &stack, u.pos)
             }
         }
-        Class::SignBlock => sign_use_item(),
+        Class::SignBlock => sign_use_item(w, p, &stack, u.pos),
         _ => return None,
     })
 }
@@ -411,8 +411,12 @@ pub(super) fn use_without_item(
         // taken (the server hands the book over, if there is one); elsewhere it
         // passes.
         Class::ChiseledBookShelfBlock => {
-            if hit_slot(u, 2, 3).is_some() {
-                Outcome::Success
+            if let Some(slot) = hit_slot(u, 2, 3) {
+                if state::get_bool(u.state, &format!("slot_{slot}_occupied")) {
+                    Outcome::Success
+                } else {
+                    Outcome::Consume
+                }
             } else {
                 Outcome::Pass
             }
@@ -426,10 +430,11 @@ pub(super) fn use_without_item(
         }
         // `LecternBlock.useWithoutItem`: the server opens a lectern's book; the click
         // is taken with or without one.
-        Class::LecternBlock => Outcome::Success,
+        Class::LecternBlock if state::get_bool(u.state, "has_book") => Outcome::Success,
+        Class::LecternBlock => Outcome::Consume,
         // `SignBlock.useWithoutItem`: editing and click commands are the server's
         // (it opens the editor); the client takes the click.
-        Class::SignBlock => Outcome::Success,
+        Class::SignBlock => Outcome::Consume,
         _ => return None,
     })
 }
@@ -972,7 +977,7 @@ fn shelf_use(p: &LocalPlayer, u: &Use<'_>) -> Outcome {
     if p.inventory.hand(Hand::Main).is_empty() {
         Outcome::Pass
     } else {
-        Outcome::Success
+        Outcome::Consume
     }
 }
 
@@ -1099,7 +1104,7 @@ fn add_to_inventory(p: &mut LocalPlayer, stack: Stack) {
 /// empty-hand click.
 fn campfire_use(w: &mut World<'_>, stack: &Stack, u: &Use<'_>) -> Outcome {
     if w.in_recipe_set(stack, "minecraft:campfire_input") {
-        return Outcome::Success;
+        return Outcome::Consume;
     }
     if w.item_is(stack, "minecraft:douses_campfires") && state::get_bool(u.state, "lit") {
         w.set_block_and_update(u.pos, state::set_bool(u.state, "lit", false));
@@ -1127,8 +1132,22 @@ fn lectern_use_item(w: &World<'_>, stack: &Stack, u: &Use<'_>) -> Outcome {
 /// `SignBlock.useItemOn` on the client: every click is taken, with a dye, ink or
 /// honeycomb (applied by the server) or without (the server then opens the editor or
 /// runs the text's click commands).
-fn sign_use_item() -> Outcome {
-    Outcome::Success
+fn sign_use_item(w: &World<'_>, p: &LocalPlayer, stack: &Stack, pos: Pos) -> Outcome {
+    let applicator = p.abilities.may_build
+        && ["DyeItem", "InkSacItem", "GlowInkSacItem", "HoneycombItem"]
+            .iter()
+            .any(|class| stack.c.is(class));
+    let waxed = w
+        .level
+        .column(pos[0] >> 4, pos[2] >> 4)
+        .and_then(|c| c.block_entities().iter().find(|e| e.pos == pos))
+        .and_then(|e| e.tag.as_deref()?.as_compound()?.int("is_waxed"))
+        .is_some_and(|v| v != 0);
+    if applicator || waxed {
+        Outcome::Success
+    } else {
+        Outcome::Consume
+    }
 }
 
 #[cfg(test)]

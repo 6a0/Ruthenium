@@ -393,6 +393,7 @@ impl<'f> Encoder<'f> {
             pipelines,
             bound: None,
             depth: depth.is_some(),
+            extent,
             end: Some(end),
         }
     }
@@ -419,6 +420,8 @@ pub struct Pass<'e> {
     bound: Option<usize>,
     /// The pass has a depth attachment.
     depth: bool,
+    /// The target's size.
+    extent: vk::Extent2D,
     /// `None` once finished.
     end: Option<End<'e>>,
 }
@@ -432,6 +435,41 @@ impl std::fmt::Debug for Pass<'_> {
 }
 
 impl Pass<'_> {
+    /// Clears the whole depth attachment to the far distance, as the pass's start did:
+    /// what is drawn from here on is in front of everything drawn before, whatever its
+    /// depth (the player's own hands over the world).
+    ///
+    /// # Panics
+    /// If the pass has no depth attachment.
+    pub fn clear_depth(&mut self) {
+        assert!(self.depth, "a pass without a depth attachment");
+        let attachment = vk::ClearAttachment {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            color_attachment: 0,
+            clear_value: vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: DEPTH_CLEAR,
+                    stencil: 0,
+                },
+            },
+        };
+        let rect = vk::ClearRect {
+            rect: vk::Rect2D {
+                offset: vk::Offset2D::default(),
+                extent: self.extent,
+            },
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        // SAFETY: inside the pass this value began, whose depth attachment (checked
+        // above) covers `extent` and has the depth aspect.
+        unsafe {
+            self.gpu
+                .device
+                .cmd_clear_attachments(self.ctx.cmd, &[attachment], &[rect]);
+        }
+    }
+
     /// Draws `instances` instances of `vertices` vertices with pipeline `pipeline` (its
     /// index in the set) and `push` as its push constants.
     ///

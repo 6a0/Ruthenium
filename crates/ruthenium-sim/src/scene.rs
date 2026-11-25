@@ -636,6 +636,20 @@ pub struct PlayerState {
     /// teleport, a respawn): when it differs from the last frame's, nothing may be
     /// interpolated from the old position.
     pub placements: u64,
+    /// What of the player its own eyes see: its hands, and how its view bobs and tilts.
+    pub first_person: crate::first_person::FirstPersonRecord,
+    /// The block the crosshair is on, if its outline is to be drawn.
+    pub target: Option<Target>,
+}
+
+/// The block the crosshair is on, as of the frame (not of its last tick: the mouse
+/// turns between ticks).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    pub pos: [i32; 3],
+    pub state: u32,
+    /// The edges of its outline, each as its two ends in blocks from the block's corner.
+    pub edges: Arc<[[[f32; 3]; 2]]>,
 }
 
 /// A world clock as of the frame (`ClockNetworkState`, counted on by the ticks).
@@ -681,6 +695,9 @@ pub struct Frame {
     pub player: PlayerState,
     /// The lids of chests and shulker boxes that are not shut, by position.
     pub lids: Vec<crate::block_entity::LidRecord>,
+    /// The blocks being broken, by the player or by others, and how far: a stage from
+    /// 0 to 9.
+    pub breaking: Vec<([i32; 3], u8)>,
     pub entities: Vec<EntityRecord>,
     /// Entities left out because [`MAX_ENTITIES`] were already in.
     pub entities_dropped: u32,
@@ -733,8 +750,11 @@ impl Frame {
                 effects: Vec::new(),
                 vehicle: None,
                 placements: 0,
+                first_person: crate::first_person::FirstPersonRecord::default(),
+                target: None,
             },
             lids: Vec::new(),
+            breaking: Vec::new(),
             entities: Vec::new(),
             entities_dropped: 0,
             terrain_stamp: 0,

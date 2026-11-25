@@ -226,16 +226,16 @@ pub(super) fn use_without_item(
         | Class::ChestBlock
         | Class::EnderChestBlock
         | Class::ShulkerBoxBlock
-        | Class::AbstractBedBlock
-        | Class::DragonEggBlock
-        | Class::LightBlock => Outcome::Success,
+        | Class::DragonEggBlock => Outcome::Success,
+        Class::AbstractBedBlock | Class::LightBlock => Outcome::Consume,
         // `JukeboxBlock.useWithoutItem`: a jukebox with a disc gives it back (the
         // server drops it).
         Class::JukeboxBlock => used_if(state::get_bool(u.state, "has_record")),
         Class::ComposterBlock => composter_empty(w, u),
         // `RespawnAnchorBlock.useWithoutItem`: a charged anchor sets the spawn point
         // or blows up, which the server decides.
-        Class::RespawnAnchorBlock => used_if(state::get_int(u.state, "charges") != 0),
+        Class::RespawnAnchorBlock if state::get_int(u.state, "charges") != 0 => Outcome::Consume,
+        Class::RespawnAnchorBlock => Outcome::Pass,
         Class::CakeBlock => cake_eat(w, p, u),
         Class::CandleCakeBlock => {
             // `CandleCakeBlock.useWithoutItem`: a slice of a whole cake; the candle
@@ -382,6 +382,70 @@ fn chest_partner_direction(chest: u32) -> Direction {
     } else {
         facing.counter_clockwise()
     }
+}
+
+/// Spectators see the outline of a portal or a block that supplies a menu at this position.
+pub(crate) fn spectator_outline(
+    blocks: &crate::blocks::Blocks,
+    level: &crate::world::Level,
+    entities: &crate::entity::Entities,
+    id: u32,
+    pos: Pos,
+) -> bool {
+    let kind = blocks.kind(id);
+    if kind.is(Class::LecternBlock) {
+        return state::get_bool(id, "has_book");
+    }
+    if kind.is(Class::ChestBlock) {
+        let open = |pos: Pos| {
+            let [x, y, z] = Direction::Up.step(pos);
+            let min = [x, y, z].map(f64::from);
+            let above = crate::shape::Aabb::new(min, min.map(|v| v + 1.0));
+            !blocks.redstone_conductor(level.block(x, y, z))
+                && !entities
+                    .in_box(&above)
+                    .iter()
+                    .any(|e| e.sitting && e.info.key == "minecraft:cat")
+        };
+        if !open(pos) {
+            return false;
+        }
+        let half = state::get(id, "type").unwrap_or("single");
+        if half == "single" {
+            return true;
+        }
+        let partner = chest_partner_direction(id).step(pos);
+        let [x, y, z] = partner;
+        let other = level.block(x, y, z);
+        let paired = state::same_block(id, other)
+            && state::get(other, "type") == Some(other_half(half))
+            && state::get(other, "facing") == state::get(id, "facing");
+        return !paired || open(partner);
+    }
+    kind.classes.iter().any(|class| {
+        matches!(
+            class,
+            Class::CraftingTableBlock
+                | Class::EnchantingTableBlock
+                | Class::CartographyTableBlock
+                | Class::SmithingTableBlock
+                | Class::StonecutterBlock
+                | Class::AnvilBlock
+                | Class::LoomBlock
+                | Class::GrindstoneBlock
+                | Class::BeaconBlock
+                | Class::BrewingStandBlock
+                | Class::AbstractFurnaceBlock
+                | Class::HopperBlock
+                | Class::DispenserBlock
+                | Class::ShulkerBoxBlock
+                | Class::BarrelBlock
+                | Class::CrafterBlock
+                | Class::EndGatewayBlock
+                | Class::EndPortalBlock
+                | Class::NetherPortalBlock
+        )
+    })
 }
 
 /// `ChestBlock.candidatePartnerFacing`: the facing of the chest towards
@@ -712,8 +776,10 @@ fn eat_slice(w: &mut World<'_>, p: &mut LocalPlayer, cake: u32, pos: Pos) -> Out
 /// not, an empty main hand still uses the click up.
 fn cake_eat(w: &mut World<'_>, p: &mut LocalPlayer, u: &Use<'_>) -> Outcome {
     let eaten = eat_slice(w, p, u.state, u.pos);
-    if eaten.consumes_action() || p.hand(Hand::Main).is_empty() {
-        Outcome::Success
+    if eaten.consumes_action() {
+        eaten
+    } else if p.hand(Hand::Main).is_empty() {
+        Outcome::Consume
     } else {
         // Vanilla eats again for the result, which can't go otherwise.
         eaten
@@ -745,7 +811,7 @@ fn flower_pot_use(w: &mut World<'_>, p: &mut LocalPlayer, u: &Use<'_>) -> Outcom
         return Outcome::TryEmptyHand;
     };
     if pot_content(w, u.state).is_some() {
-        return Outcome::Success;
+        return Outcome::Consume;
     }
     w.set_block_and_update(u.pos, state::default_of_block(pot));
     let infinite = p.infinite_materials();
@@ -758,7 +824,7 @@ fn flower_pot_use(w: &mut World<'_>, p: &mut LocalPlayer, u: &Use<'_>) -> Outcom
 /// the click without changing.
 fn flower_pot_take(w: &mut World<'_>, p: &mut LocalPlayer, u: &Use<'_>) -> Outcome {
     let Some(plant) = pot_content(w, u.state) else {
-        return Outcome::Success;
+        return Outcome::Consume;
     };
     let item = state::block_named(plant)
         .map(|b| w.blocks.kinds().of_block(b).item)
@@ -1033,6 +1099,44 @@ mod tests {
     }
 
     #[test]
+    fn spectator_outlines_follow_available_menus_and_portals() {
+        let Some(mut f) = Fixture::new() else { return };
+        let pos = [0, -60, 0];
+        let visible = |f: &Fixture, block: &str| {
+            spectator_outline(
+                f.blocks(),
+                &f.level,
+                &f.entities,
+                Fixture::state(block),
+                pos,
+            )
+        };
+        for block in [
+            "minecraft:hopper",
+            "minecraft:nether_portal",
+            "minecraft:lectern[has_book=true]",
+        ] {
+            assert!(visible(&f, block), "{block}");
+        }
+        for block in [
+            "minecraft:stone",
+            "minecraft:ender_chest",
+            "minecraft:lectern",
+        ] {
+            assert!(!visible(&f, block), "{block}");
+        }
+        let chest = "minecraft:chest[type=left,facing=north]";
+        assert!(visible(&f, chest));
+        f.set([1, -60, 0], "minecraft:chest[type=right,facing=north]");
+        f.set([1, -59, 0], "minecraft:stone");
+        assert!(!visible(&f, chest));
+        f.set([1, -60, 0], "minecraft:stone");
+        assert!(visible(&f, chest));
+        f.set([0, -59, 0], "minecraft:stone");
+        assert!(!visible(&f, chest));
+    }
+
+    #[test]
     fn a_chest_beside_a_lone_chest_makes_a_pair() {
         let Some(mut f) = standing() else { return };
         f.set([0, -60, 0], "minecraft:chest[facing=south]");
@@ -1156,8 +1260,8 @@ mod tests {
         f.click_face([0, -60, 0], Direction::Up);
         assert_eq!(f.get([0, -60, 0]), "minecraft:potted_dandelion");
         assert_eq!(f.player.hand(Hand::Main).count, 1);
-        // A full pot takes the click, nothing else.
-        assert_eq!(answer(&mut f, [0, -60, 0], Direction::Up), Outcome::Success);
+        // A full pot takes the click without a swing.
+        assert_eq!(answer(&mut f, [0, -60, 0], Direction::Up), Outcome::Consume);
         assert_eq!(f.player.hand(Hand::Main).count, 1);
         f.hold(Hand::Main, "minecraft:air", 0);
         f.click_face([0, -60, 0], Direction::Up);

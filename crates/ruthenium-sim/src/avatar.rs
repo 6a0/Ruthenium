@@ -1,5 +1,6 @@
 //! How players and mannequins hold themselves: what of an avatar moves between the ticks
-//! only to be drawn. The local player is not one of these (nothing draws it yet).
+//! only to be drawn. The local player is not one of these: what of it is drawn, from its
+//! own eyes, is [`crate::first_person`]'s.
 //!
 //! Another player's tick is `RemotePlayer.tick`, a mannequin's `LivingEntity.tick`.
 
@@ -116,16 +117,16 @@ pub struct Swing {
 
 /// `LivingEntity.SwingState`.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct SwingState {
-    current: Option<Swing>,
+pub(crate) struct SwingState {
+    pub(crate) current: Option<Swing>,
     ticks: i32,
-    old: f32,
-    now: f32,
+    pub(crate) old: f32,
+    pub(crate) now: f32,
 }
 
 impl SwingState {
     /// Starts a swing unless one is in its first half.
-    fn start(&mut self, swing: Swing) {
+    pub(crate) fn start(&mut self, swing: Swing) {
         if let Some(c) = self.current
             && self.ticks <= c.duration / 2
             && self.ticks > 0
@@ -140,7 +141,7 @@ impl SwingState {
         self.ticks = 0;
     }
 
-    fn tick(&mut self) {
+    pub(crate) fn tick(&mut self) {
         self.old = self.now;
         let Some(c) = self.current else {
             self.now = 0.0;

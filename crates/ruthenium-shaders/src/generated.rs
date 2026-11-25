@@ -13,6 +13,9 @@ pub static BACKGROUND_VERT: Spirv = crate::spirv!("background.vert");
 /// `glsl/blur.frag`
 pub static BLUR_FRAG: Spirv = crate::spirv!("blur.frag");
 
+/// `glsl/crack.vert`
+pub static CRACK_VERT: Spirv = crate::spirv!("crack.vert");
+
 /// `glsl/gui.frag`
 pub static GUI_FRAG: Spirv = crate::spirv!("gui.frag");
 
@@ -28,8 +31,17 @@ pub static MODEL_CUTOUT_FRAG: Spirv = crate::spirv!("model_cutout.frag");
 /// `glsl/model_cutout_faces.frag`
 pub static MODEL_CUTOUT_FACES_FRAG: Spirv = crate::spirv!("model_cutout_faces.frag");
 
+/// `glsl/model_repeat.frag`
+pub static MODEL_REPEAT_FRAG: Spirv = crate::spirv!("model_repeat.frag");
+
 /// `glsl/model_solid.frag`
 pub static MODEL_SOLID_FRAG: Spirv = crate::spirv!("model_solid.frag");
+
+/// `glsl/outline.frag`
+pub static OUTLINE_FRAG: Spirv = crate::spirv!("outline.frag");
+
+/// `glsl/outline.vert`
+pub static OUTLINE_VERT: Spirv = crate::spirv!("outline.vert");
 
 /// `glsl/overlay.frag`
 pub static OVERLAY_FRAG: Spirv = crate::spirv!("overlay.frag");
@@ -114,12 +126,16 @@ pub static ALL: &[&Spirv] = &[
     &BACKGROUND_FRAG,
     &BACKGROUND_VERT,
     &BLUR_FRAG,
+    &CRACK_VERT,
     &GUI_FRAG,
     &GUI_VERT,
     &MODEL_VERT,
     &MODEL_CUTOUT_FRAG,
     &MODEL_CUTOUT_FACES_FRAG,
+    &MODEL_REPEAT_FRAG,
     &MODEL_SOLID_FRAG,
+    &OUTLINE_FRAG,
+    &OUTLINE_VERT,
     &OVERLAY_FRAG,
     &OVERLAY_VERT,
     &SHADOW_VERT,

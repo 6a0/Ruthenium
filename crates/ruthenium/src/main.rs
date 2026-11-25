@@ -135,6 +135,16 @@ With no command, opens the game window. Options:
                          default); off, to measure it against
   --entity-shadows <on|off>
                          whether players cast shadows (on, the default)
+  --hand <on|off>        whether the player's own hands and what they hold are drawn
+                         (on, the default)
+  --block-outline <on|off>
+                         whether the block the crosshair is on is outlined (on, the
+                         default)
+  --view-bobbing <on|off>
+                         whether the view sways with the player's steps (on, the
+                         default), as vanilla's View Bobbing
+  --crosshair <on|off>   whether the crosshair is drawn (on, the default); off, for a
+                         picture to hold against another client's without its HUD
   --animations <on|off>  whether animated textures (water, lava, fire) play (on, the
                          default); off, they show their first frame
   --fov-effects <on|off> whether the field of view narrows in water and lava (on, the

@@ -310,6 +310,9 @@ pub struct WorldAssets {
     pub sky: crate::sky::SkyImages,
     /// What block entities are drawn from; without it they are not drawn.
     pub block_entities: Option<crate::block_entity::renderer::BlockEntityAssets>,
+    /// The cracks in a block being broken: its ten stages' pictures in order
+    /// (`textures/block/destroy_stage_0.png` to `_9`); a stage without one is not drawn.
+    pub cracks: Vec<crate::sky::SkyImage>,
 }
 
 /// The indices of quads as two triangles each, sharing the diagonal from a quad's first
@@ -1786,6 +1789,7 @@ impl WorldRenderer {
     pub fn gather_block_entities(
         &mut self,
         renderer: &mut BlockEntityRenderer,
+        mut marks: Option<&mut crate::block_marks::BlockMarks>,
         scene: &Scene,
         frame: &Frame,
         partial: f32,
@@ -1822,6 +1826,7 @@ impl WorldRenderer {
                     camera,
                     view,
                     textures,
+                    marks.as_deref_mut(),
                 );
             }
         });
@@ -1861,6 +1866,43 @@ impl WorldRenderer {
                         .is_some_and(|s| visibility(now, s, self.fade_ms) >= MIN_VISIBILITY)
                 },
             );
+        });
+    }
+
+    /// Gathers the player's own hands, for this frame.
+    pub fn gather_hand(
+        &self,
+        renderer: &mut BlockEntityRenderer,
+        scene: &Scene,
+        frame: &Frame,
+        seen: &PlayerView<'_>,
+        textures: &TextureTable,
+        options: crate::block_entity::renderer::ViewOptions,
+    ) {
+        profiling::scope!("hand_gather");
+        scene.with_terrain(|terrain| {
+            renderer.gather_hand(frame, terrain, seen, textures, self.atlas, options);
+        });
+    }
+
+    /// Gathers the outline of the block the crosshair is on and the cracks in the blocks
+    /// being broken, for this frame.
+    pub fn gather_marks(
+        &self,
+        marks: &mut crate::block_marks::BlockMarks,
+        scene: &Scene,
+        frame: &Frame,
+        camera: [f64; 3],
+        view: &View,
+        target_width: f32,
+    ) {
+        profiling::scope!("marks_gather");
+        if frame.player.target.is_none() && frame.breaking.is_empty() {
+            marks.gather_nothing();
+            return;
+        }
+        scene.with_terrain(|terrain| {
+            marks.gather(frame, terrain, &self.table, camera, view, target_width);
         });
     }
 

@@ -6,6 +6,7 @@
 mod atmosphere;
 mod backdrop;
 pub mod block_entity;
+mod block_marks;
 mod check_pass;
 mod colour_check;
 mod gui;
@@ -22,6 +23,8 @@ mod terrain_check;
 mod terrain_vertex;
 
 pub use atmosphere::{AtmosphereOptions, Fog, FogInputs, Medium, fog, rain_fog_target};
+pub use block_entity::renderer::ViewOptions;
+pub use block_marks::{MarkStats, STAGES as CRACK_STAGES};
 pub use colour_check::ColourCheckReport;
 pub use gui::GuiFrame;
 pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
@@ -51,8 +54,10 @@ use ruthenium_sim::avatar::SkinSource;
 use ruthenium_sim::scene::{Frame, Scene};
 
 use atmosphere::{Atmosphere, Look, WaterOverlay};
+use block_entity::affine::Affine;
 use block_entity::renderer::{BlockEntityRenderer, PlayerView};
 use block_entity::skins::LoadedSkin;
+use block_marks::{BlockMarks, When};
 use ruthenium_gpu::SamplerId;
 use ruthenium_sim::environment::CardinalLight;
 use ruthenium_ui::Quad;
@@ -167,6 +172,18 @@ fn water_quad(overlay: &WaterOverlay, texture: TextureId, size: [f32; 2], fov: f
     }
 }
 
+/// The world as a frame sees it: through the camera, the player's own hands with the
+/// field of view they are always seen with, in the air's look, with what is in front of
+/// it all, on a target of `size` pixels.
+#[derive(Debug)]
+struct Seen {
+    view: View,
+    hand: View,
+    look: Look,
+    front: Option<Front>,
+    size: [f32; 2],
+}
+
 /// What is in front of the world in a frame: the quad of the picture of water, and the
 /// size of the target it is laid out for.
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +209,9 @@ unsafe fn draw_world(
     look: &Look,
     front: Option<Front>,
     models: Option<(&mut BlockEntityRenderer, CardinalLight)>,
+    mut marks: Option<&mut BlockMarks>,
+    hand: Option<&View>,
+    size: [f32; 2],
 ) {
     let mut sky = sky.filter(|_| order != SkyOrder::Off && look.sky != Sky::None);
     let mut draw_sky = |pass: &mut ruthenium_gpu::Pass<'_>, frame_data: &mut FrameData, behind| {
@@ -225,15 +245,35 @@ unsafe fn draw_world(
             );
         }
     }
+    let mut draw_marks = |pass: &mut ruthenium_gpu::Pass<'_>, frame_data: &mut FrameData, when| {
+        if let Some(m) = &mut marks {
+            // SAFETY: the caller's; the pass has a depth attachment.
+            unsafe { m.draw(pass, frame_data, textures, view, &look.fog, size, when) };
+        }
+    };
+    draw_marks(pass, frame_data, When::Solid);
     if order == SkyOrder::Late {
         draw_sky(pass, frame_data, true);
     }
+    draw_marks(pass, frame_data, When::BeforeTranslucent);
     // What is seen through comes last: over the opaque world and the sky.
     // SAFETY: the caller's.
     unsafe { world.draw_translucent(pass, frame_data) };
+    draw_marks(pass, frame_data, When::AfterTranslucent);
     if let Some(((models, _), _)) = &mut models {
         // SAFETY: the caller's; `draw` has run for this frame just above.
         unsafe { models.draw_over(pass) };
+    }
+    // The player's own hands, before everything: the depths of the world are gone
+    // first, and they are seen with a field of view of their own.
+    if let (Some(hand), Some(((models, cardinal), (lightmap, indices)))) = (hand, &mut models) {
+        pass.clear_depth();
+        // SAFETY: the caller's; the world is ready, and with it what it shares.
+        unsafe {
+            models.draw_hand(
+                pass, frame_data, hand, &look.fog, *cardinal, *lightmap, *indices,
+            );
+        }
     }
     if let Some(f) = front
         && let Some((first, bytes)) = frame_data.alloc(1, gui::QUAD_BYTES)
@@ -309,6 +349,13 @@ pub struct Renderer {
     show_players: bool,
     /// Whether entities cast shadows.
     entity_shadows: bool,
+    /// The outline of the block the crosshair is on and the cracks in the blocks being
+    /// broken, with the world's assets; and whether the outline is drawn.
+    marks: Option<BlockMarks>,
+    block_outline: bool,
+    /// Whether the player's own hands are drawn, and how its view moves with it.
+    show_hand: bool,
+    view_options: ViewOptions,
     /// The terrain's part of the last frame.
     world_times: WorldTimes,
     /// The number of the last frame recorded.
@@ -420,6 +467,10 @@ impl Renderer {
             show_block_entities: true,
             show_players: true,
             entity_shadows: true,
+            marks: None,
+            block_outline: true,
+            show_hand: true,
+            view_options: ViewOptions::default(),
             world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
@@ -468,6 +519,9 @@ impl Renderer {
             if let Some(b) = &mut self.block_entities {
                 b.set_shadows(self.entity_shadows);
             }
+            let mut marks = BlockMarks::new(&mut self.textures, &mut self.uploads, &assets.cracks);
+            marks.set_outline(self.block_outline);
+            self.marks = Some(marks);
             // Without its picture, water is in front of nothing.
             self.underwater = assets.underwater.as_ref().and_then(|i| {
                 self.textures
@@ -553,6 +607,44 @@ impl Renderer {
 
     pub fn players(&self) -> bool {
         self.show_players
+    }
+
+    /// Whether the player's own hands and what they hold are drawn (they are unless
+    /// said otherwise; the game leaves them out with its HUD).
+    pub fn set_hand(&mut self, on: bool) {
+        self.show_hand = on;
+    }
+
+    pub fn hand(&self) -> bool {
+        self.show_hand
+    }
+
+    /// Whether the block the crosshair is on is outlined (it is unless said otherwise;
+    /// the game leaves the outline out with its HUD).
+    pub fn set_block_outline(&mut self, on: bool) {
+        self.block_outline = on;
+        if let Some(m) = &mut self.marks {
+            m.set_outline(on);
+        }
+    }
+
+    pub fn block_outline(&self) -> bool {
+        self.block_outline
+    }
+
+    /// How the view moves with the player: the game's View Bobbing and Damage Tilt
+    /// options.
+    pub fn set_view_options(&mut self, options: ViewOptions) {
+        self.view_options = options;
+    }
+
+    pub fn view_options(&self) -> ViewOptions {
+        self.view_options
+    }
+
+    /// What the last frame drew on single blocks.
+    pub fn mark_stats(&self) -> Option<MarkStats> {
+        self.marks.as_ref().map(BlockMarks::stats)
     }
 
     /// Whether entities cast shadows (they do unless said otherwise).
@@ -1110,7 +1202,24 @@ impl Renderer {
                     }
                     _ => None,
                 };
-                Some((View::new(&camera, aspect), look, front))
+                // The view sways with the player's steps and tilts when it is hurt; the
+                // hands are seen with their own field of view, and move by themselves.
+                let bob = self.view_options.bob(
+                    Affine::IDENTITY,
+                    &w.frame.player.first_person,
+                    w.partial_tick,
+                );
+                let hand = CameraPose {
+                    fov: HAND_FOV * fov_scale,
+                    ..camera
+                };
+                Some(Seen {
+                    view: View::moved(&camera, aspect, &bob.0),
+                    hand: View::new(&hand, aspect),
+                    look,
+                    front,
+                    size,
+                })
             }
             _ => None,
         };
@@ -1159,14 +1268,30 @@ impl Renderer {
         let cardinal = world.as_ref().map_or(CardinalLight::Default, |w| {
             w.frame.environment.cardinal_light
         });
-        if let (Some(w), Some((view, look, _)), Some(renderer), Some(models)) =
+        if let (Some(w), Some(seen), Some(renderer), Some(marks)) =
+            (&world, &view, &self.world, &mut self.marks)
+        {
+            let started = std::time::Instant::now();
+            renderer.gather_marks(
+                marks,
+                w.scene,
+                w.frame,
+                w.camera.position,
+                &seen.view,
+                seen.size[0],
+            );
+            self.world_times.stage_ns += started.elapsed().as_nanos() as u64;
+        }
+        if let (Some(w), Some(seen), Some(renderer), Some(models)) =
             (&world, &view, &mut self.world, &mut self.block_entities)
         {
+            let (view, look) = (&seen.view, &seen.look);
             let started = std::time::Instant::now();
             models.begin();
             if self.show_block_entities {
                 renderer.gather_block_entities(
                     models,
+                    self.marks.as_mut(),
                     w.scene,
                     w.frame,
                     w.partial_tick,
@@ -1175,15 +1300,25 @@ impl Renderer {
                     &self.textures,
                 );
             }
+            let seen = PlayerView {
+                camera: &w.camera,
+                view,
+                view_distance: w.view_distance,
+                partial: w.partial_tick,
+                sky_darken: look.sky_darken,
+            };
             if self.show_players {
-                let seen = PlayerView {
-                    camera: &w.camera,
-                    view,
-                    view_distance: w.view_distance,
-                    partial: w.partial_tick,
-                    sky_darken: look.sky_darken,
-                };
                 renderer.gather_players(models, w.scene, w.frame, &seen, &self.textures);
+            }
+            if self.show_hand {
+                renderer.gather_hand(
+                    models,
+                    w.scene,
+                    w.frame,
+                    &seen,
+                    &self.textures,
+                    self.view_options,
+                );
             }
             self.world_times.stage_ns += started.elapsed().as_nanos() as u64;
         }
@@ -1211,13 +1346,13 @@ impl Renderer {
                 match (&view, &mut self.world, &self.depth) {
                     // The world is what is behind the menu: drawn into the backdrop's
                     // full-size image, then blurred like any background.
-                    (Some((view, look, front)), Some(renderer), Some(depth)) => {
+                    (Some(seen), Some(renderer), Some(depth)) => {
                         let mut pass = encoder.texture_pass_with_depth(
                             &self.pipelines,
                             &self.textures,
                             b.scene(),
                             depth,
-                            clear_colour(look),
+                            clear_colour(&seen.look),
                         );
                         // SAFETY: `view` is only kept once the world is ready, and this
                         // frame's uploads are recorded and its meshes installed.
@@ -1229,10 +1364,13 @@ impl Renderer {
                                 &mut pass,
                                 &mut self.frame_data,
                                 &self.textures,
-                                view,
-                                look,
-                                *front,
+                                &seen.view,
+                                &seen.look,
+                                seen.front,
                                 self.block_entities.as_mut().map(|m| (m, cardinal)),
+                                self.marks.as_mut(),
+                                self.show_hand.then_some(&seen.hand),
+                                seen.size,
                             );
                         }
                         pass.finish();
@@ -1315,9 +1453,7 @@ impl Renderer {
             // then the window's pass has a depth attachment, and what is drawn over the
             // world uses the pipelines built for one.
             let in_window = match (&view, &self.depth) {
-                (Some((view, look, front)), Some(depth)) if !world_in_backdrop => {
-                    Some((view, look, *front, depth))
-                }
+                (Some(seen), Some(depth)) if !world_in_backdrop => Some((seen, depth)),
                 _ => None,
             };
             let over = |id: PipelineId| {
@@ -1328,9 +1464,12 @@ impl Renderer {
                 }
             };
             let mut pass = match in_window {
-                Some((_, look, _, depth)) => {
-                    encoder.window_pass_with_depth(&self.pipelines, &t, depth, clear_colour(look))
-                }
+                Some((seen, depth)) => encoder.window_pass_with_depth(
+                    &self.pipelines,
+                    &t,
+                    depth,
+                    clear_colour(&seen.look),
+                ),
                 None => encoder.window_pass(&self.pipelines, &t),
             };
             // SAFETY (every draw of the pass): each block of push constants is laid out
@@ -1345,7 +1484,7 @@ impl Renderer {
                 // contents are never loaded); with a backdrop, that is already drawn:
                 // copy it.
                 match (in_window, &mut self.world, backdrop) {
-                    (Some((view, look, front, _)), Some(renderer), _) => {
+                    (Some((seen, _)), Some(renderer), _) => {
                         let started = std::time::Instant::now();
                         draw_world(
                             renderer,
@@ -1354,10 +1493,13 @@ impl Renderer {
                             &mut pass,
                             &mut self.frame_data,
                             &self.textures,
-                            view,
-                            look,
-                            front,
+                            &seen.view,
+                            &seen.look,
+                            seen.front,
                             self.block_entities.as_mut().map(|m| (m, cardinal)),
+                            self.marks.as_mut(),
+                            self.show_hand.then_some(&seen.hand),
+                            seen.size,
                         );
                         self.world_times.draw_ns = started.elapsed().as_nanos() as u64;
                     }

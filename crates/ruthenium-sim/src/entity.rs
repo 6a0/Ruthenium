@@ -861,6 +861,8 @@ pub struct Entity {
     pub(crate) suffocating: bool,
     /// `TamableAnimal.isTame`.
     pub(crate) tame: bool,
+    /// The sitting bit in the tameable animal flags.
+    pub(crate) sitting: bool,
     /// How a player or mannequin holds itself.
     pub(crate) avatar: Option<Box<Avatar>>,
     /// What an avatar is called, apart from its profile's name.
@@ -986,6 +988,7 @@ impl Entity {
             boost_time_total: 0,
             suffocating: false,
             tame: false,
+            sitting: false,
             avatar: None,
             naming: info.avatar.then(|| {
                 Box::new(Naming {
@@ -1461,6 +1464,7 @@ impl Entity {
             && let DataValue::Byte(b) = value
         {
             self.tame = b & 4 != 0;
+            self.sitting = b & 1 != 0;
         } else if let Some(n) = &mut self.naming {
             if Some(field) == t.custom_name_field
                 && let DataValue::OptionalComponent(name) = value

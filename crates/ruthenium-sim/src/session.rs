@@ -36,15 +36,18 @@ use ruthenium_net::connection::{
     Closed, ConnectOptions, Connection, Event, Local, Protocol, Reason, Stage,
 };
 use ruthenium_protocol::packets::configuration::{self as cfg, RegistryEntry, RegistryTags};
-use ruthenium_protocol::packets::{Common, KnownPack, PackAction, play, read_brand};
+use ruthenium_protocol::packets::{
+    ClientInformation, Common, KnownPack, MainHand, PackAction, play, read_brand,
+};
 
-use crate::avatar::Swing;
+use crate::avatar::{SkinSource, Swing};
 use crate::biome::Climate;
 use crate::blocks::{BlockTags, Blocks};
 use crate::clock::{self, TickClock};
 use crate::effect::Effect;
 use crate::entity::{Entities, EntityTypes, Local as LocalInfo, PlayerInfos, Teams, TickContext};
 use crate::environment::{Clocks, Environment, LocalRegistries};
+use crate::first_person::{self, Destruction};
 use crate::handoff::{Handoff, HandoffStats, Item, Limits, Take, Taken};
 use crate::input::next_scroll_selection;
 use crate::interact::{self, GameMode, UseKeys};
@@ -55,12 +58,14 @@ use crate::light::LightTable;
 use crate::pick;
 use crate::player::{Env, Keys, LocalPlayer, Others, Pose};
 use crate::predict::Predictions;
+use crate::scene::Target;
 use crate::scene::{
     DEFAULT_DIRTY_CAPACITY, Dims, EntityRecord, Frame, MAX_ENTITIES, Scene, ScenePublisher,
 };
 use crate::scoreboard::Scoreboard;
 use crate::weather::Weather;
 use crate::world::{BiomeInfo, ChunkPacket, Level, global_bits};
+use ruthenium_protocol::profile::ResolvableProfile;
 
 #[derive(Debug)]
 pub struct SessionOptions {
@@ -269,8 +274,14 @@ impl std::fmt::Debug for Session {
 
 impl Session {
     pub fn start(options: SessionOptions) -> std::io::Result<Session> {
+        let information = options.connect.information.clone();
         let connection = Connection::open(options.connect)?;
-        Session::with_connection(connection, options.known_packs, options.physics)
+        Session::with_connection(
+            connection,
+            options.known_packs,
+            options.physics,
+            information,
+        )
     }
 
     /// A session on a connection that is already open.
@@ -278,6 +289,7 @@ impl Session {
         connection: Connection,
         known_packs: Vec<KnownPack>,
         physics: Option<Physics>,
+        information: ClientInformation,
     ) -> std::io::Result<Session> {
         let handoff = Arc::new(Handoff::new(Limits::default()));
         let (publisher, scene) = Scene::new(DEFAULT_DIRTY_CAPACITY);
@@ -291,7 +303,8 @@ impl Session {
         let thread = std::thread::Builder::new()
             .name("game".into())
             .spawn(move || {
-                let mut game = Game::new(connection, known_packs, physics, tx, publisher);
+                let mut game =
+                    Game::new(connection, known_packs, physics, tx, publisher, information);
                 game.view = game_view;
                 game.run(&game_handoff);
             })?;
@@ -522,6 +535,7 @@ enum Phase {
 }
 
 struct Game {
+    information: ClientInformation,
     connection: Connection,
     known_packs: Vec<KnownPack>,
     events: Sender<SessionEvent>,
@@ -594,6 +608,12 @@ struct Game {
     scoreboard: Scoreboard,
     /// How many chunks from the player the server ticks.
     simulation_distance: i32,
+    /// Whose skin the player's own arm wears: its entry of the player list, signed or
+    /// not.
+    own_skin: Arc<SkinSource>,
+    /// The outline last published, with the block state, the place and whether the
+    /// held item filled it that it was made for.
+    outline: Option<(Target, bool)>,
 }
 
 /// The feature flag that switches minecarts to their new movement, which doesn't
@@ -646,6 +666,8 @@ struct World {
     ticks: u64,
     /// Times the player was put somewhere (a teleport, a respawn).
     placements: u64,
+    /// The blocks being broken, by the player and by others.
+    destruction: Destruction,
 }
 
 impl World {
@@ -657,6 +679,7 @@ impl World {
             self.game_time += 1;
             self.clocks.tick(self.game_time);
         }
+        self.destruction.tick(self.game_time);
         self.ticks += 1;
     }
 
@@ -691,6 +714,7 @@ impl World {
             dimension_name: Arc::from(spawn.dimension.as_str()),
             ticks: 0,
             placements: 0,
+            destruction: Destruction::default(),
         }
     }
 }
@@ -702,11 +726,13 @@ impl Game {
         physics: Option<Physics>,
         events: Sender<SessionEvent>,
         publisher: ScenePublisher,
+        information: ClientInformation,
     ) -> Game {
         let light_table = physics
             .as_ref()
             .map(|p| Arc::new(LightTable::of(&p.blocks)));
         Game {
+            information,
             connection,
             known_packs,
             events,
@@ -750,6 +776,8 @@ impl Game {
             teams: Teams::default(),
             scoreboard: Scoreboard::default(),
             simulation_distance: i32::MAX,
+            own_skin: Arc::new(SkinSource::Profile(Default::default())),
+            outline: None,
         }
     }
 
@@ -877,6 +905,81 @@ impl Game {
         let tick_start = read.checked_sub(into_tick).unwrap_or(read);
         let (input_sequence, input_at) = (self.input_sequence, self.input_at);
         let w = &*w;
+        // The player's own skin: what its entry of the player list says.
+        let textures = self
+            .players
+            .get(self.uuid)
+            .and_then(|i| i.textures.as_ref());
+        let same = matches!(&*self.own_skin, SkinSource::Profile(p)
+            if p.id == Some(self.uuid) && p.properties.first() == textures);
+        if !same {
+            self.own_skin = Arc::new(SkinSource::Profile(ResolvableProfile {
+                id: Some(self.uuid),
+                name: Some(self.name.clone()),
+                properties: textures.cloned().into_iter().collect(),
+                ..ResolvableProfile::default()
+            }));
+        }
+        // What the crosshair is on now (`Minecraft.pick` with the frame's partial
+        // tick), where its outline is drawn (`shouldRenderBlockOutline`,
+        // `extractBlockOutline`).
+        let target = self.physics.as_ref().and_then(|physics| {
+            let p = &w.player;
+            if !w.loaded || !p.is_alive() {
+                return None;
+            }
+            let env = Env {
+                level: &w.level,
+                blocks: &physics.blocks,
+                tags: &self.tags,
+                colliders: &[],
+                others: None,
+            };
+            let partial = self.clock.partial_tick();
+            let pos = frame_target(&env, &w.entities, &self.players, p, partial)?;
+            let state = w.level.block(pos[0], pos[1], pos[2]);
+            if physics.blocks.is_air(state) || !w.level.border.block_within_bounds(pos) {
+                return None;
+            }
+            if !p.abilities.may_build {
+                let visible = if p.game_type() == play::SPECTATOR {
+                    crate::block::spectator_outline(
+                        &physics.blocks,
+                        &w.level,
+                        &w.entities,
+                        state,
+                        pos,
+                    )
+                } else {
+                    let held = p.hand(Hand::Main);
+                    !held.is_empty()
+                        && (crate::mining::can_break_in_adventure(held, state, &self.tags)
+                            || crate::mining::can_place_on_in_adventure(held, state, &self.tags))
+                };
+                if !visible {
+                    return None;
+                }
+            }
+            let held = p.hand(Hand::Main).c.name;
+            let filled = held == physics.blocks.name(state);
+            if let Some((target, was_filled)) = &self.outline
+                && (target.state, target.pos, *was_filled) == (state, pos, filled)
+            {
+                return Some(target.clone());
+            }
+            let placed = physics.blocks.outline(state, pos, held)?;
+            let offset = placed.offset.unwrap_or([0.0; 3]);
+            let edges = placed
+                .shape
+                .edges()
+                .into_iter()
+                .map(|ends| ends.map(|p| std::array::from_fn(|i| (p[i] + offset[i]) as f32)))
+                .collect();
+            let target = Target { pos, state, edges };
+            self.outline = Some((target.clone(), filled));
+            Some(target)
+        });
+        let own_skin = &self.own_skin;
         self.publisher.publish_frame(
             || Frame::new(now, w.environment.clone(), w.dimension_name.clone()),
             |f| {
@@ -927,6 +1030,35 @@ impl Game {
                     .extend(p.effects.iter().map(|e| (e.id, e.amplifier, e.duration)));
                 s.vehicle = p.riding.as_ref().map(|r| r.vehicle);
                 s.placements = w.placements;
+                s.target = target;
+                let r = &mut s.first_person;
+                p.first_person.record(r);
+                if !Arc::ptr_eq(&r.skin, own_skin) {
+                    r.skin = own_skin.clone();
+                }
+                r.parts = self.information.model_parts;
+                r.left_handed = self.information.main_hand == MainHand::Left;
+                r.invisible = p.data.flags & crate::player::flag::INVISIBLE != 0;
+                r.on_fire = p.data.flags & crate::player::flag::ON_FIRE != 0;
+                r.sleeping = p.is_sleeping();
+                r.spin_attack = p.is_auto_spin_attack();
+                r.ticks_since_kinetic_hit = p
+                    .first_person
+                    .last_kinetic_hit
+                    .and_then(|time| i32::try_from(w.game_time.saturating_sub(time)).ok())
+                    .filter(|ticks| (0..10).contains(ticks));
+                r.scoping = p.is_scoping();
+                r.dead = p.is_dead_or_dying();
+                r.death_time = p.death_time;
+                r.using = p.is_using_item().then(|| p.used_hand() == Hand::Off);
+                r.use_remaining = p.use_remaining();
+                r.hands = first_person::hands_drawn(p.hand(Hand::Main), p.hand(Hand::Off), r.using);
+                for hand in 0..2 {
+                    let c = &r.held[hand].c;
+                    r.use_duration[hand] = c.use_duration;
+                    r.charge_duration[hand] = c.crossbow_charge_ticks;
+                }
+                w.destruction.stages(&mut f.breaking);
                 w.level.block_entities.lids(&mut f.lids);
                 f.entities.clear();
                 f.entities_dropped = 0;
@@ -1451,6 +1583,19 @@ impl Game {
                 self.connection.send(p);
             }
         }
+        // The cracks of the block the player is breaking (`destroyBlockProgress` with
+        // `getDestroyStage`: none once it is given up or broken).
+        let stage = if w.game_mode.is_destroying {
+            w.game_mode.destroy_stage()
+        } else {
+            -1
+        };
+        w.destruction.set(
+            w.player.entity_id,
+            w.game_mode.destroy_pos,
+            stage,
+            w.game_time,
+        );
         let env = Env {
             level: &w.level,
             blocks: &physics.blocks,
@@ -2087,7 +2232,7 @@ impl Game {
             } => {
                 // `hurtTo` and the food data.
                 if let Some(w) = &mut self.world {
-                    w.player.health = health;
+                    w.player.hurt_to(health);
                     w.player.food = food;
                     w.player.saturation = saturation;
                 }
@@ -2157,6 +2302,12 @@ impl Game {
                     && entity_id == w.player.entity_id
                 {
                     match event {
+                        2 => {
+                            let last = &mut w.player.first_person.last_kinetic_hit;
+                            if last.is_none_or(|time| w.game_time.saturating_sub(time) > 10) {
+                                *last = Some(w.game_time);
+                            }
+                        }
                         ENTITY_EVENT_USE_ITEM_COMPLETE => {
                             if let Some(physics) = &self.physics {
                                 let colliders = w.entities.colliders(&w.player);
@@ -2249,12 +2400,26 @@ impl Game {
             }
             play::Clientbound::DamageEvent { entity_id } => {
                 if let Some(w) = &mut self.world {
-                    w.entities.damaged(entity_id);
+                    if entity_id == w.player.entity_id {
+                        w.player.first_person.hurt(None);
+                    } else {
+                        w.entities.damaged(entity_id);
+                    }
                 }
             }
-            play::Clientbound::HurtAnimation { entity_id } => {
+            play::Clientbound::HurtAnimation { entity_id, yaw } => {
                 if let Some(w) = &mut self.world {
-                    w.entities.hurt(entity_id);
+                    if entity_id == w.player.entity_id {
+                        w.player.first_person.hurt(Some(yaw));
+                    } else {
+                        w.entities.hurt(entity_id);
+                    }
+                }
+            }
+            // `handleBlockDestruction`.
+            play::Clientbound::BlockDestruction { id, pos, progress } => {
+                if let Some(w) = &mut self.world {
+                    w.destruction.set(id, pos, i32::from(progress), w.game_time);
                 }
             }
             play::Clientbound::SwingAnimation {
@@ -2264,12 +2429,17 @@ impl Game {
                 duration,
             } => {
                 if let Some(w) = &mut self.world {
-                    let swing = Swing {
-                        off_hand,
-                        kind: animation,
-                        duration,
-                    };
-                    w.entities.swing(entity_id, swing);
+                    if entity_id == w.player.entity_id {
+                        let hand = if off_hand { Hand::Off } else { Hand::Main };
+                        w.player.swing(hand, (animation, duration));
+                    } else {
+                        let swing = Swing {
+                            off_hand,
+                            kind: animation,
+                            duration,
+                        };
+                        w.entities.swing(entity_id, swing);
+                    }
                 }
             }
             // `handleSetTime`: the game time, then the clocks tick up to it and take
@@ -2299,6 +2469,53 @@ impl Game {
             }
         }
         Ok(())
+    }
+}
+
+/// The block the crosshair is on `partial` of the way into the tick
+/// (`raycastHitResult(partialTicks)`): the eyes and the view where they are drawn.
+fn frame_target(
+    env: &Env<'_>,
+    entities: &Entities,
+    players: &PlayerInfos,
+    player: &LocalPlayer,
+    partial: f32,
+) -> Option<[i32; 3]> {
+    let eye_height = (player.eye_position()[1] - player.position[1]) as f32;
+    let (old_y_rot, old_x_rot) = player.old_rot;
+    let camera = pick::Camera {
+        id: player.entity_id,
+        eye: pick::eye_position(partial, player.old_position, player.position, eye_height),
+        view: pick::view_vector(
+            pick::lerp_x_rot(partial, old_x_rot, player.x_rot),
+            pick::lerp_y_rot(partial, old_y_rot, player.y_rot),
+        ),
+        bounding_box: player.bounding_box(),
+    };
+    let attacker = player
+        .active_item()
+        .c
+        .attack_range
+        .map(|range| pick::Attacker {
+            range,
+            creative: player.creative,
+            eye: player.eye_position(),
+            head_look: pick::view_vector(player.x_rot, player.head_y_rot),
+            movement: player.delta,
+        });
+    let hit = pick::raycast(
+        env,
+        entities,
+        players,
+        &camera,
+        attacker.as_ref(),
+        player.hand(Hand::Main).c.name,
+        player.attributes.block_interaction_range.value(),
+        player.attributes.entity_interaction_range.value(),
+    );
+    match hit {
+        pick::HitResult::Block(b) if !b.miss => Some(b.pos),
+        _ => None,
     }
 }
 
@@ -2471,7 +2688,14 @@ mod tests {
         let (connection, remote) = Connection::detached();
         let (publisher, scene) = Scene::new(DEFAULT_DIRTY_CAPACITY);
         let (tx, events) = channel();
-        let mut game = Game::new(connection, Vec::new(), physics, tx, publisher);
+        let mut game = Game::new(
+            connection,
+            Vec::new(),
+            physics,
+            tx,
+            publisher,
+            ClientInformation::default(),
+        );
         game.manual_ms = Some(0);
         game.configured.registries = vec![
             (
@@ -2945,7 +3169,9 @@ mod tests {
     #[test]
     fn the_camera_runs_ahead_of_the_frames_by_the_turns_not_yet_taken() {
         let (connection, remote) = Connection::detached();
-        let session = Session::with_connection(connection, Vec::new(), None).unwrap();
+        let session =
+            Session::with_connection(connection, Vec::new(), None, ClientInformation::default())
+                .unwrap();
         assert!(session.camera().is_none());
         remote.event(Event::Play(login()));
         let wait = |until: &dyn Fn() -> bool| {

@@ -7,6 +7,8 @@
 //! - [`level_load`]: when the player counts as loaded into a level.
 //! - [`player`]: the local player: movement, collisions, flight, the server's view of
 //!   it (abilities, entity data) and the packets it sends.
+//! - [`first_person`]: what of the local player is only drawn: its hands' swings, its
+//!   view's bob and tilt, what its hands hold up, and the blocks being broken.
 //! - [`effect`]: mob effects as the client keeps them.
 //! - [`entity`]: the other entities: where they are, their sizes, and their pushes.
 //! - [`item`], [`inventory`], [`interact`]: item stacks and their components, the
@@ -36,6 +38,7 @@ pub mod effect;
 pub mod enchantment;
 pub mod entity;
 pub mod environment;
+pub mod first_person;
 pub mod fluid;
 pub mod handoff;
 pub mod input;

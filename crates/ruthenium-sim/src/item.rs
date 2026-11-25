@@ -16,6 +16,9 @@ use ruthenium_protocol::item::{
 
 use crate::transform::TransformerRef;
 
+/// `SwingAnimation.DEFAULT`: a whack of six ticks.
+pub const DEFAULT_SWING: (i32, i32) = (1, 6);
+
 /// `ItemUseAnimation` ids.
 pub mod animation {
     pub const NONE: i32 = 0;
@@ -442,6 +445,15 @@ pub struct Tool {
     pub can_destroy_blocks_in_creative: bool,
 }
 
+/// The delay and effect windows used by a held spear, in ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpearTiming {
+    pub delay: i32,
+    pub dismount: i32,
+    pub knockback: i32,
+    pub damage: i32,
+}
+
 /// A stack's effective components, the ones item use reads, and its item's class.
 #[derive(Debug, Clone, Default)]
 pub struct Components {
@@ -469,7 +481,12 @@ pub struct Components {
     pub use_remainder: Option<Arc<ItemStack>>,
     pub equippable: Option<Equippable>,
     pub blocks_attacks: bool,
-    pub kinetic_weapon: bool,
+    pub spear: Option<SpearTiming>,
+    /// How a hand swings when the item attacks and when it is used
+    /// (`minecraft:attack_animation`, `minecraft:interact_animation`): none (0), a
+    /// whack (1) or a stab (2), and its ticks. `None`: the usual whack.
+    pub attack_animation: Option<(i32, i32)>,
+    pub interact_animation: Option<(i32, i32)>,
     pub attack_range: Option<AttackRange>,
     /// `minimum_attack_charge` (0 without it).
     pub minimum_attack_charge: f32,
@@ -489,6 +506,8 @@ pub struct Components {
     pub glider: bool,
     /// `getUseDuration`, worked out when the stack was made.
     pub use_duration: i32,
+    /// Loading time after applying this stack's enchantments.
+    pub crossbow_charge_ticks: i32,
     /// The use remainder as a stack (a prototype: copy it).
     pub remainder: Option<Arc<Stack>>,
     /// `tool`: mining speeds and harvesting.
@@ -562,7 +581,7 @@ impl Components {
                 .map_or(0, |s| (s * 20.0).floor() as i32),
             _ => match self.consumable {
                 Some(c) => c.ticks(),
-                None if self.blocks_attacks || self.kinetic_weapon => 72000,
+                None if self.blocks_attacks || self.spear.is_some() => 72000,
                 None => 0,
             },
         }
@@ -581,6 +600,16 @@ impl Components {
             .map(|(_, v)| v.as_str())
     }
 
+    /// `getAttackAnimation`: the kind of swing and its ticks.
+    pub fn attack_swing(&self) -> (i32, i32) {
+        self.attack_animation.unwrap_or(DEFAULT_SWING)
+    }
+
+    /// `getInteractAnimation`.
+    pub fn interact_swing(&self) -> (i32, i32) {
+        self.interact_animation.unwrap_or(DEFAULT_SWING)
+    }
+
     /// `getUseAnimation` ([`animation`]).
     pub fn use_animation(&self) -> i32 {
         match self.class {
@@ -594,7 +623,7 @@ impl Components {
             _ => match self.consumable {
                 Some(c) => c.animation,
                 None if self.blocks_attacks => animation::BLOCK,
-                None if self.kinetic_weapon => animation::SPEAR,
+                None if self.spear.is_some() => animation::SPEAR,
                 None => animation::NONE,
             },
         }
@@ -620,7 +649,9 @@ impl Components {
                 Some(Kind::UseRemainder) => self.use_remainder = None,
                 Some(Kind::Equippable) => self.equippable = None,
                 Some(Kind::BlocksAttacks) => self.blocks_attacks = false,
-                Some(Kind::KineticWeapon) => self.kinetic_weapon = false,
+                Some(Kind::KineticWeapon) => self.spear = None,
+                Some(Kind::AttackAnimation) => self.attack_animation = None,
+                Some(Kind::InteractAnimation) => self.interact_animation = None,
                 Some(Kind::AttackRange) => self.attack_range = None,
                 Some(Kind::MinimumAttackCharge) => self.minimum_attack_charge = 0.0,
                 Some(Kind::PiercingWeapon) => self.piercing_weapon = false,
@@ -748,7 +779,20 @@ impl Components {
                 }
                 Component::Profile(p) => self.profile = Some(Arc::new((**p).clone())),
                 Component::BlocksAttacks { .. } => self.blocks_attacks = true,
-                Component::KineticWeapon(_) => self.kinetic_weapon = true,
+                Component::KineticWeapon(w) => {
+                    self.spear = Some(SpearTiming {
+                        delay: w.delay_ticks,
+                        dismount: w.dismount_conditions.map_or(0, |c| c.max_duration_ticks),
+                        knockback: w.knockback_conditions.map_or(0, |c| c.max_duration_ticks),
+                        damage: w.damage_conditions.map_or(0, |c| c.max_duration_ticks),
+                    })
+                }
+                Component::AttackAnimation(s) => {
+                    self.attack_animation = Some((s.kind, s.duration));
+                }
+                Component::InteractAnimation(s) => {
+                    self.interact_animation = Some((s.kind, s.duration));
+                }
                 Component::AttackRange {
                     min_reach,
                     max_reach,
@@ -901,6 +945,30 @@ impl Stack {
     /// The same object (Java's `==`).
     pub fn same_object(&self, other: &Stack) -> bool {
         self.identity == other.identity
+    }
+
+    /// `ItemStack.matchesIgnoringComponents` for the components a hand does not sink
+    /// for (`ignoreSwapAnimation`: the damage): the same object, or as many of the same
+    /// item with the same components but for that.
+    pub fn matches_but_damage(&self, other: &Stack) -> bool {
+        if self.same_object(other) {
+            return true;
+        }
+        if self.count != other.count || !self.same_item(other) {
+            return false;
+        }
+        if self.is_empty() && other.is_empty() {
+            return true;
+        }
+        fn added(s: &Stack) -> impl Iterator<Item = &(i32, Component)> {
+            let damage = Kind::Damage.id() as i32;
+            s.patch.added.iter().filter(move |(k, _)| *k != damage)
+        }
+        fn removed(s: &Stack) -> impl Iterator<Item = &i32> {
+            let damage = Kind::Damage.id() as i32;
+            s.patch.removed.iter().filter(move |k| **k != damage)
+        }
+        added(self).eq(added(other)) && removed(self).eq(removed(other))
     }
 
     /// `copy`: a new object.
@@ -1106,6 +1174,9 @@ impl Items {
         let mut c = (*self.defaults(s.item)).clone();
         c.apply(&s.patch, self);
         c.use_duration = c.compute_use_duration(|i| self.instrument_seconds(i));
+        if c.class == Class::Crossbow {
+            c.crossbow_charge_ticks = self.enchantments.crossbow_charge_ticks(&c.enchantments);
+        }
         c.spin_attack_strength = self.enchantments.spin_attack_strength(&c.enchantments);
         c.remainder = c
             .use_remainder
@@ -1258,7 +1329,30 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
         .and_then(|name| DYE_NAMES.iter().position(|n| *n == name))
         .map(|i| i as u8);
     c.blocks_attacks = has("minecraft:blocks_attacks");
-    c.kinetic_weapon = has("minecraft:kinetic_weapon");
+    c.spear = v.get("minecraft:kinetic_weapon").map(|w| {
+        let ticks = |field: &str| w.pointer(field).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        SpearTiming {
+            delay: ticks("/delay_ticks"),
+            dismount: ticks("/dismount_conditions/max_duration_ticks"),
+            knockback: ticks("/knockback_conditions/max_duration_ticks"),
+            damage: ticks("/damage_conditions/max_duration_ticks"),
+        }
+    });
+    let swing = |k: &str| {
+        let o = v.get(k)?;
+        let kind = match o.get("type").and_then(|t| t.as_str()) {
+            Some("none") => 0,
+            Some("stab") => 2,
+            _ => DEFAULT_SWING.0,
+        };
+        let duration = o
+            .get("duration")
+            .and_then(serde_json::Value::as_i64)
+            .map_or(DEFAULT_SWING.1, |d| d as i32);
+        Some((kind, duration))
+    };
+    c.attack_animation = swing("minecraft:attack_animation");
+    c.interact_animation = swing("minecraft:interact_animation");
     c.attack_range = v.get("minecraft:attack_range").map(|o| {
         let d = AttackRange::DEFAULT;
         AttackRange {

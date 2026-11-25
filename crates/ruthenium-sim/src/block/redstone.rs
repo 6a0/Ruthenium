@@ -281,10 +281,12 @@ pub(super) fn use_without_item(
         // client too (the neighbours' power and the timer to release it are the
         // server's); one already down takes the click and stays as it is.
         Class::ButtonBlock => {
-            if !state::get_bool(u.state, "powered") {
+            if state::get_bool(u.state, "powered") {
+                Outcome::Consume
+            } else {
                 w.set_block_and_update(u.pos, state::set_bool(u.state, "powered", true));
+                Outcome::Success
             }
-            Outcome::Success
         }
         // `NoteBlock.useWithoutItem`: the server tunes it and plays the note.
         Class::NoteBlock => Outcome::Success,

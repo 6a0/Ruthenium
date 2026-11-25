@@ -252,7 +252,7 @@ pub fn stack_use_on(w: &mut World<'_>, p: &mut LocalPlayer, hand: Hand, hit: &Bl
     }
     let before = stack.copy();
     let (result, item_interaction) = item_use_on(w, p, hand, hit);
-    if result == Outcome::Success && item_interaction {
+    if result.consumes_action() && item_interaction {
         p.after_use(hand, &before);
     }
     result

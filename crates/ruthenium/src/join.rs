@@ -417,6 +417,16 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         ruthenium_data::v26_3::blocks::STATE_COUNT,
         table.part_count(),
     );
+    // The cracks in a block being broken, a picture for each stage.
+    let cracks = (0..ruthenium_render::CRACK_STAGES)
+        .map(|stage| {
+            sky_image(&format!("textures/block/destroy_stage_{stage}.png")).unwrap_or(SkyImage {
+                width: 0,
+                height: 0,
+                rgba: Vec::new(),
+            })
+        })
+        .collect();
     Ok(WorldAssets {
         table: Arc::new(table),
         atlas_width: atlas.width,
@@ -427,6 +437,7 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         colour_maps,
         sky,
         block_entities,
+        cracks,
     })
 }
 

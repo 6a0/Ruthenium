@@ -1,9 +1,10 @@
 //! Block entities drawn from models (chests, shulker boxes, skulls and banners), the text
-//! on signs, and players.
+//! on signs, players, and the player's own hands.
 
 pub mod affine;
 mod avatar;
 pub mod equipment;
+pub(crate) mod hand;
 pub mod model;
 pub(crate) mod nametag;
 pub mod place;

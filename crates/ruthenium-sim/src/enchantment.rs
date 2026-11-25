@@ -1,5 +1,5 @@
 //! Enchantments as the client reads them from the `minecraft:enchantment` registry: only
-//! the value effects the client's movement uses (a riptide trident's spin strength).
+//! the value effects used for riptide movement and crossbow charging.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -187,16 +187,17 @@ fn type_name(v: &Value) -> Option<&str> {
 pub struct Enchantment {
     /// `minecraft:trident_spin_attack_strength`.
     pub spin_attack_strength: Option<ValueEffect>,
+    pub crossbow_charge_time: Option<ValueEffect>,
 }
 
 impl Enchantment {
     /// An enchantment as its codec writes it (only its `effects` are read).
     pub fn from_json(v: &Value) -> Enchantment {
         let effects = v.get("effects");
+        let effect = |name: &str| effects?.get(name).and_then(ValueEffect::from_json);
         Enchantment {
-            spin_attack_strength: effects
-                .and_then(|e| e.get("minecraft:trident_spin_attack_strength"))
-                .and_then(ValueEffect::from_json),
+            spin_attack_strength: effect("minecraft:trident_spin_attack_strength"),
+            crossbow_charge_time: effect("minecraft:crossbow_charge_time"),
         }
     }
 }
@@ -292,9 +293,23 @@ impl Enchantments {
     /// `EnchantmentHelper.getTridentSpinAttackStrength`: each enchantment's effect on
     /// the value, from 0, in the stack's order.
     pub fn spin_attack_strength(&self, enchantments: &[(i32, i32)]) -> f32 {
-        let mut value = 0.0f32;
+        self.modify(enchantments, 0.0, |e| e.spin_attack_strength.as_ref())
+    }
+
+    /// Loading takes 1.25 seconds before the stack's charge-time effects are applied.
+    pub fn crossbow_charge_ticks(&self, enchantments: &[(i32, i32)]) -> i32 {
+        let seconds = self.modify(enchantments, 1.25, |e| e.crossbow_charge_time.as_ref());
+        (seconds.max(0.0) * 20.0).floor() as i32
+    }
+
+    fn modify(
+        &self,
+        enchantments: &[(i32, i32)],
+        mut value: f32,
+        effect_of: impl Fn(&Enchantment) -> Option<&ValueEffect>,
+    ) -> f32 {
         for &(id, level) in enchantments {
-            if let Some(effect) = self.get(id).and_then(|e| e.spin_attack_strength.as_ref()) {
+            if let Some(effect) = self.get(id).and_then(&effect_of) {
                 value = effect.process(level, value);
             }
         }
@@ -305,6 +320,20 @@ impl Enchantments {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn charge_time_uses_the_stack_level_and_server_effect() {
+        let definition = r#"{"effects":{"minecraft:crossbow_charge_time":{"type":"minecraft:add","value":{"type":"minecraft:linear","base":-0.25,"per_level_above_first":-0.25}}}}"#;
+        let e = Enchantments::from_json_files([(
+            "data/minecraft/enchantment/test.json",
+            definition.as_bytes(),
+        )])
+        .vanilla_order();
+        assert_eq!(e.crossbow_charge_ticks(&[]), 25);
+        for (level, ticks) in [(1, 20), (2, 15), (3, 10), (6, 0)] {
+            assert_eq!(e.crossbow_charge_ticks(&[(0, level)]), ticks);
+        }
+    }
 
     #[test]
     fn riptide_strength_by_level() {

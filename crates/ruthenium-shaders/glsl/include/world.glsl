@@ -227,3 +227,69 @@ vec3 glint_row_u(uint at) {
 vec3 glint_row_v(uint at) {
     return vec3(uintBitsToFloat(frame_words[at + 5u]), uintBitsToFloat(frame_words[at + 6u]), uintBitsToFloat(frame_words[at + 7u]));
 }
+
+// One line drawn as wide on the screen wherever it is: record number gl_InstanceIndex from the offset in push constants.
+#define LINE_WORDS 8u
+
+// One end, in blocks relative to the camera.
+vec3 line_from(uint at) {
+    return vec3(uintBitsToFloat(frame_words[at + 0u]), uintBitsToFloat(frame_words[at + 1u]), uintBitsToFloat(frame_words[at + 2u]));
+}
+
+// How wide it is, in pixels of the target.
+float line_width(uint at) {
+    return uintBitsToFloat(frame_words[at + 3u]);
+}
+
+// The other end.
+vec3 line_to(uint at) {
+    return vec3(uintBitsToFloat(frame_words[at + 4u]), uintBitsToFloat(frame_words[at + 5u]), uintBitsToFloat(frame_words[at + 6u]));
+}
+
+// Its colour: red in the low byte, then green, blue and alpha.
+uint line_colour(uint at) {
+    return frame_words[at + 7u];
+}
+
+// One quad of the cracks in a block being broken: record number gl_InstanceIndex from the offset in push constants.
+#define CRACK_WORDS 20u
+
+// Its first corner, in blocks from the camera's block; the quad is the triangles a-b-c and a-c-d.
+vec3 crack_a(uint at) {
+    return vec3(uintBitsToFloat(frame_words[at + 0u]), uintBitsToFloat(frame_words[at + 1u]), uintBitsToFloat(frame_words[at + 2u]));
+}
+
+// The second.
+vec3 crack_b(uint at) {
+    return vec3(uintBitsToFloat(frame_words[at + 3u]), uintBitsToFloat(frame_words[at + 4u]), uintBitsToFloat(frame_words[at + 5u]));
+}
+
+// The third.
+vec3 crack_c(uint at) {
+    return vec3(uintBitsToFloat(frame_words[at + 6u]), uintBitsToFloat(frame_words[at + 7u]), uintBitsToFloat(frame_words[at + 8u]));
+}
+
+// The fourth.
+vec3 crack_d(uint at) {
+    return vec3(uintBitsToFloat(frame_words[at + 9u]), uintBitsToFloat(frame_words[at + 10u]), uintBitsToFloat(frame_words[at + 11u]));
+}
+
+// Where the cracks' picture is read at the first corner, in pictures (it repeats).
+vec2 crack_uv_a(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 12u]), uintBitsToFloat(frame_words[at + 13u]));
+}
+
+// At the second.
+vec2 crack_uv_b(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 14u]), uintBitsToFloat(frame_words[at + 15u]));
+}
+
+// At the third.
+vec2 crack_uv_c(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 16u]), uintBitsToFloat(frame_words[at + 17u]));
+}
+
+// At the fourth.
+vec2 crack_uv_d(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 18u]), uintBitsToFloat(frame_words[at + 19u]));
+}

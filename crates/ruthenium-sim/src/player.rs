@@ -775,6 +775,9 @@ pub struct LocalPlayer {
     pub jump_riding_scale: f32,
     /// A riding jump let go this tick: the strength the vehicle's `onPlayerJump` gets.
     pub(crate) riding_jump: Option<i32>,
+    /// What of the player is only drawn: its hands' swings and heights, its view's bob
+    /// and tilt.
+    pub first_person: crate::first_person::FirstPerson,
 }
 
 /// Where the vehicle the player controls is, for `ServerboundMoveVehiclePacket`
@@ -949,6 +952,7 @@ impl LocalPlayer {
             jump_riding_ticks: 0,
             jump_riding_scale: 0.0,
             riding_jump: None,
+            first_person: crate::first_person::FirstPerson::default(),
         }
     }
 
@@ -1853,6 +1857,8 @@ impl LocalPlayer {
         // Level.tickNonPassenger: setOldPosAndRot.
         self.old_position = self.position;
         self.old_rot = (self.y_rot, self.x_rot);
+        // AbstractClientPlayer.tick: what is only drawn starts its tick too.
+        self.first_person.begin_tick();
         // Player.tick: spectators go through everything and are never on the ground;
         // updateIsUnderwater, from the fluids as last updated.
         self.no_physics = self.spectator;
@@ -1890,10 +1896,64 @@ impl LocalPlayer {
         }
         self.cooldowns.tick();
         self.update_pose(env);
+        // LocalPlayer.tick, after the rest: the hands take up what they are to hold.
+        let swap_scale = self.item_swap_scale(1.0);
+        let (main, off) = (
+            self.inventory.hand(Hand::Main),
+            self.inventory.hand(Hand::Off),
+        );
+        self.first_person
+            .tick_hands([main, off], self.hands_busy, swap_scale);
+        // AbstractClientPlayer.rideTick: a rider's view does not bob.
+        if self.riding.is_some() {
+            self.first_person.reset_bob();
+        }
+    }
+
+    /// `getItemSwapScale`: how far the main hand has recovered from its last attack or
+    /// change of item, 0 to 1.
+    pub fn item_swap_scale(&self, a: f32) -> f32 {
+        ((self.item_swap_ticker as f32 + a) / self.attack_strength_delay()).clamp(0.0, 1.0)
+    }
+
+    /// `LivingEntity.swing`: a hand swings, as its item says (`animation`: the kind
+    /// and its ticks), faster with haste and slower with mining fatigue
+    /// (`getModifiedSwingDuration`).
+    pub fn swing(&mut self, hand: Hand, animation: (i32, i32)) {
+        let (kind, mut duration) = animation;
+        let haste = self.effects.get(MobEffect::Haste).map(|e| e.amplifier);
+        let conduit = self
+            .effects
+            .get(MobEffect::ConduitPower)
+            .map(|e| e.amplifier);
+        if haste.is_some() || conduit.is_some() {
+            duration -= 1 + haste.unwrap_or(0).max(conduit.unwrap_or(0));
+        } else if let Some(fatigue) = self.effects.get(MobEffect::MiningFatigue) {
+            duration += (1 + fatigue.amplifier) * 2;
+        }
+        self.first_person.swing(crate::avatar::Swing {
+            off_hand: hand == Hand::Off,
+            kind,
+            duration,
+        });
+    }
+
+    /// `LocalPlayer.hurtTo`: the health the server sets; less than before is a hurt
+    /// to flinch from, but for the first it sends.
+    pub fn hurt_to(&mut self, health: f32) {
+        self.first_person.health_set(self.health, health);
+        self.health = health;
+    }
+
+    /// `isScoping`: looking through a spyglass.
+    pub fn is_scoping(&self) -> bool {
+        self.is_using_item() && self.use_item.c.class == crate::item::Class::Spyglass
     }
 
     /// `Entity.baseTick`'s movement parts: the fluids, swimming, lava halving the fall.
     fn base_tick(&mut self, env: &Env<'_>) {
+        // LivingEntity.baseTick begins with the swing.
+        self.first_person.tick_swing();
         self.was_in_powder_snow = self.in_powder_snow;
         self.in_powder_snow = false;
         self.update_fluid_interaction(env);
@@ -1902,6 +1962,7 @@ impl LocalPlayer {
             self.fall_distance *= 0.5;
         }
         self.first_tick = false;
+        self.first_person.tick_hurt();
         // LivingEntity.baseTick: tickDeath (the client level ticks deaths within the
         // simulation distance of the player, which the player always is), then
         // tickEffects. After the removal the tick goes on without `aiStep`.
@@ -2171,6 +2232,14 @@ impl LocalPlayer {
         } else {
             self.jump_riding_scale = 0.0;
         }
+        // AbstractClientPlayer.aiStep: the view bobs with the speed over the ground.
+        let bob = if self.on_ground && !self.is_dead_or_dying() && !self.is_swimming() {
+            let [dx, _, dz] = self.delta;
+            ((dx * dx + dz * dz).sqrt() as f32).min(0.1)
+        } else {
+            0.0
+        };
+        self.first_person.update_bob(bob);
         // Player.aiStep.
         if self.jump_trigger_time > 0 {
             self.jump_trigger_time -= 1;
@@ -2261,6 +2330,9 @@ impl LocalPlayer {
         self.xxa = mx;
         self.zza = my;
         self.jumping = self.keys.jump;
+        if !self.is_immobile() {
+            self.first_person.follow_view(self.x_rot, self.y_rot);
+        }
         if self.is_immobile() {
             self.jumping = false;
             self.xxa = 0.0;
@@ -2943,6 +3015,16 @@ impl LocalPlayer {
     /// `game_time`) and aren't slowed by cobwebs; only the player's own moves back off
     /// edges while sneaking.
     pub fn move_by(&mut self, env: &Env<'_>, kind: MoverType, delta: [f64; 3], game_time: i64) {
+        let (x, z) = (self.position[0], self.position[2]);
+        self.entity_move(env, kind, delta, game_time);
+        // How far that went over the ground counts as walked.
+        let (dx, dz) = ((self.position[0] - x) as f32, (self.position[2] - z) as f32);
+        self.first_person
+            .walked(f64::from(dx * dx + dz * dz).sqrt() as f32 * 0.6);
+    }
+
+    /// `Entity.move`.
+    fn entity_move(&mut self, env: &Env<'_>, kind: MoverType, delta: [f64; 3], game_time: i64) {
         if self.no_physics {
             self.position = [
                 self.position[0] + delta[0],

@@ -134,7 +134,8 @@ A ratio above compares two different pictures.
 - **Drawn since, at a cost:** the terrain as vanilla's shader draws it (its texture filtering, both fogs, the fade-in of new sections), the sky, and the time of day in the light, the fog and the sky. [The picture against vanilla's](#the-picture-against-vanillas) has what that looks like and what it costs.
 - **Also drawn since those runs.** Water and lava, including fluid in waterlogged blocks, and translucent block faces such as stained glass and ice.
 - **Block entities since 2026-11-25:** [chests, shulker boxes, skulls and banners](#block-entities).
-- **Still left out:** the other block entities, entities and the player's hand, clouds, particles, the weather's rain and snow, the overlays of a burning player and of a player inside a block, the effects on the player (blindness, darkness, night vision, a conduit's) and every part of the HUD but the crosshair.
+- **Also drawn since then.** Players and mannequins, the first-person hand, the targeted block outline and breaking stages.
+- **Still left out:** the other block entities, most other entities, clouds, particles, the weather's rain and snow, the overlays of a burning player and of a player inside a block, the effects on the player (blindness, darkness, night vision, a conduit's) and every part of the HUD but the crosshair.
 - **Drawn in excess, in the first measurement:** every loaded section that had anything to draw got a mesh, and every one of those inside the view's frustum was drawn, hidden or not: at the spawn 925 sections and 522,119 quads in view, of 4,037 with a mesh among 15,288 loaded. Vanilla builds and draws only what its occlusion graph reaches, and with [cave culling](#cave-culling) so does Ruthenium, by the same rules: 405 sections and 291,723 quads, of 1,409 with a mesh. One difference remains: Ruthenium meshes what the walk reaches behind the camera too, where vanilla builds a section when it is first inside the view.
 - **The same pixels whichever way the sections are drawn.** The frame after the route's end, captured with `--screenshot`, is the same file byte for byte with direct, paged and indirect draws, at the spawn and at the end of the fly route.
 
@@ -152,7 +153,7 @@ Not there yet: clouds, rain and snow themselves, what a camera sees from inside 
 
 ### The two pictures
 
-`cargo xtask bench dedicated --client vanilla,ruthenium --scene idle --bare-picture` saves one frame of each client at the idle scene's place. Vanilla draws it without its HUD, hand, vignette and clouds, none of which Ruthenium has; Ruthenium with `--light-flicker off`. `--time` sets the time of day. Of the 2,073,600 pixels of a frame:
+`cargo xtask bench dedicated --client vanilla,ruthenium --scene idle --bare-picture` saves one frame of each client at the idle scene's place. This comparison hides the HUD, hand, block outline, vignette and clouds and uses `--light-flicker off` on Ruthenium. `--time` sets the time of day. Of the 2,073,600 pixels of a frame:
 
 | Time of day | The same byte for byte | Within one step of 255 | More than 8 steps apart | The upper 400 rows (sky and treetops) the same |
 |---|---:|---:|---:|---:|
@@ -367,6 +368,33 @@ Taking string building and lists out of the per-frame path (layer pictures looke
 
 Things worn that are not armour (a carved pumpkin, a head, a banner on the head; elytra); the spear's use and stab, a spyglass at the eye, quick charge; in the hand, the game's special models other than shield and trident (heads, banners, chests, shulker boxes, pots, conduits, copper golem statues) and what compasses, clocks, a cast rod, custom model data and component properties choose (their fallback is drawn); firework, map and team tints (the default), potions made only of their own effects (no colour mixed); a patterned shield's glint, decal trims, equipment and trims that are not the game's own; names of other entities, of what the crosshair is on, and the hide-HUD rule; shadows of anything else. Items named `_spear` stand in for the `spears` tag. All item models are baked at the join (about 9 MiB), and the models held so far share one 4 MiB vertex page that is never given back.
 
+## First-person hand, block outline and breaking
+
+Compared on 2026-11-25 with the 26.3 Vulkan client at 1920 × 1080 on the RTX 4060 Laptop. The bench's `--hand-picture` keeps the hand and outline, hides the HUD including the crosshair, and writes both clients' end-of-route PNGs beside their JSON. Results are under `cache/bench/results/hand-2026-11-25`.
+
+| Scene | What the pictures show |
+|---|---|
+| Bare arm over existing terrain at `4.5,72,2.5,32,72` | All 35,530 pixels in an interior crop of the right arm agreed within one 8-bit channel step. Around the targeted leaves, 71,977 of 72,000 pixels agreed within one step. |
+| Bare arm facing a newly placed smooth quartz block at `4.5,118,2.5,0,0` | The arm and block edges lined up. The arm and the front of the quartz were brighter in Ruthenium. Vanilla's client had sky light 11 at the eyes here, versus 15 in the terrain scene. Its own server stores 15 everywhere around the block: checked in the saved worlds of three of five repeated vanilla runs and of one Ruthenium run, and the sampled patches of all five vanilla pictures have the same darker averages. Ruthenium draws the server's light. |
+| Diamond sword facing the same block, a second player mining | The sword silhouettes lined up. Comparing the front face with the unmined capture in each client, the same 1,463 pixels changed by more than 22 channel steps in both. This checks the placement and depth of a stage-zero crack on this solid face. |
+| North-facing chest at the same position, a second player mining | The renderer drew 18 crack quads over the base, lid and latch. Against an unmined chest capture, both clients changed the same 1,425 pixels by more than eight channel steps in a 266 × 245 crop of the front. |
+
+The numerical tests compare both arms' transforms, swing and use poses, five moments of spear use, and all six crack texture orientations with values produced by the installed vanilla classes. Six isolated mutations to the bare arm offset, spear pivot, west-face decal coordinates, line width, Quick Charge time and shared breaking stage each failed the corresponding test. The GPU fixtures and the live Ruthenium picture runs passed with Vulkan validation enabled.
+
+In three consecutive 20-second idle captures over existing terrain, the two controls disabled the hand and outline. The middle run drew two arm parts and 12 outline edges. Timings are milliseconds per frame.
+
+| Median | Before | Hand and outline | After |
+|---|---:|---:|---:|
+| Main-thread work | 0.0454 | 0.0497 | 0.0473 |
+| GPU | 0.1499 | 0.1560 | 0.1499 |
+| Frame interval | 0.2254 | 0.2369 | 0.2299 |
+
+The median GPU difference was 6.1 µs. Frame interval P99 was 0.68–0.69 ms throughout. These measurements cover one idle view on this machine.
+
+A second comparison kept the chest, hand, outline and invisible remote player in all three runs. Only the middle run had the remote player mine. The capture began and ended with 18 crack quads there and zero in both controls. The GPU medians were 0.2369, 0.2393 and 0.2369 ms. Main-thread work was 0.0958, 0.0987 and 0.0977 ms. The six-second samples kept the unchanging stage within its 20-second lifetime. A longer trial lost the stage during capture and was excluded.
+
+Breaking overlays use the posed geometry of chests, shulker boxes, skulls and banners as well as terrain models. Spectators get an outline for menu providers and portals, including the lid checks on both halves of a chest. Filled maps still use the ordinary held-item path. The live pictures cover idle arms, a sword, stationary outlines and a remote miner. The animated hand poses have numerical checks.
+
 ## Where a frame's time goes
 
 Medians of the runs' medians, in milliseconds, at the default options. Work is the main thread's own: events, the game's frame, the GUI, recording and submitting. The governor is the wait for the GPU to finish the frame before, which is what one frame ahead removes.
@@ -472,6 +500,9 @@ cargo xtask bench dedicated --accept-eula --client ruthenium \
 cargo xtask bench dedicated --accept-eula --client ruthenium --scene idle,fly --reps 1 --warmup 5 --duration 20 \
     --variant rgss --variant 'ref=--terrain-shader rgss-reference' --variant 'nearest=--terrain-shader nearest' \
     --variant 'plain=--terrain-shader plain' --variant 'skyfirst=--sky first' --variant 'nosky=--sky off'
+# First-person view over existing terrain. Both PNGs are in the results directory.
+cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium --variant 'ruthenium=--light-flicker off' \
+    --scene idle --at 4.5,72,2.5,32,72 --reps 1 --warmup 5 --duration 6 --hand-picture
 # One frame of each client, vanilla's without HUD, hand, vignette and clouds (its PNG is
 # cache/bench/game/screenshots/ruthenium-bench-idle.png, Ruthenium's in the results folder)
 cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium --variant 'ruthenium=--light-flicker off' \

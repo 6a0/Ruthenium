@@ -59,6 +59,13 @@ pub struct View {
     planes: [[f32; 4]; 5],
 }
 
+/// A view that is not moved ([`View::moved`]).
+const UNMOVED: [[f32; 4]; 3] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+];
+
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -66,18 +73,37 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
 impl View {
     /// `aspect` is the target's width over its height.
     pub fn new(pose: &CameraPose, aspect: f32) -> View {
+        View::moved(pose, aspect, &UNMOVED)
+    }
+
+    /// The same, with what is seen moved by `bob` first, in the view's own space (x to the
+    /// right, y up, ahead at negative z; three rows of four): how the view sways with
+    /// the player's steps and tilts when it is hurt. What the view sees ([`Self::sees`])
+    /// is judged without it, as vanilla's own frustum is.
+    pub fn moved(pose: &CameraPose, aspect: f32, bob: &[[f32; 4]; 3]) -> View {
         let block = pose.position.map(|c| c.floor() as i32);
         let offset = std::array::from_fn(|i| -(pose.position[i] - f64::from(block[i])) as f32);
         let [forward, right, up] = pose.axes();
         let g = 1.0 / (pose.fov.to_radians() / 2.0).tan();
         let gx = g / aspect;
+        // From blocks around the eye to the view's space, then moved.
+        let to_view = [right, up, forward.map(|c| -c)];
+        let moved: [[f32; 4]; 3] = std::array::from_fn(|r| {
+            std::array::from_fn(|c| {
+                if c == 3 {
+                    bob[r][3]
+                } else {
+                    (0..3).map(|k| bob[r][k] * to_view[k][c]).sum()
+                }
+            })
+        });
         // Rows: x to the right, y down the target, the near plane's depth, and the
         // distance ahead to divide by.
         let rows = [
-            [gx * right[0], gx * right[1], gx * right[2], 0.0],
-            [-g * up[0], -g * up[1], -g * up[2], 0.0],
+            moved[0].map(|c| gx * c),
+            moved[1].map(|c| -g * c),
             [0.0, 0.0, 0.0, NEAR_PLANE],
-            [forward[0], forward[1], forward[2], 0.0],
+            moved[2].map(|c| -c),
         ];
         let view_projection = std::array::from_fn(|i| rows[i % 4][i / 4]);
         let side = |sign: f32, axis: [f32; 3], scale: f32| {
@@ -173,6 +199,46 @@ mod tests {
         assert!(down.project([0.0, 5.0, 0.0]).is_none());
         // Looking down while facing south, south is at the top of the target.
         assert!(down.project([0.0, -5.0, 1.0]).unwrap()[1] < 0.0);
+    }
+
+    #[test]
+    fn a_moved_view_sees_everything_moved() {
+        let p = pose(30.0, 10.0);
+        // Unmoved, it is the view itself, to the bit where nothing is added.
+        let plain = View::new(&p, 1.5);
+        assert_eq!(View::moved(&p, 1.5, &UNMOVED), plain);
+        // Sunk by a tenth of a block: what was at the middle is a tenth lower in the
+        // view's space, which is up on... down the target.
+        let sunk = View::moved(
+            &p,
+            1.5,
+            &[
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, -0.1],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+        );
+        let [forward, _, up] = p.axes();
+        let ahead = forward.map(|c| c * 4.0);
+        let middle = sunk.project(ahead).unwrap();
+        assert!(close(middle[0], 0.0) && middle[1] > 0.0);
+        let raised: [f32; 3] = std::array::from_fn(|i| ahead[i] + up[i] * 0.1);
+        let back = sunk.project(raised).unwrap();
+        assert!(close(back[0], 0.0) && close(back[1], 0.0));
+        // Rolled a quarter turn about the way ahead: what was to the right is below.
+        let rolled = View::moved(
+            &pose(0.0, 0.0),
+            1.0,
+            &[
+                [0.0, -1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+        );
+        let right = rolled.project([-1.0, 0.0, 5.0]).unwrap();
+        assert!(close(right[0], 0.0) && right[1] < 0.0);
+        // The frustum stays where it was.
+        assert_eq!(sunk.planes, plain.planes);
     }
 
     #[test]

@@ -12,11 +12,9 @@ use super::affine::Affine;
 use super::model::Moved;
 
 const DEGREE: f32 = 0.017_453_292;
-/// Ticks a crossbow takes to load, without enchantments.
-const CROSSBOW_TICKS: f32 = 25.0;
 
 /// The second layers' bits.
-mod part {
+pub(super) mod part {
     pub const JACKET: u8 = 1 << 1;
     pub const LEFT_SLEEVE: u8 = 1 << 2;
     pub const RIGHT_SLEEVE: u8 = 1 << 3;
@@ -45,6 +43,7 @@ pub(super) struct Anim {
     pub right_arm: ArmPose,
     /// Ticks an item has been used for, and whether by the off hand.
     pub using: Option<(f32, bool)>,
+    pub charge_ticks: f32,
     pub swing: Option<(Swing, f32)>,
     /// Ticks it has been dying for; 0 if it is not.
     pub dying: f32,
@@ -199,7 +198,7 @@ impl Limbs {
             }
             ArmPose::CrossbowCharge => {
                 let ticks = a.using.map_or(0.0, |u| u.0);
-                let by = ticks.clamp(0.0, CROSSBOW_TICKS) / CROSSBOW_TICKS;
+                let by = ticks.clamp(0.0, a.charge_ticks) / a.charge_ticks;
                 arm[1] = -0.8 * way;
                 arm[0] = -0.970_796_35;
                 other[1] = mth::lerp(by, 0.4, 0.85) * way;
@@ -435,6 +434,9 @@ impl Figure {
             left_handed: r.left_handed,
             left_arm: r.left_arm,
             right_arm: r.right_arm,
+            charge_ticks: r.using.map_or(0.0, |(_, off)| {
+                r.held[usize::from(off)].c.crossbow_charge_ticks as f32
+            }),
             using: r.using.map(|(ticks, off)| (ticks as f32 + p, off)),
             swing,
             dying: if r.death_time > 0 {
@@ -682,6 +684,7 @@ mod tests {
             left_arm: ArmPose::Empty,
             right_arm: ArmPose::Empty,
             using: None,
+            charge_ticks: 25.0,
             swing: None,
             dying: 0.0,
             glide: 0.0,

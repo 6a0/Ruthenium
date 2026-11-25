@@ -27,6 +27,7 @@ use ruthenium_sim::scoreboard::{NameRecord, NameText};
 use super::affine::Affine;
 use super::avatar::{self, Figure, Moment};
 use super::equipment::{self, EquipmentSet};
+use super::hand::{self, Hands, Shown};
 use super::model::{Model, ModelSet, PartDraw, Pose, Skull};
 use super::nametag;
 use super::place::{self, Chest, DYE_COLOURS, DYES, Kind};
@@ -112,8 +113,6 @@ const GLINTS: [(usize, f32); 3] = [(0, 0.16), (1, 8.0), (1, 0.5)];
 const KEPT_TRIMS: usize = 1024;
 /// Bytes of the one page the items' models are copied into as they are first held.
 const ITEM_PAGE: u64 = 4 << 20;
-/// The ticks a crossbow takes to load, without enchantments.
-const CROSSBOW_TICKS: f32 = 25.0;
 /// The picture of a trident's own model, below `textures/entity`.
 const TRIDENT: &str = "trident/trident";
 
@@ -373,6 +372,8 @@ pub struct BlockEntityStats {
     pub draws: u32,
     /// Players and mannequins drawn.
     pub players: u32,
+    /// Parts of the player's own hands and of what they hold.
+    pub hand_parts: u32,
     /// Sides of signs drawn, and their glyphs.
     pub texts: u32,
     pub glyphs: u32,
@@ -507,6 +508,40 @@ struct ShadowRun {
     piece: Piece,
 }
 
+/// How the player's view moves with it (the game's View Bobbing and Damage Tilt options).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViewOptions {
+    pub bobbing: bool,
+    /// 0 to 1.
+    pub damage_tilt: f32,
+}
+
+impl Default for ViewOptions {
+    fn default() -> ViewOptions {
+        ViewOptions {
+            bobbing: true,
+            damage_tilt: 1.0,
+        }
+    }
+}
+
+impl ViewOptions {
+    /// `m` with the view's tilt and bob done first (`bobHurt`, then `bobView`).
+    pub(crate) fn bob(
+        &self,
+        m: Affine,
+        r: &ruthenium_sim::first_person::FirstPersonRecord,
+        partial: f32,
+    ) -> Affine {
+        let m = hand::bob_hurt(m, r, partial, self.damage_tilt);
+        if self.bobbing {
+            hand::bob_view(m, r, partial)
+        } else {
+            m
+        }
+    }
+}
+
 /// What [`BlockEntityRenderer::gather_players`] takes of the frame besides the players.
 pub(crate) struct PlayerView<'a> {
     pub camera: &'a CameraPose,
@@ -515,6 +550,20 @@ pub(crate) struct PlayerView<'a> {
     pub partial: f32,
     /// What the sky's light lacks to its full strength now (`getSkyDarken`).
     pub sky_darken: i32,
+}
+
+/// How a stack is held, as its item's definition asks.
+#[derive(Debug, Clone, Copy)]
+struct HeldHow {
+    /// In a left hand.
+    left: bool,
+    /// Seen by the one who holds it.
+    first_person: bool,
+    left_handed: bool,
+    /// The hand uses it, for so many ticks, with so many left.
+    using: bool,
+    use_ticks: i32,
+    use_remaining: i32,
 }
 
 /// What is held is drawn with: the atlases its pictures are in.
@@ -590,6 +639,10 @@ pub(crate) struct BlockEntityRenderer {
     /// State of the numbers obfuscated text is picked by.
     random: u64,
     instances: Vec<Instance>,
+    /// The player's own hands, which are drawn over the whole world: their parts, and
+    /// what of them is drawn from back to front.
+    hand: Vec<Instance>,
+    hand_sorted: Vec<(f32, std::ops::Range<usize>)>,
     parts: Vec<PartDraw>,
     christmas: bool,
     stats: BlockEntityStats,
@@ -781,6 +834,8 @@ impl BlockEntityRenderer {
             runs: Vec::new(),
             random: 0x9E37_79B9_7F4A_7C15,
             instances: Vec::new(),
+            hand: Vec::new(),
+            hand_sorted: Vec::new(),
             parts: Vec::new(),
             textures: ids,
             christmas: is_christmas(SystemTime::now()),
@@ -912,6 +967,8 @@ impl BlockEntityRenderer {
     pub fn begin(&mut self) {
         self.instances.clear();
         self.sorted.clear();
+        self.hand.clear();
+        self.hand_sorted.clear();
         self.skins.begin();
         self.runs.clear();
         self.name_runs.clear();
@@ -937,6 +994,7 @@ impl BlockEntityRenderer {
         camera: [f64; 3],
         view: &View,
         textures: &TextureTable,
+        mut marks: Option<&mut crate::block_marks::BlockMarks>,
     ) {
         self.stats.sections += 1;
         for &(at, state) in list {
@@ -1010,6 +1068,7 @@ impl BlockEntityRenderer {
                 continue;
             }
             let usable = |id: Option<TextureId>| id.filter(|t| textures.is_ready(*t));
+            let first = self.instances.len();
             match kind {
                 Kind::Chest(chest) => {
                     let (model, half) = place::chest_half(state);
@@ -1044,33 +1103,22 @@ impl BlockEntityRenderer {
                 Kind::Skull { skull, .. } => {
                     let model = Model::Skull(skull);
                     let still = Pose::Skull(0.0);
-                    if skull == Skull::Player
+                    let (layer, texture) = if skull == Skull::Player
                         && let Some(owner) = self.owner(terrain, pos)
                     {
                         let Some(look) = self.skins.look(&owner, textures) else {
                             continue;
                         };
-                        let first = self.instances.len();
-                        let layer = skin_layer(&look);
-                        self.add(kind, state, model, still, place, layer, look.body, WHITE);
-                        self.sort(first, layer);
-                        self.stats.drawn += 1;
-                        continue;
-                    }
-                    let i = SKULLS.iter().position(|s| *s == skull).unwrap_or(0);
-                    let Some(texture) = usable(self.skulls[i]) else {
-                        continue;
+                        (skin_layer(&look), look.body)
+                    } else {
+                        let i = SKULLS.iter().position(|s| *s == skull).unwrap_or(0);
+                        let Some(texture) = usable(self.skulls[i]) else {
+                            continue;
+                        };
+                        (CUTOUT_FACES, texture)
                     };
-                    self.add(
-                        kind,
-                        state,
-                        model,
-                        still,
-                        place,
-                        CUTOUT_FACES,
-                        texture,
-                        WHITE,
-                    );
+                    self.add(kind, state, model, still, place, layer, texture, WHITE);
+                    self.sort(first, layer);
                 }
                 Kind::Sign { .. } => {}
                 Kind::Banner { dye, wall } => {
@@ -1099,6 +1147,21 @@ impl BlockEntityRenderer {
                         }
                     }
                 }
+            }
+            if let Some((_, stage)) = frame.breaking.iter().find(|(p, _)| *p == pos)
+                && let Some(marks) = marks.as_deref_mut()
+            {
+                // Each physical part casts one decal. The pattern layers repeat the banner cloth.
+                let parts = self.instances[first..]
+                    .iter()
+                    .filter(|part| part.batch.0 != PATTERN)
+                    .map(|part| {
+                        let (layer, _, first_quad) = part.batch;
+                        let faces = &self.models.quads()
+                            [first_quad as usize..(first_quad + part.quads) as usize];
+                        (layer >= SKIN, part.transform, faces)
+                    });
+                marks.add_model_block(*stage, parts, origin, view);
             }
             self.stats.drawn += 1;
         }
@@ -1277,6 +1340,131 @@ impl BlockEntityRenderer {
                 self.add_name(e.id, name, top, away, levels, axes);
             }
         }
+    }
+
+    /// Gathers the player's own hands as its eyes see them, for [`Self::draw_hand`]
+    /// (`GameRenderer.renderItemInHand`): the bare arm or what each hand holds, moved
+    /// with the view's bob and tilt as `options` say.
+    pub fn gather_hand(
+        &mut self,
+        frame: &Frame,
+        terrain: &Terrain,
+        seen: &PlayerView<'_>,
+        textures: &TextureTable,
+        block_atlas: TextureId,
+        options: ViewOptions,
+    ) {
+        /// `GameType.SPECTATOR`.
+        const SPECTATOR: i32 = 3;
+        let r = &frame.player.first_person;
+        if r.sleeping || frame.player.game_type == SPECTATOR {
+            return;
+        }
+        let Some(look) = self.skins.look(&r.skin, textures) else {
+            return;
+        };
+        let atlases = Atlases {
+            items: self.item_atlas.filter(|t| textures.is_ready(*t)),
+            blocks: Some(block_atlas).filter(|t| textures.is_ready(*t)),
+        };
+        // In the light at the eyes, as the player itself is drawn.
+        let eyes = seen.camera.position.map(|c| c.floor() as i32);
+        let (block, sky) = terrain
+            .probe(eyes)
+            .map_or((0, 15), |p| (p.block_light, p.sky_light));
+        let light = record_light(if r.on_fire { 15 } else { block }, sky);
+        // From the view's own space (x to the right, y up, ahead at negative z) to
+        // blocks around the eyes.
+        let [forward, right, up] = seen.camera.axes();
+        let from_view = Affine(std::array::from_fn(|i| [right[i], up[i], -forward[i], 0.0]));
+        let m = options.bob(from_view, r, seen.partial);
+        let hands = Hands {
+            r,
+            partial: seen.partial,
+            x_rot: seen.camera.x_rot,
+            y_rot: seen.camera.y_rot,
+        };
+        let m = hands.trailing(m);
+        // The hands are gathered as everything else is, into a list of their own.
+        std::mem::swap(&mut self.instances, &mut self.hand);
+        std::mem::swap(&mut self.sorted, &mut self.hand_sorted);
+        for off_hand in [false, true] {
+            let drawn = if off_hand {
+                r.hands.off()
+            } else {
+                r.hands.main()
+            };
+            if !drawn {
+                continue;
+            }
+            let stack = &r.held[usize::from(off_hand)];
+            let swap_scale = match (&self.items, stack.c.item_model.as_deref()) {
+                (Some(items), Some(id)) if !stack.is_empty() => items.swap_scale(id),
+                _ => 1.0,
+            };
+            match hands.hand(m, off_hand, swap_scale) {
+                Shown::Nothing => {}
+                Shown::Arm(at) => {
+                    self.add_arm(at, hands.is_right(off_hand), &look, r.parts, light);
+                }
+                Shown::Item(at) => {
+                    let how = HeldHow {
+                        left: !hands.is_right(off_hand),
+                        first_person: true,
+                        left_handed: r.left_handed,
+                        using: r.using == Some(off_hand),
+                        use_ticks: r.use_duration[usize::from(off_hand)] - r.use_remaining,
+                        use_remaining: r.use_remaining,
+                    };
+                    self.add_held_at(stack, at, how, light, atlases, textures);
+                }
+            }
+        }
+        std::mem::swap(&mut self.instances, &mut self.hand);
+        std::mem::swap(&mut self.sorted, &mut self.hand_sorted);
+    }
+
+    /// Adds the player's own bare arm at `at` (`AvatarRenderer.renderHand`): the arm of
+    /// its model at rest, turned a little outwards, with its sleeve if that is shown.
+    fn add_arm(&mut self, at: Affine, right: bool, look: &Look, shown: u8, light: u32) {
+        let model = if look.slim {
+            Model::PlayerSlim
+        } else {
+            Model::Player
+        };
+        let (arm, sleeve, bit, turn) = if right {
+            ("right_arm", "right_sleeve", avatar::part::RIGHT_SLEEVE, 0.1)
+        } else {
+            ("left_arm", "left_sleeve", avatar::part::LEFT_SLEEVE, -0.1)
+        };
+        self.parts.clear();
+        self.models.draw_by(model, &mut self.parts, |name, m| {
+            if name == arm {
+                m.rotation[2] = turn;
+                true
+            } else if name == sleeve {
+                shown & bit != 0
+            } else {
+                // The model's root carries the arm; nothing else of it is drawn.
+                name.is_empty()
+            }
+        });
+        let layer = skin_layer(look);
+        let first = self.instances.len();
+        for p in &self.parts {
+            self.instances.push(Instance {
+                batch: (layer, u32::from(p.over), p.first_quad),
+                quads: p.quads,
+                transform: at.then_inner(p.transform),
+                light,
+                colour: WHITE,
+                texture: look.body,
+                hurt: false,
+                glint: Glint::None,
+                source: 0,
+            });
+        }
+        self.sort(first, layer);
     }
 
     /// Adds what is written over the head of the entity `id`, whose top is at `top` from
@@ -1737,52 +1925,11 @@ impl BlockEntityRenderer {
         textures: &TextureTable,
     ) {
         let stack = &r.held[usize::from(off_hand)];
-        let c = &stack.c;
-        let Some(id) = c.item_model.as_deref().filter(|_| !stack.is_empty()) else {
+        if stack.is_empty() {
             return;
-        };
-        // (Taken out for as long as its leaves are read.)
-        let Some(items) = self.items.take() else {
-            return;
-        };
+        }
         // The main hand is the right one, unless it is the left.
         let left = off_hand != r.left_handed;
-        let has_component = |name: &str, _ignore_default: bool| {
-            stack.patch.added.iter().any(|(kind, _)| {
-                u32::try_from(*kind)
-                    .ok()
-                    .and_then(DataComponentType::from_id)
-                    .is_some_and(|k| k.name() == name)
-            })
-        };
-        let held = Held {
-            context: if left {
-                "thirdperson_lefthand"
-            } else {
-                "thirdperson_righthand"
-            },
-            left_handed: r.left_handed,
-            using: r.using.is_some_and(|(_, off)| off == off_hand),
-            use_ticks: r.using.map_or(0, |u| u.0),
-            use_remaining: r.use_remaining,
-            damage: c
-                .damageable()
-                .then(|| (c.damage.unwrap_or(0), c.max_damage.unwrap_or(0))),
-            count: (stack.count, c.max_stack_size()),
-            charge: match (c.charged, c.charged_rocket) {
-                (false, _) => "none",
-                (true, true) => "rocket",
-                (true, false) => "arrow",
-            },
-            charge_ticks: CROSSBOW_TICKS,
-            trim_material: c
-                .trim
-                .as_deref()
-                .map(|t| &*t.material)
-                .filter(|m| !m.is_empty()),
-            block_state: c.block_state.as_deref().map_or(&[][..], Vec::as_slice),
-            has_component: &has_component,
-        };
         // Where the hand is: on the arm, turned to hold (a thin arm half a texel
         // further out).
         let arm = if left { "left_arm" } else { "right_arm" };
@@ -1797,14 +1944,85 @@ impl BlockEntityRenderer {
                 m.position[0] += if left { -0.5 } else { 0.5 };
             }
         });
-        if let Some(on_arm) = on_arm {
-            let side = if left { -1.0 } else { 1.0 };
-            let hand = figure
-                .transform
-                .then_inner(on_arm)
-                .rotate_x(-std::f32::consts::FRAC_PI_2)
-                .rotate_y(std::f32::consts::PI)
-                .translate([side / 16.0, 0.125, -0.625]);
+        let Some(on_arm) = on_arm else {
+            return;
+        };
+        let side = if left { -1.0 } else { 1.0 };
+        let hand = figure
+            .transform
+            .then_inner(on_arm)
+            .rotate_x(-std::f32::consts::FRAC_PI_2)
+            .rotate_y(std::f32::consts::PI)
+            .translate([side / 16.0, 0.125, -0.625]);
+        let how = HeldHow {
+            left,
+            first_person: false,
+            left_handed: r.left_handed,
+            using: r.using.is_some_and(|(_, off)| off == off_hand),
+            use_ticks: r.using.map_or(0, |u| u.0),
+            use_remaining: r.use_remaining,
+        };
+        self.add_held_at(stack, hand, how, light, atlases, textures);
+    }
+
+    /// Adds a stack's models where a hand at `hand` holds it, as its item's definition
+    /// says for a stack held so.
+    fn add_held_at(
+        &mut self,
+        stack: &Stack,
+        hand: Affine,
+        how: HeldHow,
+        light: u32,
+        atlases: Atlases,
+        textures: &TextureTable,
+    ) {
+        let c = &stack.c;
+        let Some(id) = c.item_model.as_deref().filter(|_| !stack.is_empty()) else {
+            return;
+        };
+        // (Taken out for as long as its leaves are read.)
+        let Some(items) = self.items.take() else {
+            return;
+        };
+        let left = how.left;
+        let has_component = |name: &str, _ignore_default: bool| {
+            stack.patch.added.iter().any(|(kind, _)| {
+                u32::try_from(*kind)
+                    .ok()
+                    .and_then(DataComponentType::from_id)
+                    .is_some_and(|k| k.name() == name)
+            })
+        };
+        let held = Held {
+            context: match (how.first_person, left) {
+                (false, true) => "thirdperson_lefthand",
+                (false, false) => "thirdperson_righthand",
+                (true, true) => "firstperson_lefthand",
+                (true, false) => "firstperson_righthand",
+            },
+            left_handed: how.left_handed,
+            using: how.using,
+            use_ticks: how.use_ticks,
+            use_remaining: how.use_remaining,
+            damage: c
+                .damageable()
+                .then(|| (c.damage.unwrap_or(0), c.max_damage.unwrap_or(0))),
+            count: (stack.count, c.max_stack_size()),
+            charge: match (c.charged, c.charged_rocket) {
+                (false, _) => "none",
+                (true, true) => "rocket",
+                (true, false) => "arrow",
+            },
+            charge_ticks: c.crossbow_charge_ticks as f32,
+            trim_material: c
+                .trim
+                .as_deref()
+                .map(|t| &*t.material)
+                .filter(|m| !m.is_empty()),
+            block_state: c.block_state.as_deref().map_or(&[][..], Vec::as_slice),
+            has_component: &has_component,
+        };
+        {
             let glints = c.glints();
             items.resolve_each(id, &held, &mut |leaf| {
                 let (mesh, transformation) = match leaf {
@@ -1822,7 +2040,12 @@ impl BlockEntityRenderer {
                 let Some(model) = items.mesh(mesh) else {
                     return;
                 };
-                let placed = place_item(hand, model.hands[usize::from(left)], left)
+                let places = if how.first_person {
+                    &model.first_person
+                } else {
+                    &model.hands
+                };
+                let placed = place_item(hand, places[usize::from(left)], left)
                     .then_inner(Affine(*transformation));
                 match leaf {
                     Drawn::Model { tints, .. } => self.add_item(
@@ -2043,6 +2266,53 @@ impl BlockEntityRenderer {
         unsafe { self.draw_signs(pass, frame_data, view, fog, lightmap) };
         // SAFETY: the caller's.
         unsafe { self.draw_names(pass, frame_data, view, fog, lightmap) };
+    }
+
+    /// Draws the player's own hands, as [`Self::gather_hand`] left them, into `pass`,
+    /// whose depths have been cleared: `view` is the hands' own, with the field of view
+    /// they are always seen with.
+    ///
+    /// # Safety
+    /// As [`Self::draw`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn draw_hand(
+        &mut self,
+        pass: &mut Pass<'_>,
+        frame_data: &mut FrameData,
+        view: &View,
+        fog: &Fog,
+        cardinal: CardinalLight,
+        lightmap: TextureId,
+        indices: (vk::Buffer, u64),
+    ) {
+        if self.hand.is_empty() {
+            return;
+        }
+        let Some(range) = self.pool.resolve(self.range).filter(|_| self.ready) else {
+            return;
+        };
+        // Drawn as the world's models are, in their place; no shadow is among them.
+        std::mem::swap(&mut self.instances, &mut self.hand);
+        std::mem::swap(&mut self.sorted, &mut self.hand_sorted);
+        let shadows = std::mem::take(&mut self.shadows);
+        let parts = self.stats.parts;
+        // SAFETY: the caller's.
+        unsafe {
+            self.draw_models(
+                pass,
+                frame_data,
+                view,
+                fog,
+                cardinal,
+                lightmap,
+                indices,
+                (range.buffer, range.offset),
+            )
+        };
+        self.stats.hand_parts = std::mem::replace(&mut self.stats.parts, parts);
+        self.shadows = shadows;
+        std::mem::swap(&mut self.instances, &mut self.hand);
+        std::mem::swap(&mut self.sorted, &mut self.hand_sorted);
     }
 
     /// Draws what is seen through everything else, into `pass`: the names over heads,
@@ -2608,7 +2878,7 @@ fn write_part(bytes: &mut [u8], i: &Instance, glints: [u32; 3]) {
 
 /// The push constants of a frame's models, or of its signs' text: the four words the
 /// vertex stage reads, and the fog.
-fn model_push(words: [u32; 4], fog: &Fog) -> [u8; MODEL_PUSH_BYTES] {
+pub(crate) fn model_push(words: [u32; 4], fog: &Fog) -> [u8; MODEL_PUSH_BYTES] {
     let mut push = [0u8; MODEL_PUSH_BYTES];
     let mut put = |at: usize, word: [u8; 4]| push[at..at + 4].copy_from_slice(&word);
     for (i, word) in words.into_iter().enumerate() {

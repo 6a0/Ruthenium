@@ -375,8 +375,84 @@ pub const GLINT: Record = Record {
     ],
 };
 
+/// One edge of the outline of the block the crosshair is on.
+pub const LINE: Record = Record {
+    name: "line",
+    doc: "One line drawn as wide on the screen wherever it is: record number gl_InstanceIndex from the offset in push constants.",
+    fields: &[
+        Field {
+            name: "from",
+            ty: Ty::Vec3,
+            doc: "One end, in blocks relative to the camera.",
+        },
+        Field {
+            name: "width",
+            ty: Ty::Float,
+            doc: "How wide it is, in pixels of the target.",
+        },
+        Field {
+            name: "to",
+            ty: Ty::Vec3,
+            doc: "The other end.",
+        },
+        Field {
+            name: "colour",
+            ty: Ty::Uint,
+            doc: "Its colour: red in the low byte, then green, blue and alpha.",
+        },
+    ],
+};
+
+/// One face of a block that is being broken, with the cracks laid over it.
+pub const CRACK: Record = Record {
+    name: "crack",
+    doc: "One quad of the cracks in a block being broken: record number gl_InstanceIndex from the offset in push constants.",
+    fields: &[
+        Field {
+            name: "a",
+            ty: Ty::Vec3,
+            doc: "Its first corner, in blocks from the camera's block; the quad is the triangles a-b-c and a-c-d.",
+        },
+        Field {
+            name: "b",
+            ty: Ty::Vec3,
+            doc: "The second.",
+        },
+        Field {
+            name: "c",
+            ty: Ty::Vec3,
+            doc: "The third.",
+        },
+        Field {
+            name: "d",
+            ty: Ty::Vec3,
+            doc: "The fourth.",
+        },
+        Field {
+            name: "uv_a",
+            ty: Ty::Vec2,
+            doc: "Where the cracks' picture is read at the first corner, in pictures (it repeats).",
+        },
+        Field {
+            name: "uv_b",
+            ty: Ty::Vec2,
+            doc: "At the second.",
+        },
+        Field {
+            name: "uv_c",
+            ty: Ty::Vec2,
+            doc: "At the third.",
+        },
+        Field {
+            name: "uv_d",
+            ty: Ty::Vec2,
+            doc: "At the fourth.",
+        },
+    ],
+};
+
 /// Every record `world.glsl` has accessors for.
-pub const RECORDS: [&Record; 9] = [
+pub const RECORDS: [&Record; 11] = [
     &WORLD,
     &WORLD_MATRIX,
     &SECTION,
@@ -386,6 +462,8 @@ pub const RECORDS: [&Record; 9] = [
     &GLYPH,
     &SHADOW,
     &GLINT,
+    &LINE,
+    &CRACK,
 ];
 
 /// The text of `glsl/include/world.glsl`.

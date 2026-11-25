@@ -104,6 +104,7 @@ pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
                 Blend::Opaque => 0,
                 Blend::Alpha => 1,
                 Blend::Glow => 2,
+                Blend::Multiply => 3,
             })
             .u32(match d.depth {
                 Depth::None => 0,
@@ -111,6 +112,7 @@ pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
                 Depth::TestAndWrite => 2,
                 Depth::Test => 3,
                 Depth::Decal => 4,
+                Depth::TestDecal => 5,
             })
             .u32(u32::from(d.cull_back));
         match &d.vertex_input {
@@ -344,6 +346,11 @@ pub enum Blend {
     /// Light added to what is there: `src.a * src + dst`; the target's alpha becomes
     /// the source's (vanilla's blend of the sun, the moon and the stars).
     Glow,
+    /// What is there multiplied by the source, twice: `2 * src * dst`, so that a source
+    /// of half grey leaves it as it is, a darker one darkens and a lighter one lightens
+    /// it; the target's alpha becomes the source's (vanilla's blend of the cracks in a
+    /// block being broken).
+    Multiply,
 }
 
 /// How much nearer a [`Depth::Decal`] is drawn: steps of the depth format, and times the
@@ -368,6 +375,8 @@ pub enum Depth {
     /// As [`Depth::TestAndWrite`], and drawn a little nearer than it is, so that it lies over
     /// a surface in its own plane (the text on a sign): by its slope and ten steps more.
     Decal,
+    /// As [`Depth::Decal`], but not written (the cracks in a block being broken).
+    TestDecal,
 }
 
 /// The layout of the one vertex buffer a pipeline reads (binding 0, a vertex per
@@ -840,14 +849,14 @@ fn build_one(
         })
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         // Depth is reversed: what is added brings a fragment nearer.
-        .depth_bias_enable(d.depth == Depth::Decal)
+        .depth_bias_enable(matches!(d.depth, Depth::Decal | Depth::TestDecal))
         .depth_bias_constant_factor(DECAL_STEPS)
         .depth_bias_slope_factor(DECAL_SLOPE)
         .line_width(1.0);
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(matches!(
             d.depth,
-            Depth::TestAndWrite | Depth::Test | Depth::Decal
+            Depth::TestAndWrite | Depth::Test | Depth::Decal | Depth::TestDecal
         ))
         .depth_write_enable(matches!(d.depth, Depth::TestAndWrite | Depth::Decal))
         .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL);
@@ -874,6 +883,15 @@ fn build_one(
             .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA),
+        Blend::Multiply => vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::DST_COLOR)
+            .dst_color_blend_factor(vk::BlendFactor::SRC_COLOR)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA),
     };
     let attachments = [attachment];
     let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
@@ -884,7 +902,9 @@ fn build_one(
         .color_attachment_formats(&formats)
         .depth_attachment_format(match d.depth {
             Depth::None => vk::Format::UNDEFINED,
-            Depth::Ignore | Depth::TestAndWrite | Depth::Test | Depth::Decal => depth_format,
+            Depth::Ignore | Depth::TestAndWrite | Depth::Test | Depth::Decal | Depth::TestDecal => {
+                depth_format
+            }
         });
     let info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)

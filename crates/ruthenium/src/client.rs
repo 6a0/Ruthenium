@@ -183,6 +183,13 @@ pub struct Options {
     pub players: Option<bool>,
     /// Whether entities cast shadows (the default).
     pub entity_shadows: Option<bool>,
+    /// Whether the player's own hands are drawn, the block the crosshair is on is
+    /// outlined, and the view bobs with the player's steps (the defaults).
+    pub hand: Option<bool>,
+    pub block_outline: Option<bool>,
+    pub view_bobbing: Option<bool>,
+    /// Whether the crosshair is drawn (the default).
+    pub crosshair: Option<bool>,
     /// Whether animated textures play (the default) or hold still.
     pub animations: Option<bool>,
     /// Whether the field of view narrows in water and lava (the default).
@@ -250,6 +257,10 @@ impl Options {
             block_entities: None,
             players: None,
             entity_shadows: None,
+            hand: None,
+            block_outline: None,
+            view_bobbing: None,
+            crosshair: None,
             animations: None,
             fov_effects: None,
         };
@@ -443,7 +454,8 @@ impl Options {
                         ))?);
                 }
                 "--fog" | "--light-flicker" | "--translucent" | "--animations"
-                | "--fov-effects" | "--block-entities" | "--players" | "--entity-shadows" => {
+                | "--fov-effects" | "--block-entities" | "--players" | "--entity-shadows"
+                | "--hand" | "--block-outline" | "--view-bobbing" | "--crosshair" => {
                     let on = match value("on or off")?.as_str() {
                         "on" => true,
                         "off" => false,
@@ -457,6 +469,10 @@ impl Options {
                         "--block-entities" => o.block_entities = Some(on),
                         "--players" => o.players = Some(on),
                         "--entity-shadows" => o.entity_shadows = Some(on),
+                        "--hand" => o.hand = Some(on),
+                        "--block-outline" => o.block_outline = Some(on),
+                        "--view-bobbing" => o.view_bobbing = Some(on),
+                        "--crosshair" => o.crosshair = Some(on),
                         _ => o.translucent = Some(on),
                     }
                 }
@@ -596,6 +612,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut menu = Menu::new(servers_file, accounts, settings);
     if let Some(n) = opts.mesh_workers {
         menu.set_mesh_workers(n);
+    }
+    if let Some(on) = opts.crosshair {
+        menu.set_crosshair(on);
     }
     if let Some(path) = &opts.route {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -757,6 +776,18 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     if let Some(on) = opts.entity_shadows {
         renderer.set_entity_shadows(on);
+    }
+    if let Some(on) = opts.hand {
+        renderer.set_hand(on);
+    }
+    if let Some(on) = opts.block_outline {
+        renderer.set_block_outline(on);
+    }
+    if let Some(on) = opts.view_bobbing {
+        renderer.set_view_options(ruthenium_render::ViewOptions {
+            bobbing: on,
+            ..renderer.view_options()
+        });
     }
     if let Some(on) = opts.animations {
         renderer.set_animate(on);
@@ -1399,6 +1430,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 "block_entities": renderer.block_entities(),
                 "players": renderer.players(),
                 "entity_shadows": renderer.entity_shadows(),
+                "hand": renderer.hand(),
+                "block_outline": renderer.block_outline(),
+                "view_bobbing": renderer.view_options().bobbing,
                 "animations": renderer.animate(),
                 "fov_effects": renderer.fov_effects(),
                 "light_flicker": renderer.atmosphere_options().flicker,
@@ -1636,6 +1670,7 @@ fn terrain_json(s: &ruthenium_render::WorldStats) -> Value {
         "names_drawn": s.block_entities.names,
         "shadow_pieces": s.block_entities.shadows,
         "block_entity_parts": s.block_entities.parts,
+        "hand_parts": s.block_entities.hand_parts,
         "sign_texts": s.block_entities.texts,
         "sign_glyphs": s.block_entities.glyphs,
         "block_entity_draws": s.block_entities.draws,
@@ -1689,6 +1724,9 @@ fn capture_state(renderer: &Renderer) -> Value {
     let u = renderer.upload_stats();
     json!({
         "terrain": renderer.world_stats().map(|s| terrain_json(&s)),
+        "block_marks": renderer.mark_stats().map(|s| json!({
+            "outline_edges": s.lines, "cracked_blocks": s.cracked, "crack_quads": s.cracks
+        })),
         "uploads": {
             "render_memcpy_bytes": u.render_memcpy_bytes,
             "worker_write_bytes": u.worker_write_bytes,

@@ -1,6 +1,6 @@
 // Ruthenium: the fragment stage of models. Before including it a shader defines
-// ALPHA_CUTOUT to leave out texels with holes, and PER_FACE if it draws both sides of a
-// face, each in its own light.
+// ALPHA_CUTOUT to leave out texels with holes, PER_FACE if it draws both sides of a
+// face, each in its own light, and SAMPLE_REPEAT if its picture repeats.
 
 #include "push.glsl"
 #include "textures.glsl"
@@ -30,7 +30,11 @@ layout(location = 9) flat in float v_glint_strength;
 layout(location = 0) out vec4 o_color;
 
 void main() {
+#ifdef SAMPLE_REPEAT
+    vec4 color = sample_texture(v_texture, SAMPLER_NEAREST_REPEAT, v_uv);
+#else
     vec4 color = sample_texture(v_texture, SAMPLER_NEAREST_CLAMP, v_uv);
+#endif
 #ifdef ALPHA_CUTOUT
     if (color.a < ALPHA_CUTOUT) {
         discard;

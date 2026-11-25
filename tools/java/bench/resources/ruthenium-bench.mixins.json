@@ -4,6 +4,7 @@
   "package": "dev.ruthenium.bench.mixin",
   "compatibilityLevel": "JAVA_25",
   "client": [
+    "HudMixin",
     "MinecraftMixin",
     "MouseHandlerMixin",
     "SDLEventHandlerMixin"

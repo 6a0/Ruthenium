@@ -57,6 +57,10 @@ pub enum PipelineId {
     NameTagSheer,
     /// The shadows under entities, blended over the ground they lie on.
     Shadow,
+    /// The cracks in a block being broken, which darken and lighten the faces they lie
+    /// on; and the outline of the block the crosshair is on.
+    Crack,
+    Outline,
     /// The sky drawn before the world, over the cleared target: what covers what is
     /// there (the dome), what is blended over it (a sunrise's glow, the End's sky) and
     /// what adds light to it (the sun, the moon, the stars).
@@ -77,7 +81,7 @@ pub enum PipelineId {
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 39] = [
+    pub const ALL: [PipelineId; 41] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -107,6 +111,8 @@ impl PipelineId {
         PipelineId::NameTag,
         PipelineId::NameTagSheer,
         PipelineId::Shadow,
+        PipelineId::Crack,
+        PipelineId::Outline,
         PipelineId::SkyFlat,
         PipelineId::SkyBlend,
         PipelineId::SkyGlow,
@@ -331,6 +337,28 @@ impl PipelineId {
                 vertex_input: None,
                 depth: Depth::Test,
                 cull_back: true,
+            },
+            // In the planes of the faces they are on, and a little nearer.
+            PipelineId::Crack => GraphicsDesc {
+                name: "crack",
+                vertex: shaders::CRACK_VERT.words(),
+                fragment: shaders::MODEL_REPEAT_FRAG.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                blend: Blend::Multiply,
+                vertex_input: None,
+                depth: Depth::TestDecal,
+                cull_back: true,
+            },
+            // A line's strip faces whichever way its ends lie on the target.
+            PipelineId::Outline => GraphicsDesc {
+                name: "outline",
+                vertex: shaders::OUTLINE_VERT.words(),
+                fragment: shaders::OUTLINE_FRAG.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                blend: Blend::Alpha,
+                vertex_input: None,
+                depth: Depth::TestAndWrite,
+                cull_back: false,
             },
             PipelineId::SkyFlat => sky("sky_flat", Blend::Opaque, Depth::Ignore),
             PipelineId::SkyBlend => sky("sky_blend", Blend::Alpha, Depth::Ignore),

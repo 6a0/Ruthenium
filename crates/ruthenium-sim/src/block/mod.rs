@@ -36,6 +36,7 @@ use ruthenium_prepare::exporters::{BlockBehaviourData, BlockBehaviours, StateBeh
 
 pub use class::Class;
 pub use level::{CollisionMode, Support, flags};
+pub(crate) use usable::spectator_outline;
 
 use crate::direction::Direction;
 use crate::interact::{Outcome, World};

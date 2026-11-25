@@ -200,6 +200,8 @@ pub struct ItemMesh {
     pub runs: Vec<Run>,
     /// In a right hand and in a left one, seen from outside.
     pub hands: [Option<ItemTransform>; 2],
+    /// In a right hand and in a left one, seen by the one who holds it.
+    pub first_person: [Option<ItemTransform>; 2],
     /// On a head.
     pub head: Option<ItemTransform>,
 }
@@ -479,6 +481,9 @@ impl Node {
 #[derive(Debug, Default)]
 pub struct ItemModels {
     definitions: HashMap<String, Node>,
+    /// How much farther a hand sinks to change to or from each item than usual
+    /// (`swap_animation_scale`), for those that say.
+    swap_scales: HashMap<String, f32>,
     meshes: Vec<ItemMesh>,
     /// What went wrong on the way, for the log.
     pub warnings: Vec<String>,
@@ -728,6 +733,10 @@ impl<'a> Baker<'a> {
         mesh.hands = [
             place("thirdperson_righthand"),
             place("thirdperson_lefthand"),
+        ];
+        mesh.first_person = [
+            place("firstperson_righthand"),
+            place("firstperson_lefthand"),
         ];
         mesh.head = place("head");
         mesh
@@ -1080,10 +1089,16 @@ impl ItemModels {
             warnings: Vec::new(),
         };
         let mut out = HashMap::new();
+        let mut swap_scales = HashMap::new();
         for (id, text) in definitions {
-            let root = serde_json::from_str::<Value>(text)
-                .ok()
-                .and_then(|v| v.get("model").cloned());
+            let file = serde_json::from_str::<Value>(text).ok();
+            if let Some(scale) = file
+                .as_ref()
+                .and_then(|v| v.get("swap_animation_scale")?.as_f64())
+            {
+                swap_scales.insert(id.clone(), scale as f32);
+            }
+            let root = file.and_then(|v| v.get("model").cloned());
             match root {
                 Some(model) => {
                     let node = baker.node(&model, &NO_TRANSFORMATION);
@@ -1094,6 +1109,7 @@ impl ItemModels {
         }
         ItemModels {
             definitions: out,
+            swap_scales,
             meshes: baker.meshes,
             warnings: baker.warnings,
         }
@@ -1113,6 +1129,11 @@ impl ItemModels {
 
     pub fn mesh(&self, index: u32) -> Option<&ItemMesh> {
         self.meshes.get(index as usize)
+    }
+
+    /// `swapAnimationScale` of the definition `id`: 1 unless it says otherwise.
+    pub fn swap_scale(&self, id: &str) -> f32 {
+        self.swap_scales.get(id).copied().unwrap_or(1.0)
     }
 
     pub fn len(&self) -> usize {

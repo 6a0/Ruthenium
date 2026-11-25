@@ -45,6 +45,9 @@ pub(crate) struct Options {
     /// With the screenshot: vanilla draws no HUD, hand, vignette or clouds, so that its
     /// picture is of the world alone. Such a run's times are not vanilla's.
     pub bare: bool,
+    /// With the screenshot: vanilla keeps the player's hand and the outline of the block
+    /// it looks at, and draws nothing else of its HUD, no clouds either.
+    pub hand: bool,
     pub render_distance: u32,
     pub gpu: Gpu,
 }
@@ -63,6 +66,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         results: None,
         screenshot: false,
         bare: false,
+        hand: false,
         render_distance: 12,
         gpu: Gpu::Auto,
     };
@@ -76,6 +80,11 @@ fn parse(args: &[String]) -> Result<Options, String> {
         if arg == "--bare-picture" {
             o.screenshot = true;
             o.bare = true;
+            continue;
+        }
+        if arg == "--hand-picture" {
+            o.screenshot = true;
+            o.hand = true;
             continue;
         }
         let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;
@@ -252,6 +261,7 @@ pub(crate) fn launch(
         format!("-Druthenium.bench.seed={}", o.seed),
         format!("-Druthenium.bench.screenshot={}", o.screenshot),
         format!("-Druthenium.bench.bare={}", o.bare),
+        format!("-Druthenium.bench.hand={}", o.hand),
     ];
     if let Some((address, route)) = &run.dedicated {
         let route = std::path::absolute(route).map_err(|e| e.to_string())?;

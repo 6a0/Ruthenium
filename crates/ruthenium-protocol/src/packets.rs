@@ -1421,9 +1421,18 @@ pub mod play {
         DamageEvent {
             entity_id: i32,
         },
-        /// `ClientboundHurtAnimationPacket`.
+        /// `ClientboundHurtAnimationPacket`: an entity flinches; `yaw` is where what
+        /// hurt it came from, in degrees from the way it faces.
         HurtAnimation {
             entity_id: i32,
+            yaw: f32,
+        },
+        /// `ClientboundBlockDestructionPacket`: how far the entity `id` has broken the
+        /// block at `pos`: a stage from 0 to 9, anything else for no longer.
+        BlockDestruction {
+            id: i32,
+            pos: [i32; 3],
+            progress: u8,
         },
         /// `ClientboundSwingAnimationPacket`: an entity swings a hand. `animation` is
         /// none (0), a whack (1) or a stab (2).
@@ -1972,11 +1981,15 @@ pub mod play {
                     optional(&mut r, vec3)?;
                     Clientbound::DamageEvent { entity_id }
                 }
-                C::HurtAnimation => {
-                    let entity_id = r.varint()?;
-                    r.f32()?;
-                    Clientbound::HurtAnimation { entity_id }
-                }
+                C::HurtAnimation => Clientbound::HurtAnimation {
+                    entity_id: r.varint()?,
+                    yaw: r.f32()?,
+                },
+                C::BlockDestruction => Clientbound::BlockDestruction {
+                    id: r.varint()?,
+                    pos: unpack_block_pos(r.i64()?),
+                    progress: r.u8()?,
+                },
                 C::SwingAnimation => Clientbound::SwingAnimation {
                     entity_id: r.varint()?,
                     off_hand: r.varint()? == 1,
@@ -2924,7 +2937,22 @@ mod tests {
         wire::write_f32(&mut b, 90.0);
         assert_eq!(
             decode(pl::Clientbound::HurtAnimation, &b),
-            play::Clientbound::HurtAnimation { entity_id: 5 }
+            play::Clientbound::HurtAnimation {
+                entity_id: 5,
+                yaw: 90.0
+            }
+        );
+        // A block being broken: who breaks it, where, and how far.
+        let mut b = vec![7];
+        wire::write_i64(&mut b, play::pack_block_pos([3, -60, -8]));
+        b.push(9);
+        assert_eq!(
+            decode(pl::Clientbound::BlockDestruction, &b),
+            play::Clientbound::BlockDestruction {
+                id: 7,
+                pos: [3, -60, -8],
+                progress: 9
+            }
         );
     }
 

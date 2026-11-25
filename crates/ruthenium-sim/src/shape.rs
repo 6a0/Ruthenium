@@ -291,6 +291,53 @@ impl Shape {
         self.sizes[axis as usize]
     }
 
+    /// `VoxelShape.forAllEdges`: the edges of the shape, each as its two ends, with
+    /// those that go on in a line as one. An edge runs where one or three of the four
+    /// cells around a grid line are full, or two that lie across from each other.
+    pub fn edges(&self) -> Vec<[[f64; 3]; 2]> {
+        let mut out = Vec::new();
+        if self.empty {
+            return out;
+        }
+        // Along each axis in turn, past the grid points of the other two.
+        for along in 0..3 {
+            let (a, b) = ((along + 1) % 3, (along + 2) % 3);
+            for ia in 0..=self.sizes[a] {
+                for ib in 0..=self.sizes[b] {
+                    let mut start = None;
+                    for ic in 0..=self.sizes[along] {
+                        let (mut full, mut odd) = (0, 0);
+                        for da in 0..2 {
+                            for db in 0..2 {
+                                let mut at = [0isize; 3];
+                                at[a] = ia as isize + da - 1;
+                                at[b] = ib as isize + db - 1;
+                                at[along] = ic as isize;
+                                if self.is_full_wide(at[0], at[1], at[2]) {
+                                    full += 1;
+                                    odd ^= da ^ db;
+                                }
+                            }
+                        }
+                        if full == 1 || full == 3 || full == 2 && odd & 1 == 0 {
+                            start.get_or_insert(ic);
+                        } else if let Some(from) = start.take() {
+                            let point = |ic: usize| {
+                                let mut p = [0.0; 3];
+                                p[a] = self.coords[a][ia];
+                                p[b] = self.coords[b][ib];
+                                p[along] = self.coords[along][ic];
+                                p
+                            };
+                            out.push([point(from), point(ic)]);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Whether a full cell is at grid index `[x, y, z]` (out of range: no).
     pub fn is_full_at(&self, x: isize, y: isize, z: isize) -> bool {
         self.is_full_wide(x, y, z)
@@ -590,6 +637,47 @@ mod tests {
 
     fn player_at(x: f64, y: f64, z: f64) -> Aabb {
         Aabb::new([x - 0.3, y, z - 0.3], [x + 0.3, y + 1.8, z + 0.3])
+    }
+
+    #[test]
+    fn a_shapes_edges_are_its_outline() {
+        // A block: its twelve edges, each from corner to corner.
+        let edges = Shape::block().edges();
+        assert_eq!(edges.len(), 12);
+        for [from, to] in &edges {
+            let along = (0..3).filter(|&i| from[i] != to[i]).count();
+            assert_eq!(along, 1, "{from:?} to {to:?}");
+            assert!(from.iter().chain(to).all(|c| *c == 0.0 || *c == 1.0));
+        }
+        assert_eq!(slab().edges().len(), 12);
+        // Stairs: a slab with half a slab on it. The step's six corners make six edges
+        // from side to side, and each side has six; where the two boxes meet in a
+        // plane there is none, and edges that go on in a line are one.
+        let stairs = Shape::from_boxes(&[
+            Aabb::new([0.0, 0.0, 0.0], [1.0, 0.5, 1.0]),
+            Aabb::new([0.0, 0.5, 0.0], [0.5, 1.0, 1.0]),
+        ]);
+        let edges = stairs.edges();
+        assert_eq!(edges.len(), 18);
+        let has = |from: [f64; 3], to: [f64; 3]| edges.contains(&[from, to]);
+        // The back's full height is one edge; the inner corner of the step is one.
+        assert!(has([0.0, 0.0, 0.0], [0.0, 1.0, 0.0]));
+        assert!(has([0.5, 0.5, 0.0], [0.5, 0.5, 1.0]));
+        assert!(!has([0.0, 0.5, 0.0], [0.0, 0.5, 1.0]));
+        // Two boxes that touch along an edge only: that edge is drawn once, and the
+        // edges of the two that lie in one line across it are one each.
+        let corners = Shape::from_boxes(&[
+            Aabb::new([0.0, 0.0, 0.0], [0.5, 0.5, 1.0]),
+            Aabb::new([0.5, 0.5, 0.0], [1.0, 1.0, 1.0]),
+        ]);
+        let edges = corners.edges();
+        let shared = edges
+            .iter()
+            .filter(|e| **e == [[0.5, 0.5, 0.0], [0.5, 0.5, 1.0]])
+            .count();
+        assert_eq!((edges.len(), shared), (19, 1));
+        assert!(edges.contains(&[[0.0, 0.5, 0.0], [1.0, 0.5, 0.0]]));
+        assert!(Shape::empty().edges().is_empty());
     }
 
     #[test]

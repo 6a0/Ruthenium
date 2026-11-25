@@ -349,6 +349,8 @@ pub struct Menu {
     forget_world: bool,
     /// Meshing threads to start with the world's assets.
     mesh_workers: usize,
+    /// Whether the crosshair is drawn over the world.
+    crosshair: bool,
     /// The route played once the session is in the world (`--route`).
     route: Option<RoutePlayer>,
 }
@@ -457,6 +459,7 @@ impl Menu {
             game: InGame::default(),
             forget_world: false,
             mesh_workers: default_mesh_workers(),
+            crosshair: true,
             route: None,
         }
     }
@@ -492,6 +495,11 @@ impl Menu {
     /// Sets how many threads mesh the world's sections.
     pub fn set_mesh_workers(&mut self, workers: usize) {
         self.mesh_workers = workers.max(1);
+    }
+
+    /// Whether the crosshair is drawn over the world (it is unless said otherwise).
+    pub fn set_crosshair(&mut self, on: bool) {
+        self.crosshair = on;
     }
 
     /// The world to draw this frame, if the session is in one.
@@ -2006,6 +2014,7 @@ impl Menu {
                         server: &self.server_name,
                         drawn,
                         debug,
+                        crosshair: self.crosshair,
                     },
                     &scale,
                     &self.fonts,

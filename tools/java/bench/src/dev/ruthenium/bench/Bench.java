@@ -65,6 +65,8 @@ public final class Bench {
     /** The route to play on a dedicated server, or null for the integrated-server scenes. */
     private final RouteRun routeRun;
     private boolean capturing;
+    private boolean pictureRequested;
+    private volatile boolean pictureSaved;
     private final long jvmStartEpochMs = ManagementFactory.getRuntimeMXBean().getStartTime();
 
     private Phase phase = Phase.STARTING;
@@ -144,11 +146,14 @@ public final class Bench {
         if (firstFrameEpochMs < 0) {
             firstFrameEpochMs = System.currentTimeMillis();
         }
-        if (Boolean.getBoolean("ruthenium.bench.bare")) {
+        boolean bare = Boolean.getBoolean("ruthenium.bench.bare");
+        // (With the hand: the HUD stays on and draws nothing, see HudMixin.)
+        boolean hand = Boolean.getBoolean("ruthenium.bench.hand");
+        if (bare || hand) {
             // A picture of the world alone, to hold another client's picture against:
             // no HUD, hand or vignette, no clouds, and the same field of view in flight
             // as on the ground. Not a run to take times from.
-            if (!mc.gui.hud.isHidden()) {
+            if (bare && !mc.gui.hud.isHidden()) {
                 mc.gui.hud.toggle();
             }
             if (mc.options.fovEffectScale().get() != 0.0) {
@@ -279,12 +284,35 @@ public final class Bench {
             gcTimeStart = gc[1];
             lastFrameNs = now;
             capturing = true;
-            if (Boolean.getBoolean("ruthenium.bench.screenshot")) {
+            if (Boolean.getBoolean("ruthenium.bench.screenshot") && !Boolean.getBoolean("ruthenium.bench.hand")) {
                 net.minecraft.client.Screenshot.grab(
                         mc.gameDirectory, "ruthenium-bench-" + scene + ".png", mc.gameRenderer.mainRenderTarget(), 1, msg -> {});
             }
         }
         if (routeRun.finished()) {
+            if (Boolean.getBoolean("ruthenium.bench.hand") && mc.level != null && mc.player != null && !pictureSaved) {
+                if (!pictureRequested) {
+                    pictureRequested = true;
+                    Path picture = out.resolveSibling(out.getFileName().toString().replaceFirst("\\.json$", "") + ".png");
+                    var level = mc.gameRenderer.gameRenderState().levelRenderState;
+                    var avatar = level.playerRenderState.avatarRenderState;
+                    System.out.println("[hand-picture] light " + (avatar == null ? null : avatar.lightCoords));
+                    for (var stages : mc.level.destructionProgress().values()) {
+                        var furthest = stages.last();
+                        System.out.println("[hand-picture] " + furthest.getPos() + " stage " + furthest.getProgress());
+                    }
+                    net.minecraft.client.Screenshot.takeScreenshot(mc.gameRenderer.mainRenderTarget(), image -> {
+                        try (image) {
+                            image.writeToFile(picture);
+                        } catch (java.io.IOException e) {
+                            routeRun.fail("writing " + picture + ": " + e);
+                        } finally {
+                            pictureSaved = true;
+                        }
+                    });
+                }
+                return;
+            }
             write(mc);
             enter(Phase.DONE, now);
             mc.stop();
