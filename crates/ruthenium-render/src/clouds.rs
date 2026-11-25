@@ -779,6 +779,8 @@ mod tests {
         // The height is a float: 192.33 is a little more, which is below it.
         assert_eq!(at(192.33), RelativePos::Below);
         assert_eq!(at(193.0), RelativePos::Inside);
+        // Level with the layer's top is still inside it.
+        assert_eq!(at(f64::from(192.33f32) + 4.0), RelativePos::Inside);
         assert_eq!(at(196.0), RelativePos::Inside);
         assert_eq!(at(196.5), RelativePos::Above);
     }
@@ -795,6 +797,17 @@ mod tests {
         assert_eq!(p(233, 0.0).cell, [0, 0]);
         assert_eq!(p(234, 0.0).cell, [1, 0]);
         assert_eq!(p(233, 1.0).cell, [1, 0]);
+        // The drift and the shift south are the game's single-precision numbers.
+        let drifted = placement(256, 256, [0.0, 70.0, 0.0], 192.33, 1000, 0.0);
+        assert_eq!(drifted.cell, [2, 0]);
+        assert_eq!(
+            drifted.in_cell,
+            [
+                (f64::from(1000.0f32 * 0.030_000_001) - 24.0) as f32,
+                3.960_000_038_146_972_7_f64 as f32
+            ]
+        );
+        assert_ne!(drifted.in_cell[0], 6.0);
         // The picture is 256 cells: after 102400 ticks it is where it began.
         assert_eq!(p(256 * 400, 0.0), start);
         // Far from the origin the place still wraps into the picture.

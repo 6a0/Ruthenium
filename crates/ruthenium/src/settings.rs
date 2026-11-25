@@ -856,6 +856,14 @@ vsync = true
         assert_eq!(s.max_fps, None);
         s.set(Row::MenuSize, 3);
         assert_eq!(s.menu_size, MenuSize::Larger);
+        // Sliders that start above zero.
+        s.set(Row::WeatherRadius, 2);
+        s.set(Row::CloudDistance, 10);
+        assert_eq!((s.game.weather_radius, s.game.cloud_distance), (5, 12));
+        assert_eq!(
+            (s.get(Row::WeatherRadius), s.get(Row::CloudDistance)),
+            (2, 10)
+        );
         assert_eq!(s.get(Row::Fov), 40);
         s.set(Row::Fov, 80);
         assert_eq!(s.game.fov, 110);
