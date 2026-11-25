@@ -66,6 +66,11 @@ pub enum Kind {
         dye: u8,
         wall: bool,
     },
+    /// Only its text: the board is an ordinary block model.
+    Sign {
+        hanging: bool,
+        wall: bool,
+    },
 }
 
 impl Kind {
@@ -99,6 +104,14 @@ impl Kind {
                 dye: dye(colour)?,
                 wall,
             });
+        }
+        if let Some(rest) = name.strip_suffix("_sign") {
+            let (rest, hanging) = match rest.strip_suffix("_hanging") {
+                Some(rest) => (rest, true),
+                None => (rest, false),
+            };
+            let wall = rest.ends_with("_wall");
+            return Some(Kind::Sign { hanging, wall });
         }
         let rest = name
             .strip_suffix("_skull")
@@ -177,6 +190,37 @@ pub fn is_other_half(state: u32, other: u32) -> bool {
         )
 }
 
+/// From the space of the text on one side of a sign (y runs down) to the block's.
+pub fn sign_text(state: u32, hanging: bool, wall: bool, front: bool) -> Affine {
+    let angle = if wall {
+        get_dir(state, "facing").map_or(0.0, Direction::to_y_rot)
+    } else {
+        sixteenths(state)
+    };
+    let turn = |t: Affine| {
+        if front {
+            t
+        } else {
+            t.rotate_y(std::f32::consts::PI)
+        }
+    };
+    let i = Affine::IDENTITY;
+    let (t, offset, size) = if hanging {
+        let t = i
+            .translate([0.5, 0.9375, 0.5])
+            .rotate_y(turned(angle))
+            .translate([0.0, -0.3125, 0.0]);
+        (t, [0.0, -0.32, 0.073], 0.0140625)
+    } else {
+        let mut t = i.translate([0.5; 3]).rotate_y(turned(angle));
+        if wall {
+            t = t.translate([0.0, -0.3125, -0.4375]);
+        }
+        (t, [0.0, 1.0 / 3.0, 0.046666667], 0.010416667)
+    };
+    turn(t).translate(offset).scale([size, -size, size])
+}
+
 /// From a model's space to the block's (its corner at the origin).
 pub fn transform(kind: Kind, state: u32) -> Affine {
     let facing = get_dir(state, "facing");
@@ -204,6 +248,7 @@ pub fn transform(kind: Kind, state: u32) -> Affine {
                 .rotate_y(turned(facing.opposite().to_y_rot()))
                 .scale([-1.0, -1.0, 1.0])
         }
+        Kind::Sign { hanging, wall } => sign_text(state, hanging, wall, true),
         Kind::Banner { wall, .. } => {
             let angle = if wall { yaw() } else { sixteenths(state) };
             const SIZE: f32 = 2.0 / 3.0;
@@ -290,15 +335,29 @@ mod tests {
         );
         assert_eq!(of("piston_head"), None);
         assert_eq!(of("white_bed"), None);
-        assert_eq!(of("oak_sign"), None);
+        assert_eq!(
+            of("oak_sign"),
+            Some(Kind::Sign {
+                hanging: false,
+                wall: false
+            })
+        );
+        assert_eq!(
+            of("dark_oak_wall_hanging_sign"),
+            Some(Kind::Sign {
+                hanging: true,
+                wall: true
+            })
+        );
         // Every state of every block there is: 4 + 8 chests... counted by block.
         let mut blocks: Vec<&str> = (0..STATE_COUNT as u32)
             .filter(|&id| Kind::of(id).is_some())
             .map(|id| BlockState::from_id(id).unwrap().block().name())
             .collect();
         blocks.dedup();
-        // 3 chests and 8 copper ones, 17 shulker boxes, 14 skulls, 32 banners.
-        assert_eq!(blocks.len(), 3 + 8 + 17 + 14 + 32);
+        // 3 chests and 8 copper ones, 17 shulker boxes, 14 skulls, 32 banners, and four
+        // signs of each of 13 woods.
+        assert_eq!(blocks.len(), 3 + 8 + 17 + 14 + 32 + 52);
     }
 
     #[test]

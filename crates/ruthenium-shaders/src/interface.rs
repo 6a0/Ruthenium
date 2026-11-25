@@ -223,8 +223,102 @@ pub const MODEL_PART: Record = Record {
     ],
 };
 
+/// What the glyphs of one side of a sign share.
+pub const SIGN: Record = Record {
+    name: "sign",
+    doc: "One side of a sign: found by its glyphs.",
+    fields: &[
+        Field {
+            name: "row_x",
+            ty: Ty::Vec4,
+            doc: "From the text's own space (y runs down) to blocks relative to the camera: the first row.",
+        },
+        Field {
+            name: "row_y",
+            ty: Ty::Vec4,
+            doc: "The second row.",
+        },
+        Field {
+            name: "row_z",
+            ty: Ty::Vec4,
+            doc: "The third row.",
+        },
+        Field {
+            name: "light",
+            ty: Ty::Uint,
+            doc: "Block light in the low byte and sky light in the next, each 0 to 240.",
+        },
+        Field {
+            name: "outline",
+            ty: Ty::Uint,
+            doc: "The colour of what surrounds its glyphs: red in the low byte, then green, blue and alpha.",
+        },
+    ],
+};
+
+/// What one glyph on a sign reads: found by the instance number.
+pub const GLYPH: Record = Record {
+    name: "glyph",
+    doc: "One glyph on a sign: record number gl_InstanceIndex from the offset in push constants.",
+    fields: &[
+        Field {
+            name: "box",
+            ty: Ty::Vec4,
+            doc: "Its left, top, right and bottom in the text's space.",
+        },
+        Field {
+            name: "slant",
+            ty: Ty::Vec2,
+            doc: "How far its top and its bottom are moved to the right.",
+        },
+        Field {
+            name: "nearer",
+            ty: Ty::Float,
+            doc: "How far in front of the text it lies.",
+        },
+        Field {
+            name: "texels",
+            ty: Ty::Uint,
+            doc: "Its picture's first column in the low half and first row in the high one.",
+        },
+        Field {
+            name: "size",
+            ty: Ty::Uint,
+            doc: "Its picture's width in the low half and height in the high one.",
+        },
+        Field {
+            name: "colour",
+            ty: Ty::Uint,
+            doc: "What the picture is multiplied by: red in the low byte, then green, blue and alpha.",
+        },
+        Field {
+            name: "texture",
+            ty: Ty::Uint,
+            doc: "An index into the texture table.",
+        },
+        Field {
+            name: "sign",
+            ty: Ty::Uint,
+            doc: "The number of its SIGN record.",
+        },
+        Field {
+            name: "around",
+            ty: Ty::Float,
+            doc: "How far from it its outline lies; nothing for one that has none.",
+        },
+    ],
+};
+
 /// Every record `world.glsl` has accessors for.
-pub const RECORDS: [&Record; 5] = [&WORLD, &WORLD_MATRIX, &SECTION, &SKY, &MODEL_PART];
+pub const RECORDS: [&Record; 7] = [
+    &WORLD,
+    &WORLD_MATRIX,
+    &SECTION,
+    &SKY,
+    &MODEL_PART,
+    &SIGN,
+    &GLYPH,
+];
 
 /// The text of `glsl/include/world.glsl`.
 pub fn world_glsl() -> String {
@@ -296,6 +390,8 @@ mod tests {
         assert_eq!(SECTION.bytes(), 16);
         assert_eq!(MODEL_PART.offset("light"), 12);
         assert_eq!(MODEL_PART.bytes(), 60);
+        assert_eq!((SIGN.offset("light"), SIGN.words()), (12, 14));
+        assert_eq!((GLYPH.offset("sign"), GLYPH.words()), (11, 13));
         for r in RECORDS {
             let mut names: Vec<&str> = r.fields.iter().map(|f| f.name).collect();
             names.sort_unstable();

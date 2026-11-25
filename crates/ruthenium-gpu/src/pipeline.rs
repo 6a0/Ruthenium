@@ -110,6 +110,7 @@ pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
                 Depth::Ignore => 1,
                 Depth::TestAndWrite => 2,
                 Depth::Test => 3,
+                Depth::Decal => 4,
             })
             .u32(u32::from(d.cull_back));
         match &d.vertex_input {
@@ -345,6 +346,11 @@ pub enum Blend {
     Glow,
 }
 
+/// How much nearer a [`Depth::Decal`] is drawn: steps of the depth format, and times the
+/// slope of the surface.
+const DECAL_STEPS: f32 = 10.0;
+const DECAL_SLOPE: f32 = 1.0;
+
 /// How a pipeline uses the depth attachment of the passes it draws in. A pipeline only
 /// draws in passes that match: with a depth attachment or without.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,6 +365,9 @@ pub enum Depth {
     /// Kept by the same test, and not written: what is drawn behind everything that
     /// wrote its depth before it (the sky after the terrain).
     Test,
+    /// As [`Depth::TestAndWrite`], and drawn a little nearer than it is, so that it lies over
+    /// a surface in its own plane (the text on a sign): by its slope and ten steps more.
+    Decal,
 }
 
 /// The layout of the one vertex buffer a pipeline reads (binding 0, a vertex per
@@ -830,10 +839,17 @@ fn build_one(
             vk::CullModeFlags::NONE
         })
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        // Depth is reversed: what is added brings a fragment nearer.
+        .depth_bias_enable(d.depth == Depth::Decal)
+        .depth_bias_constant_factor(DECAL_STEPS)
+        .depth_bias_slope_factor(DECAL_SLOPE)
         .line_width(1.0);
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(matches!(d.depth, Depth::TestAndWrite | Depth::Test))
-        .depth_write_enable(d.depth == Depth::TestAndWrite)
+        .depth_test_enable(matches!(
+            d.depth,
+            Depth::TestAndWrite | Depth::Test | Depth::Decal
+        ))
+        .depth_write_enable(matches!(d.depth, Depth::TestAndWrite | Depth::Decal))
         .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL);
     let multisample = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -868,7 +884,7 @@ fn build_one(
         .color_attachment_formats(&formats)
         .depth_attachment_format(match d.depth {
             Depth::None => vk::Format::UNDEFINED,
-            Depth::Ignore | Depth::TestAndWrite | Depth::Test => depth_format,
+            Depth::Ignore | Depth::TestAndWrite | Depth::Test | Depth::Decal => depth_format,
         });
     let info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&stages)

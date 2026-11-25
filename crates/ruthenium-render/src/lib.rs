@@ -250,8 +250,9 @@ const UPLOAD_RING_BYTES: u64 = 16 << 20;
 /// with the CPU. One larger upload still goes, alone in its frame.
 const UPLOAD_BUDGET_DISCRETE: u64 = 4 << 20;
 const UPLOAD_BUDGET_INTEGRATED: u64 = 3 << 19;
-/// Per-frame data each frame may write (GUI and overlay rectangles for now).
-const FRAME_DATA_BYTES: u64 = 1 << 20;
+/// Per-frame data each frame may write: GUI and overlay rectangles, and the records of
+/// sections, model parts and glyphs.
+const FRAME_DATA_BYTES: u64 = 4 << 20;
 
 /// Draws frames into the window.
 #[derive(Debug)]
@@ -1049,7 +1050,7 @@ impl Renderer {
                     sky.stage(&mut self.uploads);
                 }
                 if let Some(models) = &mut self.block_entities {
-                    models.stage(&mut self.uploads);
+                    models.stage(&mut self.textures, &mut self.uploads);
                 }
                 self.world_times.stage_ns = started.elapsed().as_nanos() as u64;
                 let front = match (&look.water, self.underwater) {

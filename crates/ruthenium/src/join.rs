@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 
 use ruthenium_assets::atlas::AtlasOptions;
 use ruthenium_assets::zip::Zip;
-use ruthenium_assets::{AtlasAnimations, BlockModels, Id, Image, Pack, Resources};
+use ruthenium_assets::{AtlasAnimations, BlockModels, Font, Id, Image, Pack, Resources};
 use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, Reason, Stage};
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
@@ -35,6 +35,7 @@ pub const BRAND: &str = "ruthenium";
 pub const DEV_OFFLINE_MARKER: &str = "RUTHENIUM-DEV-OFFLINE-BUILD";
 
 const LANG: &str = "assets/minecraft/lang/en_us.json";
+const LANG_PATH: &str = "lang/en_us.json";
 const DATAPACKS: &str = "data/minecraft/datapacks/";
 
 /// What joining needs from the imported game.
@@ -421,7 +422,21 @@ fn block_entity_assets(
             Some((path, picture))
         })
         .collect();
-    Ok(BlockEntityAssets { models, textures })
+    let font = Font::load(resources, &Id::minecraft("default").expect("a valid id"));
+    for w in &font.warnings {
+        eprintln!("[ruthenium] {w}");
+    }
+    let lang = resources
+        .get(&Id::minecraft(LANG_PATH).expect("a valid id"))
+        .and_then(|r| r.read().ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    Ok(BlockEntityAssets {
+        models,
+        textures,
+        font,
+        lang,
+    })
 }
 
 /// The world's drawing assets on their way: built on a thread from the first join on.

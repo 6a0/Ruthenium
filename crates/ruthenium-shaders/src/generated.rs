@@ -43,6 +43,12 @@ pub static SHAPE_FRAG: Spirv = crate::spirv!("shape.frag");
 /// `glsl/shape.vert`
 pub static SHAPE_VERT: Spirv = crate::spirv!("shape.vert");
 
+/// `glsl/sign_outline.vert`
+pub static SIGN_OUTLINE_VERT: Spirv = crate::spirv!("sign_outline.vert");
+
+/// `glsl/sign_text.vert`
+pub static SIGN_TEXT_VERT: Spirv = crate::spirv!("sign_text.vert");
+
 /// `glsl/sky.frag`
 pub static SKY_FRAG: Spirv = crate::spirv!("sky.frag");
 
@@ -115,6 +121,8 @@ pub static ALL: &[&Spirv] = &[
     &OVERLAY_VERT,
     &SHAPE_FRAG,
     &SHAPE_VERT,
+    &SIGN_OUTLINE_VERT,
+    &SIGN_TEXT_VERT,
     &SKY_FRAG,
     &SKY_VERT,
     &TERRAIN_VERT,

@@ -95,3 +95,79 @@ uint model_part_colour(uint at) {
 uint model_part_texture(uint at) {
     return frame_words[at + 14u];
 }
+
+// One side of a sign: found by its glyphs.
+#define SIGN_WORDS 14u
+
+// From the text's own space (y runs down) to blocks relative to the camera: the first row.
+vec4 sign_row_x(uint at) {
+    return vec4(uintBitsToFloat(frame_words[at + 0u]), uintBitsToFloat(frame_words[at + 1u]), uintBitsToFloat(frame_words[at + 2u]), uintBitsToFloat(frame_words[at + 3u]));
+}
+
+// The second row.
+vec4 sign_row_y(uint at) {
+    return vec4(uintBitsToFloat(frame_words[at + 4u]), uintBitsToFloat(frame_words[at + 5u]), uintBitsToFloat(frame_words[at + 6u]), uintBitsToFloat(frame_words[at + 7u]));
+}
+
+// The third row.
+vec4 sign_row_z(uint at) {
+    return vec4(uintBitsToFloat(frame_words[at + 8u]), uintBitsToFloat(frame_words[at + 9u]), uintBitsToFloat(frame_words[at + 10u]), uintBitsToFloat(frame_words[at + 11u]));
+}
+
+// Block light in the low byte and sky light in the next, each 0 to 240.
+uint sign_light(uint at) {
+    return frame_words[at + 12u];
+}
+
+// The colour of what surrounds its glyphs: red in the low byte, then green, blue and alpha.
+uint sign_outline(uint at) {
+    return frame_words[at + 13u];
+}
+
+// One glyph on a sign: record number gl_InstanceIndex from the offset in push constants.
+#define GLYPH_WORDS 13u
+
+// Its left, top, right and bottom in the text's space.
+vec4 glyph_box(uint at) {
+    return vec4(uintBitsToFloat(frame_words[at + 0u]), uintBitsToFloat(frame_words[at + 1u]), uintBitsToFloat(frame_words[at + 2u]), uintBitsToFloat(frame_words[at + 3u]));
+}
+
+// How far its top and its bottom are moved to the right.
+vec2 glyph_slant(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 4u]), uintBitsToFloat(frame_words[at + 5u]));
+}
+
+// How far in front of the text it lies.
+float glyph_nearer(uint at) {
+    return uintBitsToFloat(frame_words[at + 6u]);
+}
+
+// Its picture's first column in the low half and first row in the high one.
+uint glyph_texels(uint at) {
+    return frame_words[at + 7u];
+}
+
+// Its picture's width in the low half and height in the high one.
+uint glyph_size(uint at) {
+    return frame_words[at + 8u];
+}
+
+// What the picture is multiplied by: red in the low byte, then green, blue and alpha.
+uint glyph_colour(uint at) {
+    return frame_words[at + 9u];
+}
+
+// An index into the texture table.
+uint glyph_texture(uint at) {
+    return frame_words[at + 10u];
+}
+
+// The number of its SIGN record.
+uint glyph_sign(uint at) {
+    return frame_words[at + 11u];
+}
+
+// How far from it its outline lies; nothing for one that has none.
+float glyph_around(uint at) {
+    return uintBitsToFloat(frame_words[at + 12u]);
+}

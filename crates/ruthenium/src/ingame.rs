@@ -226,7 +226,7 @@ pub fn terrain_lines(s: &WorldStats) -> String {
          {culling}\
          Meshed {} times ({} for the player's changes, {} stale, {} waits for neighbours), {:.2} ms a section, slowest {:.2} ms; to the screen in at most {:.1} ms\n\
          Seen through: {} quads of {} sections, sorted again {} times ({} under way)\n\
-         Block entities: {} of {} sections, {} parts in {} draws ({} left out)\n\
+         Block entities: {} of {} sections, {} parts and {} glyphs on {} sides of signs in {} draws ({} left out)\n\
          Animated: {} sprites, {} ticks, written {} times ({:.1} MiB, {} waits, the longest {:.2} ms)\n\
          Pages {:.1} MiB holding {:.1} MiB ({:.0} planned); left out: {} meshes for memory, {} sections a frame's data had no room for",
         s.meshed,
@@ -253,6 +253,8 @@ pub fn terrain_lines(s: &WorldStats) -> String {
         s.block_entities.drawn,
         s.block_entities.sections,
         s.block_entities.parts,
+        s.block_entities.glyphs,
+        s.block_entities.texts,
         s.block_entities.draws,
         s.block_entities.overflowed,
         s.animated_sprites,

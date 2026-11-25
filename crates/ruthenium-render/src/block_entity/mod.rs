@@ -1,12 +1,16 @@
-//! Block entities drawn from models: chests, shulker boxes, skulls and banners.
+//! Block entities drawn from models (chests, shulker boxes, skulls and banners) and the text
+//! on signs.
 
 pub mod affine;
 pub mod model;
 pub mod place;
 pub mod renderer;
+pub(crate) mod sign;
 
 #[cfg(test)]
 mod golden;
+#[cfg(test)]
+mod sign_golden;
 
 #[cfg(test)]
 mod tests {
@@ -38,6 +42,8 @@ mod tests {
                 Kind::Chest(_) => vec![(chest_half(state).0, Pose::Chest(p))],
                 Kind::Shulker(_) => vec![(Model::Shulker, Pose::Shulker(p))],
                 Kind::Skull { skull, .. } => vec![(Model::Skull(skull), Pose::Skull(p))],
+                // Its text has no model.
+                Kind::Sign { .. } => continue,
                 Kind::Banner { wall: false, .. } => vec![
                     (Model::StandingBanner, Pose::Rest),
                     (Model::StandingFlag, Pose::Flag(p)),

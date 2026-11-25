@@ -7,6 +7,7 @@ use std::path::Path;
 
 use super::fluid::FluidModels;
 use super::tint::BiomeColour;
+use crate::block_entity::place::Kind;
 use ruthenium_assets::BlockModels;
 use ruthenium_data::v26_3::blocks::STATE_COUNT;
 use ruthenium_data::v26_3::{Block, BlockState};
@@ -91,6 +92,8 @@ impl StateInfo {
     pub const ICE: u16 = 2048;
     /// In the `blocks_fluid_flow` block tag.
     pub const BLOCKS_FLOW: u16 = 4096;
+    /// Drawn as a block entity, besides its model if it has one.
+    pub const BLOCK_ENTITY: u16 = 8192;
 }
 
 /// How a block is moved by its position (`BlockBehaviour.OffsetType`).
@@ -190,6 +193,9 @@ impl BlockTable {
             let mut flags = 0;
             if r.flags & StateRender::MODEL != 0 && !models.is_empty(id) {
                 flags |= StateInfo::DRAWN;
+            }
+            if Kind::of(id).is_some() {
+                flags |= StateInfo::BLOCK_ENTITY;
             }
             if r.flags & StateRender::EMISSIVE != 0 {
                 flags |= StateInfo::EMISSIVE;

@@ -28,7 +28,6 @@ use super::sort;
 use super::table::{BlockTable, ShapeKind, StateInfo, Tint, sticks_out};
 use super::tint::{BiomeColour, BiomeTints, TintScratch};
 use super::visibility::Connectivity;
-use crate::block_entity::place::Kind;
 use crate::terrain_vertex::{Vertex, position_code, position_of, uv_code};
 
 /// The six directions' steps, by `Direction` ordinal: down, up, north, south, west,
@@ -395,11 +394,11 @@ impl Mesher {
                             },
                         );
                     }
+                    if state.flags & StateInfo::BLOCK_ENTITY != 0 {
+                        out.block_entities
+                            .push(([x, y, z].map(|c| c as u8), id as u16));
+                    }
                     if state.flags & StateInfo::DRAWN == 0 {
-                        if Kind::of(id).is_some() {
-                            out.block_entities
-                                .push(([x, y, z].map(|c| c as u8), id as u16));
-                        }
                         continue;
                     }
                     let world = [origin[0] + x, origin[1] + y, origin[2] + z];

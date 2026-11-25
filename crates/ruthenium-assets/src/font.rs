@@ -1,0 +1,751 @@
+//! The game's fonts: which picture and how much room each character has.
+//!
+//! A font (`font/<name>.json`) lists providers. Those of a higher pack come first, and
+//! within a file the first; the first that has a character gives its glyph. A provider is
+//! a bitmap (a PNG cut into cells), spaces (advances without pictures), a unihex file
+//! (GNU Unifont's format, zipped) or a reference to another font. Lengths are in the
+//! font's units: a line of text is nine high.
+//!
+//! TrueType providers are left out: no font of the game's own has one.
+
+use std::collections::{HashMap, HashSet};
+
+use serde_json::Value;
+
+use crate::id::Id;
+use crate::image::{Image, alpha, argb, red};
+use crate::resources::Resources;
+use crate::zip::Zip;
+
+/// The baseline's distance from the top of a line.
+const BASELINE: f32 = 7.0;
+/// Rows of a unihex glyph.
+const UNIHEX_ROWS: u32 = 16;
+
+/// What a character takes up and where its picture goes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glyph {
+    pub advance: f32,
+    /// How much wider, and how much further right its second copy lies, when bold.
+    pub bold_offset: f32,
+    /// How far from it its outline lies.
+    pub shadow_offset: f32,
+    /// The picture's box from the pen's place at the line's top; nothing to draw without
+    /// one.
+    pub picture: Option<Picture>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Picture {
+    pub right: f32,
+    pub top: f32,
+    pub bottom: f32,
+    /// Its size in texels.
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Glyph {
+    pub fn advance(&self, bold: bool) -> f32 {
+        self.advance + if bold { self.bold_offset } else { 0.0 }
+    }
+
+    /// The hollow box that stands for a character no provider has.
+    pub const MISSING: Glyph = Glyph {
+        advance: 6.0,
+        bold_offset: 1.0,
+        shadow_offset: 1.0,
+        picture: Some(Picture {
+            right: 5.0,
+            top: 0.0,
+            bottom: 8.0,
+            width: 5,
+            height: 8,
+        }),
+    };
+}
+
+struct Bitmap {
+    /// Pixels as they are drawn: white times alpha for a grey picture.
+    image: Image,
+    cell: [u32; 2],
+    height: f32,
+    ascent: f32,
+    /// The cell of each character, and its advance.
+    cells: HashMap<u32, ([u32; 2], f32)>,
+}
+
+struct Unihex {
+    /// Each character's rows (leftmost column in the highest bit), and the first and last
+    /// column drawn.
+    glyphs: HashMap<u32, ([u32; UNIHEX_ROWS as usize], i32, i32)>,
+}
+
+enum Provider {
+    Bitmap(Box<Bitmap>),
+    Space(HashMap<u32, f32>),
+    Unihex(Unihex),
+    Fixed(HashMap<u32, Glyph>),
+}
+
+impl Provider {
+    fn glyph(&self, c: u32) -> Option<Glyph> {
+        let plain = |advance| Glyph {
+            advance,
+            bold_offset: 1.0,
+            shadow_offset: 1.0,
+            picture: None,
+        };
+        match self {
+            Provider::Fixed(glyphs) => glyphs.get(&c).copied(),
+            Provider::Space(advances) => advances.get(&c).map(|a| plain(*a)),
+            Provider::Bitmap(b) => b.cells.get(&c).map(|&(_, advance)| {
+                let [width, height] = b.cell;
+                // Texels per unit.
+                let oversample = 1.0 / (b.height / height as f32);
+                let top = BASELINE - b.ascent;
+                Glyph {
+                    picture: Some(Picture {
+                        right: width as f32 / oversample,
+                        top,
+                        bottom: top + height as f32 / oversample,
+                        width,
+                        height,
+                    }),
+                    ..plain(advance)
+                }
+            }),
+            Provider::Unihex(u) => u.glyphs.get(&c).map(|&(_, left, right)| {
+                let width = right - left + 1;
+                Glyph {
+                    advance: (width / 2 + 1) as f32,
+                    bold_offset: 0.5,
+                    shadow_offset: 0.5,
+                    picture: (width > 0).then_some(Picture {
+                        right: width as f32 / 2.0,
+                        top: 0.0,
+                        bottom: UNIHEX_ROWS as f32 / 2.0,
+                        width: width.max(0) as u32,
+                        height: UNIHEX_ROWS,
+                    }),
+                }
+            }),
+        }
+    }
+
+    fn texels(&self, c: u32) -> Option<Image> {
+        match self {
+            Provider::Space(_) | Provider::Fixed(_) => None,
+            Provider::Bitmap(b) => {
+                let ([x, y], _) = *b.cells.get(&c)?;
+                b.image
+                    .sub_image(x * b.cell[0], y * b.cell[1], b.cell[0], b.cell[1])
+            }
+            Provider::Unihex(u) => {
+                let (rows, left, right) = u.glyphs.get(&c)?;
+                let width = u32::try_from(right - left + 1).ok().filter(|w| *w > 0)?;
+                let mut image = Image::new(width, UNIHEX_ROWS);
+                for (y, row) in (0..).zip(rows) {
+                    for x in 0..width {
+                        let column = left + x as i32;
+                        if (0..32).contains(&column) && row >> (31 - column) & 1 != 0 {
+                            image.set(x, y, u32::MAX);
+                        }
+                    }
+                }
+                Some(image)
+            }
+        }
+    }
+
+    fn characters(&self) -> Box<dyn Iterator<Item = u32> + '_> {
+        match self {
+            Provider::Bitmap(b) => Box::new(b.cells.keys().copied()),
+            Provider::Space(s) => Box::new(s.keys().copied()),
+            Provider::Fixed(f) => Box::new(f.keys().copied()),
+            Provider::Unihex(u) => Box::new(u.glyphs.keys().copied()),
+        }
+    }
+}
+
+/// A font, its providers in the order they are asked.
+pub struct Font {
+    providers: Vec<Provider>,
+    /// The characters by their advance rounded up, for obfuscated text.
+    by_advance: HashMap<i32, Vec<u32>>,
+    /// What could not be read.
+    pub warnings: Vec<String>,
+}
+
+impl std::fmt::Debug for Font {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Font")
+            .field("providers", &self.providers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Font {
+    /// The font `id` (`minecraft:default`), as it is with no font option set.
+    pub fn load(res: &Resources, id: &Id) -> Font {
+        let mut font = Font {
+            providers: Vec::new(),
+            by_advance: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        font.add(res, id, &mut Vec::new());
+        font.index();
+        font
+    }
+
+    /// Lists the characters by their advance.
+    fn index(&mut self) {
+        let mut seen = HashSet::new();
+        for p in &self.providers {
+            for c in p.characters() {
+                if seen.insert(c)
+                    && let Some(g) = p.glyph(c)
+                {
+                    let width = g.advance.ceil() as i32;
+                    self.by_advance.entry(width).or_default().push(c);
+                }
+            }
+        }
+        // In an order that does not change from run to run.
+        for list in self.by_advance.values_mut() {
+            list.sort_unstable();
+        }
+    }
+
+    /// A font of made-up glyphs without pictures: for tests of what is laid out.
+    #[doc(hidden)]
+    pub fn of_glyphs(glyphs: impl IntoIterator<Item = (char, Glyph)>) -> Font {
+        let mut font = Font {
+            providers: vec![Provider::Fixed(
+                glyphs.into_iter().map(|(c, g)| (u32::from(c), g)).collect(),
+            )],
+            by_advance: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        font.index();
+        font
+    }
+
+    fn add(&mut self, res: &Resources, id: &Id, within: &mut Vec<Id>) {
+        if within.contains(id) {
+            self.warnings.push(format!("font {id} refers to itself"));
+            return;
+        }
+        within.push(id.clone());
+        // Highest pack first.
+        for file in res.stack(&id.wrap("font/", ".json")).iter().rev() {
+            let read = file
+                .read()
+                .map_err(|e| e.to_string())
+                .and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()));
+            match read {
+                Ok(json) => {
+                    for p in json["providers"].as_array().map_or(&[][..], Vec::as_slice) {
+                        if let Err(e) = self.add_provider(res, p, within) {
+                            self.warnings.push(format!("font {id}: {e}"));
+                        }
+                    }
+                }
+                Err(e) => self.warnings.push(format!("font {id}: {e}")),
+            }
+        }
+        within.pop();
+    }
+
+    fn add_provider(
+        &mut self,
+        res: &Resources,
+        p: &Value,
+        within: &mut Vec<Id>,
+    ) -> Result<(), String> {
+        // Every option is off.
+        let wanted = p["filter"]
+            .as_object()
+            .is_none_or(|f| f.values().all(|v| v.as_bool() == Some(false)));
+        if !wanted {
+            return Ok(());
+        }
+        let id = |key: &str| {
+            p[key]
+                .as_str()
+                .and_then(Id::parse)
+                .ok_or_else(|| format!("no {key}"))
+        };
+        match p["type"].as_str() {
+            Some("reference") => {
+                self.add(res, &id("id")?, within);
+                return Ok(());
+            }
+            Some("space") => {
+                let advances = p["advances"].as_object().ok_or("no advances")?;
+                self.providers.push(Provider::Space(
+                    advances
+                        .iter()
+                        .filter_map(|(c, a)| {
+                            let mut chars = c.chars();
+                            let (c, None) = (chars.next()?, chars.next()) else {
+                                return None;
+                            };
+                            Some((u32::from(c), a.as_f64()? as f32))
+                        })
+                        .collect(),
+                ));
+            }
+            Some("bitmap") => {
+                let file = id("file")?;
+                let bytes = read(res, &file.wrap("textures/", ""))?;
+                let grid: Vec<Vec<u32>> = p["chars"]
+                    .as_array()
+                    .ok_or("no chars")?
+                    .iter()
+                    .map(|row| row.as_str().map(|r| r.chars().map(u32::from).collect()))
+                    .collect::<Option<_>>()
+                    .ok_or("chars that are not text")?;
+                let height = p["height"].as_i64().unwrap_or(8) as f32;
+                let ascent = p["ascent"].as_i64().ok_or("no ascent")? as f32;
+                self.providers.push(Provider::Bitmap(Box::new(
+                    bitmap(&bytes, &grid, height, ascent).map_err(|e| format!("{file}: {e}"))?,
+                )));
+            }
+            Some("unihex") => {
+                let file = id("hex_file")?;
+                let bytes = read(res, &file)?;
+                let unihex =
+                    unihex(&bytes, &p["size_overrides"]).map_err(|e| format!("{file}: {e}"))?;
+                self.providers.push(Provider::Unihex(unihex));
+            }
+            other => return Err(format!("a {} provider", other.unwrap_or("nameless"))),
+        }
+        Ok(())
+    }
+
+    fn provider(&self, c: u32) -> Option<&Provider> {
+        self.providers.iter().find(|p| p.glyph(c).is_some())
+    }
+
+    /// The glyph of a character: [`Glyph::MISSING`'s if the font has none.
+    pub fn glyph(&self, c: char) -> Glyph {
+        self.providers
+            .iter()
+            .find_map(|p| p.glyph(u32::from(c)))
+            .unwrap_or(Glyph::MISSING)
+    }
+
+    /// The picture of a character's glyph.
+    pub fn texels(&self, c: char) -> Option<Image> {
+        match self.provider(u32::from(c)) {
+            Some(p) => p.texels(u32::from(c)),
+            None => Some(missing()),
+        }
+    }
+
+    /// The characters whose advance, rounded up, is `advance`: what obfuscated text draws
+    /// for one that has it.
+    pub fn of_advance(&self, advance: i32) -> &[u32] {
+        self.by_advance.get(&advance).map_or(&[], Vec::as_slice)
+    }
+}
+
+fn read(res: &Resources, id: &Id) -> Result<Vec<u8>, String> {
+    let file = res.get(id).ok_or_else(|| format!("no {id}"))?;
+    file.read()
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|e| format!("{id}: {e}"))
+}
+
+/// A hollow box.
+fn missing() -> Image {
+    let mut image = Image::new(5, 8);
+    for y in 0..8 {
+        for x in 0..5 {
+            if x == 0 || x == 4 || y == 0 || y == 7 {
+                image.set(x, y, u32::MAX);
+            }
+        }
+    }
+    image
+}
+
+fn bitmap(png: &[u8], grid: &[Vec<u32>], height: f32, ascent: f32) -> Result<Bitmap, String> {
+    let mut image = Image::decode_png(png).map_err(|e| e.to_string())?;
+    let columns = grid.first().map_or(0, Vec::len);
+    if columns == 0 || grid.iter().any(|r| r.len() != columns) {
+        return Err("chars are not a grid".into());
+    }
+    if ascent > height {
+        return Err("the ascent is above the height".into());
+    }
+    // A picture without colours is drawn by its brightness alone.
+    let grey = png.get(25) == Some(&0);
+    if grey {
+        for p in &mut image.pixels {
+            let v = red(*p);
+            *p = argb(v, v, v, v);
+        }
+    }
+    let cell = [
+        image.width / columns as u32,
+        image.height / grid.len() as u32,
+    ];
+    if cell.contains(&0) {
+        return Err("more characters than pixels".into());
+    }
+    let scale = height / cell[1] as f32;
+    let mut cells = HashMap::new();
+    for (y, row) in (0..).zip(grid) {
+        for (x, &c) in (0..).zip(row) {
+            if c == 0 {
+                continue;
+            }
+            let ink = (0..cell[0]).rev().find(|column| {
+                (0..cell[1]).any(|r| alpha(image.get(x * cell[0] + column, y * cell[1] + r)) != 0)
+            });
+            let width = ink.map_or(0, |column| column + 1);
+            let advance = (0.5 + f64::from(width as f32 * scale)) as i32 + 1;
+            cells.insert(c, ([x, y], advance as f32));
+        }
+    }
+    Ok(Bitmap {
+        image,
+        cell,
+        height,
+        ascent,
+        cells,
+    })
+}
+
+fn unihex(zip: &[u8], overrides: &Value) -> Result<Unihex, String> {
+    let zip = Zip::from_vec(zip.to_vec()).map_err(|e| e.to_string())?;
+    let mut lines: HashMap<u32, ([u32; UNIHEX_ROWS as usize], u32)> = HashMap::new();
+    for i in 0..zip.len() {
+        if !zip.name(i).ends_with(".hex") {
+            continue;
+        }
+        let bytes = zip.read(i).map_err(|e| e.to_string())?;
+        for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+            let (c, rows) =
+                hex_line(line).ok_or_else(|| format!("{}: not a unihex line", zip.name(i)))?;
+            lines.insert(c, rows);
+        }
+    }
+    let mut sized = HashMap::new();
+    for o in overrides.as_array().map_or(&[][..], Vec::as_slice) {
+        let character = |key: &str| o[key].as_str()?.chars().next().map(u32::from);
+        let side = |key: &str| o[key].as_i64().map(|v| v as i32);
+        let (Some(from), Some(to), Some(left), Some(right)) = (
+            character("from"),
+            character("to"),
+            side("left"),
+            side("right"),
+        ) else {
+            return Err("a bad size override".into());
+        };
+        for c in from..=to {
+            if lines.contains_key(&c) {
+                // The first that names a character counts.
+                sized.entry(c).or_insert((left, right));
+            }
+        }
+    }
+    let glyphs = lines
+        .into_iter()
+        .map(|(c, (rows, width))| {
+            let (left, right) = sized.get(&c).copied().unwrap_or_else(|| {
+                let mask = rows.iter().fold(0, |m, r| m | r);
+                if mask == 0 {
+                    (0, width as i32)
+                } else {
+                    (
+                        mask.leading_zeros() as i32,
+                        31 - mask.trailing_zeros() as i32,
+                    )
+                }
+            });
+            (c, (rows, left, right))
+        })
+        .collect();
+    Ok(Unihex { glyphs })
+}
+
+/// `<code point>:<rows>` in hexadecimal: the character, its rows with the leftmost column in
+/// the highest bit, and its width in columns.
+fn hex_line(line: &[u8]) -> Option<(u32, ([u32; UNIHEX_ROWS as usize], u32))> {
+    let line = std::str::from_utf8(line).ok()?.trim_end_matches('\r');
+    let (c, rows) = line.split_once(':')?;
+    if !(4..=6).contains(&c.len()) || !rows.is_ascii() {
+        return None;
+    }
+    let digits = match rows.len() {
+        32 => 2,
+        64 => 4,
+        96 => 6,
+        128 => 8,
+        _ => return None,
+    };
+    let mut out = [0; UNIHEX_ROWS as usize];
+    for (i, row) in out.iter_mut().enumerate() {
+        let text = &rows[i * digits..(i + 1) * digits];
+        *row = u32::from_str_radix(text, 16).ok()? << (32 - digits * 4);
+    }
+    Some((u32::from_str_radix(c, 16).ok()?, (out, digits as u32 * 4)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pack::Pack;
+
+    /// Deleted when dropped.
+    struct Folder(std::path::PathBuf);
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A folder pack with these files.
+    fn pack(name: &str, files: &[(&str, &[u8])]) -> (Resources, Folder) {
+        let dir =
+            std::env::temp_dir().join(format!("ruthenium-font-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut all = vec![(
+            "pack.mcmeta",
+            &br#"{"pack":{"description":"","min_format":97,"max_format":97}}"#[..],
+        )];
+        all.extend_from_slice(files);
+        for (path, bytes) in all {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let res = Resources::new(vec![Pack::open(&dir).unwrap()]);
+        (res, Folder(dir))
+    }
+
+    fn default() -> Id {
+        Id::parse("minecraft:default").unwrap()
+    }
+
+    #[test]
+    fn a_higher_packs_providers_come_first() {
+        let font = |name: &str, advance: &str| {
+            let json = format!(
+                r#"{{"providers":[{{"type":"space","advances":{{"A":{advance},"{name}":1}}}}]}}"#
+            );
+            let dir = std::env::temp_dir().join(format!(
+                "ruthenium-font-{}-stack-{name}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("assets/minecraft/font")).unwrap();
+            std::fs::write(dir.join("assets/minecraft/font/default.json"), json).unwrap();
+            std::fs::write(
+                dir.join("pack.mcmeta"),
+                r#"{"pack":{"description":"","min_format":97,"max_format":97}}"#,
+            )
+            .unwrap();
+            (Pack::open(&dir).unwrap(), Folder(dir))
+        };
+        let ((low, _l), (high, _h)) = (font("L", "5"), font("H", "6"));
+        let res = Resources::new(vec![low, high]);
+        let font = Font::load(&res, &default());
+        assert_eq!(font.glyph('A').advance, 6.0);
+        assert_eq!(
+            (font.glyph('L').advance, font.glyph('H').advance),
+            (1.0, 1.0)
+        );
+    }
+
+    /// 'A' is three columns wide in a 8 x 8 cell, 'B' empty.
+    fn sheet() -> Vec<u8> {
+        let mut image = Image::new(16, 8);
+        for y in 1..8 {
+            image.set(0, y, u32::MAX);
+            // Black is ink; what has no alpha is not, whatever its colour.
+            image.set(2, y, 0xFF00_0000);
+            image.set(6, y, 0x00FF_FFFF);
+        }
+        image.encode_png()
+    }
+
+    #[test]
+    fn bitmap_cells_have_the_room_their_ink_takes() {
+        let png = sheet();
+        let (res, _dir) = pack(
+            "bitmap",
+            &[
+                (
+                    "assets/minecraft/font/default.json",
+                    br#"{"providers":[{"type":"space","advances":{" ":4}},{"type":"bitmap","file":"minecraft:font/x.png","ascent":7,"chars":["AB"]}]}"#,
+                ),
+                ("assets/minecraft/textures/font/x.png", &png),
+            ],
+        );
+        let font = Font::load(&res, &default());
+        assert!(font.warnings.is_empty(), "{:?}", font.warnings);
+        let a = font.glyph('A');
+        assert_eq!(a.advance, 4.0);
+        assert_eq!(a.advance(true), 5.0);
+        let p = a.picture.unwrap();
+        assert_eq!((p.right, p.top, p.bottom), (8.0, 0.0, 8.0));
+        assert_eq!(font.glyph('B').advance, 1.0);
+        assert_eq!(
+            (font.glyph(' ').advance, font.glyph(' ').picture),
+            (4.0, None)
+        );
+        assert_eq!(font.glyph('?'), Glyph::MISSING);
+        assert_eq!(font.texels('?').unwrap().width, 5);
+        let t = font.texels('A').unwrap();
+        assert_eq!(
+            (t.get(0, 1), t.get(1, 1), t.get(2, 1)),
+            (u32::MAX, 0, 0xFF00_0000)
+        );
+        assert!(font.texels(' ').is_none());
+        assert_eq!(font.of_advance(4), [u32::from(' '), u32::from('A')]);
+    }
+
+    #[test]
+    fn taller_pictures_are_scaled_to_their_height() {
+        let png = sheet();
+        let (res, _dir) = pack(
+            "height",
+            &[
+                (
+                    "assets/minecraft/font/default.json",
+                    br#"{"providers":[{"type":"bitmap","file":"minecraft:font/x.png","height":4,"ascent":3,"chars":["AB"]}]}"#,
+                ),
+                ("assets/minecraft/textures/font/x.png", &png),
+            ],
+        );
+        let g = Font::load(&res, &default()).glyph('A');
+        let p = g.picture.unwrap();
+        // Three columns at half size are a column and a half, and half of one more.
+        assert_eq!(g.advance, 3.0);
+        assert_eq!((p.right, p.top, p.bottom), (4.0, 4.0, 8.0));
+    }
+
+    #[test]
+    fn options_that_are_on_leave_a_provider_out_and_references_stay_in_order() {
+        let png = sheet();
+        let (res, _dir) = pack(
+            "references",
+            &[
+                (
+                    "assets/minecraft/font/default.json",
+                    br#"{"providers":[
+                        {"type":"reference","id":"minecraft:other"},
+                        {"type":"space","advances":{"A":9,"C":7,"D":1}},
+                        {"type":"space","filter":{"uniform":true},"advances":{"D":5,"E":5}},
+                        {"type":"space","filter":{"uniform":false,"jp":false},"advances":{"F":2}}]}"#,
+                ),
+                (
+                    "assets/minecraft/font/other.json",
+                    br#"{"providers":[{"type":"bitmap","file":"minecraft:font/x.png","ascent":7,"chars":["AB"]},
+                        {"type":"reference","id":"minecraft:default"}]}"#,
+                ),
+                ("assets/minecraft/textures/font/x.png", &png),
+            ],
+        );
+        let font = Font::load(&res, &default());
+        assert_eq!(font.glyph('A').advance, 4.0);
+        assert_eq!(font.glyph('C').advance, 7.0);
+        assert_eq!(font.glyph('D').advance, 1.0);
+        assert_eq!(font.glyph('E'), Glyph::MISSING);
+        assert_eq!(font.glyph('F').advance, 2.0);
+        // The circle is said and cut.
+        assert_eq!(font.warnings.len(), 1);
+    }
+
+    #[test]
+    fn unihex_glyphs_are_as_wide_as_their_ink() {
+        // Columns 2 to 5 of an 8-wide glyph.
+        let eight = format!("0041:{}", "3C".repeat(16));
+        // 16 wide, empty.
+        let empty = format!("3000:{}", "0000".repeat(16));
+        let wide = format!("04E00:{}", "8001".repeat(16));
+        let text = [eight, empty, wide].join("\n") + "\n";
+        let z = stored_zip("a.hex", text.as_bytes());
+        let (res, _dir) = pack(
+            "unihex",
+            &[
+                (
+                    "assets/minecraft/font/default.json",
+                    br#"{"providers":[{"type":"unihex","hex_file":"minecraft:font/u.zip","size_overrides":[{"from":"\u4e00","to":"\u4e01","left":1,"right":15}]}]}"#,
+                ),
+                ("assets/minecraft/font/u.zip", &z),
+            ],
+        );
+        let font = Font::load(&res, &default());
+        assert!(font.warnings.is_empty(), "{:?}", font.warnings);
+        let a = font.glyph('A');
+        assert_eq!((a.advance, a.bold_offset, a.shadow_offset), (3.0, 0.5, 0.5));
+        assert_eq!(a.picture.unwrap().width, 4);
+        assert_eq!(font.texels('A').unwrap().pixels, vec![u32::MAX; 4 * 16]);
+        // Nothing in it: the whole width and a column.
+        assert_eq!(font.glyph('\u{3000}').picture.unwrap().width, 17);
+        let one = font.glyph('\u{4e00}');
+        assert_eq!((one.advance, one.picture.unwrap().width), (8.0, 15));
+        let t = font.texels('\u{4e00}').unwrap();
+        assert_eq!((t.get(0, 0), t.get(14, 0)), (0, u32::MAX));
+    }
+
+    /// A zip with one stored file.
+    fn stored_zip(name: &str, data: &[u8]) -> Vec<u8> {
+        let crc = {
+            let mut c = !0u32;
+            for &b in data {
+                c ^= u32::from(b);
+                for _ in 0..8 {
+                    c = if c & 1 == 1 {
+                        c >> 1 ^ 0xEDB8_8320
+                    } else {
+                        c >> 1
+                    };
+                }
+            }
+            !c
+        };
+        let (n, size) = (name.len() as u16, data.len() as u32);
+        let common = |out: &mut Vec<u8>| {
+            out.extend(20u16.to_le_bytes());
+            out.extend([0; 2]);
+            out.extend([0; 2]);
+            out.extend([0; 4]);
+            out.extend(crc.to_le_bytes());
+            out.extend(size.to_le_bytes());
+            out.extend(size.to_le_bytes());
+            out.extend(n.to_le_bytes());
+            out.extend([0; 2]);
+        };
+        let mut z = Vec::new();
+        z.extend(0x0403_4b50u32.to_le_bytes());
+        common(&mut z);
+        z.extend(name.as_bytes());
+        z.extend(data);
+        let directory = z.len() as u32;
+        z.extend(0x0201_4b50u32.to_le_bytes());
+        z.extend(20u16.to_le_bytes());
+        common(&mut z);
+        z.extend([0; 2]); // comment length
+        z.extend([0; 2]); // disk
+        z.extend([0; 2]); // internal attributes
+        z.extend([0; 4]); // external attributes
+        z.extend([0; 4]); // the local header's offset
+        z.extend(name.as_bytes());
+        let length = z.len() as u32 - directory;
+        z.extend(0x0605_4b50u32.to_le_bytes());
+        z.extend([0; 4]);
+        z.extend(1u16.to_le_bytes());
+        z.extend(1u16.to_le_bytes());
+        z.extend(length.to_le_bytes());
+        z.extend(directory.to_le_bytes());
+        z.extend([0; 2]);
+        z
+    }
+}

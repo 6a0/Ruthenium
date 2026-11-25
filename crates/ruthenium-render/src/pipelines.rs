@@ -44,6 +44,9 @@ pub enum PipelineId {
     ModelCutout,
     ModelCutoutFaces,
     ModelPattern,
+    /// The text on signs, and what surrounds it where it glows.
+    SignText,
+    SignOutline,
     /// The sky drawn before the world, over the cleared target: what covers what is
     /// there (the dome), what is blended over it (a sunrise's glow, the End's sky) and
     /// what adds light to it (the sun, the moon, the stars).
@@ -64,7 +67,7 @@ pub enum PipelineId {
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 32] = [
+    pub const ALL: [PipelineId; 34] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -87,6 +90,8 @@ impl PipelineId {
         PipelineId::ModelCutout,
         PipelineId::ModelCutoutFaces,
         PipelineId::ModelPattern,
+        PipelineId::SignText,
+        PipelineId::SignOutline,
         PipelineId::SkyFlat,
         PipelineId::SkyBlend,
         PipelineId::SkyGlow,
@@ -238,6 +243,16 @@ impl PipelineId {
             depth,
             cull_back,
         };
+        let sign = |name, vertex: &shaders::Spirv, depth| GraphicsDesc {
+            name,
+            vertex: vertex.words(),
+            fragment: shaders::MODEL_CUTOUT_FRAG.words(),
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            blend: Blend::Alpha,
+            vertex_input: None,
+            depth,
+            cull_back: true,
+        };
         match self {
             PipelineId::ModelSolid => model(
                 "model_solid",
@@ -266,6 +281,12 @@ impl PipelineId {
                 Blend::Alpha,
                 Depth::Test,
                 true,
+            ),
+            PipelineId::SignText => sign("sign_text", &shaders::SIGN_TEXT_VERT, Depth::Decal),
+            PipelineId::SignOutline => sign(
+                "sign_outline",
+                &shaders::SIGN_OUTLINE_VERT,
+                Depth::TestAndWrite,
             ),
             PipelineId::SkyFlat => sky("sky_flat", Blend::Opaque, Depth::Ignore),
             PipelineId::SkyBlend => sky("sky_blend", Blend::Alpha, Depth::Ignore),

@@ -404,6 +404,8 @@ mod tests {
         ]);
         assert_eq!(model.last().unwrap().1 as usize + 8, b::MODEL_PUSH_BYTES);
         assert_eq!(pushed(&shaders::MODEL_VERT), words(4));
+        assert_eq!(pushed(&shaders::SIGN_TEXT_VERT), words(4));
+        assert_eq!(pushed(&shaders::SIGN_OUTLINE_VERT), words(4));
         for fragment in MODEL_FRAGMENTS {
             assert_eq!(pushed(fragment), model, "{}", fragment.name);
         }
@@ -418,7 +420,12 @@ mod tests {
         )]);
         let samplers = Type::Array(Box::new(Type::Sampler), ruthenium_gpu::SAMPLER_COUNT);
         let textures = Type::RuntimeArray(Box::new(Type::Image), None);
-        let mut vertex_stages = vec![&shaders::SKY_VERT, &shaders::MODEL_VERT];
+        let mut vertex_stages = vec![
+            &shaders::SKY_VERT,
+            &shaders::MODEL_VERT,
+            &shaders::SIGN_TEXT_VERT,
+            &shaders::SIGN_OUTLINE_VERT,
+        ];
         let mut fragment_stages = vec![&shaders::SKY_FRAG];
         fragment_stages.extend(MODEL_FRAGMENTS);
         for (vertex, fragment) in terrain_stages() {

@@ -178,7 +178,7 @@ pub struct Options {
     pub light_flicker: Option<bool>,
     /// Whether the terrain's translucent layer is drawn (the default) or left out.
     pub translucent: Option<bool>,
-    /// Whether block entities (chests, skulls, banners) are drawn (the default).
+    /// Whether block entities (chests, skulls, banners, the text of signs) are drawn (the default).
     pub block_entities: Option<bool>,
     /// Whether animated textures play (the default) or hold still.
     pub animations: Option<bool>,
@@ -1618,6 +1618,8 @@ fn terrain_json(s: &ruthenium_render::WorldStats) -> Value {
         "translucent_sections_drawn": s.translucent_sections,
         "block_entities_drawn": s.block_entities.drawn,
         "block_entity_parts": s.block_entities.parts,
+        "sign_texts": s.block_entities.texts,
+        "sign_glyphs": s.block_entities.glyphs,
         "block_entity_draws": s.block_entities.draws,
         "block_entity_parts_overflowed": s.block_entities.overflowed,
         "animated_sprites": s.animated_sprites,

@@ -1,22 +1,25 @@
 //! Draws block entities: instances of model parts, gathered each frame from the sections in
-//! view, a draw for all instances of one part in one layer.
+//! view, a draw for all instances of one part in one layer; and the text of signs, a draw
+//! for all glyphs.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ruthenium_assets::Font;
 use ruthenium_gpu::{
     Arrival, BufferPool, Error, FrameData, Gpu, Pass, PoolConfig, RangeHandle, TextureDesc,
     TextureId, TextureTable, UploadRing, UploadTicket, VertexAttribute, VertexInput, vk,
 };
 use ruthenium_protocol::nbt;
-use ruthenium_shaders::interface::MODEL_PART;
+use ruthenium_shaders::interface::{GLYPH, MODEL_PART, SIGN};
 use ruthenium_sim::environment::CardinalLight;
 use ruthenium_sim::scene::{Frame, SectionKey, Terrain};
 
 use super::affine::Affine;
 use super::model::{Model, ModelSet, PartDraw, Pose, Skull};
 use super::place::{self, Chest, DYE_COLOURS, DYES, Kind};
+use super::sign::{self, GLYPH_WORDS, GlyphPages, SignText};
 use crate::atmosphere::Fog;
 use crate::pipelines::PipelineId;
 use crate::sky::SkyImage;
@@ -61,8 +64,15 @@ pub(crate) const MIN_VISIBILITY: f32 = 0.3;
 const TOWARDS_CAMERA: f32 = 1.0 - 1.0 / 4096.0;
 /// Patterns of one banner that are drawn.
 const MAX_PATTERNS: usize = 16;
-/// Banners whose patterns are kept between frames.
+/// Banners whose patterns, and signs whose text, are kept between frames.
 const KEPT_PATTERNS: usize = 4096;
+const KEPT_SIGNS: usize = 4096;
+/// How near the player has to be for glowing text to have its outline, in blocks.
+const OUTLINE_DISTANCE: f64 = 16.0;
+/// Bytes of the frame's data left for what is drawn after block entities.
+const RESERVED: u64 = 512 << 10;
+/// Bytes of it glyphs take at most.
+const GLYPH_BYTES: u64 = 2 << 20;
 
 /// A colour that leaves the texture as it is.
 const WHITE: u32 = u32::MAX;
@@ -73,6 +83,9 @@ const WHITE: u32 = u32::MAX;
 pub struct BlockEntityAssets {
     pub models: ModelSet,
     pub textures: Vec<(String, SkyImage)>,
+    /// What signs are written in.
+    pub font: Font,
+    pub lang: HashMap<String, String>,
 }
 
 /// The folder of the banners' patterns below `textures/entity`.
@@ -176,7 +189,10 @@ pub struct BlockEntityStats {
     /// Their parts, and the draws that drew them.
     pub parts: u32,
     pub draws: u32,
-    /// Parts there was no room for, in all frames.
+    /// Sides of signs drawn, and their glyphs.
+    pub texts: u32,
+    pub glyphs: u32,
+    /// Parts and glyphs there was no room for, in all frames.
     pub overflowed: u64,
 }
 
@@ -209,6 +225,35 @@ struct Patterns {
     layers: Vec<(TextureId, u32)>,
 }
 
+/// One side of a sign, laid out.
+struct Side {
+    text: SignText,
+    /// Records as [`sign::records`] makes them, and the newest picture they need.
+    glyphs: Vec<[u32; GLYPH_WORDS]>,
+    newest: u64,
+    obfuscated: bool,
+}
+
+/// A sign's text as last read from its data.
+struct Sign {
+    /// The column's load and the last change to its block entities.
+    stamp: (u64, u64),
+    tag: Option<Arc<nbt::Tag>>,
+    /// The front and the back.
+    sides: [Option<Box<Side>>; 2],
+}
+
+/// One side of a sign to draw.
+struct SignRun {
+    pos: [i32; 3],
+    back: bool,
+    outlined: bool,
+    outline: u32,
+    transform: Affine,
+    light: u32,
+    away: f64,
+}
+
 /// One section's block entities: where in the section, and their states.
 pub(crate) type SectionEntities = [([u8; 3], u16)];
 
@@ -228,6 +273,13 @@ pub(crate) struct BlockEntityRenderer {
     /// The resting parts of a state in its block's space.
     resting: HashMap<u32, Vec<PartDraw>>,
     patterns: HashMap<[i32; 3], Patterns>,
+    font: Font,
+    lang: HashMap<String, String>,
+    pages: GlyphPages,
+    signs: HashMap<[i32; 3], Sign>,
+    runs: Vec<SignRun>,
+    /// State of the numbers obfuscated text is picked by.
+    random: u64,
     instances: Vec<Instance>,
     parts: Vec<PartDraw>,
     christmas: bool,
@@ -243,7 +295,7 @@ impl std::fmt::Debug for BlockEntityRenderer {
 }
 
 /// 0xRRGGBB as a record's colour: red in the low byte, opaque.
-fn record_colour(rgb: u32) -> u32 {
+pub(super) fn record_colour(rgb: u32) -> u32 {
     0xFF00_0000 | (rgb & 0xFF) << 16 | rgb & 0xFF00 | rgb >> 16 & 0xFF
 }
 
@@ -343,6 +395,12 @@ impl BlockEntityRenderer {
             skulls,
             resting: HashMap::new(),
             patterns: HashMap::new(),
+            font: assets.font,
+            lang: assets.lang,
+            pages: GlyphPages::default(),
+            signs: HashMap::new(),
+            runs: Vec::new(),
+            random: 0x9E37_79B9_7F4A_7C15,
             instances: Vec::new(),
             parts: Vec::new(),
             christmas: is_christmas(SystemTime::now()),
@@ -354,9 +412,10 @@ impl BlockEntityRenderer {
         self.stats
     }
 
-    /// Stages the models, until that has worked once: before the frame's
-    /// `UploadRing::record`.
-    pub fn stage(&mut self, uploads: &mut UploadRing) {
+    /// Stages the models, until that has worked once, and the glyphs that wait for it:
+    /// before the frame's `UploadRing::record`.
+    pub fn stage(&mut self, textures: &mut TextureTable, uploads: &mut UploadRing) {
+        self.pages.stage(textures, uploads);
         if self.upload.is_none()
             && let Some(range) = self.pool.resolve(self.range)
         {
@@ -380,6 +439,7 @@ impl BlockEntityRenderer {
     /// Starts a frame's gathering.
     pub fn begin(&mut self) {
         self.instances.clear();
+        self.runs.clear();
         self.stats = BlockEntityStats {
             overflowed: self.stats.overflowed,
             ..BlockEntityStats::default()
@@ -467,6 +527,11 @@ impl BlockEntityRenderer {
                 origin,
                 light: record_light(block, sky),
             };
+            if let Kind::Sign { hanging, wall } = kind {
+                self.add_sign(pos, state, [hanging, wall], terrain, frame, place, away);
+                self.stats.drawn += 1;
+                continue;
+            }
             let usable = |id: Option<TextureId>| id.filter(|t| textures.is_ready(*t));
             match kind {
                 Kind::Chest(chest) => {
@@ -515,6 +580,7 @@ impl BlockEntityRenderer {
                         WHITE,
                     );
                 }
+                Kind::Sign { .. } => {}
                 Kind::Banner { dye, wall } => {
                     let (pole, flag) = if wall {
                         (Model::WallBanner, Model::WallFlag)
@@ -543,6 +609,98 @@ impl BlockEntityRenderer {
                 }
             }
             self.stats.drawn += 1;
+        }
+    }
+
+    /// Adds the sides of a sign that have text and face the camera.
+    #[allow(clippy::too_many_arguments)]
+    fn add_sign(
+        &mut self,
+        pos: [i32; 3],
+        state: u32,
+        [hanging, wall]: [bool; 2],
+        terrain: &Terrain,
+        frame: &Frame,
+        place: Placed,
+        away: f64,
+    ) {
+        let Some(column) = terrain.column(pos[0] >> 4, pos[2] >> 4) else {
+            return;
+        };
+        let stamp = (column.generation(), column.block_entities_rev());
+        if self.signs.get(&pos).is_none_or(|s| s.stamp != stamp) {
+            let tag = column
+                .block_entities()
+                .iter()
+                .find(|e| e.pos == pos)
+                .and_then(|e| e.tag.clone());
+            let same = |s: &Sign| match (&s.tag, &tag) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            match self.signs.get_mut(&pos) {
+                // Another block entity of the chunk changed.
+                Some(s) if same(s) && s.stamp.0 == stamp.0 => s.stamp = stamp,
+                _ => {
+                    if self.signs.len() >= KEPT_SIGNS {
+                        self.signs.clear();
+                    }
+                    let sides = ["front_text", "back_text"].map(|key| {
+                        let text = SignText::read(tag.as_ref()?, key, &self.lang)?;
+                        Some(Box::new(Side {
+                            text,
+                            glyphs: Vec::new(),
+                            newest: 0,
+                            obfuscated: false,
+                        }))
+                    });
+                    let mut sign = Sign { stamp, tag, sides };
+                    for side in sign.sides.iter_mut().flatten() {
+                        lay_out(side, hanging, &self.font, &mut self.pages, &mut self.random);
+                    }
+                    self.signs.insert(pos, sign);
+                }
+            }
+        }
+        let Some(sign) = self.signs.get_mut(&pos) else {
+            return;
+        };
+        for (i, side) in sign.sides.iter_mut().enumerate() {
+            let Some(side) = side else {
+                continue;
+            };
+            let mut transform = place::sign_text(state, hanging, wall, i == 0);
+            for (row, origin) in transform.0.iter_mut().zip(place.origin) {
+                row[3] += origin;
+            }
+            if !faces_camera(&transform) {
+                continue;
+            }
+            if side.obfuscated {
+                lay_out(side, hanging, &self.font, &mut self.pages, &mut self.random);
+            }
+            if !self.pages.arrived(side.newest) {
+                continue;
+            }
+            let near: f64 = (0..3)
+                .map(|i| (f64::from(pos[i]) + 0.5 - frame.player.position[i]).powi(2))
+                .sum();
+            self.runs.push(SignRun {
+                pos,
+                back: i == 1,
+                outline: record_colour(side.text.outline()),
+                outlined: side
+                    .text
+                    .outlined(near < OUTLINE_DISTANCE * OUTLINE_DISTANCE),
+                transform,
+                light: if side.text.glowing {
+                    record_light(15, 15)
+                } else {
+                    place.light
+                },
+                away,
+            });
         }
     }
 
@@ -657,6 +815,38 @@ impl BlockEntityRenderer {
         let Some(range) = self.pool.resolve(self.range).filter(|_| self.ready) else {
             return;
         };
+        // SAFETY: the caller's.
+        unsafe {
+            self.draw_models(
+                pass,
+                frame_data,
+                view,
+                fog,
+                cardinal,
+                lightmap,
+                indices,
+                (range.buffer, range.offset),
+            )
+        };
+        // Over the boards the mesher drew.
+        // SAFETY: the caller's.
+        unsafe { self.draw_signs(pass, frame_data, view, fog, lightmap) };
+    }
+
+    /// # Safety
+    /// As [`Self::draw`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_models(
+        &mut self,
+        pass: &mut Pass<'_>,
+        frame_data: &mut FrameData,
+        view: &View,
+        fog: &Fog,
+        cardinal: CardinalLight,
+        lightmap: TextureId,
+        indices: (vk::Buffer, u64),
+        vertices: (vk::Buffer, u64),
+    ) {
         if self.instances.is_empty() {
             return;
         }
@@ -666,8 +856,9 @@ impl BlockEntityRenderer {
             self.stats.overflowed += self.instances.len() as u64;
             return;
         };
-        let room = (frame_data.capacity() - frame_data.used()) / u64::from(MODEL_PART.bytes());
-        let count = self.instances.len().min(room.saturating_sub(1) as usize);
+        let room = (frame_data.capacity() - frame_data.used()).saturating_sub(RESERVED)
+            / u64::from(MODEL_PART.bytes());
+        let count = self.instances.len().min(room as usize);
         self.stats.overflowed += (self.instances.len() - count) as u64;
         if count == 0 {
             return;
@@ -682,7 +873,11 @@ impl BlockEntityRenderer {
         {
             write_part(record, i);
         }
-        let push = model_push(world, matrix, first, fog, cardinal);
+        let lights = match cardinal {
+            CardinalLight::Default => 1,
+            CardinalLight::Nether => 2,
+        };
+        let push = model_push([world, matrix, first, lights], fog);
         self.stats.parts = count as u32;
         let mut pushed = false;
         let mut at = 0;
@@ -691,7 +886,7 @@ impl BlockEntityRenderer {
         // a part's own quads, and no part has more than the shared indices reach; the
         // textures are of the table and have arrived (`gather`).
         unsafe {
-            pass.bind_vertex_buffer(range.buffer, range.offset);
+            pass.bind_vertex_buffer(vertices.0, vertices.1);
             pass.bind_index_buffer(indices.0, indices.1);
             while at < count {
                 let Instance { batch, quads, .. } = self.instances[at];
@@ -714,6 +909,117 @@ impl BlockEntityRenderer {
             }
         }
     }
+
+    /// Draws the text that was gathered: the outlines, then the text over them.
+    ///
+    /// # Safety
+    /// As [`Self::draw`].
+    unsafe fn draw_signs(
+        &mut self,
+        pass: &mut Pass<'_>,
+        frame_data: &mut FrameData,
+        view: &View,
+        fog: &Fog,
+        lightmap: TextureId,
+    ) {
+        if self.runs.is_empty() {
+            return;
+        }
+        // The nearest are drawn when not all can be.
+        self.runs.sort_by(|a, b| a.away.total_cmp(&b.away));
+        let record = u64::from(GLYPH.bytes());
+        let room = (frame_data.capacity() - frame_data.used())
+            .saturating_sub(RESERVED)
+            .saturating_sub(self.runs.len() as u64 * u64::from(SIGN.bytes()))
+            .min(GLYPH_BYTES)
+            / record;
+        let Some((world, matrix)) = write_world(frame_data, view, [1.0; 2], lightmap) else {
+            return;
+        };
+        let (mut kept, mut glyphs) = (0, 0u64);
+        for run in &self.runs {
+            let count = self.side(run).map_or(0, |s| s.glyphs.len()) as u64;
+            if glyphs + count > room {
+                break;
+            }
+            glyphs += count;
+            kept += 1;
+        }
+        self.stats.overflowed += (self.runs.len() - kept) as u64;
+        self.runs.truncate(kept);
+        if glyphs == 0 {
+            return;
+        }
+        // Those with an outline first: their records are drawn twice.
+        self.runs.sort_by_key(|r| !r.outlined);
+        let outlined: usize = self
+            .runs
+            .iter()
+            .take_while(|r| r.outlined)
+            .filter_map(|r| Some(self.side(r)?.glyphs.len()))
+            .sum();
+        let words = GLYPH.words();
+        let Some((signs, bytes)) = frame_data.alloc(kept as u32 * SIGN.words(), 4) else {
+            return;
+        };
+        for (run, record) in self.runs.iter().zip(bytes.as_chunks_mut::<SIGN_BYTES>().0) {
+            write_sign(record, run);
+        }
+        let Some((first, bytes)) = frame_data.alloc(glyphs as u32 * words, 4) else {
+            return;
+        };
+        let textures = self.pages.textures();
+        let mut records = bytes.as_chunks_mut::<GLYPH_RECORD_BYTES>().0.iter_mut();
+        for (n, run) in self.runs.iter().enumerate() {
+            let side = self.side(run).map_or(&[][..], |s| &s.glyphs);
+            for (glyph, out) in side.iter().zip(&mut records) {
+                let page = glyph[GLYPH.offset("texture") as usize] as usize;
+                write_glyph(out, glyph, textures[page], n as u32);
+            }
+        }
+        self.stats.texts = kept as u32;
+        self.stats.glyphs = glyphs as u32;
+        // The text lies over the outlines: it is drawn nearer.
+        for (pipeline, instances) in [
+            (PipelineId::SignOutline, outlined as u32 * 8),
+            (PipelineId::SignText, glyphs as u32),
+        ] {
+            if instances == 0 {
+                continue;
+            }
+            let push = model_push([world, matrix, first, signs], fog);
+            // SAFETY: the push constants are sign_vert.glsl's, the records they point at
+            // were written just above (an outline's glyph eight times over, the first
+            // `outlined` of them), and the pages they name have arrived (`add_sign`).
+            unsafe { pass.draw(pipeline.index(), &push, 6, instances) };
+            self.stats.draws += 1;
+        }
+    }
+
+    fn side(&self, run: &SignRun) -> Option<&Side> {
+        self.signs.get(&run.pos)?.sides[usize::from(run.back)].as_deref()
+    }
+}
+
+/// Whether a text with this transform is seen from its front, with the camera at the
+/// origin.
+fn faces_camera(transform: &Affine) -> bool {
+    transform.0.iter().map(|row| -row[3] * row[2]).sum::<f32>() > 0.0
+}
+
+/// Lays out a side's text and makes its records.
+fn lay_out(side: &mut Side, hanging: bool, font: &Font, pages: &mut GlyphPages, random: &mut u64) {
+    let mut pick = |below: usize| {
+        // xorshift64
+        *random ^= *random << 13;
+        *random ^= *random >> 7;
+        *random ^= *random << 17;
+        (*random % below as u64) as usize
+    };
+    let layout = sign::layout(&side.text, hanging, font, &mut pick);
+    // What changes every frame does not wait for its pictures.
+    (side.glyphs, side.newest) = sign::records(&layout.text, pages, font, layout.obfuscated);
+    side.obfuscated = layout.obfuscated;
 }
 
 /// Where a block entity is from the camera, and its light.
@@ -721,6 +1027,37 @@ impl BlockEntityRenderer {
 struct Placed {
     origin: [f32; 3],
     light: u32,
+}
+
+/// Bytes of a sign's and a glyph's record.
+const SIGN_BYTES: usize = SIGN.bytes() as usize;
+const GLYPH_RECORD_BYTES: usize = GLYPH.bytes() as usize;
+
+fn write_sign(bytes: &mut [u8; SIGN_BYTES], run: &SignRun) {
+    for (i, c) in run.transform.0.as_flattened().iter().enumerate() {
+        let at = SIGN.offset("row_x") as usize + i;
+        bytes[at * 4..at * 4 + 4].copy_from_slice(&c.to_ne_bytes());
+    }
+    for (field, word) in [("light", run.light), ("outline", run.outline)] {
+        let at = SIGN.offset(field) as usize * 4;
+        bytes[at..at + 4].copy_from_slice(&word.to_ne_bytes());
+    }
+}
+
+fn write_glyph(
+    bytes: &mut [u8; GLYPH_RECORD_BYTES],
+    record: &[u32; GLYPH_WORDS],
+    texture: u32,
+    sign: u32,
+) {
+    const TEXTURE: usize = GLYPH.offset("texture") as usize;
+    const SIGN_NUMBER: usize = GLYPH.offset("sign") as usize;
+    let mut words = *record;
+    words[TEXTURE] = texture;
+    words[SIGN_NUMBER] = sign;
+    for (out, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+        *out = word.to_ne_bytes();
+    }
 }
 
 /// Bytes of one part's record.
@@ -742,21 +1079,12 @@ fn write_part(bytes: &mut [u8], i: &Instance) {
     );
 }
 
-/// The models' push constants for a frame's draws.
-fn model_push(
-    world: u32,
-    matrix: u32,
-    parts: u32,
-    fog: &Fog,
-    cardinal: CardinalLight,
-) -> [u8; MODEL_PUSH_BYTES] {
+/// The push constants of a frame's models, or of its signs' text: the four words the
+/// vertex stage reads, and the fog.
+fn model_push(words: [u32; 4], fog: &Fog) -> [u8; MODEL_PUSH_BYTES] {
     let mut push = [0u8; MODEL_PUSH_BYTES];
     let mut put = |at: usize, word: [u8; 4]| push[at..at + 4].copy_from_slice(&word);
-    let lights: u32 = match cardinal {
-        CardinalLight::Default => 1,
-        CardinalLight::Nether => 2,
-    };
-    for (i, word) in [world, matrix, parts, lights].into_iter().enumerate() {
+    for (i, word) in words.into_iter().enumerate() {
         put(i * 4, word.to_ne_bytes());
     }
     for (i, c) in fog.colour.iter().enumerate() {
@@ -810,6 +1138,51 @@ mod tests {
         }
         assert_eq!((word(12), word(13)), (0x70F0, 0xFF12_3456));
         assert_eq!(word(14), TextureId::MISSING.index());
+    }
+
+    #[test]
+    fn a_sign_and_its_glyphs_are_written_where_the_shader_reads_them() {
+        let run = SignRun {
+            pos: [0; 3],
+            back: false,
+            outlined: false,
+            outline: 0xFF01_0203,
+            transform: Affine(std::array::from_fn(|r| {
+                std::array::from_fn(|c| (r * 4 + c) as f32)
+            })),
+            light: 0x70F0,
+            away: 0.0,
+        };
+        let mut bytes = [0xAAu8; SIGN_BYTES];
+        write_sign(&mut bytes, &run);
+        let word = |b: &[u8], n: usize| u32::from_ne_bytes(b[n * 4..n * 4 + 4].try_into().unwrap());
+        for n in 0..12 {
+            assert_eq!(f32::from_bits(word(&bytes, n)), n as f32);
+        }
+        assert_eq!((word(&bytes, 12), word(&bytes, 13)), (0x70F0, 0xFF01_0203));
+        // The page's number becomes its texture's, and the sign's is put in.
+        let record: [u32; GLYPH_WORDS] =
+            std::array::from_fn(|i| if i == 10 { 0 } else { i as u32 });
+        let mut out = [0xAAu8; GLYPH_RECORD_BYTES];
+        write_glyph(&mut out, &record, 9, 77);
+        for n in 0..10 {
+            assert_eq!(word(&out, n), n as u32);
+        }
+        assert_eq!((word(&out, 10), word(&out, 12)), (9, 12));
+        assert_eq!(word(&out, 11), 77);
+    }
+
+    #[test]
+    fn a_text_is_drawn_from_its_front_only() {
+        let i = Affine::IDENTITY;
+        // Facing the positive z, in front of the camera and behind it.
+        assert!(!faces_camera(&i.translate([0.0, 0.0, 5.0])));
+        assert!(faces_camera(&i.translate([0.0, 0.0, -5.0])));
+        assert!(faces_camera(
+            &i.translate([3.0, 1.0, -5.0]).scale([0.01, -0.01, 0.01])
+        ));
+        let back = i.translate([0.0, 0.0, -5.0]).rotate_y(std::f32::consts::PI);
+        assert!(!faces_camera(&back));
     }
 
     #[test]
