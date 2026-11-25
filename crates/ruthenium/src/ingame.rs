@@ -206,7 +206,7 @@ pub fn world_view(session: &Session, now: Instant, fov: f32) -> Option<WorldView
             y_rot: camera.y_rot,
             x_rot: camera.x_rot,
             // The option's degrees times the eased modifier (`Camera.calculateFov`).
-            fov: fov * p.fov.at(partial_tick),
+            fov: p.fov.field_of_view(fov, partial_tick),
         },
         // What every session tells its server (`crate::join`).
         view_distance: i32::from(ClientInformation::default().view_distance),

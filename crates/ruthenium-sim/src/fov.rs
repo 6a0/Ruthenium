@@ -95,6 +95,12 @@ impl FovEase {
     pub fn at(&self, partial_tick: f32) -> f32 {
         mth::lerp(partial_tick, self.old, self.now)
     }
+
+    /// The field of view drawn with the FOV option's `degrees` (`Camera.calculateFov`,
+    /// before the narrowing in fluids).
+    pub fn field_of_view(&self, degrees: f32, partial_tick: f32) -> f32 {
+        degrees * self.at(partial_tick)
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +183,8 @@ mod tests {
         let mut low = FovEase::default();
         low.tick(-1.0);
         assert_eq!(low.now, 0.1);
+        // Drawn at the option's degrees times the modifier between the ticks.
+        assert_eq!(e.field_of_view(70.0, 0.0), 70.0 * 1.075);
+        assert_eq!(e.field_of_view(90.0, 1.0), 90.0 * 1.5);
     }
 }

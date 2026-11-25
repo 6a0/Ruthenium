@@ -566,8 +566,10 @@ mod tests {
         }
 
         fn light(&self, pos: [i32; 3]) -> (u8, u8) {
+            // The light depends on the height it is read at too.
             let c = self.at(pos[0], pos[2]);
-            (c.2, c.3)
+            let y = (pos[1] & 7) as u8;
+            (c.2 ^ y, c.3 ^ y)
         }
     }
 
