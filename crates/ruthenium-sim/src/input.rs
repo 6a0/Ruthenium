@@ -1,7 +1,7 @@
 //! The player's mouse and keys as the game reads them: the mouse's turn
 //! (`MouseHandler.onMove`, `handleAccumulatedMovement`, `turnPlayer`), the scroll
-//! wheel (`ScrollWheelHandler`) and the movement keys (`KeyboardInput`), with
-//! vanilla's default bindings.
+//! wheel (`ScrollWheelHandler`) and the movement keys (`KeyboardInput`), under the
+//! player's bindings ([`crate::keybinds`]).
 //!
 //! Turning is exact: the relative motion SDL reports (floats) is summed in doubles over
 //! a frame, turned into `Entity.turn`'s amounts once per frame with vanilla's
@@ -152,65 +152,22 @@ pub fn next_scroll_selection(wheel: f64, current: i32, limit: i32) -> i32 {
     selected
 }
 
-/// SDL scancodes of the keys movement reads; vanilla's defaults (`Options.keyUp` ...).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeyBinds {
-    pub forward: u32,
-    pub left: u32,
-    pub back: u32,
-    pub right: u32,
-    pub jump: u32,
-    pub sneak: u32,
-    pub sprint: u32,
-    /// `key.hotbar.1` to `key.hotbar.9`.
-    pub hotbar: [u32; 9],
-    /// `key.swapOffhand`.
-    pub swap_offhand: u32,
-    /// `key.playerlist`.
-    pub player_list: u32,
-}
+use crate::keybinds::Action;
+pub use crate::keybinds::{Key, KeyBinds};
 
-impl KeyBinds {
-    pub const DEFAULT: KeyBinds = KeyBinds {
-        forward: 26, // W
-        left: 4,     // A
-        back: 22,    // S
-        right: 7,    // D
-        jump: 44,    // Space
-        sneak: 225,  // Left Shift
-        sprint: 224, // Left Ctrl
-        hotbar: [30, 31, 32, 33, 34, 35, 36, 37, 38],
-        swap_offhand: 9, // F
-        player_list: 43, // Tab
-    };
-
-    /// The hotbar slot a key selects.
-    pub fn hotbar_slot(&self, scancode: u32) -> Option<u8> {
-        self.hotbar
-            .iter()
-            .position(|&k| k == scancode)
-            .map(|i| i as u8)
-    }
-}
-
-impl Default for KeyBinds {
-    fn default() -> KeyBinds {
-        KeyBinds::DEFAULT
-    }
-}
-
-/// Which keys are down (`KeyMapping.set` from key events while no screen is open;
-/// `releaseAll` when one opens), read as movement input (`KeyboardInput.tick`).
+/// Which keys and buttons are down (`KeyMapping.set` from key and button events while no
+/// screen is open; `releaseAll` when one opens), read as movement input
+/// (`KeyboardInput.tick`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeldKeys {
-    down: Vec<u32>,
+    down: Vec<Key>,
 }
 
 impl HeldKeys {
-    pub fn set(&mut self, scancode: u32, down: bool) {
-        let at = self.down.iter().position(|&k| k == scancode);
+    pub fn set(&mut self, key: Key, down: bool) {
+        let at = self.down.iter().position(|&k| k == key);
         match (down, at) {
-            (true, None) => self.down.push(scancode),
+            (true, None) => self.down.push(key),
             (false, Some(i)) => {
                 self.down.swap_remove(i);
             }
@@ -222,21 +179,36 @@ impl HeldKeys {
         self.down.clear();
     }
 
-    pub fn is_down(&self, scancode: u32) -> bool {
-        self.down.contains(&scancode)
+    pub fn is_down(&self, key: Key) -> bool {
+        self.down.contains(&key)
+    }
+
+    /// Whether a mapping is held: its key is down (an unbound one never is).
+    pub fn action_down(&self, binds: &KeyBinds, action: Action) -> bool {
+        let key = binds.get(action);
+        !key.is_unbound() && self.is_down(key)
+    }
+
+    /// The keyboard keys held.
+    pub fn keyboard(&self) -> impl Iterator<Item = Key> + '_ {
+        self.down
+            .iter()
+            .copied()
+            .filter(|k| matches!(k, Key::Keyboard(_)))
     }
 
     /// The movement keys held, under `binds` (toggle sneak and sprint off, vanilla's
     /// default).
     pub fn keys(&self, binds: &KeyBinds) -> Keys {
+        let down = |a| self.action_down(binds, a);
         Keys {
-            forward: self.is_down(binds.forward),
-            backward: self.is_down(binds.back),
-            left: self.is_down(binds.left),
-            right: self.is_down(binds.right),
-            jump: self.is_down(binds.jump),
-            shift: self.is_down(binds.sneak),
-            sprint: self.is_down(binds.sprint),
+            forward: down(Action::Forward),
+            backward: down(Action::Back),
+            left: down(Action::Left),
+            right: down(Action::Right),
+            jump: down(Action::Jump),
+            shift: down(Action::Sneak),
+            sprint: down(Action::Sprint),
         }
     }
 }
@@ -307,11 +279,11 @@ mod tests {
 
     #[test]
     fn held_keys_read_as_movement() {
-        let b = KeyBinds::DEFAULT;
+        let mut b = KeyBinds::DEFAULT;
         let mut h = HeldKeys::default();
-        h.set(b.forward, true);
-        h.set(b.sprint, true);
-        h.set(b.forward, true);
+        h.set(b.get(Action::Forward), true);
+        h.set(b.get(Action::Sprint), true);
+        h.set(b.get(Action::Forward), true);
         assert_eq!(
             h.keys(&b),
             Keys {
@@ -320,11 +292,22 @@ mod tests {
                 ..Keys::default()
             }
         );
-        h.set(b.forward, false);
+        h.set(b.get(Action::Forward), false);
         assert!(!h.keys(&b).forward);
         h.release_all();
         assert_eq!(h.keys(&b), Keys::default());
-        assert_eq!(b.hotbar_slot(32), Some(2));
-        assert_eq!(b.hotbar_slot(26), None);
+        // Rebound: a mouse button walks, the old key does nothing, and nothing holds
+        // an unbound mapping.
+        b.set(Action::Forward, Key::Mouse(4));
+        b.set(Action::Jump, Key::UNBOUND);
+        h.set(Key::Keyboard(26), true);
+        h.set(Key::UNBOUND, true);
+        assert_eq!(h.keys(&b), Keys::default());
+        h.set(Key::Mouse(4), true);
+        assert!(h.keys(&b).forward && !h.keys(&b).jump);
+        assert_eq!(
+            h.keyboard().collect::<Vec<_>>(),
+            [Key::Keyboard(26), Key::UNBOUND]
+        );
     }
 }

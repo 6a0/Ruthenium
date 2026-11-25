@@ -495,6 +495,8 @@ pub struct Renderer {
     view_options: ViewOptions,
     /// The HUD, with the world's assets.
     hud: Option<hud::Hud>,
+    /// The player's key bindings, for the HUD's text that names them.
+    key_bindings: Arc<ruthenium_protocol::text::BoundKeys>,
     /// The terrain's part of the last frame.
     world_times: WorldTimes,
     /// The number of the last frame recorded.
@@ -620,6 +622,7 @@ impl Renderer {
             show_hand: true,
             view_options: ViewOptions::default(),
             hud: None,
+            key_bindings: Arc::default(),
             world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
@@ -1047,6 +1050,11 @@ impl Renderer {
         if let Some(w) = &mut self.world {
             w.clear(&mut self.uploads, self.last_frame);
         }
+    }
+
+    /// The player's key bindings from now on, for the HUD's text that names them.
+    pub fn set_key_bindings(&mut self, keys: Arc<ruthenium_protocol::text::BoundKeys>) {
+        self.key_bindings = keys;
     }
 
     /// What the last frame's HUD was made of, if there is one.
@@ -1621,6 +1629,7 @@ impl Renderer {
                     w.partial_tick,
                     [s.extent.width, s.extent.height],
                     params,
+                    &self.key_bindings,
                     light,
                     models,
                     renderer.block_atlas(),

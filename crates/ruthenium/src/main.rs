@@ -11,6 +11,7 @@ mod client;
 mod connect_cmd;
 mod controls;
 mod ingame;
+mod input_script;
 mod join;
 mod menu;
 mod prepare_cmd;
@@ -179,9 +180,15 @@ With no command, opens the game window. Options:
   --route-out <file>     write the route's record (positions, chunks, checksums)
   --expect-positions <checksum> | --expect-footprint <checksum>
                          fail unless the route's record ends with these checksums
+  --input '<steps>'      once in the world, press keys and mouse buttons as if by hand
+                         (development): steps like key.keyboard.w+@500 (down, 500 ms
+                         after the step before), key.mouse.4-@50 (up), shot@1000 (the
+                         --screenshot); keys go through the key bindings
 The options above that change a setting override it for the run; it is saved with
 them if a setting changes. In the window, F3 toggles the frame-stats overlay and F11
-fullscreen.
+fullscreen (or the keys bound to the debug screen and to fullscreen); Escape always
+opens the menu. Key bindings live in config/client.toml's [keys]: an empty [keys]
+resets them all, and without one they are imported from vanilla's options.txt again.
 
 commands:
   version

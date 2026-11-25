@@ -8,9 +8,11 @@
 
 use std::path::{Path, PathBuf};
 
+use ruthenium_protocol::text::Lang;
 use ruthenium_render::clouds::CloudMode;
 use ruthenium_render::weather;
 use ruthenium_sim::input::MouseOptions;
+use ruthenium_sim::keybinds::{self, Action, Category, Key, KeyBinds};
 use ruthenium_ui::hud::AttackIndicator;
 use ruthenium_ui::modern::{ControlSpec, SectionSpec, SettingSpec};
 
@@ -154,6 +156,8 @@ pub struct Settings {
     /// inversion. Imported from vanilla's `options.txt` when the file has none.
     pub mouse: MouseOptions,
     pub game: GameOptions,
+    /// The key bindings. Imported from vanilla's `options.txt` when the file has none.
+    pub keys: KeyBinds,
 }
 
 impl Default for Settings {
@@ -168,6 +172,7 @@ impl Default for Settings {
             last_server: String::new(),
             mouse: MouseOptions::DEFAULT,
             game: GameOptions::default(),
+            keys: KeyBinds::DEFAULT,
         }
     }
 }
@@ -195,6 +200,80 @@ pub enum Row {
     Clouds,
     CloudDistance,
     WeatherRadius,
+    /// A key binding.
+    Key(Action),
+    /// The heading over a category of key bindings.
+    KeyHeading(Category),
+    /// Reset Keys: every binding back to its default.
+    ResetKeys,
+}
+
+/// The Controls page: the mouse, Reset Keys, then every key binding under its heading in
+/// the order vanilla lists them.
+const CONTROLS: [Row; 4 + Category::ALL.len() + keybinds::COUNT] = {
+    let mut rows = [Row::Sensitivity; 4 + Category::ALL.len() + keybinds::COUNT];
+    rows[1] = Row::InvertX;
+    rows[2] = Row::InvertY;
+    rows[3] = Row::ResetKeys;
+    let (mut n, mut i) = (4, 0);
+    let mut last = None;
+    while i < keybinds::COUNT {
+        let a = Action::SORTED[i];
+        let c = a.category();
+        let new = match last {
+            Some(l) => l as u8 != c as u8,
+            None => true,
+        };
+        if new {
+            rows[n] = Row::KeyHeading(c);
+            n += 1;
+            last = Some(c);
+        }
+        rows[n] = Row::Key(a);
+        n += 1;
+        i += 1;
+    }
+    rows
+};
+
+/// What the Controls page names keys and bindings with: the game's language where it
+/// is loaded (else Ruthenium's own words), and what the keyboard's layout calls a key
+/// (by scancode).
+#[derive(Clone, Copy)]
+#[allow(missing_debug_implementations)]
+pub struct KeyNaming<'a> {
+    pub lang: Option<&'a dyn Lang>,
+    pub system: &'a dyn Fn(i32) -> Option<String>,
+}
+
+impl KeyNaming<'_> {
+    /// No language, no layout.
+    pub const PLAIN: KeyNaming<'static> = KeyNaming {
+        lang: None,
+        system: &|_| None,
+    };
+
+    fn action(&self, a: Action) -> String {
+        self.lang
+            .and_then(|l| l.get(a.name()))
+            .unwrap_or(a.label())
+            .to_owned()
+    }
+
+    fn category(&self, c: Category) -> String {
+        self.lang
+            .and_then(|l| l.get(&c.lang_key()))
+            .unwrap_or(c.label())
+            .to_owned()
+    }
+
+    fn key(&self, key: Key) -> String {
+        let system = match key {
+            Key::Keyboard(v) => (self.system)(v),
+            Key::Mouse(_) => None,
+        };
+        keybinds::key_display(key, system.as_deref(), self.lang)
+    }
 }
 
 /// A titled group of rows.
@@ -226,7 +305,7 @@ pub const GAME: [Group; 9] = [
             Row::Vignette,
         ],
     ),
-    ("Controls", &[Row::Sensitivity, Row::InvertX, Row::InvertY]),
+    ("Controls", &CONTROLS),
     ("Online", &[]),
     ("Resources", &[]),
     ("Accessibility", &[Row::DamageTilt, Row::FovEffects]),
@@ -336,8 +415,22 @@ impl Settings {
                 g.weather_radius,
             ),
         };
+        let mut keys = d.keys;
+        if let Some(t) = section("keys") {
+            // (`key.forward = ...` without quotes is a dotted key: tables in tables.)
+            let mut named = Vec::new();
+            flatten(t, "", &mut named);
+            for (action, key) in named {
+                if let (Some(a), keybinds::Parsed::Key(k)) =
+                    (Action::by_name(&action), Key::parse(key))
+                {
+                    keys.set(a, k);
+                }
+            }
+        }
         Ok(Settings {
             game,
+            keys,
             vsync: flag(display, "vsync", d.vsync),
             max_fps,
             fullscreen: flag(display, "fullscreen", d.fullscreen),
@@ -358,20 +451,81 @@ impl Settings {
         })
     }
 
-    /// What a screen of these groups shows, with these values.
+    /// Whether `text` has the key bindings (else they're imported from vanilla).
+    pub fn has_keys(text: &str) -> bool {
+        text.parse::<toml::Table>()
+            .is_ok_and(|t| t.get("keys").is_some_and(toml::Value::is_table))
+    }
+
+    /// What a screen of these groups shows, with these values (keys named in
+    /// Ruthenium's own words).
+    #[allow(dead_code)]
     pub fn sections(&self, groups: &[Group]) -> Vec<SectionSpec> {
+        self.sections_named(groups, &KeyNaming::PLAIN)
+    }
+
+    /// The same, with keys and bindings named by `names`.
+    pub fn sections_named(&self, groups: &[Group], names: &KeyNaming<'_>) -> Vec<SectionSpec> {
         groups
             .iter()
             .map(|(title, rows)| SectionSpec {
                 title: (*title).into(),
-                settings: rows.iter().map(|&r| self.spec(r)).collect(),
+                settings: rows
+                    .iter()
+                    .map(|&r| self.key_spec(r, names).unwrap_or_else(|| self.spec(r)))
+                    .collect(),
             })
             .collect()
+    }
+
+    /// A key binding's row, a heading or Reset Keys as it shows now.
+    pub fn key_spec(&self, row: Row, names: &KeyNaming<'_>) -> Option<SettingSpec> {
+        let keys = &self.keys;
+        let (label, detail, control) = match row {
+            Row::Key(a) => {
+                let others: Vec<String> = keys.conflicts(a).map(|o| names.action(o)).collect();
+                let detail = if others.is_empty() {
+                    String::new()
+                } else {
+                    format!("Also used by {}", others.join(", "))
+                };
+                let control = ControlSpec::Key {
+                    key: names.key(keys.get(a)),
+                    conflict: !others.is_empty(),
+                    reset: !keys.is_default(a),
+                };
+                (names.action(a), detail, control)
+            }
+            Row::KeyHeading(c) => (names.category(c), String::new(), ControlSpec::Heading),
+            Row::ResetKeys => {
+                let changed = keys.changed();
+                let detail = match changed {
+                    0 => "Click one, then press a key or button; Esc unbinds".to_owned(),
+                    1 => "1 key differs from the default".to_owned(),
+                    n => format!("{n} keys differ from the defaults"),
+                };
+                let control = ControlSpec::Button {
+                    label: "Reset Keys".into(),
+                    enabled: changed > 0,
+                };
+                ("Key Binds".to_owned(), detail, control)
+            }
+            _ => return None,
+        };
+        Some(SettingSpec {
+            label,
+            detail,
+            control,
+            value: 0,
+        })
     }
 
     /// One row as its screen starts with it.
     fn spec(&self, row: Row) -> SettingSpec {
         use ControlSpec::{Choice, Slider, Switch};
+        if let Some(spec) = self.key_spec(row, &KeyNaming::PLAIN) {
+            return spec;
+        }
         let percents = |last: u32| (0..=last).map(|p| format!("{p}%")).collect();
         let (label, detail, control) = match row {
             Row::FrameStats => (
@@ -479,6 +633,8 @@ impl Settings {
                 "How far speed and fluids change the view",
                 Slider(percents(100)),
             ),
+            // Above.
+            Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys => ("", "", Switch),
         };
         SettingSpec {
             label: label.into(),
@@ -529,6 +685,8 @@ impl Settings {
                 .weather_radius
                 .clamp(weather::MIN_RADIUS, weather::MAX_RADIUS)
                 .abs_diff(weather::MIN_RADIUS) as usize,
+            // Not values: they act (see `SettingsEvent::Pressed`).
+            Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys => 0,
         }
     }
 
@@ -578,6 +736,7 @@ impl Settings {
             Row::WeatherRadius => {
                 g.weather_radius = (weather::MIN_RADIUS + value as u32).min(weather::MAX_RADIUS);
             }
+            Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys => {}
         }
     }
 
@@ -630,7 +789,15 @@ impl Settings {
              clouds = \"{}\"\n\
              cloud_distance = {}\n\
              # {} to {} blocks.\n\
-             weather_radius = {}\n",
+             weather_radius = {}\n\
+             \n\
+             [keys]\n\
+             # Each of vanilla's key bindings by its name, and its key as options.txt names\n\
+             # them (\"key.keyboard.w\", \"key.mouse.left\", \"key.mouse.4\", \"key.keyboard.unknown\"\n\
+             # for none). Escape always opens the menu, whatever is bound. An empty [keys]\n\
+             # puts every key back to its default; without [keys] they are taken from\n\
+             # vanilla's options.txt again.\n\
+             {}",
             self.vsync,
             self.fullscreen,
             self.frame_stats,
@@ -652,7 +819,36 @@ impl Settings {
             weather::MIN_RADIUS,
             weather::MAX_RADIUS,
             self.game.weather_radius,
+            self.keys_toml(),
         )
+    }
+
+    /// The `[keys]` lines: every binding, in `options.txt`'s order.
+    fn keys_toml(&self) -> String {
+        Action::ALL
+            .iter()
+            .map(|&a| {
+                let name = toml::Value::String(a.name().to_owned());
+                let key = toml::Value::String(self.keys.get(a).name());
+                format!("{name} = {key}\n")
+            })
+            .collect()
+    }
+}
+
+/// A table's string values by their dotted names (`a.b = "x"` and `"a.b" = "x"` alike).
+fn flatten<'a>(table: &'a toml::Table, prefix: &str, out: &mut Vec<(String, &'a str)>) {
+    for (k, v) in table {
+        let name = if prefix.is_empty() {
+            k.clone()
+        } else {
+            format!("{prefix}.{k}")
+        };
+        match v {
+            toml::Value::String(s) => out.push((name, s)),
+            toml::Value::Table(t) => flatten(t, &name, out),
+            _ => {}
+        }
     }
 }
 
@@ -664,8 +860,9 @@ pub struct SettingsFile {
     path: Option<PathBuf>,
     /// What the file holds (or would hold): saving is skipped when nothing changed.
     saved: Settings,
-    /// Whether the file set the mouse's sensitivity.
+    /// Whether the file set the mouse's sensitivity, and the key bindings.
     has_mouse: bool,
+    has_keys: bool,
 }
 
 impl SettingsFile {
@@ -681,6 +878,7 @@ impl SettingsFile {
             path: None,
             saved: Settings::default(),
             has_mouse: true,
+            has_keys: true,
         }
     }
 
@@ -703,13 +901,38 @@ impl SettingsFile {
                 Settings::default()
             }
         };
-        let has_mouse = std::fs::read_to_string(&path).is_ok_and(|t| Settings::has_mouse(&t));
+        let text = std::fs::read_to_string(&path);
+        let has_mouse = text.as_ref().is_ok_and(|t| Settings::has_mouse(t));
+        let has_keys = text.as_ref().is_ok_and(|t| Settings::has_keys(t));
         SettingsFile {
             saved: settings.clone(),
             settings,
             path: Some(path),
             has_mouse,
+            has_keys,
         }
+    }
+
+    /// Takes the key bindings from `import` (vanilla's) if the file had none; they are
+    /// saved with the next change, or on quitting.
+    pub fn import_keys(&mut self, import: impl FnOnce() -> Option<(KeyBinds, PathBuf)>) {
+        if self.has_keys {
+            return;
+        }
+        self.has_keys = true;
+        match import() {
+            Some((keys, from)) => {
+                eprintln!(
+                    "[ruthenium] key bindings ({} not vanilla's defaults) from {}",
+                    keys.changed(),
+                    from.display()
+                );
+                self.settings.keys = keys;
+            }
+            None => eprintln!("[ruthenium] no key bindings in vanilla's options.txt; the defaults"),
+        }
+        // Written even when they are the defaults, so the import happens once.
+        self.saved.keys.set(Action::Attack, Key::Mouse(i32::MIN));
     }
 
     /// Takes the mouse options from `import` (vanilla's) if the file didn't set them;
@@ -809,6 +1032,15 @@ mod tests {
                 cloud_distance: 12,
                 weather_radius: 5,
             },
+            keys: {
+                let mut k = KeyBinds::DEFAULT;
+                k.set(Action::Attack, Key::Keyboard(13));
+                k.set(Action::Use, Key::Mouse(5));
+                k.set(Action::Jump, Key::UNBOUND);
+                k.set(Action::Hotbar1, Key::Keyboard(300));
+                k.set(Action::DebugOverlay, Key::Mouse(9));
+                k
+            },
         };
         assert_eq!(Settings::parse(&s.to_toml()), Ok(s.clone()));
         assert!(Settings::has_mouse(&s.to_toml()));
@@ -831,7 +1063,11 @@ vsync = true
     #[test]
     fn screen_values_map_to_settings_and_back() {
         let mut s = Settings::default();
-        let rows = rows_of(&all_groups());
+        // (Key bindings' rows have no values: they act.)
+        let rows: Vec<Row> = rows_of(&all_groups())
+            .into_iter()
+            .filter(|r| !matches!(r, Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys))
+            .collect();
         // Every row keeps what it is set to, and each is a row of its own.
         for (i, &row) in rows.iter().enumerate() {
             let others: Vec<usize> = rows.iter().map(|&r| s.get(r)).collect();
@@ -906,6 +1142,7 @@ vsync = true
             let steps = match &spec.control {
                 ControlSpec::Switch => 2,
                 ControlSpec::Slider(l) | ControlSpec::Choice(l) => l.len(),
+                ControlSpec::Key { .. } | ControlSpec::Heading | ControlSpec::Button { .. } => 1,
             };
             assert!(spec.value < steps && !spec.label.is_empty(), "{row:?}");
         }
@@ -928,6 +1165,174 @@ vsync = true
         let titles: Vec<&str> = GAME.iter().map(|g| g.0).collect();
         let first = ["Video", "Controls", "Online", "Resources", "Accessibility"];
         assert_eq!(titles[..5], first);
+    }
+
+    #[test]
+    fn key_bindings_are_kept_by_their_names() {
+        let s = Settings::parse(
+            "[keys]\n\"key.forward\" = \"key.keyboard.i\"\nkey.attack = \"key.keyboard.j\"\n\
+             key.hotbar.1 = \"key.mouse.4\"\n\"key.use\" = \"nonsense\"\n\
+             \"key.mystery\" = \"key.keyboard.q\"\n\"key.jump\" = 5\n\
+             \"key.sneak\" = \"key.keyboard.unknown\"\n",
+        )
+        .unwrap();
+        let k = &s.keys;
+        assert_eq!(k.get(Action::Forward), Key::Keyboard(12));
+        assert_eq!(k.get(Action::Attack), Key::Keyboard(13), "a dotted name");
+        assert_eq!(k.get(Action::Hotbar1), Key::Mouse(4));
+        assert_eq!(k.get(Action::Sneak), Key::UNBOUND);
+        // What can't be read keeps the default, and unknown names are dropped.
+        assert!(k.is_default(Action::Use) && k.is_default(Action::Jump));
+        assert_eq!(k.changed(), 4);
+        assert!(!s.to_toml().contains("mystery"));
+        // Every binding is written, in options.txt's order, and an empty table is the
+        // defaults.
+        let text = s.to_toml();
+        let at = |name: &str| text.find(&format!("\"{name}\" = ")).unwrap();
+        assert!(at("key.attack") < at("key.use") && at("key.use") < at("key.forward"));
+        assert!(text.contains("\"key.hotbar.1\" = \"key.mouse.4\"\n"));
+        assert_eq!(Settings::parse("[keys]\n").unwrap().keys, KeyBinds::DEFAULT);
+        assert!(Settings::has_keys("[keys]\n"));
+        assert!(!Settings::has_keys("[controls]\nmouse_sensitivity = 0.5\n"));
+        assert!(!Settings::has_keys("keys = 5\n"));
+        assert!(Settings::has_keys(&Settings::default().to_toml()));
+    }
+
+    #[test]
+    fn the_controls_page_lists_every_binding_under_its_heading() {
+        let controls = GAME.iter().find(|g| g.0 == "Controls").unwrap();
+        let rows = controls.1.to_vec();
+        let start = rows.iter().position(|&r| r == Row::ResetKeys).unwrap();
+        assert_eq!(
+            &rows[start - 3..start],
+            [Row::Sensitivity, Row::InvertX, Row::InvertY]
+        );
+        let keys: Vec<Action> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Key(a) => Some(*a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys, Action::SORTED);
+        let headings: Vec<Category> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::KeyHeading(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headings, Category::ALL);
+        // Each heading is over its own.
+        let mut under = None;
+        for r in &rows[start + 1..] {
+            match *r {
+                Row::KeyHeading(c) => under = Some(c),
+                Row::Key(a) => assert_eq!(Some(a.category()), under, "{a:?}"),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn binding_rows_show_their_keys_conflicts_and_resets() {
+        let mut s = Settings::default();
+        let names = KeyNaming {
+            lang: None,
+            system: &|v| (v == 26).then(|| "W".to_owned()),
+        };
+        let spec = |s: &Settings, r| s.key_spec(r, &names).unwrap();
+        let control = |s: &Settings, r| spec(s, r).control;
+        assert_eq!(
+            control(&s, Row::Key(Action::Forward)),
+            ControlSpec::Key {
+                key: "W".into(),
+                conflict: false,
+                reset: false
+            }
+        );
+        assert_eq!(spec(&s, Row::Key(Action::Forward)).label, "Walk Forward");
+        assert_eq!(
+            spec(&s, Row::KeyHeading(Category::Misc)).label,
+            "Miscellaneous"
+        );
+        assert_eq!(
+            control(&s, Row::ResetKeys),
+            ControlSpec::Button {
+                label: "Reset Keys".into(),
+                enabled: false
+            }
+        );
+        s.keys.set(Action::Jump, Key::Keyboard(26));
+        let jump = spec(&s, Row::Key(Action::Jump));
+        assert_eq!(
+            jump.control,
+            ControlSpec::Key {
+                key: "W".into(),
+                conflict: true,
+                reset: true
+            }
+        );
+        assert_eq!(jump.detail, "Also used by Walk Forward");
+        assert_eq!(
+            spec(&s, Row::Key(Action::Forward)).detail,
+            "Also used by Jump"
+        );
+        let reset = spec(&s, Row::ResetKeys);
+        assert_eq!(reset.detail, "1 key differs from the default");
+        assert!(matches!(
+            reset.control,
+            ControlSpec::Button { enabled: true, .. }
+        ));
+        s.keys.set(Action::Use, Key::Mouse(4));
+        assert_eq!(
+            control(&s, Row::Key(Action::Use)),
+            ControlSpec::Key {
+                key: "Button 4".into(),
+                conflict: false,
+                reset: true
+            }
+        );
+        // The game's language names them, where it is loaded.
+        let mut lang = std::collections::HashMap::new();
+        lang.insert("key.use".to_owned(), "Use Item/Place Block".to_owned());
+        lang.insert("key.mouse".to_owned(), "Button %1$s".to_owned());
+        let with = KeyNaming {
+            lang: Some(&lang),
+            ..names
+        };
+        assert_eq!(
+            s.key_spec(Row::Key(Action::Use), &with).unwrap().label,
+            "Use Item/Place Block"
+        );
+        assert_eq!(s.key_spec(Row::Fov, &names), None);
+    }
+
+    #[test]
+    fn key_bindings_are_imported_once_when_the_file_has_none() {
+        let dir = std::env::temp_dir().join(format!("ruthenium-keys-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = SettingsFile::path_in(&dir);
+        let mut imported = KeyBinds::DEFAULT;
+        imported.set(Action::Forward, Key::Keyboard(82));
+        let mut f = SettingsFile::load(path.clone());
+        f.import_keys(|| Some((imported.clone(), PathBuf::from("options.txt"))));
+        assert_eq!(f.settings.keys, imported);
+        // Saved at once, though nothing else changed.
+        f.save();
+        let again = SettingsFile::load(path.clone());
+        assert_eq!(again.settings.keys, imported);
+        // The file has them now: no second import.
+        let mut f = again;
+        f.import_keys(|| panic!("imported twice"));
+        // Nothing to import still writes them, so it is asked once.
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut f2 = SettingsFile::load(path.clone());
+        f2.import_keys(|| None);
+        f2.save();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("[keys]"));
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(f);
     }
 
     #[test]

@@ -28,6 +28,84 @@ const MAX_DEPTH: usize = 16;
 /// Translation formats by key: a language file.
 pub trait Lang {
     fn get(&self, key: &str) -> Option<&str>;
+
+    /// The key the player has bound to the key binding `binding` (`key.sneak`), where
+    /// this knows the player's bindings; else text shows a binding's default key.
+    fn bound_key(&self, _binding: &str) -> Option<BoundKey<'_>> {
+        None
+    }
+}
+
+/// A key as a binding has it: its name (`key.keyboard.e`, `key.mouse.4`), its value
+/// (SDL scancode or button), and for a keyboard key what the keyboard's layout calls it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundKey<'a> {
+    pub name: &'a str,
+    pub value: i32,
+    pub mouse: bool,
+    pub system: Option<&'a str>,
+}
+
+/// The player's key bindings, for text that names them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoundKeys {
+    keys: Vec<Bound>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bound {
+    binding: String,
+    name: String,
+    value: i32,
+    mouse: bool,
+    system: Option<String>,
+}
+
+impl BoundKeys {
+    pub fn push(
+        &mut self,
+        binding: &str,
+        name: &str,
+        value: i32,
+        mouse: bool,
+        system: Option<String>,
+    ) {
+        self.keys.push(Bound {
+            binding: binding.to_owned(),
+            name: name.to_owned(),
+            value,
+            mouse,
+            system,
+        });
+    }
+
+    pub fn get(&self, binding: &str) -> Option<BoundKey<'_>> {
+        let b = self.keys.iter().find(|b| b.binding == binding)?;
+        Some(BoundKey {
+            name: &b.name,
+            value: b.value,
+            mouse: b.mouse,
+            system: b.system.as_deref(),
+        })
+    }
+}
+
+/// A language with the player's key bindings.
+#[derive(Clone, Copy)]
+#[allow(missing_debug_implementations)]
+pub struct WithKeys<'a> {
+    pub lang: &'a dyn Lang,
+    pub keys: &'a BoundKeys,
+}
+
+impl Lang for WithKeys<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.lang.get(key)
+    }
+
+    fn bound_key(&self, binding: &str) -> Option<BoundKey<'_>> {
+        self.keys.get(binding)
+    }
 }
 
 /// No language: translations show their fallback or key.
@@ -217,10 +295,100 @@ const KEYS: [(&str, &str); 39] = [
     ("key.hotbar.9", "key.keyboard.9"),
 ];
 
+/// The key a binding has by default, as far as this module knows them.
+pub fn default_key(binding: &str) -> Option<&'static str> {
+    KEYS.iter().find(|(b, _)| *b == binding).map(|(_, k)| *k)
+}
+
+/// What a key's name shows (`InputConstants.Key.getDisplayName`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyText {
+    /// What the keyboard's layout calls the key, in capitals.
+    Literal(String),
+    /// A language key: the key's own name (or the system's override of it).
+    Translate(String),
+    /// A mouse button the language has no name for: `key.mouse` with its number.
+    Button(i32),
+}
+
+impl KeyText {
+    /// As text, translated with `lang` (a key the language lacks shows itself).
+    pub fn resolve(&self, lang: &dyn Lang) -> String {
+        match self {
+            KeyText::Literal(s) => s.clone(),
+            KeyText::Translate(k) => lang.get(k).unwrap_or(k).to_owned(),
+            KeyText::Button(n) => StyledText::from_json_in(
+                &serde_json::json!({"translate": "key.mouse", "with": [n.to_string()]}),
+                lang,
+            )
+            .plain(),
+        }
+    }
+}
+
+/// How the key named `name` (`value` a scancode, or a button if `mouse`) shows: a
+/// mouse button by its name in `lang`, else as `key.mouse` with its number; an
+/// unbound key by its own name; a keyboard key by what the keyboard's layout calls it
+/// (`system`, SDL's `SDL_GetKeyName`) when that is one character, in capitals, else by
+/// its own name (`InputQuirks.keyboardTranslationKey`: the system's word for the
+/// Windows keys).
+pub fn key_text(
+    name: &str,
+    value: i32,
+    mouse: bool,
+    system: Option<&str>,
+    lang: &dyn Lang,
+) -> KeyText {
+    if mouse {
+        return if lang.get(name).is_some() {
+            KeyText::Translate(name.to_owned())
+        } else {
+            KeyText::Button(value)
+        };
+    }
+    if name == "key.keyboard.unknown" {
+        return KeyText::Translate(name.to_owned());
+    }
+    if let Some(s) = system.filter(|s| s.chars().count() == 1) {
+        return KeyText::Literal(s.to_uppercase());
+    }
+    KeyText::Translate(keyboard_name(name).to_owned())
+}
+
+/// `InputQuirks.keyboardTranslationKey`: the system's word for some keys.
+fn keyboard_name(name: &str) -> &str {
+    let overrides: &[(&str, &str)] = if cfg!(target_os = "macos") {
+        &[
+            ("key.keyboard.left.alt", "key.keyboard.left.option"),
+            ("key.keyboard.right.alt", "key.keyboard.right.option"),
+            ("key.keyboard.left.win", "key.keyboard.left.command"),
+            ("key.keyboard.right.win", "key.keyboard.right.command"),
+        ]
+    } else if cfg!(windows) {
+        &[
+            ("key.keyboard.left.win", "key.keyboard.left.windows"),
+            ("key.keyboard.right.win", "key.keyboard.right.windows"),
+        ]
+    } else {
+        &[
+            ("key.keyboard.left.win", "key.keyboard.left.meta"),
+            ("key.keyboard.right.win", "key.keyboard.right.meta"),
+        ]
+    };
+    overrides
+        .iter()
+        .find(|(from, _)| *from == name)
+        .map_or(name, |(_, to)| to)
+}
+
 /// What a component that names a key binding shows (`KeyMapping.createNameSupplier`): the
-/// name of the key it is bound to, by default, or the binding's own for one that is not
-/// known. Keys of one character have no entry in the language.
+/// name of the key it is bound to (the player's, where `lang` knows them, else the
+/// default), or the binding's own for one that is not known. Without the player's
+/// bindings, keys of one character have no entry in the language.
 pub fn key_name(binding: &str, lang: &dyn Lang) -> String {
+    if let Some(b) = lang.bound_key(binding) {
+        return key_text(b.name, b.value, b.mouse, b.system, lang).resolve(lang);
+    }
     let Some((_, key)) = KEYS.iter().find(|(b, _)| *b == binding) else {
         return lang.get(binding).unwrap_or(binding).to_owned();
     };

@@ -12,12 +12,19 @@
 //! over it scrolls it, a click (or Left/Right with it focused) turns to a section; its
 //! highlight glides there and the pages fade into each other.
 //!
+//! Key bindings have rows of their own: the key on a pill (in brackets, with a line
+//! saying what else is on it, when another binding shares it; "Press a key" while the
+//! next press is awaited), and a Reset pill while the key is not the default. A click on
+//! the row (or Enter) asks for a new key, the Reset pill (or Delete) takes the default
+//! back. Headings split such rows into cards, and a row may hold a button instead.
+//!
 //! The screen keeps layout, values, scrolling, focus and motion; the client keeps the
-//! settings themselves, applies each [`SettingsEvent::Changed`] and saves.
+//! settings themselves, applies each [`SettingsEvent::Changed`] and saves, and takes
+//! the keys pressed while a row awaits one.
 
 use super::{
-    Action, Button, ButtonStates, Ease, FAINT, Key, Rect, SOFT, ShapeList, Text, UiScale,
-    WHITE_TEXT, draw_button, draw_focus_ring, mix, px_rect,
+    Action, Button, ButtonLook, ButtonStates, Ease, FAINT, Key, Rect, SOFT, ShapeList, Text,
+    UiScale, WHITE_TEXT, draw_button, draw_focus_ring, mix, px_rect,
 };
 use crate::Clip;
 use crate::text::{Fonts, GlyphAtlas, TextList, Weight};
@@ -31,6 +38,17 @@ pub enum ControlSpec {
     Slider(Vec<String>),
     /// One of these, side by side.
     Choice(Vec<String>),
+    /// A key binding: its key's name, whether another binding shares the key, and
+    /// whether it can be reset (it is not on its default).
+    Key {
+        key: String,
+        conflict: bool,
+        reset: bool,
+    },
+    /// A heading over the rows after it (the label); not a setting.
+    Heading,
+    /// A button with this label, and whether it can be pressed.
+    Button { label: String, enabled: bool },
 }
 
 /// One setting as the screen starts with it.
@@ -56,6 +74,10 @@ pub struct SectionSpec {
 pub enum SettingsEvent {
     /// Setting `setting` (counted over every section, in order) now has `value`.
     Changed { setting: usize, value: usize },
+    /// A key binding's row asks for a new key, or a button was pressed.
+    Pressed { setting: usize },
+    /// A key binding's Reset.
+    Reset { setting: usize },
     /// Done, or Escape.
     Done,
 }
@@ -87,6 +109,20 @@ const GRAB: f32 = 14.0;
 const SEGMENT_H: f32 = 34.0;
 const SEGMENT_MIN: f32 = 64.0;
 const SEGMENT_PAD: f32 = 28.0;
+/// Key binding rows: their height, the key's pill, the Reset pill and the gap between,
+/// and a button row's pill.
+const KEY_ROW_H: f32 = 56.0;
+const KEY_W: f32 = 172.0;
+const KEY_H: f32 = 36.0;
+const RESET_W: f32 = 76.0;
+const RESET_H: f32 = 32.0;
+const KEY_GAP: f32 = 10.0;
+const ACTION_W: f32 = 150.0;
+/// A heading between cards.
+const HEADING_H: f32 = 46.0;
+/// What a row awaiting a key says.
+const CAPTURE: &str = "Press a key";
+const CAPTURE_DETAIL: &str = "A key or a mouse button; Esc leaves it unbound";
 
 /// Units per wheel notch, the scroll glide and how far the edges fade (as the lists).
 const WHEEL_STEP: f32 = 64.0;
@@ -129,12 +165,27 @@ const KNOB: [f32; 4] = [0.97, 0.98, 1.0, 1.0];
 const SEGMENTS: [f32; 4] = [0.6, 0.66, 0.85, 0.12];
 const SEGMENT_ON: [f32; 4] = [0.88, 0.92, 1.0, 0.24];
 const SEGMENT_HOVER: [f32; 4] = [0.88, 0.92, 1.0, 0.07];
+/// A key shared with another binding: its pill and text.
+const CONFLICT: [f32; 4] = [1.0, 0.78, 0.3, 0.22];
+const CONFLICT_TEXT: [f32; 4] = [1.0, 0.86, 0.55, 1.0];
+/// A row awaiting a key: its pill and ring.
+const CAPTURE_FILL: [f32; 4] = [0.45, 0.62, 1.0, 0.3];
 
 #[derive(Debug, Clone)]
 enum Control {
     Switch,
     Slider(Vec<Text>),
     Choice(Vec<Text>),
+    Key {
+        key: Text,
+        conflict: bool,
+        reset: bool,
+    },
+    Heading,
+    Button {
+        label: Text,
+        enabled: bool,
+    },
 }
 
 impl Control {
@@ -142,6 +193,60 @@ impl Control {
         match self {
             Control::Switch => 2,
             Control::Slider(t) | Control::Choice(t) => t.len().max(1),
+            Control::Key { .. } | Control::Heading | Control::Button { .. } => 1,
+        }
+    }
+
+    fn new(spec: &ControlSpec, fonts: &Fonts, s: &UiScale) -> Control {
+        let texts = |t: &[String]| {
+            t.iter()
+                .map(|l| Text::new(fonts, l, s, 14.5, Weight::MEDIUM, 0.0))
+                .collect()
+        };
+        match spec {
+            ControlSpec::Switch => Control::Switch,
+            ControlSpec::Slider(l) => Control::Slider(texts(l)),
+            ControlSpec::Choice(l) => Control::Choice(texts(l)),
+            ControlSpec::Key {
+                key,
+                conflict,
+                reset,
+            } => {
+                // A key shared with another binding is in brackets, as vanilla marks it.
+                let shown = if *conflict {
+                    format!("[ {key} ]")
+                } else {
+                    key.clone()
+                };
+                Control::Key {
+                    key: Text::new(fonts, &shown, s, 15.0, Weight::SEMIBOLD, 0.0),
+                    conflict: *conflict,
+                    reset: *reset,
+                }
+            }
+            ControlSpec::Heading => Control::Heading,
+            ControlSpec::Button { label, enabled } => Control::Button {
+                label: Text::new(fonts, label, s, 15.0, Weight::SEMIBOLD, 0.01),
+                enabled: *enabled,
+            },
+        }
+    }
+
+    /// The row's height.
+    fn height(&self) -> f32 {
+        match self {
+            Control::Key { .. } => KEY_ROW_H,
+            Control::Heading => HEADING_H,
+            _ => ROW_H,
+        }
+    }
+
+    /// Whether the row takes the pointer and the focus.
+    fn selectable(&self) -> bool {
+        match self {
+            Control::Heading => false,
+            Control::Button { enabled, .. } => *enabled,
+            _ => true,
         }
     }
 }
@@ -154,9 +259,11 @@ struct Row {
     value: usize,
     /// Where the knob or highlight shows, in steps (eased towards `value`).
     shown: Ease,
-    /// Its page, and its top in the page's content (UI units, before scrolling).
+    /// Its page, its top in the page's content (UI units, before scrolling) and its
+    /// height.
     page: usize,
     y: f32,
+    h: f32,
     /// The card's first and last row.
     first: bool,
     last: bool,
@@ -270,6 +377,13 @@ pub struct SettingsScreen {
     nothing: Text,
     /// The slider being dragged.
     dragging: Option<usize>,
+    /// The key binding row awaiting a key, and whether the press under way began on a
+    /// Reset pill.
+    capturing: Option<usize>,
+    reset_down: bool,
+    reset_label: Text,
+    capture_label: Text,
+    capture_detail: Text,
     pointer: Option<(f32, f32)>,
     still: bool,
 }
@@ -348,6 +462,11 @@ impl SettingsScreen {
             }),
             nothing: blank(),
             dragging: None,
+            capturing: None,
+            reset_down: false,
+            reset_label: blank(),
+            capture_label: blank(),
+            capture_detail: blank(),
             pointer: None,
             still: false,
             sections,
@@ -387,6 +506,9 @@ impl SettingsScreen {
         let size = if self.tabs.is_some() { 24.0 } else { 28.0 };
         self.title = Text::new(fonts, &self.name, s, size, Weight::SEMIBOLD, 0.01);
         self.nothing = Text::new(fonts, NOTHING, s, 16.0, Weight::MEDIUM, 0.0);
+        self.reset_label = Text::new(fonts, "Reset", s, 14.0, Weight::SEMIBOLD, 0.01);
+        self.capture_label = Text::new(fonts, CAPTURE, s, 15.0, Weight::SEMIBOLD, 0.0);
+        self.capture_detail = Text::new(fonts, CAPTURE_DETAIL, s, 13.5, Weight::REGULAR, 0.0);
         let mut top = TOP;
         if let Some(tabs) = &mut self.tabs {
             top = TABS_Y + TAB_H + TABS_SPACE;
@@ -442,31 +564,43 @@ impl SettingsScreen {
             let count = section.settings.len();
             for (j, spec) in section.settings.iter().enumerate() {
                 let i = self.rows.len();
-                let texts = |t: &[String]| {
-                    t.iter()
-                        .map(|l| Text::new(fonts, l, s, 14.5, Weight::MEDIUM, 0.0))
-                        .collect()
-                };
-                let control = match &spec.control {
-                    ControlSpec::Switch => Control::Switch,
-                    ControlSpec::Slider(l) => Control::Slider(texts(l)),
-                    ControlSpec::Choice(l) => Control::Choice(texts(l)),
-                };
+                let control = Control::new(&spec.control, fonts, s);
                 let (value, shown) = old
                     .get(i)
                     .map_or((spec.value, Ease::default()), |r| (r.value, r.shown));
+                // A heading ends the card before it and begins the next.
+                let heading = matches!(control, Control::Heading);
+                let label = if heading {
+                    Text::new(
+                        fonts,
+                        &spec.label.to_uppercase(),
+                        s,
+                        12.0,
+                        Weight::EXTRABOLD,
+                        0.08,
+                    )
+                } else {
+                    Text::new(fonts, &spec.label, s, 17.0, Weight::SEMIBOLD, 0.0)
+                };
+                let after_heading = j > 0 && matches!(self.rows[i - 1].control, Control::Heading);
+                let before_heading = section
+                    .settings
+                    .get(j + 1)
+                    .is_some_and(|n| n.control == ControlSpec::Heading);
+                let h = control.height();
                 self.rows.push(Row {
-                    label: Text::new(fonts, &spec.label, s, 17.0, Weight::SEMIBOLD, 0.0),
+                    label,
                     detail: Text::new(fonts, &spec.detail, s, 13.5, Weight::REGULAR, 0.0),
                     value: value.min(control.steps() - 1),
                     control,
                     shown,
                     page,
                     y,
-                    first: j == 0,
-                    last: j + 1 == count,
+                    h,
+                    first: !heading && (j == 0 || after_heading),
+                    last: !heading && (j + 1 == count || before_heading),
                 });
-                y += ROW_H;
+                y += h;
             }
             self.pages[page].content_h = y;
         }
@@ -476,11 +610,54 @@ impl SettingsScreen {
         }
     }
 
-    /// Only the rows of the page that shows take the pointer and the focus.
+    /// Only the rows of the page that shows take the pointer and the focus, and of those
+    /// not headings nor buttons that cannot be pressed.
     fn enable_rows(&mut self) {
         for i in 0..self.rows.len() {
-            self.states.set_enabled(i, self.rows[i].page == self.page);
+            let r = &self.rows[i];
+            self.states
+                .set_enabled(i, r.page == self.page && r.control.selectable());
         }
+    }
+
+    /// Shows setting `i` as `spec` says now (a key binding changed), keeping its place.
+    pub fn set_spec(&mut self, i: usize, spec: &SettingSpec, fonts: &Fonts) {
+        let s = self.scale;
+        let Some(r) = self.rows.get_mut(i) else {
+            return;
+        };
+        let control = Control::new(&spec.control, fonts, &s);
+        if control.height() != r.h {
+            return;
+        }
+        if matches!(control, Control::Heading) {
+            let caps = spec.label.to_uppercase();
+            r.label = Text::new(fonts, &caps, &s, 12.0, Weight::EXTRABOLD, 0.08);
+            return;
+        }
+        r.label = Text::new(fonts, &spec.label, &s, 17.0, Weight::SEMIBOLD, 0.0);
+        r.detail = Text::new(fonts, &spec.detail, &s, 13.5, Weight::REGULAR, 0.0);
+        r.value = spec.value.min(control.steps() - 1);
+        r.control = control;
+        self.enable_rows();
+    }
+
+    /// Shows key binding row `i` awaiting a key (or none).
+    pub fn set_capturing(&mut self, i: Option<usize>) {
+        self.capturing = i.filter(|&i| matches!(self.rows[i].control, Control::Key { .. }));
+        if let Some(i) = self.capturing {
+            self.reveal(i);
+        }
+    }
+
+    /// The key binding row awaiting a key.
+    pub fn capturing(&self) -> Option<usize> {
+        self.capturing
+    }
+
+    /// The setting with the focus.
+    pub fn focused(&self) -> Option<usize> {
+        self.states.focused().filter(|&i| i < self.rows.len())
     }
 
     /// The page that shows.
@@ -569,19 +746,24 @@ impl SettingsScreen {
             x: self.area.x,
             y: self.area.y + self.rows[i].y - self.pages[self.rows[i].page].scroll,
             w: self.area.w,
-            h: ROW_H,
+            h: self.rows[i].h,
         }
     }
 
-    /// Scrolls so that row `i` shows whole, its section's header too when it is first.
+    /// Scrolls so that row `i` shows whole, its section's header or the heading over it
+    /// too when it is first.
     fn reveal(&mut self, i: usize) {
         let Some(r) = self.rows.get(i) else { return };
-        let header = if r.first && self.tabs.is_none() {
+        let header = if !r.first {
+            0.0
+        } else if i > 0 && matches!(self.rows[i - 1].control, Control::Heading) {
+            self.rows[i - 1].h
+        } else if self.tabs.is_none() {
             HEADER_H
         } else {
             0.0
         };
-        let (page, top, bottom) = (r.page, r.y - header, r.y + ROW_H);
+        let (page, top, bottom) = (r.page, r.y - header, r.y + r.h);
         let target = &mut self.pages[page].scroll_target;
         if top < *target {
             *target = top;
@@ -599,8 +781,48 @@ impl SettingsScreen {
         if !self.area.contains(x, y) {
             return None;
         }
-        (0..self.rows.len())
-            .find(|&i| self.rows[i].page == self.page && self.row_rect(i).contains(x, y))
+        (0..self.rows.len()).find(|&i| {
+            let r = &self.rows[i];
+            r.page == self.page
+                && !matches!(r.control, Control::Heading)
+                && self.row_rect(i).contains(x, y)
+        })
+    }
+
+    /// A key binding row's Reset pill.
+    fn reset_rect(r: Rect) -> Rect {
+        Rect {
+            x: r.x + r.w - PAD - RESET_W,
+            y: r.y + 0.5 * (r.h - RESET_H),
+            w: RESET_W,
+            h: RESET_H,
+        }
+    }
+
+    /// A key binding row's key pill.
+    fn key_rect(r: Rect) -> Rect {
+        Rect {
+            x: r.x + r.w - PAD - RESET_W - KEY_GAP - KEY_W,
+            y: r.y + 0.5 * (r.h - KEY_H),
+            w: KEY_W,
+            h: KEY_H,
+        }
+    }
+
+    /// A button row's pill.
+    fn action_rect(r: Rect) -> Rect {
+        Rect {
+            x: r.x + r.w - PAD - ACTION_W,
+            y: r.y + 0.5 * (r.h - KEY_H),
+            w: ACTION_W,
+            h: KEY_H,
+        }
+    }
+
+    /// Whether row `i` has a Reset pill and `(x, y)` is on it.
+    fn on_reset(&self, i: usize, x: f32, y: f32) -> bool {
+        matches!(self.rows[i].control, Control::Key { reset: true, .. })
+            && Self::reset_rect(self.row_rect(i)).contains(x, y)
     }
 
     fn switch_rect(r: Rect) -> Rect {
@@ -646,6 +868,9 @@ impl SettingsScreen {
             Control::Switch => Self::switch_rect(r).x,
             Control::Slider(_) => Self::track_rect(r).x - 0.5 * SLIDER_KNOB,
             Control::Choice(l) => self.segments(r, l).first().map_or(r.x + r.w, |s| s.x),
+            Control::Key { .. } => Self::key_rect(r).x,
+            Control::Button { .. } => Self::action_rect(r).x,
+            Control::Heading => r.x + r.w,
         }
     }
 
@@ -709,6 +934,7 @@ impl SettingsScreen {
             tabs.states.mouse_down(over);
         }
         let i = hit.filter(|&i| i < self.rows.len())?;
+        self.reset_down = self.on_reset(i, x, y);
         if !matches!(self.rows[i].control, Control::Slider(_)) {
             return None;
         }
@@ -751,7 +977,17 @@ impl SettingsScreen {
                 let k = self.segments(r, l).iter().position(|s| s.contains(x, y))?;
                 self.change(i, k)
             }
-            Control::Slider(_) => None,
+            Control::Slider(_) | Control::Heading => None,
+            // A press that began on the Reset pill resets only if it ends there.
+            Control::Key { .. } => {
+                match (std::mem::take(&mut self.reset_down), self.on_reset(i, x, y)) {
+                    (true, true) => Some(SettingsEvent::Reset { setting: i }),
+                    (true, false) => None,
+                    (false, _) => Some(SettingsEvent::Pressed { setting: i }),
+                }
+            }
+            Control::Button { enabled, .. } => (*enabled && Self::action_rect(r).contains(x, y))
+                .then_some(SettingsEvent::Pressed { setting: i }),
         }
     }
 
@@ -769,8 +1005,18 @@ impl SettingsScreen {
         match row.control {
             Control::Switch => self.change(i, 1 - row.value.min(1)),
             Control::Choice(_) => self.change(i, (row.value + 1) % row.control.steps()),
-            Control::Slider(_) => None,
+            Control::Slider(_) | Control::Heading => None,
+            Control::Key { .. } | Control::Button { .. } => {
+                Some(SettingsEvent::Pressed { setting: i })
+            }
         }
+    }
+
+    /// Delete or Backspace: the focused key binding back to its default, if it is not.
+    pub fn reset_focused(&mut self) -> Option<SettingsEvent> {
+        let i = self.focused()?;
+        matches!(self.rows[i].control, Control::Key { reset: true, .. })
+            .then_some(SettingsEvent::Reset { setting: i })
     }
 
     /// Left (-1) or Right (+1) on the focused setting.
@@ -784,6 +1030,12 @@ impl SettingsScreen {
         self.states.set_focus(Some(i), true);
         self.reveal(i);
         let row = &self.rows[i];
+        if !matches!(
+            row.control,
+            Control::Switch | Control::Slider(_) | Control::Choice(_)
+        ) {
+            return None;
+        }
         let n = row.control.steps() as isize;
         let next = (row.value as isize + delta).clamp(0, n - 1) as usize;
         self.change(i, next)
@@ -812,6 +1064,7 @@ impl SettingsScreen {
             tabs.states.cancel();
         }
         self.dragging = None;
+        self.reset_down = false;
     }
 
     /// Advances scrolling and the controls' motion by `dt` seconds.
@@ -981,6 +1234,9 @@ impl SettingsScreen {
             if row.page != page {
                 continue;
             }
+            if matches!(row.control, Control::Heading) {
+                continue;
+            }
             let start = *first.get_or_insert(i);
             if row.last {
                 first = None;
@@ -988,7 +1244,7 @@ impl SettingsScreen {
                     x: self.area.x,
                     y: top + self.rows[start].y,
                     w: self.area.w,
-                    h: (i + 1 - start) as f32 * ROW_H,
+                    h: row.y + row.h - self.rows[start].y,
                 };
                 if visible(card.y, card.h) {
                     shapes.glass_rect(s, card, CARD_RADIUS, CARD_TINT, 0.55);
@@ -1027,6 +1283,13 @@ impl SettingsScreen {
     ) {
         let s = &self.scale;
         let row = &self.rows[i];
+        if matches!(row.control, Control::Heading) {
+            if let Some(atlas) = atlas {
+                row.label
+                    .draw_at(text, atlas, s, r.x + 6.0, r.y + r.h - 12.0, FAINT);
+            }
+            return;
+        }
         let look = self.states.look(i);
         let inner = r.outset(-4.0);
         if look.hover > 0.0 {
@@ -1087,6 +1350,24 @@ impl SettingsScreen {
                     v.left_in(text, atlas, s, line, SOFT);
                 }
             }
+            Control::Key {
+                key,
+                conflict,
+                reset,
+            } => self.draw_key(shapes, text, atlas, i, r, key, *conflict, *reset),
+            Control::Button { label, enabled } => {
+                draw_button(
+                    shapes,
+                    text,
+                    atlas,
+                    s,
+                    Self::action_rect(r),
+                    label,
+                    look,
+                    *enabled,
+                );
+            }
+            Control::Heading => {}
             Control::Choice(labels) => {
                 let segs = self.segments(r, labels);
                 if let (Some(a), Some(b)) = (segs.first(), segs.last()) {
@@ -1128,9 +1409,96 @@ impl SettingsScreen {
             ..clip
         });
         let x = r.x + PAD;
-        row.label.draw_at(text, atlas, s, x, r.y + 30.0, WHITE_TEXT);
-        row.detail.draw_at(text, atlas, s, x, r.y + 51.0, SOFT);
+        if matches!(row.control, Control::Key { .. }) {
+            // The detail line says what else is on the key, or how to give one.
+            let detail = if self.capturing == Some(i) {
+                Some(&self.capture_detail)
+            } else {
+                Some(&row.detail).filter(|d| d.line.width > 0.0)
+            };
+            match detail {
+                Some(d) => {
+                    row.label.draw_at(text, atlas, s, x, r.y + 25.0, WHITE_TEXT);
+                    let colour = match row.control {
+                        Control::Key { conflict: true, .. } if self.capturing != Some(i) => {
+                            CONFLICT_TEXT
+                        }
+                        _ => SOFT,
+                    };
+                    d.draw_at(text, atlas, s, x, r.y + 44.0, colour);
+                }
+                None => row
+                    .label
+                    .left_in(text, atlas, s, Rect { x, ..r }, WHITE_TEXT),
+            }
+        } else {
+            row.label.draw_at(text, atlas, s, x, r.y + 30.0, WHITE_TEXT);
+            row.detail.draw_at(text, atlas, s, x, r.y + 51.0, SOFT);
+        }
         text.set_clip(clip);
+    }
+
+    /// A key binding's pills: its key (awaiting one, shared, or as it is), and Reset
+    /// while it is not the default.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_key(
+        &self,
+        shapes: &mut ShapeList,
+        text: &mut TextList,
+        atlas: Option<&GlyphAtlas>,
+        i: usize,
+        r: Rect,
+        key: &Text,
+        conflict: bool,
+        reset: bool,
+    ) {
+        let s = &self.scale;
+        let look = self.states.look(i);
+        let pill = Self::key_rect(r);
+        let capturing = self.capturing == Some(i);
+        let over_reset = reset
+            && self
+                .pointer
+                .is_some_and(|(x, y)| Self::reset_rect(r).contains(x, y));
+        let lit = if over_reset { 0.0 } else { look.hover };
+        let tint = if capturing {
+            CAPTURE_FILL
+        } else if conflict {
+            CONFLICT
+        } else {
+            mix(TAB_TINT, TAB_HOVER, lit)
+        };
+        shapes.glass_pill(s, pill, tint, 0.6 + 0.3 * lit);
+        if capturing {
+            shapes.pill_ring(s, pill.outset(3.0), 2.0, ACCENT);
+        }
+        if let Some(atlas) = atlas {
+            let (label, colour) = if capturing {
+                (&self.capture_label, WHITE_TEXT)
+            } else if conflict {
+                (key, CONFLICT_TEXT)
+            } else {
+                (key, WHITE_TEXT)
+            };
+            label.centred(text, atlas, s, pill, colour);
+        }
+        if reset {
+            let look = ButtonLook {
+                hover: if over_reset { look.hover } else { 0.0 },
+                press: if self.reset_down { look.press } else { 0.0 },
+                ..look
+            };
+            draw_button(
+                shapes,
+                text,
+                atlas,
+                s,
+                Self::reset_rect(r),
+                &self.reset_label,
+                ButtonLook { focus: 0.0, ..look },
+                true,
+            );
+        }
     }
 }
 
@@ -1329,6 +1697,163 @@ mod tests {
         sc.set_value(3, 0);
         sc.update(0.016);
         assert_eq!(sc.rows[3].shown.value, 0.0);
+    }
+
+    /// Two headings over key binding rows, and a button.
+    fn keys_screen(w: u32, h: u32) -> SettingsScreen {
+        let fonts = Fonts::new(&WEIGHTS);
+        let key = |label: &str, key: &str, conflict, reset| SettingSpec {
+            label: label.into(),
+            detail: if conflict {
+                "Also used by Jump".into()
+            } else {
+                String::new()
+            },
+            control: ControlSpec::Key {
+                key: key.into(),
+                conflict,
+                reset,
+            },
+            value: 0,
+        };
+        let heading = |label: &str| SettingSpec {
+            label: label.into(),
+            detail: String::new(),
+            control: ControlSpec::Heading,
+            value: 0,
+        };
+        let settings = vec![
+            SettingSpec {
+                label: "Key Binds".into(),
+                detail: "Reset them all".into(),
+                control: ControlSpec::Button {
+                    label: "Reset Keys".into(),
+                    enabled: false,
+                },
+                value: 0,
+            },
+            heading("Movement"),
+            key("Jump", "Space", false, false),
+            key("Sneak", "W", true, true),
+            heading("Gameplay"),
+            key("Attack", "Left Button", false, false),
+        ];
+        let sections = vec![SectionSpec {
+            title: "Controls".into(),
+            settings,
+        }];
+        SettingsScreen::paged(UiScale::new(w, h), &fonts, "MC Options", sections)
+    }
+
+    #[test]
+    fn key_rows_ask_for_keys_and_reset_from_their_pill() {
+        let mut sc = keys_screen(1600, 900);
+        let click = |sc: &mut SettingsScreen, (x, y): (f32, f32)| {
+            sc.mouse_down(x, y);
+            sc.mouse_up(x, y)
+        };
+        // A click on the row asks for a key.
+        let jump = sc.row_rect(2);
+        assert_eq!(
+            click(&mut sc, centre(jump)),
+            Some(SettingsEvent::Pressed { setting: 2 })
+        );
+        assert_eq!(
+            click(&mut sc, centre(SettingsScreen::key_rect(jump))),
+            Some(SettingsEvent::Pressed { setting: 2 })
+        );
+        // Its Reset only where there is one: elsewhere the same place asks for a key.
+        let sneak = sc.row_rect(3);
+        let reset = centre(SettingsScreen::reset_rect(sneak));
+        assert_eq!(
+            click(&mut sc, reset),
+            Some(SettingsEvent::Reset { setting: 3 })
+        );
+        let no_reset = centre(SettingsScreen::reset_rect(jump));
+        assert_eq!(
+            click(&mut sc, no_reset),
+            Some(SettingsEvent::Pressed { setting: 2 })
+        );
+        // Down on Reset, up off it: nothing.
+        sc.mouse_down(reset.0, reset.1);
+        assert_eq!(sc.mouse_up(sneak.x + 30.0, reset.1), None);
+        // Headings are not hit, nor focused.
+        assert_eq!(sc.hit(sc.area.x + 20.0, sc.row_rect(1).y + 20.0), None);
+        let mut order = Vec::new();
+        sc.states.set_focus(None, false);
+        for _ in 0..4 {
+            sc.key(Key::Next, true);
+            order.push(sc.states.focused().unwrap());
+        }
+        // (Reset Keys can't be pressed: nothing differs.)
+        assert_eq!(order, [2, 3, 5, sc.len()]);
+        // Enter asks; Left and Right do nothing; Delete resets where it can.
+        sc.focus(Some(3));
+        sc.key(Key::Activate, true);
+        assert_eq!(
+            sc.key(Key::Activate, false),
+            Some(SettingsEvent::Pressed { setting: 3 })
+        );
+        assert_eq!(sc.adjust(1), None);
+        assert_eq!(
+            sc.reset_focused(),
+            Some(SettingsEvent::Reset { setting: 3 })
+        );
+        sc.focus(Some(2));
+        assert_eq!(sc.reset_focused(), None);
+    }
+
+    #[test]
+    fn rows_show_what_they_await_and_change_in_place() {
+        let fonts = Fonts::new(&WEIGHTS);
+        let mut sc = keys_screen(1600, 900);
+        sc.set_capturing(Some(5));
+        assert_eq!(sc.capturing(), Some(5));
+        sc.set_capturing(Some(1));
+        assert_eq!(sc.capturing(), None, "a heading awaits nothing");
+        // A button that can be pressed again, and a key changed: in place.
+        let y = sc.rows[5].y;
+        sc.set_spec(
+            0,
+            &SettingSpec {
+                label: "Key Binds".into(),
+                detail: "1 key differs".into(),
+                control: ControlSpec::Button {
+                    label: "Reset Keys".into(),
+                    enabled: true,
+                },
+                value: 0,
+            },
+            &fonts,
+        );
+        assert!(sc.states.enabled(0));
+        let (bx, by) = centre(SettingsScreen::action_rect(sc.row_rect(0)));
+        sc.mouse_down(bx, by);
+        assert_eq!(
+            sc.mouse_up(bx, by),
+            Some(SettingsEvent::Pressed { setting: 0 })
+        );
+        // (Off the pill, a button row does nothing.)
+        let r = sc.row_rect(0);
+        sc.mouse_down(r.x + 30.0, by);
+        assert_eq!(sc.mouse_up(r.x + 30.0, by), None);
+        assert_eq!(sc.rows[5].y, y);
+        // Cards end at headings: three cards, the headings outside them.
+        let (mut shapes, mut text) = (ShapeList::new(), TextList::new());
+        sc.set_capturing(Some(3));
+        sc.draw(&mut shapes, &mut text, None);
+        let cards: Vec<_> = shapes
+            .shapes()
+            .iter()
+            .filter(|s| s.glass && s.clip.opacity > 0.0)
+            .collect();
+        // Cards, the key and Reset pills, the button, the carousel: more than the rows.
+        assert!(cards.len() > 6, "{}", cards.len());
+        assert_eq!(sc.rows.iter().filter(|r| r.first).count(), 3);
+        assert_eq!(sc.rows.iter().filter(|r| r.last).count(), 3);
+        assert!(!sc.rows[1].first && !sc.rows[1].last);
+        // Key rows are lower than others.
+        assert!(sc.rows[2].h < sc.rows[0].h);
     }
 
     /// Nine pages: the first has two settings, the second one, the others none.

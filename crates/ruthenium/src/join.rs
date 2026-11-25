@@ -620,6 +620,14 @@ impl Joiner {
         }
     }
 
+    /// The game data, if it has loaded (without waiting for it).
+    pub fn data_if_ready(&mut self) -> Option<Arc<GameData>> {
+        if matches!(&self.data, Data::Loading(h) if !h.is_finished()) {
+            return None;
+        }
+        Some(self.data())
+    }
+
     /// Starts building the world's drawing assets on a thread, the first time it is
     /// called (when a world is first entered).
     pub fn start_world_assets(&mut self, max_texture: u32) {

@@ -176,6 +176,11 @@ pub struct HudMemory {
 }
 
 impl HudMemory {
+    /// Lets go of every line laid out (what they say changed: the key bindings).
+    pub fn forget_lines(&mut self) {
+        self.lines.clear();
+    }
+
     /// A frame begins: what has not been asked for in a while is let go of.
     pub(super) fn begin(&mut self) {
         self.frame += 1;

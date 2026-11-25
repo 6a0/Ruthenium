@@ -1,10 +1,13 @@
-//! In the world: the mouse grabbed and turning the camera, the movement, hotbar and
-//! swap-hands keys, the use button and the scroll wheel handed to the game thread; where
+//! In the world: the mouse grabbed and turning the camera, the keys and buttons pressing
+//! the bindings they are bound to (movement, hotbar, swap hands, attack, use, player
+//! list) and the scroll wheel, handed to the game thread; where
 //! the world is seen from; and a readout of where the player is and what the terrain is
 //! doing (always while the world can't be drawn, else with the frame statistics).
 //!
 //! Vanilla's rules: keys count only while no screen is open (`KeyMapping.releaseAll`
-//! when one opens); the mouse's motion is summed over a frame and turns the camera once
+//! when one opens, `setAll` reading the keyboard's held keys again when the last one
+//! closes, except on macOS); a key or button presses every binding on it, and each press
+//! (a held key's repeats too) clicks them; the mouse's motion is summed over a frame and turns the camera once
 //! per frame, after the frame's events (`handleAccumulatedMovement`), the first motion
 //! after a grab dropped; the game pauses (opens the Game Menu) once the window has been
 //! out of focus for half a second (`pauseIfInactive`, `pauseOnLostFocus` on).
@@ -16,7 +19,8 @@ use std::sync::Arc;
 use ruthenium_data::v26_3::registries::MobEffect;
 use ruthenium_protocol::packets::ClientInformation;
 use ruthenium_render::{CameraPose, WorldStats};
-use ruthenium_sim::input::{self, HeldKeys, KeyBinds, MouseMotion, MouseOptions, ScrollWheel};
+use ruthenium_sim::input::{self, HeldKeys, Key, KeyBinds, MouseMotion, MouseOptions, ScrollWheel};
+use ruthenium_sim::keybinds::Action;
 use ruthenium_sim::player::Pose;
 use ruthenium_sim::scene::{Frame, Scene};
 use ruthenium_sim::session::{PlayerView, Session};
@@ -68,10 +72,30 @@ impl InGame {
         self.player_list = on;
     }
 
-    /// The screen closed and the mouse is grabbed again (`grabMouse`).
-    pub fn enter(&mut self, session: Option<&Session>) {
+    /// The player's bindings from now on.
+    pub fn set_binds(&mut self, binds: &KeyBinds) {
+        self.binds = binds.clone();
+    }
+
+    /// The bindings in use.
+    #[cfg(test)]
+    pub fn binds(&self) -> &KeyBinds {
+        &self.binds
+    }
+
+    /// The screen closed and the mouse is grabbed again (`grabMouse`): the bindings on
+    /// keyboard keys held now (`physical`) are held from now on (`KeyMapping.setAll`,
+    /// not on macOS; buttons are not read again).
+    pub fn enter(&mut self, session: Option<&Session>, physical: impl Iterator<Item = Key>) {
         self.motion = MouseMotion::new();
         self.release(session);
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        for k in physical.filter(|k| matches!(k, Key::Keyboard(_)) && !k.is_unbound()) {
+            self.held.set(k, true);
+        }
+        self.send_held(session);
     }
 
     /// A screen opened (`KeyMapping.releaseAll`).
@@ -85,17 +109,9 @@ impl InGame {
         }
     }
 
-    /// A mouse button went down or up in the world (SDL's numbering: 1 left, 3 right):
-    /// the left one attacks, the right one uses.
+    /// A mouse button went down or up in the world (SDL's numbering).
     pub fn mouse_button(&mut self, button: u8, down: bool, session: Option<&Session>) {
-        let Some(s) = session.filter(|_| !self.scripted) else {
-            return;
-        };
-        match button {
-            1 => s.set_attack(down),
-            3 => s.set_use(down),
-            _ => {}
-        }
+        self.press(Key::button(button), down, session);
     }
 
     pub fn focused(&self) -> bool {
@@ -120,25 +136,50 @@ impl InGame {
 
     /// A key went down or up while in the world (not Escape).
     pub fn key(&mut self, scancode: u32, down: bool, session: Option<&Session>) {
-        self.held.set(scancode, down);
-        let session = session.filter(|_| !self.scripted);
-        // `KeyMapping.click`: every press, repeats too, as vanilla counts them.
-        if down
-            && let Some(slot) = self.binds.hotbar_slot(scancode)
-            && let Some(s) = session
-        {
-            s.hotbar_key(slot);
+        self.press(Key::scancode(scancode), down, session);
+    }
+
+    /// A key or button went down (a held key's repeats too) or up: the bindings on it
+    /// are held or let go, and a press clicks each (`KeyMapping.set`, `click`).
+    fn press(&mut self, key: Key, down: bool, session: Option<&Session>) {
+        // (SDL's "unknown key" would press every unbound binding.)
+        if key.is_unbound() {
+            return;
         }
-        if down
-            && scancode == self.binds.swap_offhand
-            && let Some(s) = session
-        {
-            s.swap_hands_key();
+        self.held.set(key, down);
+        let Some(s) = session.filter(|_| !self.scripted) else {
+            return;
+        };
+        if down {
+            for click in clicks(&self.binds, key) {
+                match click {
+                    // A click while the binding is already held, as a repeat gives.
+                    Click::Attack => {
+                        s.set_attack(false);
+                        s.set_attack(true);
+                    }
+                    Click::Use => {
+                        s.set_use(false);
+                        s.set_use(true);
+                    }
+                    Click::SwapHands => s.swap_hands_key(),
+                    Click::Hotbar(slot) => s.hotbar_key(slot),
+                }
+            }
         }
-        if let Some(s) = session {
-            s.set_keys(self.held.keys(&self.binds));
-            s.set_player_list(self.held.is_down(self.binds.player_list));
-        }
+        self.send_held(Some(s));
+    }
+
+    /// Hands what is held to the game thread.
+    fn send_held(&self, session: Option<&Session>) {
+        let Some(s) = session.filter(|_| !self.scripted) else {
+            return;
+        };
+        let (held, binds) = (&self.held, &self.binds);
+        s.set_keys(held.keys(binds));
+        s.set_attack(held.action_down(binds, Action::Attack));
+        s.set_use(held.action_down(binds, Action::Use));
+        s.set_player_list(held.action_down(binds, Action::PlayerList));
     }
 
     /// Relative mouse motion (SDL's `xrel`, `yrel`).
@@ -171,6 +212,25 @@ impl InGame {
             s.turn(xo, yo);
         }
     }
+}
+
+/// A click of a binding the game thread acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Click {
+    Attack,
+    Use,
+    SwapHands,
+    Hotbar(u8),
+}
+
+/// What a press of `key` clicks: every binding on it that the game acts on so far.
+fn clicks(binds: &KeyBinds, key: Key) -> impl Iterator<Item = Click> + '_ {
+    binds.on(key).filter_map(|a| match a {
+        Action::Attack => Some(Click::Attack),
+        Action::Use => Some(Click::Use),
+        Action::SwapOffhand => Some(Click::SwapHands),
+        a => a.hotbar_slot().map(Click::Hotbar),
+    })
 }
 
 /// What a frame draws of the world: what the game thread published, and where it is
@@ -539,8 +599,8 @@ mod tests {
     #[test]
     fn hotbar_and_movement_keys_reach_the_input() {
         let mut g = InGame::default();
-        g.enter(None);
-        g.key(KeyBinds::DEFAULT.forward, true, None);
+        g.enter(None, std::iter::empty());
+        g.key(26, true, None);
         assert!(g.held.keys(&g.binds).forward);
         g.set_focus(false, None);
         assert!(
@@ -552,5 +612,64 @@ mod tests {
         assert!(g.should_pause());
         g.set_focus(true, None);
         assert!(!g.should_pause());
+    }
+
+    #[test]
+    fn keys_and_buttons_press_what_is_bound_to_them() {
+        let mut b = KeyBinds::DEFAULT;
+        let of = |b: &KeyBinds, k| clicks(b, k).collect::<Vec<_>>();
+        // The defaults: the buttons attack and use, the number keys pick slots, F swaps.
+        assert_eq!(of(&b, Key::Mouse(1)), [Click::Attack]);
+        assert_eq!(of(&b, Key::Mouse(3)), [Click::Use]);
+        assert_eq!(of(&b, Key::Keyboard(32)), [Click::Hotbar(2)]);
+        assert_eq!(of(&b, Key::Keyboard(9)), [Click::SwapHands]);
+        assert_eq!(of(&b, Key::Keyboard(26)), []);
+        // Rebound: attack on a key, use on a side button, the hotbar on letters, and
+        // two bindings on one key both click.
+        b.set(Action::Attack, Key::Keyboard(13));
+        b.set(Action::Use, Key::Mouse(5));
+        b.set(Action::Hotbar1, Key::Keyboard(20));
+        b.set(Action::SwapOffhand, Key::Keyboard(20));
+        assert_eq!(of(&b, Key::Keyboard(13)), [Click::Attack]);
+        assert_eq!(of(&b, Key::Mouse(1)), []);
+        assert_eq!(of(&b, Key::Mouse(5)), [Click::Use]);
+        assert_eq!(of(&b, Key::Keyboard(30)), []);
+        assert_eq!(
+            of(&b, Key::Keyboard(20)),
+            [Click::SwapHands, Click::Hotbar(0)]
+        );
+        // Held, a button walks and a key attacks.
+        let mut g = InGame::default();
+        b.set(Action::Forward, Key::Mouse(4));
+        g.set_binds(&b);
+        g.mouse_button(4, true, None);
+        g.key(13, true, None);
+        assert!(g.held.keys(&g.binds).forward);
+        assert!(g.held.action_down(&g.binds, Action::Attack));
+        g.mouse_button(4, false, None);
+        assert!(!g.held.keys(&g.binds).forward);
+        // SDL's unknown key holds nothing, unbound bindings included.
+        b.set(Action::Jump, Key::UNBOUND);
+        g.set_binds(&b);
+        g.key(0, true, None);
+        assert!(!g.held.keys(&g.binds).jump);
+    }
+
+    #[test]
+    fn the_world_coming_back_holds_the_keys_held_meanwhile() {
+        let mut g = InGame::default();
+        g.key(26, true, None);
+        g.mouse_button(3, true, None);
+        g.release(None);
+        assert!(!g.held.keys(&g.binds).forward);
+        // `KeyMapping.setAll`: keyboard keys only, not the buttons.
+        g.enter(
+            None,
+            [Key::Keyboard(26), Key::Mouse(3), Key::UNBOUND].into_iter(),
+        );
+        let held = g.held.keys(&g.binds);
+        assert_eq!(held.forward, !cfg!(target_os = "macos"));
+        assert!(!g.held.action_down(&g.binds, Action::Use));
+        assert!(!g.held.is_down(Key::UNBOUND));
     }
 }

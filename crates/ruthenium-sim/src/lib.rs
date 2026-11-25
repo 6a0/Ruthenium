@@ -19,7 +19,8 @@
 //! - [`mining`]: how fast blocks break, and which the player may break.
 //! - [`predict`]: block changes the client predicts until the server confirms them.
 //! - [`pick`]: what the crosshair is on, and the raycasts items make.
-//! - [`input`]: the mouse's turn, the scroll wheel and the movement keys.
+//! - [`input`]: the mouse's turn, the scroll wheel and the movement keys;
+//!   [`keybinds`]: the key bindings.
 //! - [`blocks`], [`shape`], [`world`], [`fluid`]: the level the player moves in;
 //!   [`inside`]: the blocks a movement passes through; [`border`]: the world border.
 //! - [`pick`]: what the crosshair points at (block and entity raycasts).
@@ -51,6 +52,7 @@ pub mod interact;
 pub mod inventory;
 pub mod item;
 pub mod item_name;
+pub mod keybinds;
 pub mod level_load;
 pub mod light;
 pub mod mining;

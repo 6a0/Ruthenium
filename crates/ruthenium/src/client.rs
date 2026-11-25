@@ -25,11 +25,10 @@ use crate::menu::Menu;
 use crate::route::{Expected, Route, RoutePlayer, Terrain};
 use crate::settings::{Settings, SettingsFile};
 use crate::telemetry::{FrameSample, Marks, RunInfo, Startup, Telemetry};
+use ruthenium_sim::keybinds::{Action as Binding, Key};
 
-/// SDL scancode of F3: shows or hides the frame-stats overlay.
-const SCANCODE_F3: u32 = 60;
-/// SDL scancode of F11: fullscreen on or off, as in vanilla.
-const SCANCODE_F11: u32 = 68;
+/// SDL scancode of Escape: it always opens the menu, whatever is bound to it.
+const SCANCODE_ESCAPE: u32 = 41;
 /// How long a fullscreen request waits for the window manager to confirm it; events
 /// meanwhile are the window catching up with earlier requests.
 const FULLSCREEN_PENDING: Duration = Duration::from_secs(2);
@@ -103,6 +102,11 @@ pub struct Options {
     pub screen: Option<String>,
     /// Development: select this server (or account) in the list, or focus this setting.
     pub select: Option<usize>,
+    /// Development: with `--screen settings` and `--select`, that key binding's row
+    /// awaits a key.
+    pub capture: bool,
+    /// Development: keys and buttons pressed once in the world (`crate::input_script`).
+    pub input: Option<crate::input_script::InputScript>,
     /// The window's starting size in points.
     pub window_size: (u32, u32),
     /// Development: join this server (an address as typed) from the server list at once.
@@ -238,6 +242,8 @@ impl Options {
             servers_file: None,
             screen: None,
             select: None,
+            capture: false,
+            input: None,
             window_size: DEFAULT_SIZE,
             join: None,
             frames_ahead: None,
@@ -566,6 +572,10 @@ impl Options {
                     ))?);
                 }
                 "--screen" => o.screen = Some(value("a screen name")?),
+                "--capture" => o.capture = true,
+                "--input" => {
+                    o.input = Some(crate::input_script::InputScript::parse(&value("steps")?)?)
+                }
                 "--select" => {
                     let v = value("a server number")?;
                     o.select = Some(
@@ -594,6 +604,17 @@ impl Options {
         }
         Ok(o)
     }
+}
+
+/// The binding a key or button presses whatever shows (`handleGlobalKeyPress`):
+/// fullscreen; and the debug screen (the frame stats), but not while a key is being bound.
+fn global(menu: &Menu, key: Key) -> Option<Binding> {
+    let binds = menu.binds();
+    if binds.matches(Binding::Fullscreen, key) {
+        return Some(Binding::Fullscreen);
+    }
+    (!menu.capturing() && binds.matches(Binding::DebugOverlay, key))
+        .then_some(Binding::DebugOverlay)
 }
 
 fn parse_size(v: &str) -> Option<(u32, u32)> {
@@ -683,6 +704,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         {
             let mut f = SettingsFile::load(SettingsFile::path_in(d));
             f.import_mouse(crate::controls::vanilla_mouse);
+            f.import_keys(crate::controls::vanilla_keys);
             f
         }
         _ => SettingsFile::transient(),
@@ -733,6 +755,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     ));
     let mut applied: Settings = menu.settings().clone();
     let mut platform = Platform::init(env!("CARGO_PKG_VERSION"))?;
+    menu.set_key_names(Box::new(ruthenium_platform::key_name));
     let window = platform.create_window("Ruthenium", opts.window_size.0, opts.window_size.1)?;
     // A fullscreen request waiting for the window manager: what was asked, and when.
     let mut fullscreen_pending: Option<(bool, Instant)> = None;
@@ -965,6 +988,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     // shift, shortcut), handed to the menu after the events are drained, and typed text.
     let mut clicks: Vec<(bool, f32, f32, bool)> = Vec::with_capacity(4);
     let mut keys: Vec<(u32, bool, bool, bool, bool)> = Vec::with_capacity(4);
+    let mut input = opts.input.clone();
     let mut typed = String::new();
     let mut shift_held = false;
     let mut text_input = false;
@@ -1016,20 +1040,41 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 occluded = false;
                 menu.focus(true);
             }
-            Event::FocusLost => menu.focus(false),
+            // (Scripted input plays on whatever has the focus.)
+            Event::FocusLost if input.is_none() => menu.focus(false),
+            Event::FocusLost => {}
             Event::Fullscreen(on) => fullscreen_event = Some(on),
+            // The fullscreen key works everywhere (`handleGlobalKeyPress`), the debug
+            // screen's (the frame stats) except while a key is being bound.
             Event::Key {
-                scancode: SCANCODE_F11,
+                scancode,
                 down: true,
                 repeat: false,
                 ..
-            } => toggle_fullscreen = true,
+            } if global(&menu, Key::scancode(scancode)) == Some(Binding::Fullscreen)
+                && scancode != SCANCODE_ESCAPE =>
+            {
+                toggle_fullscreen = true
+            }
             Event::Key {
-                scancode: SCANCODE_F3,
+                scancode,
                 down: true,
                 repeat: false,
                 ..
-            } => toggle_overlay = true,
+            } if global(&menu, Key::scancode(scancode)) == Some(Binding::DebugOverlay)
+                && scancode != SCANCODE_ESCAPE =>
+            {
+                toggle_overlay = true
+            }
+            // In the world, buttons bound to them too.
+            Event::MouseButton {
+                button, down: true, ..
+            } if menu.in_world() && global(&menu, Key::button(button)).is_some() => {
+                match global(&menu, Key::button(button)) {
+                    Some(Binding::Fullscreen) => toggle_fullscreen = true,
+                    _ => toggle_overlay = true,
+                }
+            }
             Event::Key {
                 scancode,
                 down,
@@ -1054,6 +1099,26 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             } => clicks.push((down, x, y, shift_held)),
             Event::MouseButton { button, down, .. } => menu.other_mouse_button(button, down),
         });
+        if let Some(script) = &mut input {
+            let started = script.started();
+            let steps = script.due(Instant::now(), menu.in_world());
+            if !started && script.started() {
+                eprintln!("[ruthenium] --input: in the world");
+            }
+            for step in steps {
+                use crate::input_script::Step;
+                eprintln!("[ruthenium] --input: {step:?}");
+                match step {
+                    Step::Key(code, down) => keys.push((code, down, false, false, false)),
+                    Step::Button(1, down) => clicks.push((down, 0.0, 0.0, false)),
+                    Step::Button(b, down) => menu.other_mouse_button(b, down),
+                    Step::Shot => {
+                        renderer.request_screenshot();
+                        screenshot_requested = true;
+                    }
+                }
+            }
+        }
         let mut actions: Vec<Action> = clicks
             .drain(..)
             .filter_map(|(down, x, y, shift)| {
@@ -1230,6 +1295,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         if let Some(name) = start_screen.take() {
             if name == "settings" {
                 menu.open_settings_named(window.pixel_size(), opts.select);
+                if opts.capture {
+                    menu.capture_focused();
+                }
             } else if matches!(
                 name.as_str(),
                 "accounts" | "sign-in" | "code" | "sign-in-failed" | "sign-out"
@@ -1263,6 +1331,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         // has turned to: taken before the menus borrow themselves for the frame.
         let world = menu.world_view();
         let hud = menu.hud_params();
+        renderer.set_key_bindings(menu.bound_keys());
         let gui = if opts.empty_window {
             None
         } else {
@@ -1275,6 +1344,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             });
             if opts.screenshot.is_some()
                 && opts.route.is_none()
+                && input.is_none()
                 && !screenshot_requested
                 && !resize_asked
                 && text_ready

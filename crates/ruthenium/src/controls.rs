@@ -1,13 +1,15 @@
-//! The mouse settings vanilla players already have: imported once from the newest
-//! `options.txt` among the launchers' game folders, so the sensitivity is the exact
-//! double vanilla uses (its slider stores any value from 0 to 1, so a value typed
-//! again by hand would almost never be the same).
+//! The mouse settings and key bindings vanilla players already have: imported once from
+//! the newest `options.txt` among the launchers' game folders, so the sensitivity is the
+//! exact double vanilla uses (its slider stores any value from 0 to 1, so a value typed
+//! again by hand would almost never be the same), and the keys are read as vanilla reads
+//! them, from files of old versions too.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use ruthenium_prepare::discover::{self, Env};
 use ruthenium_sim::input::MouseOptions;
+use ruthenium_sim::keybinds::{self, KeyBinds};
 
 /// Vanilla's mouse options from `options.txt` (`mouseSensitivity`, `invertXMouse`,
 /// `invertYMouse`); keys missing or unreadable keep vanilla's defaults, as vanilla
@@ -77,13 +79,27 @@ fn modified(p: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-/// The mouse options of the most recently saved `options.txt`, and where it is.
-pub fn vanilla_mouse() -> Option<(MouseOptions, PathBuf)> {
+/// The most recently saved `options.txt`, and where it is.
+fn newest_options() -> Option<(String, PathBuf)> {
     let newest = options_files(&Env::from_process())
         .into_iter()
         .max_by_key(|p| modified(p))?;
     let text = std::fs::read_to_string(&newest).ok()?;
-    Some((parse_options(&text), newest))
+    Some((text, newest))
+}
+
+/// The mouse options of the most recently saved `options.txt`, and where it is.
+pub fn vanilla_mouse() -> Option<(MouseOptions, PathBuf)> {
+    let (text, path) = newest_options()?;
+    Some((parse_options(&text), path))
+}
+
+/// The key bindings of the most recently saved `options.txt`, if it has any, and where
+/// it is.
+pub fn vanilla_keys() -> Option<(KeyBinds, PathBuf)> {
+    let (text, path) = newest_options()?;
+    let (keys, any) = keybinds::read_options(&text);
+    any.then_some((keys, path))
 }
 
 #[cfg(test)]

@@ -5,10 +5,12 @@
 //! Everything here must be used from the main thread: SDL's video subsystem requires it.
 
 mod event;
+mod keyboard;
 mod sleep;
 mod window;
 
 pub use event::Event;
+pub use keyboard::key_name;
 pub use sleep::{Sleeper, next_deadline};
 pub use window::{DEFAULT_SIZE, Platform, Window};
 

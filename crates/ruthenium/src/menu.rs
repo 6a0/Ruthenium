@@ -48,6 +48,8 @@ use crate::route::RoutePlayer;
 use crate::servers::{Servers, valid_address};
 use crate::settings::{GAME, Group, RUTHENIUM, Row, Settings, SettingsFile, all_groups, rows_of};
 
+mod keys;
+
 /// The characters a form's message line holds.
 const MESSAGE_WIDTH: usize = 52;
 /// Side of the logo texture's top level.
@@ -412,6 +414,8 @@ pub struct Menu {
     hud: bool,
     /// The route played once the session is in the world (`--route`).
     route: Option<RoutePlayer>,
+    /// The key bindings' rows and what the keyboard holds.
+    keys: keys::KeysState,
 }
 
 impl std::fmt::Debug for Menu {
@@ -486,6 +490,9 @@ impl Menu {
             .name("menu-assets".into())
             .spawn(prepare)
             .expect("spawning a thread");
+        let keys = keys::KeysState::new(&settings.settings.keys);
+        let mut game = InGame::default();
+        game.set_binds(&settings.settings.keys);
         Menu {
             fonts: Fonts::new(&WEIGHTS),
             atlas: Atlas::Building(handle),
@@ -519,12 +526,13 @@ impl Menu {
             server_name: String::new(),
             leaving: false,
             death: None,
-            game: InGame::default(),
+            game,
             forget_world: false,
             mesh_workers: default_mesh_workers(),
             crosshair: true,
             hud: true,
             route: None,
+            keys,
         }
     }
 
@@ -708,7 +716,8 @@ impl Menu {
 
     /// Into the world, no screen open (`setScreen(null)`, which grabs the mouse).
     fn enter_game(&mut self) {
-        self.game.enter(self.session.as_ref());
+        self.game
+            .enter(self.session.as_ref(), self.keys.physical().into_iter());
         if matches!(self.screen, Screen::Settings) {
             self.settings_screen = None;
             self.save_settings();
@@ -813,6 +822,7 @@ impl Menu {
     pub fn focus(&mut self, on: bool) {
         if !on {
             self.cancel();
+            self.keys_focus_lost();
         }
         self.game.set_focus(on, self.session.as_ref());
     }
@@ -1049,6 +1059,7 @@ impl Menu {
                     self.settings_changed = Some(Instant::now());
                 }
             }
+            SettingsEvent::Pressed { .. } | SettingsEvent::Reset { .. } => self.key_row_event(e),
             SettingsEvent::Done => {
                 self.settings_screen = None;
                 self.screen = if self.settings_of == SettingsOf::Title {
@@ -1064,7 +1075,9 @@ impl Menu {
 
     /// Opens the Settings screen.
     fn open_settings(&mut self, scale: UiScale, of: SettingsOf) {
-        let sections = self.settings.settings.sections(&of.groups());
+        let groups = of.groups();
+        let sections =
+            self.with_key_naming(|m, names| m.settings.settings.sections_named(&groups, names));
         let fonts = &self.fonts;
         if of != SettingsOf::Title {
             self.transition.change_screen();
@@ -1648,6 +1661,9 @@ impl Menu {
         clipboard: &dyn Clipboard,
     ) -> Option<Action> {
         self.scale?;
+        if self.key_event(scancode, down, repeat) {
+            return None;
+        }
         let nav = match scancode {
             SCANCODE_TAB if shift => Some(Key::Previous),
             SCANCODE_TAB => Some(Key::Next),
@@ -1697,6 +1713,7 @@ impl Menu {
                     SCANCODE_LEFT | SCANCODE_RIGHT if down => {
                         screen.adjust(if scancode == SCANCODE_LEFT { -1 } else { 1 })
                     }
+                    SCANCODE_DELETE | SCANCODE_BACKSPACE if down => screen.reset_focused(),
                     SCANCODE_RETURN | SCANCODE_KP_ENTER | SCANCODE_SPACE if !repeat => {
                         screen.key(Key::Activate, down)
                     }
@@ -1872,6 +1889,9 @@ impl Menu {
     /// Another mouse button (SDL's numbering) went down or up: in the world, the right
     /// one uses items.
     pub fn other_mouse_button(&mut self, button: u8, down: bool) {
+        if self.button_event(button, down) {
+            return;
+        }
         if matches!(self.screen, Screen::Game) {
             self.game.mouse_button(button, down, self.session.as_ref());
         }
@@ -1892,6 +1912,9 @@ impl Menu {
         clipboard: &dyn Clipboard,
     ) -> Option<Action> {
         self.mouse = Some((x, y));
+        if self.button_event(1, down) {
+            return None;
+        }
         let scale = self.layout(pixel_size);
         let (ux, uy) = scale.from_window(x, y, window_size, pixel_size);
         let time = self.started.elapsed().as_secs_f64();
@@ -2107,6 +2130,7 @@ impl Menu {
         self.last_frame = Some(now);
         let scale = self.layout(pixel_size);
         self.poll_session();
+        self.name_keys_once_lang_loads();
         self.sync_world(renderer);
         if matches!(self.screen, Screen::Game) && self.game.should_pause() {
             self.pause();

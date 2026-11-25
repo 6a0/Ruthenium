@@ -3,10 +3,13 @@
 //! quads under the hotbar's items, the items (models, seen straight on with the lights of
 //! a GUI), and the quads over them with the texts between them.
 
+use std::sync::Arc;
+
 use ruthenium_assets::atlas::Atlas;
 use ruthenium_gpu::{
     Arrival, FrameData, Pass, SamplerId, TextureDesc, TextureId, TextureTable, UploadRing, vk,
 };
+use ruthenium_protocol::text::{BoundKeys, WithKeys};
 use ruthenium_sim::hud::OFF_HAND;
 use ruthenium_sim::scene::Frame;
 use ruthenium_ui::hud::{HudHealth, HudLayout, HudMemory, HudOptions, HudSprites, HudView};
@@ -171,6 +174,8 @@ pub(crate) struct Hud {
     layout: HudLayout,
     health: HudHealth,
     memory: HudMemory,
+    /// The key bindings the kept lines were laid out with.
+    keys_seen: Option<Arc<BoundKeys>>,
     /// The quads over the items, with the texts and faces between them, and how many of
     /// them are glyphs'.
     over: Vec<Quad>,
@@ -197,6 +202,7 @@ impl Hud {
             layout: HudLayout::new(),
             health: HudHealth::default(),
             memory: HudMemory::default(),
+            keys_seen: None,
             over: Vec::new(),
             glyphs: 0,
             scale: 0,
@@ -257,7 +263,8 @@ impl Hud {
     }
 
     /// Lays out the frame's HUD for a target of `size` pixels and hands its items and
-    /// its text to `models`, whose font the text is in.
+    /// its text to `models`, whose font the text is in; text that names a key binding
+    /// shows its key in `keys`.
     #[allow(clippy::too_many_arguments)]
     pub fn gather(
         &mut self,
@@ -265,6 +272,7 @@ impl Hud {
         partial: f32,
         size: [u32; 2],
         params: &HudParams,
+        keys: &Arc<BoundKeys>,
         light: EyeLight,
         models: &mut BlockEntityRenderer,
         block_atlas: TextureId,
@@ -285,10 +293,22 @@ impl Hud {
             now: params.now,
             options: params.options,
         };
+        if !self
+            .keys_seen
+            .as_ref()
+            .is_some_and(|k| Arc::ptr_eq(k, keys))
+        {
+            self.memory.forget_lines();
+            self.keys_seen = Some(keys.clone());
+        }
+        let lang = WithKeys {
+            lang: models.lang(),
+            keys,
+        };
         self.layout.build(
             sprites,
             models.font(),
-            models.lang(),
+            &lang,
             &view,
             &mut self.health,
             &mut self.memory,
