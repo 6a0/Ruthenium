@@ -587,6 +587,38 @@ impl Pass<'_> {
         vertex_offset: i32,
         instance: u32,
     ) {
+        // SAFETY: the caller's.
+        unsafe {
+            self.draw_indexed_instances(
+                pipeline,
+                push,
+                indices,
+                first_index,
+                vertex_offset,
+                instance,
+                1,
+            );
+        }
+    }
+
+    /// [`Self::draw_indexed`] `count` times over, as instances numbered from `instance`.
+    ///
+    /// # Safety
+    /// As [`Self::draw_indexed`], for every instance.
+    ///
+    /// # Panics
+    /// As [`Self::draw_indexed`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn draw_indexed_instances(
+        &mut self,
+        pipeline: usize,
+        push: &[u8],
+        indices: u32,
+        first_index: u32,
+        vertex_offset: i32,
+        instance: u32,
+        count: u32,
+    ) {
         assert!(
             push.len() <= PUSH_CONSTANT_BYTES as usize && push.len().is_multiple_of(4),
             "{} bytes of push constants",
@@ -602,7 +634,7 @@ impl Pass<'_> {
             self.gpu.device.cmd_draw_indexed(
                 self.ctx.cmd,
                 indices,
-                1,
+                count,
                 first_index,
                 vertex_offset,
                 instance,

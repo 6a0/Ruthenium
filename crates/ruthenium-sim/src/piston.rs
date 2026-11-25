@@ -121,6 +121,8 @@ impl World<'_> {
             if let Some(b) = self.level.block_entities.shulker_mut(pos) {
                 b.trigger(b0, b1);
             }
+        } else if crate::block_entity::is_chest(s) {
+            self.level.block_entities.chest_event(pos, b0, b1);
         }
     }
 
@@ -165,6 +167,7 @@ impl World<'_> {
             }
         }
         self.level.block_entities.end_ticking();
+        self.level.block_entities.tick_lids();
     }
 
     // --- Pistons ---------------------------------------------------------------------

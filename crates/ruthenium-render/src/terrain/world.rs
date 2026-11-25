@@ -25,7 +25,7 @@
 //! Every stage is bounded: jobs out at once, results waiting for staging, slices
 //! reserved, and the pool's budget.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -52,6 +52,7 @@ use super::tint::{BiomeTints, ColourMaps, MAX_BLEND_RADIUS};
 use super::tracker::{Job, Since, Tracker, TrackerStats};
 use super::visibility::{Batch, Camera, Connectivity, Visibility};
 use crate::atmosphere::{Fog, Medium};
+use crate::block_entity::renderer::{BlockEntityRenderer, MIN_VISIBILITY, SectionEntities};
 use crate::pipelines::PipelineId;
 use crate::terrain_vertex::VERTEX_BYTES;
 
@@ -305,6 +306,8 @@ pub struct WorldAssets {
     pub colour_maps: ColourMaps,
     /// The sun, the moon's phases and the End's sky.
     pub sky: crate::sky::SkyImages,
+    /// What block entities are drawn from; without it they are not drawn.
+    pub block_entities: Option<crate::block_entity::renderer::BlockEntityAssets>,
 }
 
 /// The indices of quads as two triangles each, sharing the diagonal from a quad's first
@@ -695,6 +698,8 @@ pub struct WorldStats {
     /// quad indices and the meshes on their way in or out.
     pub mesh_bytes: u64,
     pub pool: PoolStats,
+    /// The last frame's block entities.
+    pub block_entities: crate::block_entity::renderer::BlockEntityStats,
     /// Cave culling is on: only what the visibility graph reaches from the camera is
     /// meshed and drawn.
     pub culling: bool,
@@ -754,6 +759,8 @@ pub(crate) struct WorldRenderer {
     /// Where the camera is (the last [`Self::update`]'s).
     camera: [f64; 3],
     removed: Vec<MeshRange>,
+    /// The block entities of the sections that have some, as last meshed.
+    block_entities: HashMap<SectionKey, Box<SectionEntities>>,
     visible: Vec<Visible>,
     /// Scratch of [`Self::draw`]: the visible sections whose translucent quads are to
     /// be sorted again, with their distance.
@@ -1003,6 +1010,7 @@ impl WorldRenderer {
             sorted: Vec::new(),
             camera: [0.0; 3],
             removed: Vec::new(),
+            block_entities: HashMap::new(),
             visible: Vec::new(),
             unsorted: Vec::new(),
             drawn: None,
@@ -1122,6 +1130,7 @@ impl WorldRenderer {
             }
         }
         self.drawn = None;
+        self.block_entities.clear();
         for p in self.pending.drain(..) {
             match p.stage {
                 Stage::Waiting(_) => {}
@@ -1315,6 +1324,12 @@ impl WorldRenderer {
                 continue;
             }
             let key = done.stamp.section;
+            if done.mesh.block_entities.is_empty() {
+                self.block_entities.remove(&key);
+            } else {
+                let list = done.mesh.block_entities.clone().into_boxed_slice();
+                self.block_entities.insert(key, list);
+            }
             let Some(bounds) = done.mesh.bounds else {
                 // Nothing to draw there: that is its mesh.
                 self.note_installed(&done.mesh, 0, Instant::now());
@@ -1762,6 +1777,60 @@ impl WorldRenderer {
     /// target's width over its height.
     pub fn medium_at(&self, scene: &Scene, camera: &CameraPose, aspect: f32) -> Medium {
         scene.with_terrain(|t| medium::medium_at(t, &self.table, camera, aspect))
+    }
+
+    /// Gathers the block entities of the sections `view` can see into, for this frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_block_entities(
+        &mut self,
+        renderer: &mut BlockEntityRenderer,
+        scene: &Scene,
+        frame: &Frame,
+        partial: f32,
+        camera: [f64; 3],
+        view: &View,
+        textures: &TextureTable,
+    ) {
+        profiling::scope!("block_entities_gather");
+        renderer.begin();
+        let tracker = &self.tracker;
+        self.block_entities.retain(|key, _| tracker.tracks(*key));
+        if self.block_entities.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        scene.with_terrain(|terrain| {
+            for (&key, list) in &self.block_entities {
+                let low: [f32; 3] = std::array::from_fn(|i| ((key[i] << 4) - view.block[i]) as f32);
+                if !view.sees(low, low.map(|c| c + 16.0)) {
+                    continue;
+                }
+                let Some(since) = self.tracker.shown_since(key) else {
+                    continue;
+                };
+                if visibility(now, since, self.fade_ms) < MIN_VISIBILITY {
+                    continue;
+                }
+                renderer.gather(
+                    key,
+                    list,
+                    terrain,
+                    &self.table,
+                    frame,
+                    partial,
+                    camera,
+                    view,
+                    textures,
+                );
+            }
+        });
+    }
+
+    /// The light map and the shared quad indices (their buffer and where in it), which can
+    /// be read once [`Self::ready`].
+    pub fn shared(&self) -> Option<(TextureId, (vk::Buffer, u64))> {
+        let range = self.pool.resolve(self.indices)?;
+        Some((self.lightmap?, (range.buffer, range.offset)))
     }
 
     /// Whether the textures and the index buffer the draws read have arrived.

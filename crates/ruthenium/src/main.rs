@@ -127,6 +127,9 @@ With no command, opens the game window. Options:
                          the world as vanilla does it (first), or not at all
   --translucent <on|off> whether the world's translucent layer (water, stained glass,
                          ice) is drawn (on, the default); off, to measure it against
+  --block-entities <on|off>
+                         whether chests, shulker boxes, skulls and banners are drawn
+                         (on, the default); off, to measure it against
   --animations <on|off>  whether animated textures (water, lava, fire) play (on, the
                          default); off, they show their first frame
   --fov-effects <on|off> whether the field of view narrows in water and lava (on, the

@@ -185,8 +185,46 @@ pub const SKY: Record = Record {
     }],
 };
 
+/// What one part of a drawn model reads: found by the instance number.
+pub const MODEL_PART: Record = Record {
+    name: "model_part",
+    doc: "One part of a model: record number gl_InstanceIndex from the offset in push constants.",
+    fields: &[
+        Field {
+            name: "row_x",
+            ty: Ty::Vec4,
+            doc: "From the part's own space to blocks relative to the camera: the first row.",
+        },
+        Field {
+            name: "row_y",
+            ty: Ty::Vec4,
+            doc: "The second row.",
+        },
+        Field {
+            name: "row_z",
+            ty: Ty::Vec4,
+            doc: "The third row.",
+        },
+        Field {
+            name: "light",
+            ty: Ty::Uint,
+            doc: "Block light in the low byte and sky light in the next, each 0 to 240.",
+        },
+        Field {
+            name: "colour",
+            ty: Ty::Uint,
+            doc: "What the texture is multiplied by: red in the low byte, then green, blue and alpha.",
+        },
+        Field {
+            name: "texture",
+            ty: Ty::Uint,
+            doc: "An index into the texture table.",
+        },
+    ],
+};
+
 /// Every record `world.glsl` has accessors for.
-pub const RECORDS: [&Record; 4] = [&WORLD, &WORLD_MATRIX, &SECTION, &SKY];
+pub const RECORDS: [&Record; 5] = [&WORLD, &WORLD_MATRIX, &SECTION, &SKY, &MODEL_PART];
 
 /// The text of `glsl/include/world.glsl`.
 pub fn world_glsl() -> String {
@@ -256,6 +294,8 @@ mod tests {
         assert_eq!(WORLD_MATRIX.bytes(), 64);
         assert_eq!(SECTION.offset("visibility"), 3);
         assert_eq!(SECTION.bytes(), 16);
+        assert_eq!(MODEL_PART.offset("light"), 12);
+        assert_eq!(MODEL_PART.bytes(), 60);
         for r in RECORDS {
             let mut names: Vec<&str> = r.fields.iter().map(|f| f.name).collect();
             names.sort_unstable();

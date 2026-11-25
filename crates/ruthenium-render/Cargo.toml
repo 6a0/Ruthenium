@@ -18,10 +18,8 @@ ruthenium-gpu = { path = "../ruthenium-gpu" }
 ruthenium-javamath = { path = "../ruthenium-javamath" }
 ruthenium-platform = { path = "../ruthenium-platform" }
 ruthenium-prepare = { path = "../ruthenium-prepare" }
+ruthenium-protocol = { path = "../ruthenium-protocol" }
 ruthenium-shaders = { path = "../ruthenium-shaders" }
 ruthenium-sim = { path = "../ruthenium-sim" }
 serde_json = "1.0.154"
 ruthenium-ui = { path = "../ruthenium-ui" }
-
-[dev-dependencies]
-ruthenium-protocol = { path = "../ruthenium-protocol" }

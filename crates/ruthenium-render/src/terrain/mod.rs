@@ -8,7 +8,7 @@ pub(crate) mod medium;
 mod mesher;
 mod smooth;
 mod sort;
-mod table;
+pub(crate) mod table;
 #[cfg(test)]
 pub(crate) mod testing;
 mod tint;

@@ -919,6 +919,7 @@ impl Game {
                     .extend(p.effects.iter().map(|e| (e.id, e.amplifier, e.duration)));
                 s.vehicle = p.riding.as_ref().map(|r| r.vehicle);
                 s.placements = w.placements;
+                w.level.block_entities.lids(&mut f.lids);
                 f.entities.clear();
                 f.entities_dropped = 0;
                 for e in w.entities.iter() {

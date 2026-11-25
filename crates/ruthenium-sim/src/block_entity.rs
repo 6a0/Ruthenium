@@ -201,6 +201,47 @@ pub fn progress_delta_aabb(
     shrunk.moved(position)
 }
 
+/// `ChestLidController`: how far a chest's lid is open. Lids move no one: they are kept
+/// for drawing, only while they are not shut.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ChestLid {
+    /// Where it is going.
+    pub open: bool,
+    pub openness: f32,
+    pub openness_old: f32,
+}
+
+impl ChestLid {
+    /// `tickLid`.
+    fn tick(&mut self) {
+        self.openness_old = self.openness;
+        if !self.open && self.openness > 0.0 {
+            self.openness = (self.openness - 0.1).max(0.0);
+        } else if self.open && self.openness < 1.0 {
+            self.openness = (self.openness + 0.1).min(1.0);
+        }
+    }
+
+    fn is_shut(&self) -> bool {
+        !self.open && self.openness == 0.0 && self.openness_old == 0.0
+    }
+}
+
+/// Whether a state is a chest's, of any kind.
+pub fn is_chest(state: u32) -> bool {
+    ruthenium_data::v26_3::blocks::BlockState::from_id(state)
+        .is_some_and(|s| s.block().name().ends_with("chest"))
+}
+
+/// A lid that is not shut, for drawing: a chest's or a shulker box's, from how far it was
+/// open at the last tick to how far it is now.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LidRecord {
+    pub pos: Pos,
+    pub old: f32,
+    pub now: f32,
+}
+
 /// A block entity's own state.
 #[derive(Debug, Clone)]
 pub enum Data {
@@ -239,6 +280,8 @@ pub enum BlockEntityShape<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct BlockEntities {
     entries: HashMap<Pos, Entry>,
+    /// The chests whose lids are not shut.
+    lids: HashMap<Pos, ChestLid>,
     next_id: u64,
     /// `LevelChunk.tickersInLevel`: the ticker of each position.
     tickers_at: HashMap<Pos, u64>,
@@ -288,6 +331,46 @@ impl BlockEntities {
         }
     }
 
+    /// `ChestBlockEntity.triggerEvent` at a chest: the server's count of players with it
+    /// open.
+    pub fn chest_event(&mut self, pos: Pos, b0: u8, b1: u8) {
+        if b0 != 1 {
+            return;
+        }
+        if b1 > 0 {
+            self.lids.entry(pos).or_default().open = true;
+        } else if let Some(lid) = self.lids.get_mut(&pos) {
+            lid.open = false;
+        }
+    }
+
+    /// `lidAnimateTick` of every chest.
+    pub(crate) fn tick_lids(&mut self) {
+        self.lids.retain(|_, lid| {
+            lid.tick();
+            !lid.is_shut()
+        });
+    }
+
+    /// Every lid that is not shut, by position.
+    pub fn lids(&self, out: &mut Vec<LidRecord>) {
+        out.clear();
+        out.extend(self.lids.iter().map(|(&pos, lid)| LidRecord {
+            pos,
+            old: lid.openness_old,
+            now: lid.openness,
+        }));
+        out.extend(self.entries.iter().filter_map(|(&pos, e)| match &e.data {
+            Data::Shulker(s) if s.progress > 0.0 || s.progress_old > 0.0 => Some(LidRecord {
+                pos,
+                old: s.progress_old,
+                now: s.progress,
+            }),
+            _ => None,
+        }));
+        out.sort_unstable_by_key(|l| l.pos);
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -334,6 +417,7 @@ impl BlockEntities {
     /// `clearAllBlockEntities` for one chunk (loaded again, or forgotten).
     pub fn clear_chunk(&mut self, cx: i32, cz: i32) {
         let in_chunk = |p: &Pos| p[0] >> 4 == cx && p[2] >> 4 == cz;
+        self.lids.retain(|p, _| !in_chunk(p));
         let gone: Vec<Pos> = self
             .entries
             .keys()
@@ -352,6 +436,9 @@ impl BlockEntities {
     /// for its piston) or keeps it with the new state.
     pub fn on_block_changed(&mut self, pos: Pos, old: u32, new: u32) {
         let block_changed = crate::blocks::block_of(old) != crate::blocks::block_of(new);
+        if block_changed {
+            self.lids.remove(&pos);
+        }
         if block_changed && kind_of(old).is_some() {
             self.remove(pos);
         }
@@ -466,6 +553,55 @@ mod tests {
             ((-0.5 + (1.0 + old)) + 0.5, (0.5 + new) + 0.5)
         );
         assert_eq!((d.min[1], d.max[1]), (0.0, 1.0));
+    }
+
+    #[test]
+    fn chest_lids_open_and_shut_over_ten_ticks() {
+        let mut b = BlockEntities::default();
+        let mut out = Vec::new();
+        // Shutting a shut chest, and other events, are nothing.
+        b.chest_event([1, 2, 3], 1, 0);
+        b.chest_event([1, 2, 3], 0, 1);
+        b.lids(&mut out);
+        assert!(out.is_empty());
+        b.chest_event([1, 2, 3], 1, 2);
+        b.tick_lids();
+        b.lids(&mut out);
+        assert_eq!(
+            out,
+            [LidRecord {
+                pos: [1, 2, 3],
+                old: 0.0,
+                now: 0.1
+            }]
+        );
+        for _ in 0..12 {
+            b.tick_lids();
+        }
+        b.lids(&mut out);
+        assert_eq!((out[0].old, out[0].now), (1.0, 1.0));
+        b.chest_event([1, 2, 3], 1, 0);
+        b.tick_lids();
+        b.lids(&mut out);
+        assert_eq!((out[0].old, out[0].now), (1.0, 0.9));
+        for _ in 0..12 {
+            b.tick_lids();
+        }
+        b.lids(&mut out);
+        assert!(out.is_empty());
+        // Another block there, or the chunk going, takes the lid away.
+        let chest = (0..).find(|&s| is_chest(s)).expect("there are chests");
+        for gone in [true, false] {
+            b.chest_event([1, 2, 3], 1, 1);
+            b.tick_lids();
+            if gone {
+                b.on_block_changed([1, 2, 3], chest, 0);
+            } else {
+                b.clear_chunk(0, 0);
+            }
+            b.lids(&mut out);
+            assert!(out.is_empty());
+        }
     }
 
     #[test]

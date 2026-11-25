@@ -37,6 +37,13 @@ pub enum PipelineId {
     TerrainPlain,
     TerrainPlainCutout,
     TerrainPlainTranslucent,
+    /// Models made of parts (block entities): without holes; with holes, seen from the
+    /// front; with holes, seen from both sides; and what is blended over a model in the
+    /// plane it lies in (a banner's patterns).
+    ModelSolid,
+    ModelCutout,
+    ModelCutoutFaces,
+    ModelPattern,
     /// The sky drawn before the world, over the cleared target: what covers what is
     /// there (the dome), what is blended over it (a sunrise's glow, the End's sky) and
     /// what adds light to it (the sun, the moon, the stars).
@@ -57,7 +64,7 @@ pub enum PipelineId {
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 28] = [
+    pub const ALL: [PipelineId; 32] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -76,6 +83,10 @@ impl PipelineId {
         PipelineId::TerrainPlain,
         PipelineId::TerrainPlainCutout,
         PipelineId::TerrainPlainTranslucent,
+        PipelineId::ModelSolid,
+        PipelineId::ModelCutout,
+        PipelineId::ModelCutoutFaces,
+        PipelineId::ModelPattern,
         PipelineId::SkyFlat,
         PipelineId::SkyBlend,
         PipelineId::SkyGlow,
@@ -217,7 +228,45 @@ impl PipelineId {
             };
             return terrain(name, vertex, fragment, blend);
         }
+        let model = |name, fragment: &shaders::Spirv, blend, depth, cull_back| GraphicsDesc {
+            name,
+            vertex: shaders::MODEL_VERT.words(),
+            fragment: fragment.words(),
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            blend,
+            vertex_input: Some(crate::block_entity::renderer::MODEL_VERTEX),
+            depth,
+            cull_back,
+        };
         match self {
+            PipelineId::ModelSolid => model(
+                "model_solid",
+                &shaders::MODEL_SOLID_FRAG,
+                Blend::Opaque,
+                Depth::TestAndWrite,
+                true,
+            ),
+            PipelineId::ModelCutout => model(
+                "model_cutout",
+                &shaders::MODEL_CUTOUT_FRAG,
+                Blend::Opaque,
+                Depth::TestAndWrite,
+                true,
+            ),
+            PipelineId::ModelCutoutFaces => model(
+                "model_cutout_faces",
+                &shaders::MODEL_CUTOUT_FACES_FRAG,
+                Blend::Opaque,
+                Depth::TestAndWrite,
+                false,
+            ),
+            PipelineId::ModelPattern => model(
+                "model_pattern",
+                &shaders::MODEL_SOLID_FRAG,
+                Blend::Alpha,
+                Depth::Test,
+                true,
+            ),
             PipelineId::SkyFlat => sky("sky_flat", Blend::Opaque, Depth::Ignore),
             PipelineId::SkyBlend => sky("sky_blend", Blend::Alpha, Depth::Ignore),
             PipelineId::SkyGlow => sky("sky_glow", Blend::Glow, Depth::Ignore),

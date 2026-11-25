@@ -5,6 +5,7 @@
 
 mod atmosphere;
 mod backdrop;
+pub mod block_entity;
 mod check_pass;
 mod colour_check;
 mod gui;
@@ -49,7 +50,9 @@ use ruthenium_platform::{Platform, Window};
 use ruthenium_sim::scene::{Frame, Scene};
 
 use atmosphere::{Atmosphere, Look, WaterOverlay};
+use block_entity::renderer::BlockEntityRenderer;
 use ruthenium_gpu::SamplerId;
+use ruthenium_sim::environment::CardinalLight;
 use ruthenium_ui::Quad;
 use sky::{Sky, SkyRenderer};
 use terrain::View;
@@ -186,6 +189,7 @@ unsafe fn draw_world(
     view: &View,
     look: &Look,
     front: Option<Front>,
+    models: Option<(&mut BlockEntityRenderer, CardinalLight)>,
 ) {
     let mut sky = sky.filter(|_| order != SkyOrder::Off && look.sky != Sky::None);
     let mut draw_sky = |pass: &mut ruthenium_gpu::Pass<'_>, frame_data: &mut FrameData, behind| {
@@ -210,6 +214,14 @@ unsafe fn draw_world(
     }
     // SAFETY: the caller's.
     unsafe { world.draw(pass, frame_data, view, &look.fog) };
+    if let (Some((models, cardinal)), Some((lightmap, indices))) = (models, world.shared()) {
+        // SAFETY: the caller's; the world is ready, and with it what it shares.
+        unsafe {
+            models.draw(
+                pass, frame_data, view, &look.fog, cardinal, lightmap, indices,
+            );
+        }
+    }
     if order == SkyOrder::Late {
         draw_sky(pass, frame_data, true);
     }
@@ -282,6 +294,9 @@ pub struct Renderer {
     /// world's assets are loaded.
     atmosphere: Atmosphere,
     sky: Option<SkyRenderer>,
+    /// The block entities' models and pictures, with them; and whether they are drawn.
+    block_entities: Option<BlockEntityRenderer>,
+    show_block_entities: bool,
     /// The terrain's part of the last frame.
     world_times: WorldTimes,
     /// The number of the last frame recorded.
@@ -389,6 +404,8 @@ impl Renderer {
             atmosphere_options: AtmosphereOptions::default(),
             atmosphere: Atmosphere::new(),
             sky: None,
+            block_entities: None,
+            show_block_entities: true,
             world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
@@ -415,7 +432,7 @@ impl Renderer {
     /// loaded is kept as it is.
     pub fn load_world(
         &mut self,
-        assets: WorldAssets,
+        mut assets: WorldAssets,
         workers: usize,
     ) -> Result<(), ruthenium_gpu::Error> {
         if self.world.is_none() {
@@ -429,6 +446,11 @@ impl Renderer {
                         None
                     }
                 };
+            self.block_entities = assets.block_entities.take().and_then(|models| {
+                BlockEntityRenderer::new(&gpu, &mut self.textures, &mut self.uploads, models)
+                    .inspect_err(|e| eprintln!("[render] no block entities: {e}"))
+                    .ok()
+            });
             // Without its picture, water is in front of nothing.
             self.underwater = assets.underwater.as_ref().and_then(|i| {
                 self.textures
@@ -496,6 +518,15 @@ impl Renderer {
 
     pub fn translucent(&self) -> bool {
         self.translucent
+    }
+
+    /// Whether block entities are drawn (they are unless said otherwise).
+    pub fn set_block_entities(&mut self, on: bool) {
+        self.show_block_entities = on;
+    }
+
+    pub fn block_entities(&self) -> bool {
+        self.show_block_entities
     }
 
     /// How the terrain's texels are filtered (as vanilla's RGSS unless said otherwise).
@@ -660,7 +691,14 @@ impl Renderer {
 
     /// What the terrain is doing, if a world is loaded.
     pub fn world_stats(&self) -> Option<WorldStats> {
-        self.world.as_ref().map(WorldRenderer::stats)
+        let mut stats = self.world.as_ref().map(WorldRenderer::stats)?;
+        stats.block_entities = self
+            .block_entities
+            .as_ref()
+            .filter(|_| self.show_block_entities)
+            .map(BlockEntityRenderer::stats)
+            .unwrap_or_default();
+        Some(stats)
     }
 
     /// Makes the depth image the size of the target the world is drawn into.
@@ -1010,6 +1048,9 @@ impl Renderer {
                 if let Some(sky) = &mut self.sky {
                     sky.stage(&mut self.uploads);
                 }
+                if let Some(models) = &mut self.block_entities {
+                    models.stage(&mut self.uploads);
+                }
                 self.world_times.stage_ns = started.elapsed().as_nanos() as u64;
                 let front = match (&look.water, self.underwater) {
                     (Some(water), Some(texture)) if self.textures.is_ready(texture) => {
@@ -1055,12 +1096,38 @@ impl Renderer {
             if let Some(sky) = &mut self.sky {
                 sky.note_ready(&self.uploads);
             }
+            if let Some(models) = &mut self.block_entities {
+                models.note_ready(&self.uploads);
+            }
             self.world_times.stage_ns += started.elapsed().as_nanos() as u64;
         }
         // The world is drawn once everything its draws read has arrived.
         let view = view.filter(|_| {
             self.depth.is_some() && self.world.as_ref().is_some_and(|w| w.ready(&self.textures))
         });
+        let cardinal = world.as_ref().map_or(CardinalLight::Default, |w| {
+            w.frame.environment.cardinal_light
+        });
+        if let (Some(w), Some((view, ..)), Some(renderer), Some(models)) = (
+            &world,
+            &view,
+            &mut self.world,
+            self.block_entities
+                .as_mut()
+                .filter(|_| self.show_block_entities),
+        ) {
+            let started = std::time::Instant::now();
+            renderer.gather_block_entities(
+                models,
+                w.scene,
+                w.frame,
+                w.partial_tick,
+                w.camera.position,
+                view,
+                &self.textures,
+            );
+            self.world_times.stage_ns += started.elapsed().as_nanos() as u64;
+        }
         self.frame_data.begin_frame(ctx.slot());
         let gpu = self.frames.gpu().clone();
         // SAFETY: the layout was made of the texture table's and the frame data's set
@@ -1106,6 +1173,10 @@ impl Renderer {
                                 view,
                                 look,
                                 *front,
+                                self.block_entities
+                                    .as_mut()
+                                    .filter(|_| self.show_block_entities)
+                                    .map(|m| (m, cardinal)),
                             );
                         }
                         pass.finish();
@@ -1230,6 +1301,10 @@ impl Renderer {
                             view,
                             look,
                             front,
+                            self.block_entities
+                                .as_mut()
+                                .filter(|_| self.show_block_entities)
+                                .map(|m| (m, cardinal)),
                         );
                         self.world_times.draw_ns = started.elapsed().as_nanos() as u64;
                     }

@@ -21,6 +21,7 @@ pub const BLOCK_PHYSICS: &str = "block_physics.bin";
 pub const ITEM_CLASSES: &str = "item_classes.bin";
 pub const BLOCK_BEHAVIOUR: &str = "block_behaviour.bin";
 pub const BLOCK_RENDER: &str = "block_render.bin";
+pub const MODEL_LAYERS: &str = "model_layers.bin";
 
 /// The exporter bundle: `explicit`, then `RUTHENIUM_EXPORTERS`, then next to
 /// the executable, then `../java/` from it (`target/java/` in a dev build).
@@ -80,6 +81,7 @@ pub fn run(java: &Java, imported: &Imported, bundle: &Path) -> Result<(PathBuf, 
             ITEM_CLASSES,
             BLOCK_BEHAVIOUR,
             BLOCK_RENDER,
+            MODEL_LAYERS,
         ] {
             let expected = tmp.join(file);
             if !expected.is_file() {
@@ -858,9 +860,167 @@ pub fn read_block_render(bytes: &[u8]) -> Result<BlockRender, String> {
     Ok(BlockRender { shapes, states })
 }
 
+/// One face of a cube of a model part.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelFace {
+    pub normal: [f32; 3],
+    /// Four corners: position in sixteenths of a block, then u and v from 0 to 1.
+    pub corners: [[f32; 5]; 4],
+}
+
+/// A part of a model (`ModelPart`): its initial pose, its faces and the parts it carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelPart {
+    /// In sixteenths of a block.
+    pub position: [f32; 3],
+    /// Radians about x, y and z.
+    pub rotation: [f32; 3],
+    pub scale: [f32; 3],
+    /// The faces of all its cubes, in order.
+    pub faces: Vec<ModelFace>,
+    /// By name, in the names' order.
+    pub children: Vec<(String, ModelPart)>,
+}
+
+impl ModelPart {
+    pub fn child(&self, name: &str) -> Option<&ModelPart> {
+        let i = self
+            .children
+            .binary_search_by(|(n, _)| n.as_str().cmp(name))
+            .ok()?;
+        Some(&self.children[i].1)
+    }
+}
+
+/// `model_layers.bin`: the geometry of every entity and block entity model layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelLayers {
+    /// By name (`minecraft:chest#main`), in the names' order.
+    layers: Vec<(String, ModelPart)>,
+}
+
+impl ModelLayers {
+    pub fn get(&self, name: &str) -> Option<&ModelPart> {
+        let i = self
+            .layers
+            .binary_search_by(|(n, _)| n.as_str().cmp(name))
+            .ok()?;
+        Some(&self.layers[i].1)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ModelPart)> {
+        self.layers.iter().map(|(n, p)| (n.as_str(), p))
+    }
+}
+
+/// Parts inside parts at most: the game's models stay far below, a broken file must not
+/// overflow the stack.
+const MAX_PART_DEPTH: usize = 64;
+
+fn model_part(r: &mut Reader<'_>, depth: usize) -> Result<ModelPart, String> {
+    if depth > MAX_PART_DEPTH {
+        return Err("model parts nested too deeply".to_owned());
+    }
+    let mut triple = || -> Result<[f32; 3], String> { Ok([r.f32()?, r.f32()?, r.f32()?]) };
+    let (position, rotation, scale) = (triple()?, triple()?, triple()?);
+    let mut faces = Vec::new();
+    for _ in 0..r.u32()? {
+        for _ in 0..r.u8()? {
+            let normal = [r.f32()?, r.f32()?, r.f32()?];
+            let mut corners = [[0.0; 5]; 4];
+            for value in corners.as_flattened_mut() {
+                *value = r.f32()?;
+            }
+            faces.push(ModelFace { normal, corners });
+        }
+    }
+    let mut children: Vec<(String, ModelPart)> = Vec::new();
+    for _ in 0..r.u32()? {
+        let name = r.string()?;
+        if children.last().is_some_and(|(last, _)| *last >= name) {
+            return Err(format!("model part {name} out of order"));
+        }
+        children.push((name, model_part(r, depth + 1)?));
+    }
+    Ok(ModelPart {
+        position,
+        rotation,
+        scale,
+        faces,
+        children,
+    })
+}
+
+/// Parses `model_layers.bin`.
+pub fn read_model_layers(bytes: &[u8]) -> Result<ModelLayers, String> {
+    let mut r = Reader::open(bytes, "model_layers", 1)?;
+    let mut layers: Vec<(String, ModelPart)> = Vec::new();
+    for _ in 0..r.u32()? {
+        let name = r.string()?;
+        if layers.last().is_some_and(|(last, _)| *last >= name) {
+            return Err(format!("model layer {name} out of order"));
+        }
+        layers.push((name, model_part(&mut r, 0)?));
+    }
+    r.finish()?;
+    Ok(ModelLayers { layers })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A part with `faces` faces in one cube, without its children.
+    fn part(out: &mut Vec<u8>, x: f32, faces: u8) {
+        for f in [x, 0.0, 0.0, 0.0, 0.5, 0.0, 1.0, 1.0, 1.0] {
+            out.extend(f.to_le_bytes());
+        }
+        out.extend(1u32.to_le_bytes());
+        out.push(faces);
+        for face in 0..faces {
+            for i in 0..23u8 {
+                out.extend(f32::from(face * 23 + i).to_le_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn reads_model_layers() {
+        let mut b = b"RTHX".to_vec();
+        b.extend(1u32.to_le_bytes());
+        string(&mut b, "model_layers");
+        b.extend(1u32.to_le_bytes());
+        string(&mut b, "example:box#main");
+        part(&mut b, 0.0, 0);
+        b.extend(2u32.to_le_bytes());
+        let first_child = b.len();
+        string(&mut b, "bottom");
+        part(&mut b, 1.0, 2);
+        b.extend(0u32.to_le_bytes());
+        string(&mut b, "lid");
+        part(&mut b, 2.0, 1);
+        b.extend(0u32.to_le_bytes());
+        let layers = read_model_layers(&b).unwrap();
+        assert_eq!(layers.iter().count(), 1);
+        let root = layers.get("example:box#main").unwrap();
+        assert!(layers.get("example:box#other").is_none() && root.faces.is_empty());
+        assert_eq!((root.rotation, root.scale), ([0.0, 0.5, 0.0], [1.0; 3]));
+        let bottom = root.child("bottom").unwrap();
+        assert_eq!((bottom.position[0], bottom.faces.len()), (1.0, 2));
+        assert_eq!(bottom.faces[1].normal, [23.0, 24.0, 25.0]);
+        assert_eq!(bottom.faces[0].corners[0], [3.0, 4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(bottom.faces[1].corners[3], [41.0, 42.0, 43.0, 44.0, 45.0]);
+        assert_eq!(root.child("lid").unwrap().faces.len(), 1);
+        assert!(root.child("lock").is_none());
+        // Cut short, longer than it says, or with parts out of order: errors.
+        assert!(read_model_layers(&b[..b.len() - 1]).is_err());
+        let mut bad = b.clone();
+        bad.push(0);
+        assert!(read_model_layers(&bad).is_err());
+        let mut bad = b.clone();
+        bad[first_child + 2] = b'z';
+        assert!(read_model_layers(&bad).is_err());
+    }
 
     fn string(out: &mut Vec<u8>, s: &str) {
         out.extend((s.len() as u16).to_le_bytes());

@@ -62,3 +62,36 @@ mat4 sky_transform(uint at) {
         uintBitsToFloat(frame_words[at + 8u]), uintBitsToFloat(frame_words[at + 9u]), uintBitsToFloat(frame_words[at + 10u]), uintBitsToFloat(frame_words[at + 11u]),
         uintBitsToFloat(frame_words[at + 12u]), uintBitsToFloat(frame_words[at + 13u]), uintBitsToFloat(frame_words[at + 14u]), uintBitsToFloat(frame_words[at + 15u]));
 }
+
+// One part of a model: record number gl_InstanceIndex from the offset in push constants.
+#define MODEL_PART_WORDS 15u
+
+// From the part's own space to blocks relative to the camera: the first row.
+vec4 model_part_row_x(uint at) {
+    return vec4(uintBitsToFloat(frame_words[at + 0u]), uintBitsToFloat(frame_words[at + 1u]), uintBitsToFloat(frame_words[at + 2u]), uintBitsToFloat(frame_words[at + 3u]));
+}
+
+// The second row.
+vec4 model_part_row_y(uint at) {
+    return vec4(uintBitsToFloat(frame_words[at + 4u]), uintBitsToFloat(frame_words[at + 5u]), uintBitsToFloat(frame_words[at + 6u]), uintBitsToFloat(frame_words[at + 7u]));
+}
+
+// The third row.
+vec4 model_part_row_z(uint at) {
+    return vec4(uintBitsToFloat(frame_words[at + 8u]), uintBitsToFloat(frame_words[at + 9u]), uintBitsToFloat(frame_words[at + 10u]), uintBitsToFloat(frame_words[at + 11u]));
+}
+
+// Block light in the low byte and sky light in the next, each 0 to 240.
+uint model_part_light(uint at) {
+    return frame_words[at + 12u];
+}
+
+// What the texture is multiplied by: red in the low byte, then green, blue and alpha.
+uint model_part_colour(uint at) {
+    return frame_words[at + 13u];
+}
+
+// An index into the texture table.
+uint model_part_texture(uint at) {
+    return frame_words[at + 14u];
+}

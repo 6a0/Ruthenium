@@ -219,7 +219,9 @@ mod tests {
         match format {
             vk::Format::R16G16B16A16_UINT => Type::Vector(Box::new(Type::Uint), 4),
             vk::Format::R16G16_UINT => Type::Vector(Box::new(Type::Uint), 2),
-            vk::Format::R8G8B8A8_UNORM => Type::Vector(Box::new(Type::Float), 4),
+            vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SNORM => {
+                Type::Vector(Box::new(Type::Float), 4)
+            }
             vk::Format::R32G32B32_SFLOAT => Type::Vector(Box::new(Type::Float), 3),
             vk::Format::R32G32_SFLOAT => Type::Vector(Box::new(Type::Float), 2),
             other => panic!("no shader type known for {other:?}"),
@@ -256,6 +258,10 @@ mod tests {
             (&shaders::TERRAIN_VERT, TERRAIN_VERTEX),
             (&shaders::TERRAIN_PLAIN_VERT, TERRAIN_VERTEX),
             (&shaders::SKY_VERT, SKY_VERTEX),
+            (
+                &shaders::MODEL_VERT,
+                crate::block_entity::renderer::MODEL_VERTEX,
+            ),
         ] {
             let vert = interface(vertex.words());
             let inputs = Interface::located(&vert.inputs);
@@ -314,7 +320,23 @@ mod tests {
         let frag = interface(shaders::SKY_FRAG.words());
         assert_eq!(Interface::located(&frag.inputs), outputs);
         assert_eq!(Interface::located(&frag.outputs), vec![(0, &vec(4))]);
+        let vert = interface(shaders::MODEL_VERT.words());
+        let outputs = Interface::located(&vert.outputs);
+        for fragment in MODEL_FRAGMENTS {
+            let frag = interface(fragment.words());
+            // A stage that draws fronts only may not read the backs' colour.
+            for input in Interface::located(&frag.inputs) {
+                assert!(outputs.contains(&input), "{}: {input:?}", fragment.name);
+            }
+            assert_eq!(Interface::located(&frag.outputs), vec![(0, &vec(4))]);
+        }
     }
+
+    const MODEL_FRAGMENTS: [&shaders::Spirv; 3] = [
+        &shaders::MODEL_SOLID_FRAG,
+        &shaders::MODEL_CUTOUT_FRAG,
+        &shaders::MODEL_CUTOUT_FACES_FRAG,
+    ];
 
     /// A stage's push constants as its module declares them: each member's type and
     /// byte offset.
@@ -372,6 +394,19 @@ mod tests {
         assert_eq!(sky.last().unwrap().1 as usize + 4, s::SKY_PUSH_BYTES);
         assert_eq!(pushed(&shaders::SKY_VERT), words(2));
         assert_eq!(pushed(&shaders::SKY_FRAG), sky);
+        // For models: four words, then the fog.
+        use crate::block_entity::renderer as b;
+        let mut model = words(4);
+        model.extend([
+            (vec(4), b::PUSH_FOG_COLOUR as u32),
+            (vec(2), b::PUSH_FOG_ENVIRONMENTAL as u32),
+            (vec(2), b::PUSH_FOG_RENDER_DISTANCE as u32),
+        ]);
+        assert_eq!(model.last().unwrap().1 as usize + 8, b::MODEL_PUSH_BYTES);
+        assert_eq!(pushed(&shaders::MODEL_VERT), words(4));
+        for fragment in MODEL_FRAGMENTS {
+            assert_eq!(pushed(fragment), model, "{}", fragment.name);
+        }
     }
 
     #[test]
@@ -383,8 +418,9 @@ mod tests {
         )]);
         let samplers = Type::Array(Box::new(Type::Sampler), ruthenium_gpu::SAMPLER_COUNT);
         let textures = Type::RuntimeArray(Box::new(Type::Image), None);
-        let mut vertex_stages = vec![&shaders::SKY_VERT];
+        let mut vertex_stages = vec![&shaders::SKY_VERT, &shaders::MODEL_VERT];
         let mut fragment_stages = vec![&shaders::SKY_FRAG];
+        fragment_stages.extend(MODEL_FRAGMENTS);
         for (vertex, fragment) in terrain_stages() {
             vertex_stages.push(vertex);
             fragment_stages.push(fragment);

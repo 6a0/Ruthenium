@@ -28,6 +28,7 @@ use super::sort;
 use super::table::{BlockTable, ShapeKind, StateInfo, Tint, sticks_out};
 use super::tint::{BiomeColour, BiomeTints, TintScratch};
 use super::visibility::Connectivity;
+use crate::block_entity::place::Kind;
 use crate::terrain_vertex::{Vertex, position_code, position_of, uv_code};
 
 /// The six directions' steps, by `Direction` ordinal: down, up, north, south, west,
@@ -80,6 +81,8 @@ pub struct SectionMesh {
     /// Which of the section's faces can be seen from which, through its blocks that
     /// are not solid.
     pub connectivity: Connectivity,
+    /// The blocks drawn as block entities: where in the section, and their states.
+    pub block_entities: Vec<([u8; 3], u16)>,
 }
 
 impl SectionMesh {
@@ -393,6 +396,10 @@ impl Mesher {
                         );
                     }
                     if state.flags & StateInfo::DRAWN == 0 {
+                        if Kind::of(id).is_some() {
+                            out.block_entities
+                                .push(([x, y, z].map(|c| c as u8), id as u16));
+                        }
                         continue;
                     }
                     let world = [origin[0] + x, origin[1] + y, origin[2] + z];

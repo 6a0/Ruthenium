@@ -259,6 +259,20 @@ impl<M> Tracker<M> {
             .map(|s| (s.key, &s.mesh, s.since))
     }
 
+    /// Since when a section has had a result to draw, if it is one to draw; `None` also
+    /// for a section that is not tracked.
+    pub fn shown_since(&self, key: SectionKey) -> Option<Instant> {
+        self.sections
+            .get(&key)
+            .filter(|e| e.reached)
+            .and_then(|e| e.first_at)
+    }
+
+    /// Whether the section is of a loaded chunk.
+    pub fn tracks(&self, key: SectionKey) -> bool {
+        self.sections.contains_key(&key)
+    }
+
     /// The mesh drawn for a section, if it has one.
     pub fn mesh_mut(&mut self, key: SectionKey) -> Option<&mut M> {
         let index = self.sections.get(&key)?.mesh?;

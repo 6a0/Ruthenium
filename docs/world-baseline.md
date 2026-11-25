@@ -133,7 +133,8 @@ A ratio above compares two different pictures.
 - **Drawn since these runs:** smooth lighting with ambient occlusion, and the biomes' colours on grass, leaves and the like, both worked out when a section is meshed, as vanilla does. The vertices stay as they were (a colour and two lights each), so a frame draws the same quads at the same cost: one run each with and without smooth lighting, with a viewer on the streamed desktop, gave 2697 and 2683 FPS on average in idle and 3687 and 3695 in fly, the GPU's 0.206 and 0.120 ms in both. Meshing a section took 0.31 to 0.38 ms on a worker at the spawn in three joins, for 0.24 ms in one join lit flat and untinted. The medians above were not measured again.
 - **Drawn since, at a cost:** the terrain as vanilla's shader draws it (its texture filtering, both fogs, the fade-in of new sections), the sky, and the time of day in the light, the fog and the sky. [The picture against vanilla's](#the-picture-against-vanillas) has what that looks like and what it costs.
 - **Also drawn since those runs.** Water and lava, including fluid in waterlogged blocks, and translucent block faces such as stained glass and ice.
-- **Still left out:** block entities, entities and the player's hand, clouds, particles, the weather's rain and snow, the overlays of a burning player and of a player inside a block, the effects on the player (blindness, darkness, night vision, a conduit's) and every part of the HUD but the crosshair.
+- **Block entities since 2026-11-25:** [chests, shulker boxes, skulls and banners](#block-entities).
+- **Still left out:** the other block entities, entities and the player's hand, clouds, particles, the weather's rain and snow, the overlays of a burning player and of a player inside a block, the effects on the player (blindness, darkness, night vision, a conduit's) and every part of the HUD but the crosshair.
 - **Drawn in excess, in the first measurement:** every loaded section that had anything to draw got a mesh, and every one of those inside the view's frustum was drawn, hidden or not: at the spawn 925 sections and 522,119 quads in view, of 4,037 with a mesh among 15,288 loaded. Vanilla builds and draws only what its occlusion graph reaches, and with [cave culling](#cave-culling) so does Ruthenium, by the same rules: 405 sections and 291,723 quads, of 1,409 with a mesh. One difference remains: Ruthenium meshes what the walk reaches behind the camera too, where vanilla builds a section when it is first inside the view.
 - **The same pixels whichever way the sections are drawn.** The frame after the route's end, captured with `--screenshot`, is the same file byte for byte with direct, paged and indirect draws, at the spawn and at the end of the fly route.
 
@@ -276,6 +277,24 @@ A tick writes about 42 sprites, 0.5 MiB with padding and mips. Written in one fr
 | Fly | 2818 / 1584 / 1211 | 2804 / 1574 / 1254 | 0.214 → 0.214 |
 
 An earlier idle run with animations on, the first of its set, gave 2061 / 1123 / 810 and is not in the table; the two later pairs with the order reversed did not repeat it. No full campaign was run.
+
+## Block entities
+
+Chests, shulker boxes, skulls and banners, from the working tree on top of `80d267f`. (Beds and sign boards are block models in 26.3 and were drawn already.) The mesh workers list a section's block entities; each frame those of the sections in view within 64 blocks are drawn as instances of model parts, one draw for all instances of a part in a layer. Needs `ruthenium prepare` again, for the models; `--block-entities off` leaves them out.
+
+### Pictures
+
+Pairs at 1920 × 1080 with `--bare-picture`, `--light-flicker off --fov-effects off` on our side. Of the boxes around each model in the scene by day: the chests, shulker boxes and skulls are within one step of 255 in 99.5% to 100% of their pixels (the lowest is the ender chest's box, which vanilla's particles cross). Faces turned by 90 degrees are often exactly one step off; the likely reason is that vanilla cuts a normal to whole 127ths, which was not tried. Banners cannot be compared pixel by pixel: the two clients' cloths were at different points of their wave (77.6% to 96.7% within one step for three, 14.7% for the orange one).
+
+From behind, at midnight and without a wall, 92.7% of the whole picture is within one step and 0.33% more than 8 apart, where the water and our crosshair are.
+
+**Open: a difference in the terrain's light.** With a concrete wall six blocks high on the platform, vanilla's picture has the outer faces of the platform or the wall darker than ours (109 to 125 against 131 to 141 by day). It is the same with 6 and with 30 seconds of warm-up, and it was absent in the one pair without the wall. The faces are open to the sky. Which client agrees with the server was not checked.
+
+### Cost
+
+One pair of 20 s in release on the RTX 4060, with the desktop being encoded: 420 block entities in view (1,140 parts in 9 draws) against `--block-entities off`. The GPU's median frame is 0.270 ms for 0.185, the main thread's work 0.202 ms for 0.071, of which gathering them is 0.087. A frame without block entities in range gathers nothing. The run with them had one interval of 135 ms, in which the terrain's stage was not slow (0.45 ms at most); it was not explained.
+
+Not there: sign text, the skins of player heads (all show the default one), lids seen against vanilla in motion (their movement is tested by rule, their poses against the game's own models), a head's or a jaw's movement when powered, patterns of data packs whose picture is not named after their id, bells, conduits and the other animated ones, and the damage picture of a block being broken. Christmas chests go by UTC. No GPU fixture draws the models; the pictures above and a run under synchronisation validation without a message are what there is.
 
 ## Where a frame's time goes
 

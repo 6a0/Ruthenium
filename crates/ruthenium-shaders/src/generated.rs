@@ -19,6 +19,18 @@ pub static GUI_FRAG: Spirv = crate::spirv!("gui.frag");
 /// `glsl/gui.vert`
 pub static GUI_VERT: Spirv = crate::spirv!("gui.vert");
 
+/// `glsl/model.vert`
+pub static MODEL_VERT: Spirv = crate::spirv!("model.vert");
+
+/// `glsl/model_cutout.frag`
+pub static MODEL_CUTOUT_FRAG: Spirv = crate::spirv!("model_cutout.frag");
+
+/// `glsl/model_cutout_faces.frag`
+pub static MODEL_CUTOUT_FACES_FRAG: Spirv = crate::spirv!("model_cutout_faces.frag");
+
+/// `glsl/model_solid.frag`
+pub static MODEL_SOLID_FRAG: Spirv = crate::spirv!("model_solid.frag");
+
 /// `glsl/overlay.frag`
 pub static OVERLAY_FRAG: Spirv = crate::spirv!("overlay.frag");
 
@@ -95,6 +107,10 @@ pub static ALL: &[&Spirv] = &[
     &BLUR_FRAG,
     &GUI_FRAG,
     &GUI_VERT,
+    &MODEL_VERT,
+    &MODEL_CUTOUT_FRAG,
+    &MODEL_CUTOUT_FACES_FRAG,
+    &MODEL_SOLID_FRAG,
     &OVERLAY_FRAG,
     &OVERLAY_VERT,
     &SHAPE_FRAG,

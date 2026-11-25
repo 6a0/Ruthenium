@@ -13,6 +13,8 @@ use ruthenium_assets::{AtlasAnimations, BlockModels, Id, Image, Pack, Resources}
 use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, Reason, Stage};
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
+use ruthenium_render::block_entity::model::ModelSet;
+use ruthenium_render::block_entity::renderer::{self as block_entity, BlockEntityAssets};
 use ruthenium_render::terrain::{BlockTable, ColourMaps};
 use ruthenium_render::{MOON_PHASES, SkyImage, SkyImages, WorldAssets};
 use ruthenium_sim::blocks::Blocks;
@@ -354,6 +356,9 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         })
         .collect();
     let exports = ruthenium_prepare::exporters::exports_dir(&imported);
+    let block_entities = block_entity_assets(&exports, &resources, &sky_image)
+        .inspect_err(|e| eprintln!("[ruthenium] no block entities: {e}; run `ruthenium prepare`"))
+        .ok();
     let fluids = ruthenium_render::terrain::FluidModels::from_atlas(&atlas);
     let table = BlockTable::load(&exports, models, fluids, grass_default, &|tag, block| {
         tags.iter()
@@ -383,7 +388,40 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         underwater,
         colour_maps,
         sky,
+        block_entities,
     })
+}
+
+/// The models block entities are drawn from, and their pictures (read by `image`, from a
+/// file's path in the pack).
+fn block_entity_assets(
+    exports: &Path,
+    resources: &Resources,
+    image: &dyn Fn(&str) -> Option<SkyImage>,
+) -> Result<BlockEntityAssets, String> {
+    let file = exports.join(ruthenium_prepare::exporters::MODEL_LAYERS);
+    let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let models = ModelSet::new(&ruthenium_prepare::exporters::read_model_layers(&bytes)?)?;
+    let mut paths = block_entity::texture_paths();
+    let dir = format!("textures/entity/{}", block_entity::BANNER_DIR);
+    paths.extend(
+        resources
+            .list(&dir, |p| p.ends_with(".png"))
+            .keys()
+            .filter(|id| id.namespace() == "minecraft")
+            .filter_map(|id| {
+                let path = id.path().strip_prefix("textures/entity/")?;
+                Some(path.strip_suffix(".png")?.to_owned())
+            }),
+    );
+    let textures = paths
+        .into_iter()
+        .filter_map(|path| {
+            let picture = image(&format!("textures/entity/{path}.png"))?;
+            Some((path, picture))
+        })
+        .collect();
+    Ok(BlockEntityAssets { models, textures })
 }
 
 /// The world's drawing assets on their way: built on a thread from the first join on.

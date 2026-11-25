@@ -675,6 +675,8 @@ pub struct Frame {
     pub dimension: Arc<str>,
     pub environment: Arc<Environment>,
     pub player: PlayerState,
+    /// The lids of chests and shulker boxes that are not shut, by position.
+    pub lids: Vec<crate::block_entity::LidRecord>,
     pub entities: Vec<EntityRecord>,
     /// Entities left out because [`MAX_ENTITIES`] were already in.
     pub entities_dropped: u32,
@@ -728,6 +730,7 @@ impl Frame {
                 vehicle: None,
                 placements: 0,
             },
+            lids: Vec::new(),
             entities: Vec::new(),
             entities_dropped: 0,
             terrain_stamp: 0,
