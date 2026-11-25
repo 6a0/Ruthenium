@@ -34,10 +34,19 @@ pub enum Model {
     PlayerSlim,
     /// A cape, at its place on a player's body.
     Cape,
+    /// A piece of armour on a player with thin arms or not: on the head, the chest, the
+    /// legs or the feet (0 to 3).
+    Armour {
+        slim: bool,
+        piece: u8,
+    },
+    /// What is held that the game draws from models of its own.
+    Shield,
+    Trident,
 }
 
 impl Model {
-    pub const ALL: [Model; 18] = [
+    pub const ALL: [Model; 28] = [
         Model::Chest,
         Model::ChestLeft,
         Model::ChestRight,
@@ -56,6 +65,40 @@ impl Model {
         Model::Player,
         Model::PlayerSlim,
         Model::Cape,
+        Model::Armour {
+            slim: false,
+            piece: 0,
+        },
+        Model::Armour {
+            slim: false,
+            piece: 1,
+        },
+        Model::Armour {
+            slim: false,
+            piece: 2,
+        },
+        Model::Armour {
+            slim: false,
+            piece: 3,
+        },
+        Model::Armour {
+            slim: true,
+            piece: 0,
+        },
+        Model::Armour {
+            slim: true,
+            piece: 1,
+        },
+        Model::Armour {
+            slim: true,
+            piece: 2,
+        },
+        Model::Armour {
+            slim: true,
+            piece: 3,
+        },
+        Model::Shield,
+        Model::Trident,
     ];
 
     /// The game's model layer.
@@ -79,6 +122,23 @@ impl Model {
             Model::Player => "minecraft:player#main",
             Model::PlayerSlim => "minecraft:player_slim#main",
             Model::Cape => "minecraft:player#cape",
+            Model::Shield => "minecraft:shield#main",
+            Model::Trident => "minecraft:trident#main",
+            Model::Armour { slim, piece } => {
+                const WIDE: [&str; 4] = [
+                    "minecraft:player#helmet",
+                    "minecraft:player#chestplate",
+                    "minecraft:player#leggings",
+                    "minecraft:player#boots",
+                ];
+                const SLIM: [&str; 4] = [
+                    "minecraft:player_slim#helmet",
+                    "minecraft:player_slim#chestplate",
+                    "minecraft:player_slim#leggings",
+                    "minecraft:player_slim#boots",
+                ];
+                (if slim { SLIM } else { WIDE })[usize::from(piece.min(3))]
+            }
         }
     }
 
@@ -200,6 +260,30 @@ impl ModelSet {
         });
     }
 
+    /// Where the part `name` of a model is in the model's space (in blocks), each part
+    /// moved by `moves`: what the part carries, or holds, is placed by it.
+    pub fn part_transform(
+        &self,
+        model: Model,
+        name: &str,
+        mut moves: impl FnMut(&str, &mut Moved),
+    ) -> Option<Affine> {
+        let mut found = None;
+        self.place(
+            model,
+            |part, m| {
+                moves(part, m);
+                true
+            },
+            |part, transform| {
+                if part.name == name && found.is_none() {
+                    found = Some(transform);
+                }
+            },
+        );
+        found
+    }
+
     /// The same, with each part moved by `moves`, which says whether it and what it
     /// carries are shown. Parts are given in the model's order, each after the one that
     /// carries it.
@@ -207,12 +291,40 @@ impl ModelSet {
         &self,
         model: Model,
         out: &mut Vec<PartDraw>,
-        mut moves: impl FnMut(&str, &mut Moved) -> bool,
+        moves: impl FnMut(&str, &mut Moved) -> bool,
     ) {
+        self.place(model, moves, |part, transform| {
+            if part.quads > 0 {
+                out.push(PartDraw {
+                    first_quad: part.first_quad,
+                    quads: part.quads,
+                    transform,
+                    over: part.over,
+                });
+            }
+        });
+    }
+
+    /// Places a model's parts that are shown, each given to `placed` with where it is.
+    fn place(
+        &self,
+        model: Model,
+        mut moves: impl FnMut(&str, &mut Moved) -> bool,
+        mut each: impl FnMut(&Part, Affine),
+    ) {
+        /// As many parts as are placed without asking for memory.
+        const FEW: usize = 24;
         let parts = &self.models[model.index()];
         // None for those not shown.
-        let mut placed: Vec<Option<Affine>> = Vec::with_capacity(parts.len());
-        for part in parts {
+        let mut few = [None; FEW];
+        let mut many = Vec::new();
+        let placed: &mut [Option<Affine>] = if parts.len() <= FEW {
+            &mut few[..parts.len()]
+        } else {
+            many.resize(parts.len(), None);
+            &mut many
+        };
+        for (i, part) in parts.iter().enumerate() {
             let mut moved = Moved {
                 position: part.position,
                 rotation: part.rotation,
@@ -221,7 +333,6 @@ impl ModelSet {
             let shown = moves(&part.name, &mut moved);
             let parent = part.parent.map_or(Some(Affine::IDENTITY), |p| placed[p]);
             let Some(parent) = parent.filter(|_| shown) else {
-                placed.push(None);
                 continue;
             };
             let mut transform = parent.translate(moved.position.map(|c| c / 16.0));
@@ -241,15 +352,8 @@ impl ModelSet {
             if part.scale != [1.0; 3] {
                 transform = transform.scale(part.scale);
             }
-            placed.push(Some(transform));
-            if part.quads > 0 {
-                out.push(PartDraw {
-                    first_quad: part.first_quad,
-                    quads: part.quads,
-                    transform,
-                    over: part.over,
-                });
-            }
+            placed[i] = Some(transform);
+            each(part, transform);
         }
     }
 }

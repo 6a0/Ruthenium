@@ -15,6 +15,7 @@ use crate::item::{Class, Stack, animation};
 
 /// Shared flags (`Entity.DATA_SHARED_FLAGS_ID`).
 const FLAG_ON_FIRE: u8 = 1;
+const FLAG_SHIFT_KEY_DOWN: u8 = 1 << 1;
 const FLAG_INVISIBLE: u8 = 1 << 5;
 const FLAG_FALL_FLYING: u8 = 1 << 7;
 /// Living flags: an item is used, by the off hand, a riptide spin.
@@ -51,6 +52,8 @@ pub enum ArmPose {
     Spyglass,
     TootHorn,
     Brush,
+    /// A spear held ready.
+    Spear,
 }
 
 impl SkinSource {
@@ -200,6 +203,8 @@ pub struct Avatar {
     cloak_old: [f64; 3],
     main_hand: Stack,
     off_hand: Stack,
+    /// What it wears on its head, chest, legs and feet.
+    worn: [Stack; 4],
     chest: Chest,
     use_item: Stack,
     use_remaining: i32,
@@ -279,13 +284,25 @@ pub struct AvatarRecord {
     pub right_arm: ArmPose,
     /// The ticks an item has been used for and whether the off hand does.
     pub using: Option<(i32, bool)>,
+    /// The ticks its use has left.
+    pub use_remaining: i32,
     pub age: i32,
     pub scale: f32,
     pub size: [f32; 2],
     pub eye_height: f32,
     /// The old and new body angle of the living vehicle it rides.
     pub vehicle_body: Option<(f32, f32)>,
+    /// What its main hand and its other hand hold.
+    pub held: [Stack; 2],
+    /// What it wears on its head, chest, legs and feet ([`WORN_HEAD`] to [`WORN_FEET`]).
+    pub worn: [Stack; 4],
 }
+
+/// The places of [`AvatarRecord::worn`].
+pub const WORN_HEAD: usize = 0;
+pub const WORN_CHEST: usize = 1;
+pub const WORN_LEGS: usize = 2;
+pub const WORN_FEET: usize = 3;
 
 /// Turns `old` by whole turns until `now` is within half of one of it.
 fn unwrap(now: f32, old: &mut f32) {
@@ -339,6 +356,7 @@ impl Avatar {
             cloak_old: [0.0; 3],
             main_hand: Stack::empty(),
             off_hand: Stack::empty(),
+            worn: std::array::from_fn(|_| Stack::empty()),
             chest: Chest::Bare,
             use_item: Stack::empty(),
             use_remaining: 0,
@@ -400,6 +418,11 @@ impl Avatar {
 
     pub(crate) fn set_chest(&mut self, chest: Chest) {
         self.chest = chest;
+    }
+
+    /// What it wears in one of [`WORN_HEAD`] to [`WORN_FEET`].
+    pub(crate) fn set_worn(&mut self, place: usize, stack: Stack) {
+        self.worn[place] = stack;
     }
 
     fn using(&self) -> bool {
@@ -590,10 +613,21 @@ impl Avatar {
                 animation::SPYGLASS => return ArmPose::Spyglass,
                 animation::TOOT_HORN => return ArmPose::TootHorn,
                 animation::BRUSH => return ArmPose::Brush,
+                animation::SPEAR => return ArmPose::Spear,
                 _ => {}
             }
         }
-        ArmPose::Item
+        // `usesSpearPose`: a stab of this hand, or a spear in it. (The game goes by the
+        // `spears` tag, whose items are those named so.)
+        let stabs = self
+            .swing
+            .current
+            .is_some_and(|s| s.off_hand == off_hand && s.kind == 2);
+        if stabs || stack.c.name.ends_with("_spear") {
+            ArmPose::Spear
+        } else {
+            ArmPose::Item
+        }
     }
 
     /// The left and the right arm's poses.
@@ -651,11 +685,14 @@ impl Avatar {
             using: self
                 .using()
                 .then(|| (self.ticks_using(), self.off_hand_used())),
+            use_remaining: self.use_remaining,
             age: 0,
             scale: 1.0,
             size: [0.6, 1.8],
             eye_height: 1.62,
             vehicle_body: None,
+            held: [self.main_hand.clone(), self.off_hand.clone()],
+            worn: self.worn.clone(),
         }
     }
 
@@ -673,6 +710,11 @@ impl Avatar {
 
     pub(crate) fn is_invisible(&self) -> bool {
         self.flags & FLAG_INVISIBLE != 0
+    }
+
+    /// `isDiscrete`: it sneaks.
+    pub(crate) fn is_discrete(&self) -> bool {
+        self.flags & FLAG_SHIFT_KEY_DOWN != 0
     }
 }
 
@@ -909,6 +951,46 @@ mod tests {
             c: Arc::new(c),
             ..Stack::empty()
         }
+    }
+
+    #[test]
+    fn a_spear_is_held_ready_and_a_stab_is_made_as_with_one() {
+        use crate::item::Components;
+        let named = |name: &'static str| {
+            stack(
+                9,
+                Components {
+                    name,
+                    ..Components::default()
+                },
+            )
+        };
+        let mut a = player();
+        a.set_held(false, named("minecraft:iron_spear"));
+        a.set_held(true, named("minecraft:stick"));
+        assert_eq!(a.arm_poses(), (ArmPose::Item, ArmPose::Spear));
+        // A stab of the other hand, whatever it holds; a whack is not one.
+        a.swing(Swing {
+            off_hand: true,
+            kind: 2,
+            duration: 6,
+        });
+        assert_eq!(a.arm_poses(), (ArmPose::Spear, ArmPose::Spear));
+        let mut b = player();
+        b.set_held(true, named("minecraft:stick"));
+        b.swing(Swing {
+            off_hand: true,
+            kind: 1,
+            duration: 6,
+        });
+        assert_eq!(b.arm_poses(), (ArmPose::Item, ArmPose::Empty));
+        // What is worn and held goes into the record, the main hand first.
+        a.set_worn(WORN_LEGS, named("minecraft:iron_leggings"));
+        let r = a.record();
+        assert_eq!(r.held[0].c.name, "minecraft:iron_spear");
+        assert_eq!(r.held[1].c.name, "minecraft:stick");
+        assert!(r.worn[WORN_HEAD].is_empty() && !r.worn[WORN_LEGS].is_empty());
+        assert_eq!(r.use_remaining, 0);
     }
 
     #[test]

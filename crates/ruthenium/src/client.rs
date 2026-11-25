@@ -181,6 +181,8 @@ pub struct Options {
     /// Whether block entities (chests, skulls, banners, the text of signs) are drawn (the default).
     pub block_entities: Option<bool>,
     pub players: Option<bool>,
+    /// Whether entities cast shadows (the default).
+    pub entity_shadows: Option<bool>,
     /// Whether animated textures play (the default) or hold still.
     pub animations: Option<bool>,
     /// Whether the field of view narrows in water and lava (the default).
@@ -247,6 +249,7 @@ impl Options {
             translucent: None,
             block_entities: None,
             players: None,
+            entity_shadows: None,
             animations: None,
             fov_effects: None,
         };
@@ -440,7 +443,7 @@ impl Options {
                         ))?);
                 }
                 "--fog" | "--light-flicker" | "--translucent" | "--animations"
-                | "--fov-effects" | "--block-entities" | "--players" => {
+                | "--fov-effects" | "--block-entities" | "--players" | "--entity-shadows" => {
                     let on = match value("on or off")?.as_str() {
                         "on" => true,
                         "off" => false,
@@ -453,6 +456,7 @@ impl Options {
                         "--fov-effects" => o.fov_effects = Some(on),
                         "--block-entities" => o.block_entities = Some(on),
                         "--players" => o.players = Some(on),
+                        "--entity-shadows" => o.entity_shadows = Some(on),
                         _ => o.translucent = Some(on),
                     }
                 }
@@ -750,6 +754,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     if let Some(on) = opts.players {
         renderer.set_players(on);
+    }
+    if let Some(on) = opts.entity_shadows {
+        renderer.set_entity_shadows(on);
     }
     if let Some(on) = opts.animations {
         renderer.set_animate(on);
@@ -1391,6 +1398,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 "translucent": renderer.translucent(),
                 "block_entities": renderer.block_entities(),
                 "players": renderer.players(),
+                "entity_shadows": renderer.entity_shadows(),
                 "animations": renderer.animate(),
                 "fov_effects": renderer.fov_effects(),
                 "light_flicker": renderer.atmosphere_options().flicker,
@@ -1625,6 +1633,8 @@ fn terrain_json(s: &ruthenium_render::WorldStats) -> Value {
         "translucent_sections_drawn": s.translucent_sections,
         "block_entities_drawn": s.block_entities.drawn,
         "players_drawn": s.block_entities.players,
+        "names_drawn": s.block_entities.names,
+        "shadow_pieces": s.block_entities.shadows,
         "block_entity_parts": s.block_entities.parts,
         "sign_texts": s.block_entities.texts,
         "sign_glyphs": s.block_entities.glyphs,

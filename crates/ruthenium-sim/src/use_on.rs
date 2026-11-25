@@ -746,10 +746,9 @@ fn minecart(w: &World<'_>, p: &mut LocalPlayer, hand: Hand, hit: &BlockHit) -> O
 fn potion(w: &mut World<'_>, p: &mut LocalPlayer, hand: Hand, hit: &BlockHit) -> Outcome {
     let stack = p.hand(hand).clone();
     let water = Potion::Water.id() as i32;
-    let is_water =
-        stack.patch.added.iter().any(
-            |(_, c)| matches!(c, Component::PotionContents { potion: Some(id) } if *id == water),
-        );
+    let is_water = stack.patch.added.iter().any(
+        |(_, c)| matches!(c, Component::PotionContents { potion: Some(id), .. } if *id == water),
+    );
     let s = w.get(hit.pos);
     if hit.direction == Direction::Down
         || !w.tags.is(s, "minecraft:convertible_to_mud")
@@ -1197,6 +1196,7 @@ mod tests {
                 DataComponentType::PotionContents.id() as i32,
                 Component::PotionContents {
                     potion: Some(Potion::Water.id() as i32),
+                    custom_color: None,
                 },
             )],
             removed: Vec::new(),

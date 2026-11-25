@@ -597,6 +597,8 @@ pub struct EntityRecord {
     pub vehicle: Option<i32>,
     /// A player's or mannequin's pose and skin.
     pub avatar: Option<Box<crate::avatar::AvatarRecord>>,
+    /// What is written over its head, if the player is shown it.
+    pub name: Option<crate::scoreboard::NameRecord>,
 }
 
 /// The local player as drawing and the HUD need it.
@@ -1594,6 +1596,7 @@ mod tests {
                         baby: false,
                         vehicle: None,
                         avatar: None,
+                        name: None,
                     }));
                 },
             );

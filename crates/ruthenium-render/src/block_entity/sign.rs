@@ -104,8 +104,9 @@ pub(crate) struct TextQuad {
     /// How far the top and the bottom are moved to the right.
     pub slant: [f32; 2],
     pub nearer: f32,
-    /// 0xRRGGBB.
+    /// 0xRRGGBB, and how much of what is behind it it covers, of 255.
     pub colour: u32,
+    pub alpha: u8,
     pub ink: Ink,
     /// How far from it its outline lies; nothing for bars, which have none.
     pub around: f32,
@@ -181,6 +182,7 @@ fn put(out: &mut Vec<TextQuad>, ink: char, glyph: &Glyph, style: Style, at: [f32
             slant,
             nearer,
             colour,
+            alpha: u8::MAX,
             ink: Ink::Char(ink),
             around: glyph.shadow_offset,
         });
@@ -189,6 +191,59 @@ fn put(out: &mut Vec<TextQuad>, ink: char, glyph: &Glyph, style: Style, at: [f32
     if style.bold {
         quad(glyph.bold_offset, BOLD_NEARER);
     }
+}
+
+/// How wide a line is: what its characters move the pen by.
+pub(crate) fn width(line: &[(char, Style)], font: &Font) -> f32 {
+    line.iter()
+        .map(|(c, s)| font.glyph(*c).advance(s.bold))
+        .sum()
+}
+
+/// Lays out one line with the pen starting at `at`, in the colour `own` where a character
+/// has none of its own: its glyphs, then its bars. Returns where the pen ends.
+pub(crate) fn line(
+    out: &mut TextLayout,
+    line: &[(char, Style)],
+    font: &Font,
+    pick: &mut dyn FnMut(usize) -> usize,
+    [left, top]: [f32; 2],
+    own: u32,
+) -> f32 {
+    let mut x = left;
+    let mut bars = Vec::new();
+    let mut before = None;
+    for &(c, style) in line {
+        out.obfuscated |= style.obfuscated && c != ' ';
+        let c = drawn(c, style, font, pick);
+        let glyph = font.glyph(c);
+        let advance = glyph.advance(style.bold);
+        let colour = style.color.unwrap_or(own);
+        put(&mut out.text, c, &glyph, style, [x, top], colour);
+        // A run's bars begin a little before it.
+        let from = if before == Some(style) { x } else { x - 1.0 };
+        let mut bar = |y0: f32, y1: f32| {
+            bars.push(TextQuad {
+                place: [from, top + y0, x + advance, top + y1],
+                slant: [0.0; 2],
+                nearer: BAR_NEARER,
+                colour,
+                alpha: u8::MAX,
+                ink: Ink::Bar,
+                around: 0.0,
+            });
+        };
+        if style.strikethrough {
+            bar(3.5, 4.5);
+        }
+        if style.underlined {
+            bar(8.0, 9.0);
+        }
+        before = Some(style);
+        x += advance;
+    }
+    out.text.append(&mut bars);
+    x
 }
 
 /// Lays out one side of a sign: a hanging one or not.
@@ -202,45 +257,10 @@ pub(crate) fn layout(
     let (own, _) = text.colours();
     let mut out = TextLayout::default();
     for (i, line) in text.lines.iter().enumerate() {
-        let line = first_piece(line, font, width);
-        let taken: f32 = line
-            .iter()
-            .map(|(c, s)| font.glyph(*c).advance(s.bold))
-            .sum();
-        let left = -((taken.ceil() as i32) / 2) as f32;
+        let piece = first_piece(line, font, width);
+        let left = -((self::width(piece, font).ceil() as i32) / 2) as f32;
         let top = (i as i32 * height - LINES as i32 * height / 2) as f32;
-        let mut x = left;
-        let mut bars = Vec::new();
-        let mut before = None;
-        for &(c, style) in line {
-            out.obfuscated |= style.obfuscated && c != ' ';
-            let c = drawn(c, style, font, pick);
-            let glyph = font.glyph(c);
-            let advance = glyph.advance(style.bold);
-            let colour = style.color.unwrap_or(own);
-            put(&mut out.text, c, &glyph, style, [x, top], colour);
-            // A run's bars begin a little before it.
-            let from = if before == Some(style) { x } else { x - 1.0 };
-            let mut bar = |y0: f32, y1: f32| {
-                bars.push(TextQuad {
-                    place: [from, top + y0, x + advance, top + y1],
-                    slant: [0.0; 2],
-                    nearer: BAR_NEARER,
-                    colour,
-                    ink: Ink::Bar,
-                    around: 0.0,
-                });
-            };
-            if style.strikethrough {
-                bar(3.5, 4.5);
-            }
-            if style.underlined {
-                bar(8.0, 9.0);
-            }
-            before = Some(style);
-            x += advance;
-        }
-        out.text.append(&mut bars);
+        self::line(&mut out, piece, font, pick, [left, top], own);
     }
     out
 }
@@ -277,7 +297,8 @@ pub(crate) fn records(
         put("nearer", &[q.nearer.to_bits()]);
         put("texels", &[slot.x | slot.y << 16]);
         put("size", &[slot.width | slot.height << 16]);
-        put("colour", &[super::renderer::record_colour(q.colour)]);
+        let colour = super::renderer::record_colour(q.colour) & 0x00FF_FFFF;
+        put("colour", &[colour | u32::from(q.alpha) << 24]);
         put("texture", &[slot.page as u32]);
         put("around", &[q.around.to_bits()]);
         out.push(r);
@@ -859,6 +880,7 @@ mod tests {
             slant: [0.0; 2],
             nearer: 0.0,
             colour: 0,
+            alpha: u8::MAX,
             ink: Ink::Char('a'),
             around: 1.0,
         };
@@ -956,6 +978,7 @@ mod tests {
             slant: [5.0, 6.0],
             nearer: 7.0,
             colour: 0x123456,
+            alpha: u8::MAX,
             ink: Ink::Char('a'),
             around: 8.0,
         };

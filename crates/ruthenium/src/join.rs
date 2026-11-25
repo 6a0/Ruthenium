@@ -8,11 +8,13 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use ruthenium_assets::atlas::AtlasOptions;
+use ruthenium_assets::item::ItemModels;
 use ruthenium_assets::zip::Zip;
 use ruthenium_assets::{AtlasAnimations, BlockModels, Font, Id, Image, Pack, Resources};
 use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, Reason, Stage};
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
+use ruthenium_render::block_entity::equipment::{self, EquipmentSet};
 use ruthenium_render::block_entity::model::ModelSet;
 use ruthenium_render::block_entity::renderer::{self as block_entity, BlockEntityAssets};
 use ruthenium_render::terrain::{BlockTable, ColourMaps};
@@ -322,6 +324,37 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         .as_ref()
         .filter(|map| map.width == 256 && map.height == 256)
         .map_or(0xFFFF_00FF, |map| map.get(127, 127));
+    // What is held: every item definition's models, with the atlas of the items' own
+    // pictures.
+    let items_started = std::time::Instant::now();
+    let items = ruthenium_assets::atlas::atlas_def("items")
+        .and_then(|def| {
+            ruthenium_assets::atlas::build(&resources, def, &options)
+                .inspect_err(|e| eprintln!("[ruthenium] no item atlas: {e}"))
+                .ok()
+        })
+        .map(|item_atlas| {
+            let models = ItemModels::bake(&resources, &atlas, &item_atlas, grass_map.as_ref());
+            for w in &models.warnings {
+                eprintln!("[ruthenium] item models: {w}");
+            }
+            let (meshes, quads) = models.counts();
+            eprintln!(
+                "[ruthenium] {} item definitions with {meshes} models of {quads} quads, item atlas {}x{}, in {:.0?}",
+                models.len(),
+                item_atlas.width,
+                item_atlas.height,
+                items_started.elapsed(),
+            );
+            block_entity::ItemAssets {
+                models,
+                atlas: SkyImage {
+                    width: item_atlas.width,
+                    height: item_atlas.height,
+                    rgba: item_atlas.levels[0].to_rgba8(),
+                },
+            }
+        });
     // The sun, the moon and the End's sky, as bytes of red, green, blue and alpha.
     let sky_image = |file: &str| {
         colour_map(file).map(|image| SkyImage {
@@ -358,9 +391,12 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         })
         .collect();
     let exports = ruthenium_prepare::exporters::exports_dir(&imported);
-    let block_entities = block_entity_assets(&exports, &resources, &sky_image)
+    let mut block_entities = block_entity_assets(&exports, &resources, &sky_image)
         .inspect_err(|e| eprintln!("[ruthenium] no block entities: {e}; run `ruthenium prepare`"))
         .ok();
+    if let Some(b) = &mut block_entities {
+        b.items = items;
+    }
     let fluids = ruthenium_render::terrain::FluidModels::from_atlas(&atlas);
     let table = BlockTable::load(&exports, models, fluids, grass_default, &|tag, block| {
         tags.iter()
@@ -405,23 +441,80 @@ fn block_entity_assets(
     let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
     let models = ModelSet::new(&ruthenium_prepare::exporters::read_model_layers(&bytes)?)?;
     let mut paths = block_entity::texture_paths();
-    let dir = format!("textures/entity/{}", block_entity::BANNER_DIR);
-    paths.extend(
-        resources
-            .list(&dir, |p| p.ends_with(".png"))
-            .keys()
-            .filter(|id| id.namespace() == "minecraft")
-            .filter_map(|id| {
-                let path = id.path().strip_prefix("textures/entity/")?;
-                Some(path.strip_suffix(".png")?.to_owned())
-            }),
-    );
+    for folder in [block_entity::BANNER_DIR, block_entity::SHIELD_DIR] {
+        let dir = format!("textures/entity/{folder}");
+        paths.extend(
+            resources
+                .list(&dir, |p| p.ends_with(".png"))
+                .keys()
+                .filter(|id| id.namespace() == "minecraft")
+                .filter_map(|id| {
+                    let path = id.path().strip_prefix("textures/entity/")?;
+                    Some(path.strip_suffix(".png")?.to_owned())
+                }),
+        );
+    }
     let textures = paths
         .into_iter()
         .filter_map(|path| {
             let picture = image(&format!("textures/entity/{path}.png"))?;
             Some((path, picture))
         })
+        .collect();
+    // What is worn: every equipment asset, the pictures of its layers, and the trims with
+    // their palettes.
+    let listed = |dir: &str, suffix: &str| -> Vec<(Id, String)> {
+        resources
+            .list(dir, |p| p.ends_with(suffix))
+            .keys()
+            .filter(|id| id.namespace() == "minecraft")
+            .filter_map(|id| {
+                let below = id.path().strip_prefix(dir)?.strip_prefix('/')?;
+                Some((id.clone(), below.strip_suffix(suffix)?.to_owned()))
+            })
+            .collect()
+    };
+    let json = |id: &Id| -> Option<serde_json::Value> {
+        serde_json::from_slice(&resources.get(id)?.read().ok()?).ok()
+    };
+    let equipment_files: Vec<(String, serde_json::Value)> = listed("equipment", ".json")
+        .into_iter()
+        .filter_map(|(id, name)| Some((name, json(&id)?)))
+        .collect();
+    let equipment = EquipmentSet::new(equipment_files.iter().map(|(n, v)| (n.as_str(), v)));
+    let mut textures: Vec<(String, SkyImage)> = textures;
+    for dir in [
+        equipment::HUMANOID_DIR,
+        equipment::LEGGINGS_DIR,
+        equipment::WINGS_DIR,
+    ] {
+        for (_, name) in listed(&format!("textures/entity/{dir}"), ".png") {
+            let path = format!("{dir}/{name}");
+            if let Some(picture) = image(&format!("textures/entity/{path}.png")) {
+                textures.push((path, picture));
+            }
+        }
+    }
+    let mut trims = Vec::new();
+    for kind in ["humanoid", "humanoid_leggings"] {
+        let dir = format!("textures/trims/entity/{kind}");
+        for (id, name) in listed(&dir, ".png") {
+            let Some(picture) = image(id.path()) else {
+                continue;
+            };
+            // The palette its colours are of, from its metadata.
+            let palette = Id::minecraft(&format!("{}.mcmeta", id.path()))
+                .and_then(|meta| json(&meta))
+                .and_then(|m| {
+                    let id = m.get("palette")?.get("base_palette")?.as_str()?.to_owned();
+                    Some(id.strip_prefix("minecraft:").unwrap_or(&id).to_owned())
+                });
+            trims.push((format!("trims/entity/{kind}/{name}"), picture, palette));
+        }
+    }
+    let palettes = listed("textures/palettes", ".png")
+        .into_iter()
+        .filter_map(|(id, name)| Some((name, image(id.path())?)))
         .collect();
     let font = Font::load(resources, &Id::minecraft("default").expect("a valid id"));
     for w in &font.warnings {
@@ -437,6 +530,15 @@ fn block_entity_assets(
         textures,
         font,
         lang,
+        shadow: image("textures/misc/shadow.png"),
+        equipment,
+        trims,
+        palettes,
+        glint: [
+            image("textures/misc/enchanted_glint_armor.png"),
+            image("textures/misc/enchanted_glint_item.png"),
+        ],
+        items: None,
     })
 }
 

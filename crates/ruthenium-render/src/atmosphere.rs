@@ -303,6 +303,8 @@ pub struct Look {
     pub sky: Sky,
     pub lightmap: LightmapInputs,
     pub water: Option<WaterOverlay>,
+    /// What the sky's light lacks to its full strength, as of the tick (`getSkyDarken`).
+    pub sky_darken: i32,
 }
 
 fn float(v: Value) -> f32 {
@@ -561,6 +563,7 @@ impl Atmosphere {
             sky,
             lightmap: self.lightmap,
             water,
+            sky_darken: (15.0 - float(self.probe.value(Attribute::SkyLightLevel, 1.0))) as i32,
         }
     }
 }

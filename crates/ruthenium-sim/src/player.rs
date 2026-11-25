@@ -3963,6 +3963,7 @@ mod tests {
                         K::Equippable.id() as i32,
                         Component::Equippable {
                             slot: 3,
+                            asset: None,
                             swappable: true,
                             damage_on_hurt: true,
                             equip_on_interact: false,

@@ -15,6 +15,7 @@ pub mod atlas;
 pub mod font;
 pub mod id;
 pub mod image;
+pub mod item;
 pub mod meta;
 pub mod mipmap;
 pub mod model;

@@ -4,7 +4,8 @@
 // frame's data.
 //
 // As vanilla's entity shader: two lights shade a face by its normal, and the light map is
-// sampled here, per vertex. Pipelines that draw both sides of a face shade its back by
+// sampled here, per vertex. What is enchanted has its glint's picture laid over it, moved
+// and turned by the glint's record. Pipelines that draw both sides of a face shade its back by
 // the opposite of its normal.
 
 #include "push.glsl"
@@ -29,6 +30,9 @@ layout(location = 3) out float v_spherical;
 layout(location = 4) out float v_cylindrical;
 layout(location = 5) flat out uint v_texture;
 layout(location = 6) flat out vec3 v_added;
+layout(location = 7) out vec2 v_glint_uv;
+layout(location = 8) flat out uint v_glint_texture;
+layout(location = 9) flat out float v_glint_strength;
 
 // A banner's patterns lie in its cloth's plane: their depths have to come out the same.
 invariant gl_Position;
@@ -53,6 +57,9 @@ void main() {
         v_cylindrical = 0.0;
         v_texture = 0u;
         v_added = vec3(0.0);
+        v_glint_uv = vec2(0.0);
+        v_glint_texture = 0u;
+        v_glint_strength = 0.0;
         return;
     }
     uint part = pc.parts + uint(gl_InstanceIndex) * MODEL_PART_WORDS;
@@ -75,7 +82,19 @@ void main() {
         sampler2D(u_textures[nonuniformEXT(world_lightmap(pc.world))], u_samplers[SAMPLER_LINEAR_CLAMP]),
         light_uv, 0.0);
     vec4 color = unpackUnorm4x8(model_part_colour(part)) * lit;
-    bool hurt = model_part_overlay(part) != 0u;
+    uint effects = model_part_overlay(part);
+    bool hurt = (effects & 1u) != 0u;
+    uint glint = effects >> 8u;
+    if (glint != 0u) {
+        vec3 uv = vec3(a_uv, 1.0);
+        v_glint_uv = vec2(dot(glint_row_u(glint), uv), dot(glint_row_v(glint), uv));
+        v_glint_texture = glint_texture(glint);
+        v_glint_strength = glint_strength(glint);
+    } else {
+        v_glint_uv = vec2(0.0);
+        v_glint_texture = 0u;
+        v_glint_strength = 0.0;
+    }
     color.rgb *= hurt ? HURT_KEEPS : 1.0;
     v_added = hurt ? vec3(1.0 - HURT_KEEPS, 0.0, 0.0) * lit.rgb : vec3(0.0);
     v_front = vec4(color.rgb * shade(facing), color.a);

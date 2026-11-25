@@ -51,7 +51,7 @@ use ruthenium_sim::avatar::SkinSource;
 use ruthenium_sim::scene::{Frame, Scene};
 
 use atmosphere::{Atmosphere, Look, WaterOverlay};
-use block_entity::renderer::BlockEntityRenderer;
+use block_entity::renderer::{BlockEntityRenderer, PlayerView};
 use block_entity::skins::LoadedSkin;
 use ruthenium_gpu::SamplerId;
 use ruthenium_sim::environment::CardinalLight;
@@ -216,11 +216,12 @@ unsafe fn draw_world(
     }
     // SAFETY: the caller's.
     unsafe { world.draw(pass, frame_data, view, &look.fog) };
-    if let (Some((models, cardinal)), Some((lightmap, indices))) = (models, world.shared()) {
+    let mut models = models.zip(world.shared());
+    if let Some(((models, cardinal), (lightmap, indices))) = &mut models {
         // SAFETY: the caller's; the world is ready, and with it what it shares.
         unsafe {
             models.draw(
-                pass, frame_data, view, &look.fog, cardinal, lightmap, indices,
+                pass, frame_data, view, &look.fog, *cardinal, *lightmap, *indices,
             );
         }
     }
@@ -230,6 +231,10 @@ unsafe fn draw_world(
     // What is seen through comes last: over the opaque world and the sky.
     // SAFETY: the caller's.
     unsafe { world.draw_translucent(pass, frame_data) };
+    if let Some(((models, _), _)) = &mut models {
+        // SAFETY: the caller's; `draw` has run for this frame just above.
+        unsafe { models.draw_over(pass) };
+    }
     if let Some(f) = front
         && let Some((first, bytes)) = frame_data.alloc(1, gui::QUAD_BYTES)
     {
@@ -302,6 +307,8 @@ pub struct Renderer {
     show_block_entities: bool,
     /// Whether players are drawn.
     show_players: bool,
+    /// Whether entities cast shadows.
+    entity_shadows: bool,
     /// The terrain's part of the last frame.
     world_times: WorldTimes,
     /// The number of the last frame recorded.
@@ -412,6 +419,7 @@ impl Renderer {
             block_entities: None,
             show_block_entities: true,
             show_players: true,
+            entity_shadows: true,
             world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
@@ -457,6 +465,9 @@ impl Renderer {
                     .inspect_err(|e| eprintln!("[render] no block entities: {e}"))
                     .ok()
             });
+            if let Some(b) = &mut self.block_entities {
+                b.set_shadows(self.entity_shadows);
+            }
             // Without its picture, water is in front of nothing.
             self.underwater = assets.underwater.as_ref().and_then(|i| {
                 self.textures
@@ -542,6 +553,18 @@ impl Renderer {
 
     pub fn players(&self) -> bool {
         self.show_players
+    }
+
+    /// Whether entities cast shadows (they do unless said otherwise).
+    pub fn set_entity_shadows(&mut self, on: bool) {
+        self.entity_shadows = on;
+        if let Some(b) = &mut self.block_entities {
+            b.set_shadows(on);
+        }
+    }
+
+    pub fn entity_shadows(&self) -> bool {
+        self.entity_shadows
     }
 
     /// The skins that are wanted for what is in view and have not been asked for.
@@ -1136,7 +1159,7 @@ impl Renderer {
         let cardinal = world.as_ref().map_or(CardinalLight::Default, |w| {
             w.frame.environment.cardinal_light
         });
-        if let (Some(w), Some((view, ..)), Some(renderer), Some(models)) =
+        if let (Some(w), Some((view, look, _)), Some(renderer), Some(models)) =
             (&world, &view, &mut self.world, &mut self.block_entities)
         {
             let started = std::time::Instant::now();
@@ -1153,16 +1176,14 @@ impl Renderer {
                 );
             }
             if self.show_players {
-                renderer.gather_players(
-                    models,
-                    w.scene,
-                    w.frame,
-                    w.view_distance,
-                    w.partial_tick,
-                    w.camera.position,
+                let seen = PlayerView {
+                    camera: &w.camera,
                     view,
-                    &self.textures,
-                );
+                    view_distance: w.view_distance,
+                    partial: w.partial_tick,
+                    sky_darken: look.sky_darken,
+                };
+                renderer.gather_players(models, w.scene, w.frame, &seen, &self.textures);
             }
             self.world_times.stage_ns += started.elapsed().as_nanos() as u64;
         }

@@ -368,3 +368,175 @@ fn block_models_bake_from_the_game() {
     }
     eprintln!("{quads} quads in all, {translucent} translucent; {empty} states draw nothing");
 }
+
+#[test]
+fn item_models_bake_from_the_game() {
+    use ruthenium_assets::item::{Drawn, Held, ItemModels, Special, Tint};
+    let Some(res) = vanilla() else {
+        eprintln!("RUTHENIUM_GAME_DIR not set; skipped");
+        return;
+    };
+    let options = AtlasOptions::default();
+    let build = |name: &str| atlas::build(&res, atlas::atlas_def(name).unwrap(), &options).unwrap();
+    let (blocks, items) = (build("blocks"), build("items"));
+    let start = std::time::Instant::now();
+    let models = ItemModels::bake(&res, &blocks, &items, None);
+    let (meshes, quads) = models.counts();
+    eprintln!(
+        "{} item definitions, {meshes} models, {quads} quads in {:.0?}",
+        models.len(),
+        start.elapsed()
+    );
+    for w in &models.warnings {
+        eprintln!("{w}");
+    }
+    assert!(models.warnings.is_empty());
+    assert!(models.len() > 1500);
+    let none = |_: &str, _: bool| false;
+    let held = Held {
+        context: "thirdperson_righthand",
+        left_handed: false,
+        using: false,
+        use_ticks: 0,
+        use_remaining: 0,
+        damage: None,
+        count: (1, 64),
+        charge: "none",
+        charge_ticks: 25.0,
+        trim_material: None,
+        block_state: &[],
+        has_component: &none,
+    };
+    let resolve = |id: &str, held: &Held<'_>| {
+        let mut out = Vec::new();
+        models.resolve(id, held, &mut out);
+        out.into_iter()
+            .map(|d| match d {
+                Drawn::Model { mesh, tints, .. } => (mesh, tints.to_vec(), None),
+                Drawn::Special { special, base, .. } => (base, Vec::new(), Some(special)),
+            })
+            .collect::<Vec<_>>()
+    };
+    // A sword: one flat model, its picture's front and back and its edges, held as tools
+    // are.
+    let sword = resolve("minecraft:diamond_sword", &held);
+    assert_eq!(sword.len(), 1);
+    let mesh = models.mesh(sword[0].0).unwrap();
+    assert!(mesh.quads.len() > 40, "{}", mesh.quads.len());
+    assert_eq!(mesh.runs.len(), 1);
+    assert!(!mesh.runs[0].block_atlas && !mesh.runs[0].translucent);
+    assert_eq!(mesh.runs[0].tint_index, 0);
+    let right = mesh.hands[0].unwrap();
+    assert_eq!(right.rotation, [0.0, -90.0, 55.0]);
+    assert_eq!(right.translation, [0.0, 0.25, 0.03125]);
+    assert_eq!(right.scale, [0.85; 3]);
+    assert_eq!(mesh.hands[1].unwrap().rotation, [0.0, 90.0, -55.0]);
+    // Its front spans the model, a sixteenth of a block thick.
+    let front = &mesh.quads[0];
+    assert!(front.positions.iter().all(|p| p[2] == 8.5 / 16.0));
+    assert!(
+        front
+            .uvs
+            .iter()
+            .all(|uv| uv.iter().all(|c| (0.0..=1.0).contains(c)))
+    );
+    // An apple is placed as its parent says: the left hand as the right.
+    let apple = models.mesh(resolve("minecraft:apple", &held)[0].0).unwrap();
+    assert_eq!(apple.hands[0].unwrap().scale, [0.55; 3]);
+    assert_eq!(apple.hands[0], apple.hands[1]);
+    assert!(apple.head.is_some());
+    // A block: six faces of the block atlas, placed as blocks are.
+    let stone = models.mesh(resolve("minecraft:stone", &held)[0].0).unwrap();
+    assert_eq!(stone.quads.len(), 6);
+    assert!(
+        stone
+            .runs
+            .iter()
+            .all(|r| r.block_atlas && r.tint_index == -1)
+    );
+    assert_eq!(stone.hands[0].unwrap().rotation, [75.0, 45.0, 0.0]);
+    assert_eq!(stone.hands[0].unwrap().scale, [0.375; 3]);
+    // Grass is coloured by a constant, a potion by its contents, leather by its dye.
+    let grass = resolve("minecraft:grass_block", &held);
+    assert!(matches!(grass[0].1[..], [Tint::Constant(_)]));
+    assert!(
+        models
+            .mesh(grass[0].0)
+            .unwrap()
+            .runs
+            .iter()
+            .any(|r| r.tint_index == 0)
+    );
+    let potion = resolve("minecraft:potion", &held);
+    assert_eq!(potion[0].1, [Tint::Potion(0x38_5DC6)]);
+    let potion = models.mesh(potion[0].0).unwrap();
+    assert_eq!(
+        potion.runs.iter().map(|r| r.tint_index).collect::<Vec<_>>(),
+        [0, 1]
+    );
+    let helmet = resolve("minecraft:leather_helmet", &held);
+    assert_eq!(helmet[0].1, [Tint::Dye(0xA0_6540)]);
+    // A trimmed one is another model.
+    let trimmed = Held {
+        trim_material: Some("minecraft:gold"),
+        ..held
+    };
+    assert_ne!(
+        resolve("minecraft:leather_helmet", &trimmed)[0].0,
+        helmet[0].0
+    );
+    // A bow is drawn further as it is drawn.
+    let bow = resolve("minecraft:bow", &held);
+    let pulled = |ticks| {
+        let using = Held {
+            using: true,
+            use_ticks: ticks,
+            ..held
+        };
+        resolve("minecraft:bow", &using)[0].0
+    };
+    let stages = [pulled(0), pulled(13), pulled(18), pulled(100)];
+    assert_eq!(stages[1], pulled(17));
+    assert_eq!(stages[2], stages[3]);
+    assert!(stages[0] != bow[0].0 && stages[0] != stages[1] && stages[1] != stages[2]);
+    // A crossbow by what it is loaded with.
+    let loaded = Held {
+        charge: "rocket",
+        ..held
+    };
+    assert_ne!(
+        resolve("minecraft:crossbow", &loaded)[0].0,
+        resolve("minecraft:crossbow", &held)[0].0
+    );
+    // A shield and a trident in hand are the game's own models, turned over.
+    let shield = resolve("minecraft:shield", &held);
+    assert_eq!(shield[0].2, Some(Special::Shield));
+    let mut out = Vec::new();
+    models.resolve("minecraft:trident", &held, &mut out);
+    let Drawn::Special {
+        special,
+        transformation,
+        ..
+    } = out[0]
+    else {
+        panic!("{out:?}")
+    };
+    assert_eq!(special, Special::Trident);
+    assert_eq!(transformation[1], [0.0, -1.0, 0.0, 0.0]);
+    assert_eq!(transformation[2], [0.0, 0.0, -1.0, 0.0]);
+    // On the ground it is a flat one.
+    let dropped = Held {
+        context: "ground",
+        ..held
+    };
+    assert_eq!(resolve("minecraft:trident", &dropped)[0].2, None);
+    // Elytra: broken when they have one use left.
+    let worn_out = Held {
+        damage: Some((431, 432)),
+        ..held
+    };
+    assert_ne!(
+        resolve("minecraft:elytra", &worn_out)[0].0,
+        resolve("minecraft:elytra", &held)[0].0
+    );
+}

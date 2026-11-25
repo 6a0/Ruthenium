@@ -1,35 +1,44 @@
 //! Draws block entities: instances of model parts, gathered each frame from the sections in
 //! view, a draw for all instances of one part in one layer; the text of signs, a draw for
-//! all glyphs; and players, from the same parts as their heads.
+//! all glyphs; and players, from the same parts as their heads, with their shadows under
+//! them and their names over them.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ruthenium_assets::Font;
+use ruthenium_assets::item::{Drawn, Held, ItemMesh, ItemModels, ItemTransform, Special, Tint};
+use ruthenium_data::v26_3::registries::DataComponentType;
 use ruthenium_gpu::{
     Arrival, BufferPool, Error, FrameData, Gpu, Pass, PoolConfig, RangeHandle, TextureDesc,
     TextureId, TextureTable, UploadRing, UploadTicket, VertexAttribute, VertexInput, vk,
 };
 use ruthenium_protocol::nbt;
 use ruthenium_protocol::profile::ResolvableProfile;
-use ruthenium_shaders::interface::{GLYPH, MODEL_PART, SIGN};
-use ruthenium_sim::avatar::{DEFAULT_SKINS, SkinSource};
+use ruthenium_protocol::text::{Style, StyledText};
+use ruthenium_shaders::interface::{GLINT, GLYPH, MODEL_PART, SHADOW, SIGN};
+use ruthenium_sim::avatar::{AvatarRecord, DEFAULT_SKINS, SkinSource};
 use ruthenium_sim::environment::CardinalLight;
+use ruthenium_sim::item::{Components, EquipmentSlot, Stack, Trim};
 use ruthenium_sim::scene::{Frame, SectionKey, Terrain};
+use ruthenium_sim::scoreboard::{NameRecord, NameText};
 
 use super::affine::Affine;
 use super::avatar::{self, Figure, Moment};
+use super::equipment::{self, EquipmentSet};
 use super::model::{Model, ModelSet, PartDraw, Pose, Skull};
+use super::nametag;
 use super::place::{self, Chest, DYE_COLOURS, DYES, Kind};
+use super::shadow::{self, Ground, Piece};
 use super::sign::{self, GLYPH_WORDS, GlyphPages, SignText};
 use super::skins::{LoadedSkin, Look, Skins, default_path};
 use crate::atmosphere::Fog;
 use crate::pipelines::PipelineId;
 use crate::sky::SkyImage;
-use crate::terrain::View;
 use crate::terrain::table::BlockTable;
 use crate::terrain::world::write_world;
+use crate::terrain::{CameraPose, View};
 
 /// Bytes of a vertex: position (blocks) and texture coordinate as floats, and the normal.
 pub const VERTEX_BYTES: usize = 24;
@@ -72,6 +81,15 @@ const MAX_PATTERNS: usize = 16;
 const KEPT_PATTERNS: usize = 4096;
 const KEPT_SIGNS: usize = 4096;
 const KEPT_HEADS: usize = 4096;
+const KEPT_NAMES: usize = 4096;
+/// How far a player's shadow reaches from its middle, for a player of the usual size, and
+/// how strong it is (`AvatarRenderer`'s shadow radius, `EntityRenderer.shadowStrength`).
+const PLAYER_SHADOW: f32 = 0.5;
+const SHADOW_STRENGTH: f32 = 1.0;
+/// Pieces of shadows drawn in a frame at most.
+const MAX_SHADOW_PIECES: usize = 1 << 16;
+/// The bit of a text's light that says it is drawn in none (`sign_vert.glsl`).
+const UNLIT: u32 = 1 << 31;
 /// How near the player has to be for glowing text to have its outline, in blocks.
 const OUTLINE_DISTANCE: f64 = 16.0;
 /// Bytes of the frame's data left for what is drawn after block entities.
@@ -81,6 +99,108 @@ const GLYPH_BYTES: u64 = 2 << 20;
 
 /// A colour that leaves the texture as it is.
 const WHITE: u32 = u32::MAX;
+/// How strong the glint is and how fast it moves: the game's own measures of its Glint
+/// Strength and Glint Speed options.
+const GLINT_STRENGTH: f32 = 0.75;
+const GLINT_SPEED: f64 = 0.5;
+/// The glints: which of the two pictures each is drawn from (armour's or items'), and how
+/// large it lies over the pictures of armour, of items' own models (whose pictures are
+/// small parts of an atlas) and of the models the game has for a shield or a trident
+/// (`ARMOR_ENTITY_GLINT_TEXTURING`, `GLINT_TEXTURING`, `ENTITY_GLINT_TEXTURING`).
+const GLINTS: [(usize, f32); 3] = [(0, 0.16), (1, 8.0), (1, 0.5)];
+/// Trims whose pictures are kept.
+const KEPT_TRIMS: usize = 1024;
+/// Bytes of the one page the items' models are copied into as they are first held.
+const ITEM_PAGE: u64 = 4 << 20;
+/// The ticks a crossbow takes to load, without enchantments.
+const CROSSBOW_TICKS: f32 = 25.0;
+/// The picture of a trident's own model, below `textures/entity`.
+const TRIDENT: &str = "trident/trident";
+
+/// A trim's picture and the palette it is coloured by.
+type TrimKey = (String, Option<String>);
+/// Where a trim and an equipment asset are, and whether it is on the legs.
+type TrimPlace = (usize, usize, bool);
+
+/// What glints over a part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Glint {
+    None,
+    Armour,
+    Item,
+    Entity,
+}
+
+/// An item's model on its way to the GPU.
+#[derive(Debug, Clone, Copy)]
+enum ItemRange {
+    /// Asked for, and not placed yet.
+    Wanted,
+    /// Placed, and not copied yet.
+    Placed(RangeHandle),
+    Copied(RangeHandle, UploadTicket),
+    Ready(RangeHandle),
+    /// There was no room for it.
+    Failed,
+}
+
+/// An item's model as vertices: four for a quad, as [`MODEL_VERTEX`] has them.
+fn item_vertices(mesh: &ItemMesh) -> Vec<u8> {
+    let mut out = Vec::with_capacity(mesh.quads.len() * 4 * VERTEX_BYTES);
+    for quad in &mesh.quads {
+        let normal = ruthenium_assets::model::NORMALS[usize::from(quad.direction.min(5))]
+            .map(|c| (c * 127.0) as i8 as u8);
+        for (position, uv) in quad.positions.iter().zip(quad.uvs) {
+            for c in position.iter().chain(&uv) {
+                out.extend_from_slice(&c.to_le_bytes());
+            }
+            out.extend_from_slice(&normal);
+            out.push(0);
+        }
+    }
+    out
+}
+
+/// Where an item's model is from the hand that holds it (`ItemTransform.apply`): moved,
+/// turned and scaled as the model says for the hand, a left hand's the other way round,
+/// about the model's middle.
+fn place_item(hand: Affine, transform: Option<ItemTransform>, left: bool) -> Affine {
+    let Some(t) = transform else {
+        return hand.translate([-0.5; 3]);
+    };
+    let way = if left { -1.0 } else { 1.0 };
+    let degrees = std::f32::consts::PI / 180.0;
+    hand.translate([way * t.translation[0], t.translation[1], t.translation[2]])
+        .rotate_x(t.rotation[0] * degrees)
+        .rotate_y(way * t.rotation[1] * degrees)
+        .rotate_z(way * t.rotation[2] * degrees)
+        .scale(t.scale)
+        .translate([-0.5; 3])
+}
+
+/// The colour of a model's quads of one tint, for a stack: 0xRRGGBB.
+fn tint_colour(tints: &[Tint], index: i32, c: &Components) -> u32 {
+    match usize::try_from(index).ok().and_then(|i| tints.get(i)) {
+        None => 0xFF_FFFF,
+        Some(Tint::Constant(rgb) | Tint::Default(rgb)) => *rgb,
+        Some(Tint::Dye(default)) => c.dyed_color.unwrap_or(*default),
+        Some(Tint::Potion(default)) => c.potion_color.unwrap_or(*default),
+    }
+}
+
+/// Where the glint's picture is read for a part's texture coordinates, at a time
+/// (`TextureTransform.setupGlintTexturing`): moved along, turned by a tenth of a quarter
+/// turn, and scaled.
+fn glint_rows(millis: u64, scale: f32) -> ([f32; 3], [f32; 3]) {
+    let moved = (millis as f64 * GLINT_SPEED * 8.0) as i64;
+    let along = (moved % 110_000) as f32 / 110_000.0;
+    let up = (moved % 30_000) as f32 / 30_000.0;
+    let (sin, cos) = 0.174_532_92_f32.sin_cos();
+    (
+        [cos * scale, -sin * scale, -along],
+        [sin * scale, cos * scale, up],
+    )
+}
 /// What an invisible player is tinted with for those who see it.
 const INVISIBLE: u32 = 0x26FF_FFFF;
 
@@ -90,10 +210,36 @@ const INVISIBLE: u32 = 0x26FF_FFFF;
 pub struct BlockEntityAssets {
     pub models: ModelSet,
     pub textures: Vec<(String, SkyImage)>,
-    /// What signs are written in.
+    /// What signs and names are written in.
     pub font: Font,
     pub lang: HashMap<String, String>,
+    /// The picture of an entity's shadow (`textures/misc/shadow.png`).
+    pub shadow: Option<SkyImage>,
+    /// What worn things look like; their pictures are among `textures`, below the folders
+    /// [`equipment`] names.
+    pub equipment: EquipmentSet,
+    /// The pictures of armour trims, by their path below `textures` without the suffix,
+    /// each with the palette its colours are of (a path below `textures/palettes`).
+    pub trims: Vec<(String, SkyImage, Option<String>)>,
+    /// The palettes, by their path below `textures/palettes` without the suffix.
+    pub palettes: Vec<(String, SkyImage)>,
+    /// The glint over enchanted armour, and over enchanted items
+    /// (`textures/misc/enchanted_glint_armor.png`, `enchanted_glint_item.png`).
+    pub glint: [Option<SkyImage>; 2],
+    /// What held things are drawn from; without it they are not drawn.
+    pub items: Option<ItemAssets>,
 }
+
+/// The items' models, and the first level of the atlas their pictures are in.
+#[derive(Debug)]
+pub struct ItemAssets {
+    pub models: ItemModels,
+    pub atlas: SkyImage,
+}
+
+/// The folder of the patterns on shields below `textures/entity`: all its pictures are
+/// wanted.
+pub const SHIELD_DIR: &str = "shield";
 
 /// The folder of the banners' patterns below `textures/entity`.
 pub const BANNER_DIR: &str = "banner";
@@ -122,6 +268,7 @@ pub fn texture_paths() -> Vec<String> {
     out.push("shulker/shulker".to_owned());
     out.extend(DYES.map(|d| format!("shulker/shulker_{d}")));
     out.extend(SKULLS.map(|s| skull_texture(s).to_owned()));
+    out.push(TRIDENT.to_owned());
     for i in 0..DEFAULT_SKINS {
         let path = default_path(i);
         if !out.contains(&path) {
@@ -229,6 +376,9 @@ pub struct BlockEntityStats {
     /// Sides of signs drawn, and their glyphs.
     pub texts: u32,
     pub glyphs: u32,
+    /// Lines over heads drawn, and the pieces of shadows.
+    pub names: u32,
+    pub shadows: u32,
     /// Parts and glyphs there was no room for, in all frames.
     pub overflowed: u64,
 }
@@ -243,6 +393,10 @@ struct Instance {
     colour: u32,
     texture: TextureId,
     hurt: bool,
+    glint: Glint,
+    /// Where its vertices are: 0 for the models', else the number of an item's model
+    /// and one.
+    source: u32,
 }
 
 /// The layers, in the order they are drawn in: patterns lie over the cloth they are on.
@@ -255,13 +409,16 @@ const PATTERN: u8 = 3;
 const SKIN: u8 = 4;
 const SKIN_SORTED: u8 = 5;
 const SKIN_INVISIBLE: u8 = 6;
-const LAYERS: [PipelineId; 7] = [
+/// What of held things is seen through, from back to front.
+const ITEM_SORTED: u8 = 7;
+const LAYERS: [PipelineId; 8] = [
     PipelineId::ModelSolid,
     PipelineId::ModelCutout,
     PipelineId::ModelCutoutFaces,
     PipelineId::ModelPattern,
     PipelineId::ModelTranslucent,
     PipelineId::ModelTranslucent,
+    PipelineId::ModelTranslucentFront,
     PipelineId::ModelTranslucentFront,
 ];
 
@@ -308,6 +465,65 @@ struct SignRun {
     away: f64,
 }
 
+/// One line over a head as last laid out.
+#[derive(Default)]
+struct NameGlyphs {
+    line: Vec<(char, Style)>,
+    /// Records as [`sign::records`] makes them: the glyphs whole, and what lies behind
+    /// them with the glyphs seen through.
+    solid: Vec<[u32; GLYPH_WORDS]>,
+    sheer: Vec<[u32; GLYPH_WORDS]>,
+    /// The newest picture they need.
+    newest: u64,
+    obfuscated: bool,
+}
+
+/// What is written over an entity's head as last read.
+struct Named {
+    text: Arc<NameText>,
+    offset: i32,
+    /// The name, and what stands below it.
+    lines: [Option<NameGlyphs>; 2],
+}
+
+/// One line over a head to draw.
+struct NameRun {
+    id: i32,
+    /// 0: the name; 1: what stands below it.
+    line: usize,
+    transform: Affine,
+    /// Block and sky light, 0 to 15.
+    light: (u8, u8),
+    /// Not seen through walls.
+    discrete: bool,
+    away: f32,
+}
+
+/// One piece of a shadow to draw.
+struct ShadowRun {
+    /// Where its entity stands, from the camera.
+    origin: [f32; 3],
+    radius: f32,
+    piece: Piece,
+}
+
+/// What [`BlockEntityRenderer::gather_players`] takes of the frame besides the players.
+pub(crate) struct PlayerView<'a> {
+    pub camera: &'a CameraPose,
+    pub view: &'a View,
+    pub view_distance: i32,
+    pub partial: f32,
+    /// What the sky's light lacks to its full strength now (`getSkyDarken`).
+    pub sky_darken: i32,
+}
+
+/// What is held is drawn with: the atlases its pictures are in.
+#[derive(Clone, Copy)]
+struct Atlases {
+    items: Option<TextureId>,
+    blocks: Option<TextureId>,
+}
+
 /// One section's block entities: where in the section, and their states.
 pub(crate) type SectionEntities = [([u8; 3], u16)];
 
@@ -333,6 +549,41 @@ pub(crate) struct BlockEntityRenderer {
     signs: HashMap<[i32; 3], Sign>,
     heads: HashMap<[i32; 3], Head>,
     skins: Skins,
+    names: HashMap<i32, Named>,
+    name_runs: Vec<NameRun>,
+    /// What [`Self::draw`] leaves for [`Self::draw_over`]: the names seen through walls,
+    /// as their draw's push constants and how many glyphs there are.
+    over: Option<([u8; MODEL_PUSH_BYTES], u32)>,
+    equipment: EquipmentSet,
+    /// The pictures of trims and the palettes, as the pack has them.
+    trim_bases: HashMap<String, (SkyImage, Option<String>)>,
+    palettes: HashMap<String, Vec<u8>>,
+    /// The trims' pictures in their palettes, as far as they were asked for: nothing for
+    /// one that is asked for and not made yet, or cannot be.
+    trim_textures: HashMap<TrimKey, Option<TextureId>>,
+    trims_wanted: Vec<TrimKey>,
+    /// The pictures of each equipment asset's layers, on the body and on the legs, once
+    /// it has been worn.
+    worn_pictures: [HashMap<String, Vec<Option<TextureId>>>; 2],
+    /// Which picture a trim has on an armour (by where the two are, and whether on the
+    /// legs), if it has one. The trim is kept, so that nothing else comes to be there.
+    trim_keys: HashMap<TrimPlace, (Arc<Trim>, Option<TrimKey>)>,
+    /// What a worn thing is drawn with, while it is being added.
+    worn: Vec<(TextureId, u32)>,
+    glint_pictures: [Option<TextureId>; 2],
+    started: std::time::Instant,
+    items: Option<ItemModels>,
+    item_atlas: Option<TextureId>,
+    /// The items' atlas until its upload has been started.
+    item_atlas_waiting: Option<SkyImage>,
+    /// The vertices of the items' models that have been held, and where each is.
+    item_pool: BufferPool,
+    item_ranges: HashMap<u32, ItemRange>,
+    items_wanted: Vec<u32>,
+    shadow_picture: Option<TextureId>,
+    show_shadows: bool,
+    shadows: Vec<ShadowRun>,
+    pieces: Vec<Piece>,
     /// What is drawn from back to front: how far it is, and where its instances are.
     sorted: Vec<(f32, std::ops::Range<usize>)>,
     runs: Vec<SignRun>,
@@ -440,6 +691,43 @@ impl BlockEntityRenderer {
             .map(|p| ids.get(&p).copied())
             .collect();
         let skulls = SKULLS.map(|s| ids.get(skull_texture(s)).copied()).to_vec();
+        let mut picture = |i: Option<SkyImage>| {
+            i.filter(|i| {
+                !i.rgba.is_empty() && i.rgba.len() == i.width as usize * i.height as usize * 4
+            })
+            .and_then(|i| {
+                textures
+                    .create_with(
+                        uploads,
+                        TextureDesc::rgba8(i.width, i.height),
+                        &[&i.rgba],
+                        Arrival::NextFrame,
+                    )
+                    .ok()
+            })
+        };
+        let shadow_picture = picture(assets.shadow);
+        let glint_pictures = assets.glint.map(&mut picture);
+        // (Their atlas is too large to stage at once: it is streamed, from `stage` on.)
+        let (items, item_atlas_waiting) = match assets.items {
+            Some(i) => (Some(i.models), Some(i.atlas)),
+            None => (None, None),
+        };
+        let mut item_pool = BufferPool::new(
+            gpu.clone(),
+            PoolConfig {
+                page_bytes: ITEM_PAGE,
+                budget_bytes: ITEM_PAGE,
+                low_watermark: 0,
+                high_watermark: ITEM_PAGE,
+                release_after: u32::MAX,
+                granule: 8,
+            },
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        );
+        if items.is_some() {
+            item_pool.grow_now()?;
+        }
         Ok(BlockEntityRenderer {
             pool,
             range,
@@ -458,6 +746,37 @@ impl BlockEntityRenderer {
             signs: HashMap::new(),
             heads: HashMap::new(),
             skins: Skins::new(std::array::from_fn(|i| ids.get(&default_path(i)).copied())),
+            names: HashMap::new(),
+            name_runs: Vec::new(),
+            over: None,
+            equipment: assets.equipment,
+            trim_bases: assets
+                .trims
+                .into_iter()
+                .map(|(path, image, palette)| (path, (image, palette)))
+                .collect(),
+            palettes: assets
+                .palettes
+                .into_iter()
+                .map(|(path, image)| (path, image.rgba))
+                .collect(),
+            trim_textures: HashMap::new(),
+            trims_wanted: Vec::new(),
+            worn_pictures: [HashMap::new(), HashMap::new()],
+            trim_keys: HashMap::new(),
+            worn: Vec::new(),
+            glint_pictures,
+            started: std::time::Instant::now(),
+            items,
+            item_atlas: None,
+            item_atlas_waiting,
+            item_pool,
+            item_ranges: HashMap::new(),
+            items_wanted: Vec::new(),
+            shadow_picture,
+            show_shadows: true,
+            shadows: Vec::new(),
+            pieces: Vec::new(),
             sorted: Vec::new(),
             runs: Vec::new(),
             random: 0x9E37_79B9_7F4A_7C15,
@@ -473,11 +792,85 @@ impl BlockEntityRenderer {
         self.stats
     }
 
+    /// Whether entities cast shadows (the game's Entity Shadows option).
+    pub fn set_shadows(&mut self, on: bool) {
+        self.show_shadows = on;
+    }
+
     /// Stages the models, until that has worked once, and the glyphs that wait for it:
     /// before the frame's `UploadRing::record`.
     pub fn stage(&mut self, textures: &mut TextureTable, uploads: &mut UploadRing) {
         self.pages.stage(textures, uploads);
         self.skins.stage(textures, uploads);
+        for key in std::mem::take(&mut self.trims_wanted) {
+            let made = self.trim_picture(&key).and_then(|(width, height, rgba)| {
+                textures
+                    .create_with(
+                        uploads,
+                        TextureDesc::rgba8(width, height),
+                        &[&rgba],
+                        Arrival::NextFrame,
+                    )
+                    .ok()
+            });
+            self.trim_textures.insert(key, made);
+        }
+        // The items' atlas, once the ring has a stream to spare for it.
+        if let Some(atlas) = self.item_atlas_waiting.take() {
+            let whole = atlas.rgba.len() == atlas.width as usize * atlas.height as usize * 4;
+            let started = whole
+                .then(|| {
+                    textures
+                        .create(TextureDesc::rgba8(atlas.width, atlas.height))
+                        .ok()
+                })
+                .flatten()
+                .and_then(
+                    |id| match textures.stream(uploads, id, vec![atlas.rgba.clone()]) {
+                        Ok(()) => Some(id),
+                        Err(_) => {
+                            textures.destroy(id);
+                            None
+                        }
+                    },
+                );
+            match started {
+                Some(id) => self.item_atlas = Some(id),
+                None if whole => self.item_atlas_waiting = Some(atlas),
+                None => {}
+            }
+        }
+        // The models of what is newly held, as far as there is room and the ring takes
+        // them; one it does not take waits for the next frame.
+        for mesh in std::mem::take(&mut self.items_wanted) {
+            let Some(model) = self.items.as_ref().and_then(|i| i.mesh(mesh)) else {
+                continue;
+            };
+            let bytes = item_vertices(model);
+            let placed = match self.item_ranges.get(&mesh) {
+                Some(ItemRange::Placed(handle)) => Some(*handle),
+                _ => self.item_pool.alloc(bytes.len() as u64, 8).ok(),
+            };
+            let Some(handle) = placed else {
+                self.item_ranges.insert(mesh, ItemRange::Failed);
+                self.stats.overflowed += 1;
+                continue;
+            };
+            let copied = self
+                .item_pool
+                .resolve(handle)
+                .and_then(|r| uploads.upload_buffer(r.buffer, r.offset, &bytes).ok());
+            match copied {
+                Some(ticket) => {
+                    self.item_ranges
+                        .insert(mesh, ItemRange::Copied(handle, ticket));
+                }
+                None => {
+                    self.item_ranges.insert(mesh, ItemRange::Placed(handle));
+                    self.items_wanted.push(mesh);
+                }
+            }
+        }
         if self.upload.is_none()
             && let Some(range) = self.pool.resolve(self.range)
         {
@@ -495,6 +888,13 @@ impl BlockEntityRenderer {
     pub fn note_ready(&mut self, uploads: &UploadRing) {
         if !self.ready {
             self.ready = self.upload.is_some_and(|t| uploads.is_ready(t));
+        }
+        for range in self.item_ranges.values_mut() {
+            if let ItemRange::Copied(handle, ticket) = *range
+                && uploads.is_ready(ticket)
+            {
+                *range = ItemRange::Ready(handle);
+            }
         }
     }
 
@@ -514,6 +914,9 @@ impl BlockEntityRenderer {
         self.sorted.clear();
         self.skins.begin();
         self.runs.clear();
+        self.name_runs.clear();
+        self.shadows.clear();
+        self.over = None;
         self.stats = BlockEntityStats {
             overflowed: self.stats.overflowed,
             ..BlockEntityStats::default()
@@ -701,23 +1104,32 @@ impl BlockEntityRenderer {
         }
     }
 
-    /// Adds the players and mannequins that are in view and in a section that is shown.
+    /// Adds the players and mannequins that are in view and in a section that is shown,
+    /// with their shadows and their names.
     #[allow(clippy::too_many_arguments)]
     pub fn gather_players(
         &mut self,
         frame: &Frame,
         terrain: &Terrain,
-        view_distance: i32,
-        partial: f32,
-        camera: [f64; 3],
-        view: &View,
+        table: &BlockTable,
+        seen: &PlayerView<'_>,
         textures: &TextureTable,
+        block_atlas: TextureId,
         shown: impl Fn([i32; 3]) -> bool,
     ) {
+        let (view, partial, camera) = (seen.view, seen.partial, seen.camera.position);
+        let atlases = Atlases {
+            items: self.item_atlas.filter(|t| textures.is_ready(*t)),
+            blocks: Some(block_atlas).filter(|t| textures.is_ready(*t)),
+        };
+        let axes = seen.camera.axes();
+        let shadow_picture = self
+            .shadow_picture
+            .filter(|t| self.show_shadows && textures.is_ready(*t));
         // `Entity.getViewScale`.
-        let scale = (f64::from(view_distance) / 8.0).clamp(1.0, 2.5);
+        let scale = (f64::from(seen.view_distance) / 8.0).clamp(1.0, 2.5);
         for e in &frame.entities {
-            let Some(r) = e.avatar.as_deref().filter(|r| !r.hidden) else {
+            let Some(r) = e.avatar.as_deref() else {
                 continue;
             };
             // The game may be frozen: then only players go on.
@@ -755,7 +1167,8 @@ impl BlockEntityRenderer {
             let light = terrain
                 .probe(eyes.map(|c| c.floor() as i32))
                 .map_or((0, 15), |p| (p.block_light, p.sky_light));
-            let light = record_light(if r.on_fire { 15 } else { light.0 }, light.1);
+            let levels = (if r.on_fire { 15 } else { light.0 }, light.1);
+            let light = record_light(levels.0, levels.1);
             let figure = Figure::new(e, r, at);
             let (layer, colour) = if r.invisible {
                 (SKIN_INVISIBLE, INVISIBLE)
@@ -767,10 +1180,13 @@ impl BlockEntityRenderer {
             } else {
                 Model::Player
             };
+            // One that is not seen is not drawn, but for what it wears and holds.
             let first = self.instances.len();
             self.parts.clear();
-            self.models
-                .draw_by(model, &mut self.parts, |name, m| figure.place(name, m));
+            if !r.hidden {
+                self.models
+                    .draw_by(model, &mut self.parts, |name, m| figure.place(name, m));
+            }
             for p in &self.parts {
                 self.instances.push(Instance {
                     batch: (layer, u32::from(p.over), p.first_quad),
@@ -780,9 +1196,19 @@ impl BlockEntityRenderer {
                     colour,
                     texture: look.body,
                     hurt: r.hurt,
+                    glint: Glint::None,
+                    source: 0,
                 });
             }
             self.sort(first, layer);
+            if !r.spectator {
+                for (place, stack) in r.worn.iter().enumerate() {
+                    self.add_armour(&figure, look.slim, place, stack, light, textures);
+                }
+                for off_hand in [false, true] {
+                    self.add_held(&figure, r, look.slim, off_hand, light, atlases, textures);
+                }
+            }
             if let Some(cape) = look.cape
                 && !r.invisible
                 && figure.wears_cape()
@@ -803,17 +1229,147 @@ impl BlockEntityRenderer {
                         texture: cape,
                         // A cape does not redden.
                         hurt: false,
+                        glint: Glint::None,
+                        source: 0,
                     });
                 }
             }
             self.stats.players += 1;
+            let from: [f32; 3] = std::array::from_fn(|i| (here[i] - camera[i]) as f32);
+            // The invisible cast none, whoever sees them.
+            if shadow_picture.is_some() && !r.invisible {
+                let radius = PLAYER_SHADOW * r.scale;
+                let ground = |pos: [i32; 3]| {
+                    let below = terrain.probe([pos[0], pos[1] - 1, pos[2]])?;
+                    let bounds = table.shadow_ground(u32::from(below.block))?;
+                    let over = terrain.probe(pos)?;
+                    let sky = i32::from(over.sky_light) - seen.sky_darken;
+                    Some(Ground {
+                        bounds,
+                        light: sky.max(i32::from(over.block_light)),
+                    })
+                };
+                self.pieces.clear();
+                shadow::pieces(
+                    here,
+                    radius,
+                    shadow::power(away, SHADOW_STRENGTH),
+                    frame.environment.ambient_light,
+                    ground,
+                    &mut self.pieces,
+                );
+                let room = MAX_SHADOW_PIECES.saturating_sub(self.shadows.len());
+                self.stats.overflowed += self.pieces.len().saturating_sub(room) as u64;
+                self.shadows
+                    .extend(self.pieces.iter().take(room).map(|&piece| ShadowRun {
+                        origin: from,
+                        radius: radius.min(32.0),
+                        piece,
+                    }));
+            }
+            if let Some(name) = &e.name {
+                // Its top, lowered with it where it crouches.
+                let mut top = from;
+                top[1] += r.size[1];
+                if e.pose == ruthenium_sim::entity::pose::CROUCHING {
+                    top[1] += r.scale * -2.0 / 16.0;
+                }
+                self.add_name(e.id, name, top, away, levels, axes);
+            }
+        }
+    }
+
+    /// Adds what is written over the head of the entity `id`, whose top is at `top` from
+    /// the camera and whose place is `away` blocks from it, squared: its name, and what
+    /// stands below it for those who are near.
+    fn add_name(
+        &mut self,
+        id: i32,
+        name: &NameRecord,
+        top: [f32; 3],
+        away: f64,
+        light: (u8, u8),
+        axes: [[f32; 3]; 3],
+    ) {
+        let nearer_than = |blocks: f64| away < blocks * blocks;
+        if !nearer_than(f64::from(name.distance))
+            || name.discrete && !nearer_than(nametag::DISCRETE_DISTANCE)
+        {
+            return;
+        }
+        let known = self
+            .names
+            .get(&id)
+            .is_some_and(|n| Arc::ptr_eq(&n.text, &name.text) && n.offset == name.offset);
+        if !known {
+            if self.names.len() >= KEPT_NAMES {
+                self.names.clear();
+            }
+            let lang = &self.lang;
+            let line = |text: &nbt::Tag| NameGlyphs {
+                line: StyledText::from_nbt_in(text, lang)
+                    .spans
+                    .iter()
+                    .flat_map(|s| s.text.chars().map(|c| (c, s.style)))
+                    .collect(),
+                ..NameGlyphs::default()
+            };
+            let mut named = Named {
+                text: name.text.clone(),
+                offset: name.offset,
+                lines: [
+                    Some(line(&name.text.name)),
+                    name.text.below.as_ref().map(line),
+                ],
+            };
+            for glyphs in named.lines.iter_mut().flatten() {
+                lay_out_name(
+                    glyphs,
+                    name.offset,
+                    &self.font,
+                    &mut self.pages,
+                    &mut self.random,
+                );
+            }
+            self.names.insert(id, named);
+        }
+        let Some(named) = self.names.get_mut(&id) else {
+            return;
+        };
+        let below = named.lines[1].is_some() && nearer_than(f64::from(name.below_distance));
+        // The name stands a line higher over what is below it.
+        let lines = [(0, if below { nametag::LINE } else { 0.0 }), (1, 0.0)];
+        for (line, lift) in lines.into_iter().take(if below { 2 } else { 1 }) {
+            let Some(glyphs) = &mut named.lines[line] else {
+                continue;
+            };
+            if glyphs.obfuscated {
+                lay_out_name(
+                    glyphs,
+                    name.offset,
+                    &self.font,
+                    &mut self.pages,
+                    &mut self.random,
+                );
+            }
+            if !self.pages.arrived(glyphs.newest) {
+                continue;
+            }
+            self.name_runs.push(NameRun {
+                id,
+                line,
+                transform: nametag::transform(top, lift, axes),
+                light,
+                discrete: name.discrete,
+                away: away as f32,
+            });
         }
     }
 
     /// Notes that the instances from `first` on are drawn from back to front with what
     /// else is, if their layer is.
     fn sort(&mut self, first: usize, layer: u8) {
-        if matches!(layer, SKIN_SORTED | SKIN_INVISIBLE)
+        if matches!(layer, SKIN_SORTED | SKIN_INVISIBLE | ITEM_SORTED)
             && let Some(i) = self.instances.get(first)
         {
             let away = i.transform.0.iter().map(|row| row[3] * row[3]).sum();
@@ -1034,8 +1590,418 @@ impl BlockEntityRenderer {
                 colour,
                 texture,
                 hurt: false,
+                glint: Glint::None,
+                source: 0,
             });
         }
+    }
+
+    /// Adds what a figure wears in one of its four places, if that is armour for the
+    /// place and has a look (`HumanoidArmorLayer`, `EquipmentLayerRenderer`): its layers in
+    /// their order, each in its colour, and its trim over them.
+    fn add_armour(
+        &mut self,
+        figure: &Figure,
+        slim: bool,
+        place: usize,
+        stack: &Stack,
+        light: u32,
+        textures: &TextureTable,
+    ) {
+        const SLOTS: [EquipmentSlot; 4] = [
+            EquipmentSlot::Head,
+            EquipmentSlot::Chest,
+            EquipmentSlot::Legs,
+            EquipmentSlot::Feet,
+        ];
+        let c = &stack.c;
+        if stack.is_empty() || c.equippable.is_none_or(|e| e.slot != SLOTS[place]) {
+            return;
+        }
+        let Some(asset) = c.equipment_asset.as_deref() else {
+            return;
+        };
+        let Some(worn) = self.equipment.get(asset) else {
+            return;
+        };
+        let leggings = SLOTS[place] == EquipmentSlot::Legs;
+        let (layers, dir) = if leggings {
+            (&worn.leggings, equipment::LEGGINGS_DIR)
+        } else {
+            (&worn.humanoid, equipment::HUMANOID_DIR)
+        };
+        if layers.is_empty() {
+            return;
+        }
+        // Its layers' pictures are looked up once.
+        let pictures = &mut self.worn_pictures[usize::from(leggings)];
+        if !pictures.contains_key(asset) {
+            let found = layers
+                .iter()
+                .map(|l| self.textures.get(&format!("{dir}/{}", l.texture)).copied())
+                .collect();
+            pictures.insert(asset.to_owned(), found);
+        }
+        let pictures = &pictures[asset];
+        // What it is drawn with, in order: each layer's picture and colour, then the trim.
+        let mut drawn = std::mem::take(&mut self.worn);
+        drawn.clear();
+        for (layer, picture) in layers.iter().zip(pictures) {
+            let Some(colour) = layer.colour(c.dyed_color) else {
+                continue;
+            };
+            if let Some(texture) = picture.filter(|t| textures.is_ready(*t)) {
+                drawn.push((texture, record_colour(colour)));
+            }
+        }
+        if let Some(trim) = &c.trim {
+            let at = (
+                Arc::as_ptr(trim) as usize,
+                std::ptr::from_ref(worn) as usize,
+                leggings,
+            );
+            if !self.trim_keys.contains_key(&at) {
+                if self.trim_keys.len() >= KEPT_TRIMS {
+                    self.trim_keys.clear();
+                }
+                let (picture, palette) = worn.trim_picture(trim);
+                let key = equipment::trim_path(&picture, leggings).map(|base| (base, palette));
+                self.trim_keys.insert(at, (Arc::clone(trim), key));
+            }
+            if let Some(key) = &self.trim_keys[&at].1 {
+                match self.trim_textures.get(key) {
+                    Some(Some(texture)) if textures.is_ready(*texture) => {
+                        drawn.push((*texture, WHITE));
+                    }
+                    Some(_) => {}
+                    None => {
+                        if self.trim_textures.len() >= KEPT_TRIMS {
+                            self.trim_textures.clear();
+                        }
+                        self.trim_textures.insert(key.clone(), None);
+                        self.trims_wanted.push(key.clone());
+                    }
+                }
+            }
+        }
+        // Enchanted, its first layer glints; with a trim, all of it does.
+        let glints = c.glints() && self.glint_pictures[0].is_some_and(|t| textures.is_ready(t));
+        let trimmed = c.trim.is_some();
+        self.parts.clear();
+        let model = Model::Armour {
+            slim,
+            piece: place as u8,
+        };
+        self.models
+            .draw_by(model, &mut self.parts, |name, m| figure.place_worn(name, m));
+        for (n, (texture, colour)) in drawn.iter().copied().enumerate() {
+            let glint = if glints && (trimmed || n == 0) {
+                Glint::Armour
+            } else {
+                Glint::None
+            };
+            for p in &self.parts {
+                // Worn things are drawn a little nearer than they are.
+                let mut transform = figure.transform.then_inner(p.transform);
+                for row in &mut transform.0 {
+                    *row = row.map(|c| c * TOWARDS_CAMERA);
+                }
+                self.instances.push(Instance {
+                    batch: (CUTOUT_FACES, 0, p.first_quad),
+                    quads: p.quads,
+                    transform,
+                    light,
+                    colour,
+                    texture,
+                    // What is worn does not redden.
+                    hurt: false,
+                    glint,
+                    source: 0,
+                });
+            }
+        }
+        self.worn = drawn;
+    }
+
+    /// Adds what a figure holds in its main hand or its other one (`ItemInHandLayer`):
+    /// what the stack's item definition draws for it, placed in the hand.
+    #[allow(clippy::too_many_arguments)]
+    fn add_held(
+        &mut self,
+        figure: &Figure,
+        r: &AvatarRecord,
+        slim: bool,
+        off_hand: bool,
+        light: u32,
+        atlases: Atlases,
+        textures: &TextureTable,
+    ) {
+        let stack = &r.held[usize::from(off_hand)];
+        let c = &stack.c;
+        let Some(id) = c.item_model.as_deref().filter(|_| !stack.is_empty()) else {
+            return;
+        };
+        // (Taken out for as long as its leaves are read.)
+        let Some(items) = self.items.take() else {
+            return;
+        };
+        // The main hand is the right one, unless it is the left.
+        let left = off_hand != r.left_handed;
+        let has_component = |name: &str, _ignore_default: bool| {
+            stack.patch.added.iter().any(|(kind, _)| {
+                u32::try_from(*kind)
+                    .ok()
+                    .and_then(DataComponentType::from_id)
+                    .is_some_and(|k| k.name() == name)
+            })
+        };
+        let held = Held {
+            context: if left {
+                "thirdperson_lefthand"
+            } else {
+                "thirdperson_righthand"
+            },
+            left_handed: r.left_handed,
+            using: r.using.is_some_and(|(_, off)| off == off_hand),
+            use_ticks: r.using.map_or(0, |u| u.0),
+            use_remaining: r.use_remaining,
+            damage: c
+                .damageable()
+                .then(|| (c.damage.unwrap_or(0), c.max_damage.unwrap_or(0))),
+            count: (stack.count, c.max_stack_size()),
+            charge: match (c.charged, c.charged_rocket) {
+                (false, _) => "none",
+                (true, true) => "rocket",
+                (true, false) => "arrow",
+            },
+            charge_ticks: CROSSBOW_TICKS,
+            trim_material: c
+                .trim
+                .as_deref()
+                .map(|t| &*t.material)
+                .filter(|m| !m.is_empty()),
+            block_state: c.block_state.as_deref().map_or(&[][..], Vec::as_slice),
+            has_component: &has_component,
+        };
+        // Where the hand is: on the arm, turned to hold (a thin arm half a texel
+        // further out).
+        let arm = if left { "left_arm" } else { "right_arm" };
+        let model = if slim {
+            Model::PlayerSlim
+        } else {
+            Model::Player
+        };
+        let on_arm = self.models.part_transform(model, arm, |name, m| {
+            figure.place_worn(name, m);
+            if slim && name == arm {
+                m.position[0] += if left { -0.5 } else { 0.5 };
+            }
+        });
+        if let Some(on_arm) = on_arm {
+            let side = if left { -1.0 } else { 1.0 };
+            let hand = figure
+                .transform
+                .then_inner(on_arm)
+                .rotate_x(-std::f32::consts::FRAC_PI_2)
+                .rotate_y(std::f32::consts::PI)
+                .translate([side / 16.0, 0.125, -0.625]);
+            let glints = c.glints();
+            items.resolve_each(id, &held, &mut |leaf| {
+                let (mesh, transformation) = match leaf {
+                    Drawn::Model {
+                        mesh,
+                        transformation,
+                        ..
+                    } => (mesh, transformation),
+                    Drawn::Special {
+                        base,
+                        transformation,
+                        ..
+                    } => (base, transformation),
+                };
+                let Some(model) = items.mesh(mesh) else {
+                    return;
+                };
+                let placed = place_item(hand, model.hands[usize::from(left)], left)
+                    .then_inner(Affine(*transformation));
+                match leaf {
+                    Drawn::Model { tints, .. } => self.add_item(
+                        mesh,
+                        model,
+                        placed,
+                        |tint| record_colour(tint_colour(tints, tint, c)),
+                        light,
+                        glints,
+                        atlases,
+                        textures,
+                    ),
+                    Drawn::Special { special, .. } => {
+                        self.add_special(special, placed, c, light, glints, textures);
+                    }
+                }
+            });
+        }
+        self.items = Some(items);
+    }
+
+    /// Adds an item's model where `placed` puts it: its quads by the atlas they are of
+    /// and the tint that colours them, once its vertices are there.
+    #[allow(clippy::too_many_arguments)]
+    fn add_item(
+        &mut self,
+        mesh: u32,
+        model: &ItemMesh,
+        placed: Affine,
+        colour: impl Fn(i32) -> u32,
+        light: u32,
+        glints: bool,
+        atlases: Atlases,
+        textures: &TextureTable,
+    ) {
+        if model.quads.is_empty() {
+            return;
+        }
+        match self.item_ranges.get(&mesh) {
+            Some(ItemRange::Ready(_)) => {}
+            Some(_) => return,
+            None => {
+                self.item_ranges.insert(mesh, ItemRange::Wanted);
+                self.items_wanted.push(mesh);
+                return;
+            }
+        }
+        let glint = if glints && self.glint_pictures[1].is_some_and(|t| textures.is_ready(t)) {
+            Glint::Item
+        } else {
+            Glint::None
+        };
+        // What is seen through last, so that it can be put in its place among the rest.
+        for translucent in [false, true] {
+            let first = self.instances.len();
+            for run in model.runs.iter().filter(|r| r.translucent == translucent) {
+                let atlas = if run.block_atlas {
+                    atlases.blocks
+                } else {
+                    atlases.items
+                };
+                let Some(texture) = atlas else {
+                    continue;
+                };
+                self.instances.push(Instance {
+                    batch: (if translucent { ITEM_SORTED } else { CUTOUT }, 0, run.first),
+                    quads: run.count,
+                    transform: placed,
+                    light,
+                    colour: colour(run.tint_index),
+                    texture,
+                    hurt: false,
+                    glint,
+                    source: mesh + 1,
+                });
+            }
+            if translucent {
+                self.sort(first, ITEM_SORTED);
+            }
+        }
+    }
+
+    /// Adds a shield or a trident where `placed` puts it, from the game's own model of
+    /// it (`ShieldSpecialRenderer`, `TridentSpecialRenderer`).
+    fn add_special(
+        &mut self,
+        special: Special,
+        placed: Affine,
+        c: &Components,
+        light: u32,
+        glints: bool,
+        textures: &TextureTable,
+    ) {
+        let patterns = c.banner_patterns.as_deref().unwrap_or(&[]);
+        let patterned = !patterns.is_empty() || c.base_color.is_some();
+        let (model, base) = match special {
+            Special::Shield if patterned => (Model::Shield, "shield/shield_base"),
+            Special::Shield => (Model::Shield, "shield/shield_base_nopattern"),
+            Special::Trident => (Model::Trident, TRIDENT),
+            Special::Other => return,
+        };
+        let usable = |r: &Self, path: &str| {
+            r.textures
+                .get(path)
+                .copied()
+                .filter(|t| textures.is_ready(*t))
+        };
+        let Some(texture) = usable(self, base) else {
+            return;
+        };
+        // A shield with patterns does not glint here: its glint is a draw of its own.
+        let glint =
+            if glints && !patterned && self.glint_pictures[1].is_some_and(|t| textures.is_ready(t))
+            {
+                Glint::Entity
+            } else {
+                Glint::None
+            };
+        // Its ground, then its patterns over it in their order.
+        let mut drawn = [(SOLID, texture, WHITE, glint); 2 + MAX_PATTERNS];
+        let mut count = 1;
+        let mut push = |entry| {
+            drawn[count] = entry;
+            count += 1;
+        };
+        if special == Special::Shield && patterned {
+            let dyed = |dye: u8| record_colour(DYE_COLOURS[usize::from(dye.min(15))]);
+            if let Some(ground) = usable(self, "shield/base") {
+                push((
+                    PATTERN,
+                    ground,
+                    dyed(c.base_color.unwrap_or(0)),
+                    Glint::None,
+                ));
+            }
+            for (asset, dye) in patterns.iter().take(MAX_PATTERNS) {
+                let path = asset.strip_prefix("minecraft:").unwrap_or(asset);
+                if let Some(pattern) = usable(self, &format!("{SHIELD_DIR}/{path}")) {
+                    push((PATTERN, pattern, dyed(*dye), Glint::None));
+                }
+            }
+        }
+        self.parts.clear();
+        self.models.draw(model, Pose::Rest, &mut self.parts);
+        for (layer, texture, colour, glint) in drawn.into_iter().take(count) {
+            for p in &self.parts {
+                self.instances.push(Instance {
+                    batch: (layer, 0, p.first_quad),
+                    quads: p.quads,
+                    transform: placed.then_inner(p.transform),
+                    light,
+                    colour,
+                    texture,
+                    hurt: false,
+                    glint,
+                    source: 0,
+                });
+            }
+        }
+    }
+
+    /// A trim's picture in its palette: its size and texels.
+    fn trim_picture(&self, key: &(String, Option<String>)) -> Option<(u32, u32, Vec<u8>)> {
+        let (image, base) = self.trim_bases.get(&key.0)?;
+        let mapped = key
+            .1
+            .as_deref()
+            .and_then(equipment::palette_path)
+            .and_then(|target| {
+                Some((
+                    self.palettes.get(base.as_deref()?)?,
+                    self.palettes.get(target)?,
+                ))
+            })
+            .map_or_else(
+                || image.rgba.clone(),
+                |(base, target)| equipment::map_palette(&image.rgba, base, target),
+            );
+        Some((image.width, image.height, mapped))
     }
 
     /// Draws what was gathered, into `pass`, which has a depth attachment. `indices` are
@@ -1075,6 +2041,22 @@ impl BlockEntityRenderer {
         // Over the boards the mesher drew.
         // SAFETY: the caller's.
         unsafe { self.draw_signs(pass, frame_data, view, fog, lightmap) };
+        // SAFETY: the caller's.
+        unsafe { self.draw_names(pass, frame_data, view, fog, lightmap) };
+    }
+
+    /// Draws what is seen through everything else, into `pass`: the names over heads,
+    /// once the rest of the world is drawn.
+    ///
+    /// # Safety
+    /// As [`Self::draw`], which has run for this frame with the same `pass`.
+    pub unsafe fn draw_over(&mut self, pass: &mut Pass<'_>) {
+        if let Some((push, glyphs)) = self.over.take() {
+            // SAFETY: the push constants are sign_vert.glsl's and point at the records
+            // `draw_names` wrote into this frame's data, whose pages have arrived.
+            unsafe { pass.draw(PipelineId::NameTagSheer.index(), &push, 6, glyphs) };
+            self.stats.draws += 1;
+        }
     }
 
     /// # Safety
@@ -1097,7 +2079,8 @@ impl BlockEntityRenderer {
         // From back to front, each one's second layer over its first.
         order(&mut self.sorted, &mut self.instances);
         // Stable: the patterns of a banner stay in their order.
-        self.instances.sort_by_key(|i| i.batch);
+        self.instances
+            .sort_by_key(|i| (i.batch.0, i.batch.1, i.source, i.batch.2));
         let Some((world, matrix)) = write_world(frame_data, view, [1.0; 2], lightmap) else {
             self.stats.overflowed += self.instances.len() as u64;
             return;
@@ -1109,6 +2092,23 @@ impl BlockEntityRenderer {
         if count == 0 {
             return;
         }
+        // The glints' records first: the parts they lie over name them.
+        let mut glints = [0u32; 3];
+        if self.instances[..count]
+            .iter()
+            .any(|i| i.glint != Glint::None)
+        {
+            let millis = self.started.elapsed().as_millis() as u64;
+            for (n, (of, scale)) in GLINTS.into_iter().enumerate() {
+                let Some(picture) = self.glint_pictures[of] else {
+                    continue;
+                };
+                if let Some((at, bytes)) = frame_data.alloc(GLINT.words(), 4) {
+                    write_glint(bytes, picture, glint_rows(millis, scale));
+                    glints[n] = at;
+                }
+            }
+        }
         let Some((first, bytes)) = frame_data.alloc(count as u32 * MODEL_PART.words(), 4) else {
             self.stats.overflowed += count as u64;
             return;
@@ -1117,7 +2117,7 @@ impl BlockEntityRenderer {
             .iter()
             .zip(bytes.as_chunks_mut::<PART_BYTES>().0)
         {
-            write_part(record, i);
+            write_part(record, i, glints);
         }
         let lights = match cardinal {
             CardinalLight::Default => 1,
@@ -1125,6 +2125,10 @@ impl BlockEntityRenderer {
         };
         let push = model_push([world, matrix, first, lights], fog);
         self.stats.parts = count as u32;
+        // Shadows lie under what is seen through: they are drawn before the skins.
+        let shadows = self.write_shadows(frame_data, [world, matrix], fog);
+        let before_skins = self.instances[..count].partition_point(|i| i.batch.0 < SKIN);
+        let mut shadows_at = shadows.map(|s| (before_skins, s));
         let mut pushed = false;
         let mut at = 0;
         // SAFETY: the push constants are model.vert's and the records they point at were
@@ -1132,14 +2136,44 @@ impl BlockEntityRenderer {
         // a part's own quads, and no part has more than the shared indices reach; the
         // textures are of the table and have arrived (`gather`).
         unsafe {
-            pass.bind_vertex_buffer(vertices.0, vertices.1);
             pass.bind_index_buffer(indices.0, indices.1);
+            // The vertices bound: none yet.
+            let mut bound = u32::MAX;
             while at < count {
-                let Instance { batch, quads, .. } = self.instances[at];
+                if let Some((_, (shadow_push, pieces))) = shadows_at.take_if(|s| s.0 == at) {
+                    pass.draw(PipelineId::Shadow.index(), &shadow_push, 6, pieces);
+                    self.stats.draws += 1;
+                    pushed = false;
+                }
+                let Instance {
+                    batch,
+                    quads,
+                    source,
+                    ..
+                } = self.instances[at];
                 let run = self.instances[at..count]
                     .iter()
-                    .take_while(|i| i.batch == batch)
+                    .take_while(|i| i.batch == batch && i.source == source)
                     .count();
+                if source != bound {
+                    // An item's model is ready, or it was not gathered.
+                    let from = match source.checked_sub(1) {
+                        None => Some(vertices),
+                        Some(mesh) => match self.item_ranges.get(&mesh) {
+                            Some(ItemRange::Ready(handle)) => self
+                                .item_pool
+                                .resolve(*handle)
+                                .map(|r| (r.buffer, r.offset)),
+                            _ => None,
+                        },
+                    };
+                    let Some((buffer, offset)) = from else {
+                        at += run;
+                        continue;
+                    };
+                    pass.bind_vertex_buffer(buffer, offset);
+                    bound = source;
+                }
                 pass.draw_indexed_instances(
                     LAYERS[usize::from(batch.0)].index(),
                     if pushed { &[] } else { &push },
@@ -1153,6 +2187,180 @@ impl BlockEntityRenderer {
                 self.stats.draws += 1;
                 at += run;
             }
+            // (Nothing but what is solid was drawn.)
+            if let Some((_, (shadow_push, pieces))) = shadows_at {
+                pass.draw(PipelineId::Shadow.index(), &shadow_push, 6, pieces);
+                self.stats.draws += 1;
+            }
+        }
+    }
+
+    /// Writes the frame's pieces of shadows; their draw's push constants and how many
+    /// there are, if any.
+    fn write_shadows(
+        &mut self,
+        frame_data: &mut FrameData,
+        [world, matrix]: [u32; 2],
+        fog: &Fog,
+    ) -> Option<([u8; MODEL_PUSH_BYTES], u32)> {
+        let picture = self.shadow_picture?;
+        let room = (frame_data.capacity() - frame_data.used()).saturating_sub(RESERVED)
+            / u64::from(SHADOW.bytes());
+        let count = self.shadows.len().min(room as usize);
+        self.stats.overflowed += (self.shadows.len() - count) as u64;
+        if count == 0 {
+            return None;
+        }
+        let (first, bytes) = frame_data.alloc(count as u32 * SHADOW.words(), 4)?;
+        for (s, record) in self
+            .shadows
+            .iter()
+            .zip(bytes.as_chunks_mut::<SHADOW_BYTES>().0)
+        {
+            write_shadow(record, s);
+        }
+        self.stats.shadows = count as u32;
+        let push = model_push([world, matrix, first, picture.index()], fog);
+        Some((push, count as u32))
+    }
+
+    /// Draws the names that were gathered, but for those seen through walls, which are
+    /// left for [`Self::draw_over`]: where they are not behind something, those are drawn
+    /// whole here too.
+    ///
+    /// # Safety
+    /// As [`Self::draw`].
+    unsafe fn draw_names(
+        &mut self,
+        pass: &mut Pass<'_>,
+        frame_data: &mut FrameData,
+        view: &View,
+        fog: &Fog,
+        lightmap: TextureId,
+    ) {
+        if self.name_runs.is_empty() {
+            return;
+        }
+        // From back to front: what is nearer lies over what is farther.
+        self.name_runs.sort_by(|a, b| b.away.total_cmp(&a.away));
+        let glyphs_of = |names: &HashMap<i32, Named>, run: &NameRun| {
+            names
+                .get(&run.id)
+                .and_then(|n| n.lines[run.line].as_ref())
+                .map_or((0, 0), |g| (g.solid.len() as u64, g.sheer.len() as u64))
+        };
+        // The nearest are drawn when not all can be: a name takes two records and its
+        // glyphs twice at most.
+        let room = (frame_data.capacity() - frame_data.used())
+            .saturating_sub(RESERVED)
+            .min(GLYPH_BYTES);
+        let mut taken = 0;
+        let mut kept = 0;
+        for run in self.name_runs.iter().rev() {
+            let (solid, sheer) = glyphs_of(&self.names, run);
+            taken += 2 * u64::from(SIGN.bytes()) + (solid + sheer) * u64::from(GLYPH.bytes());
+            if taken > room {
+                break;
+            }
+            kept += 1;
+        }
+        self.stats.overflowed += (self.name_runs.len() - kept) as u64;
+        self.name_runs.drain(..self.name_runs.len() - kept);
+        if kept == 0 {
+            return;
+        }
+        // In the first draw a name seen through walls is whole, another as it is; the
+        // second draws the first kind again, seen through.
+        let (mut here, mut over) = (0u64, 0u64);
+        let mut seen_through = 0;
+        for run in &self.name_runs {
+            let (solid, sheer) = glyphs_of(&self.names, run);
+            if run.discrete {
+                here += sheer;
+            } else {
+                here += solid;
+                over += sheer;
+                seen_through += 1;
+            }
+        }
+        let Some((world, matrix)) = write_world(frame_data, view, [1.0; 2], lightmap) else {
+            return;
+        };
+        let records = (kept + seen_through) as u32;
+        let Some((signs, bytes)) = frame_data.alloc(records * SIGN.words(), 4) else {
+            return;
+        };
+        let mut sign_records = bytes.as_chunks_mut::<SIGN_BYTES>().0.iter_mut();
+        for run in &self.name_runs {
+            let (block, sky) = run.light;
+            let light = if run.discrete {
+                record_light(block, sky)
+            } else {
+                record_light(block.max(nametag::EMISSION), sky.max(nametag::EMISSION))
+            };
+            if let Some(record) = sign_records.next() {
+                write_sign_record(record, &run.transform, light, 0);
+            }
+        }
+        for run in self.name_runs.iter().filter(|r| !r.discrete) {
+            if let Some(record) = sign_records.next() {
+                write_sign_record(record, &run.transform, UNLIT, 0);
+            }
+        }
+        let Some((first, bytes)) = frame_data.alloc((here + over) as u32 * GLYPH.words(), 4) else {
+            return;
+        };
+        let textures = self.pages.textures();
+        let mut out = bytes.as_chunks_mut::<GLYPH_RECORD_BYTES>().0.iter_mut();
+        let page =
+            |glyph: &[u32; GLYPH_WORDS]| textures[glyph[GLYPH.offset("texture") as usize] as usize];
+        for (n, run) in self.name_runs.iter().enumerate() {
+            let Some(g) = self
+                .names
+                .get(&run.id)
+                .and_then(|n| n.lines[run.line].as_ref())
+            else {
+                continue;
+            };
+            let glyphs = if run.discrete { &g.sheer } else { &g.solid };
+            for (glyph, record) in glyphs.iter().zip(&mut out) {
+                write_glyph(record, glyph, page(glyph), n as u32);
+            }
+        }
+        let seen_through = self.name_runs.iter().filter(|r| !r.discrete);
+        for (number, run) in (kept as u32..).zip(seen_through) {
+            let Some(g) = self
+                .names
+                .get(&run.id)
+                .and_then(|n| n.lines[run.line].as_ref())
+            else {
+                continue;
+            };
+            for (glyph, record) in g.sheer.iter().zip(&mut out) {
+                write_glyph(record, glyph, page(glyph), number);
+            }
+        }
+        self.stats.names = kept as u32;
+        self.stats.glyphs += (here + over) as u32;
+        if here > 0 {
+            let push = model_push([world, matrix, first, signs], fog);
+            // SAFETY: the push constants are sign_vert.glsl's, the records they point at
+            // were written just above, and the pages they name have arrived
+            // (`add_name`).
+            unsafe { pass.draw(PipelineId::NameTag.index(), &push, 6, here as u32) };
+            self.stats.draws += 1;
+        }
+        if over > 0 {
+            // No fog lies over what is seen through everything.
+            let clear = Fog {
+                colour: [0.0; 4],
+                ..*fog
+            };
+            let first = first + here as u32 * GLYPH.words();
+            self.over = Some((
+                model_push([world, matrix, first, signs], &clear),
+                over as u32,
+            ));
         }
     }
 
@@ -1268,6 +2476,30 @@ fn lay_out(side: &mut Side, hanging: bool, font: &Font, pages: &mut GlyphPages, 
     side.obfuscated = layout.obfuscated;
 }
 
+/// Lays out a line over a head and makes its records.
+fn lay_out_name(
+    glyphs: &mut NameGlyphs,
+    offset: i32,
+    font: &Font,
+    pages: &mut GlyphPages,
+    random: &mut u64,
+) {
+    let mut pick = |below: usize| {
+        // xorshift64
+        *random ^= *random << 13;
+        *random ^= *random >> 7;
+        *random ^= *random << 17;
+        (*random % below as u64) as usize
+    };
+    let laid = nametag::layout(&glyphs.line, offset, font, &mut pick);
+    // What changes every frame does not wait for its pictures.
+    let (solid, a) = sign::records(&laid.solid, pages, font, laid.obfuscated);
+    let (sheer, b) = sign::records(&laid.sheer, pages, font, laid.obfuscated);
+    (glyphs.solid, glyphs.sheer) = (solid, sheer);
+    glyphs.newest = a.max(b);
+    glyphs.obfuscated = laid.obfuscated;
+}
+
 /// Where a block entity is from the camera, and its light.
 #[derive(Clone, Copy)]
 struct Placed {
@@ -1280,14 +2512,36 @@ const SIGN_BYTES: usize = SIGN.bytes() as usize;
 const GLYPH_RECORD_BYTES: usize = GLYPH.bytes() as usize;
 
 fn write_sign(bytes: &mut [u8; SIGN_BYTES], run: &SignRun) {
-    for (i, c) in run.transform.0.as_flattened().iter().enumerate() {
+    write_sign_record(bytes, &run.transform, run.light, run.outline);
+}
+
+/// A text's record: where it is, its light and the colour of what surrounds its glyphs.
+fn write_sign_record(bytes: &mut [u8; SIGN_BYTES], transform: &Affine, light: u32, outline: u32) {
+    for (i, c) in transform.0.as_flattened().iter().enumerate() {
         let at = SIGN.offset("row_x") as usize + i;
         bytes[at * 4..at * 4 + 4].copy_from_slice(&c.to_ne_bytes());
     }
-    for (field, word) in [("light", run.light), ("outline", run.outline)] {
+    for (field, word) in [("light", light), ("outline", outline)] {
         let at = SIGN.offset(field) as usize * 4;
         bytes[at..at + 4].copy_from_slice(&word.to_ne_bytes());
     }
+}
+
+/// Bytes of the record of a shadow's piece.
+const SHADOW_BYTES: usize = SHADOW.bytes() as usize;
+
+fn write_shadow(bytes: &mut [u8; SHADOW_BYTES], s: &ShadowRun) {
+    let mut put = |field: &str, values: &[f32]| {
+        let at = SHADOW.offset(field) as usize * 4;
+        for (i, v) in values.iter().enumerate() {
+            bytes[at + i * 4..at + i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+        }
+    };
+    put("origin", &s.origin);
+    put("radius", &[s.radius]);
+    put("box", &s.piece.edges);
+    put("height", &[s.piece.height]);
+    put("alpha", &[s.piece.alpha]);
 }
 
 fn write_glyph(
@@ -1309,7 +2563,24 @@ fn write_glyph(
 /// Bytes of one part's record.
 const PART_BYTES: usize = MODEL_PART.bytes() as usize;
 
-fn write_part(bytes: &mut [u8], i: &Instance) {
+/// The record of a glint: its picture, its strength and where the picture is read.
+fn write_glint(bytes: &mut [u8], picture: TextureId, (row_u, row_v): ([f32; 3], [f32; 3])) {
+    let mut put = |field: &str, words: &[[u8; 4]]| {
+        let at = GLINT.offset(field) as usize * 4;
+        for (i, w) in words.iter().enumerate() {
+            bytes[at + i * 4..at + i * 4 + 4].copy_from_slice(w);
+        }
+    };
+    put("texture", &[picture.index().to_ne_bytes()]);
+    put("strength", &[GLINT_STRENGTH.to_ne_bytes()]);
+    put("row_u", &row_u.map(f32::to_ne_bytes));
+    put("row_v", &row_v.map(f32::to_ne_bytes));
+}
+
+/// A part's record; `glints` are the word offsets of the records of the glints over
+/// armour, over items' own models and over the game's models of items, 0 for one that is
+/// not there.
+fn write_part(bytes: &mut [u8], i: &Instance, glints: [u32; 3]) {
     let mut put = |word: usize, value: [u8; 4]| {
         bytes[word * 4..word * 4 + 4].copy_from_slice(&value);
     };
@@ -1317,9 +2588,15 @@ fn write_part(bytes: &mut [u8], i: &Instance) {
     for (n, c) in i.transform.0.as_flattened().iter().enumerate() {
         put(rows + n, c.to_ne_bytes());
     }
+    let glint = match i.glint {
+        Glint::None => 0,
+        Glint::Armour => glints[0],
+        Glint::Item => glints[1],
+        Glint::Entity => glints[2],
+    };
     put(
         MODEL_PART.offset("overlay") as usize,
-        u32::from(i.hurt).to_ne_bytes(),
+        (u32::from(i.hurt) | glint << 8).to_ne_bytes(),
     );
     put(MODEL_PART.offset("light") as usize, i.light.to_ne_bytes());
     put(MODEL_PART.offset("colour") as usize, i.colour.to_ne_bytes());
@@ -1380,16 +2657,19 @@ mod tests {
             colour: 0xFF12_3456,
             texture: TextureId::MISSING,
             hurt: true,
+            glint: Glint::Item,
+            source: 0,
         };
         let mut bytes = [0xAAu8; PART_BYTES];
-        write_part(&mut bytes, &i);
+        write_part(&mut bytes, &i, [5, 9, 11]);
         let word = |n: usize| u32::from_ne_bytes(bytes[n * 4..n * 4 + 4].try_into().unwrap());
         for n in 0..12 {
             assert_eq!(f32::from_bits(word(n)), n as f32);
         }
         assert_eq!((word(12), word(13)), (0x70F0, 0xFF12_3456));
         assert_eq!(word(14), TextureId::MISSING.index());
-        assert_eq!(word(15), 1);
+        // Hurt, and under the glint of items.
+        assert_eq!(word(15), 1 | 9 << 8);
     }
 
     #[test]
@@ -1425,6 +2705,146 @@ mod tests {
     }
 
     #[test]
+    fn an_item_is_placed_in_a_hand_as_its_model_says() {
+        let transform = ItemTransform {
+            rotation: [0.0, -90.0, 55.0],
+            translation: [0.25, 0.5, 0.0],
+            scale: [2.0; 3],
+        };
+        let hand = Affine::IDENTITY;
+        // Without a say: about its middle only.
+        assert_eq!(place_item(hand, None, false).point([0.5; 3]), [0.0; 3]);
+        // Its middle goes where it is moved to, whatever its turn and size.
+        let right = place_item(hand, Some(transform), false);
+        let left = place_item(hand, Some(transform), true);
+        let close = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        assert!(close(right.point([0.5; 3]), [0.25, 0.5, 0.0]));
+        assert!(close(left.point([0.5; 3]), [-0.25, 0.5, 0.0]));
+        // A left hand's is the right hand's seen in a mirror: a point of the model on
+        // the other side of its middle lands across.
+        let (p, mirrored) = ([0.75, 0.25, 0.625], [0.25, 0.25, 0.625]);
+        let (r, l) = (right.point(p), left.point(mirrored));
+        assert!(close(l, [-r[0], r[1], r[2]]), "{r:?} {l:?}");
+        // Turned about its middle and twice as large: a quarter turn about y takes what
+        // lies along the model's x to z.
+        let turned = ItemTransform {
+            rotation: [0.0, -90.0, 0.0],
+            ..transform
+        };
+        let along_x = place_item(hand, Some(turned), false).point([1.0, 0.5, 0.5]);
+        assert!(close(along_x, [0.25, 0.5, 1.0]), "{along_x:?}");
+    }
+
+    #[test]
+    fn tints_colour_by_the_stack() {
+        let tints = [
+            Tint::Constant(1),
+            Tint::Dye(2),
+            Tint::Potion(3),
+            Tint::Default(4),
+        ];
+        let plain = Components::default();
+        let colours = |c: &Components| [-1, 0, 1, 2, 3, 4].map(|i| tint_colour(&tints, i, c));
+        assert_eq!(colours(&plain), [0xFF_FFFF, 1, 2, 3, 4, 0xFF_FFFF]);
+        let dyed = Components {
+            dyed_color: Some(0x12_3456),
+            potion_color: Some(0x65_4321),
+            ..Components::default()
+        };
+        assert_eq!(
+            colours(&dyed),
+            [0xFF_FFFF, 1, 0x12_3456, 0x65_4321, 4, 0xFF_FFFF]
+        );
+    }
+
+    #[test]
+    fn an_items_model_is_written_as_the_models_are() {
+        let mesh = ItemMesh {
+            quads: vec![ruthenium_assets::item::ItemQuad {
+                positions: [
+                    [0.0, 1.0, 2.0],
+                    [3.0, 4.0, 5.0],
+                    [6.0, 7.0, 8.0],
+                    [9.0, 10.0, 11.0],
+                ],
+                uvs: [[0.25, 0.5], [0.75, 1.0], [0.0, 0.0], [1.0, 1.0]],
+                direction: 0,
+            }],
+            ..ItemMesh::default()
+        };
+        let bytes = item_vertices(&mesh);
+        assert_eq!(bytes.len(), 4 * VERTEX_BYTES);
+        let second = &bytes[VERTEX_BYTES..2 * VERTEX_BYTES];
+        let float = |n: usize| f32::from_le_bytes(second[n * 4..n * 4 + 4].try_into().unwrap());
+        assert_eq!([0, 1, 2, 3, 4].map(float), [3.0, 4.0, 5.0, 0.75, 1.0]);
+        // Facing down.
+        assert_eq!(second[20..], [0, 0x81, 0, 0]);
+    }
+
+    #[test]
+    fn the_glint_moves_and_is_turned_and_scaled() {
+        let (u, v) = glint_rows(0, 8.0);
+        let (sin, cos) = 0.174_532_92_f32.sin_cos();
+        assert_eq!(u, [cos * 8.0, -sin * 8.0, 0.0]);
+        assert_eq!(v, [sin * 8.0, cos * 8.0, 0.0]);
+        // Four times as fast as the clock: along once in 27.5 s, up once in 7.5.
+        let (u, v) = glint_rows(13_750, 1.0);
+        assert_eq!(u[2], -0.5);
+        assert!((v[2] - 25_000.0 / 30_000.0).abs() < 1e-6);
+        // Armour's from its own picture, the other two from the items'.
+        assert_eq!(GLINTS.map(|g| g.0), [0, 1, 1]);
+    }
+
+    #[test]
+    fn a_glint_is_written_where_the_shader_reads_it() {
+        let mut bytes = vec![0xAAu8; GLINT.bytes() as usize];
+        let rows = ([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]);
+        write_glint(&mut bytes, TextureId::MISSING, rows);
+        let word = |n: usize| u32::from_ne_bytes(bytes[n * 4..n * 4 + 4].try_into().unwrap());
+        // Its picture, how strong it is, then where it is read along and up.
+        assert_eq!(word(0), TextureId::MISSING.index());
+        assert_eq!(f32::from_bits(word(1)), GLINT_STRENGTH);
+        let rest = [2, 3, 4, 5, 6, 7].map(|n| f32::from_bits(word(n)));
+        assert_eq!(rest, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(bytes.len(), 32);
+    }
+
+    #[test]
+    fn a_shadows_piece_is_written_where_the_shader_reads_it() {
+        let run = ShadowRun {
+            origin: [1.0, 2.0, 3.0],
+            radius: 4.0,
+            piece: Piece {
+                edges: [5.0, 6.0, 7.0, 8.0],
+                height: 9.0,
+                alpha: 10.0,
+            },
+        };
+        let mut bytes = [0xAAu8; SHADOW_BYTES];
+        write_shadow(&mut bytes, &run);
+        // The origin, the radius, the edges, the height and the alpha, a word each.
+        for (n, word) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(f32::from_ne_bytes(*word), (n + 1) as f32);
+        }
+        assert_eq!(SHADOW_BYTES, 40);
+    }
+
+    #[test]
+    fn a_name_is_written_as_a_text_in_no_light_or_in_its_own() {
+        let transform = Affine(std::array::from_fn(|r| {
+            std::array::from_fn(|c| (r * 4 + c) as f32)
+        }));
+        let mut bytes = [0xAAu8; SIGN_BYTES];
+        write_sign_record(&mut bytes, &transform, UNLIT, 0);
+        let word = |n: usize| u32::from_ne_bytes(bytes[n * 4..n * 4 + 4].try_into().unwrap());
+        assert_eq!((word(12), word(13)), (0x8000_0000, 0));
+        // No light a block can have sets that bit.
+        assert_eq!(record_light(15, 15) & UNLIT, 0);
+        let glsl = include_str!("../../../ruthenium-shaders/glsl/include/sign_vert.glsl");
+        assert!(glsl.contains("const uint UNLIT = 0x80000000u;"));
+    }
+
+    #[test]
     fn the_seen_through_are_drawn_from_back_to_front() {
         let part = |over: u32| Instance {
             batch: (SKIN_SORTED, over, 7 * over),
@@ -1434,6 +2854,8 @@ mod tests {
             colour: WHITE,
             texture: TextureId::MISSING,
             hurt: false,
+            glint: Glint::None,
+            source: 0,
         };
         let mut instances = vec![part(0), part(1), part(0), part(1), part(0), part(1)];
         let mut sorted = vec![(4.0, 0..2), (9.0, 2..4), (1.0, 4..6)];
@@ -1530,7 +2952,9 @@ mod tests {
             assert!(paths.iter().any(|q| q == p), "{p}");
         }
         assert!(!paths.iter().any(|p| p == "chest/ender_left"));
-        // 22 chests, 17 shulker boxes, 7 skulls, 18 skins (one of which a skull has).
-        assert_eq!(paths.len(), 22 + 17 + 7 + 17);
+        // 22 chests, 17 shulker boxes, 7 skulls, 18 skins (one of which a skull has), and
+        // the trident.
+        assert_eq!(paths.len(), 22 + 17 + 7 + 17 + 1);
+        assert!(paths.iter().any(|p| p == TRIDENT));
     }
 }

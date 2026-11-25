@@ -318,7 +318,54 @@ From the working tree on top of `bd882dc`; results in `cache/bench/results/playe
 
 **Cost.** One pair of 20 s with a video encoding session open on the GPU in both, so not a clean one: 100 mannequins in view, half of them with capes (1,250 parts in 25 draws). The main thread's work goes from 0.079 to 0.254 ms, 1.75 µs each; the GPU's median frame from 0.206 to 0.244 ms.
 
-Not there: what they hold and wear (items, armour, elytra, heads on heads, arrows, parrots), name tags, shadows, fire and the glow's outline; the local player in third person, asleep, and the hand; a stab's arm, quick charge's shorter loading, the body of a horse or other animal ridden (its yaw is taken), a sleeping player put on its bed by the client; a pack's own skins for mannequins beyond its pictures. The order of two see-through figures is by their middles.
+Not there (names, shadows, armour and what is held came next, below): elytra, heads on heads, arrows, parrots, fire and the glow's outline; the local player in third person, asleep, and the hand; a stab's arm, quick charge's shorter loading, the body of a horse or other animal ridden (its yaw is taken), a sleeping player put on its bed by the client; a pack's own skins for mannequins beyond its pictures. The order of two see-through figures is by their middles.
+
+## Name tags, shadows, armour and held items
+
+From the working tree on top of `4dfe421`; results in `cache/bench/results/equipment-2026-11-25-rtx4060` (not committed). Players and mannequins have their names over their heads, a shadow under them, their armour on and their items in their hands.
+
+**Names.** A player's name is its team's prefix, its name and the team's suffix in the team's colour; a mannequin shows a custom name only if it is told to, with its description below. The score of the objective in the below-name slot stands under a name for those within the below-name distance. Team rules decide who sees a name (always, never, own team, other teams); the invisible, and one who carries another, show none. A name is drawn twice, as in the game: dimmed and through walls, then whole where nothing is in front. A sneaking player's is only the dimmed one, hidden by walls, within 32 blocks.
+
+**Shadows.** One piece for every block under a figure that is seen and whole to stand on, as wide as the block's outline, darker in brighter light, fading with the height over the ground and gone from 16 blocks away. `--entity-shadows off` leaves them out.
+
+**Armour.** From the game's equipment files: each layer's picture, the dye of leather, trims coloured by their material's palette (the darker one on armour of the same material), and the enchantment glint, which moves over a piece in the shader.
+
+**Held items.** The item definitions of the game are read as it reads them (models, conditions, selections, ranges, composites, tints): 1,658 definitions bake into 2,109 models of 102,706 quads with no warning. A model is uploaded when a figure first holds it. Flat items get the game's generated sides; blocks use the block atlas; shields (with their patterns) and tridents are drawn from the game's own entity models. An item sits in the hand as its model's display entry says, mirrored in a left hand.
+
+### Pictures
+
+Pairs at 1920 × 1080 with `--bare-picture`, the game frozen unless said otherwise. Vanilla hides the HUD for such a picture and then shows names only of entities on a team, so every figure was put on one.
+
+| Scene | Within 1 of 255 | What differs |
+|---|---:|---|
+| Eleven mannequins with names, on stone, glass, a barrier and leaves, one behind a pillar | every name and shadow | Two figures on glass and a barrier set that instant: vanilla lit them darker (its light after a block change, see sign text); not so with the game running |
+| Live players: a team's prefix and colour, a score below the name | 10,500 of 10,500 pixels of the tags equal | |
+| A sneaking live player | 10,491 of 10,500 equal, 9 one step off | |
+| Ten in armour: diamond, dyed leather, trims (gold on iron, gold on gold, redstone on netherite), mixed pieces, one sneaking | 99.84% | The crosshair; a carved pumpkin on a head, which is not drawn |
+| Fourteen holding, in both hands, swords, a bow, blocks, stairs, a trident, a crossbow, glass, a pane, shields, a mace, a rod, a lantern, a door, a spyglass | 99.70% | The crosshair; the arm of one holding a spear, raised since |
+
+A name behind a pillar shows through it dimmed in both clients, and a sneaking player's does not. The glint moves by the clock in both and has no common phase: enchanted armour, items, a trident and trimmed armour were compared by eye. A shield with patterns matches; its glint is not drawn. A live player drawing a bow in a chestplate matches.
+
+### Checks
+
+880 tests in the workspace pass. 40 deliberate breakages of the new code (names, shadows, equipment, item models, records, packets): 34 were caught at once, the other 6 after tests were added. A debug run under synchronisation validation with 13 equipped and named mannequins (313 parts, 126 glyphs, 52 shadow pieces) gave no message; GPU fixtures pass, and none draws a figure. After the per-frame allocations were taken out (below), the armour scene was the same picture bit for bit, and the item scene too but for the spear's arm.
+
+### Cost
+
+One pass of 20 s for each, a video encoding session open on the GPU in all, so not clean: 100 mannequins in view, each with a name, four pieces of armour (iron, trimmed diamond, enchanted netherite or dyed leather), a shield, and a sword, bow or stairs. 3,000 parts, 1,508 glyphs and 256 shadow pieces in 30 draws.
+
+| | Main thread ms | GPU median ms |
+|---|---:|---:|
+| No figures (`--players off`) | 0.120 | 0.264 |
+| All of it | 0.782 | 0.390 |
+
+That is 6.6 µs a figure on the main thread. Split by a second set of runs (before the allocations below were removed, when the whole was 0.872 ms): bare figures with shadows 0.176 ms over none, the names 0.078 ms, armour and items 0.49 ms; shadows alone 0.034 ms and 0.011 ms on the GPU. A part costs about 0.1 µs to place and 0.1 µs to sort and write, worn or not: nothing of a figure is kept between frames.
+
+Taking string building and lists out of the per-frame path (layer pictures looked up once for an asset, a trim's picture found by the trim itself, leaves handed to a function, no list in placing a model) took gathering from 0.405 to 0.326 ms.
+
+### Not there
+
+Things worn that are not armour (a carved pumpkin, a head, a banner on the head; elytra); the spear's use and stab, a spyglass at the eye, quick charge; in the hand, the game's special models other than shield and trident (heads, banners, chests, shulker boxes, pots, conduits, copper golem statues) and what compasses, clocks, a cast rod, custom model data and component properties choose (their fallback is drawn); firework, map and team tints (the default), potions made only of their own effects (no colour mixed); a patterned shield's glint, decal trims, equipment and trims that are not the game's own; names of other entities, of what the crosshair is on, and the hide-HUD rule; shadows of anything else. Items named `_spear` stand in for the `spears` tag. All item models are baked at the join (about 9 MiB), and the models held so far share one 4 MiB vertex page that is never given back.
 
 ## Where a frame's time goes
 

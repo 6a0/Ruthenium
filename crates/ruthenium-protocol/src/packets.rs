@@ -846,9 +846,9 @@ pub mod play {
         Long(i64),
         Float(f32),
         String(String),
-        /// A text component (skipped).
-        Component,
-        OptionalComponent(bool),
+        /// A text component, in its NBT form.
+        Component(Tag),
+        OptionalComponent(Option<Tag>),
         Boolean(bool),
         Rotations([f32; 3]),
         BlockPos([i32; 3]),
@@ -894,17 +894,8 @@ pub mod play {
                 2 => DataValue::Long(r.varlong()?),
                 3 => DataValue::Float(r.f32()?),
                 4 => DataValue::String(r.string(MAX_STRING)?.to_owned()),
-                5 => {
-                    text(r)?;
-                    DataValue::Component
-                }
-                6 => {
-                    let some = r.bool()?;
-                    if some {
-                        text(r)?;
-                    }
-                    DataValue::OptionalComponent(some)
-                }
+                5 => DataValue::Component(text(r)?),
+                6 => DataValue::OptionalComponent(optional(r, text)?),
                 7 => DataValue::Item(ItemStack::read_optional(r)?),
                 8 => DataValue::Boolean(r.bool()?),
                 9 => DataValue::Rotations([r.f32()?, r.f32()?, r.f32()?]),
@@ -952,15 +943,48 @@ pub mod play {
     }
 
     /// A team's settings (`ClientboundSetPlayerTeamPacket.Parameters`); the texts are
-    /// skipped.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// components in their NBT form.
+    #[derive(Debug, Clone, PartialEq)]
     pub struct TeamParameters {
+        pub display_name: Tag,
+        /// What stands before and after its members' names.
+        pub prefix: Tag,
+        pub suffix: Tag,
+        /// `Team.Visibility` id: 0 always, 1 never, 2 hidden from other teams, 3 hidden
+        /// from the own team.
         pub name_tag_visibility: i32,
         /// `Team.CollisionRule` id: 0 always, 1 never, 2 push other teams, 3 push own
         /// team.
         pub collision_rule: i32,
+        /// `ChatFormatting` ordinal: the sixteen colours, then obfuscated, bold,
+        /// strikethrough, underline, italic and reset.
         pub color: Option<i32>,
         pub options: u8,
+    }
+
+    /// How a score is written (`NumberFormat`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum NumberFormat {
+        /// Not at all.
+        Blank,
+        /// As a number in this style (a style's fields in a compound).
+        Styled(Tag),
+        /// As this text, whatever the number.
+        Fixed(Tag),
+    }
+
+    /// `DisplaySlot.BELOW_NAME`.
+    pub const DISPLAY_SLOT_BELOW_NAME: i32 = 2;
+
+    fn number_format(r: &mut Reader<'_>) -> Result<Option<NumberFormat>, WireError> {
+        optional(r, |r| {
+            Ok(match r.varint()? {
+                0 => NumberFormat::Blank,
+                1 => NumberFormat::Styled(text(r)?),
+                2 => NumberFormat::Fixed(text(r)?),
+                _ => return Err(WireError::Invalid("number format")),
+            })
+        })
     }
 
     /// One player's part of a `ClientboundPlayerInfoUpdatePacket`: what the actions
@@ -1265,6 +1289,34 @@ pub mod play {
             method: u8,
             parameters: Option<TeamParameters>,
             players: Vec<String>,
+        },
+        /// `ClientboundSetObjectivePacket`: method 0 adds the objective, 1 removes it,
+        /// 2 changes it; the name it shows and how its scores are written come with 0
+        /// and 2.
+        SetObjective {
+            name: String,
+            method: u8,
+            display_name: Option<Tag>,
+            number_format: Option<NumberFormat>,
+        },
+        /// `ClientboundSetDisplayObjectivePacket`: the objective a `DisplaySlot` shows;
+        /// none for an empty name.
+        SetDisplayObjective {
+            slot: i32,
+            objective: String,
+        },
+        /// `ClientboundSetScorePacket`.
+        SetScore {
+            owner: String,
+            objective: String,
+            score: i32,
+            display: Option<Tag>,
+            number_format: Option<NumberFormat>,
+        },
+        /// `ClientboundResetScorePacket`: one score of an owner, or all of them.
+        ResetScore {
+            owner: String,
+            objective: Option<String>,
         },
         /// `ClientboundPlayerInfoUpdatePacket`: the action bits and the entries.
         PlayerInfoUpdate {
@@ -1748,10 +1800,10 @@ pub mod play {
                     let name = r.string(MAX_STRING)?.to_owned();
                     let method = r.u8()?;
                     let parameters = if method == 0 || method == 2 {
-                        for _ in 0..3 {
-                            text(&mut r)?;
-                        }
                         Some(TeamParameters {
+                            display_name: text(&mut r)?,
+                            prefix: text(&mut r)?,
+                            suffix: text(&mut r)?,
                             name_tag_visibility: r.varint()?,
                             collision_rule: r.varint()?,
                             color: optional(&mut r, |r| r.varint())?,
@@ -1774,6 +1826,39 @@ pub mod play {
                         players,
                     }
                 }
+                C::SetObjective => {
+                    let name = r.string(MAX_STRING)?.to_owned();
+                    let method = r.u8()?;
+                    let (display_name, number_format) = if method == 0 || method == 2 {
+                        let display_name = text(&mut r)?;
+                        // How the list shows it: whole numbers or hearts.
+                        r.varint()?;
+                        (Some(display_name), number_format(&mut r)?)
+                    } else {
+                        (None, None)
+                    };
+                    Clientbound::SetObjective {
+                        name,
+                        method,
+                        display_name,
+                        number_format,
+                    }
+                }
+                C::SetDisplayObjective => Clientbound::SetDisplayObjective {
+                    slot: r.varint()?,
+                    objective: r.string(MAX_STRING)?.to_owned(),
+                },
+                C::SetScore => Clientbound::SetScore {
+                    owner: r.string(MAX_STRING)?.to_owned(),
+                    objective: r.string(MAX_STRING)?.to_owned(),
+                    score: r.varint()?,
+                    display: optional(&mut r, text)?,
+                    number_format: number_format(&mut r)?,
+                },
+                C::ResetScore => Clientbound::ResetScore {
+                    owner: r.string(MAX_STRING)?.to_owned(),
+                    objective: optional(&mut r, |r| Ok(r.string(MAX_STRING)?.to_owned()))?,
+                },
                 C::PlayerInfoUpdate => {
                     // An `EnumSet` of the eight actions: one byte.
                     let actions = r.u8()?;
@@ -2119,7 +2204,10 @@ pub mod play {
     /// `EquipmentSlot` ordinals.
     pub const EQUIPMENT_MAINHAND: u8 = 0;
     pub const EQUIPMENT_OFFHAND: u8 = 1;
+    pub const EQUIPMENT_FEET: u8 = 2;
+    pub const EQUIPMENT_LEGS: u8 = 3;
     pub const EQUIPMENT_CHEST: u8 = 4;
+    pub const EQUIPMENT_HEAD: u8 = 5;
     pub const EQUIPMENT_BODY: u8 = 6;
     pub const EQUIPMENT_SADDLE: u8 = 7;
 
@@ -2501,6 +2589,107 @@ mod tests {
             play::Clientbound::ForgetLevelChunk { x: 5, z: -2 }
         );
         assert_eq!(play::keep_alive(1)[0], 28);
+    }
+
+    #[test]
+    fn play_reads_the_scoreboard() {
+        use play::{Clientbound as C, NumberFormat};
+        let text = |b: &mut Vec<u8>, s: &str| {
+            crate::nbt::write_network(b, &Tag::String(s.into())).unwrap();
+        };
+        let said = |s: &str| Tag::String(s.into());
+        // An objective: its name and the method; one that is made or changed says what
+        // it is called, how a list shows it, and how its numbers are written.
+        let objective = |kind: i32| {
+            let mut b = Vec::new();
+            wire::write_string(&mut b, "hp");
+            b.push(2);
+            text(&mut b, "Health");
+            wire::write_varint(&mut b, 1);
+            wire::write_bool(&mut b, true);
+            wire::write_varint(&mut b, kind);
+            if kind != 0 {
+                text(&mut b, "s");
+            }
+            C::decode(108, &b)
+        };
+        let formats = [
+            NumberFormat::Blank,
+            NumberFormat::Styled(said("s")),
+            NumberFormat::Fixed(said("s")),
+        ];
+        for (kind, format) in formats.into_iter().enumerate() {
+            assert_eq!(
+                objective(kind as i32).unwrap(),
+                C::SetObjective {
+                    name: "hp".into(),
+                    method: 2,
+                    display_name: Some(said("Health")),
+                    number_format: Some(format),
+                }
+            );
+        }
+        assert!(objective(3).is_err());
+        let mut b = Vec::new();
+        wire::write_string(&mut b, "hp");
+        b.push(1);
+        assert_eq!(
+            C::decode(108, &b).unwrap(),
+            C::SetObjective {
+                name: "hp".into(),
+                method: 1,
+                display_name: None,
+                number_format: None,
+            }
+        );
+        // The slot below names is the third.
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 2);
+        wire::write_string(&mut b, "hp");
+        assert_eq!(
+            C::decode(100, &b).unwrap(),
+            C::SetDisplayObjective {
+                slot: play::DISPLAY_SLOT_BELOW_NAME,
+                objective: "hp".into(),
+            }
+        );
+        // A score, with what it is shown as, and no way of writing of its own.
+        let mut b = Vec::new();
+        wire::write_string(&mut b, "Kai");
+        wire::write_string(&mut b, "hp");
+        wire::write_varint(&mut b, 17);
+        wire::write_bool(&mut b, true);
+        text(&mut b, "seventeen");
+        wire::write_bool(&mut b, false);
+        assert_eq!(
+            C::decode(112, &b).unwrap(),
+            C::SetScore {
+                owner: "Kai".into(),
+                objective: "hp".into(),
+                score: 17,
+                display: Some(said("seventeen")),
+                number_format: None,
+            }
+        );
+        // One score reset, and all of an owner's.
+        let reset = |objective: Option<&str>| {
+            let mut b = Vec::new();
+            wire::write_string(&mut b, "Kai");
+            wire::write_bool(&mut b, objective.is_some());
+            if let Some(o) = objective {
+                wire::write_string(&mut b, o);
+            }
+            C::decode(80, &b).unwrap()
+        };
+        for objective in [Some("hp"), None] {
+            assert_eq!(
+                reset(objective),
+                C::ResetScore {
+                    owner: "Kai".into(),
+                    objective: objective.map(str::to_owned),
+                }
+            );
+        }
     }
 
     #[test]

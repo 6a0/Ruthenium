@@ -1,4 +1,4 @@
-// Ruthenium: the vertex stage of the text on signs. A glyph is one instance of six
+// Ruthenium: the vertex stage of the text on signs and over heads. A glyph is one instance of six
 // vertices; its box, colour and place in a glyph picture come from its record in the
 // frame's data, and where the sign is, its light and its outline's colour from the sign's.
 // Before including it a shader defines OUTLINE to draw what surrounds glowing text.
@@ -25,12 +25,20 @@ layout(location = 3) out float v_spherical;
 layout(location = 4) out float v_cylindrical;
 layout(location = 5) flat out uint v_texture;
 layout(location = 6) flat out vec3 v_added;
+layout(location = 7) out vec2 v_glint_uv;
+layout(location = 8) flat out uint v_glint_texture;
+layout(location = 9) flat out float v_glint_strength;
 
 // How far inside the edge of its texels a glyph's picture is sampled, in texels.
 const float INSIDE = 0.01;
+// The bit of a sign's light that says it is drawn in none.
+const uint UNLIT = 0x80000000u;
 
 void main() {
     v_added = vec3(0.0);
+    v_glint_uv = vec2(0.0);
+    v_glint_texture = 0u;
+    v_glint_strength = 0.0;
     if (pc.signs == 0u) {
         gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
         v_front = vec4(0.0);
@@ -88,9 +96,11 @@ void main() {
     uint packed_light = sign_light(sign);
     vec2 light = vec2(packed_light & 0xFFu, packed_light >> 8u & 0xFFu);
     vec2 light_uv = clamp(light / 256.0 + 0.5 / 16.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0));
-    v_front = unpackUnorm4x8(colour) * textureLod(
+    // What is seen through walls is drawn as it is.
+    vec4 lit = (packed_light & UNLIT) != 0u ? vec4(1.0) : textureLod(
         sampler2D(u_textures[nonuniformEXT(world_lightmap(pc.world))], u_samplers[SAMPLER_LINEAR_CLAMP]),
         light_uv, 0.0);
+    v_front = unpackUnorm4x8(colour) * lit;
     v_back = v_front;
     v_spherical = length(position);
     v_cylindrical = max(length(position.xz), abs(position.y));

@@ -224,6 +224,17 @@ impl Limbs {
                 arm[0] = arm[0] * 0.5 - 0.628_318_55;
                 arm[1] = 0.0;
             }
+            // `SpearAnimations.thirdPersonHandUse`, at rest: the sway of a spear in use
+            // is not there.
+            ArmPose::Spear => {
+                arm[1] = -0.1 * way + head[1];
+                arm[0] = -FRAC_PI_2 + head[0] + 0.8;
+                if a.fall_flying || a.swim > 0.0 {
+                    arm[0] -= 0.959_931_1;
+                }
+                arm[1] = DEGREE * (57.295_776 * arm[1]).clamp(-60.0, 60.0);
+                arm[0] = DEGREE * (57.295_776 * arm[0]).clamp(-120.0, 30.0);
+            }
         }
     }
 
@@ -452,6 +463,12 @@ impl Figure {
             "body" | "right_arm" | "left_arm" | "right_leg" | "left_leg" => !self.spectator,
             _ => layer_bit(name).is_none_or(|bit| self.parts & bit != 0),
         }
+    }
+
+    /// Moves a part of what is worn over the player's model: as the part it is worn on.
+    pub fn place_worn(&self, name: &str, m: &mut Moved) -> bool {
+        self.limbs.place(name, m);
+        true
     }
 
     /// Whether a cape is shown, if there is one.
@@ -788,6 +805,9 @@ mod tests {
             size: [0.6, 1.8],
             eye_height: 1.62,
             vehicle_body: None,
+            use_remaining: 0,
+            held: Default::default(),
+            worn: Default::default(),
         }
     }
 
@@ -805,6 +825,7 @@ mod tests {
             baby: false,
             vehicle: None,
             avatar: None,
+            name: None,
         }
     }
 

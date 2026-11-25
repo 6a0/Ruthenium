@@ -983,7 +983,9 @@ fn water_bottle(stack: &Stack) -> bool {
     let water = Potion::Water.id() as i32;
     matches!(
         stack.patch.get(DataComponentType::PotionContents),
-        Some(Component::PotionContents { potion: Some(id) }) if *id == water
+        Some(Component::PotionContents {
+            potion: Some(id), ..
+        }) if *id == water
     )
 }
 

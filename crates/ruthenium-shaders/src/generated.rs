@@ -37,6 +37,9 @@ pub static OVERLAY_FRAG: Spirv = crate::spirv!("overlay.frag");
 /// `glsl/overlay.vert`
 pub static OVERLAY_VERT: Spirv = crate::spirv!("overlay.vert");
 
+/// `glsl/shadow.vert`
+pub static SHADOW_VERT: Spirv = crate::spirv!("shadow.vert");
+
 /// `glsl/shape.frag`
 pub static SHAPE_FRAG: Spirv = crate::spirv!("shape.frag");
 
@@ -119,6 +122,7 @@ pub static ALL: &[&Spirv] = &[
     &MODEL_SOLID_FRAG,
     &OVERLAY_FRAG,
     &OVERLAY_VERT,
+    &SHADOW_VERT,
     &SHAPE_FRAG,
     &SHAPE_VERT,
     &SIGN_OUTLINE_VERT,

@@ -58,7 +58,7 @@ const FACE_VERTICES: [[[bool; 3]; 4]; 6] = {
     ]
 };
 
-type Vec3 = [f32; 3];
+pub(crate) type Vec3 = [f32; 3];
 /// Row-major.
 type Mat3 = [[f32; 3]; 3];
 
@@ -266,48 +266,50 @@ impl ModelPart {
 
 /// A texture slot of a model file: another slot's name, or a sprite.
 #[derive(Debug, Clone, PartialEq)]
-enum Slot {
+pub(crate) enum Slot {
     Reference(String),
     Material { sprite: Id, force_translucent: bool },
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Face {
-    cull: Option<u8>,
-    tint_index: i32,
-    texture: String,
+pub(crate) struct Face {
+    pub(crate) cull: Option<u8>,
+    pub(crate) tint_index: i32,
+    pub(crate) texture: String,
     /// `[u0, v0, u1, v1]` in sixteenths of the sprite.
-    uvs: Option<[f32; 4]>,
+    pub(crate) uvs: Option<[f32; 4]>,
     /// Quarter turns of the texture.
-    rotation: u8,
+    pub(crate) rotation: u8,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ElementRotation {
+pub(crate) struct ElementRotation {
     /// In blocks.
     origin: Vec3,
     matrix: Mat3,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct Element {
-    from: Vec3,
-    to: Vec3,
+pub(crate) struct Element {
+    pub(crate) from: Vec3,
+    pub(crate) to: Vec3,
     /// By direction ordinal: the order the faces are baked in, whatever order the file
     /// has them in.
-    faces: [Option<Face>; 6],
-    rotation: Option<ElementRotation>,
-    shade_direction: Option<u8>,
-    light_emission: u8,
+    pub(crate) faces: [Option<Face>; 6],
+    pub(crate) rotation: Option<ElementRotation>,
+    pub(crate) shade_direction: Option<u8>,
+    pub(crate) light_emission: u8,
 }
 
 /// A model file as it stands, before its parents are followed.
 #[derive(Debug, Clone, PartialEq, Default)]
-struct RawModel {
-    parent: Option<Id>,
-    elements: Option<Vec<Element>>,
-    ambient_occlusion: Option<bool>,
-    textures: Vec<(String, Slot)>,
+pub(crate) struct RawModel {
+    pub(crate) parent: Option<Id>,
+    pub(crate) elements: Option<Vec<Element>>,
+    pub(crate) ambient_occlusion: Option<bool>,
+    pub(crate) textures: Vec<(String, Slot)>,
+    /// How it is placed where items are shown (`display`), by the place's name.
+    pub(crate) display: Vec<(String, crate::item::ItemTransform)>,
 }
 
 fn number(v: &Value, what: &str) -> Result<f32, String> {
@@ -493,7 +495,7 @@ fn parse_element(v: &Value) -> Result<Element, String> {
     })
 }
 
-fn parse_model(text: &str) -> Result<RawModel, String> {
+pub(crate) fn parse_model(text: &str) -> Result<RawModel, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     if !v.is_object() {
         return Err("not an object".into());
@@ -547,6 +549,7 @@ fn parse_model(text: &str) -> Result<RawModel, String> {
             Some(b) => Some(b.as_bool().ok_or("ambientocclusion is not true or false")?),
         },
         textures,
+        display: crate::item::parse_display(v.get("display")),
     })
 }
 
@@ -571,6 +574,7 @@ fn missing_model() -> RawModel {
             light_emission: 0,
         }]),
         ambient_occlusion: None,
+        display: Vec::new(),
         textures: vec![
             ("particle".into(), Slot::Reference("missingno".into())),
             (
@@ -598,9 +602,11 @@ fn default_uvs(from: Vec3, to: Vec3, face: u8) -> [f32; 4] {
 }
 
 /// A sprite as the bakery needs it.
-struct Material<'a> {
-    sprite: &'a Sprite,
-    force_translucent: bool,
+pub(crate) struct Material<'a> {
+    /// The atlas the sprite is of.
+    pub(crate) atlas: &'a Atlas,
+    pub(crate) sprite: &'a Sprite,
+    pub(crate) force_translucent: bool,
 }
 
 /// The transparency of the texels a face shows, over every frame of its sprite
@@ -719,8 +725,7 @@ fn rewind(positions: &mut [Vec3; 4], uvs: &mut [[f32; 2]; 4], direction: u8) -> 
 
 /// Bakes one face of an element (`FaceBakery.bakeQuad`).
 #[allow(clippy::too_many_arguments)]
-fn bake_quad(
-    atlas: &Atlas,
+pub(crate) fn bake_quad(
     element: &Element,
     face: &Face,
     direction: u8,
@@ -738,7 +743,7 @@ fn bake_quad(
         }
     } else {
         rect_transparency(
-            atlas,
+            material.atlas,
             material.sprite,
             [
                 uv[0].min(uv[2]) / 16.0,
@@ -816,8 +821,7 @@ fn bake_quad(
 
 /// Bakes a model's elements under a variant's rotation
 /// (`UnbakedCuboidGeometry.bake`). `material` resolves a face's texture slot.
-fn bake_elements<'a>(
-    atlas: &'a Atlas,
+pub(crate) fn bake_elements<'a>(
     elements: &[Element],
     rotation: ModelRotation,
     material: &dyn Fn(&str) -> Material<'a>,
@@ -840,7 +844,6 @@ fn bake_elements<'a>(
                 .then(|| uv_lock_transform(&matrix, d as u8))
                 .filter(|t| *t != IDENTITY);
             let quad = bake_quad(
-                atlas,
                 e,
                 face,
                 d as u8,
@@ -1199,6 +1202,7 @@ impl Baker<'_> {
                 let slot = slot.strip_prefix('#').unwrap_or(slot);
                 match resolved.get(slot) {
                     Some(&(id, force_translucent)) => Material {
+                        atlas,
                         sprite: atlas.sprite(id).unwrap_or_else(|| {
                             missing.borrow_mut().push(id.to_string());
                             atlas.missing()
@@ -1208,6 +1212,7 @@ impl Baker<'_> {
                     None => {
                         missing.borrow_mut().push(format!("#{slot}"));
                         Material {
+                            atlas,
                             sprite: atlas.missing(),
                             force_translucent: false,
                         }
@@ -1215,7 +1220,7 @@ impl Baker<'_> {
                 }
             };
             match chain.iter().find_map(|m| m.elements.as_deref()) {
-                Some(elements) => bake_elements(atlas, elements, rotation, &material),
+                Some(elements) => bake_elements(elements, rotation, &material),
                 None => Default::default(),
             }
         };
@@ -1547,13 +1552,11 @@ mod tests {
         let atlas = atlas();
         let id = Id::minecraft("block/a").unwrap();
         let material = |_: &str| Material {
+            atlas: &atlas,
             sprite: atlas.sprite(&id).unwrap(),
             force_translucent: false,
         };
-        ModelPart::from_groups(
-            bake_elements(&atlas, &elements(text), rotation, &material),
-            true,
-        )
+        ModelPart::from_groups(bake_elements(&elements(text), rotation, &material), true)
     }
 
     /// The texture coordinates (in sixteenths of the sprite `a`) a face without `uv`
@@ -1773,6 +1776,7 @@ mod tests {
         let bake_with = |sprite: &str, uv: &str, force: bool| {
             let id = Id::minecraft(sprite).unwrap();
             let material = |_: &str| Material {
+                atlas: &atlas,
                 sprite: atlas.sprite(&id).unwrap(),
                 force_translucent: force,
             };
@@ -1780,13 +1784,7 @@ mod tests {
                 r##"{{"elements": [{{"from": [0, 0, 0], "to": [16, 16, 16], "faces":
                 {{"up": {{"texture": "#t"{uv}}}}}}}]}}"##
             );
-            bake_elements(
-                &atlas,
-                &elements(&model),
-                ModelRotation::default(),
-                &material,
-            )[0][0]
-                .layer
+            bake_elements(&elements(&model), ModelRotation::default(), &material)[0][0].layer
         };
         assert_eq!(bake_with("block/a", "", false), Layer::Solid);
         assert_eq!(bake_with("block/a", "", true), Layer::Translucent);

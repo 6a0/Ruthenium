@@ -164,6 +164,15 @@ pub enum Holder {
     Inline,
 }
 
+/// A trim's material or pattern, or a banner's pattern: a registry entry, or one written
+/// out, of which the picture's name (a material's palette, a pattern's asset) and whether
+/// a trim's pattern is a decal are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrimPart {
+    Id(i32),
+    Inline { asset: String, decal: bool },
+}
+
 /// A set of registry entries (`HolderSet`): a tag, or entries by registry id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HolderSet {
@@ -283,10 +292,12 @@ pub enum Component {
         hitbox_margin: f32,
         mob_factor: f32,
     },
-    /// `slot` is the `EquipmentSlot` id; the sounds, assets and allowed entities are
+    /// `slot` is the `EquipmentSlot` id and `asset` what it looks like worn
+    /// (`minecraft:diamond`); the sounds, the camera overlay and the allowed entities are
     /// skipped.
     Equippable {
         slot: i32,
+        asset: Option<String>,
         swappable: bool,
         damage_on_hurt: bool,
         equip_on_interact: bool,
@@ -311,11 +322,27 @@ pub enum Component {
     StoredEnchantments(Vec<(i32, i32)>),
     ChargedProjectiles(Vec<ItemStack>),
     BundleContents(Vec<ItemStack>),
-    /// The potion (`minecraft:potion` id), if any; the colour, custom effects and name
-    /// are skipped.
+    /// The potion (`minecraft:potion` id), if any, and the colour it is given
+    /// (0xRRGGBB); the custom effects and name are skipped.
     PotionContents {
         potion: Option<i32>,
+        custom_color: Option<i32>,
     },
+    /// The item definition a stack is drawn by (`minecraft:diamond_sword`).
+    ItemModel(String),
+    /// 0xRRGGBB.
+    DyedColor(i32),
+    EnchantmentGlintOverride(bool),
+    /// An armour trim: its material and its pattern.
+    Trim {
+        material: TrimPart,
+        pattern: TrimPart,
+    },
+    /// A banner's or shield's ground: a `DyeColor` id.
+    BaseColor(i32),
+    /// A banner's or shield's patterns, each with its `DyeColor` id.
+    BannerPatterns(Vec<(TrimPart, i32)>),
+    Profile(Box<ResolvableProfile>),
     Instrument(Holder),
     /// The block transformer (`minecraft:block_transformer` registry id).
     BlockTransformer(i32),
@@ -403,12 +430,13 @@ fn read_component(r: &mut Reader<'_>, kind: i32, depth: u32) -> Result<Component
             let slot = r.varint()?;
             sound(r)?;
             // The asset id, the camera overlay, the entities that may wear it.
-            opt(r, |r| r.identifier())?;
+            let asset = opt(r, |r| r.identifier())?;
             opt(r, |r| r.identifier())?;
             opt(r, holder_set)?;
             let _dispensable = r.bool()?;
             let c = Component::Equippable {
                 slot,
+                asset,
                 swappable: r.bool()?,
                 damage_on_hurt: r.bool()?,
                 equip_on_interact: r.bool()?,
@@ -512,11 +540,43 @@ fn read_component(r: &mut Reader<'_>, kind: i32, depth: u32) -> Result<Component
         Kind::PotionContents => {
             let potion = opt(r, |r| r.varint())?;
             // Custom colour, custom effects, custom name.
-            opt(r, |r| r.i32())?;
+            let custom_color = opt(r, |r| r.i32())?;
             skip_list(r, usize::MAX, |r| mob_effect(r, depth))?;
             opt(r, |r| r.string(MAX_STRING).map(drop))?;
-            Component::PotionContents { potion }
+            Component::PotionContents {
+                potion,
+                custom_color,
+            }
         }
+        Kind::ItemModel => Component::ItemModel(r.identifier()?),
+        Kind::DyedColor => Component::DyedColor(r.i32()?),
+        Kind::EnchantmentGlintOverride => Component::EnchantmentGlintOverride(r.bool()?),
+        Kind::Trim => {
+            // A material: its palette and description. A pattern: its asset, its
+            // description, and whether it is a decal.
+            let material = trim_part(r, |r| {
+                let asset = r.identifier()?;
+                nbt(r)?;
+                Ok((asset, false))
+            })?;
+            let pattern = trim_part(r, |r| {
+                let asset = r.identifier()?;
+                nbt(r)?;
+                Ok((asset, r.bool()?))
+            })?;
+            Component::Trim { material, pattern }
+        }
+        Kind::BaseColor => Component::BaseColor(r.varint()?),
+        Kind::BannerPatterns => Component::BannerPatterns(list(r, 1024, |r| {
+            // A pattern: its asset and its translation key.
+            let pattern = trim_part(r, |r| {
+                let asset = r.identifier()?;
+                r.string(MAX_STRING)?;
+                Ok((asset, false))
+            })?;
+            Ok((pattern, r.varint()?))
+        })?),
+        Kind::Profile => Component::Profile(Box::new(ResolvableProfile::read(r)?)),
         Kind::BlockTransformer => Component::BlockTransformer(r.varint()?),
         Kind::Instrument => Component::Instrument(holder(r, |r| {
             // Sound, use duration, range, durability damage, description.
@@ -555,14 +615,8 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
         Kind::Lore => skip_list(r, 256, nbt)?,
         // Units.
         Kind::CreativeSlotLock | Kind::Waxed => {}
-        Kind::EnchantmentGlintOverride => {
-            r.bool()?;
-        }
         Kind::PotionDurationScale => {
             r.f32()?;
-        }
-        Kind::DyedColor => {
-            r.i32()?;
         }
         // One VarInt: a number, an enum id or a registry id.
         Kind::DamageType
@@ -575,7 +629,6 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
         | Kind::MapId
         | Kind::MapPostProcessing
         | Kind::OminousBottleAmplifier
-        | Kind::BaseColor
         | Kind::VillagerVariant
         | Kind::WolfVariant
         | Kind::WolfSoundVariant
@@ -608,7 +661,7 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
         | Kind::CushionColor => {
             r.varint()?;
         }
-        Kind::ItemModel | Kind::TooltipStyle | Kind::NoteBlockSound => {
+        Kind::TooltipStyle | Kind::NoteBlockSound => {
             r.identifier()?;
         }
         Kind::AttributeModifiers => skip_list(r, usize::MAX, |r| {
@@ -650,14 +703,6 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
             skip_list(r, usize::MAX, |r| filterable(r, nbt))?;
             r.bool()?;
         }
-        Kind::Trim => {
-            trim_material(r)?;
-            holder(r, |r| {
-                r.identifier()?;
-                nbt(r)?;
-                r.bool().map(drop)
-            })?;
-        }
         Kind::ProvidesTrimMaterial => trim_material(r)?,
         Kind::EntityData | Kind::BlockEntityData => {
             r.varint()?;
@@ -684,16 +729,6 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
             r.varint()?;
             skip_list(r, 256, firework_explosion)?;
         }
-        Kind::Profile => {
-            ResolvableProfile::read(r)?;
-        }
-        Kind::BannerPatterns => skip_list(r, usize::MAX, |r| {
-            holder(r, |r| {
-                r.identifier()?;
-                r.string(MAX_STRING).map(drop)
-            })?;
-            r.varint().map(drop)
-        })?,
         Kind::PotDecorations => {
             for _ in 0..4 {
                 opt(r, |r| read_template(r, depth))?;
@@ -765,6 +800,13 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
         | Kind::BundleContents
         | Kind::Container
         | Kind::PotionContents
+        | Kind::ItemModel
+        | Kind::DyedColor
+        | Kind::EnchantmentGlintOverride
+        | Kind::Trim
+        | Kind::BaseColor
+        | Kind::BannerPatterns
+        | Kind::Profile
         | Kind::Instrument
         | Kind::BlockTransformer
         | Kind::Tool
@@ -839,6 +881,20 @@ fn holder(
             Ok(Holder::Inline)
         }
         n => Ok(Holder::Id(n - 1)),
+    }
+}
+
+/// A holder of which an inline value's asset and decal flag are kept.
+fn trim_part(
+    r: &mut Reader<'_>,
+    inline: impl FnOnce(&mut Reader<'_>) -> Result<(String, bool), WireError>,
+) -> Result<TrimPart, WireError> {
+    match r.varint()? {
+        0 => {
+            let (asset, decal) = inline(r)?;
+            Ok(TrimPart::Inline { asset, decal })
+        }
+        n => Ok(TrimPart::Id(n - 1)),
     }
 }
 
@@ -1168,6 +1224,7 @@ mod tests {
             get(Kind::Equippable),
             Some(Component::Equippable {
                 slot: 4,
+                asset: Some("minecraft:iron".into()),
                 swappable: true,
                 damage_on_hurt: false,
                 equip_on_interact: true,
@@ -1397,7 +1454,7 @@ mod tests {
             Some(&Component::Enchantments(vec![(0, 5), (12, 1)]))
         );
         // A trim: an inline material then a pattern by id.
-        stack(with(
+        let s = stack(with(
             2,
             W::default()
                 .kind(Kind::Trim)
@@ -1407,6 +1464,98 @@ mod tests {
                 .v(3)
                 .kind(Kind::Glider),
         ));
+        assert_eq!(
+            s.get(Kind::Trim),
+            Some(&Component::Trim {
+                material: TrimPart::Inline {
+                    asset: "minecraft:gold".into(),
+                    decal: false
+                },
+                pattern: TrimPart::Id(2),
+            })
+        );
+        assert_eq!(s.get(Kind::Glider), Some(&Component::Glider));
+    }
+
+    #[test]
+    fn what_a_stack_looks_like_is_read() {
+        let s = stack(with(
+            7,
+            W::default()
+                .kind(Kind::ItemModel)
+                .s("minecraft:stick")
+                .kind(Kind::DyedColor)
+                .i(0x12_3456)
+                .kind(Kind::EnchantmentGlintOverride)
+                .b(true)
+                .kind(Kind::BaseColor)
+                .v(14)
+                // A pattern by id in red, then one written out in white, a decal no
+                // banner has.
+                .kind(Kind::BannerPatterns)
+                .v(2)
+                .v(5)
+                .v(14)
+                .v(0)
+                .s("example:star")
+                .s("block.example.banner.star")
+                .v(0)
+                .kind(Kind::PotionContents)
+                .b(true)
+                .v(7)
+                .b(true)
+                .i(0xAB_CDEF)
+                .v(0)
+                .b(false)
+                // A trim with a pattern written out, which is a decal.
+                .kind(Kind::Trim)
+                .v(4)
+                .v(0)
+                .s("example:lines")
+                .text("Lines")
+                .b(true),
+        ));
+        let get = |k| s.get(k).cloned();
+        assert_eq!(
+            get(Kind::ItemModel),
+            Some(Component::ItemModel("minecraft:stick".into()))
+        );
+        assert_eq!(get(Kind::DyedColor), Some(Component::DyedColor(0x12_3456)));
+        assert_eq!(
+            get(Kind::EnchantmentGlintOverride),
+            Some(Component::EnchantmentGlintOverride(true))
+        );
+        assert_eq!(get(Kind::BaseColor), Some(Component::BaseColor(14)));
+        assert_eq!(
+            get(Kind::BannerPatterns),
+            Some(Component::BannerPatterns(vec![
+                (TrimPart::Id(4), 14),
+                (
+                    TrimPart::Inline {
+                        asset: "example:star".into(),
+                        decal: false
+                    },
+                    0
+                ),
+            ]))
+        );
+        assert_eq!(
+            get(Kind::PotionContents),
+            Some(Component::PotionContents {
+                potion: Some(7),
+                custom_color: Some(0xAB_CDEF)
+            })
+        );
+        assert_eq!(
+            get(Kind::Trim),
+            Some(Component::Trim {
+                material: TrimPart::Id(3),
+                pattern: TrimPart::Inline {
+                    asset: "example:lines".into(),
+                    decal: true
+                },
+            })
+        );
     }
 
     #[test]

@@ -133,6 +133,8 @@ With no command, opens the game window. Options:
                          (on, the default); off, to measure it against
   --players <on|off>     whether other players and mannequins are drawn (on, the
                          default); off, to measure it against
+  --entity-shadows <on|off>
+                         whether players cast shadows (on, the default)
   --animations <on|off>  whether animated textures (water, lava, fire) play (on, the
                          default); off, they show their first frame
   --fov-effects <on|off> whether the field of view narrows in water and lava (on, the

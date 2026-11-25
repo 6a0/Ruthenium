@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ruthenium_data::v26_3::registries::{DataComponentType as Kind, Item};
 use ruthenium_prepare::exporters::{ItemClassData, read_item_classes};
 use ruthenium_protocol::item::{
-    BlockPredicate, Component, ComponentPatch, Holder, HolderSet, ItemStack,
+    BlockPredicate, Component, ComponentPatch, Holder, HolderSet, ItemStack, TrimPart,
 };
 
 use crate::transform::TransformerRef;
@@ -236,6 +236,92 @@ pub struct Equippable {
     pub swappable: bool,
 }
 
+/// A shield's patterns in their order.
+pub type BannerPatterns = Arc<[(Arc<str>, u8)]>;
+
+/// An armour trim as it is drawn: its material's key and palette and its pattern's
+/// pictures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trim {
+    /// The material's key in its registry (`minecraft:gold`); empty for one written out.
+    pub material: Arc<str>,
+    /// The palette its pictures are coloured by (`minecraft:trim/gold`).
+    pub palette: Arc<str>,
+    /// The pattern's key (`minecraft:bolt`); empty for one written out.
+    pub pattern: Arc<str>,
+    /// The pattern's pictures (`minecraft:bolt`).
+    pub asset: Arc<str>,
+    /// Drawn only where the armour itself is.
+    pub decal: bool,
+}
+
+/// The trim materials and patterns of the session's registries: for each its key, its
+/// picture's name (a material's palette, a pattern's asset) and, for a pattern, whether it
+/// is a decal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Trims {
+    materials: Vec<(Arc<str>, Arc<str>)>,
+    patterns: Vec<(Arc<str>, Arc<str>, bool)>,
+}
+
+impl Trims {
+    /// From the registries' entries as the configuration gave them. An entry the server
+    /// left to the client's own copy of the game is the game's: a material `gold` has the
+    /// palette `trim/gold`, a pattern is named as its key and is no decal.
+    pub fn from_registry(
+        materials: &[ruthenium_protocol::packets::configuration::RegistryEntry],
+        patterns: &[ruthenium_protocol::packets::configuration::RegistryEntry],
+    ) -> Trims {
+        let string = |e: &ruthenium_protocol::packets::configuration::RegistryEntry, key: &str| {
+            let c = e.data.as_ref()?.as_compound()?;
+            Some(Arc::<str>::from(full_identifier(c.string(key)?)))
+        };
+        Trims {
+            materials: materials
+                .iter()
+                .map(|e| {
+                    let palette = string(e, "palette_id").unwrap_or_else(|| {
+                        let (namespace, path) =
+                            e.id.split_once(':').unwrap_or(("minecraft", &e.id));
+                        format!("{namespace}:trim/{path}").into()
+                    });
+                    (e.id.as_str().into(), palette)
+                })
+                .collect(),
+            patterns: patterns
+                .iter()
+                .map(|e| {
+                    let asset = string(e, "asset_id").unwrap_or_else(|| e.id.as_str().into());
+                    let decal = e
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.as_compound()?.boolean("decal"))
+                        .unwrap_or(false);
+                    (e.id.as_str().into(), asset, decal)
+                })
+                .collect(),
+        }
+    }
+
+    fn trim(&self, material: &TrimPart, pattern: &TrimPart) -> Option<Trim> {
+        let (material, palette) = match material {
+            TrimPart::Id(id) => self.materials.get(usize::try_from(*id).ok()?)?.clone(),
+            TrimPart::Inline { asset, .. } => ("".into(), asset.as_str().into()),
+        };
+        let (pattern, asset, decal) = match pattern {
+            TrimPart::Id(id) => self.patterns.get(usize::try_from(*id).ok()?)?.clone(),
+            TrimPart::Inline { asset, decal } => ("".into(), asset.as_str().into(), *decal),
+        };
+        Some(Trim {
+            material,
+            palette,
+            pattern,
+            asset,
+            decal,
+        })
+    }
+}
+
 /// An item's instrument (`InstrumentComponent`): a registry entry by id or name, or
 /// one written out inline (whose values aren't kept).
 #[derive(Debug, Clone, PartialEq)]
@@ -392,8 +478,9 @@ pub struct Components {
     /// `block_transformer`: what the item turns blocks into (axes, shovels, hoes).
     pub block_transformer: Option<TransformerRef>,
     pub instrument: Option<InstrumentRef>,
-    /// Charged projectiles, any.
+    /// Charged projectiles, any; and a firework rocket among them.
     pub charged: bool,
+    pub charged_rocket: bool,
     /// (`minecraft:enchantment` id, level).
     pub enchantments: Vec<(i32, i32)>,
     /// `EnchantmentHelper.getTridentSpinAttackStrength`: above 0, a riptide trident.
@@ -416,9 +503,33 @@ pub struct Components {
     pub compostable: bool,
     /// `jukebox_playable`: a jukebox plays it.
     pub jukebox_playable: bool,
+    /// `item_model`: the item definition it is drawn by (`minecraft:diamond_sword`).
+    pub item_model: Option<Arc<str>>,
+    /// `equippable`'s asset: what it looks like worn (`minecraft:diamond`).
+    pub equipment_asset: Option<Arc<str>>,
+    /// `dyed_color`, 0xRRGGBB.
+    pub dyed_color: Option<u32>,
+    /// `enchantment_glint_override`.
+    pub glint_override: Option<bool>,
+    /// `trim`.
+    pub trim: Option<Arc<Trim>>,
+    /// `potion_contents`' own colour, 0xRRGGBB.
+    pub potion_color: Option<u32>,
+    /// `base_color`: a shield's ground, a `DyeColor` id.
+    pub base_color: Option<u8>,
+    /// `banner_patterns`: each pattern's asset (`minecraft:creeper`) and `DyeColor` id.
+    /// Those of the registry are named as their keys.
+    pub banner_patterns: Option<BannerPatterns>,
+    /// `profile`: whose head it is.
+    pub profile: Option<Arc<ruthenium_protocol::profile::ResolvableProfile>>,
 }
 
 impl Components {
+    /// `ItemStack.hasFoil`: it glints if it says so, or else if it is enchanted.
+    pub fn glints(&self) -> bool {
+        self.glint_override.unwrap_or(!self.enchantments.is_empty())
+    }
+
     /// `getOrDefault(USE_EFFECTS, UseEffects.DEFAULT)`.
     pub fn use_effects(&self) -> UseEffects {
         self.use_effects.unwrap_or(UseEffects::DEFAULT)
@@ -515,7 +626,10 @@ impl Components {
                 Some(Kind::PiercingWeapon) => self.piercing_weapon = false,
                 Some(Kind::BlockTransformer) => self.block_transformer = None,
                 Some(Kind::Instrument) => self.instrument = None,
-                Some(Kind::ChargedProjectiles) => self.charged = false,
+                Some(Kind::ChargedProjectiles) => {
+                    self.charged = false;
+                    self.charged_rocket = false;
+                }
                 Some(Kind::Enchantments) => self.enchantments.clear(),
                 Some(Kind::Tool) => self.tool = None,
                 Some(Kind::CanBreak) => self.can_break = None,
@@ -524,8 +638,20 @@ impl Components {
                 Some(Kind::Compostable) => self.compostable = false,
                 Some(Kind::JukeboxPlayable) => self.jukebox_playable = false,
                 Some(Kind::Glider) => self.glider = false,
+                Some(Kind::ItemModel) => self.item_model = None,
+                Some(Kind::DyedColor) => self.dyed_color = None,
+                Some(Kind::EnchantmentGlintOverride) => self.glint_override = None,
+                Some(Kind::Trim) => self.trim = None,
+                Some(Kind::PotionContents) => self.potion_color = None,
+                Some(Kind::BaseColor) => self.base_color = None,
+                Some(Kind::BannerPatterns) => self.banner_patterns = None,
+                Some(Kind::Profile) => self.profile = None,
                 _ => {}
             }
+        }
+        // (A removed equippable takes its asset along.)
+        if self.equippable.is_none() {
+            self.equipment_asset = None;
         }
         for (_, c) in &patch.added {
             match c {
@@ -575,13 +701,52 @@ impl Components {
                 }
                 Component::UseRemainder(s) => self.use_remainder = Some(Arc::new((**s).clone())),
                 Component::Equippable {
-                    slot, swappable, ..
+                    slot,
+                    swappable,
+                    asset,
+                    ..
                 } => {
                     self.equippable = Some(Equippable {
                         slot: EquipmentSlot::from_id(*slot),
                         swappable: *swappable,
-                    })
+                    });
+                    self.equipment_asset = asset.as_deref().map(Arc::from);
                 }
+                Component::ItemModel(id) => self.item_model = Some(id.as_str().into()),
+                Component::DyedColor(rgb) => self.dyed_color = Some(*rgb as u32 & 0xFF_FFFF),
+                Component::EnchantmentGlintOverride(on) => self.glint_override = Some(*on),
+                Component::Trim { material, pattern } => {
+                    self.trim = items.trims.trim(material, pattern).map(Arc::new);
+                }
+                Component::PotionContents {
+                    potion,
+                    custom_color,
+                } => {
+                    // Its own colour, else its potion's. (One made of effects of its
+                    // own alone is not mixed here.)
+                    self.potion_color = custom_color
+                        .map(|c| c as u32 & 0xFF_FFFF)
+                        .or_else(|| potion_colour(potion.unwrap_or(-1)));
+                }
+                Component::BaseColor(dye) => self.base_color = u8::try_from(*dye).ok(),
+                Component::BannerPatterns(patterns) => {
+                    self.banner_patterns = Some(
+                        patterns
+                            .iter()
+                            .filter_map(|(pattern, dye)| {
+                                let asset: Arc<str> = match pattern {
+                                    TrimPart::Id(id) => items
+                                        .banner_patterns
+                                        .get(usize::try_from(*id).ok()?)?
+                                        .clone(),
+                                    TrimPart::Inline { asset, .. } => asset.as_str().into(),
+                                };
+                                Some((asset, u8::try_from(*dye).ok()?))
+                            })
+                            .collect(),
+                    );
+                }
+                Component::Profile(p) => self.profile = Some(Arc::new((**p).clone())),
                 Component::BlocksAttacks { .. } => self.blocks_attacks = true,
                 Component::KineticWeapon(_) => self.kinetic_weapon = true,
                 Component::AttackRange {
@@ -609,7 +774,12 @@ impl Components {
                         Holder::Inline => InstrumentRef::Inline,
                     })
                 }
-                Component::ChargedProjectiles(p) => self.charged = !p.is_empty(),
+                Component::ChargedProjectiles(p) => {
+                    self.charged = !p.is_empty();
+                    let rocket =
+                        Item::from_name("minecraft:firework_rocket").map(|i| i.id() as i32);
+                    self.charged_rocket = p.iter().any(|s| Some(s.item) == rocket);
+                }
                 Component::Enchantments(e) => self.enchantments = e.clone(),
                 Component::Glider => self.glider = true,
                 Component::Tool {
@@ -858,6 +1028,10 @@ pub struct Items {
     pub instruments: Vec<(String, Option<f32>)>,
     /// The `minecraft:enchantment` registry (empty until the server sends it).
     pub enchantments: crate::enchantment::Enchantments,
+    /// The `minecraft:trim_material` and `minecraft:trim_pattern` registries.
+    pub trims: Trims,
+    /// The `minecraft:banner_pattern` registry: each entry's asset, by id.
+    pub banner_patterns: Vec<Arc<str>>,
 }
 
 impl Items {
@@ -910,6 +1084,8 @@ impl Items {
             defaults,
             instruments: Vec::new(),
             enchantments: crate::enchantment::Enchantments::default(),
+            trims: Trims::default(),
+            banner_patterns: Vec::new(),
         }
     }
 
@@ -1052,7 +1228,35 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
             slot: EquipmentSlot::from_name(o.get("slot").and_then(|s| s.as_str()).unwrap_or("")),
             swappable: bool_or(o, "swappable", true),
         });
+        c.equipment_asset = o
+            .get("asset_id")
+            .and_then(|a| a.as_str())
+            .map(|a| full_identifier(a).into());
     }
+    c.item_model = v
+        .get("minecraft:item_model")
+        .and_then(|m| m.as_str())
+        .map(|m| full_identifier(m).into());
+    c.glint_override = v
+        .get("minecraft:enchantment_glint_override")
+        .and_then(serde_json::Value::as_bool);
+    c.dyed_color = v
+        .get("minecraft:dyed_color")
+        .and_then(serde_json::Value::as_i64)
+        .map(|rgb| rgb as u32 & 0xFF_FFFF);
+    c.potion_color = v.get("minecraft:potion_contents").and_then(|p| {
+        let custom = p.get("custom_color").and_then(serde_json::Value::as_i64);
+        custom.map(|c| c as u32 & 0xFF_FFFF).or_else(|| {
+            let name = full_identifier(p.get("potion")?.as_str()?);
+            let potion = ruthenium_data::v26_3::registries::Potion::from_name(&name)?;
+            potion_colour(potion.id() as i32)
+        })
+    });
+    c.base_color = v
+        .get("minecraft:base_color")
+        .and_then(|d| d.as_str())
+        .and_then(|name| DYE_NAMES.iter().position(|n| *n == name))
+        .map(|i| i as u8);
     c.blocks_attacks = has("minecraft:blocks_attacks");
     c.kinetic_weapon = has("minecraft:kinetic_weapon");
     c.attack_range = v.get("minecraft:attack_range").map(|o| {
@@ -1111,6 +1315,32 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
         })
     });
 }
+
+/// The colour of a potion of the registry, if it has effects.
+fn potion_colour(id: i32) -> Option<u32> {
+    let colours = &crate::potion_colours::POTION_COLOURS;
+    *usize::try_from(id).ok().and_then(|i| colours.get(i))?
+}
+
+/// `DyeColor` names, by id.
+pub const DYE_NAMES: [&str; 16] = [
+    "white",
+    "orange",
+    "magenta",
+    "light_blue",
+    "yellow",
+    "lime",
+    "pink",
+    "gray",
+    "light_gray",
+    "cyan",
+    "purple",
+    "blue",
+    "brown",
+    "green",
+    "red",
+    "black",
+];
 
 fn full_identifier(s: &str) -> String {
     if s.contains(':') {
@@ -1245,5 +1475,232 @@ mod tests {
         assert!(spear.is_in_range(eye, at(4.625), false));
         assert!(!spear.is_in_range(eye, at(4.7), false));
         assert!(spear.is_in_range(eye, at(6.0), true));
+    }
+
+    /// A stack of `name` with these components added.
+    fn with(items: &Items, name: &str, added: Vec<(Kind, Component)>) -> Stack {
+        items.stack(&ItemStack {
+            item: Item::from_name(name).unwrap().id() as i32,
+            count: 1,
+            patch: ComponentPatch {
+                added: added.into_iter().map(|(k, c)| (k.id() as i32, c)).collect(),
+                removed: Vec::new(),
+            },
+        })
+    }
+
+    #[test]
+    fn what_a_stack_looks_like_comes_from_its_item_and_its_patch() {
+        use ruthenium_protocol::nbt::Tag;
+        use ruthenium_protocol::packets::configuration::RegistryEntry;
+        let class = |name: &str| ItemClassData {
+            id: Item::from_name(name).unwrap().id(),
+            key: name.to_owned(),
+            classes: vec!["Item".to_owned()],
+            flags: 0,
+            block: None,
+            fields: Vec::new(),
+        };
+        let classes = vec![
+            class("minecraft:air"),
+            class("minecraft:leather_chestplate"),
+            class("minecraft:enchanted_golden_apple"),
+            class("minecraft:potion"),
+            class("minecraft:crossbow"),
+        ];
+        let mut reports = HashMap::new();
+        reports.insert(
+            "minecraft:leather_chestplate".to_owned(),
+            serde_json::json!({"components": {
+                "minecraft:equippable": {"asset_id": "minecraft:leather", "slot": "chest"},
+                "minecraft:item_model": "minecraft:leather_chestplate",
+                "minecraft:enchantments": {}
+            }}),
+        );
+        reports.insert(
+            "minecraft:enchanted_golden_apple".to_owned(),
+            serde_json::json!({"components": {"minecraft:enchantment_glint_override": true}}),
+        );
+        reports.insert(
+            "minecraft:potion".to_owned(),
+            serde_json::json!({"components": {"minecraft:potion_contents": {"potion": "minecraft:healing"}}}),
+        );
+        let mut items = Items::new(&classes, &reports);
+        let entry = |id: &str, data: Option<Tag>| RegistryEntry {
+            id: id.to_owned(),
+            data,
+        };
+        let mut own = ruthenium_protocol::nbt::Compound::new();
+        own.put("palette_id", Tag::String("example:shiny".into()));
+        let mut lines = ruthenium_protocol::nbt::Compound::new();
+        lines.put("asset_id", Tag::String("example:lines".into()));
+        lines.put("decal", Tag::Byte(1));
+        items.trims = Trims::from_registry(
+            &[
+                entry("minecraft:gold", None),
+                entry("example:mithril", Some(Tag::Compound(own))),
+            ],
+            &[
+                entry("minecraft:bolt", None),
+                entry("example:striped", Some(Tag::Compound(lines))),
+            ],
+        );
+        items.banner_patterns = vec!["minecraft:creeper".into(), "minecraft:border".into()];
+
+        // The item's own: what it looks like worn and held, no dye, no glint.
+        let plain = with(&items, "minecraft:leather_chestplate", Vec::new());
+        assert_eq!(
+            plain.c.equipment_asset.as_deref(),
+            Some("minecraft:leather")
+        );
+        assert_eq!(
+            plain.c.item_model.as_deref(),
+            Some("minecraft:leather_chestplate")
+        );
+        assert_eq!((plain.c.dyed_color, plain.c.glints()), (None, false));
+        assert!(plain.c.trim.is_none());
+        // Dyed, enchanted and trimmed by entries the client knows only by name.
+        let worn = with(
+            &items,
+            "minecraft:leather_chestplate",
+            vec![
+                (
+                    Kind::DyedColor,
+                    Component::DyedColor(-0x100_0000 | 0x12_3456),
+                ),
+                (Kind::Enchantments, Component::Enchantments(vec![(3, 1)])),
+                (
+                    Kind::Trim,
+                    Component::Trim {
+                        material: TrimPart::Id(0),
+                        pattern: TrimPart::Id(0),
+                    },
+                ),
+                (Kind::ItemModel, Component::ItemModel("example:robe".into())),
+            ],
+        );
+        assert_eq!(
+            (worn.c.dyed_color, worn.c.glints()),
+            (Some(0x12_3456), true)
+        );
+        assert_eq!(worn.c.item_model.as_deref(), Some("example:robe"));
+        let trim = worn.c.trim.as_deref().unwrap();
+        assert_eq!(
+            (&*trim.material, &*trim.palette),
+            ("minecraft:gold", "minecraft:trim/gold")
+        );
+        assert_eq!(
+            (&*trim.pattern, &*trim.asset, trim.decal),
+            ("minecraft:bolt", "minecraft:bolt", false)
+        );
+        // By entries the server described, and written out in the stack itself.
+        let of = |material, pattern| {
+            let s = with(
+                &items,
+                "minecraft:leather_chestplate",
+                vec![(Kind::Trim, Component::Trim { material, pattern })],
+            );
+            s.c.trim.as_deref().cloned()
+        };
+        let described = of(TrimPart::Id(1), TrimPart::Id(1)).unwrap();
+        assert_eq!(
+            (&*described.palette, &*described.asset, described.decal),
+            ("example:shiny", "example:lines", true)
+        );
+        let inline = TrimPart::Inline {
+            asset: "example:own".into(),
+            decal: true,
+        };
+        let written = of(inline.clone(), inline).unwrap();
+        assert_eq!(
+            (&*written.material, &*written.palette, written.decal),
+            ("", "example:own", true)
+        );
+        assert_eq!(of(TrimPart::Id(7), TrimPart::Id(0)), None);
+        // A glint an item has by itself, and one a stack is told not to have.
+        let apple = with(&items, "minecraft:enchanted_golden_apple", Vec::new());
+        assert!(apple.c.glints());
+        let dull = with(
+            &items,
+            "minecraft:leather_chestplate",
+            vec![
+                (Kind::Enchantments, Component::Enchantments(vec![(3, 1)])),
+                (
+                    Kind::EnchantmentGlintOverride,
+                    Component::EnchantmentGlintOverride(false),
+                ),
+            ],
+        );
+        assert!(!dull.c.glints());
+        // A potion's colour: its item's own contents', its potion's, or the one it is given.
+        let healing = with(&items, "minecraft:potion", Vec::new());
+        assert_eq!(healing.c.potion_color, Some(0xF8_2423));
+        let contents = |potion, custom_color| {
+            let c = Component::PotionContents {
+                potion,
+                custom_color,
+            };
+            with(&items, "minecraft:potion", vec![(Kind::PotionContents, c)])
+                .c
+                .potion_color
+        };
+        let id = |name: &str| {
+            ruthenium_data::v26_3::registries::Potion::from_name(name).map(|p| p.id() as i32)
+        };
+        assert_eq!(contents(id("minecraft:swiftness"), None), Some(0x33_EBFF));
+        assert_eq!(contents(id("minecraft:water"), None), None);
+        assert_eq!(
+            contents(id("minecraft:swiftness"), Some(0x0A_0B0C)),
+            Some(0x0A_0B0C)
+        );
+        assert_eq!(contents(None, None), None);
+        // A crossbow by what is in it; a shield by its ground and patterns.
+        let loaded = |name: &str| {
+            let projectile = ItemStack {
+                item: Item::from_name(name).unwrap().id() as i32,
+                count: 1,
+                patch: ComponentPatch::EMPTY,
+            };
+            let c = Component::ChargedProjectiles(vec![projectile]);
+            let s = with(
+                &items,
+                "minecraft:crossbow",
+                vec![(Kind::ChargedProjectiles, c)],
+            );
+            (s.c.charged, s.c.charged_rocket)
+        };
+        assert_eq!(loaded("minecraft:arrow"), (true, false));
+        assert_eq!(loaded("minecraft:firework_rocket"), (true, true));
+        let shield = with(
+            &items,
+            "minecraft:crossbow",
+            vec![
+                (Kind::BaseColor, Component::BaseColor(14)),
+                (
+                    Kind::BannerPatterns,
+                    Component::BannerPatterns(vec![
+                        (TrimPart::Id(1), 4),
+                        (TrimPart::Id(9), 4),
+                        (
+                            TrimPart::Inline {
+                                asset: "example:star".into(),
+                                decal: false,
+                            },
+                            15,
+                        ),
+                    ]),
+                ),
+            ],
+        );
+        assert_eq!(shield.c.base_color, Some(14));
+        let patterns: Vec<(&str, u8)> = shield
+            .c
+            .banner_patterns
+            .as_deref()
+            .unwrap()
+            .iter()
+            .map(|(asset, dye)| (&**asset, *dye))
+            .collect();
+        assert_eq!(patterns, [("minecraft:border", 4), ("example:star", 15)]);
     }
 }

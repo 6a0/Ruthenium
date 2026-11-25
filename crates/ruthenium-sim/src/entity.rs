@@ -28,10 +28,12 @@
 //! the type's default. A sitting camel has its sitting size.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
 
 use ruthenium_data::v26_3::registries::Item;
 use ruthenium_javamath::mth;
 use ruthenium_prepare::exporters::EntityTypeData;
+use ruthenium_protocol::nbt::Tag;
 use ruthenium_protocol::packets::Property;
 use ruthenium_protocol::packets::play::{self, DataValue, PositionPath, VecDelta};
 use ruthenium_protocol::profile::ResolvableProfile;
@@ -41,6 +43,7 @@ use crate::item::{Items, Stack};
 use crate::player::{
     Attribute, DEG_TO_RAD_F, Env, LocalPlayer, Modifier, Riding, VehicleMove, rotate_y,
 };
+use crate::scoreboard::{NameRecord, NameText, Scoreboard, team_name};
 use crate::shape::Aabb;
 use crate::vehicle::{Body, Controller, RideKind};
 
@@ -302,6 +305,11 @@ pub struct TypeInfo {
     tame_flags_field: Option<u8>,
     /// An avatar's own fields.
     avatar_fields: AvatarFields,
+    /// `Entity.DATA_CUSTOM_NAME` and `DATA_CUSTOM_NAME_VISIBLE`, and a mannequin's
+    /// `DATA_DESCRIPTION`.
+    custom_name_field: Option<u8>,
+    custom_name_visible_field: Option<u8>,
+    description_field: Option<u8>,
 }
 
 /// When a saddle counts (`canUseSlot(SADDLE)`).
@@ -557,6 +565,9 @@ impl EntityTypes {
                     profile: d.field("Mannequin.DATA_PROFILE"),
                 },
                 tame_flags_field: d.field("TamableAnimal.DATA_FLAGS_ID"),
+                custom_name_field: d.field("Entity.DATA_CUSTOM_NAME"),
+                custom_name_visible_field: d.field("Entity.DATA_CUSTOM_NAME_VISIBLE"),
+                description_field: d.field("Mannequin.DATA_DESCRIPTION"),
             };
             let i = d.id as usize;
             if types.len() <= i {
@@ -852,9 +863,40 @@ pub struct Entity {
     pub(crate) tame: bool,
     /// How a player or mannequin holds itself.
     pub(crate) avatar: Option<Box<Avatar>>,
+    /// What an avatar is called, apart from its profile's name.
+    naming: Option<Box<Naming>>,
+}
+
+/// An avatar's names and how far they are seen from.
+#[derive(Debug, Clone)]
+struct Naming {
+    /// `getCustomName` and `isCustomNameVisible`.
+    custom_name: Option<Tag>,
+    custom_name_visible: bool,
+    /// A mannequin's `getDescription`.
+    description: Option<Tag>,
+    /// `Attributes.NAME_TAG_DISTANCE` and `BELOW_NAME_DISTANCE`.
+    distance: f32,
+    below_distance: f32,
+    /// Counts the changes to the texts.
+    rev: u64,
+    /// The texts as last put together, and what they were put together from: the teams',
+    /// the scoreboard's and the own changes.
+    shown: Option<([u64; 3], Arc<NameText>)>,
+}
+
+/// `Mannequin.DEFAULT_DESCRIPTION`.
+const MANNEQUIN_LABEL: &str = "entity.minecraft.mannequin.label";
+
+fn translatable(key: &str) -> Tag {
+    let mut c = ruthenium_protocol::nbt::Compound::new();
+    c.put("translate", Tag::String(key.to_owned()));
+    Tag::Compound(c)
 }
 
 const ATTRIBUTE_SCALE: &str = "minecraft:scale";
+const ATTRIBUTE_NAME_TAG_DISTANCE: &str = "minecraft:name_tag_distance";
+const ATTRIBUTE_BELOW_NAME_DISTANCE: &str = "minecraft:below_name_distance";
 
 /// `UUID.toString`.
 pub fn uuid_string(u: u128) -> String {
@@ -945,6 +987,17 @@ impl Entity {
             suffocating: false,
             tame: false,
             avatar: None,
+            naming: info.avatar.then(|| {
+                Box::new(Naming {
+                    custom_name: None,
+                    custom_name_visible: false,
+                    description: (!info.player).then(|| translatable(MANNEQUIN_LABEL)),
+                    distance: 64.0,
+                    below_distance: 10.0,
+                    rev: 0,
+                    shown: None,
+                })
+            }),
         };
         if let Some(b) = e.body.as_deref_mut() {
             for (name, base) in &info.default_attributes {
@@ -1408,6 +1461,22 @@ impl Entity {
             && let DataValue::Byte(b) = value
         {
             self.tame = b & 4 != 0;
+        } else if let Some(n) = &mut self.naming {
+            if Some(field) == t.custom_name_field
+                && let DataValue::OptionalComponent(name) = value
+            {
+                n.custom_name = name.clone();
+                n.rev += 1;
+            } else if Some(field) == t.custom_name_visible_field
+                && let DataValue::Boolean(b) = value
+            {
+                n.custom_name_visible = *b;
+            } else if Some(field) == t.description_field
+                && let DataValue::OptionalComponent(text) = value
+            {
+                n.description = text.clone();
+                n.rev += 1;
+            }
         }
     }
 }
@@ -1445,13 +1514,28 @@ fn section_chunk(key: i64) -> (i32, i32) {
     ((key >> 42) as i32, (key << 22 >> 42) as i32)
 }
 
-/// A scoreboard team, as far as pushing cares.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A scoreboard team, as far as pushing and names care.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Team {
     pub name: String,
     pub collision_rule: i32,
     /// Its members see those of it who are invisible.
     pub see_invisible: bool,
+    /// What stands before and after its members' names, as components.
+    pub prefix: Tag,
+    pub suffix: Tag,
+    /// The `ChatFormatting` ordinal its members' names are written in.
+    pub colour: Option<i32>,
+    /// Who sees its members' names (`visibility`).
+    pub name_visibility: i32,
+}
+
+/// `Team.Visibility` ids.
+pub mod visibility {
+    pub const ALWAYS: i32 = 0;
+    pub const NEVER: i32 = 1;
+    pub const HIDE_FOR_OTHER_TEAMS: i32 = 2;
+    pub const HIDE_FOR_OWN_TEAM: i32 = 3;
 }
 
 /// The scoreboard's teams and who is on which (`Scoreboard`'s team part).
@@ -1459,6 +1543,7 @@ pub struct Team {
 pub struct Teams {
     teams: HashMap<String, Team>,
     members: HashMap<String, String>,
+    rev: u64,
 }
 
 impl Teams {
@@ -1470,6 +1555,7 @@ impl Teams {
         parameters: Option<&play::TeamParameters>,
         players: &[String],
     ) {
+        self.rev += 1;
         if method == 0 {
             // `addPlayerTeam` (an existing name is refused by vanilla's scoreboard,
             // which keeps the old team).
@@ -1477,6 +1563,10 @@ impl Teams {
                 name: name.to_owned(),
                 collision_rule: rule::ALWAYS,
                 see_invisible: true,
+                prefix: Tag::String(String::new()),
+                suffix: Tag::String(String::new()),
+                colour: None,
+                name_visibility: visibility::ALWAYS,
             });
         } else if !self.teams.contains_key(name) {
             return;
@@ -1486,6 +1576,14 @@ impl Teams {
         {
             // Unknown ids read as the first rule.
             t.see_invisible = p.options & 2 != 0;
+            t.prefix = p.prefix.clone();
+            t.suffix = p.suffix.clone();
+            t.colour = p.color;
+            t.name_visibility = if (0..=3).contains(&p.name_tag_visibility) {
+                p.name_tag_visibility
+            } else {
+                visibility::ALWAYS
+            };
             t.collision_rule = if (0..=3).contains(&p.collision_rule) {
                 p.collision_rule
             } else {
@@ -1516,6 +1614,11 @@ impl Teams {
     /// `getPlayersTeam`.
     pub fn team_of(&self, scoreboard_name: &str) -> Option<&Team> {
         self.teams.get(self.members.get(scoreboard_name)?)
+    }
+
+    /// Counts the packets taken in: what was made of an older state is out of date.
+    pub fn rev(&self) -> u64 {
+        self.rev
     }
 }
 
@@ -2282,7 +2385,11 @@ impl Entities {
                         n if n.ends_with("_chestplate") => Chest::Armour,
                         _ => Chest::Bare,
                     });
+                    a.set_worn(crate::avatar::WORN_CHEST, stack);
                 }
+                play::EQUIPMENT_HEAD => a.set_worn(crate::avatar::WORN_HEAD, stack),
+                play::EQUIPMENT_LEGS => a.set_worn(crate::avatar::WORN_LEGS, stack),
+                play::EQUIPMENT_FEET => a.set_worn(crate::avatar::WORN_FEET, stack),
                 _ => {}
             }
         }
@@ -2329,6 +2436,94 @@ impl Entities {
         Some(Box::new(r))
     }
 
+    /// Puts together again the names that are out of date: before a frame is published.
+    pub fn refresh_names(&mut self, teams: &Teams, scores: &Scoreboard) {
+        for e in self.entities.values_mut() {
+            let Some(n) = &mut e.naming else {
+                continue;
+            };
+            let stamp = [teams.rev(), scores.rev(), n.rev];
+            if n.shown.as_ref().is_some_and(|s| s.0 == stamp) {
+                continue;
+            }
+            // `getName`: a player's is its profile's, another's the one it was given or
+            // its type's.
+            let own = if e.info.player {
+                Tag::String(e.scoreboard_name.clone())
+            } else {
+                n.custom_name.clone().unwrap_or_else(|| {
+                    translatable(&format!("entity.{}", e.info.key.replace(':', ".")))
+                })
+            };
+            let name = match teams.team_of(&e.scoreboard_name) {
+                Some(t) => team_name(&t.prefix, own, &t.suffix, t.colour),
+                None => own,
+            };
+            let below = if e.info.player {
+                scores.below_name(&e.scoreboard_name)
+            } else {
+                n.description.clone()
+            };
+            let text = NameText { name, below };
+            // The same one as before if nothing of it changed: what is drawn from it is
+            // kept by it.
+            let text = match n.shown.take() {
+                Some((_, old)) if *old == text => old,
+                _ => Arc::new(text),
+            };
+            n.shown = Some((stamp, text));
+        }
+    }
+
+    /// The name over the avatar `e` as [`Self::refresh_names`] left it, if a viewer who is
+    /// a spectator or not and has this scoreboard name is shown it
+    /// (`LivingEntityRenderer.shouldShowName`, `AvatarRenderer.shouldShowName`). How far
+    /// it is seen from is left to the one who draws.
+    pub fn name_record(
+        &self,
+        e: &Entity,
+        teams: &Teams,
+        spectator: bool,
+        viewer: &str,
+    ) -> Option<NameRecord> {
+        let a = e.avatar.as_deref()?;
+        let n = e.naming.as_deref()?;
+        let team = teams.team_of(&e.scoreboard_name);
+        let own = teams.team_of(viewer);
+        let same = |t: &Team| own.is_some_and(|o| o.name == t.name);
+        // `isInvisibleTo`.
+        let visible =
+            !a.is_invisible() || spectator || team.is_some_and(|t| t.see_invisible && same(t));
+        let shown = match team {
+            Some(t) => match t.name_visibility {
+                visibility::NEVER => false,
+                visibility::HIDE_FOR_OTHER_TEAMS if own.is_some() => {
+                    same(t) && (t.see_invisible || visible)
+                }
+                visibility::HIDE_FOR_OWN_TEAM if own.is_some() => !same(t) && visible,
+                _ => visible,
+            },
+            // (The heads-up display cannot be hidden yet.)
+            None => visible && e.passengers.is_empty(),
+        };
+        // A player's name is always there to show; another's only if it is said to be.
+        // (Nor while the crosshair is on it: what it is on is not kept.)
+        if !shown || !(e.info.player || n.custom_name.is_some() && n.custom_name_visible) {
+            return None;
+        }
+        Some(NameRecord {
+            text: n.shown.as_ref()?.1.clone(),
+            discrete: a.is_discrete(),
+            distance: n.distance,
+            below_distance: n.below_distance,
+            offset: if e.info.player && e.scoreboard_name == "deadmau5" {
+                -10
+            } else {
+                0
+            },
+        })
+    }
+
     /// `handleSetEntityData`.
     pub fn set_data(&mut self, id: i32, values: &[(u8, DataValue)], types: &EntityTypes) {
         if let Some(e) = self.entities.get_mut(&id) {
@@ -2364,6 +2559,30 @@ impl Entities {
                         operation: *operation,
                     })
                     .collect();
+            }
+            if let Some(n) = &mut e.naming
+                && matches!(
+                    name,
+                    Some(ATTRIBUTE_NAME_TAG_DISTANCE | ATTRIBUTE_BELOW_NAME_DISTANCE)
+                )
+            {
+                // Both have the same range.
+                let mut attribute = Attribute::new(a.base, 0.0, 512.0);
+                attribute.modifiers = a
+                    .modifiers
+                    .iter()
+                    .map(|(id, amount, operation)| Modifier {
+                        id: id.clone(),
+                        amount: *amount,
+                        operation: *operation,
+                    })
+                    .collect();
+                let value = attribute.value() as f32;
+                if name == Some(ATTRIBUTE_NAME_TAG_DISTANCE) {
+                    n.distance = value;
+                } else {
+                    n.below_distance = value;
+                }
             }
             if name == Some(ATTRIBUTE_SCALE) {
                 // Dirty as `setBaseValue`, `removeModifiers` and the adds mark it.
@@ -3253,6 +3472,18 @@ mod tests {
                 (0.6, 1.8),
                 &[("Entity.DATA_SHARED_FLAGS_ID", 0)],
             ),
+            data(
+                7,
+                "minecraft:mannequin",
+                &["Mannequin", "Avatar", "LivingEntity", "Entity"],
+                (0.6, 1.8),
+                &[
+                    ("Entity.DATA_SHARED_FLAGS_ID", 0),
+                    ("Entity.DATA_CUSTOM_NAME", 2),
+                    ("Entity.DATA_CUSTOM_NAME_VISIBLE", 3),
+                    ("Mannequin.DATA_DESCRIPTION", 19),
+                ],
+            ),
         ])
     }
 
@@ -3492,6 +3723,9 @@ mod tests {
         let mut teams = Teams::default();
         let rules = |teams: &mut Teams, rule: i32| {
             let p = play::TeamParameters {
+                display_name: Tag::String(String::new()),
+                prefix: Tag::String(String::new()),
+                suffix: Tag::String(String::new()),
                 name_tag_visibility: 0,
                 collision_rule: rule,
                 color: None,
@@ -3808,6 +4042,217 @@ mod tests {
         e.add(&p, &types(), &players);
     }
 
+    const MANNEQUIN: i32 = 7;
+
+    fn text(s: &str) -> Tag {
+        Tag::String(s.to_owned())
+    }
+
+    fn team(visibility: i32, options: u8) -> play::TeamParameters {
+        play::TeamParameters {
+            display_name: text(""),
+            prefix: text("["),
+            suffix: text("]"),
+            name_tag_visibility: visibility,
+            collision_rule: 0,
+            color: Some(12),
+            options,
+        }
+    }
+
+    /// The name over `id` as the player "Developer" is shown it.
+    fn name(e: &mut Entities, id: i32, teams: &Teams, spectator: bool) -> Option<NameRecord> {
+        e.refresh_names(teams, &Scoreboard::default());
+        e.name_record(e.get(id).unwrap(), teams, spectator, "Developer")
+    }
+
+    #[test]
+    fn a_player_is_named_as_its_team_names_it() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
+        let mut teams = Teams::default();
+        let plain = name(&mut e, 9, &teams, false).unwrap();
+        assert_eq!(plain.text.name, text("Kai"));
+        assert_eq!((plain.distance, plain.below_distance), (64.0, 10.0));
+        assert!(!plain.discrete && plain.offset == 0 && plain.text.below.is_none());
+        // Nothing changed: the same text, not another like it.
+        let again = name(&mut e, 9, &teams, false).unwrap();
+        assert!(Arc::ptr_eq(&plain.text, &again.text));
+        teams.apply("red", 0, Some(&team(0, 0)), &["Kai".to_owned()]);
+        let named = name(&mut e, 9, &teams, false).unwrap();
+        let c = named.text.name.as_compound().unwrap();
+        assert_eq!(c.string("color"), Some("red"));
+        assert_eq!(c.list("extra"), [text("["), text("Kai"), text("]")]);
+        // A packet that changes nothing of it leaves the text the one it was.
+        teams.apply("blue", 0, Some(&team(0, 0)), &[]);
+        let after = name(&mut e, 9, &teams, false).unwrap();
+        assert!(Arc::ptr_eq(&named.text, &after.text));
+        // Sneaking, and the ears of one player.
+        e.set_data(9, &[(0, DataValue::Byte(2))], &types());
+        assert!(name(&mut e, 9, &teams, false).unwrap().discrete);
+        add_player(&mut e, 10, "deadmau5", [5.5, -60.0, 5.5]);
+        assert_eq!(name(&mut e, 10, &teams, false).unwrap().offset, -10);
+    }
+
+    #[test]
+    fn a_score_stands_below_a_players_name() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
+        let teams = Teams::default();
+        let mut scores = Scoreboard::default();
+        scores.set_objective("hp", 0, Some(text("HP")), None);
+        scores.set_display(play::DISPLAY_SLOT_BELOW_NAME, "hp");
+        scores.set_score("Kai", "hp", 14, None);
+        e.refresh_names(&teams, &scores);
+        let shown = e
+            .name_record(e.get(9).unwrap(), &teams, false, "Developer")
+            .unwrap();
+        assert_eq!(shown.text.below, scores.below_name("Kai"));
+        assert!(shown.text.below.is_some());
+        scores.reset_score("Kai", None);
+        e.refresh_names(&teams, &scores);
+        let shown = e
+            .name_record(e.get(9).unwrap(), &teams, false, "Developer")
+            .unwrap();
+        assert_eq!(shown.text.below, None);
+    }
+
+    #[test]
+    fn teams_say_who_sees_a_name() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
+        let kai = ["Kai".to_owned()];
+        let me = ["Developer".to_owned()];
+        let seen = |e: &mut Entities, teams: &Teams| name(e, 9, teams, false).is_some();
+        // Its team alone decides while the viewer has none.
+        for (visibility, shown) in [(0, true), (1, false), (2, true), (3, true), (9, true)] {
+            let mut teams = Teams::default();
+            teams.apply("red", 0, Some(&team(visibility, 0)), &kai);
+            assert_eq!(seen(&mut e, &teams), shown, "{visibility}");
+        }
+        // With the viewer on the same team, and on another.
+        for (visibility, same, other) in [(0, true, true), (2, true, false), (3, false, true)] {
+            let mut teams = Teams::default();
+            teams.apply("red", 0, Some(&team(visibility, 0)), &kai);
+            teams.apply("blue", 0, Some(&team(0, 0)), &me);
+            assert_eq!(seen(&mut e, &teams), other, "{visibility} from another");
+            teams.apply("red", 3, None, &me);
+            assert_eq!(seen(&mut e, &teams), same, "{visibility} from its own");
+        }
+        // The invisible: not named, but for spectators and for a team that sees its own.
+        e.set_data(9, &[(0, DataValue::Byte(0x20))], &types());
+        let mut teams = Teams::default();
+        assert!(!seen(&mut e, &teams));
+        assert!(name(&mut e, 9, &teams, true).is_some());
+        teams.apply("red", 0, Some(&team(0, 2)), &kai);
+        assert!(!seen(&mut e, &teams));
+        teams.apply("red", 3, None, &me);
+        assert!(seen(&mut e, &teams));
+        teams.apply("red", 2, Some(&team(0, 0)), &[]);
+        assert!(!seen(&mut e, &teams));
+        // Hidden from other teams, a team that sees its own shows them regardless.
+        teams.apply("red", 2, Some(&team(2, 2)), &[]);
+        assert!(seen(&mut e, &teams));
+        teams.apply("red", 2, Some(&team(3, 2)), &[]);
+        assert!(!seen(&mut e, &teams));
+    }
+
+    #[test]
+    fn one_who_carries_another_has_no_name_shown() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        e.chunk_loaded(0, 0);
+        add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
+        add(&mut e, 8, ZOMBIE, [5.5, -60.0, 5.5]);
+        let mut teams = Teams::default();
+        assert!(name(&mut e, 9, &teams, false).is_some());
+        e.set_passengers(9, &[8]);
+        assert!(name(&mut e, 9, &teams, false).is_none());
+        // A team asks no such thing.
+        teams.apply("red", 0, Some(&team(0, 0)), &["Kai".to_owned()]);
+        assert!(name(&mut e, 9, &teams, false).is_some());
+    }
+
+    #[test]
+    fn a_mannequin_shows_the_name_it_was_given_if_told_to() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        let p = play::AddEntity {
+            entity_id: 9,
+            uuid: 1009,
+            entity_type: MANNEQUIN,
+            position: [5.5, -60.0, 5.5],
+            movement: [0.0; 3],
+            x_rot: 0,
+            y_rot: 0,
+            y_head_rot: 0,
+            data: 0,
+        };
+        e.add(&p, &types(), &PlayerInfos::default());
+        let teams = Teams::default();
+        assert!(name(&mut e, 9, &teams, false).is_none());
+        // Told to show a name it does not have.
+        e.set_data(9, &[(3, DataValue::Boolean(true))], &types());
+        assert!(name(&mut e, 9, &teams, false).is_none());
+        let given = DataValue::OptionalComponent(Some(text("Guard")));
+        e.set_data(9, &[(2, given)], &types());
+        let shown = name(&mut e, 9, &teams, false).unwrap();
+        assert_eq!(shown.text.name, text("Guard"));
+        // Below it what it is described as: a label until it is given another or none.
+        let label = shown.text.below.as_ref().unwrap().as_compound().unwrap();
+        assert_eq!(label.string("translate"), Some(MANNEQUIN_LABEL));
+        let described = DataValue::OptionalComponent(Some(text("of the gate")));
+        e.set_data(9, &[(19, described)], &types());
+        let shown = name(&mut e, 9, &teams, false).unwrap();
+        assert_eq!(shown.text.below, Some(text("of the gate")));
+        e.set_data(9, &[(19, DataValue::OptionalComponent(None))], &types());
+        assert_eq!(name(&mut e, 9, &teams, false).unwrap().text.below, None);
+        e.set_data(9, &[(3, DataValue::Boolean(false))], &types());
+        assert!(name(&mut e, 9, &teams, false).is_none());
+        // Its team is the one of its id.
+        let mut teams = Teams::default();
+        teams.apply("red", 0, Some(&team(0, 0)), &[uuid_string(1009)]);
+        e.set_data(9, &[(3, DataValue::Boolean(true))], &types());
+        let shown = name(&mut e, 9, &teams, false).unwrap();
+        let c = shown.text.name.as_compound().unwrap();
+        assert_eq!(c.list("extra")[1], text("Guard"));
+    }
+
+    #[test]
+    fn names_are_seen_from_as_far_as_the_attributes_say() {
+        use ruthenium_data::v26_3::registries::Attribute as Registered;
+        let mut e = Entities::new(PLAYER_ID, false);
+        add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
+        let id = |name: &str| {
+            (0..200)
+                .find(|i| Registered::from_id(*i).is_some_and(|a| a.name() == name))
+                .unwrap() as i32
+        };
+        let snapshot = |name: &str, base: f64, modifiers| play::AttributeSnapshot {
+            attribute: id(name),
+            base,
+            modifiers,
+        };
+        e.update_attributes(
+            9,
+            &[
+                snapshot("minecraft:name_tag_distance", 20.0, Vec::new()),
+                snapshot(
+                    "minecraft:below_name_distance",
+                    10.0,
+                    vec![("a".to_owned(), 1.0, 2), ("b".to_owned(), 6.0, 0)],
+                ),
+            ],
+        );
+        let shown = name(&mut e, 9, &Teams::default(), false).unwrap();
+        assert_eq!((shown.distance, shown.below_distance), (20.0, 32.0));
+        // Never farther than the attribute goes.
+        e.update_attributes(
+            9,
+            &[snapshot("minecraft:name_tag_distance", 9000.0, Vec::new())],
+        );
+        let shown = name(&mut e, 9, &Teams::default(), false).unwrap();
+        assert_eq!(shown.distance, 512.0);
+    }
+
     fn record(e: &Entities, id: i32, teams: &Teams, spectator: bool) -> Option<AvatarRecord> {
         let found = e.get(id).unwrap();
         e.avatar_record(found, teams, spectator, "Developer")
@@ -3904,6 +4349,9 @@ mod tests {
         add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
         let mut teams = Teams::default();
         let team = |options| play::TeamParameters {
+            display_name: Tag::String(String::new()),
+            prefix: Tag::String(String::new()),
+            suffix: Tag::String(String::new()),
             name_tag_visibility: 0,
             collision_rule: 0,
             color: None,

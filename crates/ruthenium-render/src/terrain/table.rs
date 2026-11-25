@@ -94,6 +94,8 @@ impl StateInfo {
     pub const BLOCKS_FLOW: u16 = 4096;
     /// Drawn as a block entity, besides its model if it has one.
     pub const BLOCK_ENTITY: u16 = 8192;
+    /// `getRenderShape` is not invisible: it is something to cast a shadow on.
+    pub const VISIBLE: u16 = 16384;
 }
 
 /// How a block is moved by its position (`BlockBehaviour.OffsetType`).
@@ -116,6 +118,39 @@ pub struct BlockTable {
     pub(crate) mangrove_roots: u16,
     pub(crate) powder_snow: u16,
     pub(crate) fluids: FluidModels,
+    /// The boxes around the outlines of the states a shadow can lie on whose outline is
+    /// not the whole block; nothing for an outline that is empty.
+    pub(crate) odd_outlines: std::collections::HashMap<u32, Option<[f32; 5]>>,
+}
+
+/// The whole block as [`BlockTable::shadow_ground`] gives it.
+const WHOLE_BLOCK: [f32; 5] = [0.0, 0.0, 0.0, 1.0, 1.0];
+
+/// Whether a state with these flags is something a shadow lies on: what is drawn at all
+/// and is a whole block to walk on (`EntityRenderer.extractShadow`).
+fn takes_shadow(flags: u16) -> bool {
+    const TAKES: u16 = StateInfo::VISIBLE | StateInfo::COLLISION_FULL;
+    flags & TAKES == TAKES
+}
+
+/// The box around a shape: its west, bottom and north, then its east and south.
+fn bounds(s: &ShapeData) -> Option<[f32; 5]> {
+    let cells: [usize; 3] = std::array::from_fn(|axis| s.coords[axis].len().saturating_sub(1));
+    let mut low = [f64::INFINITY; 3];
+    let mut high = [f64::NEG_INFINITY; 3];
+    for x in 0..cells[0] {
+        for y in 0..cells[1] {
+            for z in 0..cells[2] {
+                if s.full.get((x * cells[1] + y) * cells[2] + z) == Some(&true) {
+                    for (axis, cell) in [x, y, z].into_iter().enumerate() {
+                        low[axis] = low[axis].min(s.coords[axis][cell]);
+                        high[axis] = high[axis].max(s.coords[axis][cell + 1]);
+                    }
+                }
+            }
+        }
+    }
+    (low[0] <= high[0]).then(|| [low[0], low[1], low[2], high[0], high[2]].map(|c| c as f32))
 }
 
 /// What a tint layer multiplies its faces by, 0xAARRGGBB.
@@ -182,6 +217,7 @@ impl BlockTable {
             max_vertical: 0.0,
         }];
         let mut states = Vec::with_capacity(STATE_COUNT);
+        let mut odd_outlines = std::collections::HashMap::new();
         // What is asked of a block is asked once, not for each of its states.
         let mut last_block = None;
         let (mut overlay, mut blocks_flow) = (false, false);
@@ -199,6 +235,17 @@ impl BlockTable {
             }
             if r.flags & StateRender::EMISSIVE != 0 {
                 flags |= StateInfo::EMISSIVE;
+            }
+            if r.flags & StateRender::MODEL != 0 {
+                flags |= StateInfo::VISIBLE;
+            }
+            if r.flags & StateRender::MODEL != 0
+                && b.flags & StateBehaviour::COLLISION_FULL_BLOCK != 0
+            {
+                let outline = physics.shapes.get(p.outline as usize).and_then(bounds);
+                if outline != Some(WHOLE_BLOCK) {
+                    odd_outlines.insert(id, outline);
+                }
             }
             if r.flags & StateRender::LEAVES != 0 {
                 flags |= StateInfo::LEAVES;
@@ -295,6 +342,7 @@ impl BlockTable {
             powder_snow: Block::from_name("minecraft:powder_snow")
                 .map_or(u16::MAX, |b| b.id() as u16),
             fluids,
+            odd_outlines,
         })
     }
 
@@ -324,6 +372,19 @@ impl BlockTable {
     /// A state's entry; air's for an id the table doesn't have.
     pub(crate) fn state(&self, id: u32) -> &StateInfo {
         self.states.get(id as usize).unwrap_or(&self.states[0])
+    }
+
+    /// The box around the outline of a state an entity's shadow can lie on (its west,
+    /// bottom and north, then its east and south): one that is drawn, that nothing can
+    /// enter, and that has an outline.
+    pub(crate) fn shadow_ground(&self, id: u32) -> Option<[f32; 5]> {
+        if !takes_shadow(self.state(id).flags) {
+            return None;
+        }
+        match self.odd_outlines.get(&id) {
+            Some(outline) => *outline,
+            None => Some(WHOLE_BLOCK),
+        }
     }
 
     /// `isAir` of a state: a section of nothing else has nothing to draw and hides
@@ -377,6 +438,52 @@ impl BlockTable {
                             && neighbour.connects >> (direction ^ 1) & 1 != 0))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+
+    fn shape(coords: [&[f64]; 3], full: &[bool]) -> ShapeData {
+        ShapeData {
+            coords: coords.map(<[f64]>::to_vec),
+            full: full.to_vec(),
+        }
+    }
+
+    #[test]
+    fn a_shadow_lies_on_what_is_seen_and_whole() {
+        let (seen, whole) = (StateInfo::VISIBLE, StateInfo::COLLISION_FULL);
+        assert!(takes_shadow(seen | whole));
+        assert!(takes_shadow(
+            seen | whole | StateInfo::DRAWN | StateInfo::SOLID
+        ));
+        // Not on a barrier's like, nor on a slab's.
+        assert!(!takes_shadow(whole | StateInfo::SOLID));
+        assert!(!takes_shadow(seen | StateInfo::DRAWN));
+        assert!(!takes_shadow(0));
+    }
+
+    #[test]
+    fn a_shapes_box_is_around_what_is_full_of_it() {
+        let unit: &[f64] = &[0.0, 1.0];
+        assert_eq!(bounds(&shape([unit; 3], &[true])), Some(WHOLE_BLOCK));
+        assert_eq!(bounds(&shape([unit; 3], &[false])), None);
+        // A slab in the upper half.
+        let slab = shape([unit, &[0.0, 0.5, 1.0], unit], &[false, true]);
+        assert_eq!(bounds(&slab), Some([0.0, 0.5, 0.0, 1.0, 1.0]));
+        // Two posts along x, the second one thinner along z: x fastest, then y, then z.
+        let posts = shape(
+            [&[0.0, 0.25, 0.75, 1.0], unit, &[0.0, 0.5, 1.0]],
+            &[true, true, false, false, true, false],
+        );
+        assert_eq!(bounds(&posts), Some([0.0, 0.0, 0.0, 1.0, 1.0]));
+        let one = shape(
+            [&[0.0, 0.25, 0.75, 1.0], unit, &[0.0, 0.5, 1.0]],
+            &[false, false, false, false, true, false],
+        );
+        assert_eq!(bounds(&one), Some([0.75, 0.0, 0.0, 1.0, 0.5]));
     }
 }
 

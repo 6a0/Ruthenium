@@ -3,9 +3,12 @@
 
 pub mod affine;
 mod avatar;
+pub mod equipment;
 pub mod model;
+pub(crate) mod nametag;
 pub mod place;
 pub mod renderer;
+pub(crate) mod shadow;
 pub(crate) mod sign;
 pub mod skins;
 

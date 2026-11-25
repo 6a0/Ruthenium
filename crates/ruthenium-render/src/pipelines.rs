@@ -51,6 +51,12 @@ pub enum PipelineId {
     /// The text on signs, and what surrounds it where it glows.
     SignText,
     SignOutline,
+    /// The names over heads: where nothing is in front of them, and seen through
+    /// everything.
+    NameTag,
+    NameTagSheer,
+    /// The shadows under entities, blended over the ground they lie on.
+    Shadow,
     /// The sky drawn before the world, over the cleared target: what covers what is
     /// there (the dome), what is blended over it (a sunrise's glow, the End's sky) and
     /// what adds light to it (the sun, the moon, the stars).
@@ -71,7 +77,7 @@ pub enum PipelineId {
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 36] = [
+    pub const ALL: [PipelineId; 39] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -98,6 +104,9 @@ impl PipelineId {
         PipelineId::ModelTranslucentFront,
         PipelineId::SignText,
         PipelineId::SignOutline,
+        PipelineId::NameTag,
+        PipelineId::NameTagSheer,
+        PipelineId::Shadow,
         PipelineId::SkyFlat,
         PipelineId::SkyBlend,
         PipelineId::SkyGlow,
@@ -308,6 +317,21 @@ impl PipelineId {
                 &shaders::SIGN_OUTLINE_VERT,
                 Depth::TestAndWrite,
             ),
+            PipelineId::NameTag => sign("name_tag", &shaders::SIGN_TEXT_VERT, Depth::TestAndWrite),
+            PipelineId::NameTagSheer => {
+                sign("name_tag_sheer", &shaders::SIGN_TEXT_VERT, Depth::Ignore)
+            }
+            // Seen from above only, as the game's.
+            PipelineId::Shadow => GraphicsDesc {
+                name: "shadow",
+                vertex: shaders::SHADOW_VERT.words(),
+                fragment: shaders::MODEL_SOLID_FRAG.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                blend: Blend::Alpha,
+                vertex_input: None,
+                depth: Depth::Test,
+                cull_back: true,
+            },
             PipelineId::SkyFlat => sky("sky_flat", Blend::Opaque, Depth::Ignore),
             PipelineId::SkyBlend => sky("sky_blend", Blend::Alpha, Depth::Ignore),
             PipelineId::SkyGlow => sky("sky_glow", Blend::Glow, Depth::Ignore),

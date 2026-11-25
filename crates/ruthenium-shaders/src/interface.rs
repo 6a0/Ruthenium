@@ -223,7 +223,7 @@ pub const MODEL_PART: Record = Record {
         Field {
             name: "overlay",
             ty: Ty::Uint,
-            doc: "1 if it is tinted red, hurt; else 0.",
+            doc: "The lowest bit: it is tinted red, hurt. From the ninth bit up: the word offset of the GLINT record of what glints over it, 0 for nothing.",
         },
     ],
 };
@@ -251,7 +251,7 @@ pub const SIGN: Record = Record {
         Field {
             name: "light",
             ty: Ty::Uint,
-            doc: "Block light in the low byte and sky light in the next, each 0 to 240.",
+            doc: "Block light in the low byte and sky light in the next, each 0 to 240; with the top bit set it is drawn as it is, in no light.",
         },
         Field {
             name: "outline",
@@ -314,8 +314,69 @@ pub const GLYPH: Record = Record {
     ],
 };
 
+/// What one piece of an entity's shadow reads: the part of it that lies on one block.
+pub const SHADOW: Record = Record {
+    name: "shadow",
+    doc: "One block's piece of an entity's shadow: record number gl_InstanceIndex from the offset in push constants.",
+    fields: &[
+        Field {
+            name: "origin",
+            ty: Ty::Vec3,
+            doc: "Where its entity stands, in blocks relative to the camera.",
+        },
+        Field {
+            name: "radius",
+            ty: Ty::Float,
+            doc: "How far the whole shadow reaches from there.",
+        },
+        Field {
+            name: "box",
+            ty: Ty::Vec4,
+            doc: "The piece's west, north, east and south edges from there.",
+        },
+        Field {
+            name: "height",
+            ty: Ty::Float,
+            doc: "How far above there it lies.",
+        },
+        Field {
+            name: "alpha",
+            ty: Ty::Float,
+            doc: "How dark it is, 0 to 1.",
+        },
+    ],
+};
+
+/// What glints over enchanted things: one record for each scale it is drawn at.
+pub const GLINT: Record = Record {
+    name: "glint",
+    doc: "The glint over what is enchanted: found by the parts it lies over.",
+    fields: &[
+        Field {
+            name: "texture",
+            ty: Ty::Uint,
+            doc: "Its picture, an index into the texture table.",
+        },
+        Field {
+            name: "strength",
+            ty: Ty::Float,
+            doc: "How strong it is, 0 to 1.",
+        },
+        Field {
+            name: "row_u",
+            ty: Ty::Vec3,
+            doc: "From a part's texture coordinates (and 1) to where its picture is read: the first row.",
+        },
+        Field {
+            name: "row_v",
+            ty: Ty::Vec3,
+            doc: "The second row.",
+        },
+    ],
+};
+
 /// Every record `world.glsl` has accessors for.
-pub const RECORDS: [&Record; 7] = [
+pub const RECORDS: [&Record; 9] = [
     &WORLD,
     &WORLD_MATRIX,
     &SECTION,
@@ -323,6 +384,8 @@ pub const RECORDS: [&Record; 7] = [
     &MODEL_PART,
     &SIGN,
     &GLYPH,
+    &SHADOW,
+    &GLINT,
 ];
 
 /// The text of `glsl/include/world.glsl`.
@@ -397,6 +460,9 @@ mod tests {
         assert_eq!((MODEL_PART.offset("overlay"), MODEL_PART.bytes()), (15, 64));
         assert_eq!((SIGN.offset("light"), SIGN.words()), (12, 14));
         assert_eq!((GLYPH.offset("sign"), GLYPH.words()), (11, 13));
+        assert_eq!((SHADOW.offset("box"), SHADOW.offset("alpha")), (4, 9));
+        assert_eq!(SHADOW.bytes(), 40);
+        assert_eq!((GLINT.offset("row_u"), GLINT.words()), (2, 8));
         for r in RECORDS {
             let mut names: Vec<&str> = r.fields.iter().map(|f| f.name).collect();
             names.sort_unstable();

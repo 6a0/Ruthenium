@@ -58,6 +58,7 @@ use crate::predict::Predictions;
 use crate::scene::{
     DEFAULT_DIRTY_CAPACITY, Dims, EntityRecord, Frame, MAX_ENTITIES, Scene, ScenePublisher,
 };
+use crate::scoreboard::Scoreboard;
 use crate::weather::Weather;
 use crate::world::{BiomeInfo, ChunkPacket, Level, global_bits};
 
@@ -590,6 +591,7 @@ struct Game {
     /// on a reconfiguration).
     players: PlayerInfos,
     teams: Teams,
+    scoreboard: Scoreboard,
     /// How many chunks from the player the server ticks.
     simulation_distance: i32,
 }
@@ -746,6 +748,7 @@ impl Game {
             uuid: 0,
             players: PlayerInfos::default(),
             teams: Teams::default(),
+            scoreboard: Scoreboard::default(),
             simulation_distance: i32::MAX,
         }
     }
@@ -863,6 +866,7 @@ impl Game {
             return;
         };
         self.publisher.publish_level(&mut w.level);
+        w.entities.refresh_names(&self.teams, &self.scoreboard);
         let now = Instant::now();
         let ms_per_tick = clock::ms_per_tick(w.tick_rate, !w.frozen);
         // The tick under way began this long before the clock's last reading.
@@ -946,6 +950,9 @@ impl Game {
                         avatar: w
                             .entities
                             .avatar_record(e, &self.teams, p.spectator, &self.name),
+                        name: w
+                            .entities
+                            .name_record(e, &self.teams, p.spectator, &self.name),
                     });
                 }
             },
@@ -1250,9 +1257,32 @@ impl Game {
             .find(|(r, _)| r == "minecraft:enchantment")
             .map(|(_, e)| e.as_slice())
             .unwrap_or(&[]);
+        let registry = |name: &str| {
+            self.configured
+                .registries
+                .iter()
+                .find(|(r, _)| r == name)
+                .map(|(_, e)| e.as_slice())
+                .unwrap_or(&[])
+        };
         let mut items = (*physics.items).clone();
         items.enchantments =
             crate::enchantment::Enchantments::from_registry(entries, &physics.enchantments);
+        // What worn and held things look like: trims, and the patterns of shields.
+        items.trims = crate::item::Trims::from_registry(
+            registry("minecraft:trim_material"),
+            registry("minecraft:trim_pattern"),
+        );
+        items.banner_patterns = registry("minecraft:banner_pattern")
+            .iter()
+            .map(|e| {
+                e.data
+                    .as_ref()
+                    .and_then(|d| d.as_compound()?.string("asset_id"))
+                    .unwrap_or(&e.id)
+                    .into()
+            })
+            .collect();
         physics.items = std::sync::Arc::new(items);
     }
 
@@ -1626,6 +1656,7 @@ impl Game {
                 self.death_screen = None;
                 self.players = PlayerInfos::default();
                 self.teams = Teams::default();
+                self.scoreboard = Scoreboard::default();
                 self.report(SessionEvent::Reconfiguring);
             }
             play::Clientbound::Login(login) => {
@@ -1994,6 +2025,29 @@ impl Game {
             } => self
                 .teams
                 .apply(&name, method, parameters.as_ref(), &players),
+            play::Clientbound::SetObjective {
+                name,
+                method,
+                display_name,
+                number_format,
+            } => self
+                .scoreboard
+                .set_objective(&name, method, display_name, number_format),
+            play::Clientbound::SetDisplayObjective { slot, objective } => {
+                self.scoreboard.set_display(slot, &objective);
+            }
+            play::Clientbound::SetScore {
+                owner,
+                objective,
+                score,
+                number_format,
+                ..
+            } => self
+                .scoreboard
+                .set_score(&owner, &objective, score, number_format),
+            play::Clientbound::ResetScore { owner, objective } => {
+                self.scoreboard.reset_score(&owner, objective.as_deref());
+            }
             play::Clientbound::PlayerInfoUpdate { actions, entries } => {
                 if let Some(w) = &mut self.world
                     && let Some(mode) = self.players.changed_game_mode(self.uuid, actions, &entries)

@@ -52,7 +52,9 @@ use super::tint::{BiomeTints, ColourMaps, MAX_BLEND_RADIUS};
 use super::tracker::{Job, Since, Tracker, TrackerStats};
 use super::visibility::{Batch, Camera, Connectivity, Visibility};
 use crate::atmosphere::{Fog, Medium};
-use crate::block_entity::renderer::{BlockEntityRenderer, MIN_VISIBILITY, SectionEntities};
+use crate::block_entity::renderer::{
+    BlockEntityRenderer, MIN_VISIBILITY, PlayerView, SectionEntities,
+};
 use crate::pipelines::PipelineId;
 use crate::terrain_vertex::VERTEX_BYTES;
 
@@ -1826,16 +1828,12 @@ impl WorldRenderer {
     }
 
     /// Gathers the players in view, for this frame.
-    #[allow(clippy::too_many_arguments)]
     pub fn gather_players(
         &self,
         renderer: &mut BlockEntityRenderer,
         scene: &Scene,
         frame: &Frame,
-        view_distance: i32,
-        partial: f32,
-        camera: [f64; 3],
-        view: &View,
+        seen: &PlayerView<'_>,
         textures: &TextureTable,
     ) {
         profiling::scope!("players_gather");
@@ -1848,11 +1846,10 @@ impl WorldRenderer {
             renderer.gather_players(
                 frame,
                 terrain,
-                view_distance,
-                partial,
-                camera,
-                view,
+                &self.table,
+                seen,
                 textures,
+                self.atlas,
                 |block| {
                     let key = block.map(|c| c >> 4);
                     // Above and below the level there are no sections.

@@ -222,6 +222,7 @@ pub(crate) fn bare_table(
         mangrove_roots: u16::MAX,
         powder_snow: u16::MAX,
         fluids,
+        odd_outlines: std::collections::HashMap::new(),
     }
 }
 

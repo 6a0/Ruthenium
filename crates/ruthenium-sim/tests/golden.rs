@@ -818,6 +818,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                         as i32,
                     ruthenium_protocol::item::Component::PotionContents {
                         potion: Some(potion.id() as i32),
+                        custom_color: None,
                     },
                 ));
             }

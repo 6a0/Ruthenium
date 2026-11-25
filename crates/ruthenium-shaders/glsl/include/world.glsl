@@ -96,7 +96,7 @@ uint model_part_texture(uint at) {
     return frame_words[at + 14u];
 }
 
-// 1 if it is tinted red, hurt; else 0.
+// The lowest bit: it is tinted red, hurt. From the ninth bit up: the word offset of the GLINT record of what glints over it, 0 for nothing.
 uint model_part_overlay(uint at) {
     return frame_words[at + 15u];
 }
@@ -119,7 +119,7 @@ vec4 sign_row_z(uint at) {
     return vec4(uintBitsToFloat(frame_words[at + 8u]), uintBitsToFloat(frame_words[at + 9u]), uintBitsToFloat(frame_words[at + 10u]), uintBitsToFloat(frame_words[at + 11u]));
 }
 
-// Block light in the low byte and sky light in the next, each 0 to 240.
+// Block light in the low byte and sky light in the next, each 0 to 240; with the top bit set it is drawn as it is, in no light.
 uint sign_light(uint at) {
     return frame_words[at + 12u];
 }
@@ -175,4 +175,55 @@ uint glyph_sign(uint at) {
 // How far from it its outline lies; nothing for one that has none.
 float glyph_around(uint at) {
     return uintBitsToFloat(frame_words[at + 12u]);
+}
+
+// One block's piece of an entity's shadow: record number gl_InstanceIndex from the offset in push constants.
+#define SHADOW_WORDS 10u
+
+// Where its entity stands, in blocks relative to the camera.
+vec3 shadow_origin(uint at) {
+    return vec3(uintBitsToFloat(frame_words[at + 0u]), uintBitsToFloat(frame_words[at + 1u]), uintBitsToFloat(frame_words[at + 2u]));
+}
+
+// How far the whole shadow reaches from there.
+float shadow_radius(uint at) {
+    return uintBitsToFloat(frame_words[at + 3u]);
+}
+
+// The piece's west, north, east and south edges from there.
+vec4 shadow_box(uint at) {
+    return vec4(uintBitsToFloat(frame_words[at + 4u]), uintBitsToFloat(frame_words[at + 5u]), uintBitsToFloat(frame_words[at + 6u]), uintBitsToFloat(frame_words[at + 7u]));
+}
+
+// How far above there it lies.
+float shadow_height(uint at) {
+    return uintBitsToFloat(frame_words[at + 8u]);
+}
+
+// How dark it is, 0 to 1.
+float shadow_alpha(uint at) {
+    return uintBitsToFloat(frame_words[at + 9u]);
+}
+
+// The glint over what is enchanted: found by the parts it lies over.
+#define GLINT_WORDS 8u
+
+// Its picture, an index into the texture table.
+uint glint_texture(uint at) {
+    return frame_words[at + 0u];
+}
+
+// How strong it is, 0 to 1.
+float glint_strength(uint at) {
+    return uintBitsToFloat(frame_words[at + 1u]);
+}
+
+// From a part's texture coordinates (and 1) to where its picture is read: the first row.
+vec3 glint_row_u(uint at) {
+    return vec3(uintBitsToFloat(frame_words[at + 2u]), uintBitsToFloat(frame_words[at + 3u]), uintBitsToFloat(frame_words[at + 4u]));
+}
+
+// The second row.
+vec3 glint_row_v(uint at) {
+    return vec3(uintBitsToFloat(frame_words[at + 5u]), uintBitsToFloat(frame_words[at + 6u]), uintBitsToFloat(frame_words[at + 7u]));
 }

@@ -24,6 +24,9 @@ layout(location = 3) in float v_spherical;
 layout(location = 4) in float v_cylindrical;
 layout(location = 5) flat in uint v_texture;
 layout(location = 6) flat in vec3 v_added;
+layout(location = 7) in vec2 v_glint_uv;
+layout(location = 8) flat in uint v_glint_texture;
+layout(location = 9) flat in float v_glint_strength;
 layout(location = 0) out vec4 o_color;
 
 void main() {
@@ -39,6 +42,14 @@ void main() {
     color *= v_front;
 #endif
     color.rgb += v_added;
+    if (v_glint_strength > 0.0) {
+        // Its picture has one level: read without the slopes a discard leaves undefined.
+        vec3 glint = v_glint_strength * textureLod(
+            sampler2D(u_textures[nonuniformEXT(v_glint_texture)], u_samplers[SAMPLER_LINEAR_REPEAT]),
+            v_glint_uv, 0.0).rgb;
+        color.rgb += glint * glint;
+        color.a = max(color.a, v_glint_strength);
+    }
     float amount = max(
         fog_amount(v_spherical, pc.fog_environmental),
         fog_amount(v_cylindrical, pc.fog_render_distance));

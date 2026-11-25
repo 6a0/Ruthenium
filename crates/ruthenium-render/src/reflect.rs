@@ -320,15 +320,28 @@ mod tests {
         let frag = interface(shaders::SKY_FRAG.words());
         assert_eq!(Interface::located(&frag.inputs), outputs);
         assert_eq!(Interface::located(&frag.outputs), vec![(0, &vec(4))]);
-        let vert = interface(shaders::MODEL_VERT.words());
-        let outputs = Interface::located(&vert.outputs);
-        for fragment in MODEL_FRAGMENTS {
-            let frag = interface(fragment.words());
-            // A stage that draws fronts only may not read the backs' colour.
-            for input in Interface::located(&frag.inputs) {
-                assert!(outputs.contains(&input), "{}: {input:?}", fragment.name);
+        // The models' fragment stages also draw text and shadows.
+        for vertex in [
+            &shaders::MODEL_VERT,
+            &shaders::SIGN_TEXT_VERT,
+            &shaders::SIGN_OUTLINE_VERT,
+            &shaders::SHADOW_VERT,
+        ] {
+            let vert = interface(vertex.words());
+            let outputs = Interface::located(&vert.outputs);
+            for fragment in MODEL_FRAGMENTS {
+                let frag = interface(fragment.words());
+                // A stage that draws fronts only may not read the backs' colour.
+                for input in Interface::located(&frag.inputs) {
+                    assert!(
+                        outputs.contains(&input),
+                        "{} to {}: {input:?}",
+                        vertex.name,
+                        fragment.name
+                    );
+                }
+                assert_eq!(Interface::located(&frag.outputs), vec![(0, &vec(4))]);
             }
-            assert_eq!(Interface::located(&frag.outputs), vec![(0, &vec(4))]);
         }
     }
 
@@ -406,6 +419,7 @@ mod tests {
         assert_eq!(pushed(&shaders::MODEL_VERT), words(4));
         assert_eq!(pushed(&shaders::SIGN_TEXT_VERT), words(4));
         assert_eq!(pushed(&shaders::SIGN_OUTLINE_VERT), words(4));
+        assert_eq!(pushed(&shaders::SHADOW_VERT), words(4));
         for fragment in MODEL_FRAGMENTS {
             assert_eq!(pushed(fragment), model, "{}", fragment.name);
         }
@@ -425,6 +439,7 @@ mod tests {
             &shaders::MODEL_VERT,
             &shaders::SIGN_TEXT_VERT,
             &shaders::SIGN_OUTLINE_VERT,
+            &shaders::SHADOW_VERT,
         ];
         let mut fragment_stages = vec![&shaders::SKY_FRAG];
         fragment_stages.extend(MODEL_FRAGMENTS);
@@ -443,8 +458,10 @@ mod tests {
                 shader.name
             );
             // The terrain's also samples the light map: samplers at binding 0,
-            // textures at binding 1 of set 0. Nothing else is bound.
-            let samples = shader.name != shaders::SKY_VERT.name;
+            // textures at binding 1 of set 0. Nothing else is bound. (The sky and
+            // shadows are in no light.)
+            let samples =
+                ![shaders::SKY_VERT.name, shaders::SHADOW_VERT.name].contains(&shader.name);
             if samples {
                 assert_eq!(i.resource(0, 0), Some(&samplers), "{}", shader.name);
                 assert_eq!(i.resource(0, 1), Some(&textures), "{}", shader.name);
