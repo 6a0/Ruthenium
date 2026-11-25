@@ -7,9 +7,10 @@
 //! Vanilla's rules: keys count only while no screen is open (`KeyMapping.releaseAll`
 //! when one opens, `setAll` reading the keyboard's held keys again when the last one
 //! closes, except on macOS); a key or button presses every binding on it, and each press
-//! (a held key's repeats too) clicks them; the mouse's motion is summed over a frame and turns the camera once
-//! per frame, after the frame's events (`handleAccumulatedMovement`), the first motion
-//! after a grab dropped; the game pauses (opens the Game Menu) once the window has been
+//! (a held key's repeats too) clicks them; sneak and sprint may toggle
+//! (`ToggleKeyMapping`); the mouse's motion is summed over a frame and turns the camera
+//! once per frame, after the frame's events (`handleAccumulatedMovement`), the first
+//! motion after a grab dropped; the game pauses (opens the Game Menu) once the window has been
 //! out of focus for half a second (`pauseIfInactive`, `pauseOnLostFocus` on).
 
 use std::time::{Duration, Instant};
@@ -19,7 +20,9 @@ use std::sync::Arc;
 use ruthenium_data::v26_3::registries::MobEffect;
 use ruthenium_protocol::packets::ClientInformation;
 use ruthenium_render::{CameraPose, WorldStats};
-use ruthenium_sim::input::{self, HeldKeys, Key, KeyBinds, MouseMotion, MouseOptions, ScrollWheel};
+use ruthenium_sim::input::{
+    self, HeldKeys, Key, KeyBinds, MouseMotion, MouseOptions, ScrollWheel, ToggleKey,
+};
 use ruthenium_sim::keybinds::Action;
 use ruthenium_sim::player::Pose;
 use ruthenium_sim::scene::{Frame, Scene};
@@ -44,6 +47,11 @@ pub struct InGame {
     scripted: bool,
     /// The player list shows whether or not its key is held.
     player_list: bool,
+    /// Sneak and sprint, and whether each toggles (the Controls page's Sneak and Sprint).
+    sneak: ToggleKey,
+    sprint: ToggleKey,
+    toggle_sneak: bool,
+    toggle_sprint: bool,
 }
 
 impl Default for InGame {
@@ -57,6 +65,10 @@ impl Default for InGame {
             unfocused_since: None,
             scripted: false,
             player_list: false,
+            sneak: ToggleKey::default(),
+            sprint: ToggleKey::default(),
+            toggle_sneak: false,
+            toggle_sprint: false,
         }
     }
 }
@@ -77,6 +89,19 @@ impl InGame {
         self.binds = binds.clone();
     }
 
+    /// Whether sneak and sprint toggle from now on.
+    pub fn set_toggles(&mut self, sneak: bool, sprint: bool) {
+        self.toggle_sneak = sneak;
+        self.toggle_sprint = sprint;
+    }
+
+    /// The player respawned (`LocalPlayer.respawn`): toggled sneak and sprint are off.
+    pub fn respawned(&mut self, session: Option<&Session>) {
+        self.sneak.reset();
+        self.sprint.reset();
+        self.send_held(session);
+    }
+
     /// The bindings in use.
     #[cfg(test)]
     pub fn binds(&self) -> &KeyBinds {
@@ -89,11 +114,21 @@ impl InGame {
     pub fn enter(&mut self, session: Option<&Session>, physical: impl Iterator<Item = Key>) {
         self.motion = MouseMotion::new();
         self.release(session);
-        if cfg!(target_os = "macos") {
-            return;
+        let read_again = !cfg!(target_os = "macos");
+        if read_again {
+            for k in physical.filter(|k| matches!(k, Key::Keyboard(_)) && !k.is_unbound()) {
+                self.held.set(k, true);
+            }
         }
-        for k in physical.filter(|k| matches!(k, Key::Keyboard(_)) && !k.is_unbound()) {
-            self.held.set(k, true);
+        // Toggled ones come back on; held ones are held as their keys are.
+        for (state, action, toggle) in [
+            (&mut self.sneak, Action::Sneak, self.toggle_sneak),
+            (&mut self.sprint, Action::Sprint, self.toggle_sprint),
+        ] {
+            let key = self.binds.get(action);
+            let keyboard = matches!(key, Key::Keyboard(_)) && !key.is_unbound();
+            let held = read_again.then(|| self.held.is_down(key));
+            state.screen_closed(toggle, keyboard, held);
         }
         self.send_held(session);
     }
@@ -101,6 +136,13 @@ impl InGame {
     /// A screen opened (`KeyMapping.releaseAll`).
     pub fn release(&mut self, session: Option<&Session>) {
         self.held.release_all();
+        self.sneak.release(self.toggle_sneak);
+        self.sprint.release(self.toggle_sprint);
+        self.let_go(session);
+    }
+
+    /// Hands nothing held to the game thread.
+    fn let_go(&self, session: Option<&Session>) {
         if let Some(s) = session.filter(|_| !self.scripted) {
             s.set_keys(Default::default());
             s.set_player_list(false);
@@ -122,7 +164,14 @@ impl InGame {
         self.focused = on;
         self.unfocused_since = if on { None } else { Some(Instant::now()) };
         if !on {
-            self.release(session);
+            // Every key goes up: held bindings are let go, toggled ones stay.
+            self.held.release_all();
+            self.sneak.set(false, self.toggle_sneak);
+            self.sprint.set(false, self.toggle_sprint);
+            self.let_go(session);
+            if self.sneak.is_down() || self.sprint.is_down() {
+                self.send_held(session);
+            }
         }
     }
 
@@ -142,11 +191,14 @@ impl InGame {
     /// A key or button went down (a held key's repeats too) or up: the bindings on it
     /// are held or let go, and a press clicks each (`KeyMapping.set`, `click`).
     fn press(&mut self, key: Key, down: bool, session: Option<&Session>) {
-        // (SDL's "unknown key" would press every unbound binding.)
-        if key.is_unbound() {
-            return;
-        }
         self.held.set(key, down);
+        for a in self.binds.on(key) {
+            match a {
+                Action::Sneak => self.sneak.set(down, self.toggle_sneak),
+                Action::Sprint => self.sprint.set(down, self.toggle_sprint),
+                _ => {}
+            }
+        }
         let Some(s) = session.filter(|_| !self.scripted) else {
             return;
         };
@@ -176,10 +228,19 @@ impl InGame {
             return;
         };
         let (held, binds) = (&self.held, &self.binds);
-        s.set_keys(held.keys(binds));
+        s.set_keys(self.keys());
         s.set_attack(held.action_down(binds, Action::Attack));
         s.set_use(held.action_down(binds, Action::Use));
         s.set_player_list(held.action_down(binds, Action::PlayerList));
+    }
+
+    /// The movement keys as the game reads them: sneak and sprint as toggled or held.
+    fn keys(&self) -> ruthenium_sim::player::Keys {
+        ruthenium_sim::player::Keys {
+            shift: self.sneak.is_down(),
+            sprint: self.sprint.is_down(),
+            ..self.held.keys(&self.binds)
+        }
     }
 
     /// Relative mouse motion (SDL's `xrel`, `yrel`).
@@ -653,6 +714,46 @@ mod tests {
         g.set_binds(&b);
         g.key(0, true, None);
         assert!(!g.held.keys(&g.binds).jump);
+    }
+
+    #[test]
+    fn sneak_and_sprint_toggle_and_come_back_after_a_screen() {
+        let mut g = InGame::default();
+        // Held, as the keys are.
+        g.key(225, true, None);
+        assert!(g.keys().shift);
+        g.key(225, false, None);
+        assert!(!g.keys().shift);
+        // Toggled: a press flips it (a repeat too), a release does nothing.
+        g.set_toggles(true, true);
+        g.key(225, true, None);
+        g.key(225, false, None);
+        assert!(g.keys().shift);
+        g.key(224, true, None);
+        g.key(224, true, None);
+        assert!(!g.keys().sprint, "the repeat flipped it back");
+        g.key(224, true, None);
+        assert!(g.keys().sprint);
+        // A screen lets go of them and gives them back when it closes.
+        g.release(None);
+        assert_eq!((g.keys().shift, g.keys().sprint), (false, false));
+        g.enter(None, std::iter::empty());
+        assert_eq!((g.keys().shift, g.keys().sprint), (true, true));
+        // Losing the focus keeps them; a respawn ends them.
+        g.set_focus(false, None);
+        assert!(g.keys().shift);
+        g.set_focus(true, None);
+        g.respawned(None);
+        assert_eq!((g.keys().shift, g.keys().sprint), (false, false));
+        // Rebound to a button, sneak still toggles, but a screen ends it for good.
+        let mut b = KeyBinds::DEFAULT;
+        b.set(Action::Sneak, Key::Mouse(4));
+        g.set_binds(&b);
+        g.mouse_button(4, true, None);
+        assert!(g.keys().shift);
+        g.release(None);
+        g.enter(None, std::iter::empty());
+        assert!(!g.keys().shift);
     }
 
     #[test]

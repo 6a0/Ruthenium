@@ -362,7 +362,7 @@ impl Key {
 /// `Integer.parseInt`: an optional sign and decimal digits, in range.
 fn java_int(s: &str) -> Option<i32> {
     let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     s.parse().ok()
@@ -1378,6 +1378,11 @@ mod tests {
         assert_eq!(
             key_label(Key::Keyboard(225), Some("Left Shift"), None),
             KeyText::Translate("key.keyboard.left.shift".into())
+        );
+        // No key is its own name, whatever the layout says.
+        assert_eq!(
+            key_label(Key::UNBOUND, Some("x"), None),
+            KeyText::Translate("key.keyboard.unknown".into())
         );
     }
 

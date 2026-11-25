@@ -1960,6 +1960,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fullscreen_and_the_frame_stats_follow_their_keys() {
+        let mut settings = SettingsFile::transient();
+        settings
+            .settings
+            .keys
+            .set(Binding::DebugOverlay, Key::Keyboard(66));
+        let mut m = Menu::new(None, crate::account::Accounts::disabled(), settings);
+        assert_eq!(global(&m, Key::Keyboard(68)), Some(Binding::Fullscreen));
+        assert_eq!(global(&m, Key::Keyboard(66)), Some(Binding::DebugOverlay));
+        assert_eq!(global(&m, Key::Keyboard(60)), None, "F3 is free now");
+        assert_eq!(global(&m, Key::Mouse(1)), None);
+        // While a row awaits a key the debug screen's is the row's; fullscreen is not.
+        m.open_settings_named((1600, 900), Some(30));
+        m.capture_focused();
+        assert!(m.capturing());
+        assert_eq!(global(&m, Key::Keyboard(66)), None);
+        assert_eq!(global(&m, Key::Keyboard(68)), Some(Binding::Fullscreen));
+    }
+
+    #[test]
     fn an_acquire_may_wait_two_pacing_intervals() {
         let t = Instant::now();
         let after = |limiter: Option<f64>, hz: Option<f32>| {

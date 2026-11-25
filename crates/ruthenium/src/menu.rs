@@ -493,6 +493,10 @@ impl Menu {
         let keys = keys::KeysState::new(&settings.settings.keys);
         let mut game = InGame::default();
         game.set_binds(&settings.settings.keys);
+        game.set_toggles(
+            settings.settings.toggle_sneak,
+            settings.settings.toggle_sprint,
+        );
         Menu {
             fonts: Fonts::new(&WEIGHTS),
             atlas: Atlas::Building(handle),
@@ -784,6 +788,7 @@ impl Menu {
         if let Some(s) = &self.session {
             s.respawn();
         }
+        self.game.respawned(self.session.as_ref());
         if let Some(d) = &mut self.death {
             d.respawn_pressed = true;
         }
@@ -926,6 +931,8 @@ impl Menu {
                     }
                 }
                 SessionEvent::Respawned if !self.leaving => {
+                    // (`LocalPlayer.respawn` ends toggled keys, before the screen.)
+                    self.game.respawned(self.session.as_ref());
                     // The level loading screen, until the player is back in the world.
                     self.death = None;
                     let title = self.server_name.clone();
@@ -1057,6 +1064,8 @@ impl Menu {
                 if let Some(row) = rows_of(&self.settings_of.groups()).get(setting) {
                     self.settings.settings.set(*row, value);
                     self.settings_changed = Some(Instant::now());
+                    let s = &self.settings.settings;
+                    self.game.set_toggles(s.toggle_sneak, s.toggle_sprint);
                 }
             }
             SettingsEvent::Pressed { .. } | SettingsEvent::Reset { .. } => self.key_row_event(e),

@@ -155,6 +155,58 @@ pub fn next_scroll_selection(wheel: f64, current: i32, limit: i32) -> i32 {
 use crate::keybinds::Action;
 pub use crate::keybinds::{Key, KeyBinds};
 
+/// A binding that may toggle instead of being held (`ToggleKeyMapping`), as sneak and
+/// sprint are: with the option on, a press (a held key's repeats too) flips it and a
+/// release does nothing; a screen opening lets go of it but remembers that it was on,
+/// and it comes back on when the screen closes (if its key is a keyboard key).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToggleKey {
+    down: bool,
+    released_by_screen: bool,
+}
+
+impl ToggleKey {
+    pub fn is_down(&self) -> bool {
+        self.down
+    }
+
+    /// Its key went down or up (`setDown`).
+    pub fn set(&mut self, down: bool, toggle: bool) {
+        if !toggle {
+            self.down = down;
+        } else if down {
+            self.down = !self.down;
+        }
+    }
+
+    /// A screen opened (`releaseAll`).
+    pub fn release(&mut self, toggle: bool) {
+        if toggle && self.down {
+            self.released_by_screen = true;
+        }
+        self.down = false;
+    }
+
+    /// The screen closed (`restoreToggleStatesOnScreenClosed`, then `setAll`): on again
+    /// if the screen let go of it while toggled on, else held as its key is (`held`,
+    /// `None` where the keys are not read again), for a keyboard key.
+    pub fn screen_closed(&mut self, toggle: bool, keyboard: bool, held: Option<bool>) {
+        let restore = toggle && keyboard && self.released_by_screen;
+        self.released_by_screen = false;
+        if restore {
+            self.set(true, toggle);
+        }
+        if let Some(held) = held.filter(|_| keyboard && !toggle) {
+            self.set(held, toggle);
+        }
+    }
+
+    /// The player respawned (`resetToggleKeys`).
+    pub fn reset(&mut self) {
+        self.down = false;
+    }
+}
+
 /// Which keys and buttons are down (`KeyMapping.set` from key and button events while no
 /// screen is open; `releaseAll` when one opens), read as movement input
 /// (`KeyboardInput.tick`).
@@ -216,6 +268,57 @@ impl HeldKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("toggle_golden.rs");
+
+    #[test]
+    fn toggled_bindings_do_as_the_games_do() {
+        for &(ops, downs) in TOGGLED {
+            let mut k = ToggleKey::default();
+            let mut toggle = ops.starts_with('T');
+            let (mut screen, mut physical) = (false, false);
+            let mut got = String::new();
+            for op in ops[1..].chars() {
+                match op {
+                    'd' => {
+                        physical = true;
+                        if !screen {
+                            k.set(true, toggle);
+                        }
+                    }
+                    'u' => {
+                        physical = false;
+                        k.set(false, toggle);
+                    }
+                    'o' if !screen => {
+                        k.release(toggle);
+                        screen = true;
+                    }
+                    'c' if screen => {
+                        k.screen_closed(toggle, true, Some(physical));
+                        screen = false;
+                    }
+                    'r' => k.reset(),
+                    'f' => toggle = !toggle,
+                    _ => {}
+                }
+                got.push(if k.is_down() { '1' } else { '0' });
+            }
+            assert_eq!(got, downs, "{ops}");
+        }
+        assert_eq!(TOGGLED.len(), 400);
+        // A mouse button is not held again when a screen closes, nor turned back on.
+        let mut k = ToggleKey::default();
+        k.set(true, true);
+        k.release(true);
+        k.screen_closed(true, false, Some(true));
+        assert!(!k.is_down());
+        k.screen_closed(false, false, Some(true));
+        assert!(!k.is_down());
+        // Where keys are not read again (macOS), a held key is not held after.
+        k.screen_closed(false, true, None);
+        assert!(!k.is_down());
+    }
 
     #[test]
     fn default_sensitivity_turns_about_one_to_one() {

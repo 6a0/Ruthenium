@@ -9,7 +9,9 @@ use std::time::SystemTime;
 
 use ruthenium_prepare::discover::{self, Env};
 use ruthenium_sim::input::MouseOptions;
-use ruthenium_sim::keybinds::{self, KeyBinds};
+use ruthenium_sim::keybinds;
+
+use crate::settings::VanillaKeys;
 
 /// Vanilla's mouse options from `options.txt` (`mouseSensitivity`, `invertXMouse`,
 /// `invertYMouse`); keys missing or unreadable keep vanilla's defaults, as vanilla
@@ -94,12 +96,39 @@ pub fn vanilla_mouse() -> Option<(MouseOptions, PathBuf)> {
     Some((parse_options(&text), path))
 }
 
-/// The key bindings of the most recently saved `options.txt`, if it has any, and where
-/// it is.
-pub fn vanilla_keys() -> Option<(KeyBinds, PathBuf)> {
+/// Whether sneak and sprint toggle (`toggleCrouch`, `toggleSprint`); a value that is not
+/// `true` or `false` keeps the default (off), as vanilla's boolean options read.
+pub fn parse_toggles(text: &str) -> (bool, bool) {
+    let mut t = (false, false);
+    for line in text.lines() {
+        let (field, on) = match line.split_once(':') {
+            Some(("toggleCrouch", v)) => (&mut t.0, v),
+            Some(("toggleSprint", v)) => (&mut t.1, v),
+            _ => continue,
+        };
+        match on {
+            "true" => *field = true,
+            "false" => *field = false,
+            _ => {}
+        }
+    }
+    t
+}
+
+/// The key bindings of the most recently saved `options.txt`, and whether sneak and
+/// sprint toggle there, if it has any bindings; and where it is.
+pub fn vanilla_keys() -> Option<(VanillaKeys, PathBuf)> {
     let (text, path) = newest_options()?;
     let (keys, any) = keybinds::read_options(&text);
-    any.then_some((keys, path))
+    let (toggle_sneak, toggle_sprint) = parse_toggles(&text);
+    any.then_some((
+        VanillaKeys {
+            keys,
+            toggle_sneak,
+            toggle_sprint,
+        },
+        path,
+    ))
 }
 
 #[cfg(test)]
@@ -119,5 +148,19 @@ mod tests {
         assert_eq!(parse_options("mouseSensitivity:1.5").sensitivity, 0.5);
         assert_eq!(parse_options("mouseSensitivity:fast").sensitivity, 0.5);
         assert_eq!(parse_options("invertXMouse:yes"), MouseOptions::DEFAULT);
+    }
+
+    #[test]
+    fn reads_whether_sneak_and_sprint_toggle() {
+        assert_eq!(
+            parse_toggles("toggleCrouch:true\ntoggleSprint:false\n"),
+            (true, false)
+        );
+        assert_eq!(parse_toggles("toggleSprint:true\n"), (false, true));
+        assert_eq!(
+            parse_toggles("toggleCrouch:yes\ntoggleSprint:1\n"),
+            (false, false)
+        );
+        assert_eq!(parse_toggles(""), (false, false));
     }
 }

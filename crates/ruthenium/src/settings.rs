@@ -156,8 +156,12 @@ pub struct Settings {
     /// inversion. Imported from vanilla's `options.txt` when the file has none.
     pub mouse: MouseOptions,
     pub game: GameOptions,
-    /// The key bindings. Imported from vanilla's `options.txt` when the file has none.
+    /// The key bindings, and whether sneak and sprint toggle instead of being held
+    /// (vanilla's `toggleCrouch`, `toggleSprint`). Imported from vanilla's `options.txt`
+    /// when the file has no bindings.
     pub keys: KeyBinds,
+    pub toggle_sneak: bool,
+    pub toggle_sprint: bool,
 }
 
 impl Default for Settings {
@@ -173,6 +177,8 @@ impl Default for Settings {
             mouse: MouseOptions::DEFAULT,
             game: GameOptions::default(),
             keys: KeyBinds::DEFAULT,
+            toggle_sneak: false,
+            toggle_sprint: false,
         }
     }
 }
@@ -195,6 +201,8 @@ pub enum Row {
     Sensitivity,
     InvertX,
     InvertY,
+    ToggleSneak,
+    ToggleSprint,
     DamageTilt,
     FovEffects,
     Clouds,
@@ -208,14 +216,16 @@ pub enum Row {
     ResetKeys,
 }
 
-/// The Controls page: the mouse, Reset Keys, then every key binding under its heading in
-/// the order vanilla lists them.
-const CONTROLS: [Row; 4 + Category::ALL.len() + keybinds::COUNT] = {
-    let mut rows = [Row::Sensitivity; 4 + Category::ALL.len() + keybinds::COUNT];
+/// The Controls page: the mouse, Sneak and Sprint (hold or toggle), Reset Keys, then
+/// every key binding under its heading in the order vanilla lists them.
+const CONTROLS: [Row; 6 + Category::ALL.len() + keybinds::COUNT] = {
+    let mut rows = [Row::Sensitivity; 6 + Category::ALL.len() + keybinds::COUNT];
     rows[1] = Row::InvertX;
     rows[2] = Row::InvertY;
-    rows[3] = Row::ResetKeys;
-    let (mut n, mut i) = (4, 0);
+    rows[3] = Row::ToggleSneak;
+    rows[4] = Row::ToggleSprint;
+    rows[5] = Row::ResetKeys;
+    let (mut n, mut i) = (6, 0);
     let mut last = None;
     while i < keybinds::COUNT {
         let a = Action::SORTED[i];
@@ -415,6 +425,8 @@ impl Settings {
                 g.weather_radius,
             ),
         };
+        let toggle_sneak = flag(controls, "toggle_sneak", d.toggle_sneak);
+        let toggle_sprint = flag(controls, "toggle_sprint", d.toggle_sprint);
         let mut keys = d.keys;
         if let Some(t) = section("keys") {
             // (`key.forward = ...` without quotes is a dotted key: tables in tables.)
@@ -431,6 +443,8 @@ impl Settings {
         Ok(Settings {
             game,
             keys,
+            toggle_sneak,
+            toggle_sprint,
             vsync: flag(display, "vsync", d.vsync),
             max_fps,
             fullscreen: flag(display, "fullscreen", d.fullscreen),
@@ -600,6 +614,15 @@ impl Settings {
             ),
             Row::InvertX => ("Invert Mouse X", "Left turns right", Switch),
             Row::InvertY => ("Invert Mouse Y", "Up looks down", Switch),
+            Row::ToggleSneak | Row::ToggleSprint => (
+                if row == Row::ToggleSneak {
+                    "Sneak"
+                } else {
+                    "Sprint"
+                },
+                "Hold its key, or press it once to start and again to stop",
+                Choice(vec!["Hold".into(), "Toggle".into()]),
+            ),
             Row::DamageTilt => (
                 "Damage Tilt",
                 "How far the view tilts when you are hurt",
@@ -674,6 +697,8 @@ impl Settings {
             }
             Row::InvertX => self.mouse.invert_x.into(),
             Row::InvertY => self.mouse.invert_y.into(),
+            Row::ToggleSneak => self.toggle_sneak.into(),
+            Row::ToggleSprint => self.toggle_sprint.into(),
             Row::DamageTilt => g.damage_tilt as usize,
             Row::FovEffects => g.fov_effects as usize,
             Row::Clouds => CLOUDS.iter().position(|c| c.0 == g.clouds).unwrap_or(2),
@@ -723,6 +748,8 @@ impl Settings {
             }
             Row::InvertX => self.mouse.invert_x = value != 0,
             Row::InvertY => self.mouse.invert_y = value != 0,
+            Row::ToggleSneak => self.toggle_sneak = value != 0,
+            Row::ToggleSprint => self.toggle_sprint = value != 0,
             Row::DamageTilt => g.damage_tilt = percent,
             Row::FovEffects => g.fov_effects = percent,
             Row::Clouds => {
@@ -771,6 +798,9 @@ impl Settings {
              mouse_sensitivity = {:?}\n\
              invert_mouse_x = {}\n\
              invert_mouse_y = {}\n\
+             # Whether Sneak and Sprint toggle instead of being held.\n\
+             toggle_sneak = {}\n\
+             toggle_sprint = {}\n\
              \n\
              [game]\n\
              # {FOV_MIN} to {FOV_MAX} degrees.\n\
@@ -806,6 +836,8 @@ impl Settings {
             self.mouse.sensitivity,
             self.mouse.invert_x,
             self.mouse.invert_y,
+            self.toggle_sneak,
+            self.toggle_sprint,
             self.game.fov,
             self.game.gui_scale,
             self.game.view_bobbing,
@@ -834,6 +866,14 @@ impl Settings {
             })
             .collect()
     }
+}
+
+/// What is imported with the key bindings from vanilla's `options.txt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VanillaKeys {
+    pub keys: KeyBinds,
+    pub toggle_sneak: bool,
+    pub toggle_sprint: bool,
 }
 
 /// A table's string values by their dotted names (`a.b = "x"` and `"a.b" = "x"` alike).
@@ -913,21 +953,34 @@ impl SettingsFile {
         }
     }
 
-    /// Takes the key bindings from `import` (vanilla's) if the file had none; they are
-    /// saved with the next change, or on quitting.
-    pub fn import_keys(&mut self, import: impl FnOnce() -> Option<(KeyBinds, PathBuf)>) {
+    /// Takes the key bindings, and whether sneak and sprint toggle, from `import`
+    /// (vanilla's) if the file had no bindings; they are saved with the next change, or
+    /// on quitting.
+    pub fn import_keys(&mut self, import: impl FnOnce() -> Option<(VanillaKeys, PathBuf)>) {
         if self.has_keys {
             return;
         }
         self.has_keys = true;
         match import() {
-            Some((keys, from)) => {
+            Some((v, from)) => {
                 eprintln!(
-                    "[ruthenium] key bindings ({} not vanilla's defaults) from {}",
-                    keys.changed(),
+                    "[ruthenium] key bindings ({} not vanilla's defaults{}{}) from {}",
+                    v.keys.changed(),
+                    if v.toggle_sneak {
+                        ", sneak toggles"
+                    } else {
+                        ""
+                    },
+                    if v.toggle_sprint {
+                        ", sprint toggles"
+                    } else {
+                        ""
+                    },
                     from.display()
                 );
-                self.settings.keys = keys;
+                self.settings.keys = v.keys;
+                self.settings.toggle_sneak = v.toggle_sneak;
+                self.settings.toggle_sprint = v.toggle_sprint;
             }
             None => eprintln!("[ruthenium] no key bindings in vanilla's options.txt; the defaults"),
         }
@@ -1041,6 +1094,8 @@ mod tests {
                 k.set(Action::DebugOverlay, Key::Mouse(9));
                 k
             },
+            toggle_sneak: true,
+            toggle_sprint: false,
         };
         assert_eq!(Settings::parse(&s.to_toml()), Ok(s.clone()));
         assert!(Settings::has_mouse(&s.to_toml()));
@@ -1204,8 +1259,14 @@ vsync = true
         let rows = controls.1.to_vec();
         let start = rows.iter().position(|&r| r == Row::ResetKeys).unwrap();
         assert_eq!(
-            &rows[start - 3..start],
-            [Row::Sensitivity, Row::InvertX, Row::InvertY]
+            &rows[start - 5..start],
+            [
+                Row::Sensitivity,
+                Row::InvertX,
+                Row::InvertY,
+                Row::ToggleSneak,
+                Row::ToggleSprint
+            ]
         );
         let keys: Vec<Action> = rows
             .iter()
@@ -1315,13 +1376,20 @@ vsync = true
         let path = SettingsFile::path_in(&dir);
         let mut imported = KeyBinds::DEFAULT;
         imported.set(Action::Forward, Key::Keyboard(82));
+        let vanilla = VanillaKeys {
+            keys: imported.clone(),
+            toggle_sneak: false,
+            toggle_sprint: true,
+        };
         let mut f = SettingsFile::load(path.clone());
-        f.import_keys(|| Some((imported.clone(), PathBuf::from("options.txt"))));
+        f.import_keys(|| Some((vanilla, PathBuf::from("options.txt"))));
         assert_eq!(f.settings.keys, imported);
+        assert!(f.settings.toggle_sprint && !f.settings.toggle_sneak);
         // Saved at once, though nothing else changed.
         f.save();
         let again = SettingsFile::load(path.clone());
         assert_eq!(again.settings.keys, imported);
+        assert!(again.settings.toggle_sprint);
         // The file has them now: no second import.
         let mut f = again;
         f.import_keys(|| panic!("imported twice"));
