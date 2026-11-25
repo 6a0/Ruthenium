@@ -1667,9 +1667,11 @@ pub mod play {
             entity_id: i32,
             y_head_rot: i8,
         },
-        /// `ClientboundDamageEventPacket`: an entity was hurt (what by is not read).
+        /// `ClientboundDamageEventPacket`: an entity was hurt, with the kind of damage (its
+        /// id in the `damage_type` registry; who and what caused it are not read).
         DamageEvent {
             entity_id: i32,
+            source_type: i32,
         },
         /// `ClientboundHurtAnimationPacket`: an entity flinches; `yaw` is where what
         /// hurt it came from, in degrees from the way it faces.
@@ -1804,6 +1806,12 @@ pub mod play {
         StopSound {
             source: Option<i32>,
             name: Option<String>,
+        },
+        /// `ClientboundTakeItemEntityPacket`: an entity picked an item or orb up.
+        TakeItemEntity {
+            item_id: i32,
+            player_id: i32,
+            amount: i32,
         },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
@@ -2302,13 +2310,17 @@ pub mod play {
                 },
                 C::DamageEvent => {
                     let entity_id = r.varint()?;
-                    // The kind of damage, who and what caused it (one above their ids),
-                    // and where it came from.
-                    for _ in 0..3 {
+                    let source_type = r.varint()?;
+                    // Who and what caused it (one above their ids), and where it came
+                    // from.
+                    for _ in 0..2 {
                         r.varint()?;
                     }
                     optional(&mut r, vec3)?;
-                    Clientbound::DamageEvent { entity_id }
+                    Clientbound::DamageEvent {
+                        entity_id,
+                        source_type,
+                    }
                 }
                 C::HurtAnimation => Clientbound::HurtAnimation {
                     entity_id: r.varint()?,
@@ -2438,6 +2450,11 @@ pub mod play {
                     };
                     Clientbound::StopSound { source, name }
                 }
+                C::TakeItemEntity => Clientbound::TakeItemEntity {
+                    item_id: r.varint()?,
+                    player_id: r.varint()?,
+                    amount: r.varint()?,
+                },
                 other => {
                     r.rest();
                     Clientbound::Other(other)
@@ -3706,7 +3723,10 @@ mod tests {
                 duration: 13
             }
         );
-        let hurt = play::Clientbound::DamageEvent { entity_id: 5 };
+        let hurt = play::Clientbound::DamageEvent {
+            entity_id: 5,
+            source_type: 1,
+        };
         assert_eq!(decode(pl::Clientbound::DamageEvent, &[5, 1, 8, 0, 0]), hurt);
         let mut from = vec![5, 1, 0, 0, 1];
         for c in [1.0, 2.0, 3.0] {

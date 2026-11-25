@@ -139,6 +139,8 @@ pub struct World<'a> {
     /// state, flags, update limit), in the order made (tests compare it with
     /// vanilla's).
     pub set_log: Option<Vec<crate::block::level::SetCall>>,
+    /// The block sounds the actions made, for the session to play.
+    pub sounds: Vec<crate::sound::BlockSound>,
 }
 
 impl<'a> World<'a> {
@@ -167,6 +169,7 @@ impl<'a> World<'a> {
             transformers: None,
             recipe_sets: None,
             set_log: None,
+            sounds: Vec::new(),
         }
     }
 
@@ -482,6 +485,8 @@ impl GameMode {
                 self.destroying_item = p.hand(Hand::Main).clone();
                 self.destroy_progress = 0.0;
                 self.destroy_ticks = 0.0;
+                // `addBreakingBlockEffects` with its sound.
+                w.sounds.push(crate::sound::BlockSound::Hit { pos, state });
             }
             w.predictions.end();
             out.push(play::player_action(
@@ -592,6 +597,8 @@ impl GameMode {
         // `playerWillDestroy` and `destroy` only make particles and sounds on the
         // client (the rest is the server's). `removeBlock`: the fluid stays, and the
         // neighbours hear of it.
+        w.sounds
+            .push(crate::sound::BlockSound::Break { pos, state: old });
         let left = w.blocks.left_behind(old);
         w.track_player(p);
         w.set_block(pos, left, crate::block::flags::ALL)

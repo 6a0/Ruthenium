@@ -353,6 +353,8 @@ pub fn place(w: &mut World<'_>, p: &mut LocalPlayer, ctx: PlaceContext) -> Outco
         // Block entity data is the server's.
         block::set_placed_by(w, p, placed, pos, ctx.hand());
     }
+    w.sounds
+        .push(crate::sound::BlockSound::Place { pos, state: placed });
     let infinite = p.infinite_materials();
     p.inventory.hand_mut(ctx.hand()).consume(1, infinite);
     Outcome::Success

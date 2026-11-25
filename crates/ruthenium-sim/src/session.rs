@@ -69,6 +69,7 @@ use crate::scene::{
 use crate::scoreboard::Scoreboard;
 use crate::weather::Weather;
 use crate::world::{BiomeInfo, ChunkPacket, Level, global_bits};
+use ruthenium_audio::SoundSource;
 use ruthenium_protocol::profile::ResolvableProfile;
 
 #[derive(Debug)]
@@ -1544,6 +1545,30 @@ impl Game {
         }))
     }
 
+    /// The effects of the damage type with this id (`DamageType.effects`), for the
+    /// hurt sound.
+    fn damage_effects(&self, id: i32) -> String {
+        let entry = self
+            .configured
+            .registries
+            .iter()
+            .find(|(r, _)| r == "minecraft:damage_type")
+            .and_then(|(_, e)| e.get(usize::try_from(id).ok()?));
+        let Some(entry) = entry else {
+            return "hurt".into();
+        };
+        let data = entry
+            .data
+            .as_ref()
+            .and_then(|d| d.as_compound()?.string("effects"));
+        crate::sound::damage_effects(&entry.id, data).to_owned()
+    }
+
+    /// The player entity type's network id.
+    fn player_type(&self) -> i32 {
+        ruthenium_data::v26_3::registries::EntityType::Player as i32
+    }
+
     /// A level's entities, the player's among them.
     fn new_entities(&self, player_id: i32) -> Entities {
         let improved = self
@@ -1710,6 +1735,9 @@ impl Game {
                 &mut self.use_keys,
                 &mut out,
             );
+            for s in world.sounds.drain(..) {
+                self.sounds.block(s, &physics.blocks);
+            }
             for p in out.drain(..) {
                 self.connection.send(p);
             }
@@ -1768,6 +1796,9 @@ impl Game {
                     player.tick(&env, keys);
                 }
             });
+        for s in w.player.sounds.drain(..) {
+            self.sounds.player_sound(s);
+        }
         // `tickBlockEntities`: moving pistons and shulker boxes' lids, which push the
         // player; then `sendChanges`, for a player still in the level.
         if !w.frozen {
@@ -2042,6 +2073,7 @@ impl Game {
                         }
                         _ => {
                             w.level.weather.game_event(event, param);
+                            self.sounds.game_event(&w.player, event, param);
                         }
                     }
                 }
@@ -2484,6 +2516,31 @@ impl Game {
                 }
             }
             play::Clientbound::EntityEvent { entity_id, event } => {
+                // The totem's sound is the packet listener's, for any entity.
+                if let Some(w) = &self.world {
+                    if event == crate::sound::ENTITY_EVENT_TOTEM {
+                        let at = if entity_id == w.player.entity_id {
+                            Some((w.player.position, SoundSource::Players))
+                        } else {
+                            w.entities.get(entity_id).map(|e| {
+                                let player = e.entity_type == self.player_type();
+                                let source = if player {
+                                    SoundSource::Players
+                                } else {
+                                    SoundSource::Neutral
+                                };
+                                (e.position, source)
+                            })
+                        };
+                        if let Some((position, source)) = at {
+                            self.sounds.totem(position, source);
+                        }
+                    } else if event == crate::sound::ENTITY_EVENT_DEATH
+                        && entity_id == w.player.entity_id
+                    {
+                        self.sounds.death(&w.player);
+                    }
+                }
                 // `Player.handleEntityEvent`: the server finished the item's use; the
                 // player's operator level (events 24 to 28: levels 0 to 4).
                 if let Some(w) = &mut self.world
@@ -2586,10 +2643,15 @@ impl Game {
                     w.entities.rotate_head(entity_id, y_head_rot);
                 }
             }
-            play::Clientbound::DamageEvent { entity_id } => {
+            play::Clientbound::DamageEvent {
+                entity_id,
+                source_type,
+            } => {
+                let effects = self.damage_effects(source_type);
                 if let Some(w) = &mut self.world {
                     if entity_id == w.player.entity_id {
                         w.player.first_person.hurt(None);
+                        self.sounds.hurt(&w.player, &effects);
                     } else {
                         w.entities.damaged(entity_id);
                     }
@@ -2694,7 +2756,18 @@ impl Game {
             play::Clientbound::TabList { header, footer } => {
                 self.hud_text.set_tab_list(header, footer);
             }
-            play::Clientbound::LevelEvent { event, data, .. } => {
+            play::Clientbound::LevelEvent {
+                event,
+                pos,
+                data,
+                global,
+            } => {
+                if !global && let Some(w) = &self.world {
+                    let blocks = self.physics.as_ref().map(|p| &*p.blocks);
+                    self.sounds.level_event(event, pos, data, blocks, |p| {
+                        w.level.block(p[0], p[1], p[2])
+                    });
+                }
                 // A record starts to play: what it is called shows.
                 if event == LEVEL_EVENT_RECORD_STARTS
                     && let Some(song) = self.song_name(data)
@@ -2735,6 +2808,14 @@ impl Game {
             }
             play::Clientbound::StopSound { source, name } => {
                 self.sounds.stop(source, name.as_deref());
+            }
+            play::Clientbound::TakeItemEntity { item_id, .. } => {
+                if let Some(e) = self.world.as_ref().and_then(|w| w.entities.get(item_id)) {
+                    let orb = e.entity_type
+                        == ruthenium_data::v26_3::registries::EntityType::ExperienceOrb as i32;
+                    let at = e.position;
+                    self.sounds.pickup(at, orb);
+                }
             }
             play::Clientbound::Other(kind) => {
                 self.play_packets += 1;

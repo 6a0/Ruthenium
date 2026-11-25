@@ -643,6 +643,9 @@ impl<'a> Env<'a> {
     }
 }
 
+/// Sounds the player keeps for the session at most (see [`LocalPlayer::sounds`]).
+pub const MAX_SOUNDS: usize = 64;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalPlayer {
     pub entity_id: i32,
@@ -727,6 +730,19 @@ pub struct LocalPlayer {
     /// How used to seeing under water the eyes are (`waterVisionTime`).
     water_vision_time: i32,
     first_tick: bool,
+    /// `tickCount`, and how far the player has gone for its steps (`moveDist`,
+    /// `flyDist`, `nextStep`).
+    tick_count: i32,
+    move_dist: f32,
+    fly_dist: f32,
+    next_step: f32,
+    /// The amethyst chime's loudness and when it last sounded
+    /// (`crystalSoundIntensity`, `lastCrystalSoundPlayTick`).
+    crystal_sound_intensity: f32,
+    last_crystal_sound_tick: i32,
+    /// The sounds the player made since the session last took them (at most
+    /// [`MAX_SOUNDS`]).
+    pub sounds: Vec<crate::sound::PlayerSound>,
     // `sendChanges` state.
     last_sent_keys: Keys,
     last_sent: [f64; 3],
@@ -938,6 +954,13 @@ impl LocalPlayer {
             was_underwater: false,
             water_vision_time: 0,
             first_tick: true,
+            tick_count: 0,
+            move_dist: 0.0,
+            fly_dist: 0.0,
+            next_step: 1.0,
+            crystal_sound_intensity: 0.0,
+            last_crystal_sound_tick: 0,
+            sounds: Vec::new(),
             last_sent_keys: Keys::default(),
             last_sent: [0.0; 3],
             last_sent_rot: (0.0, 0.0),
@@ -1876,9 +1899,10 @@ impl LocalPlayer {
     /// One client tick of the player (`LocalPlayer.tick`, only called once the player
     /// has loaded into the level). `keys` are the movement keys held.
     pub fn tick(&mut self, env: &Env<'_>, keys: Keys) {
-        // Level.tickNonPassenger: setOldPosAndRot.
+        // Level.tickNonPassenger: setOldPosAndRot, and the tick count.
         self.old_position = self.position;
         self.old_rot = (self.y_rot, self.x_rot);
+        self.tick_count += 1;
         // AbstractClientPlayer.tick: what is only drawn starts its tick too.
         self.first_person.begin_tick();
         // Player.tick: spectators go through everything and are never on the ground;
@@ -2034,6 +2058,10 @@ impl LocalPlayer {
         let in_lava = self.fluids.is_in(false);
         if in_water {
             self.fall_distance = 0.0;
+            // `Player.doWaterSplashEffect`: not for spectators.
+            if !self.in_water && !self.first_tick && !self.spectator {
+                self.water_splash();
+            }
         }
         self.in_water = in_water;
         if !pushed {
@@ -3151,8 +3179,174 @@ impl LocalPlayer {
         if moved_vertically && self.vertical_collision || self.horizontal_collision {
             self.restitute(env, effect_state, x_collision, z_collision, movement);
         }
+        // `Player.getMovementEmission`: nothing while flying or sneaking on the ground;
+        // a passenger makes none.
+        let emits = !(self.abilities.flying || self.on_ground && self.keys.shift);
+        if emits && self.riding.is_none() {
+            self.movement_emission(env, movement, effect_pos, effect_state);
+        }
         let f = f64::from(self.block_speed_factor(env));
         self.delta = [self.delta[0] * f, self.delta[1], self.delta[2] * f];
+    }
+
+    /// Keeps a sound for the session (bounded: nothing takes them in tests).
+    fn sound(&mut self, s: crate::sound::PlayerSound) {
+        if self.sounds.len() < MAX_SOUNDS {
+            self.sounds.push(s);
+        }
+    }
+
+    /// `isStateClimbable`: climbable, or powder snow.
+    fn state_climbable(env: &Env<'_>, state: u32) -> bool {
+        env.tags.climbable(state) || env.blocks.is_class(state, Class::PowderSnowBlock)
+    }
+
+    /// `Entity.applyMovementEmissionAndPlaySound`: the distance walked (climbed, on a
+    /// climbable block), and a step each time it passes the next whole block.
+    fn movement_emission(
+        &mut self,
+        env: &Env<'_>,
+        movement: [f64; 3],
+        effect_pos: [i32; 3],
+        effect_state: u32,
+    ) {
+        let length =
+            (movement[0] * movement[0] + movement[1] * movement[1] + movement[2] * movement[2])
+                .sqrt();
+        let horizontal = (movement[0] * movement[0] + movement[2] * movement[2]).sqrt();
+        let moved = (length * 0.6000000238418579) as f32;
+        let moved_horizontally = (horizontal * 0.6000000238418579) as f32;
+        let supporting_pos = self.on_pos(env, 1.0E-5);
+        let supporting = env.state(supporting_pos);
+        let climbing = Self::state_climbable(env, supporting);
+        self.move_dist += if climbing { moved } else { moved_horizontally };
+        self.fly_dist += moved;
+        if self.move_dist > self.next_step && !env.blocks.is_air(supporting) {
+            let only_effect = supporting_pos == effect_pos;
+            let mut produced = self.step_effects(env, effect_pos, effect_state, true, movement);
+            if !only_effect {
+                produced |= self.step_effects(env, supporting_pos, supporting, false, movement);
+            }
+            if produced {
+                self.next_step = self.move_dist as i32 as f32 + 1.0;
+            } else if self.in_water {
+                self.next_step = self.move_dist as i32 as f32 + 1.0;
+                self.water_swim_sound();
+            }
+        }
+    }
+
+    /// `vibrationAndSoundEffectsFromBlock`: on the ground, climbing, or sneaking without
+    /// moving up or down, and not swimming, the block steps.
+    fn step_effects(
+        &mut self,
+        env: &Env<'_>,
+        pos: [i32; 3],
+        state: u32,
+        sound: bool,
+        movement: [f64; 3],
+    ) -> bool {
+        if env.blocks.is_air(state) {
+            return false;
+        }
+        let crouching = self.pose == Pose::Crouching;
+        let stepping =
+            self.on_ground || Self::state_climbable(env, state) || crouching && movement[1] == 0.0;
+        if !stepping || self.is_swimming() {
+            return false;
+        }
+        if sound {
+            self.walking_step_sound(env, pos, state);
+        }
+        true
+    }
+
+    /// `walkingStepSound` with `Player.playStepSound`: in water the swim and a muffled
+    /// step; else the block above when it sounds for steps (carpet, snow), alone or
+    /// with a muffled step of the block under it; and amethyst's chime.
+    fn walking_step_sound(&mut self, env: &Env<'_>, pos: [i32; 3], state: u32) {
+        use crate::sound::PlayerSound;
+        let at = self.position;
+        let muffled = |state| PlayerSound::Step {
+            state,
+            volume: 0.05,
+            pitch: 0.8,
+            at,
+        };
+        if self.in_water {
+            self.water_swim_sound();
+            self.sound(muffled(state));
+        } else {
+            let above = [pos[0], pos[1] + 1, pos[2]];
+            let above_state = env.state(above);
+            let inside = env
+                .tags
+                .is(above_state, "minecraft:inside_step_sound_blocks");
+            let combination = env
+                .tags
+                .is(above_state, "minecraft:combination_step_sound_blocks");
+            if inside || combination {
+                self.sound(PlayerSound::Step {
+                    state: above_state,
+                    volume: 0.15,
+                    pitch: 1.0,
+                    at,
+                });
+                if combination {
+                    self.sound(muffled(state));
+                }
+            } else {
+                self.sound(PlayerSound::Step {
+                    state,
+                    volume: 0.15,
+                    pitch: 1.0,
+                    at,
+                });
+            }
+        }
+        // `shouldPlayAmethystStepSound` and `playAmethystStepSound`.
+        if env.tags.is(state, "minecraft:crystal_sound_blocks")
+            && self.tick_count >= self.last_crystal_sound_tick + 20
+        {
+            let since = self.tick_count - self.last_crystal_sound_tick;
+            self.crystal_sound_intensity *= 0.997f64.powi(since) as f32;
+            self.crystal_sound_intensity = (self.crystal_sound_intensity + 0.07).min(1.0);
+            self.sound(PlayerSound::Chime {
+                volume: 0.1 + self.crystal_sound_intensity * 1.2,
+                intensity: self.crystal_sound_intensity,
+                at,
+            });
+            self.last_crystal_sound_tick = self.tick_count;
+        }
+    }
+
+    /// `Entity.waterSwimSound`: louder the faster (sideways counting a fifth).
+    fn water_swim_sound(&mut self) {
+        let d = self.delta;
+        let speed =
+            ((d[0] * d[0] * 0.20000000298023224 + d[1] * d[1] + d[2] * d[2] * 0.20000000298023224)
+                .sqrt() as f32
+                * 0.35)
+                .min(1.0);
+        self.sound(crate::sound::PlayerSound::Swim {
+            volume: speed,
+            at: self.position,
+        });
+    }
+
+    /// `Entity.doWaterSplashEffect`'s sound: a splash, or a big one from 0.25.
+    fn water_splash(&mut self) {
+        let d = self.delta;
+        let speed =
+            ((d[0] * d[0] * 0.20000000298023224 + d[1] * d[1] + d[2] * d[2] * 0.20000000298023224)
+                .sqrt() as f32
+                * 0.2)
+                .min(1.0);
+        self.sound(crate::sound::PlayerSound::Splash {
+            volume: speed,
+            high_speed: speed >= 0.25,
+            at: self.position,
+        });
     }
 
     /// `limitPistonMovement`: the first axis the move goes along, cut so that the
@@ -4023,6 +4217,77 @@ mod tests {
         jump: false,
         ..JUMP
     };
+
+    /// `applyMovementEmissionAndPlaySound`: a step each time 0.6 of the distance walked
+    /// passes the next whole number, on the block underfoot; none sneaking on the
+    /// ground or flying.
+    #[test]
+    fn walking_steps_on_the_block_underfoot() {
+        use crate::sound::PlayerSound;
+        let (level, blocks, tags) = world();
+        let env = Env {
+            level: &level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+            others: None,
+        };
+        let forward = Keys {
+            forward: true,
+            ..NONE
+        };
+        let walk = |keys: Keys, flying: bool| {
+            let mut p = standing(
+                &env,
+                if flying {
+                    play::CREATIVE
+                } else {
+                    play::SURVIVAL
+                },
+            );
+            if flying {
+                // Off the ground, which ends flying.
+                p.abilities.flying = true;
+                p.position[1] = -50.0;
+                p.on_ground = false;
+            }
+            let start = p.position;
+            let mut steps = Vec::new();
+            for _ in 0..40 {
+                p.tick(&env, keys);
+                steps.append(&mut p.sounds);
+            }
+            let walked =
+                ((p.position[0] - start[0]).powi(2) + (p.position[2] - start[2]).powi(2)).sqrt();
+            (steps, walked, p)
+        };
+        let (steps, walked, p) = walk(forward, false);
+        assert!(walked > 3.0, "{walked}");
+        assert_eq!(steps.len(), (walked * 0.6) as usize, "{walked}");
+        assert!((p.move_dist - (walked * 0.6) as f32).abs() < 1e-3);
+        for s in &steps {
+            let PlayerSound::Step {
+                state,
+                volume,
+                pitch,
+                at,
+            } = *s
+            else {
+                panic!("{s:?}");
+            };
+            assert_eq!((state, volume, pitch), (1, 0.15, 1.0));
+            assert_eq!(at[1], -60.0);
+        }
+        let sneaking = Keys {
+            shift: true,
+            ..forward
+        };
+        assert!(walk(sneaking, false).0.is_empty());
+        assert!(walk(NONE, false).0.is_empty());
+        // Flying: nothing.
+        let (steps, walked, _) = walk(forward, true);
+        assert!(steps.is_empty() && walked > 3.0, "{walked}");
+    }
 
     #[test]
     fn a_change_of_health_holds_off_the_next_for_ticks_that_count_down() {
