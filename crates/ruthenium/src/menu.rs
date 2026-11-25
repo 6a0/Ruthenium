@@ -517,6 +517,12 @@ impl Menu {
         self.vignette = on;
     }
 
+    /// Whether the player list shows without its key held (it does not unless said
+    /// otherwise).
+    pub fn set_player_list(&mut self, on: bool) {
+        self.game.set_player_list(on);
+    }
+
     /// How this frame's HUD is to be drawn: over the world while no screen is open,
     /// unless it is switched off.
     pub fn hud_params(&self) -> Option<ruthenium_render::HudParams> {
@@ -528,6 +534,7 @@ impl Menu {
                 ..Default::default()
             },
             millis: self.started.elapsed().as_millis() as i64,
+            now: Instant::now(),
         })
     }
 

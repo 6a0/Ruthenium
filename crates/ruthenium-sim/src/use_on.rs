@@ -1195,6 +1195,7 @@ mod tests {
             added: vec![(
                 DataComponentType::PotionContents.id() as i32,
                 Component::PotionContents {
+                    custom_name: None,
                     potion: Some(Potion::Water.id() as i32),
                     custom_color: None,
                 },

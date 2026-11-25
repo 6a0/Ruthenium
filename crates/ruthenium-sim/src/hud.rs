@@ -7,6 +7,7 @@ use ruthenium_data::v26_3::registries::DataComponentType as Kind;
 use ruthenium_protocol::item::Component;
 
 use crate::effect::Effect;
+use crate::hud_text::HudTexts;
 use crate::item::Stack;
 use crate::player::LocalPlayer;
 
@@ -54,8 +55,9 @@ pub struct HudState {
 }
 
 impl HudState {
-    /// `Hud.tick`, and the hotbar's part of `Inventory.tick`.
-    pub fn tick(&mut self, player: &LocalPlayer) {
+    /// `Hud.tick`, and the hotbar's part of `Inventory.tick`. Returns whether the
+    /// selected stack is another, or has changed ([`Self::selected`]).
+    pub fn tick(&mut self, player: &LocalPlayer) -> bool {
         self.ticks = self.ticks.wrapping_add(1);
         let selected = player.inventory.hand(crate::inventory::Hand::Main);
         if selected.is_empty() {
@@ -68,12 +70,24 @@ impl HudState {
         } else if self.highlight_timer > 0 {
             self.highlight_timer -= 1;
         }
-        if *selected != self.last_highlight {
+        let changed = *selected != self.last_highlight;
+        if changed {
             self.last_highlight = selected.clone();
         }
         for pop in &mut self.pop {
             *pop = (*pop - 1).max(0);
         }
+        changed
+    }
+
+    /// The stack whose name shows, as the last tick found it.
+    pub fn selected(&self) -> &Stack {
+        &self.last_highlight
+    }
+
+    /// How long its name still shows, in ticks.
+    pub fn highlight(&self) -> i32 {
+        self.highlight_timer
     }
 
     /// `handleContainerSetSlot`: the server put `new` where `old` was, in the hotbar's
@@ -193,8 +207,7 @@ pub struct HudRecord {
     pub attack_delay: f32,
     /// The crosshair is on something alive that an attack would reach.
     pub target_alive: bool,
-    /// How long the selected item's name still shows, in ticks.
-    pub highlight: i32,
+    pub texts: HudTexts,
 }
 
 impl Default for HudRecord {
@@ -227,7 +240,7 @@ impl Default for HudRecord {
             attack_strength: 0.0,
             attack_delay: 0.0,
             target_alive: false,
-            highlight: 0,
+            texts: HudTexts::default(),
         }
     }
 }
@@ -300,7 +313,6 @@ impl HudRecord {
         self.attack_strength = p.attack_strength_scale(0.0);
         self.attack_delay = p.attack_strength_delay();
         self.target_alive = target_alive;
-        self.highlight = state.highlight_timer;
     }
 }
 
@@ -364,7 +376,7 @@ mod tests {
         let mut record = HudRecord::default();
         let mut shows = |hud: &HudState, p: &LocalPlayer| {
             record.fill(hud, p, false, false, false);
-            (record.ticks, record.highlight)
+            (record.ticks, hud.highlight())
         };
         let stack = |identity, item, added: Vec<(i32, Component)>| Stack {
             identity,

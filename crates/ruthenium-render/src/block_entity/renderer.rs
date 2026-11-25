@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ruthenium_assets::Font;
+use ruthenium_assets::font::Glyph;
 use ruthenium_assets::item::{Drawn, Held, ItemMesh, ItemModels, ItemTransform, Special, Tint};
 use ruthenium_data::v26_3::registries::DataComponentType;
 use ruthenium_gpu::{
@@ -23,8 +24,9 @@ use ruthenium_sim::environment::CardinalLight;
 use ruthenium_sim::item::{Components, EquipmentSlot, Stack, Trim};
 use ruthenium_sim::scene::{Frame, SectionKey, Terrain};
 use ruthenium_sim::scoreboard::{NameRecord, NameText};
+use ruthenium_ui::NO_TEXTURE;
 use ruthenium_ui::Quad;
-use ruthenium_ui::hud::{HudItem, HudText};
+use ruthenium_ui::hud::{HudFace, HudItem, HudLayout, HudText};
 
 use super::affine::Affine;
 use super::avatar::{self, Figure, Moment};
@@ -586,6 +588,156 @@ const GUI_LIGHT: (u8, u8) = (15, 15);
 fn shadow_colour(color: u32) -> u32 {
     let quarter = |shift: u32| ((color >> shift & 0xFF) as f32 * 0.25) as u32;
     color & 0xFF00_0000 | quarter(16) << 16 | quarter(8) << 8 | quarter(0)
+}
+
+/// What a text's colour does not show at all: the text shader discards less than a tenth.
+const SEEN: u32 = 26;
+
+/// What belongs between a HUD's quads.
+enum Woven<'a> {
+    Face(&'a HudFace),
+    Text(&'a HudText),
+}
+
+/// Adds a HUD's quads over its items to `out`, with `put` adding each face and text where
+/// it belongs between them.
+fn weave(layout: &HudLayout, out: &mut Vec<Quad>, mut put: impl FnMut(Woven<'_>, &mut Vec<Quad>)) {
+    let over = layout.over.quads();
+    let mut taken = 0;
+    let mut faces = layout.faces.iter().peekable();
+    let mut texts = layout.texts().iter().peekable();
+    loop {
+        let face = faces.peek().map_or(usize::MAX, |f| f.at);
+        let text = texts.peek().map_or(usize::MAX, |t| t.at);
+        let at = face.min(text).min(over.len()).max(taken);
+        out.extend_from_slice(&over[taken..at]);
+        taken = at;
+        if face <= text {
+            match faces.next() {
+                Some(face) => put(Woven::Face(face), out),
+                // (Neither is left.)
+                None => return,
+            }
+        } else if let Some(text) = texts.next() {
+            put(Woven::Text(text), out);
+        }
+    }
+}
+
+/// A player's face on its skin's picture, and what is worn over it.
+fn face_quads(face: &HudFace, texture: u32) -> impl Iterator<Item = Quad> {
+    let (x, y) = (face.x as f32, face.y as f32);
+    let quad = move |left: f32, flipped: bool| {
+        let (top, bottom) = if flipped { (16.0, 8.0) } else { (8.0, 16.0) };
+        Quad {
+            rect: [x, y, x + 8.0, y + 8.0],
+            uv: [left, top, left + 8.0, bottom].map(|c| c / 64.0),
+            color: 0xFFFF_FFFF,
+            texture,
+            slant: [0.0; 2],
+        }
+    };
+    let hat = face.hat.then(|| quad(40.0, face.flipped));
+    std::iter::once(quad(8.0, face.flipped)).chain(hat)
+}
+
+/// Where a GUI's line of text has come to.
+struct Pen {
+    at: [f32; 2],
+    scale: f32,
+    x: f32,
+    color: u32,
+    shadow: bool,
+    before: Option<Style>,
+    /// The lines under and through what was written, drawn over it.
+    bars: Vec<Quad>,
+}
+
+impl Pen {
+    /// Writes one glyph with its picture, if it has one that is there.
+    fn put(
+        &mut self,
+        glyph: &Glyph,
+        style: Style,
+        picture: Option<(u32, [f32; 4])>,
+        out: &mut Vec<Quad>,
+    ) {
+        let color = style
+            .color
+            .map_or(self.color, |rgb| self.color & 0xFF00_0000 | rgb);
+        let shadow = match style.shadow {
+            Some(own) if color >> 24 == 0xFF => own,
+            Some(own) => {
+                let part = (color >> 24) as f32 / 255.0 * ((own >> 24) as f32 / 255.0);
+                ((part * 255.0).floor() as u32) << 24 | own & 0x00FF_FFFF
+            }
+            None if self.shadow => shadow_colour(color),
+            None => 0,
+        };
+        let advance = glyph.advance(style.bold);
+        let copies = [(glyph.shadow_offset, shadow), (0.0, color)];
+        let seen = |c: &(f32, u32)| c.1 >> 24 >= SEEN;
+        let (k, [x, y]) = (self.scale, self.at);
+        let place = |b: [f32; 4]| [x + b[0] * k, y + b[1] * k, x + b[2] * k, y + b[3] * k];
+        if let (Some(p), Some((texture, uv))) = (glyph.picture, picture) {
+            let edge = if style.bold { sign::BOLD_EDGE } else { 0.0 };
+            let slant = if style.italic {
+                [1.0 - 0.25 * p.top, 1.0 - 0.25 * p.bottom].map(|s| s * k)
+            } else {
+                [0.0; 2]
+            };
+            for (by, color) in copies.into_iter().filter(seen) {
+                let bold = style.bold.then_some(glyph.bold_offset);
+                for more in std::iter::once(0.0).chain(bold) {
+                    let left = self.x + by + more;
+                    out.push(Quad {
+                        rect: place([
+                            left - edge,
+                            p.top + by - edge,
+                            left + p.right + edge,
+                            p.bottom + by + edge,
+                        ]),
+                        uv,
+                        color,
+                        texture,
+                        slant,
+                    });
+                }
+            }
+        }
+        // A run's bars begin a little before it.
+        let from = if self.before == Some(style) {
+            self.x
+        } else {
+            self.x - 1.0
+        };
+        let heights = [
+            style.strikethrough.then_some([3.5, 4.5]),
+            style.underlined.then_some([8.0, 9.0]),
+        ];
+        for [top, bottom] in heights.into_iter().flatten() {
+            for (by, color) in copies.into_iter().filter(seen) {
+                self.bars.push(Quad {
+                    rect: place([from + by, top + by, self.x + advance + by, bottom + by]),
+                    uv: [0.0; 4],
+                    color,
+                    texture: NO_TEXTURE,
+                    slant: [0.0; 2],
+                });
+            }
+        }
+        self.before = Some(style);
+        self.x += advance;
+    }
+}
+
+/// The next of the numbers obfuscated text is picked by, below `below`.
+fn next_random(random: &mut u64, below: usize) -> usize {
+    // xorshift64
+    *random ^= *random << 13;
+    *random ^= *random >> 7;
+    *random ^= *random << 17;
+    (*random % below as u64) as usize
 }
 
 /// What is held is drawn with: the atlases its pictures are in.
@@ -2357,6 +2509,11 @@ impl BlockEntityRenderer {
         &self.font
     }
 
+    /// The language texts are translated with.
+    pub fn lang(&self) -> &HashMap<String, String> {
+        &self.lang
+    }
+
     /// Adds the items a GUI shows (`GuiGraphicsExtractor.item`, `GuiItemAtlas.drawToSlot`):
     /// each of `items` holds `slots`' stack of its number in a square of 16 GUI units,
     /// which are `scale` pixels each. `using` is the slot whose stack is being used, for
@@ -2472,46 +2629,59 @@ impl BlockEntityRenderer {
         self.sorted = sorted;
     }
 
-    /// Lines of text as a GUI's quads, in the game's font: every line's shadows, then
-    /// its glyphs. A glyph whose picture has not arrived yet is left out.
-    pub fn gui_text(&mut self, texts: &[HudText], out: &mut Vec<Quad>) {
-        for text in texts {
-            for shadow in [true, false] {
-                if shadow && !text.shadow {
-                    continue;
-                }
-                let mut x = text.x as f32;
-                for c in text.text.chars() {
-                    let glyph = self.font.glyph(c);
-                    let pen = x;
-                    x += glyph.advance(false);
-                    let Some(picture) = glyph.picture else {
-                        continue;
-                    };
-                    let Some((texture, uv)) = self.pages.picture(sign::Ink::Char(c), &self.font)
-                    else {
-                        continue;
-                    };
-                    let (by, color) = if shadow {
-                        (glyph.shadow_offset, shadow_colour(text.color))
-                    } else {
-                        (0.0, text.color)
-                    };
-                    let y = text.y as f32;
-                    out.push(Quad {
-                        rect: [
-                            pen + by,
-                            y + picture.top + by,
-                            pen + picture.right + by,
-                            y + picture.bottom + by,
-                        ],
-                        uv,
-                        color,
-                        texture,
-                    });
+    /// What the HUD draws over its items: its quads, with its texts and the faces each
+    /// where it belongs between them. A glyph whose picture has not arrived yet is left
+    /// out. Returns how many of the quads are glyphs'.
+    pub fn gui_over(
+        &mut self,
+        layout: &HudLayout,
+        textures: &TextureTable,
+        out: &mut Vec<Quad>,
+    ) -> u32 {
+        let mut glyphs = 0;
+        weave(layout, out, |piece, out| match piece {
+            Woven::Face(face) => {
+                if let Some(look) = self.skins.look(&face.skin, textures) {
+                    out.extend(face_quads(face, look.body.index()));
                 }
             }
+            Woven::Text(text) => {
+                let before = out.len();
+                self.gui_text(text, out);
+                glyphs += (out.len() - before) as u32;
+            }
+        });
+        glyphs
+    }
+
+    /// A line of text as a GUI's quads, in the game's font (`Font.prepareText`,
+    /// `BakedSheetGlyph.renderChar`): each glyph over its shadow, then the bars.
+    fn gui_text(&mut self, text: &HudText, out: &mut Vec<Quad>) {
+        let random = &mut self.random;
+        let mut pick = |below: usize| next_random(random, below);
+        let (font, pages) = (&self.font, &mut self.pages);
+        let mut pen = Pen {
+            at: [text.x, text.y],
+            scale: text.scale,
+            x: 0.0,
+            color: text.color,
+            shadow: text.shadow,
+            before: None,
+            bars: Vec::new(),
+        };
+        let mut put = |c: char, style: Style| {
+            let c = sign::drawn(c, style, font, &mut pick);
+            let glyph = font.glyph(c);
+            let picture = glyph
+                .picture
+                .and_then(|_| pages.picture(sign::Ink::Char(c), font));
+            pen.put(&glyph, style, picture, out);
+        };
+        match &text.line {
+            Some(line) => line.chars.iter().for_each(|(c, style)| put(*c, *style)),
+            None => text.text.chars().for_each(|c| put(c, Style::default())),
         }
+        out.append(&mut pen.bars);
     }
 
     /// Draws what is seen through everything else, into `pass`: the names over heads,
@@ -2928,13 +3098,7 @@ fn faces_camera(transform: &Affine) -> bool {
 
 /// Lays out a side's text and makes its records.
 fn lay_out(side: &mut Side, hanging: bool, font: &Font, pages: &mut GlyphPages, random: &mut u64) {
-    let mut pick = |below: usize| {
-        // xorshift64
-        *random ^= *random << 13;
-        *random ^= *random >> 7;
-        *random ^= *random << 17;
-        (*random % below as u64) as usize
-    };
+    let mut pick = |below: usize| next_random(random, below);
     let layout = sign::layout(&side.text, hanging, font, &mut pick);
     // What changes every frame does not wait for its pictures.
     (side.glyphs, side.newest) = sign::records(&layout.text, pages, font, layout.obfuscated);
@@ -2949,13 +3113,7 @@ fn lay_out_name(
     pages: &mut GlyphPages,
     random: &mut u64,
 ) {
-    let mut pick = |below: usize| {
-        // xorshift64
-        *random ^= *random << 13;
-        *random ^= *random >> 7;
-        *random ^= *random << 17;
-        (*random % below as u64) as usize
-    };
+    let mut pick = |below: usize| next_random(random, below);
     let laid = nametag::layout(&glyphs.line, offset, font, &mut pick);
     // What changes every frame does not wait for its pictures.
     let (solid, a) = sign::records(&laid.solid, pages, font, laid.obfuscated);
@@ -3098,6 +3256,185 @@ pub(crate) fn model_push(words: [u32; 4], fog: &Fog) -> [u8; MODEL_PUSH_BYTES] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What is written with `style`: a glyph five wide from its line's top and eight high,
+    /// with its picture there, and what follows it.
+    fn written(style: Style, color: u32, shadow: bool, scale: f32, letters: usize) -> Vec<Quad> {
+        let mut pen = Pen {
+            at: [100.0, 50.0],
+            scale,
+            x: 0.0,
+            color,
+            shadow,
+            before: None,
+            bars: Vec::new(),
+        };
+        let mut out = Vec::new();
+        for _ in 0..letters {
+            pen.put(
+                &Glyph::MISSING,
+                style,
+                Some((9, [0.0, 0.0, 1.0, 1.0])),
+                &mut out,
+            );
+        }
+        out.append(&mut pen.bars);
+        out
+    }
+
+    fn places(quads: &[Quad]) -> Vec<([f32; 4], u32)> {
+        quads.iter().map(|q| (q.rect, q.color)).collect()
+    }
+
+    const RED: u32 = 0xFFFF_0000;
+    const DARK_RED: u32 = 0xFF3F_0000;
+
+    #[test]
+    fn a_huds_glyphs_stand_over_their_shadows() {
+        let plain = Style::default();
+        let q = written(plain, RED, true, 1.0, 2);
+        assert_eq!(
+            places(&q),
+            [
+                ([101.0, 51.0, 106.0, 59.0], DARK_RED),
+                ([100.0, 50.0, 105.0, 58.0], RED),
+                ([107.0, 51.0, 112.0, 59.0], DARK_RED),
+                ([106.0, 50.0, 111.0, 58.0], RED),
+            ]
+        );
+        assert!(q.iter().all(|q| q.slant == [0.0; 2] && q.texture == 9));
+        // As much larger as the text is, all of it.
+        let q = written(plain, RED, false, 4.0, 2);
+        assert_eq!(
+            places(&q),
+            [
+                ([100.0, 50.0, 120.0, 82.0], RED),
+                ([124.0, 50.0, 144.0, 82.0], RED),
+            ]
+        );
+        // A style's colour takes the text's alpha; its own shadow shows either way.
+        let coloured = Style {
+            color: Some(0x00FF00),
+            shadow: Some(0x8000_00FF),
+            ..plain
+        };
+        let q = written(coloured, 0x8000_0000, false, 1.0, 1);
+        assert_eq!([q[0].color, q[1].color], [0x4000_00FF, 0x8000_FF00]);
+        let q = written(coloured, 0xFF00_0000, true, 1.0, 1);
+        assert_eq!(q[0].color, 0x8000_00FF);
+        let none = Style {
+            shadow: Some(0),
+            ..plain
+        };
+        assert_eq!(written(none, RED, true, 1.0, 1).len(), 1);
+        // Less than a tenth is not seen.
+        assert_eq!(written(plain, 0x1AFF_FFFF, true, 1.0, 1).len(), 2);
+        assert!(written(plain, 0x19FF_FFFF, true, 1.0, 1).is_empty());
+    }
+
+    #[test]
+    fn a_huds_bold_glyphs_are_drawn_twice_and_slanted_ones_lean() {
+        let bold = Style {
+            bold: true,
+            italic: true,
+            ..Style::default()
+        };
+        let q = written(bold, RED, true, 2.0, 2);
+        assert_eq!(q.len(), 8);
+        let near = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-4);
+        // Both shadows, then both copies, a tenth larger on every side.
+        assert!(near(q[0].rect, [101.8, 51.8, 112.2, 68.2]), "{:?}", q[0]);
+        assert!(near(q[1].rect, [103.8, 51.8, 114.2, 68.2]));
+        assert!(near(q[2].rect, [99.8, 49.8, 110.2, 66.2]));
+        assert!(near(q[3].rect, [101.8, 49.8, 112.2, 66.2]));
+        // The next is seven on: bold is one wider.
+        assert!(near(q[6].rect, [113.8, 49.8, 124.2, 66.2]));
+        let colours: Vec<u32> = q[..4].iter().map(|q| q.color).collect();
+        assert_eq!(colours, [DARK_RED, DARK_RED, RED, RED]);
+        // One to the right at the top, as far to the left at the bottom: twice as large.
+        assert!(q.iter().all(|q| q.slant == [2.0, -2.0]));
+    }
+
+    #[test]
+    fn a_huds_lines_lie_over_all_that_was_written() {
+        let lined = Style {
+            underlined: true,
+            strikethrough: true,
+            ..Style::default()
+        };
+        let q = written(lined, RED, true, 1.0, 2);
+        assert_eq!(q.len(), 4 + 8);
+        assert!(q[4..].iter().all(|q| q.texture == NO_TEXTURE));
+        // The first begins a little before its glyph; each over its shadow.
+        assert_eq!(
+            places(&q[4..8]),
+            [
+                ([100.0, 54.5, 107.0, 55.5], DARK_RED),
+                ([99.0, 53.5, 106.0, 54.5], RED),
+                ([100.0, 59.0, 107.0, 60.0], DARK_RED),
+                ([99.0, 58.0, 106.0, 59.0], RED),
+            ]
+        );
+        assert_eq!(q[9].rect, [106.0, 53.5, 112.0, 54.5]);
+    }
+
+    #[test]
+    fn faces_are_cut_out_of_skins() {
+        let face = |hat, flipped| HudFace {
+            skin: Arc::new(SkinSource::Player {
+                id: 0,
+                textures: None,
+            }),
+            x: 10,
+            y: 20,
+            hat,
+            flipped,
+            at: 0,
+        };
+        let q: Vec<Quad> = face_quads(&face(true, false), 4).collect();
+        assert_eq!(q.len(), 2);
+        assert!(
+            q.iter()
+                .all(|q| q.rect == [10.0, 20.0, 18.0, 28.0] && q.texture == 4)
+        );
+        assert_eq!(q[0].uv, [0.125, 0.125, 0.25, 0.25]);
+        assert_eq!(q[1].uv, [0.625, 0.125, 0.75, 0.25]);
+        let q: Vec<Quad> = face_quads(&face(false, true), 4).collect();
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].uv, [0.125, 0.25, 0.25, 0.125]);
+    }
+
+    #[test]
+    fn texts_and_faces_are_drawn_between_the_huds_quads() {
+        let mut layout = HudLayout::new();
+        for x in 0..3 {
+            layout.over.fill(x, 0, x + 1, 1, 0xFF00_0000);
+        }
+        let face = |at| HudFace {
+            skin: Arc::new(SkinSource::Player {
+                id: 0,
+                textures: None,
+            }),
+            x: 0,
+            y: 0,
+            hat: false,
+            flipped: false,
+            at,
+        };
+        layout.faces = vec![face(0), face(2), face(3)];
+        let mut out = Vec::new();
+        let mut at = Vec::new();
+        weave(&layout, &mut out, |piece, out| {
+            assert!(matches!(piece, Woven::Face(_)));
+            at.push(out.len());
+        });
+        assert_eq!((at, out.len()), (vec![0, 2, 3], 3));
+        // Nothing between them: the quads alone.
+        layout.faces.clear();
+        out.clear();
+        weave(&layout, &mut out, |_, _| panic!());
+        assert_eq!(out.len(), 3);
+    }
 
     #[test]
     fn a_texts_shadow_is_a_quarter_as_bright() {

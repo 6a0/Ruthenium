@@ -817,6 +817,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                     ruthenium_data::v26_3::registries::DataComponentType::PotionContents.id()
                         as i32,
                     ruthenium_protocol::item::Component::PotionContents {
+                        custom_name: None,
                         potion: Some(potion.id() as i32),
                         custom_color: None,
                     },
@@ -853,8 +854,8 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             &[play::PlayerInfoEntry {
                 uuid,
                 name: Some(name.clone()),
-                properties: Vec::new(),
                 game_mode: Some(0),
+                ..Default::default()
             }],
         );
     }

@@ -1,5 +1,6 @@
-//! What is written over an entity's head: its name as its team shows it, and below it the
-//! score of the objective that is shown there (`Scoreboard`, as far as that goes).
+//! The scoreboard (`Scoreboard`): what is written over an entity's head (its name as its
+//! team shows it, and below it the score of the objective that is shown there), the
+//! sidebar, and the scores in the player list.
 //!
 //! Texts stay components in their NBT form: what draws them has the language.
 
@@ -8,6 +9,8 @@ use std::sync::Arc;
 
 use ruthenium_protocol::nbt::{Compound, Tag};
 use ruthenium_protocol::packets::play::{self, NumberFormat};
+
+use crate::entity::Teams;
 
 /// The names of the sixteen colours, by `ChatFormatting` ordinal.
 const COLOURS: [&str; 16] = [
@@ -62,13 +65,75 @@ pub(crate) fn team_name(prefix: &Tag, name: Tag, suffix: &Tag, colour: Option<i3
 #[derive(Debug, Clone, PartialEq)]
 struct Objective {
     display_name: Tag,
+    /// The player list shows it as hearts.
+    hearts: bool,
     format: Option<NumberFormat>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct Score {
     value: i32,
+    /// What its owner is called.
+    display: Option<Tag>,
     format: Option<NumberFormat>,
+}
+
+/// A score as it is written: as it says itself, else as its objective says, else in
+/// `colour`.
+fn written(value: i32, formats: [Option<&NumberFormat>; 2], colour: Option<&str>) -> Tag {
+    let number = || Tag::String(value.to_string());
+    let styled = |mut style: Compound| {
+        style.put("text", number());
+        Tag::Compound(style)
+    };
+    let [own, objective] = formats;
+    match own.or(objective) {
+        Some(NumberFormat::Blank) => Tag::String(String::new()),
+        Some(NumberFormat::Fixed(text)) => text.clone(),
+        Some(NumberFormat::Styled(Tag::Compound(style))) => styled(style.clone()),
+        // (A style that is no compound styles nothing.)
+        Some(NumberFormat::Styled(_)) => number(),
+        None => match colour {
+            Some(colour) => {
+                let mut style = Compound::new();
+                style.put("color", Tag::String(colour.to_owned()));
+                styled(style)
+            }
+            None => number(),
+        },
+    }
+}
+
+/// Lines of the sidebar at most.
+const SIDEBAR_LINES: usize = 15;
+
+/// What the sidebar shows (`Hud.displayScoreboardSidebar`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sidebar {
+    pub title: Arc<Tag>,
+    /// Each line's name and score, from the top.
+    pub lines: Vec<(Arc<Tag>, Arc<Tag>)>,
+}
+
+/// `String.CASE_INSENSITIVE_ORDER`.
+pub(crate) fn ignoring_case(a: &str, b: &str) -> std::cmp::Ordering {
+    let folded = |s: &str| -> Vec<u32> {
+        s.chars()
+            .map(|c| {
+                let one = |mut i: std::char::ToUppercase| match (i.next(), i.next()) {
+                    (Some(u), None) => u,
+                    _ => c,
+                };
+                let upper = one(c.to_uppercase());
+                let mut lower = upper.to_lowercase();
+                match (lower.next(), lower.next()) {
+                    (Some(l), None) => l as u32,
+                    _ => upper as u32,
+                }
+            })
+            .collect()
+    };
+    folded(a).cmp(&folded(b))
 }
 
 /// The objectives and scores the server has told of.
@@ -77,8 +142,8 @@ pub struct Scoreboard {
     objectives: HashMap<String, Objective>,
     /// By owner, then by objective.
     scores: HashMap<String, HashMap<String, Score>>,
-    /// The objective shown below names.
-    below_name: Option<String>,
+    /// The objective each `DisplaySlot` shows.
+    displayed: HashMap<i32, String>,
     rev: u64,
 }
 
@@ -94,11 +159,13 @@ impl Scoreboard {
         name: &str,
         method: u8,
         display_name: Option<Tag>,
+        hearts: bool,
         format: Option<NumberFormat>,
     ) {
         self.rev += 1;
         let objective = display_name.map(|display_name| Objective {
             display_name,
+            hearts,
             format,
         });
         match (method, objective) {
@@ -108,9 +175,7 @@ impl Scoreboard {
             }
             (1, _) => {
                 if self.objectives.remove(name).is_some() {
-                    if self.below_name.as_deref() == Some(name) {
-                        self.below_name = None;
-                    }
+                    self.displayed.retain(|_, o| o != name);
                     for scores in self.scores.values_mut() {
                         scores.remove(name);
                     }
@@ -125,15 +190,22 @@ impl Scoreboard {
         }
     }
 
-    /// `handleSetDisplayObjective`: only the slot below names is kept.
+    /// `handleSetDisplayObjective`.
     pub fn set_display(&mut self, slot: i32, objective: &str) {
-        if slot == play::DISPLAY_SLOT_BELOW_NAME {
-            self.rev += 1;
-            self.below_name = self
-                .objectives
-                .contains_key(objective)
-                .then(|| objective.to_owned());
+        self.rev += 1;
+        // (Unknown slots read as the first.)
+        let slot = if (0..19).contains(&slot) { slot } else { 0 };
+        if self.objectives.contains_key(objective) {
+            self.displayed.insert(slot, objective.to_owned());
+        } else {
+            self.displayed.remove(&slot);
         }
+    }
+
+    /// The objective a slot shows, and its name.
+    fn shown(&self, slot: i32) -> Option<(&str, &Objective)> {
+        let name = self.displayed.get(&slot)?;
+        Some((name, self.objectives.get(name)?))
     }
 
     /// `handleSetScore`.
@@ -142,15 +214,76 @@ impl Scoreboard {
         owner: &str,
         objective: &str,
         value: i32,
+        display: Option<Tag>,
         format: Option<NumberFormat>,
     ) {
         if self.objectives.contains_key(objective) {
             self.rev += 1;
+            let score = Score {
+                value,
+                display,
+                format,
+            };
             self.scores
                 .entry(owner.to_owned())
                 .or_default()
-                .insert(objective.to_owned(), Score { value, format });
+                .insert(objective.to_owned(), score);
         }
+    }
+
+    /// The sidebar as the player `owner` sees it (`extractScoreboardSidebar`): its team's
+    /// colour's own, else the one for all.
+    pub fn sidebar(&self, owner: &str, teams: &Teams) -> Option<Sidebar> {
+        let own = teams
+            .team_of(owner)
+            .and_then(|t| t.colour)
+            .and_then(|colour| self.shown(play::DISPLAY_SLOT_TEAM + colour));
+        let (name, objective) = own.or_else(|| self.shown(play::DISPLAY_SLOT_SIDEBAR))?;
+        let mut scores: Vec<(&str, &Score)> = self
+            .scores
+            .iter()
+            .filter(|(owner, _)| !owner.starts_with('#'))
+            .filter_map(|(owner, scores)| Some((owner.as_str(), scores.get(name)?)))
+            .collect();
+        scores.sort_by(|(a, x), (b, y)| {
+            y.value
+                .cmp(&x.value)
+                .then_with(|| ignoring_case(a, b))
+                // (Which of two that differ in case alone comes first is not said: one
+                // and the same every time.)
+                .then_with(|| a.cmp(b))
+        });
+        scores.truncate(SIDEBAR_LINES);
+        let lines = scores
+            .into_iter()
+            .map(|(owner, score)| {
+                let name = score
+                    .display
+                    .clone()
+                    .unwrap_or_else(|| Tag::String(owner.to_owned()));
+                let name = teams.decorated(owner, name);
+                let formats = [score.format.as_ref(), objective.format.as_ref()];
+                let value = written(score.value, formats, Some("red"));
+                (Arc::new(name), Arc::new(value))
+            })
+            .collect();
+        Some(Sidebar {
+            title: Arc::new(objective.display_name.clone()),
+            lines,
+        })
+    }
+
+    /// Whether the player list shows scores, and as hearts.
+    pub fn list_hearts(&self) -> Option<bool> {
+        Some(self.shown(play::DISPLAY_SLOT_LIST)?.1.hearts)
+    }
+
+    /// The score of `owner` in the player list: its value, and how it is written.
+    pub fn list_score(&self, owner: &str) -> Option<(i32, Tag)> {
+        let (name, objective) = self.shown(play::DISPLAY_SLOT_LIST)?;
+        let score = self.scores.get(owner)?.get(name)?;
+        let formats = [score.format.as_ref(), objective.format.as_ref()];
+        Some((score.value, written(score.value, formats, Some("yellow"))))
     }
 
     /// `handleResetScore`: one of an owner's scores, or all of them.
@@ -174,22 +307,10 @@ impl Scoreboard {
     /// What stands below the name of `owner` (`Entity.belowNameDisplay`): its score as the
     /// objective writes it, a space, and the objective's name.
     pub fn below_name(&self, owner: &str) -> Option<Tag> {
-        let name = self.below_name.as_ref()?;
-        let objective = self.objectives.get(name)?;
+        let (name, objective) = self.shown(play::DISPLAY_SLOT_BELOW_NAME)?;
         let score = self.scores.get(owner)?.get(name)?;
-        let number = || Tag::String(score.value.to_string());
-        let value = match score.format.as_ref().or(objective.format.as_ref()) {
-            None => number(),
-            Some(NumberFormat::Blank) => Tag::String(String::new()),
-            Some(NumberFormat::Fixed(text)) => text.clone(),
-            Some(NumberFormat::Styled(Tag::Compound(style))) => {
-                let mut c = style.clone();
-                c.put("text", number());
-                Tag::Compound(c)
-            }
-            // (A style that is no compound styles nothing.)
-            Some(NumberFormat::Styled(_)) => number(),
-        };
+        let formats = [score.format.as_ref(), objective.format.as_ref()];
+        let value = written(score.value, formats, None);
         // The first is the parent of the rest: an empty text, which styles nothing.
         Some(Tag::List(vec![
             Tag::String(String::new()),
@@ -262,12 +383,12 @@ mod tests {
     fn a_score_is_shown_below_a_name_as_its_objective_says() {
         let mut s = Scoreboard::default();
         // Nothing without the objective, the slot and a score.
-        s.set_score("Kai", "hp", 20, None);
+        s.set_score("Kai", "hp", 20, None, None);
         assert_eq!(s.below_name("Kai"), None);
-        s.set_objective("hp", 0, Some(text("Health")), None);
+        s.set_objective("hp", 0, Some(text("Health")), false, None);
         s.set_display(play::DISPLAY_SLOT_BELOW_NAME, "hp");
         assert_eq!(s.below_name("Kai"), None);
-        s.set_score("Kai", "hp", 20, None);
+        s.set_score("Kai", "hp", 20, None, None);
         let shown = |s: &Scoreboard| match s.below_name("Kai") {
             Some(Tag::List(items)) => items,
             other => panic!("{other:?}"),
@@ -281,6 +402,7 @@ mod tests {
             "hp",
             2,
             Some(text("HP")),
+            false,
             Some(NumberFormat::Styled(Tag::Compound(red))),
         );
         let items = shown(&s);
@@ -290,9 +412,15 @@ mod tests {
             (Some("20"), Some("red"))
         );
         assert_eq!(items[3], text("HP"));
-        s.set_score("Kai", "hp", 7, Some(NumberFormat::Fixed(text("seven"))));
+        s.set_score(
+            "Kai",
+            "hp",
+            7,
+            None,
+            Some(NumberFormat::Fixed(text("seven"))),
+        );
         assert_eq!(shown(&s)[1], text("seven"));
-        s.set_score("Kai", "hp", 7, Some(NumberFormat::Blank));
+        s.set_score("Kai", "hp", 7, None, Some(NumberFormat::Blank));
         assert_eq!(shown(&s)[1], text(""));
         // Another slot shows nothing here; a slot given no objective shows none.
         s.set_display(1, "");
@@ -305,31 +433,142 @@ mod tests {
     fn scores_go_with_their_owner_or_their_objective() {
         let mut s = Scoreboard::default();
         for name in ["hp", "kills"] {
-            s.set_objective(name, 0, Some(text(name)), None);
-            s.set_score("Kai", name, 1, None);
+            s.set_objective(name, 0, Some(text(name)), false, None);
+            s.set_score("Kai", name, 1, None, None);
         }
         s.set_display(play::DISPLAY_SLOT_BELOW_NAME, "hp");
         // An objective that is there is not made again.
-        s.set_objective("hp", 0, Some(text("other")), None);
+        s.set_objective("hp", 0, Some(text("other")), false, None);
         assert!(matches!(s.below_name("Kai"), Some(Tag::List(i)) if i[3] == text("hp")));
         s.reset_score("Kai", Some("kills"));
         assert!(s.below_name("Kai").is_some());
         s.reset_score("Kai", Some("hp"));
         assert_eq!(s.below_name("Kai"), None);
-        s.set_score("Kai", "hp", 3, None);
+        s.set_score("Kai", "hp", 3, None, None);
         s.reset_score("Kai", None);
         assert_eq!(s.below_name("Kai"), None);
         // A removed objective takes its scores and its slot along.
-        s.set_score("Kai", "hp", 3, None);
-        s.set_objective("hp", 1, None, None);
-        s.set_objective("hp", 0, Some(text("hp")), None);
+        s.set_score("Kai", "hp", 3, None, None);
+        s.set_objective("hp", 1, None, false, None);
+        s.set_objective("hp", 0, Some(text("hp")), false, None);
         assert_eq!(s.below_name("Kai"), None);
         s.set_display(play::DISPLAY_SLOT_BELOW_NAME, "hp");
         assert_eq!(s.below_name("Kai"), None);
         // A change to one that is not there makes none.
-        s.set_objective("gone", 2, Some(text("gone")), None);
-        s.set_score("Kai", "gone", 3, None);
+        s.set_objective("gone", 2, Some(text("gone")), false, None);
+        s.set_score("Kai", "gone", 3, None, None);
         s.set_display(play::DISPLAY_SLOT_BELOW_NAME, "gone");
         assert_eq!(s.below_name("Kai"), None);
+    }
+
+    #[test]
+    fn the_sidebar_shows_the_highest_scores_first() {
+        let mut s = Scoreboard::default();
+        let mut teams = Teams::default();
+        let plain = |b: &Sidebar| -> Vec<(Tag, Tag)> {
+            b.lines
+                .iter()
+                .map(|(n, s)| ((**n).clone(), (**s).clone()))
+                .collect()
+        };
+        let red = |n: i32| {
+            let mut c = Compound::new();
+            c.put("color", text("red"));
+            c.put("text", text(&n.to_string()));
+            Tag::Compound(c)
+        };
+        assert_eq!(s.sidebar("Kai", &teams), None);
+        s.set_objective("o", 0, Some(text("Points")), false, None);
+        s.set_display(play::DISPLAY_SLOT_SIDEBAR, "o");
+        // Shown even without a score in it.
+        assert!(s.sidebar("Kai", &teams).unwrap().lines.is_empty());
+        for (owner, value) in [("bea", 2), ("Abe", 2), ("cy", 9), ("#hid", 50), ("dan", -1)] {
+            s.set_score(owner, "o", value, None, None);
+        }
+        let bar = s.sidebar("Kai", &teams).unwrap();
+        assert_eq!(*bar.title, text("Points"));
+        assert_eq!(
+            plain(&bar),
+            [
+                (text("cy"), red(9)),
+                (text("Abe"), red(2)),
+                (text("bea"), red(2)),
+                (text("dan"), red(-1)),
+            ]
+        );
+        // What an owner is called, how a number is written, and the owner's team.
+        s.set_score(
+            "cy",
+            "o",
+            9,
+            Some(text("Boss")),
+            Some(NumberFormat::Fixed(text("top"))),
+        );
+        let params = play::TeamParameters {
+            display_name: text(""),
+            prefix: text("["),
+            suffix: text("]"),
+            name_tag_visibility: 0,
+            collision_rule: 0,
+            color: Some(12),
+            options: 0,
+        };
+        teams.apply("t", 0, Some(&params), &["cy".to_owned(), "Kai".to_owned()]);
+        let bar = plain(&s.sidebar("Kai", &teams).unwrap());
+        let boss = team_name(&text("["), text("Boss"), &text("]"), Some(12));
+        assert_eq!(bar[0], (boss, text("top")));
+        // A team's colour has a sidebar of its own, which only its members see.
+        s.set_objective("own", 0, Some(text("Team")), false, None);
+        s.set_display(play::DISPLAY_SLOT_TEAM + 12, "own");
+        assert_eq!(*s.sidebar("Kai", &teams).unwrap().title, text("Team"));
+        assert_eq!(*s.sidebar("Efe", &teams).unwrap().title, text("Points"));
+        s.set_display(play::DISPLAY_SLOT_TEAM + 12, "");
+        assert_eq!(*s.sidebar("Kai", &teams).unwrap().title, text("Points"));
+        // Fifteen at most.
+        for i in 0..20 {
+            s.set_score(&format!("p{i:02}"), "o", 100 + i, None, None);
+        }
+        let bar = s.sidebar("Kai", &teams).unwrap();
+        assert_eq!(bar.lines.len(), 15);
+        assert_eq!(*bar.lines[14].0, text("p05"));
+        // Removed and made again, the objective is shown nowhere.
+        s.set_objective("o", 1, None, false, None);
+        s.set_objective("o", 0, Some(text("Points")), false, None);
+        assert_eq!(s.sidebar("Kai", &teams), None);
+    }
+
+    #[test]
+    fn the_player_list_shows_scores_as_numbers_or_hearts() {
+        let mut s = Scoreboard::default();
+        assert_eq!((s.list_hearts(), s.list_score("Kai")), (None, None));
+        s.set_objective("o", 0, Some(text("")), true, None);
+        s.set_display(play::DISPLAY_SLOT_LIST, "o");
+        assert_eq!((s.list_hearts(), s.list_score("Kai")), (Some(true), None));
+        s.set_objective("o", 2, Some(text("")), false, None);
+        s.set_score("Kai", "o", 7, None, None);
+        assert_eq!(s.list_hearts(), Some(false));
+        let (value, shown) = s.list_score("Kai").unwrap();
+        let c = shown.as_compound().unwrap();
+        assert_eq!(
+            (value, c.string("text"), c.string("color")),
+            (7, Some("7"), Some("yellow"))
+        );
+        s.set_objective("o", 1, None, false, None);
+        assert_eq!(s.list_hearts(), None);
+        // A slot that is not known is the list's.
+        s.set_objective("o", 0, Some(text("")), true, None);
+        s.set_display(99, "o");
+        assert_eq!(s.list_hearts(), Some(true));
+    }
+
+    #[test]
+    fn names_are_ordered_as_java_does_ignoring_case() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(ignoring_case("abe", "ABE"), Equal);
+        assert_eq!(ignoring_case("Abe", "bea"), Less);
+        // Case is folded up and then down: an underscore comes before the letters.
+        assert_eq!(ignoring_case("_a", "Aa"), Less);
+        assert_eq!(ignoring_case("ab", "a"), Greater);
+        assert_eq!(ignoring_case("ß", "ẞ"), Equal);
     }
 }

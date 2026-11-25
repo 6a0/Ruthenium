@@ -146,6 +146,8 @@ With no command, opens the game window. Options:
   --crosshair <on|off>   whether the crosshair is drawn (on, the default)
   --vignette <on|off>    whether the frame's corners darken in the dark (on, the
                          default), as vanilla's Vignette
+  --player-list <on|off> whether the player list shows without its key held (off, the
+                         default)
   --hud <on|off>         whether the HUD is drawn over the world (on, the default);
                          off, for a picture to hold against another client's without
                          its HUD

@@ -42,7 +42,7 @@ use crate::gpu::Gpu;
 use crate::routes::{self, Checked, Route};
 use crate::server::{self, Server};
 
-const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--hand-picture] [--hud-picture] [--at <x,y,z[,yaw,pitch]>] [--setup <console command>]... [--time <ticks of the day>] [--keep-worlds]";
+const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--hand-picture] [--hud-picture] [--at <x,y,z[,yaw,pitch]>] [--setup <console command>]... [--tick <command>]... [--player-list] [--time <ticks of the day>] [--keep-worlds]";
 /// The view and simulation distance of the server and the render distance of the
 /// clients, as in the integrated-server scenes.
 const VIEW_DISTANCE: i32 = 12;
@@ -99,6 +99,10 @@ struct Options {
     /// Pictures of the HUD: the route begins in survival mode, on the ground, and vanilla
     /// keeps its HUD.
     hud: bool,
+    /// Both clients show the player list.
+    player_list: bool,
+    /// Commands a data pack runs every tick: what would fade is always new.
+    tick: Vec<String>,
     /// The time of day the scenes are set to, in ticks of the day (noon unless said
     /// otherwise: the baselines').
     time: u32,
@@ -141,6 +145,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         bare: false,
         hand: false,
         hud: false,
+        player_list: false,
+        tick: Vec::new(),
         time: 6000,
         at: None,
         setup: Vec::new(),
@@ -165,6 +171,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
                 o.screenshot = true;
                 o.hud = true;
             }
+            "--player-list" => o.player_list = true,
             "--keep-worlds" => o.keep_worlds = true,
             "--any-drawable" => o.any_drawable = true,
             _ => {
@@ -237,6 +244,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
                         o.at = Some(([n[0], n[1], n[2]], yaw, pitch));
                     }
                     "--setup" => o.setup.push(value.clone()),
+                    "--tick" => o.tick.push(value.clone()),
                     "--width" => o.width = num(value)? as u32,
                     "--height" => o.height = num(value)? as u32,
                     "--expect" => {
@@ -345,6 +353,28 @@ fn world_id(dir: &Path) -> Result<String, String> {
     Ok(hash.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Writes a data pack into a world that runs `commands` every tick.
+fn write_tick_pack(world: &Path, commands: &[String]) -> Result<(), String> {
+    let pack = world.join("datapacks/bench");
+    let format = json!({"pack": {"description": "bench", "min_format": 121, "max_format": 121}});
+    let tag = json!({"values": ["bench:tick"]});
+    for (path, text) in [
+        ("pack.mcmeta", format.to_string()),
+        ("data/minecraft/tags/function/tick.json", tag.to_string()),
+        (
+            "data/bench/function/tick.mcfunction",
+            commands.join("\n") + "\n",
+        ),
+    ] {
+        let path = pack.join(path);
+        path.parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, text))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// The controller's world setup, before anyone joins: what the integrated-server
 /// scenes fix, a spawn at the scene's, the team that switches pushing off, and no
 /// random ticks. With them, plants grow while a route runs: in the first recorded
@@ -435,6 +465,9 @@ impl Harness<'_> {
         let world = server_dir.join("world");
         bench::copy_dir(&self.template, &world)?;
         let id = world_id(&world)?;
+        if !self.o.tick.is_empty() {
+            write_tick_pack(&world, &self.o.tick)?;
+        }
         let route_file = dir.join("route.json");
         std::fs::write(&route_file, route.json().to_string())
             .map_err(|e| format!("{}: {e}", route_file.display()))?;
@@ -667,6 +700,9 @@ impl Harness<'_> {
         }
         if self.o.bare {
             command.args(["--hand", "off", "--block-outline", "off"]);
+        }
+        if self.o.player_list {
+            command.args(["--player-list", "on"]);
         }
         command.args(options);
         if self.o.screenshot {
@@ -1093,6 +1129,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         bare: o.bare,
         hand: o.hand,
         hud: o.hud,
+        player_list: o.player_list,
         render_distance: VIEW_DISTANCE as u32,
         gpu: o.gpu,
     };

@@ -987,9 +987,225 @@ pub mod play {
         })
     }
 
+    /// `DisplaySlot.LIST` and `SIDEBAR`; a team colour's own sidebar is 3 plus the
+    /// colour.
+    pub const DISPLAY_SLOT_LIST: i32 = 0;
+    pub const DISPLAY_SLOT_SIDEBAR: i32 = 1;
+    pub const DISPLAY_SLOT_TEAM: i32 = 3;
+
+    /// Bytes of a chat message's signature.
+    pub const SIGNATURE_BYTES: usize = 256;
+
+    /// A chat message's signature, whole or as its place in the signatures both sides
+    /// keep (`MessageSignature.Packed`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PackedSignature {
+        Cached(usize),
+        Full(Box<[u8; SIGNATURE_BYTES]>),
+    }
+
+    fn signature(r: &mut Reader<'_>) -> Result<Box<[u8; SIGNATURE_BYTES]>, WireError> {
+        let bytes: [u8; SIGNATURE_BYTES] = r
+            .bytes(SIGNATURE_BYTES)?
+            .try_into()
+            .map_err(|_| WireError::Invalid("signature"))?;
+        Ok(Box::new(bytes))
+    }
+
+    fn packed_signature(r: &mut Reader<'_>) -> Result<PackedSignature, WireError> {
+        Ok(match r.varint()? {
+            0 => PackedSignature::Full(signature(r)?),
+            n => PackedSignature::Cached(
+                usize::try_from(n - 1).map_err(|_| WireError::Invalid("signature id"))?,
+            ),
+        })
+    }
+
+    /// How a kind of chat message is written (`ChatTypeDecoration`): a translation, what
+    /// it is filled in with, and its style (a style's fields in a compound).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ChatDecoration {
+        pub translation_key: String,
+        pub parameters: Vec<ChatParameter>,
+        pub style: Option<Tag>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ChatParameter {
+        Sender,
+        Target,
+        Content,
+    }
+
+    fn chat_decoration(r: &mut Reader<'_>) -> Result<ChatDecoration, WireError> {
+        let translation_key = r.string(MAX_STRING)?.to_owned();
+        let n = r.count(usize::MAX)?;
+        let mut parameters = Vec::with_capacity(n.min(16));
+        for _ in 0..n {
+            parameters.push(match r.varint()? {
+                1 => ChatParameter::Target,
+                2 => ChatParameter::Content,
+                // (Unknown ones read as the first.)
+                _ => ChatParameter::Sender,
+            });
+        }
+        Ok(ChatDecoration {
+            translation_key,
+            parameters,
+            style: r.nbt()?,
+        })
+    }
+
+    /// A chat message's kind and who it is from and to (`ChatType.Bound`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct BoundChatType {
+        pub kind: ChatTypeRef,
+        pub name: Tag,
+        pub target: Option<Tag>,
+    }
+
+    /// A `chat_type` of the registry, by its id, or one written out.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum ChatTypeRef {
+        Id(usize),
+        Direct(Box<ChatDecoration>),
+    }
+
+    fn bound_chat_type(r: &mut Reader<'_>) -> Result<BoundChatType, WireError> {
+        let kind = match r.varint()? {
+            0 => {
+                let chat = chat_decoration(r)?;
+                // How it is read out.
+                chat_decoration(r)?;
+                ChatTypeRef::Direct(Box::new(chat))
+            }
+            n => ChatTypeRef::Id(
+                usize::try_from(n - 1).map_err(|_| WireError::Invalid("chat type"))?,
+            ),
+        };
+        Ok(BoundChatType {
+            kind,
+            name: text(r)?,
+            target: optional(r, text)?,
+        })
+    }
+
+    /// Which characters of a chat message a server's filter hides (`FilterMask`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum FilterMask {
+        PassThrough,
+        FullyFiltered,
+        /// Bit `i % 8` of byte `i / 8` is the message's UTF-16 unit `i`.
+        Partly(Vec<u8>),
+    }
+
+    /// A player's chat message (`ClientboundPlayerChatPacket`).
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct PlayerChat {
+        /// How many of them the server had sent before this one.
+        pub global_index: i32,
+        pub sender: u128,
+        pub signature: Option<Box<[u8; SIGNATURE_BYTES]>>,
+        /// What the player wrote, and when, in milliseconds of the epoch.
+        pub content: String,
+        pub time: i64,
+        /// The messages the sender had last seen.
+        pub last_seen: Vec<PackedSignature>,
+        /// What the server shows in its place.
+        pub unsigned_content: Option<Tag>,
+        pub filter: FilterMask,
+        pub kind: BoundChatType,
+    }
+
+    fn player_chat(r: &mut Reader<'_>) -> Result<PlayerChat, WireError> {
+        let global_index = r.varint()?;
+        let sender = r.uuid()?;
+        // How many messages of the sender's session came before.
+        r.varint()?;
+        let signature = optional(r, signature)?;
+        let content = r.string(256)?.to_owned();
+        let time = r.i64()?;
+        // The salt.
+        r.i64()?;
+        let n = r.count(20)?;
+        let mut last_seen = Vec::with_capacity(n);
+        for _ in 0..n {
+            last_seen.push(packed_signature(r)?);
+        }
+        let unsigned_content = optional(r, text)?;
+        let filter = match r.varint()? {
+            1 => FilterMask::FullyFiltered,
+            2 => FilterMask::Partly(r.byte_array(1 << 16)?.to_vec()),
+            _ => FilterMask::PassThrough,
+        };
+        Ok(PlayerChat {
+            global_index,
+            sender,
+            signature,
+            content,
+            time,
+            last_seen,
+            unsigned_content,
+            filter,
+            kind: bound_chat_type(r)?,
+        })
+    }
+
+    /// What a `ClientboundBossEventPacket` does to the bar it names. Colours are
+    /// `BossBarColor` ordinals (pink, blue, red, green, yellow, purple, white), overlays
+    /// `BossBarOverlay`'s (none, then 6, 10, 12 and 20 notches).
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum BossEvent {
+        Add {
+            name: Tag,
+            progress: f32,
+            color: u8,
+            overlay: u8,
+            /// Bit 0 darkens the screen, 1 plays the boss music, 2 makes fog.
+            flags: u8,
+        },
+        Remove,
+        Progress(f32),
+        Name(Tag),
+        Style {
+            color: u8,
+            overlay: u8,
+        },
+        Properties {
+            flags: u8,
+        },
+    }
+
+    fn boss_event(r: &mut Reader<'_>) -> Result<BossEvent, WireError> {
+        fn ordinal(r: &mut Reader<'_>, count: u8) -> Result<u8, WireError> {
+            u8::try_from(r.varint()?)
+                .ok()
+                .filter(|v| *v < count)
+                .ok_or(WireError::Invalid("boss bar style"))
+        }
+        Ok(match r.varint()? {
+            0 => BossEvent::Add {
+                name: text(r)?,
+                progress: r.f32()?,
+                color: ordinal(r, 7)?,
+                overlay: ordinal(r, 5)?,
+                flags: r.u8()?,
+            },
+            1 => BossEvent::Remove,
+            2 => BossEvent::Progress(r.f32()?),
+            3 => BossEvent::Name(text(r)?),
+            4 => BossEvent::Style {
+                color: ordinal(r, 7)?,
+                overlay: ordinal(r, 5)?,
+            },
+            5 => BossEvent::Properties { flags: r.u8()? },
+            _ => return Err(WireError::Invalid("boss event")),
+        })
+    }
+
     /// One player's part of a `ClientboundPlayerInfoUpdatePacket`: what the actions
     /// carry that the client keeps so far.
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Debug, Clone, Default, PartialEq)]
     pub struct PlayerInfoEntry {
         pub uuid: u128,
         /// With `ADD_PLAYER`: the profile's name and properties.
@@ -997,6 +1213,13 @@ pub mod play {
         pub properties: Vec<Property>,
         /// With `UPDATE_GAME_MODE`.
         pub game_mode: Option<i32>,
+        /// With `UPDATE_LISTED`, `UPDATE_LATENCY`, `UPDATE_DISPLAY_NAME` (which may be
+        /// taken away), `UPDATE_LIST_ORDER` and `UPDATE_HAT`.
+        pub listed: Option<bool>,
+        pub latency: Option<i32>,
+        pub display_name: Option<Option<Tag>>,
+        pub list_order: Option<i32>,
+        pub show_hat: Option<bool>,
     }
 
     /// `ClientboundPlayerInfoUpdatePacket.Action` bits.
@@ -1012,9 +1235,7 @@ pub mod play {
     fn read_player_info(r: &mut Reader<'_>, actions: u8) -> Result<PlayerInfoEntry, WireError> {
         let mut e = PlayerInfoEntry {
             uuid: r.uuid()?,
-            name: None,
-            properties: Vec::new(),
-            game_mode: None,
+            ..PlayerInfoEntry::default()
         };
         let has = |bit: u8| actions & 1 << bit != 0;
         if has(0) {
@@ -1035,19 +1256,19 @@ pub mod play {
             e.game_mode = Some(r.varint()?);
         }
         if has(3) {
-            r.bool()?;
+            e.listed = Some(r.bool()?);
         }
         if has(4) {
-            r.varint()?;
+            e.latency = Some(r.varint()?);
         }
         if has(5) {
-            optional(r, |r| text(r).map(|_| ()))?;
+            e.display_name = Some(optional(r, text)?);
         }
         if has(6) {
-            r.varint()?;
+            e.list_order = Some(r.varint()?);
         }
         if has(7) {
-            r.bool()?;
+            e.show_hat = Some(r.bool()?);
         }
         Ok(e)
     }
@@ -1297,6 +1518,8 @@ pub mod play {
             name: String,
             method: u8,
             display_name: Option<Tag>,
+            /// The player list shows it as hearts.
+            hearts: bool,
             number_format: Option<NumberFormat>,
         },
         /// `ClientboundSetDisplayObjectivePacket`: the objective a `DisplaySlot` shows;
@@ -1487,6 +1710,56 @@ pub mod play {
         /// `ClientboundSetBorderWarningDistancePacket`.
         SetBorderWarningDistance {
             warning_blocks: i32,
+        },
+        /// `ClientboundSystemChatPacket`: a message of the server's, for the chat or (an
+        /// overlay) over the hotbar.
+        SystemChat {
+            content: Tag,
+            overlay: bool,
+        },
+        PlayerChat(Box<PlayerChat>),
+        /// `ClientboundDisguisedChatPacket`: a message shown as a player's that no player
+        /// wrote.
+        DisguisedChat {
+            message: Tag,
+            kind: BoundChatType,
+        },
+        DeleteChat {
+            signature: PackedSignature,
+        },
+        SetActionBarText {
+            text: Tag,
+        },
+        SetTitleText {
+            text: Tag,
+        },
+        SetSubtitleText {
+            text: Tag,
+        },
+        /// `ClientboundSetTitlesAnimationPacket`, in ticks; below 0 leaves one as it is.
+        SetTitlesAnimation {
+            fade_in: i32,
+            stay: i32,
+            fade_out: i32,
+        },
+        ClearTitles {
+            reset_times: bool,
+        },
+        BossEvent {
+            id: u128,
+            event: BossEvent,
+        },
+        /// `ClientboundTabListPacket`: what stands over and under the player list.
+        TabList {
+            header: Tag,
+            footer: Tag,
+        },
+        /// `ClientboundLevelEventPacket`.
+        LevelEvent {
+            event: i32,
+            pos: [i32; 3],
+            data: i32,
+            global: bool,
         },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
@@ -1845,18 +2118,18 @@ pub mod play {
                 C::SetObjective => {
                     let name = r.string(MAX_STRING)?.to_owned();
                     let method = r.u8()?;
-                    let (display_name, number_format) = if method == 0 || method == 2 {
+                    let (display_name, hearts, number_format) = if method == 0 || method == 2 {
                         let display_name = text(&mut r)?;
-                        // How the list shows it: whole numbers or hearts.
-                        r.varint()?;
-                        (Some(display_name), number_format(&mut r)?)
+                        let hearts = r.varint()? == 1;
+                        (Some(display_name), hearts, number_format(&mut r)?)
                     } else {
-                        (None, None)
+                        (None, false, None)
                     };
                     Clientbound::SetObjective {
                         name,
                         method,
                         display_name,
+                        hearts,
                         number_format,
                     }
                 }
@@ -2048,6 +2321,49 @@ pub mod play {
                 C::SetBorderWarningDistance => Clientbound::SetBorderWarningDistance {
                     warning_blocks: r.varint()?,
                 },
+                C::SystemChat => Clientbound::SystemChat {
+                    content: text(&mut r)?,
+                    overlay: r.bool()?,
+                },
+                C::PlayerChat => Clientbound::PlayerChat(Box::new(player_chat(&mut r)?)),
+                C::DisguisedChat => Clientbound::DisguisedChat {
+                    message: text(&mut r)?,
+                    kind: bound_chat_type(&mut r)?,
+                },
+                C::DeleteChat => Clientbound::DeleteChat {
+                    signature: packed_signature(&mut r)?,
+                },
+                C::SetActionBarText => Clientbound::SetActionBarText {
+                    text: text(&mut r)?,
+                },
+                C::SetTitleText => Clientbound::SetTitleText {
+                    text: text(&mut r)?,
+                },
+                C::SetSubtitleText => Clientbound::SetSubtitleText {
+                    text: text(&mut r)?,
+                },
+                C::SetTitlesAnimation => Clientbound::SetTitlesAnimation {
+                    fade_in: r.i32()?,
+                    stay: r.i32()?,
+                    fade_out: r.i32()?,
+                },
+                C::ClearTitles => Clientbound::ClearTitles {
+                    reset_times: r.bool()?,
+                },
+                C::BossEvent => Clientbound::BossEvent {
+                    id: r.uuid()?,
+                    event: boss_event(&mut r)?,
+                },
+                C::TabList => Clientbound::TabList {
+                    header: text(&mut r)?,
+                    footer: text(&mut r)?,
+                },
+                C::LevelEvent => Clientbound::LevelEvent {
+                    event: r.i32()?,
+                    pos: unpack_block_pos(r.i64()?),
+                    data: r.i32()?,
+                    global: r.bool()?,
+                },
                 other => {
                     r.rest();
                     Clientbound::Other(other)
@@ -2094,6 +2410,14 @@ pub mod play {
 
     pub fn player_loaded() -> Vec<u8> {
         wire::packet(pl::Serverbound::PlayerLoaded.id(), |_| {})
+    }
+
+    /// How many signed chat messages were taken in since the last time
+    /// (`ServerboundChatAckPacket`).
+    pub fn chat_ack(offset: i32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ChatAck.id(), |o| {
+            wire::write_varint(o, offset);
+        })
     }
 
     /// `ServerboundClientCommandPacket.Action` ordinals.
@@ -2342,6 +2666,343 @@ mod tests {
             login::Clientbound::decode(2, &b),
             Err(WireError::TrailingBytes(1))
         );
+    }
+
+    fn nbt_text(o: &mut Vec<u8>, s: &str) -> Tag {
+        let tag = Tag::String(s.to_owned());
+        crate::nbt::write_network(o, &tag).unwrap();
+        tag
+    }
+
+    #[test]
+    fn play_reads_chat() {
+        use play::{ChatParameter, ChatTypeRef, Clientbound, FilterMask, PackedSignature};
+        let id = |k: pl::Clientbound| k.id();
+        let mut b = Vec::new();
+        let hello = nbt_text(&mut b, "hello");
+        b.push(1);
+        assert_eq!(
+            Clientbound::decode(id(pl::Clientbound::SystemChat), &b).unwrap(),
+            Clientbound::SystemChat {
+                content: hello.clone(),
+                overlay: true
+            }
+        );
+        // A player's, with everything there can be.
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 5);
+        wire::write_uuid(&mut b, 77);
+        wire::write_varint(&mut b, 2);
+        b.push(1);
+        b.extend([9; 256]);
+        wire::write_string(&mut b, "hi there");
+        wire::write_i64(&mut b, 1234);
+        wire::write_i64(&mut b, -1);
+        wire::write_varint(&mut b, 2);
+        wire::write_varint(&mut b, 4);
+        wire::write_varint(&mut b, 0);
+        b.extend([3; 256]);
+        b.push(1);
+        nbt_text(&mut b, "hi *****");
+        wire::write_varint(&mut b, 2);
+        wire::write_byte_array(&mut b, &[0b1110_0000]);
+        // The registry's first type, and a name without a target.
+        wire::write_varint(&mut b, 1);
+        let name = nbt_text(&mut b, "Kai");
+        b.push(0);
+        let Clientbound::PlayerChat(chat) =
+            Clientbound::decode(id(pl::Clientbound::PlayerChat), &b).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!((chat.global_index, chat.sender, chat.time), (5, 77, 1234));
+        assert_eq!(chat.signature, Some(Box::new([9; 256])));
+        assert_eq!(chat.content, "hi there");
+        assert_eq!(
+            chat.last_seen,
+            [
+                PackedSignature::Cached(3),
+                PackedSignature::Full(Box::new([3; 256]))
+            ]
+        );
+        assert_eq!(chat.unsigned_content, Some(Tag::String("hi *****".into())));
+        assert_eq!(chat.filter, FilterMask::Partly(vec![0b1110_0000]));
+        assert_eq!(chat.kind.kind, ChatTypeRef::Id(0));
+        assert_eq!((&chat.kind.name, &chat.kind.target), (&name, &None));
+        // A message no player wrote, of a kind that is written out, with a target.
+        let mut b = Vec::new();
+        nbt_text(&mut b, "hello");
+        wire::write_varint(&mut b, 0);
+        for key in ["chat.type.team.text", "chat.type.text.narrate"] {
+            wire::write_string(&mut b, key);
+            wire::write_varint(&mut b, 3);
+            for p in [1, 0, 2] {
+                wire::write_varint(&mut b, p);
+            }
+            crate::nbt::write_network(&mut b, &Tag::Compound(crate::nbt::Compound::new())).unwrap();
+        }
+        nbt_text(&mut b, "Kai");
+        b.push(1);
+        let team = nbt_text(&mut b, "Red");
+        let Clientbound::DisguisedChat { message, kind } =
+            Clientbound::decode(id(pl::Clientbound::DisguisedChat), &b).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!((message, kind.target), (hello, Some(team)));
+        let ChatTypeRef::Direct(d) = kind.kind else {
+            panic!()
+        };
+        assert_eq!(d.translation_key, "chat.type.team.text");
+        assert_eq!(
+            d.parameters,
+            [
+                ChatParameter::Target,
+                ChatParameter::Sender,
+                ChatParameter::Content
+            ]
+        );
+        let mut b = Vec::new();
+        wire::write_varint(&mut b, 128);
+        assert_eq!(
+            Clientbound::decode(id(pl::Clientbound::DeleteChat), &b).unwrap(),
+            Clientbound::DeleteChat {
+                signature: PackedSignature::Cached(127)
+            }
+        );
+        assert_eq!(body(&play::chat_ack(65)), (6, &[65][..]));
+    }
+
+    /// What the game's own codecs write.
+    #[test]
+    fn play_reads_what_the_game_writes_of_the_chat() {
+        use play::{ChatParameter, ChatTypeRef, Clientbound, FilterMask, PackedSignature};
+        fn bytes(hex: &str) -> Vec<u8> {
+            hex.as_bytes()
+                .chunks(2)
+                .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+                .collect()
+        }
+        let read =
+            |kind: pl::Clientbound, hex: &str| Clientbound::decode(kind.id(), &bytes(hex)).unwrap();
+        let (nines, sevens) = ("09".repeat(256), "07".repeat(256));
+        let hex = format!(
+            "ac0200000000000000010000000000000002040\
+             1{nines}0b68656c6c6f207468657265000000000012d687000000000000002a\
+             020600{sevens}010800026869\
+             02020202\
+             020800034b61690108000352\
+             6564"
+        );
+        let Clientbound::PlayerChat(chat) = read(pl::Clientbound::PlayerChat, &hex) else {
+            panic!()
+        };
+        assert_eq!((chat.global_index, chat.sender), (300, 1 << 64 | 2));
+        assert_eq!(chat.signature, Some(Box::new([9; 256])));
+        assert_eq!(
+            (chat.content.as_str(), chat.time),
+            ("hello there", 1_234_567)
+        );
+        assert_eq!(
+            chat.last_seen,
+            [
+                PackedSignature::Cached(5),
+                PackedSignature::Full(Box::new([7; 256]))
+            ]
+        );
+        assert_eq!(chat.unsigned_content, Some(Tag::String("hi".into())));
+        // The second and the tenth character.
+        assert_eq!(chat.filter, FilterMask::Partly(vec![2, 2]));
+        assert_eq!(chat.kind.kind, ChatTypeRef::Id(1));
+        assert_eq!(chat.kind.name, Tag::String("Kai".into()));
+        assert_eq!(chat.kind.target, Some(Tag::String("Red".into())));
+        let Clientbound::PlayerChat(chat) = read(
+            pl::Clientbound::PlayerChat,
+            "00000000000000000000000000000000030000017800000000000000050000000000000000\
+             0000010003782e790201020a0100066974616c696301000f636861742e747970652e656d6f\
+             74650200020a000800034b616900",
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            (chat.signature, chat.filter),
+            (None, FilterMask::FullyFiltered)
+        );
+        let ChatTypeRef::Direct(d) = chat.kind.kind else {
+            panic!()
+        };
+        assert_eq!(d.translation_key, "x.y");
+        assert_eq!(
+            d.parameters,
+            [ChatParameter::Target, ChatParameter::Content]
+        );
+        let style = d.style.unwrap();
+        assert_eq!(style.as_compound().unwrap().boolean("italic"), Some(true));
+        assert_eq!(
+            read(pl::Clientbound::DeleteChat, "12"),
+            Clientbound::DeleteChat {
+                signature: PackedSignature::Cached(17)
+            }
+        );
+        assert_eq!(
+            read(pl::Clientbound::SystemChat, "0800017301"),
+            Clientbound::SystemChat {
+                content: Tag::String("s".into()),
+                overlay: true
+            }
+        );
+        assert_eq!(
+            read(
+                pl::Clientbound::LevelEvent,
+                "000003f20000004000003ffe0000000701"
+            ),
+            Clientbound::LevelEvent {
+                event: 1010,
+                pos: [1, -2, 3],
+                data: 7,
+                global: true
+            }
+        );
+        assert_eq!(
+            read(pl::Clientbound::TabList, "080003746f70080000"),
+            Clientbound::TabList {
+                header: Tag::String("top".into()),
+                footer: Tag::String(String::new())
+            }
+        );
+        assert_eq!(
+            read(
+                pl::Clientbound::SetTitlesAnimation,
+                "00000005ffffffff00000014"
+            ),
+            Clientbound::SetTitlesAnimation {
+                fade_in: 5,
+                stay: -1,
+                fade_out: 20
+            }
+        );
+    }
+
+    #[test]
+    fn play_reads_titles_boss_bars_and_the_tab_list() {
+        use play::{BossEvent, Clientbound};
+        let mut b = Vec::new();
+        for v in [5, -1, 20] {
+            wire::write_i32(&mut b, v);
+        }
+        assert_eq!(
+            Clientbound::decode(pl::Clientbound::SetTitlesAnimation.id(), &b).unwrap(),
+            Clientbound::SetTitlesAnimation {
+                fade_in: 5,
+                stay: -1,
+                fade_out: 20
+            }
+        );
+        let boss = |write: &dyn Fn(&mut Vec<u8>)| {
+            let mut b = Vec::new();
+            wire::write_uuid(&mut b, 3);
+            write(&mut b);
+            match Clientbound::decode(pl::Clientbound::BossEvent.id(), &b) {
+                Ok(Clientbound::BossEvent { id: 3, event }) => Ok(event),
+                Ok(other) => panic!("{other:?}"),
+                Err(e) => Err(e),
+            }
+        };
+        assert_eq!(
+            boss(&|b| {
+                wire::write_varint(b, 0);
+                nbt_text(b, "Raid");
+                wire::write_f32(b, 0.5);
+                wire::write_varint(b, 2);
+                wire::write_varint(b, 4);
+                b.push(5);
+            }),
+            Ok(BossEvent::Add {
+                name: Tag::String("Raid".into()),
+                progress: 0.5,
+                color: 2,
+                overlay: 4,
+                flags: 5
+            })
+        );
+        assert_eq!(boss(&|b| b.push(1)), Ok(BossEvent::Remove));
+        assert_eq!(
+            boss(&|b| {
+                b.push(2);
+                wire::write_f32(b, 0.25);
+            }),
+            Ok(BossEvent::Progress(0.25))
+        );
+        assert_eq!(
+            boss(&|b| {
+                b.push(3);
+                nbt_text(b, "x");
+            }),
+            Ok(BossEvent::Name(Tag::String("x".into())))
+        );
+        assert_eq!(
+            boss(&|b| b.extend([4, 6, 1])),
+            Ok(BossEvent::Style {
+                color: 6,
+                overlay: 1
+            })
+        );
+        assert_eq!(
+            boss(&|b| b.extend([5, 3])),
+            Ok(BossEvent::Properties { flags: 3 })
+        );
+        assert!(boss(&|b| b.extend([4, 7, 0])).is_err());
+        assert!(boss(&|b| b.extend([4, 0, 5])).is_err());
+        let mut b = Vec::new();
+        let (header, footer) = (nbt_text(&mut b, "top"), nbt_text(&mut b, ""));
+        assert_eq!(
+            Clientbound::decode(pl::Clientbound::TabList.id(), &b).unwrap(),
+            Clientbound::TabList { header, footer }
+        );
+        // A level event: where, what with, and whether it is heard everywhere.
+        let mut b = Vec::new();
+        wire::write_i32(&mut b, 1010);
+        wire::write_i64(&mut b, 0);
+        wire::write_i32(&mut b, 4);
+        b.push(0);
+        assert_eq!(
+            Clientbound::decode(pl::Clientbound::LevelEvent.id(), &b).unwrap(),
+            Clientbound::LevelEvent {
+                event: 1010,
+                pos: [0; 3],
+                data: 4,
+                global: false
+            }
+        );
+    }
+
+    #[test]
+    fn play_reads_what_the_player_list_shows() {
+        let mut b = vec![0b1111_1000];
+        wire::write_varint(&mut b, 2);
+        for (uuid, named) in [(1, true), (2, false)] {
+            wire::write_uuid(&mut b, uuid);
+            wire::write_bool(&mut b, named);
+            wire::write_varint(&mut b, 250);
+            wire::write_bool(&mut b, named);
+            if named {
+                nbt_text(&mut b, "Boss");
+            }
+            wire::write_varint(&mut b, 7);
+            wire::write_bool(&mut b, !named);
+        }
+        let play::Clientbound::PlayerInfoUpdate { entries, .. } =
+            play::Clientbound::decode(pl::Clientbound::PlayerInfoUpdate.id(), &b).unwrap()
+        else {
+            panic!()
+        };
+        let e = &entries[0];
+        assert_eq!((e.listed, e.latency), (Some(true), Some(250)));
+        assert_eq!(e.display_name, Some(Some(Tag::String("Boss".into()))));
+        assert_eq!((e.list_order, e.show_hat), (Some(7), Some(false)));
+        let e = &entries[1];
+        assert_eq!((e.listed, &e.display_name), (Some(false), &Some(None)));
+        assert_eq!((e.name.as_ref(), e.game_mode), (None, None));
     }
 
     #[test]
@@ -2650,6 +3311,7 @@ mod tests {
                     name: "hp".into(),
                     method: 2,
                     display_name: Some(said("Health")),
+                    hearts: true,
                     number_format: Some(format),
                 }
             );
@@ -2664,6 +3326,7 @@ mod tests {
                 name: "hp".into(),
                 method: 1,
                 display_name: None,
+                hearts: false,
                 number_format: None,
             }
         );
@@ -2942,8 +3605,8 @@ mod tests {
                 entries: vec![play::PlayerInfoEntry {
                     uuid: 77,
                     name: Some("Alex".into()),
-                    properties: Vec::new(),
                     game_mode: Some(3),
+                    ..Default::default()
                 }],
             }
         );

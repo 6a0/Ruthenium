@@ -222,6 +222,7 @@ impl TableCheck {
                 uv: [0.25; 4],
                 color: 0xFFFF_FFFF,
                 texture: slot,
+                slant: [0.0; 2],
             });
             let own = self.colours[slot as usize];
             self.expected.push(match (textures.shows(slot), own) {

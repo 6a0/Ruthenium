@@ -13,6 +13,7 @@ use ruthenium_prepare::exporters::{ItemClassData, read_item_classes};
 use ruthenium_protocol::item::{
     BlockPredicate, Component, ComponentPatch, Holder, HolderSet, ItemStack, TrimPart,
 };
+use ruthenium_protocol::nbt::{Compound, Tag};
 
 use crate::transform::TransformerRef;
 
@@ -541,6 +542,54 @@ pub struct Components {
     pub banner_patterns: Option<BannerPatterns>,
     /// `profile`: whose head it is.
     pub profile: Option<Arc<ruthenium_protocol::profile::ResolvableProfile>>,
+    /// `getDescriptionId`: the translation key of the item's own name.
+    pub description: Option<Arc<str>>,
+    /// `custom_name` and `item_name`.
+    pub custom_name: Option<Arc<Tag>>,
+    pub item_name: Option<Arc<Tag>>,
+    /// `rarity`'s id: common, uncommon, rare or epic.
+    pub rarity: u8,
+    /// `lodestone_tracker`.
+    pub lodestone: bool,
+    /// `potion_contents`, and what they are called in a potion's name (`swiftness`).
+    pub potion_name: Option<Arc<str>>,
+    /// `written_book_content`'s title.
+    pub book_title: Option<Arc<str>>,
+}
+
+/// What the registered potion `id` is called in names (`Potion.name`): longer and
+/// stronger ones go by the plain one's.
+fn potion_name(id: i32) -> Option<&'static str> {
+    let name = ruthenium_data::v26_3::registries::Potion::from_id(u32::try_from(id).ok()?)?
+        .name()
+        .trim_start_matches("minecraft:");
+    Some(
+        name.strip_prefix("long_")
+            .or_else(|| name.strip_prefix("strong_"))
+            .unwrap_or(name),
+    )
+}
+
+/// A component read from a report, as the NBT a packet would bring it in.
+fn json_to_tag(v: &serde_json::Value) -> Tag {
+    use serde_json::Value;
+    match v {
+        Value::Null => Tag::String(String::new()),
+        Value::Bool(b) => Tag::Byte(i8::from(*b)),
+        Value::Number(n) => match n.as_i64() {
+            Some(n) => Tag::Int(n as i32),
+            None => Tag::Double(n.as_f64().unwrap_or(0.0)),
+        },
+        Value::String(s) => Tag::String(s.clone()),
+        Value::Array(items) => Tag::List(items.iter().map(json_to_tag).collect()),
+        Value::Object(o) => {
+            let mut c = Compound::new();
+            for (k, v) in o {
+                c.put(k, json_to_tag(v));
+            }
+            Tag::Compound(c)
+        }
+    }
 }
 
 impl Components {
@@ -673,7 +722,15 @@ impl Components {
                 Some(Kind::DyedColor) => self.dyed_color = None,
                 Some(Kind::EnchantmentGlintOverride) => self.glint_override = None,
                 Some(Kind::Trim) => self.trim = None,
-                Some(Kind::PotionContents) => self.potion_color = None,
+                Some(Kind::PotionContents) => {
+                    self.potion_color = None;
+                    self.potion_name = None;
+                }
+                Some(Kind::CustomName) => self.custom_name = None,
+                Some(Kind::ItemName) => self.item_name = None,
+                Some(Kind::Rarity) => self.rarity = 0,
+                Some(Kind::LodestoneTracker) => self.lodestone = false,
+                Some(Kind::WrittenBookContent) => self.book_title = None,
                 Some(Kind::BaseColor) => self.base_color = None,
                 Some(Kind::BannerPatterns) => self.banner_patterns = None,
                 Some(Kind::Profile) => self.profile = None,
@@ -752,7 +809,15 @@ impl Components {
                 Component::PotionContents {
                     potion,
                     custom_color,
+                    custom_name,
                 } => {
+                    self.potion_name = Some(
+                        custom_name
+                            .as_deref()
+                            .or_else(|| potion.and_then(potion_name))
+                            .unwrap_or("empty")
+                            .into(),
+                    );
                     // Its own colour, else its potion's. (One made of effects of its
                     // own alone is not mixed here.)
                     self.potion_color = custom_color
@@ -854,10 +919,34 @@ impl Components {
                 _ => {}
             }
         }
-        for &(kind, _) in &patch.added {
-            match u32::try_from(kind).ok().and_then(Kind::from_id) {
+        for (kind, c) in &patch.added {
+            let kind = u32::try_from(*kind).ok().and_then(Kind::from_id);
+            let text = |c: &Component| match c {
+                Component::Other { data, .. } => ruthenium_protocol::nbt::read_network(data)
+                    .ok()
+                    .and_then(|(tag, _)| tag.map(Arc::new)),
+                _ => None,
+            };
+            match kind {
                 Some(Kind::Compostable) => self.compostable = true,
                 Some(Kind::JukeboxPlayable) => self.jukebox_playable = true,
+                Some(Kind::LodestoneTracker) => self.lodestone = true,
+                Some(Kind::CustomName) => self.custom_name = text(c),
+                Some(Kind::ItemName) => self.item_name = text(c),
+                Some(Kind::Rarity) => {
+                    if let Component::Other { data, .. } = c {
+                        // (Unknown ones read as the first.)
+                        self.rarity = data.first().copied().filter(|r| *r < 4).unwrap_or(0);
+                    }
+                }
+                Some(Kind::WrittenBookContent) => {
+                    if let Component::Other { data, .. } = c {
+                        self.book_title = ruthenium_protocol::wire::Reader::new(data)
+                            .string(32)
+                            .ok()
+                            .map(Arc::from);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1323,6 +1412,31 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
             potion_colour(potion.id() as i32)
         })
     });
+    c.potion_name = v.get("minecraft:potion_contents").map(|p| {
+        let potion = p.get("potion").and_then(|n| n.as_str());
+        let custom = p.get("custom_name").and_then(|n| n.as_str());
+        custom
+            .or_else(|| {
+                let name = full_identifier(potion?);
+                let potion = ruthenium_data::v26_3::registries::Potion::from_name(&name)?;
+                potion_name(potion.id() as i32)
+            })
+            .unwrap_or("empty")
+            .into()
+    });
+    c.item_name = v
+        .get("minecraft:item_name")
+        .map(|n| Arc::new(json_to_tag(n)));
+    c.description = v
+        .pointer("/minecraft:item_name/translate")
+        .and_then(|k| k.as_str())
+        .map(Arc::from);
+    c.rarity = match v.get("minecraft:rarity").and_then(|r| r.as_str()) {
+        Some("uncommon") => 1,
+        Some("rare") => 2,
+        Some("epic") => 3,
+        _ => 0,
+    };
     c.base_color = v
         .get("minecraft:base_color")
         .and_then(|d| d.as_str())
@@ -1552,6 +1666,143 @@ mod tests {
     }
 
     #[test]
+    fn stacks_are_named_by_their_items_and_their_own_components() {
+        use crate::item_name::{hover_name, styled_name};
+        let report = |v: serde_json::Value| serde_json::json!({ "components": v });
+        let reports = HashMap::from([
+            (
+                "minecraft:diamond_sword".to_owned(),
+                report(serde_json::json!({
+                    "minecraft:item_name": {"translate": "item.minecraft.diamond_sword"},
+                    "minecraft:rarity": "uncommon",
+                })),
+            ),
+            (
+                "minecraft:potion".to_owned(),
+                report(serde_json::json!({
+                    "minecraft:item_name": {"translate": "item.minecraft.potion"},
+                    "minecraft:potion_contents": {"potion": "minecraft:long_swiftness"},
+                })),
+            ),
+        ]);
+        let class = |key: &str, class: &str| ItemClassData {
+            id: Item::from_name(key).unwrap().id(),
+            key: key.to_owned(),
+            classes: vec![class.to_owned()],
+            flags: 0,
+            block: None,
+            fields: Vec::new(),
+        };
+        let items = Items::new(
+            &[
+                class("minecraft:diamond_sword", "Item"),
+                class("minecraft:potion", "PotionItem"),
+            ],
+            &reports,
+        );
+        let key = |t: &Tag| {
+            let c = t.as_compound().expect("a translation");
+            c.string("translate").unwrap_or_default().to_owned()
+        };
+        let sword = with(&items, "minecraft:diamond_sword", Vec::new());
+        assert_eq!(key(&hover_name(&sword)), "item.minecraft.diamond_sword");
+        let colour = |s: &Stack| {
+            styled_name(s)
+                .as_compound()
+                .unwrap()
+                .string("color")
+                .map(str::to_owned)
+        };
+        assert_eq!(colour(&sword).as_deref(), Some("yellow"));
+        // Longer and stronger potions go by the plain one's name.
+        let potion = with(&items, "minecraft:potion", Vec::new());
+        assert_eq!(
+            key(&hover_name(&potion)),
+            "item.minecraft.potion.effect.swiftness"
+        );
+        let contents = |potion: Option<&str>, custom_name: Option<&str>| {
+            let c = Component::PotionContents {
+                potion: potion.map(|p| {
+                    ruthenium_data::v26_3::registries::Potion::from_name(p)
+                        .unwrap()
+                        .id() as i32
+                }),
+                custom_color: None,
+                custom_name: custom_name.map(str::to_owned),
+            };
+            let s = with(&items, "minecraft:potion", vec![(Kind::PotionContents, c)]);
+            key(&hover_name(&s)).replace("item.minecraft.potion.effect.", "")
+        };
+        assert_eq!(contents(Some("minecraft:strong_healing"), None), "healing");
+        assert_eq!(contents(Some("minecraft:water"), Some("fizz")), "fizz");
+        assert_eq!(contents(None, None), "empty");
+        // Components that are kept as they came.
+        let other = |kind: Kind, data: Vec<u8>| {
+            let component = Component::Other {
+                kind: kind.id() as i32,
+                data,
+            };
+            (kind, component)
+        };
+        let nbt = |s: &str| {
+            let mut out = Vec::new();
+            ruthenium_protocol::nbt::write_network(&mut out, &Tag::String(s.into())).unwrap();
+            out
+        };
+        let given = with(
+            &items,
+            "minecraft:diamond_sword",
+            vec![
+                other(Kind::CustomName, nbt("Mine")),
+                other(Kind::ItemName, nbt("Its")),
+                other(Kind::Rarity, vec![3]),
+                other(Kind::LodestoneTracker, vec![0, 0]),
+            ],
+        );
+        assert_eq!(hover_name(&given), Tag::String("Mine".into()));
+        assert_eq!(
+            given.c.item_name.as_deref(),
+            Some(&Tag::String("Its".into()))
+        );
+        assert_eq!(colour(&given).as_deref(), Some("light_purple"));
+        assert!(given.c.lodestone && !sword.c.lodestone);
+        let mut title = vec![5];
+        title.extend(b"Title");
+        let book = with(
+            &items,
+            "minecraft:diamond_sword",
+            vec![other(Kind::WrittenBookContent, title)],
+        );
+        assert_eq!(hover_name(&book), Tag::String("Title".into()));
+        let unknown = with(
+            &items,
+            "minecraft:diamond_sword",
+            vec![other(Kind::Rarity, vec![9])],
+        );
+        assert_eq!(unknown.c.rarity, 0);
+        // Taken away, there is none.
+        let bare = items.stack(&ItemStack {
+            item: sword.item,
+            count: 1,
+            patch: ComponentPatch {
+                added: Vec::new(),
+                removed: vec![Kind::ItemName.id() as i32, Kind::Rarity.id() as i32],
+            },
+        });
+        assert_eq!(hover_name(&bare), Tag::String(String::new()));
+        assert_eq!(colour(&bare).as_deref(), Some("white"));
+        let bare = items.stack(&ItemStack {
+            item: potion.item,
+            count: 1,
+            patch: ComponentPatch {
+                added: Vec::new(),
+                removed: vec![Kind::PotionContents.id() as i32],
+            },
+        });
+        assert_eq!(key(&hover_name(&bare)), "item.minecraft.potion");
+    }
+
+    #[test]
     fn attack_ranges_widen_by_the_margin() {
         // A spear's range: 2 to 4.5 blocks, 0.125 either side.
         let spear = AttackRange {
@@ -1733,6 +1984,7 @@ mod tests {
             let c = Component::PotionContents {
                 potion,
                 custom_color,
+                custom_name: None,
             };
             with(&items, "minecraft:potion", vec![(Kind::PotionContents, c)])
                 .c

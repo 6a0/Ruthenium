@@ -130,12 +130,14 @@ impl ColourCheck {
                 uv: [0.5; 4],
                 color: 0xFFFF_FFFF,
                 texture: self.grey.index(),
+                slant: [0.0; 2],
             },
             Quad {
                 rect: [PATCH as f32, 0.0, WIDTH as f32, HEIGHT as f32],
                 uv: [0.0; 4],
                 color: a << 24 | r << 16 | g << 8 | b,
                 texture: NO_TEXTURE,
+                slant: [0.0; 2],
             },
         ]
     }

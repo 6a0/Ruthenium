@@ -193,6 +193,8 @@ pub struct Options {
     pub hud: Option<bool>,
     /// Whether the frame's corners darken in the dark (the default).
     pub vignette: Option<bool>,
+    /// Show the player list without its key (default: no).
+    pub player_list: Option<bool>,
     /// Whether animated textures play (the default) or hold still.
     pub animations: Option<bool>,
     /// Whether the field of view narrows in water and lava (the default).
@@ -266,6 +268,7 @@ impl Options {
             crosshair: None,
             hud: None,
             vignette: None,
+            player_list: None,
             animations: None,
             fov_effects: None,
         };
@@ -461,7 +464,7 @@ impl Options {
                 "--fog" | "--light-flicker" | "--translucent" | "--animations"
                 | "--fov-effects" | "--block-entities" | "--players" | "--entity-shadows"
                 | "--hand" | "--block-outline" | "--view-bobbing" | "--crosshair" | "--hud"
-                | "--vignette" => {
+                | "--vignette" | "--player-list" => {
                     let on = match value("on or off")?.as_str() {
                         "on" => true,
                         "off" => false,
@@ -481,6 +484,7 @@ impl Options {
                         "--crosshair" => o.crosshair = Some(on),
                         "--hud" => o.hud = Some(on),
                         "--vignette" => o.vignette = Some(on),
+                        "--player-list" => o.player_list = Some(on),
                         _ => o.translucent = Some(on),
                     }
                 }
@@ -629,6 +633,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     if let Some(on) = opts.vignette {
         menu.set_vignette(on);
+    }
+    if let Some(on) = opts.player_list {
+        menu.set_player_list(on);
     }
     if let Some(path) = &opts.route {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;

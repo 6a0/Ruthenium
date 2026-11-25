@@ -173,6 +173,7 @@ fn water_quad(overlay: &WaterOverlay, texture: TextureId, size: [f32; 2], fov: f
         uv: [u + WATER_REPEATS, v, u, v + WATER_REPEATS],
         color: overlay.colour,
         texture: texture.index(),
+        slant: [0.0; 2],
     }
 }
 

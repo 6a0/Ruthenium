@@ -38,6 +38,8 @@ pub struct InGame {
     /// A route plays ([`crate::route`]): the keyboard and the mouse reach nothing in the
     /// world, and losing the focus neither lets go of keys nor pauses.
     scripted: bool,
+    /// The player list shows whether or not its key is held.
+    player_list: bool,
 }
 
 impl Default for InGame {
@@ -50,6 +52,7 @@ impl Default for InGame {
             focused: true,
             unfocused_since: None,
             scripted: false,
+            player_list: false,
         }
     }
 }
@@ -58,6 +61,11 @@ impl InGame {
     /// Hands the input in the world to a route, for good.
     pub fn set_scripted(&mut self) {
         self.scripted = true;
+    }
+
+    /// Shows the player list without its key.
+    pub fn set_player_list(&mut self, on: bool) {
+        self.player_list = on;
     }
 
     /// The screen closed and the mouse is grabbed again (`grabMouse`).
@@ -71,6 +79,7 @@ impl InGame {
         self.held.release_all();
         if let Some(s) = session.filter(|_| !self.scripted) {
             s.set_keys(Default::default());
+            s.set_player_list(false);
             s.set_use(false);
             s.set_attack(false);
         }
@@ -128,6 +137,7 @@ impl InGame {
         }
         if let Some(s) = session {
             s.set_keys(self.held.keys(&self.binds));
+            s.set_player_list(self.held.is_down(self.binds.player_list));
         }
     }
 
@@ -147,6 +157,11 @@ impl InGame {
 
     /// The frame's turn of the camera, after its events.
     pub fn frame(&mut self, mouse: &MouseOptions, session: Option<&Session>) {
+        if self.player_list
+            && let Some(s) = session
+        {
+            s.set_player_list(true);
+        }
         let (dx, dy) = self.motion.take();
         if !self.focused || self.scripted || (dx == 0.0 && dy == 0.0) {
             return;

@@ -22,6 +22,8 @@ pub struct Quad {
     pub color: u32,
     /// The renderer's texture index, or [`NO_TEXTURE`].
     pub texture: u32,
+    /// How far the top and the bottom edge are moved to the right (slanted text).
+    pub slant: [f32; 2],
 }
 
 /// Where one GUI sprite is and how it scales.
@@ -122,6 +124,7 @@ impl DrawList {
             uv,
             color,
             texture,
+            slant: [0.0; 2],
         });
     }
 

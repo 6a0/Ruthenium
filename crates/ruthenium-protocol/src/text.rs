@@ -90,6 +90,8 @@ pub const NAMED_COLORS: [(&str, u32); 16] = [
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Style {
     pub color: Option<u32>,
+    /// The shadow's own colour, `0xAARRGGBB`; `None` is the drawer's.
+    pub shadow: Option<u32>,
     pub bold: bool,
     pub italic: bool,
     pub underlined: bool,
@@ -101,6 +103,7 @@ pub struct Style {
 #[derive(Debug, Clone, Copy, Default)]
 struct Partial {
     color: Option<u32>,
+    shadow: Option<u32>,
     bold: Option<bool>,
     italic: Option<bool>,
     underlined: Option<bool>,
@@ -119,6 +122,7 @@ impl Partial {
         };
         Partial {
             color: o.get("color").and_then(Value::as_str).and_then(parse_color),
+            shadow: o.get("shadow_color").and_then(parse_argb),
             bold: flag("bold"),
             italic: flag("italic"),
             underlined: flag("underlined"),
@@ -130,6 +134,7 @@ impl Partial {
     fn over(self, parent: Style) -> Style {
         Style {
             color: self.color.or(parent.color),
+            shadow: self.shadow.or(parent.shadow),
             bold: self.bold.unwrap_or(parent.bold),
             italic: self.italic.unwrap_or(parent.italic),
             underlined: self.underlined.unwrap_or(parent.underlined),
@@ -147,6 +152,83 @@ pub fn parse_color(s: &str) -> Option<u32> {
             .flatten();
     }
     NAMED_COLORS.iter().find(|(n, _)| *n == s).map(|&(_, c)| c)
+}
+
+/// A colour with its alpha, as a number or as four parts from 0 to 1 in the order red,
+/// green, blue, alpha (`ExtraCodecs.ARGB_COLOR_CODEC`).
+fn parse_argb(v: &Value) -> Option<u32> {
+    match v {
+        Value::Number(n) => n.as_i64().map(|n| n as u32),
+        Value::Array(parts) => {
+            let parts: [f64; 4] = parts
+                .iter()
+                .map(Value::as_f64)
+                .collect::<Option<Vec<_>>>()?
+                .try_into()
+                .ok()?;
+            let [r, g, b, a] = parts.map(|p| ((p as f32 * 255.0).floor() as i32 as u32) & 0xFF);
+            Some(a << 24 | r << 16 | g << 8 | b)
+        }
+        _ => None,
+    }
+}
+
+/// The key each binding has by default (`Options`), by which a component that names a
+/// binding shows it.
+const KEYS: [(&str, &str); 39] = [
+    ("key.forward", "key.keyboard.w"),
+    ("key.left", "key.keyboard.a"),
+    ("key.back", "key.keyboard.s"),
+    ("key.right", "key.keyboard.d"),
+    ("key.jump", "key.keyboard.space"),
+    ("key.sneak", "key.keyboard.left.shift"),
+    ("key.sprint", "key.keyboard.left.control"),
+    ("key.inventory", "key.keyboard.e"),
+    ("key.swapOffhand", "key.keyboard.f"),
+    ("key.drop", "key.keyboard.q"),
+    ("key.use", "key.mouse.right"),
+    ("key.attack", "key.mouse.left"),
+    ("key.pickItem", "key.mouse.middle"),
+    ("key.chat", "key.keyboard.t"),
+    ("key.playerlist", "key.keyboard.tab"),
+    ("key.command", "key.keyboard.slash"),
+    ("key.friends", "key.keyboard.o"),
+    ("key.socialInteractions", "key.keyboard.p"),
+    ("key.toggleGui", "key.keyboard.f1"),
+    ("key.screenshot", "key.keyboard.f2"),
+    ("key.togglePerspective", "key.keyboard.f5"),
+    ("key.fullscreen", "key.keyboard.f11"),
+    ("key.advancements", "key.keyboard.l"),
+    ("key.quickActions", "key.keyboard.g"),
+    ("key.saveToolbarActivator", "key.keyboard.c"),
+    ("key.loadToolbarActivator", "key.keyboard.x"),
+    ("key.smoothCamera", "key.keyboard.unknown"),
+    ("key.spectatorOutlines", "key.keyboard.unknown"),
+    ("key.spectatorHotbar", "key.mouse.middle"),
+    ("key.toggleSpectatorShaderEffects", "key.keyboard.f4"),
+    ("key.hotbar.1", "key.keyboard.1"),
+    ("key.hotbar.2", "key.keyboard.2"),
+    ("key.hotbar.3", "key.keyboard.3"),
+    ("key.hotbar.4", "key.keyboard.4"),
+    ("key.hotbar.5", "key.keyboard.5"),
+    ("key.hotbar.6", "key.keyboard.6"),
+    ("key.hotbar.7", "key.keyboard.7"),
+    ("key.hotbar.8", "key.keyboard.8"),
+    ("key.hotbar.9", "key.keyboard.9"),
+];
+
+/// What a component that names a key binding shows (`KeyMapping.createNameSupplier`): the
+/// name of the key it is bound to, by default, or the binding's own for one that is not
+/// known. Keys of one character have no entry in the language.
+pub fn key_name(binding: &str, lang: &dyn Lang) -> String {
+    let Some((_, key)) = KEYS.iter().find(|(b, _)| *b == binding) else {
+        return lang.get(binding).unwrap_or(binding).to_owned();
+    };
+    match (lang.get(key), key.rsplit('.').next()) {
+        (Some(name), _) => name.to_owned(),
+        (None, Some(last)) if last.len() <= 3 => last.to_uppercase(),
+        _ => (*key).to_owned(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +317,7 @@ impl StyledText {
             style = match code.to_ascii_lowercase() {
                 c @ ('0'..='9' | 'a'..='f') => Style {
                     color: Some(NAMED_COLORS[c.to_digit(16).unwrap() as usize].1),
+                    shadow: style.shadow,
                     ..Style::default()
                 },
                 'k' => Style {
@@ -306,7 +389,7 @@ impl StyledText {
                     let args = o.get("with").and_then(Value::as_array);
                     self.translate(format, args.map_or(&[], Vec::as_slice), style, depth, lang);
                 } else if let Some(key) = o.get("keybind").and_then(Value::as_str) {
-                    self.push(key, style);
+                    self.push(&key_name(key, lang), style);
                 }
                 if let Some(Value::Array(extra)) = o.get("extra") {
                     for child in extra {
@@ -486,6 +569,45 @@ mod tests {
         assert!(t.spans[0].style.bold);
         let s = StyledText::from_nbt_in(&Tag::String("§cBanned".into()), &());
         assert_eq!(spans(&s), [("Banned", Some(0xFF5555), false)]);
+    }
+
+    #[test]
+    fn shadows_have_a_colour_of_their_own() {
+        let shadow = |v: Value| StyledText::from_json(&v).spans[0].style.shadow;
+        assert_eq!(shadow(json!({"text": "a"})), None);
+        assert_eq!(shadow(json!({"text": "a", "shadow_color": 0})), Some(0));
+        assert_eq!(
+            shadow(json!({"text": "a", "shadow_color": -16_711_936})),
+            Some(0xFF00_FF00)
+        );
+        assert_eq!(
+            shadow(json!({"text": "a", "shadow_color": [1.0, 0.5, 0.0, 0.25]})),
+            Some(0x3FFF_7F00)
+        );
+        assert_eq!(shadow(json!({"text": "a", "shadow_color": [1.0]})), None);
+        // Children have it, and legacy colours keep it.
+        let t = StyledText::from_json(&json!({
+            "text": "", "shadow_color": 7, "extra": ["a§cb", {"text": "c", "bold": true}]
+        }));
+        assert!(t.spans.len() == 3 && t.spans.iter().all(|s| s.style.shadow == Some(7)));
+    }
+
+    #[test]
+    fn bindings_are_shown_by_their_keys() {
+        let mut lang = std::collections::HashMap::new();
+        lang.insert(
+            "key.keyboard.left.shift".to_owned(),
+            "Left Shift".to_owned(),
+        );
+        lang.insert("key.other".to_owned(), "Other".to_owned());
+        let shown = |key: &str| StyledText::from_json_in(&json!({"keybind": key}), &lang).plain();
+        assert_eq!(shown("key.sneak"), "Left Shift");
+        assert_eq!(shown("key.inventory"), "E");
+        assert_eq!(shown("key.togglePerspective"), "F5");
+        assert_eq!(shown("key.other"), "Other");
+        assert_eq!(shown("key.mystery"), "key.mystery");
+        // (Without its language, a key with a name of its own.)
+        assert_eq!(shown("key.jump"), "key.keyboard.space");
     }
 
     #[test]

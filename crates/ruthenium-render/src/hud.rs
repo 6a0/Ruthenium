@@ -1,7 +1,7 @@
 //! The HUD over the world: `ruthenium-ui` lays it out from what a frame of the game
 //! thread says of the player, and it is drawn here in vanilla's order: the crosshair, the
 //! quads under the hotbar's items, the items (models, seen straight on with the lights of
-//! a GUI), the quads over them, and the text.
+//! a GUI), and the quads over them with the texts between them.
 
 use ruthenium_assets::atlas::Atlas;
 use ruthenium_gpu::{
@@ -9,7 +9,7 @@ use ruthenium_gpu::{
 };
 use ruthenium_sim::hud::OFF_HAND;
 use ruthenium_sim::scene::Frame;
-use ruthenium_ui::hud::{HudHealth, HudLayout, HudOptions, HudSprites, HudView};
+use ruthenium_ui::hud::{HudHealth, HudLayout, HudMemory, HudOptions, HudSprites, HudView};
 use ruthenium_ui::{GuiScale, Quad, Sprites};
 
 use crate::block_entity::renderer::BlockEntityRenderer;
@@ -83,6 +83,8 @@ pub struct HudParams {
     pub vignette: bool,
     /// A clock in milliseconds that only goes on (`Util.getMillis`).
     pub millis: i64,
+    /// The time itself.
+    pub now: std::time::Instant,
 }
 
 /// What the last frame's HUD was made of.
@@ -168,8 +170,11 @@ pub(crate) struct Hud {
     vignette_quad: Option<Quad>,
     layout: HudLayout,
     health: HudHealth,
-    /// The frame's text as quads.
-    text: Vec<Quad>,
+    memory: HudMemory,
+    /// The quads over the items, with the texts and faces between them, and how many of
+    /// them are glyphs'.
+    over: Vec<Quad>,
+    glyphs: u32,
     /// The GUI scale the frame is laid out for; 0 while there is nothing to draw.
     scale: u32,
     stats: HudStats,
@@ -191,7 +196,9 @@ impl Hud {
             vignette_quad: None,
             layout: HudLayout::new(),
             health: HudHealth::default(),
-            text: Vec::new(),
+            memory: HudMemory::default(),
+            over: Vec::new(),
+            glyphs: 0,
             scale: 0,
             stats: HudStats::default(),
         }
@@ -275,10 +282,17 @@ impl Hud {
             width: scale.width as i32,
             height: scale.height as i32,
             millis: params.millis,
+            now: params.now,
             options: params.options,
         };
-        self.layout
-            .build(sprites, models.font(), &view, &mut self.health);
+        self.layout.build(
+            sprites,
+            models.font(),
+            models.lang(),
+            &view,
+            &mut self.health,
+            &mut self.memory,
+        );
         // An item in use shows it in its slot too: the selected one, or the other hand's.
         let r = &frame.player.first_person;
         let using = r.using.map(|off_hand| {
@@ -298,8 +312,8 @@ impl Hud {
             block_atlas,
             textures,
         );
-        self.text.clear();
-        models.gui_text(self.layout.texts(), &mut self.text);
+        self.over.clear();
+        self.glyphs = models.gui_over(&self.layout, textures, &mut self.over);
         self.vignette_quad = self
             .vignette_picture
             // (Fully faded, it would darken nothing.)
@@ -313,6 +327,7 @@ impl Hud {
                 uv: [0.0, 0.0, 1.0, 1.0],
                 color: self.vignette.colour(),
                 texture: texture.index(),
+                slant: [0.0; 2],
             });
         self.scale = scale.scale;
     }
@@ -393,17 +408,11 @@ impl Hud {
             // SAFETY: the caller's.
             unsafe { models.draw_gui_items(pass, frame_data, size, lightmap, indices) };
         }
-        quads(
-            pass,
-            frame_data,
-            PipelineId::WorldGui,
-            self.layout.over.quads(),
-        );
-        quads(pass, frame_data, PipelineId::WorldGui, &self.text);
+        quads(pass, frame_data, PipelineId::WorldGui, &self.over);
         self.stats = HudStats {
-            quads: drawn - self.text.len() as u32,
+            quads: drawn.saturating_sub(self.glyphs),
             items: self.layout.items.len() as u32,
-            glyphs: self.text.len() as u32,
+            glyphs: self.glyphs,
         };
     }
 }

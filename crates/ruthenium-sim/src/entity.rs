@@ -1620,6 +1620,14 @@ impl Teams {
         self.teams.get(self.members.get(scoreboard_name)?)
     }
 
+    /// `name` as the team of `owner` shows it (`PlayerTeam.formatNameForTeam`).
+    pub fn decorated(&self, owner: &str, name: Tag) -> Tag {
+        match self.team_of(owner) {
+            Some(t) => team_name(&t.prefix, name, &t.suffix, t.colour),
+            None => name,
+        }
+    }
+
     /// Counts the packets taken in: what was made of an older state is out of date.
     pub fn rev(&self) -> u64 {
         self.rev
@@ -1627,23 +1635,32 @@ impl Teams {
 }
 
 /// What the client knows of a player from the player list (`PlayerInfo`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlayerInfo {
     pub name: String,
     pub game_mode: i32,
     /// Its profile's skin.
     pub textures: Option<Property>,
+    /// The player list shows it, under this name if it has one, in this order.
+    pub listed: bool,
+    pub display_name: Option<Tag>,
+    pub list_order: i32,
+    /// In milliseconds.
+    pub latency: i32,
+    pub show_hat: bool,
 }
 
 /// The player list (`ClientPacketListener.playerInfoMap`).
 #[derive(Debug, Clone, Default)]
 pub struct PlayerInfos {
     players: HashMap<u128, PlayerInfo>,
+    rev: u64,
 }
 
 impl PlayerInfos {
     /// `handlePlayerInfoUpdate`: new players first, then every entry's updates.
     pub fn update(&mut self, actions: u8, entries: &[play::PlayerInfoEntry]) {
+        self.rev += 1;
         if actions & play::PLAYER_INFO_ADD != 0 {
             for e in entries {
                 if let Some(name) = &e.name {
@@ -1651,20 +1668,41 @@ impl PlayerInfos {
                         name: name.clone(),
                         game_mode: 0,
                         textures: e.properties.iter().find(|p| p.name == "textures").cloned(),
+                        listed: false,
+                        display_name: None,
+                        list_order: 0,
+                        latency: 0,
+                        show_hat: true,
                     });
                 }
             }
         }
         for e in entries {
-            if let Some(p) = self.players.get_mut(&e.uuid)
-                && let Some(m) = e.game_mode
-            {
-                p.game_mode = m;
+            let Some(p) = self.players.get_mut(&e.uuid) else {
+                continue;
+            };
+            p.game_mode = e.game_mode.unwrap_or(p.game_mode);
+            p.listed = e.listed.unwrap_or(p.listed);
+            p.latency = e.latency.unwrap_or(p.latency);
+            p.list_order = e.list_order.unwrap_or(p.list_order);
+            p.show_hat = e.show_hat.unwrap_or(p.show_hat);
+            if let Some(name) = &e.display_name {
+                p.display_name.clone_from(name);
             }
         }
     }
 
+    /// Counts the changes: what was made of an older state is out of date.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u128, &PlayerInfo)> {
+        self.players.iter().map(|(id, p)| (*id, p))
+    }
+
     pub fn remove(&mut self, ids: &[u128]) {
+        self.rev += 1;
         for id in ids {
             self.players.remove(id);
         }
@@ -3617,8 +3655,7 @@ mod tests {
             &[play::PlayerInfoEntry {
                 uuid: 1007,
                 name: Some("Alex".into()),
-                properties: Vec::new(),
-                game_mode: None,
+                ..Default::default()
             }],
         );
         let mut e = Entities::new(PLAYER_ID, false);
@@ -3672,9 +3709,8 @@ mod tests {
             play::PLAYER_INFO_GAME_MODE,
             &[play::PlayerInfoEntry {
                 uuid: 1007,
-                name: None,
-                properties: Vec::new(),
                 game_mode: Some(play::SPECTATOR),
+                ..Default::default()
             }],
         );
         let p = spin(&e, &players);
@@ -4029,7 +4065,7 @@ mod tests {
                     },
                     textures,
                 ],
-                game_mode: None,
+                ..Default::default()
             }],
         );
         let p = play::AddEntity {
@@ -4104,9 +4140,9 @@ mod tests {
         add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
         let teams = Teams::default();
         let mut scores = Scoreboard::default();
-        scores.set_objective("hp", 0, Some(text("HP")), None);
+        scores.set_objective("hp", 0, Some(text("HP")), false, None);
         scores.set_display(play::DISPLAY_SLOT_BELOW_NAME, "hp");
-        scores.set_score("Kai", "hp", 14, None);
+        scores.set_score("Kai", "hp", 14, None, None);
         e.refresh_names(&teams, &scores);
         let shown = e
             .name_record(e.get(9).unwrap(), &teams, false, "Developer")

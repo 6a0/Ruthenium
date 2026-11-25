@@ -323,10 +323,11 @@ pub enum Component {
     ChargedProjectiles(Vec<ItemStack>),
     BundleContents(Vec<ItemStack>),
     /// The potion (`minecraft:potion` id), if any, and the colour it is given
-    /// (0xRRGGBB); the custom effects and name are skipped.
+    /// (0xRRGGBB) and the name it goes by; the custom effects are skipped.
     PotionContents {
         potion: Option<i32>,
         custom_color: Option<i32>,
+        custom_name: Option<String>,
     },
     /// The item definition a stack is drawn by (`minecraft:diamond_sword`).
     ItemModel(String),
@@ -542,10 +543,11 @@ fn read_component(r: &mut Reader<'_>, kind: i32, depth: u32) -> Result<Component
             // Custom colour, custom effects, custom name.
             let custom_color = opt(r, |r| r.i32())?;
             skip_list(r, usize::MAX, |r| mob_effect(r, depth))?;
-            opt(r, |r| r.string(MAX_STRING).map(drop))?;
+            let custom_name = opt(r, |r| Ok(r.string(MAX_STRING)?.to_owned()))?;
             Component::PotionContents {
                 potion,
                 custom_color,
+                custom_name,
             }
         }
         Kind::ItemModel => Component::ItemModel(r.identifier()?),
@@ -1506,7 +1508,8 @@ mod tests {
                 .b(true)
                 .i(0xAB_CDEF)
                 .v(0)
-                .b(false)
+                .b(true)
+                .s("fizz")
                 // A trim with a pattern written out, which is a decal.
                 .kind(Kind::Trim)
                 .v(4)
@@ -1543,7 +1546,8 @@ mod tests {
             get(Kind::PotionContents),
             Some(Component::PotionContents {
                 potion: Some(7),
-                custom_color: Some(0xAB_CDEF)
+                custom_color: Some(0xAB_CDEF),
+                custom_name: Some("fizz".into()),
             })
         );
         assert_eq!(

@@ -158,6 +158,9 @@ public final class Bench {
             if (bare && !mc.gui.hud.isHidden()) {
                 mc.gui.hud.toggle();
             }
+            if (Boolean.getBoolean("ruthenium.bench.playerList")) {
+                mc.options.keyPlayerList.setDown(true);
+            }
             if (mc.options.fovEffectScale().get() != 0.0) {
                 mc.options.fovEffectScale().set(0.0);
             }

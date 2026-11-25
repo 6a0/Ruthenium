@@ -51,6 +51,8 @@ pub(crate) struct Options {
     /// With the screenshot: vanilla keeps its whole HUD, without clouds, and the picture
     /// is taken at the route's end.
     pub hud: bool,
+    /// With the player list showing.
+    pub player_list: bool,
     pub render_distance: u32,
     pub gpu: Gpu,
 }
@@ -71,6 +73,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         bare: false,
         hand: false,
         hud: false,
+        player_list: false,
         render_distance: 12,
         gpu: Gpu::Auto,
     };
@@ -272,6 +275,7 @@ pub(crate) fn launch(
         format!("-Druthenium.bench.bare={}", o.bare),
         format!("-Druthenium.bench.hand={}", o.hand),
         format!("-Druthenium.bench.hud={}", o.hud),
+        format!("-Druthenium.bench.playerList={}", o.player_list),
     ];
     if let Some((address, route)) = &run.dedicated {
         let route = std::path::absolute(route).map_err(|e| e.to_string())?;

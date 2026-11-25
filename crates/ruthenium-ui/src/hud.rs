@@ -1,17 +1,25 @@
 //! The HUD (`client/gui/Hud.java`, `contextualbar/ExperienceBar.java`, the item
 //! decorations of `GuiGraphicsExtractor`), laid out as vanilla lays it out, in GUI units:
 //! the crosshair and the attack indicator, the hotbar with what is in it, hearts, armour,
-//! food, air, the experience bar and its level, and the effects' icons.
+//! food, air, the experience bar and its level, the effects' icons, and what it says in
+//! words (the `text` module).
 //!
 //! What comes out is lists for the renderer, in the order they are drawn: the crosshair
-//! (which inverts what is behind it), the quads under the hotbar's items, the items, the
-//! quads over them, and the text.
+//! (which inverts what is behind it), the quads under the hotbar's items, the items, and
+//! the quads over them, with the texts and the faces each between two of those quads.
+
+mod text;
+
+use std::time::Instant;
 
 use ruthenium_assets::{Font, Id};
 use ruthenium_javamath::mth;
 use ruthenium_javamath::random::JavaRandom;
+use ruthenium_protocol::text::Lang;
 use ruthenium_sim::hud::{HudEffect, HudRecord, OFF_HAND};
 
+use self::text::Words;
+pub use self::text::{HudFace, HudMemory, HudText, TextLine};
 use crate::draw::{DrawList, SpriteInfo, Sprites};
 
 const WHITE: u32 = 0xFFFF_FFFF;
@@ -66,6 +74,9 @@ const EFFECTS: [(&str, bool, i32); 40] = [
     ("infested", false, 0x8C9B8C),
     ("breath_of_the_nautilus", true, 0x00FFEE),
 ];
+
+/// `BossBarColor`, by its ordinal.
+const BOSS_COLOURS: [&str; 7] = ["pink", "blue", "red", "green", "yellow", "purple", "white"];
 
 const REGENERATION: i32 = 9;
 const HUNGER: i32 = 16;
@@ -166,6 +177,11 @@ pub struct HudSprites {
     experience_progress: SpriteInfo,
     /// By the effect's registry id.
     effects: Vec<SpriteInfo>,
+    /// By colour, then by notches: the bars' ground and what fills them.
+    boss_bars: [[SpriteInfo; 2]; 7],
+    boss_notches: [[SpriteInfo; 2]; 4],
+    /// Unknown, then one to five bars.
+    ping: [SpriteInfo; 6],
     missing: SpriteInfo,
 }
 
@@ -205,6 +221,12 @@ impl HudSprites {
                 .iter()
                 .map(|(name, ..)| s(&format!("mob_effect/{name}")))
                 .collect(),
+            boss_bars: BOSS_COLOURS
+                .map(|c| ["background", "progress"].map(|part| s(&format!("boss_bar/{c}_{part}")))),
+            boss_notches: [6, 10, 12, 20].map(|n| {
+                ["background", "progress"].map(|part| s(&format!("boss_bar/notched_{n}_{part}")))
+            }),
+            ping: ["unknown", "1", "2", "3", "4", "5"].map(|n| s(&format!("icon/ping_{n}"))),
             missing: s("missingno"),
         }
     }
@@ -228,17 +250,6 @@ pub struct HudHealth {
     blink_time: i64,
 }
 
-/// A line of text, in the game's own font.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct HudText {
-    pub text: String,
-    pub x: i32,
-    pub y: i32,
-    /// `0xAARRGGBB`.
-    pub color: u32,
-    pub shadow: bool,
-}
-
 /// An item of the hotbar: which of the record's slots, and where its 16 by 16 units are.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HudItem {
@@ -259,8 +270,9 @@ pub struct HudView<'a> {
     /// The GUI's size in its own units.
     pub width: i32,
     pub height: i32,
-    /// A clock in milliseconds (`Util.getMillis`).
+    /// A clock in milliseconds (`Util.getMillis`), and the time itself.
     pub millis: i64,
+    pub now: Instant,
     pub options: HudOptions,
 }
 
@@ -277,6 +289,8 @@ pub struct HudLayout {
     texts: Vec<HudText>,
     /// How many of `texts` this frame uses: the rest keep their room for later.
     texts_used: usize,
+    /// The faces in the player list.
+    pub faces: Vec<HudFace>,
     sorted: Vec<HudEffect>,
 }
 
@@ -347,23 +361,12 @@ impl HudLayout {
         self.items.clear();
         self.over.clear();
         self.texts_used = 0;
+        self.faces.clear();
     }
 
-    /// The frame's lines of text, drawn over everything else of the HUD.
+    /// The frame's lines of text, each over so many of [`Self::over`] and under the rest.
     pub fn texts(&self) -> &[HudText] {
         &self.texts[..self.texts_used]
-    }
-
-    fn text(&mut self, text: std::fmt::Arguments<'_>, x: i32, y: i32, color: u32, shadow: bool) {
-        use std::fmt::Write;
-        if self.texts_used == self.texts.len() {
-            self.texts.push(HudText::default());
-        }
-        let t = &mut self.texts[self.texts_used];
-        t.text.clear();
-        let _ = t.text.write_fmt(text);
-        (t.x, t.y, t.color, t.shadow) = (x, y, color, shadow);
-        self.texts_used += 1;
     }
 
     /// Lays out the frame's HUD (`Hud.extractRenderState`, for what there is of it).
@@ -371,10 +374,13 @@ impl HudLayout {
         &mut self,
         sprites: &HudSprites,
         font: &Font,
+        lang: &dyn Lang,
         view: &HudView<'_>,
         health: &mut HudHealth,
+        memory: &mut HudMemory,
     ) {
         self.clear();
+        memory.begin();
         self.crosshair(sprites, view);
         if !view.hud.spectator {
             self.hotbar(sprites, font, view);
@@ -383,7 +389,19 @@ impl HudLayout {
             self.player_health(sprites, view, health);
             self.experience(sprites, font, view);
         }
+        let words = &mut Words {
+            sprites,
+            font,
+            lang,
+            view,
+            memory,
+        };
+        if !view.hud.spectator {
+            self.selected_name(words);
+        }
         self.effects(sprites, view);
+        self.bosses(words);
+        self.words(words);
     }
 
     /// `extractCrosshair`. A spectator's shows only on what it can open, which is not
@@ -906,9 +924,11 @@ mod tests {
             width: 427,
             height: 240,
             millis,
+            now: Instant::now(),
             options,
         };
-        layout.build(&sprites, &font(), &view, health);
+        let mut memory = HudMemory::default();
+        layout.build(&sprites, &font(), &(), &view, health, &mut memory);
         Laid { names, layout }
     }
 
@@ -1260,7 +1280,10 @@ mod tests {
         // "30" is 12 wide: black on four sides, then green.
         let texts = l.layout.texts();
         assert_eq!(texts.len(), 5);
-        let places: Vec<(i32, i32, u32)> = texts.iter().map(|t| (t.x, t.y, t.color)).collect();
+        let places: Vec<(i32, i32, u32)> = texts
+            .iter()
+            .map(|t| (t.x as i32, t.y as i32, t.color))
+            .collect();
         assert_eq!(
             places,
             [
@@ -1341,7 +1364,7 @@ mod tests {
         assert_eq!(texts.len(), 1);
         assert_eq!(
             (texts[0].text.as_str(), texts[0].x, texts[0].y),
-            ("64", 125 + 17 - 12, 230)
+            ("64", (125 + 17 - 12) as f32, 230.0)
         );
         assert!(texts[0].shadow);
         // A quarter worn: a black bar with ten of thirteen units lit, between yellow and

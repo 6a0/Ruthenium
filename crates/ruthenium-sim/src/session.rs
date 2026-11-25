@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use ruthenium_net::connection::{
     Closed, ConnectOptions, Connection, Event, Local, Protocol, Reason, Stage,
 };
+use ruthenium_protocol::nbt::{Compound, Tag};
 use ruthenium_protocol::packets::configuration::{self as cfg, RegistryEntry, RegistryTags};
 use ruthenium_protocol::packets::{
     ClientInformation, Common, KnownPack, MainHand, PackAction, play, read_brand,
@@ -49,10 +50,12 @@ use crate::entity::{Entities, EntityTypes, Local as LocalInfo, PlayerInfos, Team
 use crate::environment::{Clocks, Environment, LocalRegistries};
 use crate::first_person::{self, Destruction};
 use crate::handoff::{Handoff, HandoffStats, Item, Limits, Take, Taken};
+use crate::hud_text::{ChatTypes, HudTextState};
 use crate::input::next_scroll_selection;
 use crate::interact::{self, GameMode, UseKeys};
 use crate::inventory::Hand;
 use crate::item::Items;
+use crate::item_name::translation;
 use crate::level_load::LevelLoad;
 use crate::light::LightTable;
 use crate::pick;
@@ -196,6 +199,8 @@ struct FrameInput {
     attack_clicks: u32,
     /// A screen is open over the world (keys and clicks aren't read).
     screen_open: bool,
+    /// The player list's key is held.
+    player_list: bool,
     /// The game was paused this frame (`pauseGame`): breaking stops.
     paused: bool,
     /// Scroll-wheel notches, in order.
@@ -357,17 +362,19 @@ impl Session {
     /// ([`Session::handoff_stats`] counts it).
     pub fn frame(&self) -> u64 {
         let mut input = lock(&self.input);
-        let (keys, use_down, attack_down, screen_open) = (
+        let (keys, use_down, attack_down, screen_open, player_list) = (
             input.keys,
             input.use_down,
             input.attack_down,
             input.screen_open,
+            input.player_list,
         );
         let frame = std::mem::take(&mut *input);
         input.keys = keys;
         input.use_down = use_down;
         input.attack_down = attack_down;
         input.screen_open = screen_open;
+        input.player_list = player_list;
         drop(input);
         let events = frame.scrolls.len() + frame.turns.len();
         let turns = frame.turns.clone();
@@ -480,6 +487,11 @@ impl Session {
     /// the ticks then read no keys, and attacks wait for the attack key to be let go.
     pub fn set_screen_open(&self, open: bool) {
         lock(&self.input).screen_open = open;
+    }
+
+    /// Whether the player list's key is held: the frames then carry the list.
+    pub fn set_player_list(&self, shown: bool) {
+        lock(&self.input).player_list = shown;
     }
 
     /// The game is paused (`pauseGame`: the Game Menu opens): breaking a block stops.
@@ -597,8 +609,14 @@ struct Game {
     held_keys: Keys,
     /// The world is hardcore (the login says).
     hardcore: bool,
-    /// The HUD's own counters (`Hud.tick`).
+    /// The HUD's own counters (`Hud.tick`), and what it says in words.
     hud: crate::hud::HudState,
+    hud_text: HudTextState,
+    /// How the configuration's kinds of chat message are written.
+    chat_types: ChatTypes,
+    /// The player list's key is held; the list shows faces (the server checks accounts).
+    player_list: bool,
+    online_mode: bool,
     /// The profile name the server knows the player by (its scoreboard name), and its
     /// UUID (its player list entry).
     name: String,
@@ -626,6 +644,9 @@ const MINECART_IMPROVEMENTS: &str = "minecraft:minecart_improvements";
 const GAME_EVENT_CHANGE_GAME_MODE: u8 = 3;
 const GAME_EVENT_IMMEDIATE_RESPAWN: u8 = 11;
 const GAME_EVENT_LEVEL_CHUNKS_LOAD_START: u8 = 13;
+
+/// `LevelEvent.SOUND_PLAY_JUKEBOX_SONG`.
+const LEVEL_EVENT_RECORD_STARTS: i32 = 1010;
 
 /// `EntityEvent.USE_ITEM_COMPLETE`.
 const ENTITY_EVENT_USE_ITEM_COMPLETE: u8 = 9;
@@ -773,6 +794,10 @@ impl Game {
             held_keys: Keys::default(),
             hardcore: false,
             hud: crate::hud::HudState::default(),
+            hud_text: HudTextState::default(),
+            chat_types: ChatTypes::default(),
+            player_list: false,
+            online_mode: false,
             name: String::new(),
             uuid: 0,
             players: PlayerInfos::default(),
@@ -1005,6 +1030,9 @@ impl Game {
         });
         let own_skin = &self.own_skin;
         let (hud, hardcore) = (&self.hud, self.hardcore);
+        let (hud_text, players) = (&mut self.hud_text, &self.players);
+        let (teams, scoreboard) = (&self.teams, &self.scoreboard);
+        let (own_name, list, faces) = (&self.name, self.player_list, self.online_mode);
         self.publisher.publish_frame(
             || Frame::new(now, w.environment.clone(), w.dimension_name.clone()),
             |f| {
@@ -1064,6 +1092,16 @@ impl Game {
                 r.parts = self.information.model_parts;
                 r.left_handed = self.information.main_hand == MainHand::Left;
                 f.hud.fill(hud, p, hardcore, r.left_handed, target_alive);
+                hud_text.fill(
+                    &mut f.hud.texts,
+                    hud.highlight(),
+                    own_name,
+                    list,
+                    faces,
+                    players,
+                    teams,
+                    scoreboard,
+                );
                 r.invisible = p.data.flags & crate::player::flag::INVISIBLE != 0;
                 r.on_fire = p.data.flags & crate::player::flag::ON_FIRE != 0;
                 r.sleeping = p.is_sleeping();
@@ -1128,6 +1166,7 @@ impl Game {
         self.use_keys.attack_down = input.attack_down;
         self.use_keys.attack_clicks += input.attack_clicks;
         self.screen_open = input.screen_open;
+        self.player_list = input.player_list;
         // The death screen or the bed screen took the keys (`KeyMapping.releaseAll`)
         // and keeps them.
         if self.death_screen.is_some() || self.bed_screen {
@@ -1444,6 +1483,36 @@ impl Game {
         physics.items = std::sync::Arc::new(items);
     }
 
+    /// How the kinds of chat message the configuration's registry lists are written.
+    fn configured_chat_types(&self) -> ChatTypes {
+        let entries = self
+            .configured
+            .registries
+            .iter()
+            .find(|(r, _)| r == "minecraft:chat_type")
+            .map_or(&[][..], |(_, e)| e.as_slice());
+        ChatTypes::from_registry(entries)
+    }
+
+    /// What a song of the jukebox registry is called: as the server says, else as
+    /// vanilla's of that name is.
+    fn song_name(&self, id: i32) -> Option<Tag> {
+        let (_, entries) = self
+            .configured
+            .registries
+            .iter()
+            .find(|(r, _)| r == "minecraft:jukebox_song")?;
+        let entry = entries.get(usize::try_from(id).ok()?)?;
+        let own = entry
+            .data
+            .as_ref()
+            .and_then(|d| d.as_compound()?.get("description").cloned());
+        Some(own.unwrap_or_else(|| {
+            let key = format!("jukebox_song.{}", entry.id.replace([':', '/'], "."));
+            translation(&key, Vec::new())
+        }))
+    }
+
     /// A level's entities, the player's among them.
     fn new_entities(&self, player_id: i32) -> Entities {
         let improved = self
@@ -1486,7 +1555,10 @@ impl Game {
             return;
         };
         // `gui.tick`, before anything of the level ticks.
-        self.hud.tick(&w.player);
+        if self.hud.tick(&w.player) {
+            self.hud_text.select(self.hud.selected());
+        }
+        self.hud_text.tick(self.hud.ticks());
         let mut out = Vec::new();
         // `rightClickDelay`, then `gameMode.tick`: the held slot first, then the
         // connection's tick, where the listener lets the player in once the level is
@@ -1794,6 +1866,7 @@ impl Game {
                 }
                 self.configured = c;
                 self.transformers = self.configured_transformers();
+                self.chat_types = self.configured_chat_types();
                 self.configure_enchantments();
                 log_configured(&self.configured, self.server_brand.as_deref());
                 self.connection
@@ -1818,8 +1891,12 @@ impl Game {
                 self.common(c, play::cookie_response, play::resource_pack, play::pong)
             }
             play::Clientbound::StartConfiguration => {
-                // Vanilla also sends a pending chat acknowledgement first; there is no
-                // chat yet. The level goes (`clearLevel`), and with it the ticks' packets.
+                // What was taken in of the chat first. The level goes (`clearLevel`), and
+                // with it the ticks' packets.
+                if let Some(offset) = self.hud_text.take_acknowledgement() {
+                    self.connection.send(play::chat_ack(offset));
+                }
+                self.hud_text.reconfigure();
                 self.connection
                     .switch(Protocol::Configuration, play::configuration_acknowledged());
                 self.phase = Phase::Configuration;
@@ -1851,6 +1928,7 @@ impl Game {
                 world.player.entity_id = login.player_id;
                 world.player.show_death_screen = login.show_death_screen;
                 self.hardcore = login.hardcore;
+                self.online_mode = login.online_mode;
                 self.world = Some(world);
             }
             play::Clientbound::Respawn {
@@ -2176,6 +2254,22 @@ impl Game {
                 passengers,
             } => {
                 if let Some(w) = &mut self.world {
+                    // Getting on something says how to get off.
+                    let mounted = w.player.riding.as_ref().map(|r| r.vehicle) == Some(vehicle);
+                    if !mounted
+                        && passengers.contains(&w.player.entity_id)
+                        && let Some(on) = w.entities.get(vehicle)
+                    {
+                        let key = if on.info.key == "minecraft:cushion" {
+                            "mount.sit"
+                        } else {
+                            "mount.onboard"
+                        };
+                        let mut sneak = Compound::new();
+                        sneak.put("keybind", Tag::String("key.sneak".into()));
+                        let text = translation(key, vec![Tag::Compound(sneak)]);
+                        self.hud_text.set_overlay(text, false);
+                    }
                     if let Some((y, x)) = w.entities.set_passengers(vehicle, &passengers) {
                         w.player.y_rot = y % 360.0;
                         // A boat turns the head too.
@@ -2202,10 +2296,11 @@ impl Game {
                 name,
                 method,
                 display_name,
+                hearts,
                 number_format,
             } => self
                 .scoreboard
-                .set_objective(&name, method, display_name, number_format),
+                .set_objective(&name, method, display_name, hearts, number_format),
             play::Clientbound::SetDisplayObjective { slot, objective } => {
                 self.scoreboard.set_display(slot, &objective);
             }
@@ -2213,11 +2308,11 @@ impl Game {
                 owner,
                 objective,
                 score,
+                display,
                 number_format,
-                ..
             } => self
                 .scoreboard
-                .set_score(&owner, &objective, score, number_format),
+                .set_score(&owner, &objective, score, display, number_format),
             play::Clientbound::ResetScore { owner, objective } => {
                 self.scoreboard.reset_score(&owner, objective.as_deref());
             }
@@ -2518,6 +2613,59 @@ impl Game {
             | play::Clientbound::SetBorderWarningDistance { .. }) => {
                 if let Some(w) = &mut self.world {
                     w.level.border.handle(&p);
+                }
+            }
+            play::Clientbound::SystemChat { content, overlay } => {
+                if overlay {
+                    self.hud_text.set_overlay(content, false);
+                } else {
+                    self.hud_text.system_message(self.hud.ticks(), content);
+                }
+            }
+            play::Clientbound::PlayerChat(chat) => {
+                let time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |t| t.as_millis() as i64);
+                let known = self.players.get(chat.sender).is_some();
+                let ticks = self.hud.ticks();
+                let told =
+                    self.hud_text
+                        .player_chat(ticks, time, &chat, known, &self.chat_types)?;
+                if let Some(offset) = told {
+                    self.connection.send(play::chat_ack(offset));
+                }
+            }
+            play::Clientbound::DisguisedChat { message, kind } => {
+                let ticks = self.hud.ticks();
+                self.hud_text
+                    .disguised(ticks, &message, &kind, &self.chat_types)?;
+            }
+            play::Clientbound::DeleteChat { signature } => {
+                self.hud_text.delete_chat(self.hud.ticks(), &signature)?;
+            }
+            play::Clientbound::SetActionBarText { text } => self.hud_text.set_overlay(text, false),
+            play::Clientbound::SetTitleText { text } => self.hud_text.set_title(text),
+            play::Clientbound::SetSubtitleText { text } => self.hud_text.set_subtitle(text),
+            play::Clientbound::SetTitlesAnimation {
+                fade_in,
+                stay,
+                fade_out,
+            } => self.hud_text.set_title_times([fade_in, stay, fade_out]),
+            play::Clientbound::ClearTitles { reset_times } => {
+                self.hud_text.clear_titles(reset_times);
+            }
+            play::Clientbound::BossEvent { id, event } => {
+                self.hud_text.boss_event(id, event, Instant::now());
+            }
+            play::Clientbound::TabList { header, footer } => {
+                self.hud_text.set_tab_list(header, footer);
+            }
+            play::Clientbound::LevelEvent { event, data, .. } => {
+                // A record starts to play: what it is called shows.
+                if event == LEVEL_EVENT_RECORD_STARTS
+                    && let Some(song) = self.song_name(data)
+                {
+                    self.hud_text.now_playing(song);
                 }
             }
             play::Clientbound::Other(kind) => {
@@ -3276,6 +3424,216 @@ mod tests {
         let f = r.frame(100);
         assert_eq!(f.hud.ticks, ticks + i32::try_from(f.ticks).unwrap());
         assert!(f.hud.ticks > ticks);
+    }
+
+    #[test]
+    fn what_the_server_says_reaches_the_frame() {
+        use ruthenium_protocol::packets::play::{BoundChatType, ChatTypeRef};
+        let text = |s: &str| Tag::String(s.to_owned());
+        let mut r = rig(None);
+        r.packet(login());
+        r.game.configured.registries.push((
+            "minecraft:chat_type".into(),
+            vec![
+                entry("minecraft:chat", None),
+                entry("minecraft:emote_command", None),
+            ],
+        ));
+        r.game.chat_types = r.game.configured_chat_types();
+        r.game.configured.registries.push((
+            "minecraft:jukebox_song".into(),
+            vec![entry("minecraft:cat", None)],
+        ));
+        let ticks = r.frame(50).hud.ticks;
+        r.packet(play::Clientbound::SystemChat {
+            content: text("hello"),
+            overlay: false,
+        });
+        r.packet(play::Clientbound::DisguisedChat {
+            message: text("waves"),
+            kind: BoundChatType {
+                kind: ChatTypeRef::Id(1),
+                name: text("Kai"),
+                target: None,
+            },
+        });
+        r.packet(play::Clientbound::SetTitlesAnimation {
+            fade_in: 1,
+            stay: 50,
+            fade_out: 2,
+        });
+        r.packet(play::Clientbound::SetSubtitleText { text: text("sub") });
+        r.packet(play::Clientbound::SetTitleText {
+            text: text("title"),
+        });
+        r.packet(play::Clientbound::BossEvent {
+            id: 1,
+            event: play::BossEvent::Add {
+                name: text("boss"),
+                progress: 1.0,
+                color: 0,
+                overlay: 0,
+                flags: 0,
+            },
+        });
+        r.packet(play::Clientbound::SystemChat {
+            content: text("over"),
+            overlay: true,
+        });
+        let t = r.frame(1).hud.texts.clone();
+        assert_eq!(t.chat.len(), 2);
+        assert_eq!(
+            (&*t.chat[1].content, t.chat[1].added),
+            (&text("hello"), ticks)
+        );
+        let emote = t.chat[0].content.as_compound().unwrap();
+        assert_eq!(emote.string("translate"), Some("chat.type.emote"));
+        let title = t.title.unwrap();
+        assert_eq!((&*title.title, title.time), (&text("title"), 53));
+        assert_eq!(title.subtitle.as_deref(), Some(&text("sub")));
+        assert_eq!(*t.bosses[0].name, text("boss"));
+        assert_eq!(*t.overlay.unwrap().text, text("over"));
+        // The action bar's own packet; and a record that starts to play.
+        r.packet(play::Clientbound::SetActionBarText { text: text("bar") });
+        let o = r.frame(1).hud.texts.overlay.clone().unwrap();
+        assert_eq!((&*o.text, o.animated), (&text("bar"), false));
+        let record = |event, data| play::Clientbound::LevelEvent {
+            event,
+            pos: [0; 3],
+            data,
+            global: false,
+        };
+        r.packet(record(1011, 0));
+        r.packet(record(1010, 5));
+        assert!(!r.frame(1).hud.texts.overlay.as_ref().unwrap().animated);
+        r.packet(record(1010, 0));
+        let o = r.frame(1).hud.texts.overlay.clone().unwrap();
+        assert!(o.animated);
+        let song = o.text.as_compound().unwrap().list("with")[0].clone();
+        assert_eq!(
+            song.as_compound().unwrap().string("translate"),
+            Some("jukebox_song.minecraft.cat")
+        );
+        // Time passes: the title goes on, and goes.
+        let t = r.frame(1000).hud.texts.clone();
+        assert!(t.title.unwrap().time < 53);
+        r.packet(play::Clientbound::ClearTitles { reset_times: true });
+        assert_eq!(r.frame(1).hud.texts.title, None);
+        // The sidebar, with the scores' names.
+        r.packet(play::Clientbound::SetObjective {
+            name: "o".into(),
+            method: 0,
+            display_name: Some(text("Points")),
+            hearts: false,
+            number_format: None,
+        });
+        r.packet(play::Clientbound::SetDisplayObjective {
+            slot: play::DISPLAY_SLOT_SIDEBAR,
+            objective: "o".into(),
+        });
+        r.packet(play::Clientbound::SetScore {
+            owner: "x".into(),
+            objective: "o".into(),
+            score: 3,
+            display: Some(text("The X")),
+            number_format: None,
+        });
+        let bar = r.frame(1).hud.texts.sidebar.clone().unwrap();
+        assert_eq!(
+            (&*bar.title, &*bar.lines[0].0),
+            (&text("Points"), &text("The X"))
+        );
+        // The player list while its key is held, with faces where accounts are checked.
+        r.packet(play::Clientbound::TabList {
+            header: text("top"),
+            footer: text(""),
+        });
+        assert_eq!(r.frame(1).hud.texts.players, None);
+        let held = || FrameInput {
+            player_list: true,
+            ..FrameInput::default()
+        };
+        let f = r.frame_with(1, held());
+        let list = f.hud.texts.players.clone().unwrap();
+        assert_eq!(
+            (list.header.as_deref(), list.faces),
+            (Some(&text("top")), false)
+        );
+        r.game.online_mode = true;
+        r.packet(play::Clientbound::TabList {
+            header: text("top"),
+            footer: text("end"),
+        });
+        assert!(
+            r.frame_with(1, held())
+                .hud
+                .texts
+                .players
+                .as_ref()
+                .unwrap()
+                .faces
+        );
+        assert_eq!(r.frame(1).hud.texts.players, None);
+        // A reconfiguration keeps the chat and nothing of the play connection's.
+        r.packet(play::Clientbound::StartConfiguration);
+        r.game.phase = Phase::Play;
+        r.packet(login());
+        let t = r.frame(1).hud.texts.clone();
+        assert!(t.chat.len() == 2 && t.bosses.is_empty() && t.sidebar.is_none());
+    }
+
+    #[test]
+    fn getting_on_something_says_how_to_get_off() {
+        use ruthenium_data::v26_3::registries::EntityType;
+        // (With the prepared game: what can be got on is its.)
+        let Some(physics) = physics() else {
+            return;
+        };
+        let mut r = rig(Some(physics));
+        r.packet(login());
+        r.frame(50);
+        let own = r.game.world.as_ref().unwrap().player.entity_id;
+        for (entity_id, name) in [(900, "minecraft:oak_boat"), (901, "minecraft:cushion")] {
+            r.packet(play::Clientbound::AddEntity(Box::new(play::AddEntity {
+                entity_id,
+                uuid: entity_id as u128,
+                entity_type: EntityType::from_name(name).unwrap().id() as i32,
+                position: [0.0, 10.0, 0.0],
+                movement: [0.0; 3],
+                x_rot: 0,
+                y_rot: 0,
+                y_head_rot: 0,
+                data: 0,
+            })));
+        }
+        let mut sit = |vehicle: i32, passengers: &[i32]| {
+            r.packet(play::Clientbound::SetPassengers {
+                vehicle,
+                passengers: passengers.to_vec(),
+            });
+            let overlay = r.frame(50).hud.texts.overlay.clone()?;
+            let c = overlay.text.as_compound()?;
+            let key = c.string("translate")?.to_owned();
+            let with = c.list("with")[0]
+                .as_compound()?
+                .string("keybind")?
+                .to_owned();
+            Some((key, with, overlay.time))
+        };
+        // What is not there is not got on, and others' getting on says nothing.
+        assert_eq!(sit(77, &[own]), None);
+        assert_eq!(sit(900, &[5]), None);
+        let (key, with, time) = sit(900, &[own]).unwrap();
+        assert_eq!(
+            (key.as_str(), with.as_str()),
+            ("mount.onboard", "key.sneak")
+        );
+        // Another getting on too says it no second time.
+        for n in 1..4 {
+            assert_eq!(sit(900, &[own, 5]).unwrap().2, time - n);
+        }
+        sit(900, &[]);
+        assert_eq!(sit(901, &[own]).unwrap().0, "mount.sit");
     }
 
     #[test]

@@ -16,8 +16,11 @@ use super::place;
 const OBFUSCATED: usize = 512;
 /// Lines on one side of a sign.
 const LINES: usize = 4;
+/// How far inside the edge of its texels a glyph's picture is sampled, in texels
+/// (`FontTexture`'s nudge; the world's text has its own in `sign_vert.glsl`).
+const INSIDE: f32 = 0.01;
 /// How far bold glyphs reach over their box on every side.
-const BOLD_EDGE: f32 = 0.1;
+pub(crate) const BOLD_EDGE: f32 = 0.1;
 /// How much nearer the second copy of a bold glyph lies, and how much nearer a bar.
 const BOLD_NEARER: f32 = 0.001;
 const BAR_NEARER: f32 = 0.01;
@@ -144,7 +147,12 @@ fn first_piece<'a>(line: &'a [(char, Style)], font: &Font, width: f32) -> &'a [(
 
 /// Which character is drawn: for obfuscated ones another of the same width, by `pick`
 /// (a number below the given one).
-fn drawn(c: char, style: Style, font: &Font, pick: &mut dyn FnMut(usize) -> usize) -> char {
+pub(crate) fn drawn(
+    c: char,
+    style: Style,
+    font: &Font,
+    pick: &mut dyn FnMut(usize) -> usize,
+) -> char {
     if !style.obfuscated || c == ' ' {
         return c;
     }
@@ -486,7 +494,9 @@ impl GlyphPages {
         let texture = self.pages.get(slot.page)?.texture?.index();
         let side = PAGE as f32;
         let (x, y) = (slot.x as f32, slot.y as f32);
-        let uv = [x, y, x + slot.width as f32, y + slot.height as f32].map(|c| c / side);
+        let (right, bottom) = (x + slot.width as f32, y + slot.height as f32);
+        // A little inside the edge of its texels, as the game's are.
+        let uv = [x + INSIDE, y + INSIDE, right - INSIDE, bottom - INSIDE].map(|c| c / side);
         Some((texture, uv))
     }
 

@@ -11,7 +11,7 @@ struct Quad {
     uint color;   // 0xAARRGGBB
     uint texture; // texture table index, or GUI_NO_TEXTURE
     uint smp;     // how the texture is read: a SAMPLER_* index (0: nearest, clamped)
-    uint pad;
+    uint slant;   // how far the top and the bottom edge lie to the right: two halves
 };
 #define FRAME_ELEMENT Quad
 #include "frame.glsl"
@@ -41,7 +41,10 @@ void main() {
     Quad q = frame_data[pc.first + gl_InstanceIndex];
     // Corners of two triangles: (0,0) (1,0) (0,1), (0,1) (1,0) (1,1).
     vec2 corner = vec2((0x32 >> gl_VertexIndex) & 1, (0x2C >> gl_VertexIndex) & 1);
-    vec2 pixel = mix(q.rect.xy, q.rect.zw, corner) * pc.scale;
+    vec2 place = mix(q.rect.xy, q.rect.zw, corner);
+    vec2 slant = unpackHalf2x16(q.slant);
+    place.x += mix(slant.x, slant.y, corner.y);
+    vec2 pixel = place * pc.scale;
     v_uv = mix(q.uv.xy, q.uv.zw, corner);
     // unpackUnorm4x8 reads the lowest byte first: B, G, R, A.
     v_color = unpackUnorm4x8(q.color).zyxw;
