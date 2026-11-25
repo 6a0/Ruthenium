@@ -543,14 +543,26 @@ impl Pass<'_> {
     /// # Safety
     /// As [`Self::bind_vertex_buffer`], for indices.
     pub unsafe fn bind_index_buffer(&mut self, buffer: vk::Buffer, offset: u64) {
+        // SAFETY: the caller's.
+        unsafe { self.bind_index_buffer_of(buffer, offset, false) }
+    }
+
+    /// Binds `buffer` from `offset` as the index buffer of the draws that follow: of
+    /// 32-bit indices if `wide`, else of 16-bit ones.
+    ///
+    /// # Safety
+    /// As [`Self::bind_vertex_buffer`], for indices.
+    pub unsafe fn bind_index_buffer_of(&mut self, buffer: vk::Buffer, offset: u64, wide: bool) {
+        let kind = if wide {
+            vk::IndexType::UINT32
+        } else {
+            vk::IndexType::UINT16
+        };
         // SAFETY: inside the pass; the rest is the caller's guarantee.
         unsafe {
-            self.gpu.device.cmd_bind_index_buffer(
-                self.ctx.cmd,
-                buffer,
-                offset,
-                vk::IndexType::UINT16,
-            );
+            self.gpu
+                .device
+                .cmd_bind_index_buffer(self.ctx.cmd, buffer, offset, kind);
         }
     }
 

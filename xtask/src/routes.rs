@@ -120,6 +120,17 @@ impl Route {
         Ok(route)
     }
 
+    /// The same route begun at `position` (the player's feet) looking with `yaw` and
+    /// `pitch`, hovering there in creative flight: for pictures of a chosen place.
+    pub fn at(mut self, position: [f64; 3], yaw: f32, pitch: f32) -> Route {
+        self.position = position;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.flying = true;
+        self.id = fnv1a(&self.json().to_string());
+        self
+    }
+
     pub fn total(&self) -> u64 {
         self.segments.iter().map(|s| s.0).sum()
     }

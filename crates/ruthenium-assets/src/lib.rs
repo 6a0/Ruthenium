@@ -9,6 +9,7 @@
 //!   and mip-mapped exactly as 26.3 does, composed on the CPU.
 //! - [`model`]: every block state's model, baked into quads as 26.3 bakes them.
 
+pub mod animation;
 pub mod atlas;
 pub mod id;
 pub mod image;
@@ -20,6 +21,7 @@ pub mod resources;
 pub mod stitch;
 pub mod zip;
 
+pub use animation::AtlasAnimations;
 pub use atlas::{ATLASES, Atlas, AtlasDef, AtlasOptions};
 pub use id::Id;
 pub use image::Image;

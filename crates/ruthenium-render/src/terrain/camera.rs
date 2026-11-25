@@ -25,6 +25,25 @@ pub struct CameraPose {
     pub fov: f32,
 }
 
+impl CameraPose {
+    /// The directions the camera looks along, has to its right and has above it.
+    pub fn axes(&self) -> [[f32; 3]; 3] {
+        let (yaw, pitch) = (self.y_rot.to_radians(), self.x_rot.to_radians());
+        let forward = [
+            -yaw.sin() * pitch.cos(),
+            -pitch.sin(),
+            yaw.cos() * pitch.cos(),
+        ];
+        let right = [-yaw.cos(), 0.0, -yaw.sin()];
+        let up = [
+            right[1] * forward[2] - right[2] * forward[1],
+            right[2] * forward[0] - right[0] * forward[2],
+            right[0] * forward[1] - right[1] * forward[0],
+        ];
+        [forward, right, up]
+    }
+}
+
 /// A camera for one frame and one target shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct View {
@@ -49,19 +68,7 @@ impl View {
     pub fn new(pose: &CameraPose, aspect: f32) -> View {
         let block = pose.position.map(|c| c.floor() as i32);
         let offset = std::array::from_fn(|i| -(pose.position[i] - f64::from(block[i])) as f32);
-        let (yaw, pitch) = (pose.y_rot.to_radians(), pose.x_rot.to_radians());
-        // The directions the camera looks along, has to its right and has above it.
-        let forward = [
-            -yaw.sin() * pitch.cos(),
-            -pitch.sin(),
-            yaw.cos() * pitch.cos(),
-        ];
-        let right = [-yaw.cos(), 0.0, -yaw.sin()];
-        let up = [
-            right[1] * forward[2] - right[2] * forward[1],
-            right[2] * forward[0] - right[0] * forward[2],
-            right[0] * forward[1] - right[1] * forward[0],
-        ];
+        let [forward, right, up] = pose.axes();
         let g = 1.0 / (pose.fov.to_radians() / 2.0).tan();
         let gx = g / aspect;
         // Rows: x to the right, y down the target, the near plane's depth, and the

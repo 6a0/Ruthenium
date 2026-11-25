@@ -2,7 +2,7 @@
 
 What Ruthenium's world renderer costs on the routes the vanilla client was measured on, and where its frame time, memory and latency go. It measures an unfinished renderer: read [what the scene leaves out](#what-ruthenium-draws-and-what-it-does-not) before any ratio. The vanilla numbers are the dedicated-server runs of [baseline.md](baseline.md); the menus' own cost is in [menu-baseline.md](menu-baseline.md).
 
-There are two measurements here, both of 2026-11-24 and in release. The first, from the working tree on top of `d447d22`, is of a renderer that meshed every loaded section and drew every one inside the view: everything from [Against vanilla](#against-vanilla) on, where nothing else is said. The second, on top of `50564e0`, is of [cave culling](#cave-culling), which is the default since. A third, on top of `92e7bb6`, is of the terrain drawn as vanilla's shader draws it, with fog and sky: [the picture against vanilla's](#the-picture-against-vanillas), which also holds the two clients' pictures against each other for the first time.
+The release measurements here were taken on 2026-11-24. The first, from the working tree on top of `d447d22`, is of a renderer that meshed every loaded section and drew every one inside the view: everything from [Against vanilla](#against-vanilla) on, where nothing else is said. The second, on top of `50564e0`, is of [cave culling](#cave-culling), which is the default since. A third, on top of `92e7bb6`, is of the terrain drawn as vanilla's shader draws it, with fog and sky: [the picture against vanilla's](#the-picture-against-vanillas), which also holds the two clients' pictures against each other for the first time. A fourth, on top of `63b6734`, adds [water, lava and translucent blocks](#water-lava-and-translucent-blocks). On 2026-11-25 short runs on the same working tree followed for [animated textures and the camera inside fluids](#animated-textures-and-the-camera-inside-fluids).
 
 ## Machine and conditions
 
@@ -132,7 +132,8 @@ A ratio above compares two different pictures.
 - **Left out in the measurements above:** water and lava, translucent blocks, block entities, entities and the player's hand, the sky, clouds, fog and the fade-in of new chunks, smooth lighting and ambient occlusion, biome colours, animated textures, the time of day, particles and every part of the HUD but the crosshair. Vanilla draws all of them in its runs.
 - **Drawn since these runs:** smooth lighting with ambient occlusion, and the biomes' colours on grass, leaves and the like, both worked out when a section is meshed, as vanilla does. The vertices stay as they were (a colour and two lights each), so a frame draws the same quads at the same cost: one run each with and without smooth lighting, with a viewer on the streamed desktop, gave 2697 and 2683 FPS on average in idle and 3687 and 3695 in fly, the GPU's 0.206 and 0.120 ms in both. Meshing a section took 0.31 to 0.38 ms on a worker at the spawn in three joins, for 0.24 ms in one join lit flat and untinted. The medians above were not measured again.
 - **Drawn since, at a cost:** the terrain as vanilla's shader draws it (its texture filtering, both fogs, the fade-in of new sections), the sky, and the time of day in the light, the fog and the sky. [The picture against vanilla's](#the-picture-against-vanillas) has what that looks like and what it costs.
-- **Still left out:** water and lava, translucent blocks, block entities, entities and the player's hand, clouds, animated textures, particles, the weather's rain and snow, what the camera sees from inside water, lava or powder snow, the effects on the player (blindness, darkness, night vision) and every part of the HUD but the crosshair.
+- **Also drawn since those runs.** Water and lava, including fluid in waterlogged blocks, and translucent block faces such as stained glass and ice.
+- **Still left out:** block entities, entities and the player's hand, clouds, particles, the weather's rain and snow, the overlays of a burning player and of a player inside a block, the effects on the player (blindness, darkness, night vision, a conduit's) and every part of the HUD but the crosshair.
 - **Drawn in excess, in the first measurement:** every loaded section that had anything to draw got a mesh, and every one of those inside the view's frustum was drawn, hidden or not: at the spawn 925 sections and 522,119 quads in view, of 4,037 with a mesh among 15,288 loaded. Vanilla builds and draws only what its occlusion graph reaches, and with [cave culling](#cave-culling) so does Ruthenium, by the same rules: 405 sections and 291,723 quads, of 1,409 with a mesh. One difference remains: Ruthenium meshes what the walk reaches behind the camera too, where vanilla builds a section when it is first inside the view.
 - **The same pixels whichever way the sections are drawn.** The frame after the route's end, captured with `--screenshot`, is the same file byte for byte with direct, paged and indirect draws, at the spawn and at the end of the fly route.
 
@@ -158,7 +159,7 @@ Not there yet: clouds, rain and snow themselves, what a camera sees from inside 
 | sunset (12600) | 98.6% | 99.4% | 0.54% | 100.0% |
 | midnight (18000) | 98.9% | 99.5% | 0.50% | 100.0% |
 
-What is more than 8 steps apart is what Ruthenium does not draw: the water at the frame's right edge (8,345 of the 11,466 such pixels at noon), a handful of animals, and its own crosshair. The pixels one step apart are on leaves and plants, in both directions; the cause was not looked for. With vanilla's HUD on, its vignette alone darkens the frame by up to 4% towards the edges.
+In those shader-only captures, the differences over 8 steps included the then-missing water at the frame's right edge (8,345 of the 11,466 such pixels at noon), a handful of animals, and its own crosshair. The pixels one step apart are on leaves and plants, in both directions; the cause was not looked for. With vanilla's HUD on, its vignette alone darkens the frame by up to 4% towards the edges.
 
 So the sky's and the fog's colours, the sun's glow, the stars, the light by day and by night, the smooth lighting and the biomes' colours are vanilla's at this place at these three times, with the time standing still. Not compared: a picture in motion or with time passing, rain, another biome's fog, the Nether and the End (looked at, not held against vanilla), and distances at which most texels are smaller than a pixel.
 
@@ -196,6 +197,85 @@ Where the GPU's time goes, from one run of 20 s for each way of drawing (the fra
 - **Where a fragment's constants come from mattered more than what is done with them.** Read from the frame's data for every pixel, the fog's colour and ranges and the atlas's size made fog and fade cost 0.051 ms instead of 0.010 in idle, and the default 0.298 ms instead of 0.270 in runs of the same day under one condition (a viewer on the stream). They are push constants now, and the terrain's and the sky's fragment stages read nothing of the frame's data.
 - **The sky's order** was expected to matter on a GPU bound by its pixels. On this one the sky is 3% of a frame either way; the Intel iGPU is where it has to be measured.
 - The main thread's work is 0.049 to 0.075 ms a frame, of which working out the fog, the sky and the light map is part of the terrain's stage, 0.001 ms at the median as before. The rise in idle from 0.054 is in recording the frame (0.046 to 0.064 ms), with the same draws; it comes with the longer wait for the GPU and was not looked into.
+
+## Water, lava and translucent blocks
+
+The mesher now emits sloped fluid surfaces and the translucent faces of block models. With the game's textures, lava draws with solid terrain. Water, stained glass and ice draw after the opaque terrain and sky. Sections draw farthest first, and workers update each section's quad order as the camera changes position. When the pictures and times below were taken, the camera used atmospheric fog beneath a fluid surface and fluid textures showed one animation frame. Both have [come since](#animated-textures-and-the-camera-inside-fluids).
+
+### Pictures at rest
+
+Six pairs from the 26.3 dedicated server at 1920 × 1080. Each percentage counts whole pixels by the largest absolute difference across their three RGB channels. Both clients recorded the same position and chunk checksums in each pair. Vanilla animates its atlas during the capture.
+
+| Scene | Identical | Within 1 of 255 | More than 8 apart |
+|---|---:|---:|---:|
+| Spawn at noon | 95.32% | 99.78% | 0.16% |
+| Ocean from above | 52.81% | 73.30% | 2.31% |
+| Stained glass, ice and flowing water | 74.94% | 89.89% | 2.28% |
+| Pools beside open and glass-covered pits | 96.11% | 98.82% | 0.49% |
+| Pools over different ground | 93.68% | 96.94% | 1.57% |
+| Lava fall, water, glass and ice | 77.47% | 79.93% | 12.71% |
+
+In the last pair, the overlapping red and blue glass agrees within one step in all 34,000 pixels of the rectangle from (808, 300) to (978, 500), upper bounds excluded. The ice does too across (1090, 450) to (1210, 565). The flowing lava and the surface of the pool differ visibly. The four Ruthenium PNGs of this scene are byte-identical with direct, paged and indirect draws and with frustum-only culling. These are stationary views. They leave the visible delay of a resort during camera motion unmeasured.
+
+### Cost of drawing the translucent layer
+
+One on/off pair per route on the RTX 4060, 5 s warm-up and 20 s capture, direct draws, view distance 12. Each pair matched its position and chunk checksums. A 60 FPS video encoding session was active before and after all six runs. Both settings mesh the fluids and build the initial indices. `--translucent off` skips the translucent draws and subsequent resorts. Lava still draws in the solid layer.
+
+| Route | Off, FPS avg / 1% / 0.1% low | On, FPS avg / 1% / 0.1% low | GPU median ms, off → on | Translucent quads / sections at capture end | Resorts installed during capture |
+|---|---:|---:|---:|---:|---:|
+| Idle at spawn | 2147 / 344 / 319 | 1917 / 339 / 318 | 0.257 → 0.275 | 54,071 / 208 | 0 |
+| Fly | 3067 / 362 / 328 | 2434 / 350 / 322 | 0.162 → 0.214 | 79,653 / 211 | 5,816 |
+| Fly over the ocean | 1426 / 317 / 298 | 1288 / 311 / 293 | 0.394 → 0.452 | 57,256 / 246 | 3,534 |
+
+The median GPU cost rose by 0.018 to 0.058 ms in these pairs. The main thread's median work rose by 0.015 to 0.021 ms. Sampling each variant once with the desktop streamed limits what these lows say about normal frame pacing. The separate ocean flight with synchronization validation installed 5,015 resorts by exit and logged no validation errors. Raw run records and the screenshot pairs are kept locally under `cache/bench/results/fluids-2026-11-24-rtx4060/`.
+
+### Mutation checks
+
+All 32 selected mutations were detected. The render tests caught 12 changes to fluid geometry and shading, nine to sorting and index encoding, and seven to the software rasteriser. The RTX 4060 fixture caught all four GPU changes with both direct and indirect draws. The unmodified fixture had zero mismatches across 59 probe regions in 684 direct frames and 675 indirect frames.
+
+One blend error initially passed. Using source alpha for the destination weight gives nearly the right byte value at half alpha, and over clear the destination contributes zero. A new probe draws a 26/255-alpha texel over solid terrain, where the two weights give visibly different results. Two other probes exercise a later draw behind a pane and behind a discarded texel. The sort tests also check that quad 16,384 still uses 16-bit indices and quad 16,385 switches to 32 bits.
+
+### Reproducing the checks
+
+```sh
+cargo test -p ruthenium-render --lib
+python3 tools/test-render-mutations.py
+python3 tools/test-render-mutations.py --gpu     # display and multi-draw indirect support
+cargo xtask bench dedicated --accept-eula --client ruthenium --scene idle,fly \
+    --width 960 --height 540 --warmup 5 --duration 20 --reps 1 \
+    --variant ruthenium --variant 'opaque=--translucent off'
+```
+
+For the ocean flight use `--scene fly --at -120,82,-100,0,30`. For the aerial picture use `--client vanilla,ruthenium --scene idle --variant 'ruthenium=--light-flicker off' --bare-picture --at 4.5,116,2.5,90,35`. The window dimensions above assume the machine's 2× display scale. The harness also accepts a repeated `--setup` for server commands that build a scene after teleporting the player.
+
+## Animated textures and the camera inside fluids
+
+The block atlas's 56 animated sprites play as in 26.3: once in a frame in which the game has ticked, not while it is frozen, with every mip level written from its own frame and interpolated sprites mixed every tick. The camera's medium sets the fog and, in lava and powder snow, hides the sky. In water and lava the field of view shrinks to six sevenths, and with the player's eyes in water the picture of water lies over the frame. The eyes get used to water over 30 seconds. `--animations off` and `--fov-effects off` turn off what the names say; pictures that are to be the same file need the first.
+
+### Pictures from inside
+
+Pairs at 1920 × 1080 with `--bare-picture`, which turns vanilla's FOV Effects off, so Ruthenium ran with `--fov-effects off`; its narrowing is tested by rule only. Positions and chunk checksums agree in each pair.
+
+| Scene | Identical | Within 1 of 255 | More than 8 apart | What differs |
+|---|---:|---:|---:|---|
+| A lit tank of water, after 30 s in it | 86.38% | 94.84% | 1.22% | Vanilla's particles, our crosshair, the surface's animation frame |
+| In powder snow | 99.99% | 99.99% | 0.01% | Our crosshair |
+| In lava | 59.65% | 59.65% | 40.35% | Vanilla's burning overlay, over plain fog of the same colour in both |
+| A kelp forest in the ocean | 24.67% to 84.32% | | | The plants' animation frames, right in front of the camera |
+
+The two clients' animations have no common phase, so a picture of moving textures is not a comparison of them. Their timing is checked instead against the game's own animation states: 2,000 made-up animations over 64 ticks each, every frame, tick count and decision to write equal. A debug run inside the tank under synchronization validation logged no message.
+
+### Cost
+
+A tick writes about 42 sprites, 0.5 MiB with padding and mips. Written in one frame, that took 0.75 ms of the main thread at P99.9 in idle and cost 18% of the 1% low and 35% of the 0.1% low in a single pair. Two changes followed: a row of a frame is mixed once and copied over the padding, and frames shorter than 8 ms share a tick's sprites among them. Single 20 s runs with desktop encoding active, after both changes:
+
+| Route | Off, FPS avg / 1% / 0.1% low | On, FPS avg / 1% / 0.1% low | GPU median ms, off → on |
+|---|---:|---:|---:|
+| Idle | 2204 / 1433 / 1169 | 2176 / 1410 / 1146 | 0.278 → 0.278 |
+| Idle, again | 2197 / 1406 / 1173 | 2182 / 1410 / 1165 | 0.278 → 0.278 |
+| Fly | 2818 / 1584 / 1211 | 2804 / 1574 / 1254 | 0.214 → 0.214 |
+
+An earlier idle run with animations on, the first of its set, gave 2061 / 1123 / 810 and is not in the table; the two later pairs with the order reversed did not repeat it. No full campaign was run.
 
 ## Where a frame's time goes
 
@@ -266,7 +346,7 @@ Two runs before those fixes also showed frames waiting 2.5 ms for the GPU about 
 ## Not measured yet
 
 - **The Intel iGPU, AMD and Macs.** Every number here is one discrete NVIDIA GPU's. Which way of drawing is fastest, and whether a frame ahead pays, may differ where the GPU is slow and memory is shared.
-- **The whole picture.** Everything [still left out](#what-ruthenium-draws-and-what-it-does-not) has yet to be drawn, and no ratio here is a result until it is. Pictures are compared with vanilla's [at one place, at rest, at three times of day](#the-two-pictures).
+- **The whole picture.** Everything [still left out](#what-ruthenium-draws-and-what-it-does-not) has yet to be drawn, and no ratio here is a result until it is. Stationary comparisons cover three times of day at spawn and six views with fluids and glass. [Time of day](#the-two-pictures) · [Fluids and glass](#pictures-at-rest).
 - **The shader's variants and the sky's order on the Intel iGPU**, where a frame is bound by its pixels: what RGSS, the shorter RGSS, fog and fade and the sky drawn late each cost there is what the options of [what it costs](#what-it-costs) are for.
 - **Whether vanilla draws the same sections.** Cave culling follows vanilla's rules, but the vanilla runs did not record how many sections they drew, and the walk's order of work differs once meshes arrive.
 - **The picture in motion with cave culling.** The pictures compared are of scenes at rest. What a moving camera can miss is a section between being reached and having its mesh, 5 to 6 ms at P99 on these routes.

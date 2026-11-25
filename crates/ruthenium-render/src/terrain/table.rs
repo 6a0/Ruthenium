@@ -5,13 +5,14 @@
 
 use std::path::Path;
 
+use super::fluid::FluidModels;
 use super::tint::BiomeColour;
 use ruthenium_assets::BlockModels;
 use ruthenium_data::v26_3::blocks::STATE_COUNT;
 use ruthenium_data::v26_3::{Block, BlockState};
 use ruthenium_prepare::exporters::{
     self, BlockBehaviours, BlockPhysics, BlockRender, ShapeData, SkipRule, StateBehaviour,
-    StateRender, WorldTint,
+    StatePhysics, StateRender, WorldTint,
 };
 
 /// What a face occlusion shape is, as face culling asks first.
@@ -21,6 +22,19 @@ pub(crate) enum ShapeKind {
     /// The whole face (`Shapes.block()`).
     Full,
     Partial,
+}
+
+impl ShapeKind {
+    pub(crate) fn of(s: &ShapeData) -> ShapeKind {
+        let unit = s.coords.iter().all(|c| c[..] == [0.0, 1.0]);
+        if s.full.iter().all(|f| !f) {
+            ShapeKind::Empty
+        } else if unit && s.full[..] == [true] {
+            ShapeKind::Full
+        } else {
+            ShapeKind::Partial
+        }
+    }
 }
 
 /// A block state as the mesher reads it.
@@ -41,6 +55,11 @@ pub(crate) struct StateInfo {
     pub offset: u8,
     /// The state's tint layers: a range of the table's tints.
     pub tints: (u32, u8),
+    /// The state's fluid (`getFluidState`), as the physics export packs it
+    /// (`ruthenium_sim::fluid::FluidState::from_bits`); 0: none.
+    pub fluid: u8,
+    /// `isFaceSturdy`, a bit per direction ordinal.
+    pub sturdy: u8,
 }
 
 impl StateInfo {
@@ -63,6 +82,15 @@ impl StateInfo {
     pub const DARK: u16 = 128;
     /// `isLightPermeable`: something is seen through it, or it takes no light away.
     pub const PERMEABLE: u16 = 256;
+    /// `isSolid` (the legacy flag): a fluid's surface does not slope down towards it.
+    pub const SOLID: u16 = 512;
+    /// A `HalfTransparentBlock` or a `LeavesBlock`: water's side against it is drawn
+    /// with the overlay sprite.
+    pub const OVERLAY: u16 = 1024;
+    /// An `IceBlock`: falling fluid does not count its faces as walls.
+    pub const ICE: u16 = 2048;
+    /// In the `blocks_fluid_flow` block tag.
+    pub const BLOCKS_FLOW: u16 = 4096;
 }
 
 /// How a block is moved by its position (`BlockBehaviour.OffsetType`).
@@ -83,6 +111,8 @@ pub struct BlockTable {
     pub(crate) tints: Vec<Tint>,
     pub(crate) offsets: Vec<Offset>,
     pub(crate) mangrove_roots: u16,
+    pub(crate) powder_snow: u16,
+    pub(crate) fluids: FluidModels,
 }
 
 /// What a tint layer multiplies its faces by, 0xAARRGGBB.
@@ -114,16 +144,18 @@ fn tint(layer: &exporters::TintLayer, grass_default: u32) -> Tint {
 }
 
 impl BlockTable {
-    /// Puts the exports and the baked models together. `grass_default` is the grass
-    /// colour map's default colour (0xAARRGGBB), and `in_bars_tag` says whether a block
-    /// (by name) is in the `bars` block tag.
+    /// Puts the exports, the baked models and the fluids' sprites together.
+    /// `grass_default` is the grass colour map's default colour (0xAARRGGBB), and
+    /// `in_tag` says whether a block tag (`bars`, `blocks_fluid_flow`) has a block (by
+    /// name).
     pub fn new(
         physics: &BlockPhysics,
         behaviour: &BlockBehaviours,
         render: &BlockRender,
         models: BlockModels,
+        fluids: FluidModels,
         grass_default: u32,
-        in_bars_tag: &dyn Fn(&str) -> bool,
+        in_tag: &dyn Fn(&str, &str) -> bool,
     ) -> Result<BlockTable, String> {
         for (what, n) in [
             ("block_physics", physics.states.len()),
@@ -139,20 +171,7 @@ impl BlockTable {
         if render.shapes.len() > usize::from(u16::MAX) {
             return Err(format!("{} face shapes", render.shapes.len()));
         }
-        let kinds = render
-            .shapes
-            .iter()
-            .map(|s| {
-                let unit = s.coords.iter().all(|c| c[..] == [0.0, 1.0]);
-                if s.full.iter().all(|f| !f) {
-                    ShapeKind::Empty
-                } else if unit && s.full[..] == [true] {
-                    ShapeKind::Full
-                } else {
-                    ShapeKind::Partial
-                }
-            })
-            .collect();
+        let kinds = render.shapes.iter().map(ShapeKind::of).collect();
         let mut tints = Vec::new();
         let mut offsets = vec![Offset {
             vertical: false,
@@ -160,6 +179,9 @@ impl BlockTable {
             max_vertical: 0.0,
         }];
         let mut states = Vec::with_capacity(STATE_COUNT);
+        // What is asked of a block is asked once, not for each of its states.
+        let mut last_block = None;
+        let (mut overlay, mut blocks_flow) = (false, false);
         for (id, r) in render.states.iter().enumerate() {
             let id = id as u32;
             let state = BlockState::from_id(id).ok_or("a block state without an id")?;
@@ -190,9 +212,29 @@ impl BlockTable {
             if b.flags & StateBehaviour::SOLID_RENDER == 0 || p.light_dampening == 0 {
                 flags |= StateInfo::PERMEABLE;
             }
+            if b.flags & StateBehaviour::SOLID != 0 {
+                flags |= StateInfo::SOLID;
+            }
+            if p.flags & StatePhysics::ICE != 0 {
+                flags |= StateInfo::ICE;
+            }
+            if last_block != Some(block.id()) {
+                last_block = Some(block.id());
+                overlay = behaviour
+                    .blocks
+                    .get(block.id() as usize)
+                    .is_some_and(|c| c.is("HalfTransparentBlock") || c.is("LeavesBlock"));
+                blocks_flow = in_tag("blocks_fluid_flow", block.name());
+            }
+            if overlay {
+                flags |= StateInfo::OVERLAY;
+            }
+            if blocks_flow {
+                flags |= StateInfo::BLOCKS_FLOW;
+            }
             let mut connects = 0;
             if r.skip == SkipRule::Bars {
-                if in_bars_tag(block.name()) {
+                if in_tag("bars", block.name()) {
                     flags |= StateInfo::BARS;
                 }
                 for (direction, name) in [(2, "north"), (3, "south"), (4, "west"), (5, "east")] {
@@ -231,6 +273,8 @@ impl BlockTable {
                 seed_offset: r.seed_offset,
                 offset,
                 tints: (first_tint, r.tints.len() as u8),
+                fluid: p.fluid,
+                sturdy: p.sturdy,
             });
         }
         Ok(BlockTable {
@@ -242,6 +286,9 @@ impl BlockTable {
             offsets,
             mangrove_roots: Block::from_name("minecraft:mangrove_roots")
                 .map_or(u16::MAX, |b| b.id() as u16),
+            powder_snow: Block::from_name("minecraft:powder_snow")
+                .map_or(u16::MAX, |b| b.id() as u16),
+            fluids,
         })
     }
 
@@ -249,8 +296,9 @@ impl BlockTable {
     pub fn load(
         exports: &Path,
         models: BlockModels,
+        fluids: FluidModels,
         grass_default: u32,
-        in_bars_tag: &dyn Fn(&str) -> bool,
+        in_tag: &dyn Fn(&str, &str) -> bool,
     ) -> Result<BlockTable, String> {
         let read = |name: &str| {
             let path = exports.join(name);
@@ -261,8 +309,9 @@ impl BlockTable {
             &exporters::read_block_behaviour(&read(exporters::BLOCK_BEHAVIOUR)?)?,
             &exporters::read_block_render(&read(exporters::BLOCK_RENDER)?)?,
             models,
+            fluids,
             grass_default,
-            in_bars_tag,
+            in_tag,
         )
     }
 

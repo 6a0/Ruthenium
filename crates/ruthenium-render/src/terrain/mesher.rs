@@ -8,20 +8,25 @@
 //! lit flat (`ModelBlockRenderer.tesselateFlat`): on the block's boundary by the block
 //! it looks into, else by the block's own place. Every face is shaded by the direction
 //! it looks in (the dimension's cardinal light) and multiplied by its tint. Quads go to
-//! the solid or the cutout layer by
-//! their texture; translucent ones are counted and left out, as are fluids and blocks
-//! that block entities draw, until their steps.
+//! the solid, the cutout or the translucent layer by their texture. A block's fluid is
+//! meshed before its model ([`super::fluid`]), and goes to the layer its sprites say.
+//! Every translucent quad also leaves the point it is sorted by ([`super::sort`]), in
+//! the order the quads were made. Blocks that block entities draw are left out until
+//! their step.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use ruthenium_assets::{BakedQuad, Layer, ModelPart};
 use ruthenium_sim::blocks::{offset as block_offset, seed};
+use ruthenium_sim::fluid::FluidState;
 use ruthenium_sim::scene::{HALO_SIDE, Neighbourhood};
 
+use super::fluid::{self, FluidQuad};
 use super::smooth::{self, Cell, Face, Lit};
+use super::sort;
 use super::table::{BlockTable, ShapeKind, StateInfo, Tint, sticks_out};
-use super::tint::{BiomeTints, TintScratch};
+use super::tint::{BiomeColour, BiomeTints, TintScratch};
 use super::visibility::Connectivity;
 use crate::terrain_vertex::{Vertex, position_code, position_of, uv_code};
 
@@ -58,15 +63,17 @@ pub struct MeshOptions {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SectionMesh {
     /// Packed vertices, four per quad: the solid layer's quads, then the cutout
-    /// layer's.
+    /// layer's, then the translucent layer's.
     pub vertices: Vec<u8>,
     pub solid_quads: u32,
     pub cutout_quads: u32,
     /// The least and the greatest corner of everything drawn, in blocks from the
     /// section's corner; none for an empty mesh.
     pub bounds: Option<[[f32; 3]; 2]>,
-    /// Quads of the translucent layer, which are not drawn yet.
     pub translucent_quads: u32,
+    /// The point each translucent quad is sorted by, in the quads' order, in blocks
+    /// from the section's corner.
+    pub centres: Vec<[f32; 3]>,
     /// Corners and texture coordinates outside what a vertex can hold (they were moved
     /// to the nearest value it can).
     pub out_of_range: u32,
@@ -77,7 +84,7 @@ pub struct SectionMesh {
 
 impl SectionMesh {
     pub fn quads(&self) -> u32 {
-        self.solid_quads + self.cutout_quads
+        self.solid_quads + self.cutout_quads + self.translucent_quads
     }
 }
 
@@ -89,6 +96,7 @@ pub struct Mesher {
     /// Whether a face shape sticks out of the shape over it, by the two shapes.
     pairs: HashMap<(u16, u16), bool>,
     cutout: Vec<u8>,
+    translucent: Vec<u8>,
     /// What smooth lighting has read of each block of the scratch so far, packed
     /// ([`pack_cell`]); 0: not read yet.
     cells: Vec<u16>,
@@ -227,6 +235,7 @@ impl Mesher {
                 .expect("the size it was made with"),
             pairs: HashMap::new(),
             cutout: Vec::new(),
+            translucent: Vec::new(),
             cells: Vec::new(),
             tints: TintScratch::default(),
         }
@@ -283,6 +292,8 @@ impl Mesher {
         let mut out = SectionMesh::default();
         let mut cutout = std::mem::take(&mut self.cutout);
         cutout.clear();
+        let mut translucent = std::mem::take(&mut self.translucent);
+        translucent.clear();
         let mut cells = std::mem::take(&mut self.cells);
         cells.clear();
         if options.smooth_lighting {
@@ -308,6 +319,78 @@ impl Mesher {
                     if state.flags & StateInfo::SOLID_RENDER != 0 {
                         let i = (x | z << 4 | y << 8) as usize;
                         solid[i >> 6] |= 1 << (i & 63);
+                    }
+                    // `SectionCompiler.compile`: the block's fluid, then its model.
+                    let in_block = FluidState::from_bits(state.fluid);
+                    if !in_block.is_empty() {
+                        let blocks = &*self.blocks;
+                        let state_at = |p: [i32; 3]| {
+                            *table.state(u32::from(blocks[halo_index(p[0], p[1], p[2])]))
+                        };
+                        fluid::tesselate(
+                            &table,
+                            &options.shades,
+                            [x, y, z],
+                            &state,
+                            in_block,
+                            &state_at,
+                            &|p| light_at(n, &state_at(p), p),
+                            || {
+                                tints
+                                    .colour(
+                                        n,
+                                        biomes,
+                                        options.biome_blend,
+                                        BiomeColour::Water,
+                                        [x, y, z],
+                                    )
+                                    .unwrap_or(u32::MAX)
+                            },
+                            &mut |layer, quad: &FluidQuad| {
+                                let vertices = match layer {
+                                    Layer::Solid => &mut out.vertices,
+                                    Layer::Cutout => &mut cutout,
+                                    Layer::Translucent => {
+                                        out.centres.push(sort::centre(
+                                            quad.vertices[0].position,
+                                            quad.vertices[2].position,
+                                        ));
+                                        &mut translucent
+                                    }
+                                };
+                                let c = quad.colour;
+                                let colour =
+                                    [(c >> 16) as u8, (c >> 8) as u8, c as u8, (c >> 24) as u8];
+                                for v in &quad.vertices {
+                                    let mut position = [0u16; 3];
+                                    for a in 0..3 {
+                                        let p = v.position[a];
+                                        position[a] = position_code(p).unwrap_or_else(|| {
+                                            out.out_of_range += 1;
+                                            if p < 0.0 { 0 } else { u16::MAX }
+                                        });
+                                        let p = position_of(position[a]);
+                                        min[a] = min[a].min(p);
+                                        max[a] = max[a].max(p);
+                                    }
+                                    let uv = [0, 1].map(|a| {
+                                        let t = v.uv[a] * table.fluids.atlas[a];
+                                        uv_code(t).unwrap_or_else(|| {
+                                            out.out_of_range += 1;
+                                            if t < 0.0 { 0 } else { u16::MAX }
+                                        })
+                                    });
+                                    Vertex {
+                                        position,
+                                        block_light: quad.light.0 << 4,
+                                        sky_light: quad.light.1 << 4,
+                                        colour,
+                                        uv,
+                                    }
+                                    .pack(vertices);
+                                }
+                            },
+                        );
                     }
                     if state.flags & StateInfo::DRAWN == 0 {
                         continue;
@@ -354,8 +437,10 @@ impl Mesher {
                             }
                             Layer::Cutout => &mut cutout,
                             Layer::Translucent => {
-                                out.translucent_quads += 1;
-                                return;
+                                let corner =
+                                    |i: usize| std::array::from_fn(|a| base[a] + q.positions[i][a]);
+                                out.centres.push(sort::centre(corner(0), corner(2)));
+                                &mut translucent
                             }
                         };
                         let tint = usize::try_from(q.tint_index)
@@ -468,8 +553,11 @@ impl Mesher {
         }
         out.solid_quads = (out.vertices.len() / (4 * crate::terrain_vertex::VERTEX_BYTES)) as u32;
         out.cutout_quads = (cutout.len() / (4 * crate::terrain_vertex::VERTEX_BYTES)) as u32;
+        out.translucent_quads = out.centres.len() as u32;
         out.vertices.extend_from_slice(&cutout);
+        out.vertices.extend_from_slice(&translucent);
         self.cutout = cutout;
+        self.translucent = translucent;
         self.cells = cells;
         self.tints = tints;
         if out.quads() > 0 {
@@ -1067,17 +1155,246 @@ mod tests {
     }
 
     #[test]
-    fn translucent_quads_are_counted_and_left_out() {
+    fn translucent_quads_come_last_with_the_points_they_are_sorted_by() {
         let mut world = World::new(&[(0, 0)]);
         world.set(3, 3, 3, testing::ice());
         world.set(4, 3, 3, testing::ice());
+        world.set(8, 3, 3, testing::stone());
+        world.set(9, 3, 3, testing::glass());
+        let m = mesh(&mut world, [0, 0, 0]);
+        // The faces between the two blocks of ice are left out; the stone's face
+        // towards the glass is not.
+        assert_eq!(
+            (m.solid_quads, m.cutout_quads, m.translucent_quads),
+            (6, 5, 10)
+        );
+        assert_eq!(m.quads(), 21);
+        assert_eq!(m.vertices.len(), 21 * 4 * VERTEX_BYTES);
+        assert_eq!(m.bounds, Some([[3.0, 3.0, 3.0], [10.0, 4.0, 4.0]]));
+        let all = quads(&m);
+        let ice = &all[11..];
+        assert!(ice.iter().all(|q| (3.0..=5.0).contains(&corners(q)[0][0])));
+        // A point for each, in their order: half-way between a quad's first and third
+        // corner, which for a block's face is its middle.
+        assert_eq!(m.centres.len(), 10);
+        for (q, centre) in ice.iter().zip(&m.centres) {
+            let c = corners(q);
+            assert_eq!(*centre, sort::centre(c[0], c[2]));
+            let d = facing(q).unwrap();
+            let block = if c.iter().all(|p| p[0] >= 4.0) {
+                4.0
+            } else {
+                3.0
+            };
+            let middle: [f32; 3] =
+                std::array::from_fn(|a| [block, 3.0, 3.0][a] + 0.5 + 0.5 * STEPS[d][a] as f32);
+            assert_eq!(*centre, middle);
+        }
+        // The first block's faces before the second's, in the directions' order.
+        assert_eq!(
+            ice.iter().map(|q| facing(q).unwrap()).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 0, 1, 2, 3, 5]
+        );
+    }
+
+    /// The translucent quads of a mesh.
+    fn translucent(m: &SectionMesh) -> Vec<[Vertex; 4]> {
+        quads(m).split_off((m.solid_quads + m.cutout_quads) as usize)
+    }
+
+    #[test]
+    fn a_lone_source_of_water_slopes_down_all_round_and_is_seen_from_inside() {
+        let mut world = World::new(&[(0, 0)]);
+        world.set(5, 5, 7, testing::stone());
+        world.set(5, 6, 7, testing::water(0));
+        world.light(0, 0, 0, 13, 4);
+        let m = mesh(&mut world, [0, 0, 0]);
+        // The stone, then the water: its top and four sides, each with its other
+        // side; the stone covers its underside.
+        assert_eq!(
+            (m.solid_quads, m.cutout_quads, m.translucent_quads),
+            (6, 0, 10)
+        );
+        let water = translucent(&m);
+        // Every corner is the mean of the source (counted ten times) and the two open
+        // blocks beside it there, less a thousandth: 80/9 over 12, in 2048ths. (The
+        // block across the corner only counts where one of the two has fluid.)
+        let top = corners(&water[0]);
+        let height = (8.0_f32 / 9.0 * 10.0) / 12.0 - 0.001;
+        for c in top {
+            assert_eq!(c[1], position_of(position_code(6.0 + height).unwrap()));
+        }
+        assert_eq!(facing(&water[0]), Some(1));
+        // The same corners the other way round.
+        let below = corners(&water[1]);
+        assert_eq!(
+            [below[0], below[1], below[2], below[3]],
+            [top[0], top[3], top[2], top[1]]
+        );
+        assert_eq!(facing(&water[1]), Some(0));
+        // North, east, south, west, each a thousandth inside the block.
+        assert_eq!(
+            water[2..]
+                .iter()
+                .map(|q| facing(q).unwrap())
+                .collect::<Vec<_>>(),
+            [2, 3, 5, 4, 3, 2, 4, 5]
+        );
+        let inset = position_of(position_code(7.001).unwrap());
+        assert!(
+            corners(&water[2])
+                .iter()
+                .all(|c| c[2] == inset && c[2] > 7.0)
+        );
+        assert_eq!(m.centres.len(), 10);
+        assert_eq!(m.centres[0], m.centres[1]);
+        for q in &water {
+            for v in q {
+                // No biome's colour is known: white, shaded by the way the face looks.
+                assert_eq!((v.block_light, v.sky_light), (4 << 4, 13 << 4));
+                assert_eq!(v.colour[3], 255);
+            }
+        }
+        assert_eq!(water[0][0].colour, [255, 255, 255, 255]);
+        assert_eq!(water[2][0].colour, [204, 204, 204, 255]);
+        assert_eq!(water[4][0].colour, [153, 153, 153, 255]);
+        // The still sprite on top, the upper left quarter of the flowing one on a
+        // side, from as far down it as the side is short of a block.
+        let texels = |q: &[Vertex; 4]| q.map(|v| v.uv.map(|c| f32::from(c) / 8.0));
+        assert_eq!(
+            texels(&water[0]),
+            [[64.0, 0.0], [64.0, 16.0], [80.0, 16.0], [80.0, 0.0]]
+        );
+        let side = texels(&water[2]);
+        assert_eq!(
+            (side[0][0], side[1][0], side[2], side[3]),
+            (80.0, 88.0, [88.0, 8.0], [80.0, 8.0])
+        );
+        assert!((side[0][1] - (1.0 - height) * 8.0).abs() <= 1.0 / 16.0 + 1e-4);
+    }
+
+    #[test]
+    fn water_in_a_pool_is_only_its_top() {
+        let mut world = World::new(&[(0, 0)]);
+        for x in 4..7 {
+            for z in 4..7 {
+                world.set(x, 2, z, testing::stone());
+                world.set(x, 3, z, testing::water(0));
+            }
+        }
+        let m = mesh(&mut world, [0, 0, 0]);
+        let water = translucent(&m);
+        // The middle block: its top and the top's underside, level at eight ninths.
+        let middle: Vec<_> = water
+            .iter()
+            .filter(|q| {
+                corners(q)
+                    .iter()
+                    .all(|c| (5.0..=6.0).contains(&c[0]) && (5.0..=6.0).contains(&c[2]))
+            })
+            .collect();
+        assert_eq!(middle.len(), 2);
+        let level = position_of(position_code(3.0 + 8.0_f32 / 9.0 - 0.001).unwrap());
+        assert!(corners(middle[0]).iter().all(|c| c[1] == level));
+        // Under more water a block fills its space and has no top at all.
+        world.set(5, 4, 5, testing::water(0));
+        let m = mesh(&mut world, [0, 0, 0]);
+        let water = translucent(&m);
+        let lower_tops = water
+            .iter()
+            .filter(|q| {
+                let c = corners(q);
+                facing(q) == Some(1)
+                    && c.iter().all(|p| {
+                        p[1] < 4.0 && (5.0..=6.0).contains(&p[0]) && (5.0..=6.0).contains(&p[2])
+                    })
+            })
+            .count();
+        assert_eq!(lower_tops, 0);
+        // Its neighbours' corners there rise to the full block.
+        assert!(water.iter().any(|q| corners(q).iter().any(|c| c[1] == 4.0)));
+    }
+
+    #[test]
+    fn lava_is_solid_and_as_bright_as_it_glows() {
+        let mut world = World::new(&[(0, 0)]);
+        world.set(5, 5, 7, testing::stone());
+        world.set(5, 6, 7, testing::lava(0));
+        world.light(0, 0, 0, 0, 2);
         let m = mesh(&mut world, [0, 0, 0]);
         assert_eq!(
             (m.solid_quads, m.cutout_quads, m.translucent_quads),
-            (0, 0, 10)
+            (16, 0, 0)
         );
-        assert!(m.vertices.is_empty());
-        assert_eq!(m.bounds, None);
+        assert!(m.centres.is_empty());
+        let all = quads(&m);
+        // The stone's top is hidden by nothing (lava covers no face) and lit by the
+        // lava's own light; the lava itself is lit by it too.
+        for q in &all[6..] {
+            assert!(q.iter().all(|v| (v.block_light, v.sky_light) == (240, 0)));
+            assert_eq!(q[0].colour[3], 255);
+        }
+        // Lava's sprites: still at 112, flowing at 128.
+        assert_eq!(all[6][0].uv, [112 * 8, 0]);
+    }
+
+    #[test]
+    fn a_block_with_water_in_it_is_its_water_and_then_its_model() {
+        let mut world = World::new(&[(0, 0)]);
+        world.set(5, 6, 7, testing::wet_slab());
+        let m = mesh(&mut world, [0, 0, 0]);
+        // The slab's own six faces; the water's top and sides with their other sides,
+        // and no underside: the slab's own bottom face covers it.
+        assert_eq!(
+            (m.solid_quads, m.cutout_quads, m.translucent_quads),
+            (6, 0, 10)
+        );
+        assert!(translucent(&m).iter().all(|q| {
+            let c = corners(q);
+            // Nothing of the water reaches below the block's floor.
+            facing(q) != Some(0) || c.iter().any(|p| p[1] > 6.5)
+        }));
+        // Beside stone the side towards it is still drawn (only the same fluid and
+        // the block's own shape hide a side), but a full block of water above hides
+        // the top.
+        world.set(5, 7, 7, testing::water(0));
+        let m = mesh(&mut world, [0, 0, 0]);
+        let wet: Vec<_> = translucent(&m)
+            .into_iter()
+            .filter(|q| corners(q).iter().all(|c| c[1] <= 7.0))
+            .collect();
+        assert_eq!(wet.len(), 8);
+        assert!(wet.iter().all(|q| facing(q).is_some_and(|d| d >= 2)));
+        // Under the same fluid the block is full to its top.
+        assert!(wet.iter().any(|q| corners(q).iter().any(|c| c[1] == 7.0)));
+    }
+
+    #[test]
+    fn flowing_water_turns_its_texture_the_way_it_flows() {
+        let mut world = World::new(&[(0, 0)]);
+        for x in 3..9 {
+            world.set(x, 2, 5, testing::stone());
+            world.set(x, 3, 4, testing::stone());
+            world.set(x, 3, 6, testing::stone());
+        }
+        // Lower and lower towards the east.
+        for (x, level) in [(4, 1), (5, 2), (6, 3)] {
+            world.set(x, 3, 5, testing::water(level));
+        }
+        let m = mesh(&mut world, [0, 0, 0]);
+        let water = translucent(&m);
+        let top = water
+            .iter()
+            .find(|q| facing(q).is_none() && corners(q).iter().all(|c| (5.0..=6.0).contains(&c[0])))
+            .expect("the middle block's sloping top");
+        // The top slopes down to the east.
+        let c = corners(top);
+        assert!(c[0][1] > c[3][1] && c[1][1] > c[2][1]);
+        // The flowing sprite (80 to 96), its middle half, turned a quarter so that its
+        // rows run along the flow: the north-west corner has the sprite's upper right
+        // quarter point, the south-west one its upper left.
+        let uv = top.map(|v| v.uv.map(|c| f32::from(c) / 8.0));
+        assert_eq!(uv, [[92.0, 4.0], [84.0, 4.0], [84.0, 12.0], [92.0, 12.0]]);
     }
 
     #[test]

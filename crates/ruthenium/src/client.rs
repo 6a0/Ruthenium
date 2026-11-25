@@ -176,6 +176,12 @@ pub struct Options {
     pub sky: Option<ruthenium_render::SkyOrder>,
     /// Whether block light flickers (the default) or holds still.
     pub light_flicker: Option<bool>,
+    /// Whether the terrain's translucent layer is drawn (the default) or left out.
+    pub translucent: Option<bool>,
+    /// Whether animated textures play (the default) or hold still.
+    pub animations: Option<bool>,
+    /// Whether the field of view narrows in water and lava (the default).
+    pub fov_effects: Option<bool>,
 }
 
 impl Options {
@@ -235,6 +241,9 @@ impl Options {
             chunk_fade_ms: None,
             sky: None,
             light_flicker: None,
+            translucent: None,
+            animations: None,
+            fov_effects: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -425,16 +434,19 @@ impl Options {
                             "--terrain-shader: not rgss, rgss-reference, nearest or plain: {v}"
                         ))?);
                 }
-                "--fog" | "--light-flicker" => {
+                "--fog" | "--light-flicker" | "--translucent" | "--animations"
+                | "--fov-effects" => {
                     let on = match value("on or off")?.as_str() {
                         "on" => true,
                         "off" => false,
                         v => return Err(format!("{a}: not on or off: {v}")),
                     };
-                    if a == "--fog" {
-                        o.fog = Some(on);
-                    } else {
-                        o.light_flicker = Some(on);
+                    match a.as_str() {
+                        "--fog" => o.fog = Some(on),
+                        "--light-flicker" => o.light_flicker = Some(on),
+                        "--animations" => o.animations = Some(on),
+                        "--fov-effects" => o.fov_effects = Some(on),
+                        _ => o.translucent = Some(on),
                     }
                 }
                 "--chunk-fade" => {
@@ -722,6 +734,15 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     if let Some(order) = opts.sky {
         renderer.set_sky_order(order);
+    }
+    if let Some(on) = opts.translucent {
+        renderer.set_translucent(on);
+    }
+    if let Some(on) = opts.animations {
+        renderer.set_animate(on);
+    }
+    if let Some(on) = opts.fov_effects {
+        renderer.set_fov_effects(if on { 1.0 } else { 0.0 });
     }
     {
         let mut air = renderer.atmosphere_options();
@@ -1354,6 +1375,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 "fog": renderer.atmosphere_options().fog,
                 "chunk_fade_ms": renderer.chunk_fade_ms(),
                 "sky": renderer.sky_order().name(),
+                "translucent": renderer.translucent(),
+                "animations": renderer.animate(),
+                "fov_effects": renderer.fov_effects(),
                 "light_flicker": renderer.atmosphere_options().flicker,
                 "mesh_workers": menu.mesh_workers(),
                 "envelope_bytes": ruthenium_render::terrain::POOL_ENVELOPE,
@@ -1580,7 +1604,16 @@ fn terrain_json(s: &ruthenium_render::WorldStats) -> Value {
         "mesh_micros": s.mesh_micros,
         "slowest_mesh_micros": s.slowest_mesh_micros,
         "slowest_install_ms": s.slowest_install_ms,
-        "translucent_quads_left_out": s.translucent_quads,
+        "translucent_quads": s.translucent_quads,
+        "translucent_sorts": s.sorts,
+        "translucent_quads_drawn": s.translucent_drawn,
+        "translucent_sections_drawn": s.translucent_sections,
+        "animated_sprites": s.animated_sprites,
+        "animation_ticks": s.animation_ticks,
+        "animation_writes": s.animation_writes,
+        "animation_bytes": s.animation_bytes,
+        "animation_waits": s.animation_waits,
+        "slowest_animation_micros": s.slowest_animation_micros,
         "out_of_range": s.out_of_range,
         "meshes_dropped": s.dropped,
         "sections_overflowed": s.overflowed,

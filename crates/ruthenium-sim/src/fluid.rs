@@ -417,6 +417,19 @@ impl FluidInteraction {
         h
     }
 
+    /// One whose eyes are in `fluid`.
+    #[cfg(test)]
+    pub(crate) fn with_eyes_in(fluid: Fluid) -> FluidInteraction {
+        FluidInteraction {
+            trackers: vec![Tracker {
+                fluid,
+                height: 1.0,
+                eyes_inside: true,
+            }],
+            ..FluidInteraction::default()
+        }
+    }
+
     /// `isInFluid`.
     pub fn is_in(&self, water: bool) -> bool {
         self.height(water) > 0.0

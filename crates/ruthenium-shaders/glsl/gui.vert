@@ -10,8 +10,8 @@ struct Quad {
     vec4 uv;      // u0, v0, u1, v1
     uint color;   // 0xAARRGGBB
     uint texture; // texture table index, or GUI_NO_TEXTURE
-    uint pad0;
-    uint pad1;
+    uint smp;     // how the texture is read: a SAMPLER_* index (0: nearest, clamped)
+    uint pad;
 };
 #define FRAME_ELEMENT Quad
 #include "frame.glsl"
@@ -25,6 +25,7 @@ layout(push_constant) uniform Push {
 layout(location = 0) out vec2 v_uv;
 layout(location = 1) out vec4 v_color;
 layout(location = 2) flat out uint v_texture;
+layout(location = 3) flat out uint v_sampler;
 
 void main() {
     // The start-up warm-up draws every pipeline with zeroed push constants and unwritten
@@ -34,6 +35,7 @@ void main() {
         v_uv = vec2(0.0);
         v_color = vec4(0.0);
         v_texture = 0xFFFFFFFFu;
+        v_sampler = 0u;
         return;
     }
     Quad q = frame_data[pc.first + gl_InstanceIndex];
@@ -44,5 +46,6 @@ void main() {
     // unpackUnorm4x8 reads the lowest byte first: B, G, R, A.
     v_color = unpackUnorm4x8(q.color).zyxw;
     v_texture = q.texture;
+    v_sampler = q.smp;
     gl_Position = vec4(pixel / pc.screen * 2.0 - 1.0, 0.0, 1.0);
 }

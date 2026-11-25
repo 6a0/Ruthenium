@@ -59,6 +59,9 @@ const DELTA_Z: u32 = 1 << 7;
 const ROTATE_DELTA: u32 = 1 << 8;
 
 /// Java's `Math.toRadians` constant, and the game's float degrees-to-radians.
+/// Ticks with the eyes in water until the player sees there as well as it gets.
+const WATER_VISION_TICKS: i32 = 600;
+
 const DEGREES_TO_RADIANS: f64 = 0.017453292519943295;
 pub(crate) const DEG_TO_RAD_F: f32 = 0.017453292;
 
@@ -711,6 +714,8 @@ pub struct LocalPlayer {
     in_water: bool,
     /// `LocalPlayer.wasUnderwater`: the eyes were in water at the start of the tick.
     was_underwater: bool,
+    /// How used to seeing under water the eyes are (`waterVisionTime`).
+    water_vision_time: i32,
     first_tick: bool,
     // `sendChanges` state.
     last_sent_keys: Keys,
@@ -910,6 +915,7 @@ impl LocalPlayer {
             fluids: FluidInteraction::default(),
             in_water: false,
             was_underwater: false,
+            water_vision_time: 0,
             first_tick: true,
             last_sent_keys: Keys::default(),
             last_sent: [0.0; 3],
@@ -1086,6 +1092,35 @@ impl LocalPlayer {
     /// `isEyeInFluid(WATER)`, as the last fluid update left it.
     pub fn is_eye_in_water(&self) -> bool {
         self.fluids.eye_in(true)
+    }
+
+    /// The eyes get used to the water they are in, over 30 seconds (a spectator's ten
+    /// times as fast), and lose it ten times as fast out of it.
+    fn tick_water_vision(&mut self) {
+        let change = if !self.is_eye_in_water() {
+            -10
+        } else if self.spectator {
+            10
+        } else {
+            1
+        };
+        self.water_vision_time = (self.water_vision_time + change).clamp(0, WATER_VISION_TICKS);
+    }
+
+    /// How well the player sees under water (`getWaterVision`): 0 with the eyes out of
+    /// it, 0.6 of the way within the first 5 seconds in it, 1 after 30.
+    pub fn water_vision(&self) -> f32 {
+        if !self.is_eye_in_water() {
+            return 0.0;
+        }
+        if self.water_vision_time >= WATER_VISION_TICKS {
+            return 1.0;
+        }
+        let time = self.water_vision_time as f32;
+        let soon = (time / 100.0).clamp(0.0, 1.0);
+        let later = ((time - 100.0) / 500.0).clamp(0.0, 1.0);
+        // The game's constant: a little under 0.4.
+        soon * 0.6 + later * 0.399_999_98
     }
 
     /// `handleUpdateMobEffect`.
@@ -2093,6 +2128,7 @@ impl LocalPlayer {
         if self.in_water && keys.shift && self.affected_by_fluids() {
             self.delta[1] += -0.03999999910593033;
         }
+        self.tick_water_vision();
         // Flying up and down.
         if self.abilities.flying {
             let ya = i32::from(keys.jump) - i32::from(keys.shift);
@@ -4103,6 +4139,22 @@ mod tests {
         assert!(!p.on_ground && !p.vertical_collision);
     }
 
+    #[test]
+    fn every_tick_out_of_the_water_takes_from_its_vision() {
+        let (level, blocks, tags) = world();
+        let env = Env {
+            level: &level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+            others: None,
+        };
+        let mut p = standing(&env, play::SPECTATOR);
+        p.water_vision_time = 100;
+        p.tick(&env, Keys::default());
+        assert_eq!(p.water_vision_time, 90);
+    }
+
     fn player_types() -> EntityTypes {
         use ruthenium_prepare::exporters::EntityTypeData;
         let fields = [
@@ -4159,6 +4211,47 @@ mod tests {
         // An unknown field or a wrong kind changes nothing.
         p.set_data(&[(6, DataValue::Int(3)), (40, DataValue::Int(1))], &types);
         assert_eq!(p.pose, Pose::Crouching);
+    }
+
+    #[test]
+    fn eyes_get_used_to_the_water() {
+        let mut p = LocalPlayer::new();
+        // Out of the water there is nothing to get used to.
+        p.tick_water_vision();
+        assert_eq!((p.water_vision_time, p.water_vision()), (0, 0.0));
+        p.fluids = FluidInteraction::with_eyes_in(crate::fluid::Fluid::Water);
+        assert_eq!(p.water_vision(), 0.0);
+        let mut after = |ticks: i32| {
+            for _ in 0..ticks {
+                p.tick_water_vision();
+            }
+            p.water_vision()
+        };
+        assert_eq!(after(50), 0.5 * 0.6);
+        assert_eq!(after(50), 0.6);
+        assert_eq!(after(250), 0.6 + 0.5 * 0.399_999_98);
+        assert_eq!(after(249), 0.6 + 499.0 / 500.0 * 0.399_999_98);
+        assert_eq!(after(1), 1.0);
+        assert_eq!(after(100), 1.0);
+        // Out of it, ten ticks' worth go each tick, though nothing shows of it.
+        p.fluids = FluidInteraction::default();
+        p.tick_water_vision();
+        assert_eq!((p.water_vision_time, p.water_vision()), (590, 0.0));
+        for _ in 0..100 {
+            p.tick_water_vision();
+        }
+        assert_eq!(p.water_vision_time, 0);
+        // Lava is nothing to see through.
+        p.fluids = FluidInteraction::with_eyes_in(crate::fluid::Fluid::Lava);
+        p.tick_water_vision();
+        assert_eq!(p.water_vision_time, 0);
+        // A spectator's eyes are quicker.
+        p.fluids = FluidInteraction::with_eyes_in(crate::fluid::Fluid::FlowingWater);
+        p.spectator = true;
+        p.tick_water_vision();
+        assert_eq!(p.water_vision_time, 10);
+        // A new player's eyes know nothing of it.
+        assert_eq!(p.respawned(KEEP_ENTITY_DATA).water_vision_time, 0);
     }
 
     #[test]

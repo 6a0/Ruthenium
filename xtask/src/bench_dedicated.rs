@@ -42,7 +42,7 @@ use crate::gpu::Gpu;
 use crate::routes::{self, Checked, Route};
 use crate::server::{self, Server};
 
-const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--time <ticks of the day>] [--keep-worlds]";
+const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--at <x,y,z[,yaw,pitch]>] [--setup <console command>]... [--time <ticks of the day>] [--keep-worlds]";
 /// The view and simulation distance of the server and the render distance of the
 /// clients, as in the integrated-server scenes.
 const VIEW_DISTANCE: i32 = 12;
@@ -97,6 +97,12 @@ struct Options {
     /// The time of day the scenes are set to, in ticks of the day (noon unless said
     /// otherwise: the baselines').
     time: u32,
+    /// For pictures of a chosen place: where the player hovers instead of at the
+    /// spawn (its eyes are 1.62 blocks higher) and the yaw and pitch it looks with.
+    at: Option<([f64; 3], f32, f32)>,
+    /// Console commands run once the player is there, before the scene begins (blocks
+    /// to look at).
+    setup: Vec<String>,
     keep_worlds: bool,
     accept_eula: bool,
 }
@@ -129,6 +135,8 @@ fn parse(args: &[String]) -> Result<Options, String> {
         screenshot: false,
         bare: false,
         time: 6000,
+        at: None,
+        setup: Vec::new(),
         keep_worlds: false,
         accept_eula: false,
     };
@@ -201,6 +209,19 @@ fn parse(args: &[String]) -> Result<Options, String> {
                     "--compare" => o.compare = Some(PathBuf::from(value)),
                     "--timeout" => o.timeout = num(value)?.max(0.0),
                     "--time" => o.time = num(value)? as u32 % 24000,
+                    "--at" => {
+                        let n = value
+                            .split(',')
+                            .map(|v| num(v.trim()))
+                            .collect::<Result<Vec<f64>, String>>()?;
+                        let (yaw, pitch) = match n.len() {
+                            3 => (0.0, 0.0),
+                            5 => (n[3] as f32, n[4] as f32),
+                            _ => return Err("--at takes x,y,z or x,y,z,yaw,pitch".into()),
+                        };
+                        o.at = Some(([n[0], n[1], n[2]], yaw, pitch));
+                    }
+                    "--setup" => o.setup.push(value.clone()),
                     "--width" => o.width = num(value)? as u32,
                     "--height" => o.height = num(value)? as u32,
                     "--expect" => {
@@ -270,6 +291,8 @@ struct Trial {
     route_file: PathBuf,
     world: Value,
     server: Server,
+    /// Console commands to run once the player is at the route's start.
+    setup: Vec<String>,
     /// Whether the controller has put the player at the route's start.
     placed: bool,
     last_health: Instant,
@@ -335,27 +358,50 @@ fn fix_world(server: &mut Server, spawn: [f64; 3], time: u32) -> Result<(), Stri
 /// The controller's setup of the player once it has joined: on the team, at the route's
 /// start, and in creative mode last, which is what the clients wait for. A player
 /// switched from spectator to creative in the air stays flying.
-fn place_player(server: &mut Server, route: &Route) -> Result<(), String> {
+fn place_player(server: &mut Server, route: &Route, setup: &[String]) -> Result<(), String> {
     let [x, y, z] = route.position;
-    let teleport = format!("tp {PLAYER} {x} {y} {z} {} {}", route.yaw, route.pitch);
+    // With their decimal points: a whole number sideways means the block's middle.
+    let teleport = format!(
+        "tp {PLAYER} {x:?} {y:?} {z:?} {} {}",
+        route.yaw, route.pitch
+    );
     server.command(&format!("team join {TEAM} {PLAYER}"), "Added")?;
     if route.flying {
         server.command(&format!("gamemode spectator {PLAYER}"), "Spectator")?;
     }
     server.command(&teleport, "Teleported")?;
+    // The chunks around the player's new place load over the next ticks: a command
+    // that changes blocks there is asked again until they have.
+    for command in setup {
+        let mut tries = 0;
+        loop {
+            match server.command(command, "") {
+                Ok(_) => break,
+                Err(e) if e.contains("not loaded") && tries < 80 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
     server.command(&format!("gamemode creative {PLAYER}"), "Creative")?;
     Ok(())
 }
 
 impl Harness<'_> {
     fn route(&self, scene: &str) -> Result<Route, String> {
-        Route::new(
+        let route = Route::new(
             scene,
             self.spawn,
             self.o.warmup,
             self.o.duration,
             VIEW_DISTANCE,
-        )
+        )?;
+        Ok(match self.o.at {
+            Some((position, yaw, pitch)) => route.at(position, yaw, pitch),
+            None => route,
+        })
     }
 
     /// A fresh world copy and a server on it, set up for `scene`.
@@ -393,6 +439,7 @@ impl Harness<'_> {
                 "seed": self.seed,
             }),
             server,
+            setup: self.o.setup.clone(),
             placed: false,
             last_health: Instant::now(),
             health: Vec::new(),
@@ -413,7 +460,7 @@ impl Trial {
             ));
         }
         if !self.placed && self.server.players()?.iter().any(|p| p == PLAYER) {
-            place_player(&mut self.server, &self.route)?;
+            place_player(&mut self.server, &self.route, &self.setup)?;
             self.placed = true;
         }
         self.samples.push(self.server.sample());
@@ -1610,10 +1657,10 @@ fn windowed_report(rows: &[&Row], baseline: Option<&Path>) -> Result<(), String>
     }
 
     println!(
-        "\nWhat was drawn at the capture's end and what the terrain holds (medians over runs). Translucent quads are those Ruthenium leaves out for now; the pages are its vertex buffers."
+        "\nWhat was drawn at the capture's end and what the terrain holds (medians over runs). Translucent quads are those of the last frame, with the sections they are of and the times a section's were sorted again so far; the pages are its vertex and index buffers."
     );
     println!(
-        "\n| Variant | Scene | Drawn as | Sections drawn / with a mesh / loaded | Quads | Draws / calls / binds | Translucent quads left out | Pages MiB (payload, free, largest free) | Allocations failed (with room) | RSS MiB | VRAM MiB |"
+        "\n| Variant | Scene | Drawn as | Sections drawn / with a mesh / loaded | Quads | Draws / calls / binds | Translucent quads (sections, sorts) | Pages MiB (payload, free, largest free) | Allocations failed (with room) | RSS MiB | VRAM MiB |"
     );
     println!("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|");
     for (variant, scene) in &groups {
@@ -1639,7 +1686,7 @@ fn windowed_report(rows: &[&Row], baseline: Option<&Path>) -> Result<(), String>
             })
         };
         println!(
-            "| {variant} | {scene} | {} | {:.0} / {:.0} / {:.0} | {:.0} | {:.0} / {:.0} / {:.0} | {:.0} | {:.0} ({:.0}, {:.1}, {:.2}) | {:.0} ({:.0}) | {:.0} | {:.0} |",
+            "| {variant} | {scene} | {} | {:.0} / {:.0} / {:.0} | {:.0} | {:.0} / {:.0} / {:.0} | {:.0} ({:.0}, {:.0}) | {:.0} ({:.0}, {:.1}, {:.2}) | {:.0} ({:.0}) | {:.0} | {:.0} |",
             group[0].4["ruthenium"]["world"]["draws"]
                 .as_str()
                 .unwrap_or("?"),
@@ -1650,7 +1697,9 @@ fn windowed_report(rows: &[&Row], baseline: Option<&Path>) -> Result<(), String>
             end("draws"),
             end("calls"),
             end("binds"),
-            end("translucent_quads_left_out"),
+            end("translucent_quads_drawn"),
+            end("translucent_sections_drawn"),
+            end("translucent_sorts"),
             mib(pool("reserved_bytes")),
             mib(pool("payload_bytes")),
             mib(pool("free_bytes")),

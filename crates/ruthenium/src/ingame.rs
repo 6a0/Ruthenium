@@ -225,7 +225,9 @@ pub fn terrain_lines(s: &WorldStats) -> String {
         "Terrain: {} sections with a mesh of {} ({} waiting, {} jobs out, {} on their way); drawn {} of {} tested, {} quads in {} draws with {} buffer binds\n\
          {culling}\
          Meshed {} times ({} for the player's changes, {} stale, {} waits for neighbours), {:.2} ms a section, slowest {:.2} ms; to the screen in at most {:.1} ms\n\
-         Pages {:.1} MiB holding {:.1} MiB ({:.0} planned); left out: {} translucent quads, {} meshes for memory, {} sections a frame's data had no room for",
+         Seen through: {} quads of {} sections, sorted again {} times ({} under way)\n\
+         Animated: {} sprites, {} ticks, written {} times ({:.1} MiB, {} waits, the longest {:.2} ms)\n\
+         Pages {:.1} MiB holding {:.1} MiB ({:.0} planned); left out: {} meshes for memory, {} sections a frame's data had no room for",
         s.meshed,
         s.sections,
         s.dirty,
@@ -243,10 +245,19 @@ pub fn terrain_lines(s: &WorldStats) -> String {
         average / 1000.0,
         s.slowest_mesh_micros as f64 / 1000.0,
         s.slowest_install_ms,
+        s.translucent_drawn,
+        s.translucent_sections,
+        s.sorts,
+        s.sorting,
+        s.animated_sprites,
+        s.animation_ticks,
+        s.animation_writes,
+        mib(s.animation_bytes),
+        s.animation_waits,
+        f64::from(s.slowest_animation_micros) / 1000.0,
         mib(s.pool.reserved_bytes),
         mib(s.pool.payload_bytes),
         mib(ruthenium_render::terrain::POOL_ENVELOPE),
-        s.translucent_quads,
         s.dropped,
         s.overflowed,
     )

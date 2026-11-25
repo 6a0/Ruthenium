@@ -146,9 +146,13 @@ public final class Bench {
         }
         if (Boolean.getBoolean("ruthenium.bench.bare")) {
             // A picture of the world alone, to hold another client's picture against:
-            // no HUD, hand or vignette, and no clouds. Not a run to take times from.
+            // no HUD, hand or vignette, no clouds, and the same field of view in flight
+            // as on the ground. Not a run to take times from.
             if (!mc.gui.hud.isHidden()) {
                 mc.gui.hud.toggle();
+            }
+            if (mc.options.fovEffectScale().get() != 0.0) {
+                mc.options.fovEffectScale().set(0.0);
             }
             if (mc.options.cloudStatus().get() != net.minecraft.client.CloudStatus.OFF) {
                 mc.options.cloudStatus().set(net.minecraft.client.CloudStatus.OFF);

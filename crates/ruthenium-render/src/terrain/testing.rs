@@ -64,6 +64,35 @@ pub(crate) fn tall_grass(upper: bool) -> u32 {
     state("minecraft:tall_grass", &[("half", half)])
 }
 
+/// Water: `level` 0 is a source, 1 to 7 flowing and ever lower, 8 falling.
+pub(crate) fn water(level: u8) -> u32 {
+    state("minecraft:water", &[("level", &level.to_string())])
+}
+
+/// Lava, likewise. It gives off light 15.
+pub(crate) fn lava(level: u8) -> u32 {
+    state("minecraft:lava", &[("level", &level.to_string())])
+}
+
+/// A lower slab with water in it.
+pub(crate) fn wet_slab() -> u32 {
+    state(
+        "minecraft:oak_slab",
+        &[("type", "bottom"), ("waterlogged", "true")],
+    )
+}
+
+/// A fluid state as the physics export packs it: a source, a flowing or a falling
+/// fluid of a `level`, of water or of lava.
+fn fluid_bits(level: u8, lava: bool) -> u8 {
+    let (kind, falling, amount) = match level {
+        0 => (1, 0, 8),
+        1..=7 => (2, 0, 8 - level),
+        _ => (2, 8, 8),
+    };
+    (kind + if lava { 2 } else { 0 }) | falling | amount << 4
+}
+
 /// A cube that gives off light 15.
 pub(crate) fn glowstone() -> u32 {
     state("minecraft:glowstone", &[])
@@ -74,15 +103,16 @@ pub(crate) fn magma() -> u32 {
     state("minecraft:magma_block", &[])
 }
 
-/// A 64 x 16 atlas of four 16 x 16 sprites: the missing one, `a` (opaque), `holes`
-/// (its left half fully transparent) and `ice` (half transparent everywhere).
+/// A 144 x 16 atlas of nine 16 x 16 sprites: the missing one, `a` (opaque), `holes`
+/// (its left half fully transparent), `ice` (half transparent everywhere), water's
+/// three (half transparent) and lava's two (opaque).
 fn atlas() -> Atlas {
-    let mut level = Image::new(64, 16);
+    let mut level = Image::new(144, 16);
     for y in 0..16 {
-        for x in 0..64 {
+        for x in 0..144 {
             let alpha = match x {
                 32..40 => 0,
-                48.. => 128,
+                48..112 => 128,
                 _ => 255,
             };
             level.set(x, y, alpha << 24 | 0x80_8080);
@@ -106,7 +136,7 @@ fn atlas() -> Atlas {
     let id = |path: &str| Id::minecraft(path).unwrap();
     Atlas {
         def: ATLASES[1],
-        width: 64,
+        width: 144,
         height: 16,
         max_level: 0,
         levels: vec![level],
@@ -115,6 +145,11 @@ fn atlas() -> Atlas {
             (id("block/a"), sprite(16, false, false)),
             (id("block/holes"), sprite(32, true, false)),
             (id("block/ice"), sprite(48, false, true)),
+            (id("block/water_still"), sprite(64, false, true)),
+            (id("block/water_flow"), sprite(80, false, true)),
+            (id("block/water_overlay"), sprite(96, false, true)),
+            (id("block/lava_still"), sprite(112, false, false)),
+            (id("block/lava_flow"), sprite(128, false, false)),
         ]),
         animated: Vec::new(),
         warnings: Vec::new(),
@@ -170,6 +205,25 @@ const CROSS: &str = r##"{"ambientocclusion": false, "textures": {"t": "block/hol
      "rotation": {"origin": [8, 8, 8], "axis": "y", "angle": 45, "rescale": true},
      "faces": {"west": {"texture": "#t", "tintindex": 0},
                "east": {"texture": "#t", "tintindex": 0}}}]}"##;
+
+/// A table of nothing but these states, face shapes and fluids: no state has a model.
+pub(crate) fn bare_table(
+    states: Vec<super::table::StateInfo>,
+    shapes: Vec<ShapeData>,
+    fluids: super::fluid::FluidModels,
+) -> BlockTable {
+    BlockTable {
+        models: BlockModels::bake(&Files::default(), &atlas()),
+        states,
+        kinds: shapes.iter().map(super::table::ShapeKind::of).collect(),
+        shapes,
+        tints: Vec::new(),
+        offsets: Vec::new(),
+        mangrove_roots: u16::MAX,
+        powder_snow: u16::MAX,
+        fluids,
+    }
+}
 
 /// The made-up game's block table.
 pub(crate) fn table() -> Arc<BlockTable> {
@@ -248,6 +302,28 @@ pub(crate) fn table() -> Arc<BlockTable> {
     };
     let full = StateBehaviour::COLLISION_FULL_BLOCK;
     behaviour.states[0].flags |= StateBehaviour::AIR;
+    for level in 0..16 {
+        physics.states[water(level) as usize].fluid = fluid_bits(level, false);
+        let lava = &mut physics.states[lava(level) as usize];
+        lava.fluid = fluid_bits(level, true);
+        lava.light_emission = 15;
+    }
+    physics.states[wet_slab() as usize].fluid = fluid_bits(0, false);
+    // What a fluid's surface does not slope down to, and what holds a falling fluid in.
+    for id in [
+        stone(),
+        glowstone(),
+        magma(),
+        glass(),
+        ice(),
+        slab(),
+        wet_slab(),
+    ] {
+        behaviour.states[id as usize].flags |= StateBehaviour::SOLID;
+    }
+    for id in [stone(), glowstone(), magma(), glass(), ice()] {
+        physics.states[id as usize].sturdy = 0b11_1111;
+    }
     for id in [stone(), glowstone(), magma()] {
         behaviour.states[id as usize].flags |= StateBehaviour::SOLID_RENDER;
     }
@@ -262,6 +338,7 @@ pub(crate) fn table() -> Arc<BlockTable> {
         (glass(), [0; 6], true),
         (ice(), [1; 6], true),
         (slab(), [1, 0, 2, 2, 2, 2], false),
+        (wet_slab(), [1, 0, 2, 2, 2, 2], false),
         (grass(), [0; 6], false),
         (tall_grass(false), [0; 6], false),
         (tall_grass(true), [0; 6], false),
@@ -297,9 +374,15 @@ pub(crate) fn table() -> Arc<BlockTable> {
         outline: true,
     });
     Arc::new(
-        BlockTable::new(&physics, &behaviour, &render, models, GRASS_TINT, &|_| {
-            false
-        })
+        BlockTable::new(
+            &physics,
+            &behaviour,
+            &render,
+            models,
+            super::fluid::FluidModels::from_atlas(&atlas),
+            GRASS_TINT,
+            &|_, _| false,
+        )
         .unwrap(),
     )
 }

@@ -608,6 +608,10 @@ pub struct PlayerState {
     pub x_rot: f32,
     pub old_rot: (f32, f32),
     pub eye_height: f32,
+    /// The eyes are in water, as of the last tick, and how well they see there
+    /// (`getWaterVision`, 0 to 1).
+    pub eye_in_water: bool,
+    pub water_vision: f32,
     pub pose: Pose,
     pub on_ground: bool,
     pub sprinting: bool,
@@ -708,6 +712,8 @@ impl Frame {
                 x_rot: 0.0,
                 old_rot: (0.0, 0.0),
                 eye_height: 0.0,
+                eye_in_water: false,
+                water_vision: 0.0,
                 pose: Pose::Standing,
                 on_ground: false,
                 sprinting: false,

@@ -9,7 +9,7 @@ use std::thread::JoinHandle;
 
 use ruthenium_assets::atlas::AtlasOptions;
 use ruthenium_assets::zip::Zip;
-use ruthenium_assets::{BlockModels, Id, Image, Pack, Resources};
+use ruthenium_assets::{AtlasAnimations, BlockModels, Id, Image, Pack, Resources};
 use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, Reason, Stage};
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
@@ -229,8 +229,43 @@ fn enchantments(jar: &Zip) -> Enchantments {
     Enchantments::from_json_files(files)
 }
 
-/// The `bars` block tag as the game's own data pack has it.
-const BARS_TAG: &str = "data/minecraft/tags/block/bars.json";
+/// Where the game's own data pack has its block tags. The mesher reads two: `bars`
+/// (which bars and panes leave out faces against each other) and `blocks_fluid_flow`
+/// (what a fluid's flow, and with it the turn of its texture, takes for a wall).
+const BLOCK_TAGS: &str = "data/minecraft/tags/block/";
+
+/// Adds the blocks of a block tag to `out`, with those of the tags it names.
+fn block_tag(jar: &Zip, name: &str, out: &mut std::collections::HashSet<String>, depth: u32) {
+    // No tag of the game's is nested this deep: one that names itself ends here.
+    if depth > 16 {
+        return;
+    }
+    let Some(tag) = jar
+        .find(&format!("{BLOCK_TAGS}{name}.json"))
+        .and_then(|i| jar.read(i).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    else {
+        return;
+    };
+    let values = tag.get("values").and_then(|v| v.as_array());
+    for v in values.into_iter().flatten() {
+        // An entry is a name, or a name with a note that it may be missing.
+        let Some(id) = v.as_str().or_else(|| v.get("id")?.as_str()) else {
+            continue;
+        };
+        match id.strip_prefix('#') {
+            Some(inner) => block_tag(
+                jar,
+                inner.strip_prefix("minecraft:").unwrap_or(inner),
+                out,
+                depth + 1,
+            ),
+            None => {
+                out.insert(id.to_owned());
+            }
+        }
+    }
+}
 /// The colour maps biomes take their grass and foliage colours from. The grass map's
 /// default colour tints grass until biomes do.
 const GRASS_MAP: &str = "textures/colormap/grass.png";
@@ -240,6 +275,8 @@ const DRY_FOLIAGE_MAP: &str = "textures/colormap/dry_foliage.png";
 const SUN: &str = "textures/environment/celestial/sun.png";
 const MOON_DIR: &str = "textures/environment/celestial/moon/";
 const END_SKY: &str = "textures/environment/end_sky.png";
+/// What is before a player's eyes in water.
+const UNDERWATER: &str = "textures/misc/underwater.png";
 
 /// Builds what drawing a world needs from the imported game in `game`: the block atlas
 /// with its mip levels, and every block state's baked model and drawing rules.
@@ -261,7 +298,7 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         max_size: max_texture,
         ..AtlasOptions::default()
     };
-    let atlas = ruthenium_assets::atlas::build(&resources, def, &options)
+    let mut atlas = ruthenium_assets::atlas::build(&resources, def, &options)
         .map_err(|e| format!("the block atlas: {e}"))?;
     let stitched = started.elapsed();
     let models = BlockModels::bake(&resources, &atlas);
@@ -298,31 +335,32 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         moon: MOON_PHASES.map(|phase| sky_image(&format!("{MOON_DIR}{phase}.png"))),
         end_sky: sky_image(END_SKY),
     };
+    let underwater = sky_image(UNDERWATER);
     let pixels = |map: Option<Image>| map.map_or(Vec::new(), |m| m.pixels);
     let colour_maps = ColourMaps {
         grass: pixels(grass_map),
         foliage: pixels(colour_map(FOLIAGE_MAP)),
         dry_foliage: pixels(colour_map(DRY_FOLIAGE_MAP)),
     };
-    let bars: Vec<String> = Zip::open(&imported.client_jar)
-        .ok()
-        .and_then(|jar| {
-            let bytes = jar.read(jar.find(BARS_TAG)?).ok()?;
-            let tag: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            Some(
-                tag.get("values")?
-                    .as_array()?
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect(),
-            )
+    let jar = Zip::open(&imported.client_jar).ok();
+    let tags: Vec<(&str, std::collections::HashSet<String>)> = ["bars", "blocks_fluid_flow"]
+        .into_iter()
+        .map(|name| {
+            let mut blocks = std::collections::HashSet::new();
+            if let Some(jar) = &jar {
+                block_tag(jar, name, &mut blocks, 0);
+            }
+            (name, blocks)
         })
-        .unwrap_or_default();
+        .collect();
     let exports = ruthenium_prepare::exporters::exports_dir(&imported);
-    let table = BlockTable::load(&exports, models, grass_default, &|name| {
-        bars.iter().any(|b| b == name)
+    let fluids = ruthenium_render::terrain::FluidModels::from_atlas(&atlas);
+    let table = BlockTable::load(&exports, models, fluids, grass_default, &|tag, block| {
+        tags.iter()
+            .any(|(name, blocks)| *name == tag && blocks.contains(block))
     })
     .map_err(|e| format!("{e}; run `ruthenium prepare`"))?;
+    let animations = AtlasAnimations::take(&mut atlas);
     let atlas_levels: Vec<Vec<u8>> = atlas.levels.iter().map(Image::to_rgba8).collect();
     eprintln!(
         "[ruthenium] world assets in {:.0?}: block atlas {}x{} with {} levels ({:.1} MiB, {:.0?}), {} of {} block states drawn from {} model parts",
@@ -341,6 +379,8 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         atlas_width: atlas.width,
         atlas_height: atlas.height,
         atlas_levels,
+        animations,
+        underwater,
         colour_maps,
         sky,
     })

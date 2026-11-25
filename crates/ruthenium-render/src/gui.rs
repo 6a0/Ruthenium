@@ -1,5 +1,6 @@
 //! Writes ruthenium-ui's quads into the frame's data for `gui.vert`.
 
+use ruthenium_gpu::SamplerId;
 use ruthenium_ui::Quad;
 use ruthenium_ui::modern::Shape;
 use ruthenium_ui::text::GlyphQuad;
@@ -89,6 +90,12 @@ pub fn write_quads(quads: &[Quad], out: &mut [u8]) {
     }
 }
 
+/// Writes one quad whose texture is read with `sampler`.
+pub fn write_quad_with(quad: Quad, sampler: SamplerId, out: &mut [u8]) {
+    write_quads(&[quad], out);
+    out[40..44].copy_from_slice(&sampler.index().to_ne_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +117,12 @@ mod tests {
             0x80FF0000
         );
         assert_eq!(u32::from_ne_bytes(out[36..40].try_into().unwrap()), 9);
+        // Sprites' edges are clamped, unless said otherwise.
         assert_eq!(&out[40..], &[0; 8]);
+        assert_eq!(SamplerId::NearestClamp.index(), 0);
+        write_quad_with(q, SamplerId::NearestRepeat, &mut out);
+        assert_eq!(u32::from_ne_bytes(out[36..40].try_into().unwrap()), 9);
+        assert_eq!(u32::from_ne_bytes(out[40..44].try_into().unwrap()), 1);
+        assert_eq!(&out[44..], &[0; 4]);
     }
 }

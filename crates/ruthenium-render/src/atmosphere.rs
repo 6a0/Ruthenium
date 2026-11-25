@@ -5,17 +5,22 @@
 //! camera reads them, and worked out as its `FogRenderer`, `SkyRenderer` and
 //! `LightmapRenderStateExtractor` do.
 //!
-//! Not here yet: a camera inside water, lava or powder snow is told to [`fog`] but
-//! never found; the effects on the player (blindness, darkness, night vision) and a
-//! boss's fog change nothing.
+//! Inside water, lava or powder snow the fog is the medium's (found by
+//! `terrain::medium`), and with the player's eyes in water the frame is tinted by a
+//! picture of it ([`WaterOverlay`]).
+//!
+//! Not here yet: the effects on the player (blindness, darkness, night vision, a
+//! conduit's) and a boss's fog change nothing.
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use ruthenium_data::v26_3::registries::MobEffect;
 use ruthenium_javamath::mth;
 use ruthenium_sim::attributes::{Attribute, AttributeSystem, BiomeWeights, Probe, Sample, Value};
 use ruthenium_sim::biome::zoomed_cell;
 use ruthenium_sim::environment::Environment;
+use ruthenium_sim::player::Pose;
 use ruthenium_sim::scene::{Frame, Scene};
 
 use crate::sky::{OverworldSky, Sky};
@@ -57,6 +62,54 @@ pub enum Medium {
     Water,
     Lava,
     PowderSnow,
+}
+
+/// What the field of view shrinks to in water and lava, with FOV Effects all the way up.
+const FLUID_FOV: f32 = 0.857_142_87;
+
+impl Medium {
+    /// What the field of view is multiplied by; `effects` is the FOV Effects option, 0
+    /// to 1.
+    pub fn fov_scale(self, effects: f32) -> f32 {
+        match self {
+            Medium::Water | Medium::Lava => 1.0 + effects * (FLUID_FOV - 1.0),
+            Medium::Air | Medium::PowderSnow => 1.0,
+        }
+    }
+
+    /// Nothing of the sky is drawn from inside it.
+    fn hides_sky(self) -> bool {
+        matches!(self, Medium::Lava | Medium::PowderSnow)
+    }
+}
+
+/// `GameType.SPECTATOR`'s id.
+const SPECTATOR: i32 = 3;
+
+/// The picture of water in front of a player whose eyes are in it
+/// (`ScreenEffectRenderer.submitWater`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaterOverlay {
+    /// What the picture is multiplied by, 0xAARRGGBB.
+    pub colour: u32,
+    /// How far it has slid, in its own widths and heights, as the player turns.
+    pub offset: [f32; 2],
+}
+
+impl WaterOverlay {
+    /// With light `light` (0 to 15) at the eyes in a dimension of that ambient light.
+    pub fn new(light: i32, ambient: f32, y_rot: f32, x_rot: f32) -> WaterOverlay {
+        let v = light as f32 / 15.0;
+        let curved = v / (4.0 - 3.0 * v);
+        let brightness = curved + ambient * (1.0 - curved);
+        let channel = (brightness * 255.0).floor() as u32 & 0xFF;
+        // A tenth of it is there.
+        let alpha = (0.1_f32 * 255.0).floor() as u32;
+        WaterOverlay {
+            colour: alpha << 24 | channel << 16 | channel << 8 | channel,
+            offset: [-y_rot / 64.0, x_rot / 64.0],
+        }
+    }
 }
 
 /// What a frame's fog is worked out from.
@@ -249,6 +302,7 @@ pub struct Look {
     pub fog: Fog,
     pub sky: Sky,
     pub lightmap: LightmapInputs,
+    pub water: Option<WaterOverlay>,
 }
 
 fn float(v: Value) -> f32 {
@@ -311,14 +365,15 @@ impl Atmosphere {
         (self.random.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    /// The look of the frame `frame` seen from `camera`, `partial` of the way from its
-    /// tick to the next, at `now`.
+    /// The look of the frame `frame` seen from `camera`, which is in `medium`, `partial`
+    /// of the way from its tick to the next, at `now`.
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         frame: &Frame,
         partial: f32,
         camera: &CameraPose,
+        medium: Medium,
         scene: &Scene,
         view_distance: i32,
         now: Instant,
@@ -405,7 +460,8 @@ impl Atmosphere {
             now.saturating_duration_since(last).as_secs_f32()
         });
         self.last_frame = Some(now);
-        if frame.rain > 0.0 || self.rain_fog != 0.0 {
+        // Only the air's fog takes part: inside anything else it stays as it was.
+        if medium == Medium::Air && (frame.rain > 0.0 || self.rain_fog != 0.0) {
             let (sky_light, precipitation) = scene.with_terrain(|t| {
                 let light = t.probe(block).map_or(15, |p| p.sky_light);
                 let cell = zoomed_cell(dims.biome_seed, block);
@@ -420,12 +476,11 @@ impl Atmosphere {
             let ticks = elapsed * 1000.0 / frame.ms_per_tick.max(1.0);
             self.rain_fog += (target - self.rain_fog) * ticks * 0.2;
         }
-        let (yaw, pitch) = (camera.y_rot.to_radians(), camera.x_rot.to_radians());
         let sun_angle = float(read(Attribute::SunAngle));
         let sky_colour = rgb(read(Attribute::SkyColor));
         let sunrise = argb(read(Attribute::SunriseSunsetColor));
         let mut fog = fog(&FogInputs {
-            medium: Medium::Air,
+            medium,
             view_distance,
             fog_colour: rgb(read(Attribute::FogColor)),
             sky_colour,
@@ -440,23 +495,24 @@ impl Atmosphere {
             rain: frame.rain,
             thunder,
             rain_fog: self.rain_fog,
-            forward: [
-                -yaw.sin() * pitch.cos(),
-                -pitch.sin(),
-                yaw.cos() * pitch.cos(),
-            ],
+            forward: camera.axes()[0],
             camera_y: camera.position[1],
             min_y: dims.min_section << 4,
             flat: dims.flat,
-            spectator: frame.player.game_type == 3,
-            fire_resistance: false,
-            water_vision: 1.0,
+            spectator: frame.player.game_type == SPECTATOR,
+            fire_resistance: frame
+                .player
+                .effects
+                .iter()
+                .any(|e| e.0 == MobEffect::FireResistance.id() as i32),
+            water_vision: frame.player.water_vision,
         });
         if !options.fog {
             fog.environmental = Fog::NONE.environmental;
             fog.render_distance = Fog::NONE.render_distance;
         }
         let sky = match environment.skybox.trim_start_matches("minecraft:") {
+            _ if medium.hides_sky() => Sky::None,
             "none" => Sky::None,
             "end" => Sky::End,
             _ => {
@@ -480,10 +536,31 @@ impl Atmosphere {
                 })
             }
         };
+        let player = &frame.player;
+        let water = (player.eye_in_water
+            && player.game_type != SPECTATOR
+            && player.pose != Pose::Sleeping)
+            .then(|| {
+                let mut eye = player.position;
+                eye[1] += f64::from(player.eye_height);
+                let light = scene.with_terrain(|t| t.probe(eye.map(|c| c.floor() as i32)));
+                // What the sky lacks to its full light, as of the tick.
+                let lacks = (15.0 - float(self.probe.value(Attribute::SkyLightLevel, 1.0))) as i32;
+                let light = light.map_or(15 - lacks, |p| {
+                    (i32::from(p.sky_light) - lacks).max(i32::from(p.block_light))
+                });
+                WaterOverlay::new(
+                    light.max(0),
+                    environment.ambient_light,
+                    camera.y_rot,
+                    camera.x_rot,
+                )
+            });
         Look {
             fog,
             sky,
             lightmap: self.lightmap,
+            water,
         }
     }
 }
@@ -707,6 +784,121 @@ mod tests {
             ..noon()
         };
         assert_eq!(fog(&lava).colour, [0.6, 25.0 / 255.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn fluids_narrow_the_view() {
+        assert_eq!(Medium::Water.fov_scale(1.0), 0.857_142_87);
+        assert_eq!(Medium::Lava.fov_scale(1.0), 0.857_142_87);
+        assert_eq!(Medium::Water.fov_scale(0.0), 1.0);
+        assert_eq!(Medium::Air.fov_scale(1.0), 1.0);
+        assert_eq!(Medium::PowderSnow.fov_scale(1.0), 1.0);
+        // From water the sky is seen, from lava and powder snow it is not.
+        assert!(!Medium::Air.hides_sky() && !Medium::Water.hides_sky());
+        assert!(Medium::Lava.hides_sky() && Medium::PowderSnow.hides_sky());
+    }
+
+    /// A frame's look in `medium` above a level lit by full sky light, as `change` has
+    /// the frame.
+    fn look(medium: Medium, rain_fog: f32, change: impl Fn(&mut Frame)) -> (Look, f32) {
+        let mut world = crate::terrain::testing::World::new(&[(0, 0)]);
+        world.publish();
+        let mut frame = Frame::new(
+            Instant::now(),
+            Arc::new(Environment {
+                skybox: "minecraft:overworld".into(),
+                has_skylight: true,
+                ..Environment::default()
+            }),
+            Arc::from("minecraft:overworld"),
+        );
+        frame.player.position = [8.5, 4.0, 8.5];
+        frame.player.eye_height = 1.62;
+        change(&mut frame);
+        let camera = CameraPose {
+            position: [8.5, 5.62, 8.5],
+            y_rot: 64.0,
+            x_rot: 0.0,
+            fov: 70.0,
+        };
+        let mut air = Atmosphere::new();
+        let now = Instant::now();
+        let options = AtmosphereOptions::default();
+        let step = |air: &mut Atmosphere, at: Instant| {
+            air.update(&frame, 1.0, &camera, medium, &world.scene, 12, at, &options)
+        };
+        step(&mut air, now);
+        air.rain_fog = rain_fog;
+        let look = step(&mut air, now + std::time::Duration::from_millis(50));
+        (look, air.rain_fog)
+    }
+
+    #[test]
+    fn a_frame_takes_the_mediums_look() {
+        let sky = |medium| look(medium, 0.0, |_| {}).0.sky;
+        assert!(matches!(sky(Medium::Air), Sky::Overworld(_)));
+        assert!(matches!(sky(Medium::Water), Sky::Overworld(_)));
+        assert_eq!(sky(Medium::Lava), Sky::None);
+        assert_eq!(sky(Medium::PowderSnow), Sky::None);
+        // Rain draws the air's fog in; inside water it waits.
+        let rain = |f: &mut Frame| f.rain = 1.0;
+        assert!(look(Medium::Air, 0.5, rain).1 > 0.5);
+        assert_eq!(look(Medium::Water, 0.5, rain).1, 0.5);
+        // Lava's fog is the player's: further with fire resistance, or as a spectator.
+        let lava =
+            |change: &dyn Fn(&mut Frame)| look(Medium::Lava, 0.0, change).0.fog.environmental;
+        assert_eq!(lava(&|_| {}), [0.25, 1.0]);
+        let id = MobEffect::FireResistance.id() as i32;
+        assert_eq!(lava(&|f| f.player.effects.push((id, 0, 100))), [0.0, 5.0]);
+        assert_eq!(
+            lava(&|f| f.player.effects.push((id + 1, 0, 100))),
+            [0.25, 1.0]
+        );
+        assert_eq!(lava(&|f| f.player.game_type = SPECTATOR), [-8.0, 96.0]);
+        // Water's by how well the player sees in it.
+        let reach = |vision| {
+            let set = |f: &mut Frame| f.player.water_vision = vision;
+            look(Medium::Water, 0.0, set).0.fog.environmental[1]
+        };
+        assert_eq!((reach(1.0), reach(0.0)), (96.0, 24.0));
+    }
+
+    #[test]
+    fn water_is_before_the_eyes_of_a_player_in_it() {
+        let water = |change: &dyn Fn(&mut Frame)| {
+            let set = |f: &mut Frame| {
+                f.player.eye_in_water = true;
+                change(f);
+            };
+            look(Medium::Water, 0.0, set).0.water
+        };
+        let full = water(&|_| {}).expect("the picture of water");
+        assert_eq!((full.colour, full.offset), (0x19FF_FFFF, [-1.0, 0.0]));
+        assert_eq!(water(&|f| f.player.eye_in_water = false), None);
+        assert_eq!(water(&|f| f.player.game_type = SPECTATOR), None);
+        assert_eq!(water(&|f| f.player.pose = Pose::Sleeping), None);
+        // A storm takes 5 levels of the sky's light (15 towards 4 by 0.527): 10 are left.
+        let storm = water(&|f| {
+            f.rain = 1.0;
+            f.thunder = 1.0;
+        });
+        let dim = WaterOverlay::new(10, 0.0, 64.0, 0.0);
+        assert_eq!(storm, Some(dim));
+        assert!(dim.colour < full.colour);
+    }
+
+    #[test]
+    fn the_water_before_the_eyes_is_as_bright_as_its_light() {
+        // Full light is white, none is black, and a tenth of it is there.
+        assert_eq!(WaterOverlay::new(15, 0.0, 0.0, 0.0).colour, 0x19FF_FFFF);
+        assert_eq!(WaterOverlay::new(0, 0.0, 0.0, 0.0).colour, 0x1900_0000);
+        // Light 12 is 0.8, which curves to 0.5.
+        assert_eq!(WaterOverlay::new(12, 0.0, 0.0, 0.0).colour, 0x197F_7F7F);
+        // The Nether's ambient light lifts it a tenth of the way to white.
+        assert_eq!(WaterOverlay::new(0, 0.1, 0.0, 0.0).colour, 0x1919_1919);
+        // It slides against the turn, once its width in 64 degrees.
+        let turned = WaterOverlay::new(15, 0.0, 64.0, -32.0);
+        assert_eq!(turned.offset, [-1.0, -0.5]);
     }
 
     #[test]

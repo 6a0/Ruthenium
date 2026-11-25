@@ -899,6 +899,8 @@ impl Game {
                 s.x_rot = p.x_rot;
                 s.old_rot = p.old_rot;
                 s.eye_height = (p.eye_position()[1] - p.position[1]) as f32;
+                s.eye_in_water = p.is_eye_in_water();
+                s.water_vision = p.water_vision();
                 s.pose = p.pose;
                 s.on_ground = p.on_ground;
                 s.sprinting = p.sprinting;

@@ -15,6 +15,9 @@
 //! - **Depth**: of two overlapping quads the nearer shows, whichever is drawn first; a
 //!   cutout quad in the same plane as a solid one shows through its holes; texels less
 //!   than half opaque are holes, half opaque ones are not.
+//! - **Translucency**: sorted indices put one pane over another. A fragment that
+//!   passes the one-tenth alpha cutoff blends and writes depth. A hole leaves both
+//!   colour and depth available to a later draw.
 //! - **Winding**: a quad seen from behind is not drawn; a quad in a corner of its block
 //!   is in that corner.
 //! - **Section borders**: two sections' quads that meet on the border between them
@@ -76,6 +79,13 @@ const LEFT_SECTION: Rgba = [10, 20, 30, 255];
 const RIGHT_SECTION: Rgba = [200, 150, 100, 255];
 const HOLE: Rgba = [9, 9, 9, 0];
 const CUTOUT: Rgba = [40, 200, 40, 255];
+/// Texels just under and just over a tenth opaque: what the translucent layer leaves
+/// out and what it blends.
+const UNDER_A_TENTH: Rgba = [200, 100, 50, 25];
+const OVER_A_TENTH: Rgba = [200, 100, 50, 26];
+/// Two half opaque texels for the translucent layer's order.
+const GLASS_NEAR: Rgba = [250, 250, 0, 0x80];
+const GLASS_FAR: Rgba = [0, 0, 250, 0x80];
 const TURNED: [Rgba; 4] = [
     [255, 0, 0, 255],
     [0, 255, 0, 255],
@@ -180,7 +190,11 @@ impl Case {
 /// Where each texel a quad shows is in the atlas. The two texels around half opaque
 /// are not side by side: averaged, their border would be a hole or not by the last bit
 /// of a GPU's arithmetic.
-const TEXELS: [([u32; 2], Rgba); 20] = [
+const TEXELS: [([u32; 2], Rgba); 24] = [
+    ([20, 0], UNDER_A_TENTH),
+    ([21, 0], OVER_A_TENTH),
+    ([22, 0], GLASS_NEAR),
+    ([23, 0], GLASS_FAR),
     ([0, 0], WHITE),
     ([1, 0], GREY),
     ([2, 0], SOLID),
@@ -233,10 +247,14 @@ struct Probe {
 /// The scene: vertices by draw, and what it must look like.
 #[derive(Debug, Default)]
 struct Scene {
-    /// Solid quads of the four sections, then the cutout quads (of the first).
+    /// Solid quads of the four sections, then the cutout quads and the translucent
+    /// quads (both of the first).
     vertices: Vec<u8>,
-    /// Quads of each of the five draws.
-    quads: [u32; 5],
+    /// Quads of each of the six draws.
+    quads: [u32; 6],
+    /// The order the translucent quads are drawn in, as their indices say: not the
+    /// order of their vertices.
+    order: Vec<u32>,
     probes: Vec<Probe>,
 }
 
@@ -308,6 +326,16 @@ fn pixels(rect: [f32; 4]) -> [u32; 4] {
     ]
 }
 
+/// `over` blended over `under` as the translucent pipeline blends: by its own alpha,
+/// and the alphas added up likewise.
+fn blended(over: Rgba, under: Rgba) -> Rgba {
+    let a = f64::from(over[3]) / 255.0;
+    std::array::from_fn(|i| {
+        let src = if i == 3 { 1.0 } else { a };
+        (f64::from(over[i]) * src + f64::from(under[i]) * (1.0 - a)).round() as u8
+    })
+}
+
 fn times(a: Rgba, b: Rgba) -> Rgba {
     std::array::from_fn(|i| (f64::from(a[i]) * f64::from(b[i]) / 255.0).round() as u8)
 }
@@ -317,6 +345,7 @@ impl Scene {
         let mut scene = Scene::default();
         let mut solid: [Vec<Quad>; 4] = Default::default();
         let mut cutout: Vec<Quad> = Vec::new();
+        let mut translucent: Vec<Quad> = Vec::new();
         let mut probes = Vec::new();
         let mut probe = |what, rect: [f32; 4], want: Rgba, tolerance: u8| {
             probes.push(Probe {
@@ -442,6 +471,104 @@ impl Scene {
         );
         probe("the cutout quad over it", [7.5, 6.0, 8.0, 7.0], CUTOUT, 1);
 
+        // The translucent layer, drawn last through indices of its own. A half opaque
+        // texel is blended over what is there, a solid quad or nothing.
+        solid[0].push(Quad {
+            z: -2.0,
+            ..Quad::texel(cell(0, 4), [2, 0])
+        });
+        translucent.push(Quad::texel(cell(0, 4), [3, 0]));
+        probe(
+            "half opaque over a solid quad",
+            cell(0, 4),
+            blended(HALF, SOLID),
+            1,
+        );
+        translucent.push(Quad::texel(cell(1, 4), [3, 0]));
+        probe(
+            "half opaque over nothing",
+            cell(1, 4),
+            blended(HALF, CLEAR),
+            1,
+        );
+        // Under a tenth opaque it is left out; from a tenth on it is not.
+        translucent.push(Quad::texel(cell(2, 4), [20, 0]));
+        probe("a texel under a tenth opaque", cell(2, 4), CLEAR, 0);
+        solid[0].push(Quad {
+            z: -2.0,
+            ..Quad::texel([3.5, 4.0, 4.0, 5.0], [2, 0])
+        });
+        translucent.push(Quad::texel(cell(3, 4), [21, 0]));
+        probe(
+            "a texel a tenth opaque",
+            [3.0, 4.0, 3.5, 5.0],
+            blended(OVER_A_TENTH, CLEAR),
+            1,
+        );
+        probe(
+            "a texel a tenth opaque over solid terrain",
+            [3.5, 4.0, 4.0, 5.0],
+            blended(OVER_A_TENTH, SOLID),
+            1,
+        );
+        // Draw the far pane second in these cells to make depth writes observable.
+        // The front pane writes depth in cell 7, is discarded in cell 8, and the
+        // solid terrain already owns the depth in cell 9.
+        translucent.push(Quad::texel(cell(7, 4), [22, 0]));
+        translucent.push(Quad::texel(cell(8, 4), [20, 0]));
+        solid[0].push(Quad::texel(cell(9, 4), [2, 0]));
+        translucent.push(Quad {
+            z: -4.0,
+            ..Quad::texel([7.0, 4.0, 10.0, 5.0], [23, 0])
+        });
+        probe(
+            "depth written by a pane",
+            cell(7, 4),
+            blended(GLASS_NEAR, CLEAR),
+            1,
+        );
+        probe(
+            "depth through a discarded pane",
+            cell(8, 4),
+            blended(GLASS_FAR, CLEAR),
+            1,
+        );
+        probe("a pane behind solid terrain", cell(9, 4), SOLID, 1);
+
+        // Order: the nearer quad's vertices come first, the indices draw the farther
+        // one first. Drawn in the vertices' order the nearer quad's depth would keep
+        // the farther one out from behind it.
+        let first_ordered = translucent.len() as u32;
+        translucent.push(Quad {
+            z: 4.0,
+            ..Quad::texel([5.0, 4.0, 6.5, 5.0], [22, 0])
+        });
+        translucent.push(Quad {
+            z: -4.0,
+            ..Quad::texel([5.5, 4.0, 7.0, 5.0], [23, 0])
+        });
+        scene.order = (0..first_ordered)
+            .chain([first_ordered + 1, first_ordered])
+            .collect();
+        probe(
+            "the nearer glass alone",
+            [5.0, 4.0, 5.5, 5.0],
+            blended(GLASS_NEAR, CLEAR),
+            1,
+        );
+        probe(
+            "the nearer glass over the farther",
+            [5.5, 4.0, 6.5, 5.0],
+            blended(GLASS_NEAR, blended(GLASS_FAR, CLEAR)),
+            1,
+        );
+        probe(
+            "the farther glass alone",
+            [6.5, 4.0, 7.0, 5.0],
+            blended(GLASS_FAR, CLEAR),
+            1,
+        );
+
         // Section borders. The second section's corner is 12 blocks to the left of
         // the scene's, so its east border is at 4 blocks; the third's corner is there.
         solid[1].push(Quad::texel([12.0, 3.0, 16.0, 4.0], [9, 0]));
@@ -511,13 +638,19 @@ impl Scene {
         probe("between the fading quads", [6.0, 0.0, 8.0, 1.0], CLEAR, 0);
         probe("between the fading quads", [9.0, 0.0, 11.0, 1.0], CLEAR, 0);
         probe("the empty row", [1.0, 1.0, 12.0, 2.0], CLEAR, 0);
-        probe("the empty row", [0.0, 4.0, 12.0, 5.0], CLEAR, 0);
+        probe("between the translucent quads", cell(4, 4), CLEAR, 0);
+        probe(
+            "right of the translucent quads",
+            [10.0, 4.0, 12.0, 5.0],
+            CLEAR,
+            0,
+        );
         probe("right of the border quads", [8.0, 3.0, 12.0, 4.0], CLEAR, 0);
         probe("right of the cutout quad", [8.0, 6.0, 12.0, 7.0], CLEAR, 0);
         probe("left of the turned square", [0.0, 5.0, 3.0, 6.0], CLEAR, 0);
         probe("right of the depth quads", [7.0, 5.0, 12.0, 6.0], CLEAR, 0);
 
-        for (i, quads) in solid.iter().chain([&cutout]).enumerate() {
+        for (i, quads) in solid.iter().chain([&cutout, &translucent]).enumerate() {
             scene.quads[i] = quads.len() as u32;
             for q in quads {
                 q.pack(&mut scene.vertices);
@@ -525,6 +658,18 @@ impl Scene {
         }
         scene.probes = probes;
         scene
+    }
+}
+
+impl Scene {
+    /// The translucent draw's 16-bit indices: its quads in [`Self::order`], two
+    /// triangles each.
+    fn translucent_indices(&self) -> Vec<u8> {
+        self.order
+            .iter()
+            .flat_map(|quad| [0, 1, 2, 2, 3, 0].map(|corner| (quad * 4 + corner) as u16))
+            .flat_map(u16::to_le_bytes)
+            .collect()
     }
 }
 
@@ -685,11 +830,24 @@ fn picture(scene: &Scene, case: Case) -> Vec<u8> {
         .collect();
     let mut next = 0;
     for (draw, &count) in scene.quads.iter().enumerate() {
-        // The last draw is the first section's cutout layer.
+        // The last two draws are the first section's cutout and translucent layers.
         let section = if draw < ORIGINS.len() { draw } else { 0 };
-        let cutout = draw == ORIGINS.len();
+        let translucent = draw == ORIGINS.len() + 1;
+        // Below how much alpha a fragment is left out.
+        let threshold = match draw.checked_sub(ORIGINS.len()) {
+            Some(0) => 0.5,
+            Some(_) => 0.1,
+            None => 0.0,
+        };
         let origin = ORIGINS[section].map(|c| c as f32);
-        for q in &quads[next..next + count as usize] {
+        let of_draw = &quads[next..next + count as usize];
+        // The translucent quads in their indices' order, the others as they come.
+        let in_order: Vec<&[Vertex; 4]> = if translucent {
+            scene.order.iter().map(|&i| &of_draw[i as usize]).collect()
+        } else {
+            of_draw.iter().collect()
+        };
+        for q in in_order {
             let p: [[f32; 3]; 4] = q.map(|v| {
                 let local = v.position.map(position_of);
                 std::array::from_fn(|i| local[i] + origin[i])
@@ -759,7 +917,7 @@ fn picture(scene: &Scene, case: Case) -> Vec<u8> {
                             *v = from * (1.0 - f) + *v * f;
                         }
                     }
-                    if cutout && c[3] < 0.5 {
+                    if c[3] < threshold {
                         continue;
                     }
                     if fogged {
@@ -773,6 +931,14 @@ fn picture(scene: &Scene, case: Case) -> Vec<u8> {
                     let i = (py * WIDTH + px) as usize;
                     if z >= depth[i] {
                         depth[i] = z;
+                        if translucent {
+                            // Over what is there, by its own alpha.
+                            let (under, a) = (colour[i].map(|v| f32::from(v) / 255.0), c[3]);
+                            for (k, v) in c.iter_mut().enumerate() {
+                                let src = if k == 3 { 1.0 } else { a };
+                                *v = *v * src + under[k] * (1.0 - a);
+                            }
+                        }
                         colour[i] = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
                     }
                 }
@@ -810,8 +976,10 @@ pub(crate) struct TerrainCheck {
     scene: Scene,
     vertices: RangeHandle,
     indices: RangeHandle,
-    /// The two buffers' uploads, once staged.
-    uploads: [Option<UploadTicket>; 2],
+    /// The translucent draw's own indices.
+    sorted: RangeHandle,
+    /// The three buffers' uploads, once staged.
+    uploads: [Option<UploadTicket>; 3],
     atlas: TextureId,
     lightmap: TextureId,
     /// What each kind of frame must read ([`Case::picture`]), once one was drawn.
@@ -858,6 +1026,7 @@ impl TerrainCheck {
         alloc(&mut pool, 3 * VERTEX_BYTES)?;
         let vertices = alloc(&mut pool, scene.vertices.len())?;
         let indices = alloc(&mut pool, quad_indices().len())?;
+        let sorted = alloc(&mut pool, scene.translucent_indices().len())?;
         let texels: Vec<u8> = atlas_texels().into_iter().flatten().collect();
         let atlas = textures.create_with(
             uploads,
@@ -886,7 +1055,8 @@ impl TerrainCheck {
             scene,
             vertices,
             indices,
-            uploads: [None; 2],
+            sorted,
+            uploads: [None; 3],
             atlas,
             lightmap,
             pictures: vec![None; 2 * FOGS.len() + 1],
@@ -903,9 +1073,11 @@ impl TerrainCheck {
     pub fn stage(&mut self, uploads: &mut UploadRing) {
         self.pool.maintain(&uploads.completed());
         let indices = quad_indices();
+        let sorted = self.scene.translucent_indices();
         for (i, (handle, bytes)) in [
             (self.vertices, &self.scene.vertices),
             (self.indices, &indices),
+            (self.sorted, &sorted),
         ]
         .into_iter()
         .enumerate()
@@ -960,9 +1132,10 @@ impl TerrainCheck {
                 .uploads
                 .iter()
                 .all(|t| t.is_some_and(|t| uploads.is_ready(t)));
-        let (Some(vertices), Some(indices)) = (
+        let (Some(vertices), Some(indices), Some(sorted)) = (
             self.pool.resolve(self.vertices),
             self.pool.resolve(self.indices),
+            self.pool.resolve(self.sorted),
         ) else {
             return Ok(());
         };
@@ -1000,7 +1173,7 @@ impl TerrainCheck {
         // The frame's fog and shader: the fog goes with the push constants.
         let case = Case::of(frame);
         let fog = &FOGS[case.fog];
-        let [solid, with_holes] = case.shader.pipelines();
+        let [solid, with_holes, seen_through] = case.shader.pipelines();
         if !gap(frame_data, 4) {
             return Ok(());
         }
@@ -1041,9 +1214,16 @@ impl TerrainCheck {
         // The scene's draws: pipeline, instance, quads and first quad.
         let mut draws = Vec::with_capacity(self.scene.quads.len());
         let mut quad = 0;
+        // The translucent layer's own draw: its quads and its first.
+        let mut last = (0, 0);
         for (i, &quads) in self.scene.quads.iter().enumerate() {
             let (pipeline, instance) = match i {
                 4 => (with_holes, 0),
+                5 => {
+                    last = (quads, quad);
+                    quad += quads;
+                    continue;
+                }
                 section => (solid, section as u32),
             };
             if quads > 0 {
@@ -1051,6 +1231,9 @@ impl TerrainCheck {
             }
             quad += quads;
         }
+        // Its indices start where their range does, counted in indices.
+        let first_sorted = (sorted.offset / 2) as u32;
+        let last_vertex = (first + last.1 * 4) as i32;
         // Drawn indirectly, each pipeline's draws are commands in the frame's data,
         // after a gap that changes like the records'.
         let mut calls = Vec::new();
@@ -1060,7 +1243,7 @@ impl TerrainCheck {
                     .iter()
                     .filter(|d| d.0 == pipeline)
                     .flat_map(|&(_, instance, quads, quad)| {
-                        draw_command(quads * 6, (first + quad * 4) as i32, instance)
+                        draw_command(quads * 6, 0, (first + quad * 4) as i32, instance)
                     })
                     .collect();
                 if commands.is_empty() {
@@ -1076,6 +1259,17 @@ impl TerrainCheck {
                 bytes.copy_from_slice(&commands);
                 calls.push((pipeline, offset, count));
             }
+        }
+        let mut last_call = None;
+        if indirect {
+            if !gap(frame_data, 5) {
+                return Ok(());
+            }
+            let Some((offset, bytes)) = frame_data.alloc_draw_commands(1) else {
+                return Ok(());
+            };
+            bytes.copy_from_slice(&draw_command(last.0 * 6, first_sorted, last_vertex, 0));
+            last_call = Some(offset);
         }
         let commands = frame_data.buffer();
         let mut pass = encoder.readback_pass_with_depth(pipelines, &mut self.target, &self.depth);
@@ -1116,6 +1310,25 @@ impl TerrainCheck {
                         instance,
                     );
                 }
+            }
+            // Last, the translucent layer through its own indices.
+            pass.bind_index_buffer_of(sorted.buffer, 0, false);
+            match last_call {
+                Some(offset) => pass.draw_indexed_indirect(
+                    seen_through.index(),
+                    constants(),
+                    commands,
+                    offset,
+                    1,
+                ),
+                None => pass.draw_indexed(
+                    seen_through.index(),
+                    constants(),
+                    last.0 * 6,
+                    first_sorted,
+                    last_vertex,
+                    0,
+                ),
             }
         }
         pass.finish();

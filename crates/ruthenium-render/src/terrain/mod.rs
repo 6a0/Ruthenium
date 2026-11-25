@@ -2,18 +2,22 @@
 //! mesher that turns a section of the level into vertices ([`Mesher`]).
 
 mod camera;
+mod fluid;
 mod lightmap;
+pub(crate) mod medium;
 mod mesher;
 mod smooth;
+mod sort;
 mod table;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 mod tint;
 mod tracker;
 mod visibility;
 pub(crate) mod world;
 
 pub use camera::{CameraPose, NEAR_PLANE, View};
+pub use fluid::FluidModels;
 pub use lightmap::LightmapInputs;
 pub use mesher::{MeshOptions, Mesher, SectionMesh};
 pub use table::BlockTable;

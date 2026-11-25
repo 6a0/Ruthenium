@@ -14,31 +14,44 @@
 //!    the mesh replaces the section's old one, which is drawn until then and retired
 //!    after the frames that drew it.
 //!
+//! A mesh's translucent quads are drawn after everything else, the farthest section
+//! first and each section's quads farthest first, through indices of the section's own.
+//! The worker that meshes a section sorts them for where the camera then is, and those
+//! indices travel behind the vertices in the same range. When the camera has moved
+//! enough ([`super::sort::needs_sort`]) a worker sorts the kept centres again; the new
+//! indices go into a range of their own in the frame they come back in, and the draw
+//! switches to them once that frame may read them.
+//!
 //! Every stage is bounded: jobs out at once, results waiting for staging, slices
 //! reserved, and the pool's budget.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use ruthenium_assets::AtlasAnimations;
+use ruthenium_assets::animation::Rect;
 use ruthenium_gpu::{
-    BufferPool, DRAW_COMMAND_BYTES, Error, FrameData, Gpu, MAX_INDIRECT_DRAWS, Pass, PoolConfig,
-    PoolError, PoolStats, RangeHandle, Reservation, ReservationState, StagingWriter, TextureDesc,
-    TextureId, TextureTable, UploadError, UploadRing, UploadTicket, Urgency, Users, vk,
+    BufferPool, DRAW_COMMAND_BYTES, Error, FrameData, Gpu, ImageRegion, MAX_INDIRECT_DRAWS, Pass,
+    PoolConfig, PoolError, PoolStats, RangeHandle, Reservation, ReservationState, StagingWriter,
+    TextureDesc, TextureId, TextureTable, UploadError, UploadRing, UploadTicket, Urgency, Users,
+    vk,
 };
 use ruthenium_shaders::interface::{SECTION, WORLD, WORLD_MATRIX};
 use ruthenium_sim::environment::Environment;
-use ruthenium_sim::scene::{Scene, SectionKey, Stamp};
+use ruthenium_sim::scene::{Frame, Scene, SectionKey, Stamp};
 
 use super::camera::{CameraPose, View};
 use super::lightmap::{self, LightmapInputs};
+use super::medium;
 use super::mesher::{MeshOptions, Mesher, SectionMesh};
+use super::sort::{self, PointOfView, Sorter};
 use super::table::BlockTable;
 use super::tint::{BiomeTints, ColourMaps, MAX_BLEND_RADIUS};
 use super::tracker::{Job, Since, Tracker, TrackerStats};
 use super::visibility::{Batch, Camera, Connectivity, Visibility};
-use crate::atmosphere::Fog;
+use crate::atmosphere::{Fog, Medium};
 use crate::pipelines::PipelineId;
 use crate::terrain_vertex::VERTEX_BYTES;
 
@@ -62,8 +75,24 @@ const WORKER_STAGING_BYTES: u64 = 8 << 20;
 const MAX_PENDING: usize = 48;
 /// Jobs out per worker.
 const JOBS_PER_WORKER: usize = 2;
+/// Sections whose translucent quads are being sorted again or whose new order is on its
+/// way to the GPU, at once: the nearest go first, the others wait for a later frame.
+const MAX_SORTS: usize = 32;
 /// `GameType.SPECTATOR`'s id.
 const SPECTATOR: i32 = 3;
+/// Bytes of animated sprites staged in one piece: a piece the upload ring has no room
+/// for waits for the next frame, the ones before it are on their way.
+const ANIMATION_PIECE: usize = 256 << 10;
+/// Over how long a tick's animated sprites are written, where frames are shorter than
+/// that: each frame writes its share. A longer frame writes them all.
+const ANIMATION_SPREAD: Duration = Duration::from_millis(8);
+
+/// How many of the `stale` sprites a tick left a frame writes that came `since` after the
+/// one before.
+fn animation_share(stale: usize, since: Duration) -> usize {
+    let share = since.as_secs_f64() / ANIMATION_SPREAD.as_secs_f64();
+    ((stale as f64 * share.min(1.0)).ceil() as usize).min(stale)
+}
 
 /// How a frame's sections are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -138,18 +167,29 @@ impl TerrainShader {
         TerrainShader::ALL.into_iter().find(|s| s.name() == name)
     }
 
-    /// The pipelines of the solid and of the cutout layer.
-    pub(crate) fn pipelines(self) -> [PipelineId; 2] {
+    /// The pipelines of the solid, the cutout and the translucent layer.
+    pub(crate) fn pipelines(self) -> [PipelineId; 3] {
         match self {
-            TerrainShader::Rgss => [PipelineId::TerrainRgss, PipelineId::TerrainRgssCutout],
+            TerrainShader::Rgss => [
+                PipelineId::TerrainRgss,
+                PipelineId::TerrainRgssCutout,
+                PipelineId::TerrainRgssTranslucent,
+            ],
             TerrainShader::RgssReference => [
                 PipelineId::TerrainRgssReference,
                 PipelineId::TerrainRgssReferenceCutout,
+                PipelineId::TerrainRgssReferenceTranslucent,
             ],
-            TerrainShader::Nearest => {
-                [PipelineId::TerrainNearest, PipelineId::TerrainNearestCutout]
-            }
-            TerrainShader::Plain => [PipelineId::TerrainPlain, PipelineId::TerrainPlainCutout],
+            TerrainShader::Nearest => [
+                PipelineId::TerrainNearest,
+                PipelineId::TerrainNearestCutout,
+                PipelineId::TerrainNearestTranslucent,
+            ],
+            TerrainShader::Plain => [
+                PipelineId::TerrainPlain,
+                PipelineId::TerrainPlainCutout,
+                PipelineId::TerrainPlainTranslucent,
+            ],
         }
     }
 }
@@ -257,6 +297,10 @@ pub struct WorldAssets {
     pub atlas_width: u32,
     pub atlas_height: u32,
     pub atlas_levels: Vec<Vec<u8>>,
+    /// The atlas's animated sprites.
+    pub animations: AtlasAnimations,
+    /// The picture of water before a player whose eyes are in it.
+    pub underwater: Option<crate::sky::SkyImage>,
     /// The colour maps biomes take their grass and foliage colours from.
     pub colour_maps: ColourMaps,
     /// The sun, the moon's phases and the End's sky.
@@ -276,7 +320,7 @@ pub(crate) fn quad_indices() -> Vec<u8> {
 }
 
 /// A section's mesh in a buffer page.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct MeshRange {
     handle: RangeHandle,
     buffer: vk::Buffer,
@@ -287,6 +331,52 @@ struct MeshRange {
     cutout_quads: u32,
     /// In blocks from the section's corner.
     bounds: [[f32; 3]; 2],
+    translucent: Option<Translucent>,
+}
+
+/// Where a section's sorted indices are: the buffer, the index of the first of them in
+/// it, and whether they are 32-bit ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexRange {
+    buffer: vk::Buffer,
+    first: u32,
+    wide: bool,
+}
+
+/// The translucent quads of a mesh: they follow the solid and the cutout ones among
+/// its vertices.
+#[derive(Debug, Clone)]
+struct Translucent {
+    quads: u32,
+    indices: IndexRange,
+    /// The range the indices have to themselves, once sorted again; until then they
+    /// are behind the vertices in the mesh's own range.
+    own: Option<RangeHandle>,
+    /// The points the quads are sorted by.
+    centres: Arc<[[f32; 3]]>,
+    /// The block the camera was in and its point of view when the order drawn now (or
+    /// the one on its way) was made.
+    sorted_at: [i32; 3],
+    sorted_from: PointOfView,
+    /// A new order is being made or is on its way to the GPU.
+    sorting: bool,
+}
+
+impl MeshRange {
+    /// Bytes of its vertices and of the indices that came with them.
+    fn bytes(&self) -> u64 {
+        let translucent = self.translucent.as_ref().map_or(0, |t| t.quads);
+        u64::from(self.solid_quads + self.cutout_quads + translucent) * 4 * VERTEX_BYTES as u64
+            + sort::index_bytes(translucent as usize) as u64
+    }
+}
+
+/// Lets go of a mesh's ranges once `users` are done with them.
+fn retire(pool: &mut BufferPool, mesh: &MeshRange, users: Users) {
+    pool.retire(mesh.handle, users);
+    if let Some(own) = mesh.translucent.as_ref().and_then(|t| t.own) {
+        pool.retire(own, users);
+    }
 }
 
 enum Work {
@@ -294,6 +384,8 @@ enum Work {
         job: Box<Job>,
         options: MeshOptions,
         biomes: Arc<BiomeTints>,
+        /// Where the camera is: what the translucent quads are first sorted for.
+        camera: [f64; 3],
         /// Which run of sessions the job is of ([`WorldRenderer::clear`]).
         session: u64,
     },
@@ -302,16 +394,43 @@ enum Work {
         writer: StagingWriter,
         bytes: Vec<u8>,
     },
+    /// Sort a mesh's translucent quads again.
+    Sort {
+        session: u64,
+        key: SectionKey,
+        /// The mesh the centres are of.
+        mesh: RangeHandle,
+        centres: Arc<[[f32; 3]]>,
+        camera: [f64; 3],
+    },
 }
 
 struct Meshed {
     session: u64,
     stamp: Stamp,
     mesh: SectionMesh,
+    /// The translucent quads' indices, sorted for the job's camera.
+    indices: Vec<u8>,
+    sorted_at: [i32; 3],
+    sorted_from: PointOfView,
     urgent: bool,
     first: bool,
     since: Since,
     micros: u64,
+}
+
+struct Sorted {
+    session: u64,
+    key: SectionKey,
+    mesh: RangeHandle,
+    indices: Vec<u8>,
+    sorted_at: [i32; 3],
+    sorted_from: PointOfView,
+}
+
+enum Done {
+    Meshed(Box<Meshed>),
+    Sorted(Sorted),
 }
 
 #[derive(Default)]
@@ -322,7 +441,7 @@ struct WorkQueue {
 
 struct Workers {
     shared: Arc<(Mutex<WorkQueue>, Condvar)>,
-    results: mpsc::Receiver<Meshed>,
+    results: mpsc::Receiver<Done>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -353,8 +472,9 @@ impl Workers {
     fn push(&self, work: Work) {
         let mut q = lock(&self.shared.0);
         match work {
-            // Copies first: they free the memory of finished results.
-            Work::Fill { .. } => q.work.push_front(work),
+            // Copies first: they free the memory of finished results. Sorts before
+            // meshes too: they are short, and what they are for is on screen.
+            Work::Fill { .. } | Work::Sort { .. } => q.work.push_front(work),
             Work::Mesh { .. } => q.work.push_back(work),
         }
         drop(q);
@@ -378,10 +498,11 @@ impl Workers {
 
 fn work(
     shared: &(Mutex<WorkQueue>, Condvar),
-    results: &mpsc::Sender<Meshed>,
+    results: &mpsc::Sender<Done>,
     table: Arc<BlockTable>,
 ) {
     let mut mesher = Mesher::new(table);
+    let mut sorter = Sorter::default();
     loop {
         let next = {
             let mut q = lock(&shared.0);
@@ -400,21 +521,52 @@ fn work(
                 job,
                 options,
                 biomes,
+                camera,
                 session,
             } => {
                 profiling::scope!("mesh_section");
                 let started = Instant::now();
                 let mesh = mesher.mesh(&job.neighbourhood, &options, &biomes);
+                let section = job.neighbourhood.section();
+                let mut indices = Vec::new();
+                if !mesh.centres.is_empty() {
+                    sorter.indices(&mesh.centres, sort::eye(camera, section), &mut indices);
+                }
                 let done = Meshed {
                     session,
                     stamp: job.neighbourhood.stamp().clone(),
                     mesh,
+                    indices,
+                    sorted_at: camera.map(ruthenium_javamath::mth::floor),
+                    sorted_from: sort::point_of_view(camera, section),
                     urgent: job.urgent,
                     first: job.first,
                     since: job.since,
                     micros: started.elapsed().as_micros() as u64,
                 };
-                if results.send(done).is_err() {
+                if results.send(Done::Meshed(Box::new(done))).is_err() {
+                    return;
+                }
+            }
+            Work::Sort {
+                session,
+                key,
+                mesh,
+                centres,
+                camera,
+            } => {
+                profiling::scope!("sort_section");
+                let mut indices = Vec::new();
+                sorter.indices(&centres, sort::eye(camera, key), &mut indices);
+                let done = Sorted {
+                    session,
+                    key,
+                    mesh,
+                    indices,
+                    sorted_at: camera.map(ruthenium_javamath::mth::floor),
+                    sorted_from: sort::point_of_view(camera, key),
+                };
+                if results.send(Done::Sorted(done)).is_err() {
                     return;
                 }
             }
@@ -447,23 +599,42 @@ struct Pending {
     first: bool,
     /// When the change it shows was known.
     known: Since,
+    /// Bytes of the vertices and of the indices behind them, and of the vertices.
     bytes: u64,
+    vertex_bytes: u64,
     solid_quads: u32,
     cutout_quads: u32,
+    translucent_quads: u32,
+    centres: Arc<[[f32; 3]]>,
+    sorted_at: [i32; 3],
+    sorted_from: PointOfView,
     bounds: [[f32; 3]; 2],
     connectivity: Connectivity,
     since: Instant,
     stage: Stage,
 }
 
+/// A new order of a mesh's translucent quads between its worker and the screen.
+struct PendingSort {
+    sorted: Sorted,
+    /// Its range and its copy, once it has them.
+    placed: Option<(RangeHandle, UploadTicket)>,
+}
+
 /// A section the frame draws.
 #[derive(Clone, Copy)]
 struct Visible {
     distance: i64,
-    mesh: MeshRange,
     origin: [i32; 3],
     /// How far it has faded in.
     visibility: f32,
+    buffer: vk::Buffer,
+    page: u32,
+    first_vertex: u32,
+    solid_quads: u32,
+    cutout_quads: u32,
+    /// Its translucent quads and where their indices are.
+    translucent: Option<(u32, IndexRange)>,
 }
 
 /// What the terrain is doing, for the debug text and the logs.
@@ -487,8 +658,24 @@ pub struct WorldStats {
     pub slowest_mesh_micros: u64,
     /// The longest a mesh took from its result to being drawn, in milliseconds.
     pub slowest_install_ms: f32,
-    /// Translucent quads left out so far (in meshes installed).
+    /// Translucent quads so far (in meshes that arrived), and the times a section's
+    /// were sorted again and drawn in their new order.
     pub translucent_quads: u64,
+    pub sorts: u64,
+    /// The last frame's translucent quads and the sections they are of.
+    pub translucent_drawn: u64,
+    pub translucent_sections: u32,
+    /// Orders being made or on their way.
+    pub sorting: usize,
+    /// Animated sprites, the ticks they have played, the times one was written into the
+    /// atlas again, the bytes that took, the times the upload ring had no room for some,
+    /// and the longest a frame spent on them, in microseconds.
+    pub animated_sprites: usize,
+    pub animation_ticks: u64,
+    pub animation_writes: u64,
+    pub animation_bytes: u64,
+    pub animation_waits: u64,
+    pub slowest_animation_micros: u32,
     /// Corners and texture coordinates moved into a vertex's range.
     pub out_of_range: u64,
     /// Meshes that found no room in the pool's budget, or were larger than a page.
@@ -529,6 +716,17 @@ pub struct WorldStats {
 pub(crate) struct WorldRenderer {
     atlas: TextureId,
     atlas_size: [f32; 2],
+    animations: AtlasAnimations,
+    /// Whether they play, and the level and the tick they last played in.
+    animate: bool,
+    animated_at: Option<(u64, u64)>,
+    /// How many sprites the last tick left to write, and when the last frame was.
+    animated_stale: usize,
+    animated_frame: Option<Instant>,
+    /// Scratch of [`Self::animate`]: a piece's sprites, rectangles and texels.
+    animated: Vec<usize>,
+    animated_rects: Vec<Rect>,
+    animated_texels: Vec<u8>,
     lightmap: Option<TextureId>,
     lightmap_inputs: LightmapInputs,
     pool: BufferPool,
@@ -550,8 +748,24 @@ pub(crate) struct WorldRenderer {
     workers: Workers,
     jobs_out: usize,
     pending: Vec<Pending>,
+    /// Sorts with a worker, and their results on the way to the GPU.
+    sorts_out: usize,
+    sorted: Vec<PendingSort>,
+    /// Where the camera is (the last [`Self::update`]'s).
+    camera: [f64; 3],
     removed: Vec<MeshRange>,
     visible: Vec<Visible>,
+    /// Scratch of [`Self::draw`]: the visible sections whose translucent quads are to
+    /// be sorted again, with their distance.
+    unsorted: Vec<(i64, SectionKey)>,
+    /// What [`Self::draw`] leaves for [`Self::draw_translucent`]: the frame's push
+    /// constants and how many of the visible sections have a record.
+    drawn: Option<([u8; TERRAIN_PUSH_BYTES], usize)>,
+    /// Scratch of [`Self::draw_translucent`]: the sections to draw, farthest first, as
+    /// their places among the visible ones; and the indirect calls (vertex buffer,
+    /// indices, first command and how many).
+    translucent_order: Vec<u32>,
+    translucent_calls: Vec<(vk::Buffer, IndexRange, u32, u32)>,
     /// How the sections are drawn, and whether the GPU can draw them indirectly.
     draws: TerrainDraws,
     indirect: bool,
@@ -559,6 +773,8 @@ pub(crate) struct WorldRenderer {
     /// is there at once).
     shader: TerrainShader,
     fade_ms: u32,
+    /// Whether the translucent layer is drawn (and sorted again as the camera moves).
+    translucent: bool,
     /// Scratch of [`Self::draw`]: each page's nearest section and then its place in the
     /// order of pages; a layer's draw commands; and the calls that read them (a vertex
     /// buffer, its first command and how many).
@@ -581,16 +797,18 @@ const FIRST: usize = 0;
 const CHANGED: usize = 1;
 const OWN: usize = 2;
 
-/// One indexed draw command of a single instance, as the GPU reads it.
+/// One indexed draw command of a single instance, as the GPU reads it. The solid and
+/// the cutout layer start at the shared quad indices' beginning (`first_index` 0).
 pub(crate) fn draw_command(
     indices: u32,
+    first_index: u32,
     vertex_offset: i32,
     instance: u32,
 ) -> [u8; DRAW_COMMAND_BYTES as usize] {
     let mut out = [0u8; DRAW_COMMAND_BYTES as usize];
     out[0..4].copy_from_slice(&indices.to_ne_bytes());
     out[4..8].copy_from_slice(&1u32.to_ne_bytes());
-    // The first index: every draw starts at the shared quad indices' beginning.
+    out[8..12].copy_from_slice(&first_index.to_ne_bytes());
     out[12..16].copy_from_slice(&vertex_offset.to_ne_bytes());
     out[16..20].copy_from_slice(&instance.to_ne_bytes());
     out
@@ -753,6 +971,14 @@ impl WorldRenderer {
         Ok(WorldRenderer {
             atlas,
             atlas_size: [assets.atlas_width as f32, assets.atlas_height as f32],
+            animations: assets.animations,
+            animate: true,
+            animated_at: None,
+            animated_stale: 0,
+            animated_frame: None,
+            animated: Vec::new(),
+            animated_rects: Vec::new(),
+            animated_texels: Vec::new(),
             lightmap: None,
             lightmap_inputs: LightmapInputs::default(),
             pool,
@@ -773,8 +999,15 @@ impl WorldRenderer {
             table: assets.table,
             jobs_out: 0,
             pending: Vec::new(),
+            sorts_out: 0,
+            sorted: Vec::new(),
+            camera: [0.0; 3],
             removed: Vec::new(),
             visible: Vec::new(),
+            unsorted: Vec::new(),
+            drawn: None,
+            translucent_order: Vec::new(),
+            translucent_calls: Vec::new(),
             draws: TerrainDraws::default(),
             indirect: {
                 let o = gpu.caps().optional;
@@ -782,6 +1015,7 @@ impl WorldRenderer {
             },
             shader: TerrainShader::default(),
             fade_ms: DEFAULT_FADE_MS,
+            translucent: true,
             page_order: Vec::new(),
             commands: Vec::new(),
             calls: Vec::new(),
@@ -862,11 +1096,9 @@ impl WorldRenderer {
             tracker: self.tracker.stats(),
             jobs_out: self.jobs_out,
             pending: self.pending.len(),
-            mesh_bytes: self
-                .tracker
-                .all_meshes()
-                .map(|m| u64::from(m.solid_quads + m.cutout_quads) * 4 * VERTEX_BYTES as u64)
-                .sum(),
+            mesh_bytes: self.tracker.all_meshes().map(MeshRange::bytes).sum(),
+            sorting: self.sorts_out + self.sorted.len(),
+            animated_sprites: self.animations.len(),
             pool: self.pool.stats(),
             culling: self.visibility.is_some(),
             reached: self.tracker.reached(),
@@ -882,8 +1114,14 @@ impl WorldRenderer {
     pub fn clear(&mut self, uploads: &mut UploadRing, frame: u64) {
         self.tracker.clear(&mut self.removed);
         for m in self.removed.drain(..) {
-            self.pool.retire(m.handle, Users::until_frame(frame));
+            retire(&mut self.pool, &m, Users::until_frame(frame));
         }
+        for s in self.sorted.drain(..) {
+            if let Some((handle, ticket)) = s.placed {
+                self.pool.retire(handle, uploads.users_of(ticket));
+            }
+        }
+        self.drawn = None;
         for p in self.pending.drain(..) {
             match p.stage {
                 Stage::Waiting(_) => {}
@@ -917,6 +1155,11 @@ impl WorldRenderer {
         self.options.shades = environment.cardinal_light.shades();
         self.biomes = Arc::new(BiomeTints::new(&self.colour_maps, &environment.biomes));
         self.environment = Some(environment.clone());
+    }
+
+    /// Whether the translucent layer is drawn. It applies from the next frame.
+    pub fn set_translucent(&mut self, on: bool) {
+        self.translucent = on;
     }
 
     /// How the terrain's texels are filtered. It applies from the next frame.
@@ -1007,6 +1250,7 @@ impl WorldRenderer {
         profiling::scope!("world_update");
         let block = camera.position.map(|c| c.floor() as i32);
         let section: SectionKey = block.map(|b| b >> 4);
+        self.camera = camera.position;
         self.tracker.set_clock(Since {
             at: Instant::now(),
             frame,
@@ -1044,10 +1288,23 @@ impl WorldRenderer {
         }
         self.tracker.sync(scene, &mut self.removed);
         for m in self.removed.drain(..) {
-            self.pool.retire(m.handle, Users::until_frame(frame));
+            retire(&mut self.pool, &m, Users::until_frame(frame));
         }
 
         while let Ok(done) = self.workers.results.try_recv() {
+            let done = match done {
+                Done::Meshed(done) => *done,
+                Done::Sorted(sorted) => {
+                    self.sorts_out -= 1;
+                    if sorted.session == self.session {
+                        self.sorted.push(PendingSort {
+                            sorted,
+                            placed: None,
+                        });
+                    }
+                    continue;
+                }
+            };
             self.jobs_out -= 1;
             if done.session != self.session {
                 continue;
@@ -1063,7 +1320,7 @@ impl WorldRenderer {
                 self.note_installed(&done.mesh, 0, Instant::now());
                 self.note_latency(done.urgent, done.first, done.since, frame);
                 if let Some(old) = self.tracker.install(done.stamp, None) {
-                    self.pool.retire(old.handle, Users::until_frame(frame));
+                    retire(&mut self.pool, &old, Users::until_frame(frame));
                 }
                 self.tracker.connect(key, done.mesh.connectivity, true);
                 continue;
@@ -1073,18 +1330,27 @@ impl WorldRenderer {
             self.tracker.connect(key, done.mesh.connectivity, false);
             self.stats.translucent_quads += u64::from(done.mesh.translucent_quads);
             self.stats.out_of_range += u64::from(done.mesh.out_of_range);
+            // The indices travel behind the vertices, in one range.
+            let mut bytes = done.mesh.vertices;
+            let vertex_bytes = bytes.len() as u64;
+            bytes.extend_from_slice(&done.indices);
             self.pending.push(Pending {
                 stamp: done.stamp,
                 urgent: done.urgent,
                 first: done.first,
                 known: done.since,
-                bytes: done.mesh.vertices.len() as u64,
+                bytes: bytes.len() as u64,
+                vertex_bytes,
                 solid_quads: done.mesh.solid_quads,
                 cutout_quads: done.mesh.cutout_quads,
+                translucent_quads: done.mesh.translucent_quads,
+                centres: done.mesh.centres.into(),
+                sorted_at: done.sorted_at,
+                sorted_from: done.sorted_from,
                 bounds,
                 connectivity: done.mesh.connectivity,
                 since: Instant::now(),
-                stage: Stage::Waiting(done.mesh.vertices),
+                stage: Stage::Waiting(bytes),
             });
         }
 
@@ -1096,6 +1362,7 @@ impl WorldRenderer {
                 self.pending.swap_remove(i);
             }
         }
+        self.place_sorts(uploads);
 
         let limit = self.workers.threads.len() * JOBS_PER_WORKER;
         while self.jobs_out < limit && self.jobs_out + self.pending.len() < MAX_PENDING {
@@ -1107,6 +1374,7 @@ impl WorldRenderer {
                 job: Box::new(job),
                 options: self.options,
                 biomes: self.biomes.clone(),
+                camera: camera.position,
                 session: self.session,
             });
         }
@@ -1135,6 +1403,73 @@ impl WorldRenderer {
                     camera,
                     events: self.tracker.take_events(),
                 });
+            }
+        }
+    }
+
+    /// The translucent quads a new order is for, if their mesh is still the one drawn.
+    fn sorting_mesh<'t>(
+        tracker: &'t mut Tracker<MeshRange>,
+        sorted: &Sorted,
+    ) -> Option<&'t mut Translucent> {
+        tracker
+            .mesh_mut(sorted.key)
+            .filter(|m| m.handle == sorted.mesh)
+            .and_then(|m| m.translucent.as_mut())
+    }
+
+    /// Gives every new order that has none a range of its own and records the copy into
+    /// it: into this frame, so that the frame may draw with it.
+    fn place_sorts(&mut self, uploads: &mut UploadRing) {
+        let mut i = 0;
+        while i < self.sorted.len() {
+            if self.sorted[i].placed.is_some() {
+                i += 1;
+                continue;
+            }
+            // The mesh was replaced meanwhile: the new one came with its own order.
+            if Self::sorting_mesh(&mut self.tracker, &self.sorted[i].sorted).is_none() {
+                self.sorted.swap_remove(i);
+                continue;
+            }
+            let bytes = self.sorted[i].sorted.indices.len() as u64;
+            let placed = match self.pool.alloc(bytes, VERTEX_BYTES as u64) {
+                Ok(handle) => {
+                    let range = self.pool.resolve(handle).expect("just allocated");
+                    match uploads.upload_buffer_with(
+                        range.buffer,
+                        range.offset,
+                        &self.sorted[i].sorted.indices,
+                        Urgency::Edit,
+                    ) {
+                        Ok(ticket) => Ok((handle, ticket)),
+                        Err(e) => {
+                            self.pool.retire(handle, Users::NONE);
+                            Err(matches!(e, UploadError::Full))
+                        }
+                    }
+                }
+                Err(e) => Err(matches!(e, PoolError::Growing)),
+            };
+            match placed {
+                Ok(placed) => {
+                    let s = &mut self.sorted[i];
+                    s.placed = Some(placed);
+                    s.sorted.indices = Vec::new();
+                    i += 1;
+                }
+                // No room this frame: the next one asks again.
+                Err(true) => i += 1,
+                // No room at all: the section keeps the order it has, and is asked
+                // again only when the camera has moved on.
+                Err(false) => {
+                    let s = self.sorted.swap_remove(i).sorted;
+                    if let Some(t) = Self::sorting_mesh(&mut self.tracker, &s) {
+                        t.sorting = false;
+                        t.sorted_at = s.sorted_at;
+                        t.sorted_from = s.sorted_from;
+                    }
+                }
             }
         }
     }
@@ -1258,6 +1593,7 @@ impl WorldRenderer {
                 self.pool.retire(handle, uploads.users_of(ticket));
                 continue;
             }
+            let wide = p.translucent_quads as usize > sort::NARROW_QUADS;
             let mesh = MeshRange {
                 handle,
                 buffer: range.buffer,
@@ -1266,9 +1602,23 @@ impl WorldRenderer {
                 solid_quads: p.solid_quads,
                 cutout_quads: p.cutout_quads,
                 bounds: p.bounds,
+                translucent: (p.translucent_quads > 0).then(|| Translucent {
+                    quads: p.translucent_quads,
+                    indices: IndexRange {
+                        buffer: range.buffer,
+                        first: ((range.offset + p.vertex_bytes) / if wide { 4 } else { 2 }) as u32,
+                        wide,
+                    },
+                    own: None,
+                    centres: p.centres,
+                    sorted_at: p.sorted_at,
+                    sorted_from: p.sorted_from,
+                    sorting: false,
+                }),
             };
             self.stats.installed += 1;
-            self.stats.installed_quads += u64::from(p.solid_quads + p.cutout_quads);
+            self.stats.installed_quads +=
+                u64::from(p.solid_quads + p.cutout_quads + p.translucent_quads);
             self.stats.installed_bytes += p.bytes;
             self.stats.slowest_install_ms = self
                 .stats
@@ -1278,10 +1628,140 @@ impl WorldRenderer {
             let key = p.stamp.section;
             if let Some(old) = self.tracker.install(p.stamp, Some(mesh)) {
                 // Frames up to the one before this may have drawn it.
-                self.pool.retire(old.handle, Users::until_frame(frame));
+                retire(&mut self.pool, &old, Users::until_frame(frame));
             }
             self.tracker.connect(key, p.connectivity, true);
         }
+        // New orders whose copies this frame may read.
+        let mut i = 0;
+        while i < self.sorted.len() {
+            let Some((handle, ticket)) = self.sorted[i].placed.filter(|p| uploads.is_ready(p.1))
+            else {
+                i += 1;
+                continue;
+            };
+            let s = self.sorted.swap_remove(i).sorted;
+            let range = self.pool.resolve(handle).expect("a live range");
+            let Some(t) = Self::sorting_mesh(&mut self.tracker, &s) else {
+                self.pool.retire(handle, uploads.users_of(ticket));
+                continue;
+            };
+            let wide = t.indices.wide;
+            t.indices = IndexRange {
+                buffer: range.buffer,
+                first: (range.offset / if wide { 4 } else { 2 }) as u32,
+                wide,
+            };
+            t.sorted_at = s.sorted_at;
+            t.sorted_from = s.sorted_from;
+            t.sorting = false;
+            let old = t.own.replace(handle);
+            if let Some(old) = old {
+                self.pool.retire(old, Users::until_frame(frame));
+            }
+            self.stats.sorts += 1;
+        }
+    }
+
+    /// Whether the animated textures play (they do unless said otherwise); stopped, they
+    /// show what they last showed.
+    pub fn set_animate(&mut self, on: bool) {
+        self.animate = on;
+    }
+
+    /// Plays the animated textures on and stages what changed of the atlas, before the
+    /// frame's `UploadRing::record`. They move on once in a frame in which the game has
+    /// ticked, however many ticks it caught up on, and not while it is frozen
+    /// (`Minecraft.runTick`).
+    pub fn animate(
+        &mut self,
+        frame: &Frame,
+        textures: &mut TextureTable,
+        uploads: &mut UploadRing,
+    ) {
+        if !textures.is_ready(self.atlas) || self.animations.is_empty() {
+            return;
+        }
+        profiling::scope!("animate_textures");
+        let started = Instant::now();
+        let now = Some((frame.epoch, frame.ticks));
+        if now != self.animated_at {
+            self.animated_at = now;
+            if self.animate && !frame.frozen {
+                self.animations.tick();
+                self.animated_stale = self.animations.stale_count();
+                self.stats.animation_ticks += 1;
+            }
+        }
+        let since = self
+            .animated_frame
+            .replace(started)
+            .map_or(ANIMATION_SPREAD, |last| {
+                started.saturating_duration_since(last)
+            });
+        let mut left = animation_share(self.animated_stale, since);
+        let mut from = 0;
+        let mut worked = false;
+        while left > 0
+            && let Some(first) = self.animations.next_stale(from)
+        {
+            worked = true;
+            // A piece: some sprites, with all their levels.
+            self.animated.clear();
+            self.animated_rects.clear();
+            self.animated_texels.clear();
+            let mut next = Some(first);
+            while let Some(sprite) = next {
+                self.animated.push(sprite);
+                self.animations.compose(
+                    sprite,
+                    &mut self.animated_rects,
+                    &mut self.animated_texels,
+                );
+                from = sprite + 1;
+                left -= 1;
+                next = (left > 0 && self.animated_texels.len() < ANIMATION_PIECE)
+                    .then(|| self.animations.next_stale(from))
+                    .flatten();
+            }
+            let mut rest = &self.animated_texels[..];
+            let regions: Vec<(ImageRegion, &[u8])> = self
+                .animated_rects
+                .iter()
+                .map(|r| {
+                    let (texels, after) = rest.split_at((r.width * r.height * 4) as usize);
+                    rest = after;
+                    let region = ImageRegion {
+                        mip: r.level,
+                        x: r.x,
+                        y: r.y,
+                        width: r.width,
+                        height: r.height,
+                    };
+                    (region, texels)
+                })
+                .collect();
+            if textures.update(uploads, self.atlas, &regions).is_err() {
+                // No room: the next frame writes what they should show by then.
+                self.stats.animation_waits += 1;
+                break;
+            }
+            for &sprite in &self.animated {
+                self.animations.written(sprite);
+            }
+            self.stats.animation_writes += self.animated.len() as u64;
+            self.stats.animation_bytes += self.animated_texels.len() as u64;
+        }
+        if worked {
+            let micros = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+            self.stats.slowest_animation_micros = self.stats.slowest_animation_micros.max(micros);
+        }
+    }
+
+    /// What a camera is in, whose field of view is the option's; `aspect` is the
+    /// target's width over its height.
+    pub fn medium_at(&self, scene: &Scene, camera: &CameraPose, aspect: f32) -> Medium {
+        scene.with_terrain(|t| medium::medium_at(t, &self.table, camera, aspect))
     }
 
     /// Whether the textures and the index buffer the draws read have arrived.
@@ -1306,7 +1786,8 @@ impl WorldRenderer {
     }
 
     /// Draws the sections `view` can see into `pass`, which has a depth attachment:
-    /// the solid layer nearest first, then the cutout layer, in `fog`.
+    /// the solid layer nearest first, then the cutout layer, in `fog`. Their translucent
+    /// layer is [`Self::draw_translucent`]'s, after whatever else is opaque.
     ///
     /// # Safety
     /// [`Self::ready`] holds for the frame being recorded, whose `UploadRing::record`
@@ -1320,9 +1801,12 @@ impl WorldRenderer {
     ) {
         profiling::scope!("world_draw");
         self.visible.clear();
+        self.unsorted.clear();
+        self.drawn = None;
         let mut tested = 0;
         let now = Instant::now();
         let fade_ms = self.fade_ms;
+        let camera = self.camera;
         for (key, mesh, since) in self.tracker.meshes_since() {
             tested += 1;
             let origin = [
@@ -1339,14 +1823,55 @@ impl WorldRenderer {
                 .iter()
                 .map(|c| i64::from(c + 8) * i64::from(c + 8))
                 .sum();
+            if let Some(t) = &mesh.translucent
+                && self.translucent
+                && !t.sorting
+                && sort::needs_sort(camera, key, t.sorted_at, t.sorted_from)
+            {
+                self.unsorted.push((distance, key));
+            }
             self.visible.push(Visible {
                 distance,
-                mesh: *mesh,
                 origin,
                 visibility: visibility(now, since, fade_ms),
+                buffer: mesh.buffer,
+                page: mesh.page,
+                first_vertex: mesh.first_vertex,
+                solid_quads: mesh.solid_quads,
+                cutout_quads: mesh.cutout_quads,
+                translucent: mesh.translucent.as_ref().map(|t| (t.quads, t.indices)),
             });
         }
+        // The sections in view whose translucent quads are in an order made for
+        // another place: the nearest are sorted again first.
+        if !self.unsorted.is_empty() {
+            self.unsorted.sort_unstable();
+            for i in 0..self.unsorted.len() {
+                if self.sorts_out + self.sorted.len() >= MAX_SORTS {
+                    break;
+                }
+                let key = self.unsorted[i].1;
+                let Some(mesh) = self.tracker.mesh_mut(key) else {
+                    continue;
+                };
+                let handle = mesh.handle;
+                let Some(t) = &mut mesh.translucent else {
+                    continue;
+                };
+                t.sorting = true;
+                self.sorts_out += 1;
+                self.workers.push(Work::Sort {
+                    session: self.session,
+                    key,
+                    mesh: handle,
+                    centres: t.centres.clone(),
+                    camera,
+                });
+            }
+        }
         self.stats.tested = tested;
+        self.stats.translucent_drawn = 0;
+        self.stats.translucent_sections = 0;
         self.stats.visible = 0;
         self.stats.quads = 0;
         self.stats.draws = 0;
@@ -1356,26 +1881,21 @@ impl WorldRenderer {
             // Nearest first: what is behind fails the depth test before it is shaded.
             TerrainDraws::Direct => self
                 .visible
-                .sort_unstable_by_key(|v| (v.distance, v.mesh.page, v.mesh.first_vertex)),
+                .sort_unstable_by_key(|v| (v.distance, v.page, v.first_vertex)),
             // A page at a time, the page with the nearest section first, and nearest
             // first within a page.
             TerrainDraws::Paged | TerrainDraws::Indirect => {
                 let nearest = &mut self.page_order;
                 nearest.clear();
                 for v in &self.visible {
-                    let page = v.mesh.page as usize;
+                    let page = v.page as usize;
                     if nearest.len() <= page {
                         nearest.resize(page + 1, i64::MAX);
                     }
                     nearest[page] = nearest[page].min(v.distance);
                 }
                 self.visible.sort_unstable_by_key(|v| {
-                    (
-                        nearest[v.mesh.page as usize],
-                        v.mesh.page,
-                        v.distance,
-                        v.mesh.first_vertex,
-                    )
+                    (nearest[v.page as usize], v.page, v.distance, v.first_vertex)
                 });
             }
         }
@@ -1405,8 +1925,9 @@ impl WorldRenderer {
             write_section(record, v.origin, v.visibility);
         }
         let push = terrain_push(world, matrix, first, fog, self.atlas, self.atlas_size);
-        let [solid, with_holes] = self.shader.pipelines();
+        let [solid, with_holes, _] = self.shader.pipelines();
         self.stats.visible = count as u32;
+        self.drawn = Some((push, count));
         let indirect = self.draws == TerrainDraws::Indirect;
         // SAFETY: the push constants are terrain.vert's and the records they point at
         // were written just above; the atlas and the light map are textures of the
@@ -1423,24 +1944,21 @@ impl WorldRenderer {
                 self.calls.clear();
                 for (instance, v) in self.visible[..count].iter().enumerate() {
                     let (mut quads, mut first_vertex) = if cutout {
-                        (
-                            v.mesh.cutout_quads,
-                            v.mesh.first_vertex + v.mesh.solid_quads * 4,
-                        )
+                        (v.cutout_quads, v.first_vertex + v.solid_quads * 4)
                     } else {
-                        (v.mesh.solid_quads, v.mesh.first_vertex)
+                        (v.solid_quads, v.first_vertex)
                     };
                     if quads == 0 {
                         continue;
                     }
-                    if bound != Some(v.mesh.page) {
-                        bound = Some(v.mesh.page);
+                    if bound != Some(v.page) {
+                        bound = Some(v.page);
                         self.stats.binds += 1;
                         if indirect {
                             let next = self.commands.len() as u32 / DRAW_COMMAND_BYTES;
-                            self.calls.push((v.mesh.buffer, next, 0));
+                            self.calls.push((v.buffer, next, 0));
                         } else {
-                            pass.bind_vertex_buffer(v.mesh.buffer, 0);
+                            pass.bind_vertex_buffer(v.buffer, 0);
                         }
                     }
                     self.stats.quads += u64::from(quads);
@@ -1450,6 +1968,7 @@ impl WorldRenderer {
                         if indirect {
                             self.commands.extend_from_slice(&draw_command(
                                 n * 6,
+                                0,
                                 first_vertex as i32,
                                 instance as u32,
                             ));
@@ -1508,6 +2027,125 @@ impl WorldRenderer {
     }
 }
 
+impl WorldRenderer {
+    /// Draws the translucent layer of the sections [`Self::draw`] drew, over what is in
+    /// `pass` by now: the farthest section first, each section's quads in the order
+    /// they were last sorted in. A fragment less than a tenth opaque is left out; the
+    /// others are blended over what is behind them, and write their depth.
+    ///
+    /// # Safety
+    /// As [`Self::draw`], which has run for this frame and this `pass`.
+    pub unsafe fn draw_translucent(&mut self, pass: &mut Pass<'_>, frame_data: &mut FrameData) {
+        profiling::scope!("world_draw_translucent");
+        let Some((push, count)) = self.drawn.take() else {
+            return;
+        };
+        if !self.translucent {
+            return;
+        }
+        let visible = &self.visible[..count];
+        self.translucent_order.clear();
+        self.translucent_order
+            .extend((0..count as u32).filter(|&i| visible[i as usize].translucent.is_some()));
+        if self.translucent_order.is_empty() {
+            return;
+        }
+        // Farthest first. Two sections as far are told apart by where they are, not by
+        // where their meshes happen to be in memory: the same picture every run.
+        self.translucent_order.sort_unstable_by_key(|&i| {
+            let v = &visible[i as usize];
+            (std::cmp::Reverse(v.distance), v.origin)
+        });
+        let pipeline = self.shader.pipelines()[2];
+        let indirect = self.draws == TerrainDraws::Indirect;
+        self.commands.clear();
+        self.translucent_calls.clear();
+        self.stats.translucent_sections = self.translucent_order.len() as u32;
+        let mut bound = None;
+        let mut pushed = false;
+        // SAFETY: as in `draw`: the records and push constants are this frame's; every
+        // mesh's indices were copied with its vertices, or into a range of their own
+        // whose copy this frame may read (`install_ready`), and name only the mesh's
+        // translucent vertices.
+        unsafe {
+            for &i in &self.translucent_order {
+                let v = &visible[i as usize];
+                let Some((quads, indices)) = v.translucent else {
+                    continue;
+                };
+                let first_vertex = v.first_vertex + (v.solid_quads + v.cutout_quads) * 4;
+                let buffers = (v.buffer, indices.buffer, indices.wide);
+                if bound != Some(buffers) {
+                    bound = Some(buffers);
+                    self.stats.binds += 1;
+                    if indirect {
+                        let next = self.commands.len() as u32 / DRAW_COMMAND_BYTES;
+                        self.translucent_calls.push((v.buffer, indices, next, 0));
+                    } else {
+                        pass.bind_vertex_buffer(v.buffer, 0);
+                        pass.bind_index_buffer_of(indices.buffer, 0, indices.wide);
+                    }
+                }
+                self.stats.translucent_drawn += u64::from(quads);
+                self.stats.quads += u64::from(quads);
+                self.stats.draws += 1;
+                if indirect {
+                    self.commands.extend_from_slice(&draw_command(
+                        quads * 6,
+                        indices.first,
+                        first_vertex as i32,
+                        i,
+                    ));
+                    if let Some(call) = self.translucent_calls.last_mut() {
+                        call.3 += 1;
+                    }
+                } else {
+                    pass.draw_indexed(
+                        pipeline.index(),
+                        if pushed { &[] } else { &push },
+                        quads * 6,
+                        indices.first,
+                        first_vertex as i32,
+                        i,
+                    );
+                    pushed = true;
+                    self.stats.calls += 1;
+                }
+            }
+            if !indirect {
+                return;
+            }
+            let commands = self.commands.len() as u32 / DRAW_COMMAND_BYTES;
+            let Some((offset, bytes)) = frame_data.alloc_draw_commands(commands) else {
+                // No room for the layer's commands: it is not drawn this frame.
+                self.stats.overflowed += u64::from(commands);
+                self.stats.draws -= commands;
+                return;
+            };
+            bytes.copy_from_slice(&self.commands);
+            let buffer = frame_data.buffer();
+            for &(vertices, indices, first_command, draws) in &self.translucent_calls {
+                pass.bind_vertex_buffer(vertices, 0);
+                pass.bind_index_buffer_of(indices.buffer, 0, indices.wide);
+                let mut done = 0;
+                while done < draws {
+                    let n = (draws - done).min(MAX_INDIRECT_DRAWS);
+                    pass.draw_indexed_indirect(
+                        pipeline.index(),
+                        if pushed { &[] } else { &push },
+                        buffer,
+                        offset + u64::from(first_command + done) * u64::from(DRAW_COMMAND_BYTES),
+                        n,
+                    );
+                    pushed = true;
+                    self.stats.calls += 1;
+                    done += n;
+                }
+            }
+        }
+    }
+}
+
 impl Drop for WorldRenderer {
     fn drop(&mut self) {
         self.workers.stop();
@@ -1517,6 +2155,19 @@ impl Drop for WorldRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_frames_share_a_ticks_animations() {
+        let share = |ms: f64| animation_share(40, Duration::from_secs_f64(ms / 1000.0));
+        assert_eq!(share(1.0), 5);
+        assert_eq!(share(0.4), 2);
+        assert_eq!(share(0.0001), 1);
+        // A frame at 60 FPS, or a stall, writes them all.
+        assert_eq!(share(16.7), 40);
+        assert_eq!(share(8.0), 40);
+        assert_eq!(share(500.0), 40);
+        assert_eq!(animation_share(0, Duration::from_millis(1)), 0);
+    }
 
     #[test]
     fn quads_are_two_triangles_over_the_first_diagonal() {
@@ -1598,24 +2249,45 @@ mod tests {
     fn every_shader_has_a_name_of_its_own_and_two_pipelines() {
         for s in TerrainShader::ALL {
             assert_eq!(TerrainShader::parse(s.name()), Some(s));
-            let [solid, cutout] = s.pipelines();
+            let [solid, cutout, translucent] = s.pipelines();
             assert_ne!(solid, cutout);
-            assert!(solid.terrain_stages().is_some() && cutout.terrain_stages().is_some());
+            assert_ne!(cutout, translucent);
+            assert!(
+                [solid, cutout, translucent]
+                    .iter()
+                    .all(|p| p.terrain_stages().is_some())
+            );
         }
         assert_eq!(TerrainShader::parse("fancy"), None);
         assert_eq!(TerrainShader::default(), TerrainShader::Rgss);
         // No two draw with the same pipelines, and each with those of its name.
-        let names: Vec<[&str; 2]> = TerrainShader::ALL
+        let names: Vec<[&str; 3]> = TerrainShader::ALL
             .iter()
             .map(|s| s.pipelines().map(|p| p.terrain_stages().unwrap().0))
             .collect();
         assert_eq!(
             names,
             [
-                ["terrain_rgss", "terrain_rgss_cutout"],
-                ["terrain_rgss_reference", "terrain_rgss_reference_cutout"],
-                ["terrain_nearest", "terrain_nearest_cutout"],
-                ["terrain_plain", "terrain_plain_cutout"],
+                [
+                    "terrain_rgss",
+                    "terrain_rgss_cutout",
+                    "terrain_rgss_translucent"
+                ],
+                [
+                    "terrain_rgss_reference",
+                    "terrain_rgss_reference_cutout",
+                    "terrain_rgss_reference_translucent"
+                ],
+                [
+                    "terrain_nearest",
+                    "terrain_nearest_cutout",
+                    "terrain_nearest_translucent"
+                ],
+                [
+                    "terrain_plain",
+                    "terrain_plain_cutout",
+                    "terrain_plain_translucent"
+                ],
             ]
         );
     }

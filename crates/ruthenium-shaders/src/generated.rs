@@ -46,6 +46,10 @@ pub static TERRAIN_NEAREST_FRAG: Spirv = crate::spirv!("terrain_nearest.frag");
 /// `glsl/terrain_nearest_cutout.frag`
 pub static TERRAIN_NEAREST_CUTOUT_FRAG: Spirv = crate::spirv!("terrain_nearest_cutout.frag");
 
+/// `glsl/terrain_nearest_translucent.frag`
+pub static TERRAIN_NEAREST_TRANSLUCENT_FRAG: Spirv =
+    crate::spirv!("terrain_nearest_translucent.frag");
+
 /// `glsl/terrain_plain.frag`
 pub static TERRAIN_PLAIN_FRAG: Spirv = crate::spirv!("terrain_plain.frag");
 
@@ -54,6 +58,9 @@ pub static TERRAIN_PLAIN_VERT: Spirv = crate::spirv!("terrain_plain.vert");
 
 /// `glsl/terrain_plain_cutout.frag`
 pub static TERRAIN_PLAIN_CUTOUT_FRAG: Spirv = crate::spirv!("terrain_plain_cutout.frag");
+
+/// `glsl/terrain_plain_translucent.frag`
+pub static TERRAIN_PLAIN_TRANSLUCENT_FRAG: Spirv = crate::spirv!("terrain_plain_translucent.frag");
 
 /// `glsl/terrain_rgss.frag`
 pub static TERRAIN_RGSS_FRAG: Spirv = crate::spirv!("terrain_rgss.frag");
@@ -67,6 +74,13 @@ pub static TERRAIN_RGSS_REFERENCE_FRAG: Spirv = crate::spirv!("terrain_rgss_refe
 /// `glsl/terrain_rgss_reference_cutout.frag`
 pub static TERRAIN_RGSS_REFERENCE_CUTOUT_FRAG: Spirv =
     crate::spirv!("terrain_rgss_reference_cutout.frag");
+
+/// `glsl/terrain_rgss_reference_translucent.frag`
+pub static TERRAIN_RGSS_REFERENCE_TRANSLUCENT_FRAG: Spirv =
+    crate::spirv!("terrain_rgss_reference_translucent.frag");
+
+/// `glsl/terrain_rgss_translucent.frag`
+pub static TERRAIN_RGSS_TRANSLUCENT_FRAG: Spirv = crate::spirv!("terrain_rgss_translucent.frag");
 
 /// `glsl/text.frag`
 pub static TEXT_FRAG: Spirv = crate::spirv!("text.frag");
@@ -90,13 +104,17 @@ pub static ALL: &[&Spirv] = &[
     &TERRAIN_VERT,
     &TERRAIN_NEAREST_FRAG,
     &TERRAIN_NEAREST_CUTOUT_FRAG,
+    &TERRAIN_NEAREST_TRANSLUCENT_FRAG,
     &TERRAIN_PLAIN_FRAG,
     &TERRAIN_PLAIN_VERT,
     &TERRAIN_PLAIN_CUTOUT_FRAG,
+    &TERRAIN_PLAIN_TRANSLUCENT_FRAG,
     &TERRAIN_RGSS_FRAG,
     &TERRAIN_RGSS_CUTOUT_FRAG,
     &TERRAIN_RGSS_REFERENCE_FRAG,
     &TERRAIN_RGSS_REFERENCE_CUTOUT_FRAG,
+    &TERRAIN_RGSS_REFERENCE_TRANSLUCENT_FRAG,
+    &TERRAIN_RGSS_TRANSLUCENT_FRAG,
     &TEXT_FRAG,
     &TEXT_VERT,
 ];

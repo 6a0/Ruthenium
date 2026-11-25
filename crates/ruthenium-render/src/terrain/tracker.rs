@@ -259,6 +259,12 @@ impl<M> Tracker<M> {
             .map(|s| (s.key, &s.mesh, s.since))
     }
 
+    /// The mesh drawn for a section, if it has one.
+    pub fn mesh_mut(&mut self, key: SectionKey) -> Option<&mut M> {
+        let index = self.sections.get(&key)?.mesh?;
+        Some(&mut self.meshes[index as usize].mesh)
+    }
+
     /// Every mesh there is, drawn or not.
     pub fn all_meshes(&self) -> impl Iterator<Item = &M> + '_ {
         self.meshes.iter().map(|s| &s.mesh)

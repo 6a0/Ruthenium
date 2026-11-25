@@ -48,7 +48,9 @@ use ruthenium_gpu::{
 use ruthenium_platform::{Platform, Window};
 use ruthenium_sim::scene::{Frame, Scene};
 
-use atmosphere::{Atmosphere, Look};
+use atmosphere::{Atmosphere, Look, WaterOverlay};
+use ruthenium_gpu::SamplerId;
+use ruthenium_ui::Quad;
 use sky::{Sky, SkyRenderer};
 use terrain::View;
 use terrain::world::WorldRenderer;
@@ -137,8 +139,39 @@ fn clear_colour(look: &Look) -> [f32; 4] {
     [r, g, b, 1.0]
 }
 
+/// How often the picture of water repeats from one side of its quad to the other.
+const WATER_REPEATS: f32 = 4.0;
+/// The field of view the hand and the picture of water are seen with, in degrees.
+const HAND_FOV: f32 = 70.0;
+
+/// The quad of the picture of water on a target of `size` pixels: a square two blocks
+/// wide, half a block before the eyes, seen with the field of view `fov`.
+fn water_quad(overlay: &WaterOverlay, texture: TextureId, size: [f32; 2], fov: f32) -> Quad {
+    let half_height = 0.5 * (fov.to_radians() / 2.0).tan();
+    let [w, h] = size;
+    let dy = h / 2.0 / half_height;
+    // The target's pixels are square: as many of them to a block sideways.
+    let dx = dy;
+    let [u, v] = overlay.offset;
+    Quad {
+        rect: [w / 2.0 - dx, h / 2.0 - dy, w / 2.0 + dx, h / 2.0 + dy],
+        // Mirrored sideways, as the game has it.
+        uv: [u + WATER_REPEATS, v, u, v + WATER_REPEATS],
+        color: overlay.colour,
+        texture: texture.index(),
+    }
+}
+
+/// What is in front of the world in a frame: the quad of the picture of water, and the
+/// size of the target it is laid out for.
+#[derive(Debug, Clone, Copy)]
+struct Front {
+    quad: Quad,
+    size: [f32; 2],
+}
+
 /// Draws the world and its sky into `pass`, which has a depth attachment, in the order
-/// asked for.
+/// asked for, and `front` over them.
 ///
 /// # Safety
 /// As [`WorldRenderer::draw`] and [`SkyRenderer::draw`].
@@ -152,6 +185,7 @@ unsafe fn draw_world(
     textures: &TextureTable,
     view: &View,
     look: &Look,
+    front: Option<Front>,
 ) {
     let mut sky = sky.filter(|_| order != SkyOrder::Off && look.sky != Sky::None);
     let mut draw_sky = |pass: &mut ruthenium_gpu::Pass<'_>, frame_data: &mut FrameData, behind| {
@@ -178,6 +212,23 @@ unsafe fn draw_world(
     unsafe { world.draw(pass, frame_data, view, &look.fog) };
     if order == SkyOrder::Late {
         draw_sky(pass, frame_data, true);
+    }
+    // What is seen through comes last: over the opaque world and the sky.
+    // SAFETY: the caller's.
+    unsafe { world.draw_translucent(pass, frame_data) };
+    if let Some(f) = front
+        && let Some((first, bytes)) = frame_data.alloc(1, gui::QUAD_BYTES)
+    {
+        gui::write_quad_with(f.quad, SamplerId::NearestRepeat, bytes);
+        let mut push = [0u8; 16];
+        push[0..4].copy_from_slice(&f.size[0].to_ne_bytes());
+        push[4..8].copy_from_slice(&f.size[1].to_ne_bytes());
+        push[8..12].copy_from_slice(&1.0f32.to_ne_bytes());
+        push[12..16].copy_from_slice(&first.to_ne_bytes());
+        // SAFETY: the pipeline is the one of passes with a depth attachment, its push
+        // constants are laid out as gui.vert declares them, and its one quad was just
+        // written; the texture is the renderer's own.
+        unsafe { pass.draw(PipelineId::Gui.over_world().index(), &push, 6, 1) };
     }
 }
 
@@ -217,6 +268,14 @@ pub struct Renderer {
     biome_blend: u8,
     terrain_shader: TerrainShader,
     chunk_fade_ms: u32,
+    /// Whether the terrain's translucent layer is drawn.
+    translucent: bool,
+    /// Whether animated textures play.
+    animate: bool,
+    /// The FOV Effects option, 0 to 1.
+    fov_effects: f32,
+    /// The picture of water before a player whose eyes are in it.
+    underwater: Option<TextureId>,
     sky_order: SkyOrder,
     atmosphere_options: AtmosphereOptions,
     /// The air of the level being drawn, and the sky's meshes and pictures once the
@@ -322,6 +381,10 @@ impl Renderer {
             biome_blend: 2,
             terrain_shader: TerrainShader::default(),
             chunk_fade_ms: terrain::DEFAULT_FADE_MS,
+            translucent: true,
+            animate: true,
+            fov_effects: 1.0,
+            underwater: None,
             sky_order: SkyOrder::default(),
             atmosphere_options: AtmosphereOptions::default(),
             atmosphere: Atmosphere::new(),
@@ -366,6 +429,17 @@ impl Renderer {
                         None
                     }
                 };
+            // Without its picture, water is in front of nothing.
+            self.underwater = assets.underwater.as_ref().and_then(|i| {
+                self.textures
+                    .create_with(
+                        &mut self.uploads,
+                        TextureDesc::rgba8(i.width, i.height),
+                        &[&i.rgba],
+                        Arrival::NextFrame,
+                    )
+                    .ok()
+            });
             self.world = Some(WorldRenderer::new(
                 &gpu,
                 &mut self.textures,
@@ -380,9 +454,48 @@ impl Renderer {
                 w.set_biome_blend(self.biome_blend);
                 w.set_shader(self.terrain_shader);
                 w.set_fade_ms(self.chunk_fade_ms);
+                w.set_translucent(self.translucent);
+                w.set_animate(self.animate);
             }
         }
         Ok(())
+    }
+
+    /// Whether the block atlas's animated textures play (they do unless said otherwise).
+    /// Stopped, two frames of one place and time are the same picture.
+    pub fn set_animate(&mut self, on: bool) {
+        self.animate = on;
+        if let Some(w) = &mut self.world {
+            w.set_animate(on);
+        }
+    }
+
+    pub fn animate(&self) -> bool {
+        self.animate
+    }
+
+    /// The FOV Effects option, 0 to 1 (1 unless said otherwise): how much of the field
+    /// of view's narrowing in water and lava shows.
+    pub fn set_fov_effects(&mut self, scale: f32) {
+        self.fov_effects = scale.clamp(0.0, 1.0);
+    }
+
+    pub fn fov_effects(&self) -> f32 {
+        self.fov_effects
+    }
+
+    /// Whether the terrain's translucent layer (water, stained glass, ice) is drawn: it
+    /// is unless said otherwise. Off, it is meshed and kept all the same, and only
+    /// left out of the frame: what drawing and sorting it cost is measured against that.
+    pub fn set_translucent(&mut self, on: bool) {
+        self.translucent = on;
+        if let Some(w) = &mut self.world {
+            w.set_translucent(on);
+        }
+    }
+
+    pub fn translucent(&self) -> bool {
+        self.translucent
     }
 
     /// How the terrain's texels are filtered (as vanilla's RGSS unless said otherwise).
@@ -867,19 +980,27 @@ impl Renderer {
         let view = match (&world, surface, &mut self.world) {
             (Some(w), Some(s), Some(renderer)) => {
                 let started = std::time::Instant::now();
+                let size = [s.extent.width as f32, s.extent.height.max(1) as f32];
+                let aspect = size[0] / size[1];
+                let medium = renderer.medium_at(w.scene, &w.camera, aspect);
+                let fov_scale = medium.fov_scale(self.fov_effects);
+                let mut camera = w.camera;
+                camera.fov *= fov_scale;
                 let look = self.atmosphere.update(
                     w.frame,
                     w.partial_tick,
-                    &w.camera,
+                    &camera,
+                    medium,
                     w.scene,
                     w.view_distance,
                     started,
                     &self.atmosphere_options,
                 );
                 renderer.set_environment(&w.frame.environment);
+                renderer.animate(w.frame, &mut self.textures, &mut self.uploads);
                 renderer.update(
                     w.scene,
-                    &w.camera,
+                    &camera,
                     w.view_distance,
                     &mut self.textures,
                     &mut self.uploads,
@@ -890,8 +1011,14 @@ impl Renderer {
                     sky.stage(&mut self.uploads);
                 }
                 self.world_times.stage_ns = started.elapsed().as_nanos() as u64;
-                let aspect = s.extent.width as f32 / s.extent.height.max(1) as f32;
-                Some((View::new(&w.camera, aspect), look))
+                let front = match (&look.water, self.underwater) {
+                    (Some(water), Some(texture)) if self.textures.is_ready(texture) => {
+                        let quad = water_quad(water, texture, size, HAND_FOV * fov_scale);
+                        Some(Front { quad, size })
+                    }
+                    _ => None,
+                };
+                Some((View::new(&camera, aspect), look, front))
             }
             _ => None,
         };
@@ -958,7 +1085,7 @@ impl Renderer {
                 match (&view, &mut self.world, &self.depth) {
                     // The world is what is behind the menu: drawn into the backdrop's
                     // full-size image, then blurred like any background.
-                    (Some((view, look)), Some(renderer), Some(depth)) => {
+                    (Some((view, look, front)), Some(renderer), Some(depth)) => {
                         let mut pass = encoder.texture_pass_with_depth(
                             &self.pipelines,
                             &self.textures,
@@ -978,6 +1105,7 @@ impl Renderer {
                                 &self.textures,
                                 view,
                                 look,
+                                *front,
                             );
                         }
                         pass.finish();
@@ -1060,8 +1188,8 @@ impl Renderer {
             // then the window's pass has a depth attachment, and what is drawn over the
             // world uses the pipelines built for one.
             let in_window = match (&view, &self.depth) {
-                (Some((view, look)), Some(depth)) if !world_in_backdrop => {
-                    Some((view, look, depth))
+                (Some((view, look, front)), Some(depth)) if !world_in_backdrop => {
+                    Some((view, look, *front, depth))
                 }
                 _ => None,
             };
@@ -1073,7 +1201,7 @@ impl Renderer {
                 }
             };
             let mut pass = match in_window {
-                Some((_, look, depth)) => {
+                Some((_, look, _, depth)) => {
                     encoder.window_pass_with_depth(&self.pipelines, &t, depth, clear_colour(look))
                 }
                 None => encoder.window_pass(&self.pipelines, &t),
@@ -1090,7 +1218,7 @@ impl Renderer {
                 // contents are never loaded); with a backdrop, that is already drawn:
                 // copy it.
                 match (in_window, &mut self.world, backdrop) {
-                    (Some((view, look, _)), Some(renderer), _) => {
+                    (Some((view, look, front, _)), Some(renderer), _) => {
                         let started = std::time::Instant::now();
                         draw_world(
                             renderer,
@@ -1101,6 +1229,7 @@ impl Renderer {
                             &self.textures,
                             view,
                             look,
+                            front,
                         );
                         self.world_times.draw_ns = started.elapsed().as_nanos() as u64;
                     }
@@ -1219,5 +1348,29 @@ impl Drop for Renderer {
         if let Some(w) = &mut self.world {
             w.stop_workers();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_picture_of_water_is_half_a_block_away() {
+        let overlay = WaterOverlay {
+            colour: 0x19FF_FFFF,
+            offset: [0.25, -0.5],
+        };
+        // With 90 degrees the target's height spans one block half a block away: the
+        // quad, two blocks wide, is twice as high, whatever the target's width.
+        let quad = water_quad(&overlay, TextureId::MISSING, [1600.0, 900.0], 90.0);
+        for (a, b) in quad.rect.iter().zip([-100.0, -450.0, 1700.0, 1350.0]) {
+            assert!((a - b).abs() < 1e-2, "{a} {b}");
+        }
+        assert_eq!(quad.uv, [4.25, -0.5, 0.25, 3.5]);
+        assert_eq!(quad.color, 0x19FF_FFFF);
+        // A narrower view takes it nearer.
+        let near = water_quad(&overlay, TextureId::MISSING, [1600.0, 900.0], 60.0);
+        assert!(near.rect[1] < quad.rect[1] && near.rect[3] > quad.rect[3]);
     }
 }

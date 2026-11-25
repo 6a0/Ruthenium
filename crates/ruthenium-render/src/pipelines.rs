@@ -19,19 +19,24 @@ pub enum PipelineId {
     Text,
     /// The development overlay's rectangles.
     Overlay,
-    /// Terrain whose texels are all opaque, and terrain with holes (leaves, plants,
-    /// panes), once for each way the atlas is filtered ([`crate::terrain::TerrainShader`]):
-    /// texels with hard edges; far texels averaged, with the samples that count for
-    /// nothing left out; the same with every sample taken; and hard edges without fog
-    /// or fade.
+    /// Terrain whose texels are all opaque, terrain with holes (leaves, plants, panes)
+    /// and terrain that is seen through (water, stained glass, ice), which is blended
+    /// over what is behind it; once for each way the atlas is filtered
+    /// ([`crate::terrain::TerrainShader`]): texels with hard edges; far texels averaged,
+    /// with the samples that count for nothing left out; the same with every sample
+    /// taken; and hard edges without fog or fade.
     TerrainNearest,
     TerrainNearestCutout,
+    TerrainNearestTranslucent,
     TerrainRgss,
     TerrainRgssCutout,
+    TerrainRgssTranslucent,
     TerrainRgssReference,
     TerrainRgssReferenceCutout,
+    TerrainRgssReferenceTranslucent,
     TerrainPlain,
     TerrainPlainCutout,
+    TerrainPlainTranslucent,
     /// The sky drawn before the world, over the cleared target: what covers what is
     /// there (the dome), what is blended over it (a sunrise's glow, the End's sky) and
     /// what adds light to it (the sun, the moon, the stars).
@@ -52,7 +57,7 @@ pub enum PipelineId {
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 24] = [
+    pub const ALL: [PipelineId; 28] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -61,12 +66,16 @@ impl PipelineId {
         PipelineId::Overlay,
         PipelineId::TerrainNearest,
         PipelineId::TerrainNearestCutout,
+        PipelineId::TerrainNearestTranslucent,
         PipelineId::TerrainRgss,
         PipelineId::TerrainRgssCutout,
+        PipelineId::TerrainRgssTranslucent,
         PipelineId::TerrainRgssReference,
         PipelineId::TerrainRgssReferenceCutout,
+        PipelineId::TerrainRgssReferenceTranslucent,
         PipelineId::TerrainPlain,
         PipelineId::TerrainPlainCutout,
+        PipelineId::TerrainPlainTranslucent,
         PipelineId::SkyFlat,
         PipelineId::SkyBlend,
         PipelineId::SkyGlow,
@@ -95,6 +104,17 @@ impl PipelineId {
         self as usize
     }
 
+    /// Whether this is the pipeline of a translucent terrain layer.
+    pub fn is_translucent_terrain(self) -> bool {
+        matches!(
+            self,
+            PipelineId::TerrainNearestTranslucent
+                | PipelineId::TerrainRgssTranslucent
+                | PipelineId::TerrainRgssReferenceTranslucent
+                | PipelineId::TerrainPlainTranslucent
+        )
+    }
+
     /// A terrain pipeline's name and its two stages; `None` for the others.
     pub fn terrain_stages(
         self,
@@ -113,7 +133,27 @@ impl PipelineId {
                 &FULL,
                 &shaders::TERRAIN_NEAREST_CUTOUT_FRAG,
             ),
+            PipelineId::TerrainNearestTranslucent => (
+                "terrain_nearest_translucent",
+                &FULL,
+                &shaders::TERRAIN_NEAREST_TRANSLUCENT_FRAG,
+            ),
             PipelineId::TerrainRgss => ("terrain_rgss", &FULL, &shaders::TERRAIN_RGSS_FRAG),
+            PipelineId::TerrainRgssTranslucent => (
+                "terrain_rgss_translucent",
+                &FULL,
+                &shaders::TERRAIN_RGSS_TRANSLUCENT_FRAG,
+            ),
+            PipelineId::TerrainRgssReferenceTranslucent => (
+                "terrain_rgss_reference_translucent",
+                &FULL,
+                &shaders::TERRAIN_RGSS_REFERENCE_TRANSLUCENT_FRAG,
+            ),
+            PipelineId::TerrainPlainTranslucent => (
+                "terrain_plain_translucent",
+                &PLAIN,
+                &shaders::TERRAIN_PLAIN_TRANSLUCENT_FRAG,
+            ),
             PipelineId::TerrainRgssCutout => (
                 "terrain_rgss_cutout",
                 &FULL,
@@ -140,16 +180,19 @@ impl PipelineId {
     }
 
     fn desc(self) -> GraphicsDesc {
-        let terrain = |name, vertex: &shaders::Spirv, fragment: &shaders::Spirv| GraphicsDesc {
-            name,
-            vertex: vertex.words(),
-            fragment: fragment.words(),
-            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-            blend: Blend::Opaque,
-            vertex_input: Some(crate::terrain_vertex::TERRAIN_VERTEX),
-            depth: Depth::TestAndWrite,
-            cull_back: true,
-        };
+        // The translucent layer is blended over what is there and writes its depth, as
+        // vanilla's translucent terrain pipeline does.
+        let terrain =
+            |name, vertex: &shaders::Spirv, fragment: &shaders::Spirv, blend| GraphicsDesc {
+                name,
+                vertex: vertex.words(),
+                fragment: fragment.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                blend,
+                vertex_input: Some(crate::terrain_vertex::TERRAIN_VERTEX),
+                depth: Depth::TestAndWrite,
+                cull_back: true,
+            };
         let over_world = |name, of: PipelineId| GraphicsDesc {
             name,
             depth: Depth::Ignore,
@@ -167,7 +210,12 @@ impl PipelineId {
             cull_back: false,
         };
         if let Some((name, vertex, fragment)) = self.terrain_stages() {
-            return terrain(name, vertex, fragment);
+            let blend = if self.is_translucent_terrain() {
+                Blend::Alpha
+            } else {
+                Blend::Opaque
+            };
+            return terrain(name, vertex, fragment, blend);
         }
         match self {
             PipelineId::SkyFlat => sky("sky_flat", Blend::Opaque, Depth::Ignore),
@@ -184,7 +232,11 @@ impl PipelineId {
             | PipelineId::TerrainRgssReference
             | PipelineId::TerrainRgssReferenceCutout
             | PipelineId::TerrainPlain
-            | PipelineId::TerrainPlainCutout => unreachable!("a terrain pipeline"),
+            | PipelineId::TerrainPlainCutout
+            | PipelineId::TerrainNearestTranslucent
+            | PipelineId::TerrainRgssTranslucent
+            | PipelineId::TerrainRgssReferenceTranslucent
+            | PipelineId::TerrainPlainTranslucent => unreachable!("a terrain pipeline"),
             PipelineId::WorldGui => over_world("gui_world", PipelineId::Gui),
             PipelineId::WorldShape => over_world("shape_world", PipelineId::Shape),
             PipelineId::WorldText => over_world("text_world", PipelineId::Text),

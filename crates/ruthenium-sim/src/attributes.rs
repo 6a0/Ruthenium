@@ -62,6 +62,10 @@ pub enum Attribute {
     SkyLightFactor,
     NightVisionColor,
     AmbientLightColor,
+    /// How bright the sky counts as where rules ask for a light level, 0 to 15
+    /// (`Level.getSkyDarken` is what it lacks to 15). It is the dimension's: no place
+    /// has another.
+    SkyLightLevel,
 }
 
 /// A value of an attribute.
@@ -158,7 +162,7 @@ const fn ranged(name: &'static str, default: f32, min: f32, max: f32) -> Spec {
 }
 
 /// How many attributes there are.
-const COUNT: usize = 22;
+const COUNT: usize = 23;
 
 /// Each attribute's id, type, default and range, in [`Attribute`]'s order
 /// (`EnvironmentAttributes.java:19-95`; the ranges are `AttributeRange.java:7-9`).
@@ -213,6 +217,7 @@ const SPECS: [Spec; COUNT] = [
         Kind::Rgb,
         Value::Rgb(rgb24(0x000000)),
     ),
+    ranged("gameplay/sky_light_level", 15.0, 0.0, 15.0),
 ];
 
 /// The moon's phases by index (`MoonPhase.java:7-14`).
@@ -251,6 +256,7 @@ impl Attribute {
         Attribute::SkyLightFactor,
         Attribute::NightVisionColor,
         Attribute::AmbientLightColor,
+        Attribute::SkyLightLevel,
     ];
 
     fn spec(self) -> &'static Spec {
@@ -1067,6 +1073,7 @@ fn weather(attribute: Attribute) -> Option<(Entry, Entry)> {
             argb(Modifier::AlphaBlend, 0x867A_7AFF),
         ),
         Attribute::SkyLightFactor => (blend(0.24, 0.3125), blend(0.24, 0.527_343_75)),
+        Attribute::SkyLightLevel => (blend(4.0, 0.3125), blend(4.0, 0.527_343_75)),
         Attribute::StarBrightness => {
             let none = entry(Modifier::Override, Argument::Plain(Value::Float(0.0)));
             (none, none)
@@ -1567,6 +1574,7 @@ mod tests {
             "visual/sky_light_factor",
             "visual/night_vision_color",
             "visual/ambient_light_color",
+            "gameplay/sky_light_level",
         ];
         for (id, attribute) in ids.into_iter().zip(Attribute::ALL) {
             assert_eq!(Attribute::from_id(id), Some(attribute));
@@ -1577,7 +1585,7 @@ mod tests {
             assert_eq!(Attribute::ALL[attribute as usize], attribute);
         }
         assert_eq!(
-            Attribute::from_id("minecraft:gameplay/sky_light_level"),
+            Attribute::from_id("minecraft:gameplay/water_evaporates"),
             None
         );
         assert_eq!(Attribute::from_id("other:visual/sky_color"), None);
@@ -2459,6 +2467,18 @@ mod tests {
             value(&dry, Attribute::StarBrightness, 1.0, 0.0).float(),
             0.5
         );
+        // The sky's light level goes from 15 towards 4, less far in rain than in thunder.
+        assert_eq!(
+            value(&dry, Attribute::SkyLightLevel, 1.0, 1.0).float(),
+            15.0
+        );
+        let wet = AttributeSystem::new(&Environment::default(), true);
+        for (thunder, alpha) in [(0.0, 0.3125), (1.0, 0.527_343_75)] {
+            assert_eq!(
+                value(&wet, Attribute::SkyLightLevel, 1.0, thunder).float(),
+                lerp(alpha, 15.0, 4.0)
+            );
+        }
         // Weather alone sets an attribute: its default goes through it.
         let bare = AttributeSystem::new(&Environment::default(), true);
         assert_eq!(
@@ -2658,12 +2678,15 @@ mod tests {
     // The generator the golden values' program draws its cases from, and the tables it
     // goes by, written out again here so that the tables above are checked too.
 
+    /// The attributes the golden values are of: the visual ones, which come first.
+    const VISUAL: usize = 22;
+
     /// 0 a float, 1 an angle, 2 a colour, 3 a colour with alpha, 4 a moon phase.
-    const KINDS: [u8; COUNT] = [
+    const KINDS: [u8; VISUAL] = [
         2, 0, 0, 0, 0, 2, 0, 0, 2, 3, 3, 0, 1, 1, 1, 4, 0, 2, 2, 0, 2, 2,
     ];
     /// What a plain value may be: 0 any, 1 not negative, 2 from 0 to 1.
-    const RANGES: [u8; COUNT] = [
+    const RANGES: [u8; VISUAL] = [
         0, 0, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 2, 0, 0,
     ];
     const FLOAT_MODIFIERS: [&str; 7] = [
@@ -2918,7 +2941,7 @@ mod tests {
     fn case(rng: &mut Rng) -> Vec<u32> {
         let weather = rng.below(4) != 0;
         let mut env = Environment::default();
-        for a in 0..COUNT {
+        for a in 0..VISUAL {
             if rng.below(2) == 0 {
                 env.attributes.insert(id(a), rng.entry(a));
             }
@@ -2930,13 +2953,13 @@ mod tests {
                 1 => json!({}),
                 _ => {
                     let mut map = serde_json::Map::new();
-                    for a in 0..COUNT {
+                    for a in 0..VISUAL {
                         if rng.below(4) == 0 {
                             map.insert(id(a), rng.entry(a));
                         }
                     }
                     if map.is_empty() {
-                        let a = rng.below(COUNT as i32) as usize;
+                        let a = rng.below(VISUAL as i32) as usize;
                         map.insert(id(a), rng.entry(a));
                     }
                     Json::Object(map)
@@ -2957,7 +2980,7 @@ mod tests {
                 };
             }
             let mut tracks = serde_json::Map::new();
-            for a in 0..COUNT {
+            for a in 0..VISUAL {
                 if rng.below(5) == 0 {
                     tracks.insert(id(a), rng.track(a, period));
                 }
@@ -3012,19 +3035,19 @@ mod tests {
                 biomes: Some(&weights),
                 ..alone
             };
-            for a in Attribute::ALL {
-                words(system.value(a, &blended), &mut out);
+            for a in &Attribute::ALL[..VISUAL] {
+                words(system.value(*a, &blended), &mut out);
             }
-            for a in Attribute::ALL {
-                words(system.value(a, &alone), &mut out);
+            for a in &Attribute::ALL[..VISUAL] {
+                words(system.value(*a, &alone), &mut out);
             }
             if e < 2 {
                 probe.tick(&system, &blended);
             }
         }
-        for a in Attribute::ALL {
+        for a in &Attribute::ALL[..VISUAL] {
             let partial = rng.below(257) as f32 / 256.0;
-            words(probe.value(a, partial), &mut out);
+            words(probe.value(*a, partial), &mut out);
         }
         out
     }
@@ -3217,8 +3240,8 @@ mod tests {
                             biome: Some(biome_at(x, y, z)),
                         };
                         let mut out = Vec::new();
-                        for a in Attribute::ALL {
-                            words(system.value(a, &sample), &mut out);
+                        for a in &Attribute::ALL[..VISUAL] {
+                            words(system.value(*a, &sample), &mut out);
                         }
                         let mut line = format!("{scenario} {tick} {weather} {mode}");
                         for word in out {
@@ -3231,6 +3254,8 @@ mod tests {
             }
         }
         assert_eq!(expected.next(), None);
-        eprintln!("the real overworld: {lines} evaluations of {COUNT} attributes equal the game's");
+        eprintln!(
+            "the real overworld: {lines} evaluations of {VISUAL} attributes equal the game's"
+        );
     }
 }

@@ -237,7 +237,7 @@ mod tests {
             .filter_map(|p| p.terrain_stages())
             .map(|(_, vertex, fragment)| (vertex, fragment))
             .collect();
-        assert_eq!(stages.len(), 8);
+        assert_eq!(stages.len(), 12);
         stages
     }
 
