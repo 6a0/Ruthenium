@@ -363,6 +363,8 @@ pub struct Menu {
     settings: SettingsFile,
     /// When a setting last changed, while that change isn't saved.
     settings_changed: Option<Instant>,
+    /// Buttons pressed since the client last asked (each one clicks).
+    clicks: u32,
     /// The Settings screen, while it shows.
     settings_screen: Option<SettingsScreen>,
     settings_of: SettingsOf,
@@ -508,6 +510,7 @@ impl Menu {
             servers_path,
             settings,
             settings_changed: None,
+            clicks: 0,
             settings_screen: None,
             settings_of: SettingsOf::Title,
             pause: None,
@@ -1011,6 +1014,11 @@ impl Menu {
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.states.cancel();
         }
+    }
+
+    /// How many buttons were pressed since the last call: each plays the click.
+    pub fn take_clicks(&mut self) -> u32 {
+        std::mem::take(&mut self.clicks)
     }
 
     /// The settings as they are now (the client applies them).
@@ -1950,7 +1958,11 @@ impl Menu {
                 } else {
                     screen.mouse_up(ux, uy)
                 };
-                self.settings_event(e?);
+                let e = e?;
+                if !down {
+                    self.clicks += 1;
+                }
+                self.settings_event(e);
                 return None;
             }
             Screen::Title => {
@@ -1998,7 +2010,11 @@ impl Menu {
                 }
             }
         };
-        self.act(action?, Some(renderer), clipboard)
+        let action = action?;
+        if !down {
+            self.clicks += 1;
+        }
+        self.act(action, Some(renderer), clipboard)
     }
 
     /// Takes newly loaded faces, frees the ones no account needs any more, and uploads

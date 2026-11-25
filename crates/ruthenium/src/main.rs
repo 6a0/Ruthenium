@@ -19,6 +19,7 @@ mod route;
 mod servers;
 mod settings;
 mod skins;
+mod sound;
 mod telemetry;
 
 use std::process::ExitCode;
@@ -154,6 +155,10 @@ With no command, opens the game window. Options:
                          its HUD
   --animations <on|off>  whether animated textures (water, lava, fire) play (on, the
                          default); off, they show their first frame
+  --sound <on|off>       whether there is sound at all (on, the default); off opens no
+                         device and decodes nothing
+  --sound-wav <file>     write what the mixer makes to a WAV file (32-bit float,
+                         stereo, 48 kHz, in real time) instead of playing it
   --fov-effects <on|off> whether the field of view widens and narrows with speed,
                          flight, bows and fluids (on, the default), as vanilla's FOV
                          Effects at 100% or at 0%
@@ -212,12 +217,14 @@ commands:
   connect <address> [--seconds <s>] [--data-dir <folder>] [--script '<steps>']
           [--light-out <file>] [--light-against <file>]
           [--route <file> [--route-out <file>] [--expect-positions <checksum>]
-           [--expect-footprint <checksum>]]
+           [--expect-footprint <checksum>]] [--sound <on|off>] [--sound-wav <file>]
       Join a server without a window, print each step, and disconnect after
       <s> seconds (default 10). Joins as the signed-in account; development
       builds with the dev-offline feature join offline-mode servers on this
       machine or the local network as an offline player. --script plays timed
-      input. --light-out writes every loaded chunk's light before leaving, and
+      input. --sound on plays the session's sounds (off by default here), and
+      --sound-wav writes them to a WAV file instead. --light-out writes every
+      loaded chunk's light before leaving, and
       --light-against compares it with such a file and fails if a level differs. --route plays a tick-keyed route file from cargo xtask bench
       dedicated instead, leaves when it ends, and fails unless the start, every
       tick and the loaded chunks are what the route and the checksums say.";

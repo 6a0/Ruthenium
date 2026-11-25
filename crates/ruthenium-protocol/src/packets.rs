@@ -624,6 +624,26 @@ pub mod configuration {
 pub mod play {
     use super::*;
 
+    /// A sound event on the wire (`SoundEvent.STREAM_CODEC`): an id in the
+    /// `sound_event` registry, or an event written out, with the fixed range the server
+    /// used to choose who hears it (the client doesn't use it).
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum SoundEventRef {
+        Registry(i32),
+        Direct { id: String, range: Option<f32> },
+    }
+
+    /// `ByteBufCodecs.holder`: 0 for a value written out, else the registry id + 1.
+    pub fn read_sound_event(r: &mut Reader<'_>) -> Result<SoundEventRef, WireError> {
+        Ok(match r.varint()? {
+            0 => SoundEventRef::Direct {
+                id: r.identifier()?,
+                range: optional(r, |r| r.f32())?,
+            },
+            n => SoundEventRef::Registry(n - 1),
+        })
+    }
+
     /// Where and how the player spawns (`CommonPlayerSpawnInfo`).
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct SpawnInfo {
@@ -1761,6 +1781,30 @@ pub mod play {
             data: i32,
             global: bool,
         },
+        /// `ClientboundSoundPacket`: a sound at a place, given in eighths of a block;
+        /// `source` is the `SoundSource` ordinal and `seed` picks the sound.
+        Sound {
+            event: SoundEventRef,
+            source: i32,
+            position: [i32; 3],
+            volume: f32,
+            pitch: f32,
+            seed: i64,
+        },
+        /// `ClientboundSoundEntityPacket`: a sound that follows an entity.
+        SoundEntity {
+            event: SoundEventRef,
+            source: i32,
+            entity_id: i32,
+            volume: f32,
+            pitch: f32,
+            seed: i64,
+        },
+        /// `ClientboundStopSoundPacket`: stop sounds of a category, of an event, or all.
+        StopSound {
+            source: Option<i32>,
+            name: Option<String>,
+        },
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
     }
@@ -2364,6 +2408,36 @@ pub mod play {
                     data: r.i32()?,
                     global: r.bool()?,
                 },
+                C::Sound => Clientbound::Sound {
+                    event: read_sound_event(&mut r)?,
+                    source: r.varint()?,
+                    position: [r.i32()?, r.i32()?, r.i32()?],
+                    volume: r.f32()?,
+                    pitch: r.f32()?,
+                    seed: r.i64()?,
+                },
+                C::SoundEntity => Clientbound::SoundEntity {
+                    event: read_sound_event(&mut r)?,
+                    source: r.varint()?,
+                    entity_id: r.varint()?,
+                    volume: r.f32()?,
+                    pitch: r.f32()?,
+                    seed: r.i64()?,
+                },
+                C::StopSound => {
+                    let flags = r.u8()?;
+                    let source = if flags & 1 != 0 {
+                        Some(r.varint()?)
+                    } else {
+                        None
+                    };
+                    let name = if flags & 2 != 0 {
+                        Some(r.identifier()?)
+                    } else {
+                        None
+                    };
+                    Clientbound::StopSound { source, name }
+                }
                 other => {
                     r.rest();
                     Clientbound::Other(other)

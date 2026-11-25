@@ -29,7 +29,7 @@ cargo test --workspace
 cargo xtask check-content   # make sure no Mojang content is in the tree
 ```
 
-The window and input use SDL3, and rendering uses Vulkan (on macOS, Vulkan runs on Metal through MoltenVK). On Windows and macOS, SDL3 is built from source and linked statically, so you need CMake. On Linux, either install the SDL3 development package (Fedora `SDL3-devel`, Debian/Ubuntu `libsdl3-dev`), or build SDL3 from source with `--features ruthenium/sdl-static` (needs CMake and the X11 and Wayland development headers).
+The window and input use SDL3, and rendering uses Vulkan (on macOS, Vulkan runs on Metal through MoltenVK). On Windows and macOS, SDL3 is built from source and linked statically, so you need CMake. On Linux, either install the SDL3 development package (Fedora `SDL3-devel`, Debian/Ubuntu `libsdl3-dev`), or build SDL3 from source with `--features ruthenium/sdl-static` (needs CMake and the X11 and Wayland development headers). Sound goes out through ALSA on Linux (PipeWire and PulseAudio take it through their ALSA plugins), so building needs the ALSA development package too (Fedora `alsa-lib-devel`, Debian/Ubuntu `libasound2-dev`).
 
 ```sh
 cargo run -p ruthenium -- --stats             # open the window; print frame-time statistics every second

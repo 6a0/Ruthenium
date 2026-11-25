@@ -66,6 +66,7 @@ pub mod scene;
 pub mod scoreboard;
 pub mod session;
 pub mod shape;
+pub mod sound;
 pub mod transform;
 pub mod use_on;
 pub mod vehicle;

@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ruthenium_audio::{SoundSource, Volumes};
 use ruthenium_protocol::text::Lang;
 use ruthenium_render::clouds::CloudMode;
 use ruthenium_render::weather;
@@ -162,6 +163,75 @@ pub struct Settings {
     pub keys: KeyBinds,
     pub toggle_sneak: bool,
     pub toggle_sprint: bool,
+    /// The volume sliders. Imported from vanilla's `options.txt` when the file has none.
+    pub sound: SoundSettings,
+}
+
+/// Vanilla's volume sliders (`soundCategory_*`): any value from 0 to 1, kept exactly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SoundSettings {
+    pub volumes: [f64; SoundSource::COUNT],
+}
+
+impl Default for SoundSettings {
+    fn default() -> SoundSettings {
+        SoundSettings {
+            volumes: [1.0; SoundSource::COUNT],
+        }
+    }
+}
+
+impl SoundSettings {
+    /// As the engine takes them (vanilla's `floatValue`).
+    pub fn volumes(&self) -> Volumes {
+        Volumes(self.volumes.map(|v| v as f32))
+    }
+
+    fn parse(t: Option<&toml::Table>) -> SoundSettings {
+        let mut s = SoundSettings::default();
+        for source in SoundSource::ALL {
+            let v = match t.and_then(|t| t.get(source.name())) {
+                Some(toml::Value::Float(v)) => *v,
+                Some(toml::Value::Integer(n)) => *n as f64,
+                _ => continue,
+            };
+            if (0.0..=1.0).contains(&v) {
+                s.volumes[source.index()] = v;
+            }
+        }
+        s
+    }
+
+    fn toml_section(&self) -> String {
+        let mut s =
+            "\n[sound]\n# Each category's volume, 0 to 1, as vanilla's soundCategory_ options.\n"
+                .to_owned();
+        for source in SoundSource::ALL {
+            s.push_str(&format!(
+                "{} = {:?}\n",
+                source.name(),
+                self.volumes[source.index()]
+            ));
+        }
+        s
+    }
+}
+
+/// A volume slider's label and what it says it does.
+fn volume_label(s: SoundSource) -> (&'static str, &'static str) {
+    match s {
+        SoundSource::Master => ("Master Volume", "Every sound"),
+        SoundSource::Music => ("Music", "The game's music"),
+        SoundSource::Records => ("Jukebox & Note Blocks", "Records and note blocks"),
+        SoundSource::Weather => ("Weather", "Rain and thunder"),
+        SoundSource::Blocks => ("Blocks", "Blocks placed, broken and used"),
+        SoundSource::Hostile => ("Hostile Creatures", "Monsters"),
+        SoundSource::Neutral => ("Friendly Creatures", "Animals and villagers"),
+        SoundSource::Players => ("Players", "Steps, hits and eating"),
+        SoundSource::Ambient => ("Ambient", "Caves and surroundings"),
+        SoundSource::Voice => ("Voice", "The narrator"),
+        SoundSource::Ui => ("Interface", "Menu clicks"),
+    }
 }
 
 impl Default for Settings {
@@ -179,6 +249,7 @@ impl Default for Settings {
             keys: KeyBinds::DEFAULT,
             toggle_sneak: false,
             toggle_sprint: false,
+            sound: SoundSettings::default(),
         }
     }
 }
@@ -214,6 +285,8 @@ pub enum Row {
     KeyHeading(Category),
     /// Reset Keys: every binding back to its default.
     ResetKeys,
+    /// A category's volume.
+    Volume(SoundSource),
 }
 
 /// The Controls page: the mouse, Sneak and Sprint (hold or toggle), Reset Keys, then
@@ -319,7 +392,22 @@ pub const GAME: [Group; 9] = [
     ("Online", &[]),
     ("Resources", &[]),
     ("Accessibility", &[Row::DamageTilt, Row::FovEffects]),
-    ("Sound", &[]),
+    (
+        "Sound",
+        &[
+            Row::Volume(SoundSource::Master),
+            Row::Volume(SoundSource::Music),
+            Row::Volume(SoundSource::Records),
+            Row::Volume(SoundSource::Weather),
+            Row::Volume(SoundSource::Blocks),
+            Row::Volume(SoundSource::Hostile),
+            Row::Volume(SoundSource::Neutral),
+            Row::Volume(SoundSource::Players),
+            Row::Volume(SoundSource::Ambient),
+            Row::Volume(SoundSource::Voice),
+            Row::Volume(SoundSource::Ui),
+        ],
+    ),
     ("Chat", &[]),
     ("Skin", &[]),
     ("Language", &[]),
@@ -348,6 +436,7 @@ impl Settings {
         let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
         let d = Settings::default();
         let section = |name: &str| table.get(name).and_then(toml::Value::as_table);
+        let sound = SoundSettings::parse(section("sound"));
         let (display, interface, multiplayer, controls, game) = (
             section("display"),
             section("interface"),
@@ -453,7 +542,14 @@ impl Settings {
             reduce_motion: flag(interface, "reduce_motion", d.reduce_motion),
             last_server,
             mouse,
+            sound,
         })
+    }
+
+    /// Whether `text` has the volumes (else they're imported from vanilla).
+    pub fn has_sound(text: &str) -> bool {
+        text.parse::<toml::Table>()
+            .is_ok_and(|t| t.get("sound").and_then(toml::Value::as_table).is_some())
     }
 
     /// Whether `text` sets the mouse's sensitivity (else it's imported from vanilla).
@@ -658,6 +754,14 @@ impl Settings {
             ),
             // Above.
             Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys => ("", "", Switch),
+            Row::Volume(s) => {
+                let (label, detail) = volume_label(s);
+                // `percentValueOrOffLabel`.
+                let steps = std::iter::once("Off".to_owned())
+                    .chain((1..=100).map(|p| format!("{p}%")))
+                    .collect();
+                (label, detail, Slider(steps))
+            }
         };
         SettingSpec {
             label: label.into(),
@@ -712,6 +816,8 @@ impl Settings {
                 .abs_diff(weather::MIN_RADIUS) as usize,
             // Not values: they act (see `SettingsEvent::Pressed`).
             Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys => 0,
+            // (Vanilla's own may lie between two steps: the nearest shows.)
+            Row::Volume(s) => (self.sound.volumes[s.index()] * 100.0).round() as usize,
         }
     }
 
@@ -764,6 +870,7 @@ impl Settings {
                 g.weather_radius = (weather::MIN_RADIUS + value as u32).min(weather::MAX_RADIUS);
             }
             Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys => {}
+            Row::Volume(s) => self.sound.volumes[s.index()] = f64::from(percent) / 100.0,
         }
     }
 
@@ -852,7 +959,7 @@ impl Settings {
             weather::MAX_RADIUS,
             self.game.weather_radius,
             self.keys_toml(),
-        )
+        ) + &self.sound.toml_section()
     }
 
     /// The `[keys]` lines: every binding, in `options.txt`'s order.
@@ -903,6 +1010,8 @@ pub struct SettingsFile {
     /// Whether the file set the mouse's sensitivity, and the key bindings.
     has_mouse: bool,
     has_keys: bool,
+    /// Whether the file had the volumes.
+    has_sound: bool,
 }
 
 impl SettingsFile {
@@ -919,6 +1028,7 @@ impl SettingsFile {
             saved: Settings::default(),
             has_mouse: true,
             has_keys: true,
+            has_sound: true,
         }
     }
 
@@ -944,12 +1054,14 @@ impl SettingsFile {
         let text = std::fs::read_to_string(&path);
         let has_mouse = text.as_ref().is_ok_and(|t| Settings::has_mouse(t));
         let has_keys = text.as_ref().is_ok_and(|t| Settings::has_keys(t));
+        let has_sound = text.as_ref().is_ok_and(|t| Settings::has_sound(t));
         SettingsFile {
             saved: settings.clone(),
             settings,
             path: Some(path),
             has_mouse,
             has_keys,
+            has_sound,
         }
     }
 
@@ -1012,6 +1124,21 @@ impl SettingsFile {
         }
         // Written even when it's the default, so the import happens once.
         self.saved.mouse.sensitivity = f64::NAN;
+    }
+
+    /// Takes the volumes from `import` (vanilla's) if the file didn't have them; they are
+    /// saved with the next change, or on quitting.
+    pub fn import_sound(&mut self, import: impl FnOnce() -> Option<(SoundSettings, PathBuf)>) {
+        if self.has_sound {
+            return;
+        }
+        self.has_sound = true;
+        if let Some((sound, from)) = import() {
+            eprintln!("[ruthenium] volumes from {}", from.display());
+            self.settings.sound = sound;
+        }
+        // Written even when it's the default, so the import happens once.
+        self.saved.sound.volumes[0] = f64::NAN;
     }
 
     /// Writes the settings if they changed since they were read or last saved.
@@ -1096,6 +1223,21 @@ mod tests {
             },
             toggle_sneak: true,
             toggle_sprint: false,
+            sound: SoundSettings {
+                volumes: [
+                    0.5,
+                    0.0,
+                    1.0,
+                    0.25,
+                    0.3333333333333333,
+                    1.0,
+                    0.9,
+                    0.07,
+                    1.0,
+                    0.0,
+                    0.6,
+                ],
+            },
         };
         assert_eq!(Settings::parse(&s.to_toml()), Ok(s.clone()));
         assert!(Settings::has_mouse(&s.to_toml()));

@@ -2419,6 +2419,7 @@ dependencies = [
  "base64 0.22.1",
  "profiling",
  "ruthenium-assets",
+ "ruthenium-audio",
  "ruthenium-auth",
  "ruthenium-data",
  "ruthenium-gpu",
@@ -2567,6 +2568,7 @@ name = "ruthenium-sim"
 version = "0.0.0"
 dependencies = [
  "ruthenium-assets",
+ "ruthenium-audio",
  "ruthenium-data",
  "ruthenium-javamath",
  "ruthenium-net",

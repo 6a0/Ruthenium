@@ -320,6 +320,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut light_against = None;
     let mut route_out = None;
     let mut expected = Expected::default();
+    let mut sound = crate::sound::SoundMode::Off;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -352,6 +353,18 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
             }
             "--route-out" => {
                 route_out = Some(PathBuf::from(it.next().ok_or("--route-out needs a file")?));
+            }
+            "--sound" => {
+                sound = match it.next().map(String::as_str) {
+                    Some("on") => crate::sound::SoundMode::Device,
+                    Some("off") => crate::sound::SoundMode::Off,
+                    _ => return Err("--sound needs on or off".into()),
+                };
+            }
+            "--sound-wav" => {
+                sound = crate::sound::SoundMode::Wav(PathBuf::from(
+                    it.next().ok_or("--sound-wav needs a file")?,
+                ));
             }
             "--expect-positions" => {
                 expected.positions = Some(
@@ -391,6 +404,12 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     }
     let mut settings = SettingsFile::load(SettingsFile::path_in(&data_dir));
     settings.import_mouse(crate::controls::vanilla_mouse);
+    settings.import_sound(crate::sound::vanilla_volumes);
+    let audio = crate::sound::start(
+        &sound,
+        Some(data_dir.join("game")),
+        settings.settings.sound.volumes(),
+    );
     let now = Instant::now();
     let mut player = script.map(|steps| Player {
         steps,
@@ -404,6 +423,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut scripting = false;
     let mut script_started = false;
     let mut joiner = Joiner::new(Some(data_dir.join("game")), cache_dir);
+    joiner.set_sound(audio.handle());
     let data = joiner.data();
     let session = joiner.join(&address, &accounts)?;
     if let Some(route) = route {
@@ -481,6 +501,9 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
             scripting = p.frame(&session);
         }
         session.frame();
+        if let Some(v) = crate::ingame::world_view(&session, Instant::now(), 70.0) {
+            audio.set_listener(&crate::sound::listener(&v.camera));
+        }
         if !leaving && started.elapsed() >= stay {
             leaving = true;
             if light_out.is_some() || light_against.is_some() {

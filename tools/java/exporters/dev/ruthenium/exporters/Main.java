@@ -34,5 +34,6 @@ public final class Main {
         BlockBehaviourExporter.export(out.resolve(BlockBehaviourExporter.FILE));
         BlockRenderExporter.export(out.resolve(BlockRenderExporter.FILE));
         ModelLayersExporter.export(out.resolve(ModelLayersExporter.FILE));
+        BlockSoundExporter.export(out.resolve(BlockSoundExporter.FILE));
     }
 }

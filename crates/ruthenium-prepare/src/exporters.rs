@@ -22,6 +22,7 @@ pub const ITEM_CLASSES: &str = "item_classes.bin";
 pub const BLOCK_BEHAVIOUR: &str = "block_behaviour.bin";
 pub const BLOCK_RENDER: &str = "block_render.bin";
 pub const MODEL_LAYERS: &str = "model_layers.bin";
+pub const BLOCK_SOUNDS: &str = "block_sounds.bin";
 
 /// The exporter bundle: `explicit`, then `RUTHENIUM_EXPORTERS`, then next to
 /// the executable, then `../java/` from it (`target/java/` in a dev build).
@@ -82,6 +83,7 @@ pub fn run(java: &Java, imported: &Imported, bundle: &Path) -> Result<(PathBuf, 
             BLOCK_BEHAVIOUR,
             BLOCK_RENDER,
             MODEL_LAYERS,
+            BLOCK_SOUNDS,
         ] {
             let expected = tmp.join(file);
             if !expected.is_file() {
@@ -975,9 +977,80 @@ pub fn read_model_layers(bytes: &[u8]) -> Result<ModelLayers, String> {
     Ok(ModelLayers { layers })
 }
 
+/// One of the game's `SoundType`s: what a block sounds like.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SoundTypeData {
+    pub volume: f32,
+    pub pitch: f32,
+    pub break_sound: String,
+    pub step: String,
+    pub place: String,
+    pub hit: String,
+    pub fall: String,
+}
+
+/// `block_sounds` v1: the sound types, and each block state's, by state id.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlockSoundsData {
+    pub types: Vec<SoundTypeData>,
+    pub states: Vec<u32>,
+}
+
+/// Parses `block_sounds.bin`.
+pub fn read_block_sounds(bytes: &[u8]) -> Result<BlockSoundsData, String> {
+    let mut r = Reader::open(bytes, "block_sounds", 1)?;
+    let n = r.u32()? as usize;
+    let mut types = Vec::with_capacity(n.min(4096));
+    for _ in 0..n {
+        types.push(SoundTypeData {
+            volume: r.f32()?,
+            pitch: r.f32()?,
+            break_sound: r.string()?,
+            step: r.string()?,
+            place: r.string()?,
+            hit: r.string()?,
+            fall: r.string()?,
+        });
+    }
+    let n = r.u32()? as usize;
+    let mut states = Vec::with_capacity(n.min(1 << 20));
+    for _ in 0..n {
+        let t = r.u32()?;
+        if t as usize >= types.len() {
+            return Err(format!("sound type {t} of {}", types.len()));
+        }
+        states.push(t);
+    }
+    r.finish()?;
+    Ok(BlockSoundsData { types, states })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_block_sounds() {
+        let mut b = b"RTHX".to_vec();
+        b.extend(1u32.to_le_bytes());
+        string(&mut b, "block_sounds");
+        b.extend(1u32.to_le_bytes());
+        b.extend(1.0f32.to_le_bytes());
+        b.extend(0.8f32.to_le_bytes());
+        for s in ["b", "s", "p", "h", "f"] {
+            string(&mut b, s);
+        }
+        b.extend(2u32.to_le_bytes());
+        b.extend(0u32.to_le_bytes());
+        b.extend(0u32.to_le_bytes());
+        let d = read_block_sounds(&b).unwrap();
+        assert_eq!((d.types.len(), d.states.as_slice()), (1, &[0, 0][..]));
+        assert_eq!((d.types[0].pitch, d.types[0].fall.as_str()), (0.8, "f"));
+        // A state naming a type that isn't there.
+        let n = b.len();
+        b[n - 4] = 1;
+        assert!(read_block_sounds(&b).is_err());
+    }
 
     /// A part with `faces` faces in one cube, without its children.
     fn part(out: &mut Vec<u8>, x: f32, faces: u8) {

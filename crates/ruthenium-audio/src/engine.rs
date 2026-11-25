@@ -708,6 +708,12 @@ impl Engine {
                         // `canPlaySound`: a silent entity's sound stops.
                         stop |= state.silent;
                         i.sound.position = state.position.map(|v| f64::from(v as f32));
+                        if crate::loader::trace() {
+                            eprintln!(
+                                "[sound] {} follows entity {e} to {:?}",
+                                i.sound.event, i.sound.position
+                            );
+                        }
                     }
                     None => {
                         i.stopped = true;

@@ -80,6 +80,8 @@ pub struct SessionOptions {
     /// What the local player's movement needs from the prepared game; without it the
     /// player doesn't move or send movement.
     pub physics: Option<Physics>,
+    /// Where the session's sounds go (none: silent).
+    pub sound: crate::sound::GameSounds,
 }
 
 /// The prepared game's data movement uses.
@@ -289,6 +291,7 @@ impl Session {
             options.known_packs,
             options.physics,
             information,
+            options.sound,
         )
     }
 
@@ -298,6 +301,7 @@ impl Session {
         known_packs: Vec<KnownPack>,
         physics: Option<Physics>,
         information: ClientInformation,
+        sound: crate::sound::GameSounds,
     ) -> std::io::Result<Session> {
         let handoff = Arc::new(Handoff::new(Limits::default()));
         let (publisher, scene) = Scene::new(DEFAULT_DIRTY_CAPACITY);
@@ -314,6 +318,7 @@ impl Session {
                 let mut game =
                     Game::new(connection, known_packs, physics, tx, publisher, information);
                 game.view = game_view;
+                game.sounds = sound;
                 game.run(&game_handoff);
             })?;
         Ok(Session {
@@ -646,6 +651,7 @@ struct Game {
     /// The camera's field of view modifier, and the FOV Effects option it is eased with.
     fov: FovEase,
     fov_effects: f32,
+    sounds: crate::sound::GameSounds,
 }
 
 /// The feature flag that switches minecarts to their new movement, which doesn't
@@ -820,6 +826,7 @@ impl Game {
             outline: None,
             fov: FovEase::default(),
             fov_effects: 1.0,
+            sounds: crate::sound::GameSounds::default(),
         }
     }
 
@@ -829,6 +836,8 @@ impl Game {
 
     fn run(&mut self, handoff: &Handoff<FrameInput, Command>) {
         while self.step(handoff.take()) {}
+        // Leaving stops every sound (`Minecraft.disconnect`).
+        self.sounds.stop_all();
         // A main thread waiting for room in the queue goes on.
         handoff.end();
         self.publisher.end_level();
@@ -915,6 +924,9 @@ impl Game {
         self.take_input(&input);
         for _ in 0..ticks {
             self.tick();
+            if let Some(w) = &self.world {
+                self.sounds.tick(&w.player, &w.entities);
+            }
         }
         self.frames += 1;
         self.ticks += u64::from(ticks);
@@ -2690,6 +2702,40 @@ impl Game {
                     self.hud_text.now_playing(song);
                 }
             }
+            play::Clientbound::Sound {
+                event,
+                source,
+                position,
+                volume,
+                pitch,
+                seed,
+            } => self
+                .sounds
+                .sound(&event, source, position, volume, pitch, seed),
+            play::Clientbound::SoundEntity {
+                event,
+                source,
+                entity_id,
+                volume,
+                pitch,
+                seed,
+            } => {
+                if let Some(w) = &self.world {
+                    self.sounds.sound_entity(
+                        &event,
+                        source,
+                        entity_id,
+                        volume,
+                        pitch,
+                        seed,
+                        &w.player,
+                        &w.entities,
+                    );
+                }
+            }
+            play::Clientbound::StopSound { source, name } => {
+                self.sounds.stop(source, name.as_deref());
+            }
             play::Clientbound::Other(kind) => {
                 self.play_packets += 1;
                 if self.play_packets <= 3 {
@@ -3661,9 +3707,14 @@ mod tests {
     #[test]
     fn the_camera_runs_ahead_of_the_frames_by_the_turns_not_yet_taken() {
         let (connection, remote) = Connection::detached();
-        let session =
-            Session::with_connection(connection, Vec::new(), None, ClientInformation::default())
-                .unwrap();
+        let session = Session::with_connection(
+            connection,
+            Vec::new(),
+            None,
+            ClientInformation::default(),
+            crate::sound::GameSounds::default(),
+        )
+        .unwrap();
         assert!(session.camera().is_none());
         remote.event(Event::Play(login()));
         let wait = |until: &dyn Fn() -> bool| {

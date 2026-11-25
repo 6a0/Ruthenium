@@ -24,6 +24,7 @@ pub mod wav;
 pub use audio::{Audio, SoundHandle};
 pub use engine::{Engine, EntityState, Follow, InstanceId, PlayResult, SoundInstance};
 pub use files::SoundFiles;
+pub use loader::trace;
 pub use output::Output;
 pub use source::{SoundSource, Volumes};
 pub use spatial::Listener;

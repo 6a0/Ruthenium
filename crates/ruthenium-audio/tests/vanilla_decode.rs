@@ -58,7 +58,7 @@ fn every_sound_file_decodes_as_vanillas_decoder_does() {
         let mut rms = 0.0;
         for d in batch {
             let (line, level) = d.as_ref().expect("checked");
-            for byte in line.bytes().chain([b'\n']) {
+            for byte in line.bytes().chain(*b"\n") {
                 h ^= u64::from(byte);
                 h = h.wrapping_mul(0x100000001b3);
             }

@@ -92,7 +92,7 @@ fn made_up_packs_choose_what_vanilla_chooses() {
 }
 
 fn fnv(mut h: u64, line: &str) -> u64 {
-    for b in line.bytes().chain([b'\n']) {
+    for b in line.bytes().chain(*b"\n") {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x100000001b3);
     }

@@ -22,6 +22,7 @@ dev-offline = ["ruthenium-net/dev-offline"]
 [dependencies]
 profiling = "1.0.18"
 ruthenium-assets = { path = "../ruthenium-assets" }
+ruthenium-audio = { path = "../ruthenium-audio", features = ["device"] }
 ruthenium-auth = { path = "../ruthenium-auth" }
 ruthenium-data = { path = "../ruthenium-data" }
 ruthenium-gpu = { path = "../ruthenium-gpu" }

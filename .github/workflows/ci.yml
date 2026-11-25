@@ -150,7 +150,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends cmake ninja-build \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
             libxss-dev libxtst-dev libxkbcommon-dev libwayland-dev wayland-protocols \
-            libegl1-mesa-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libibus-1.0-dev
+            libegl1-mesa-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libibus-1.0-dev \
+            libasound2-dev
       - run: cargo clippy --workspace --all-targets $FEATURES
       - run: cargo test --workspace $FEATURES
       # The development-only offline login (PLAN D3) compiles and passes its tests...
@@ -174,6 +175,7 @@ jobs:
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
             libxss-dev libxtst-dev libxkbcommon-dev libwayland-dev wayland-protocols \
             libegl1-mesa-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libibus-1.0-dev \
+            libasound2-dev \
             mesa-vulkan-drivers libvulkan1 xvfb xauth
       - run: >
           xvfb-run -a -s "-screen 0 1920x1080x24"
@@ -218,7 +220,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends cmake ninja-build \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev \
             libxss-dev libxtst-dev libxkbcommon-dev libwayland-dev wayland-protocols \
-            libegl1-mesa-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libibus-1.0-dev
+            libegl1-mesa-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libibus-1.0-dev \
+            libasound2-dev
       - run: cargo build --release -p ruthenium --features ruthenium/sdl-static
       - name: Check the binary for the dev-offline marker
         run: |

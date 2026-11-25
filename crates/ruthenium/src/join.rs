@@ -51,6 +51,8 @@ pub struct GameData {
     pub known_packs: Vec<KnownPack>,
     /// What movement needs: the exported block physics and vanilla's dimension heights.
     pub physics: Option<Physics>,
+    /// Every block state's sounds (steps, breaking, placing), for the client's own.
+    pub block_sounds: Option<Arc<ruthenium_sim::sound::BlockSounds>>,
 }
 
 impl GameData {
@@ -124,10 +126,17 @@ impl GameData {
                 None
             }
         };
+        let block_sounds = ruthenium_sim::sound::BlockSounds::load(&exports)
+            .map(Arc::new)
+            .map_err(|e| {
+                eprintln!("[ruthenium] no block sounds ({e}); run `ruthenium prepare`");
+            })
+            .ok();
         GameData {
             lang,
             known_packs,
             physics,
+            block_sounds,
         }
     }
 }
@@ -589,6 +598,8 @@ pub struct Joiner {
     skins: Option<SkinLoader>,
     /// For the services' discovery document (online logins) and the skins.
     cache_dir: Option<PathBuf>,
+    /// Where the sessions' sounds go.
+    sound: ruthenium_audio::SoundHandle,
 }
 
 #[derive(Debug)]
@@ -617,6 +628,7 @@ impl Joiner {
             world: WorldLoad::NotStarted,
             skins: None,
             cache_dir,
+            sound: ruthenium_audio::SoundHandle::off(),
         }
     }
 
@@ -626,6 +638,11 @@ impl Joiner {
             return None;
         }
         Some(self.data())
+    }
+
+    /// Where the sessions it starts play their sounds.
+    pub fn set_sound(&mut self, sound: ruthenium_audio::SoundHandle) {
+        self.sound = sound;
     }
 
     /// Starts building the world's drawing assets on a thread, the first time it is
@@ -706,6 +723,10 @@ impl Joiner {
             },
             known_packs: data.known_packs.clone(),
             physics: data.physics.clone(),
+            sound: ruthenium_sim::sound::GameSounds::new(
+                self.sound.clone(),
+                data.block_sounds.clone(),
+            ),
         })
         .map_err(|e| format!("couldn't start the connection: {e}"))
     }

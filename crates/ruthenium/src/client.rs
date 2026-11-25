@@ -10,6 +10,7 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use ruthenium_audio::SoundSource;
 use ruthenium_gpu::{
     ACQUIRE_TIMEOUT, GpuOptions, PresentPolicy, Presented, PretendSrgb, SwapchainMaintenance,
     TextureTablePath, Validation,
@@ -197,6 +198,8 @@ pub struct Options {
     pub hud: Option<bool>,
     /// Whether the frame's corners darken in the dark (the default).
     pub vignette: Option<bool>,
+    /// Where sound goes: the device (the default), nowhere, or a WAV file.
+    pub sound: crate::sound::SoundMode,
     /// Development: show the Game Menu as soon as the world is there.
     pub game_menu: Option<crate::menu::ShownMenu>,
     /// Show the player list without its key (default: no).
@@ -284,6 +287,7 @@ impl Options {
             crosshair: None,
             hud: None,
             vignette: None,
+            sound: crate::sound::SoundMode::Device,
             game_menu: None,
             player_list: None,
             animations: None,
@@ -319,6 +323,17 @@ impl Options {
                         .parse()
                         .map_err(|_| format!("--quit-after: not a number: {v}"))?;
                     o.quit_after = Some(Duration::from_secs_f64(s.max(0.0)));
+                }
+                "--sound" => {
+                    o.sound = match value("on or off")?.as_str() {
+                        "on" => crate::sound::SoundMode::Device,
+                        "off" => crate::sound::SoundMode::Off,
+                        v => return Err(format!("--sound: not on or off: {v}")),
+                    }
+                }
+                "--sound-wav" => {
+                    o.sound =
+                        crate::sound::SoundMode::Wav(std::path::PathBuf::from(value("a file")?));
                 }
                 "--stats" => o.stats = true,
                 "--overlay" => o.overlay = true,
@@ -705,6 +720,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             let mut f = SettingsFile::load(SettingsFile::path_in(d));
             f.import_mouse(crate::controls::vanilla_mouse);
             f.import_keys(crate::controls::vanilla_keys);
+            f.import_sound(crate::sound::vanilla_volumes);
             f
         }
         _ => SettingsFile::transient(),
@@ -749,10 +765,19 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     let started_epoch_ms =
         crate::route::epoch_ms().saturating_sub(started.elapsed().as_millis() as u64);
-    menu.set_joiner(crate::join::Joiner::new(
+    let audio = crate::sound::start(
+        &opts.sound,
+        data_dir.as_ref().map(|d| d.join("game")),
+        menu.settings().sound.volumes(),
+    );
+    let mut sound_preview = crate::sound::Preview::default();
+    let mut sound_ticked = Instant::now();
+    let mut joiner = crate::join::Joiner::new(
         data_dir.as_ref().map(|d| d.join("game")),
         ruthenium_prepare::default_cache_dir(&env),
-    ));
+    );
+    joiner.set_sound(audio.handle());
+    menu.set_joiner(joiner);
     let mut applied: Settings = menu.settings().clone();
     let mut platform = Platform::init(env!("CARGO_PKG_VERSION"))?;
     menu.set_key_names(Box::new(ruthenium_platform::key_name));
@@ -1137,6 +1162,14 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         for (code, down, repeat, shift, shortcut) in keys.drain(..) {
             actions.extend(menu.key(code, down, repeat, shift, shortcut, &window));
         }
+        for _ in 0..menu.take_clicks() {
+            crate::sound::click(&audio.handle(), started.elapsed().as_nanos() as i64);
+        }
+        // Outside a session nothing else ticks the sounds (`SoundManager.tick`).
+        if menu.session_stats().is_none() && sound_ticked.elapsed() >= Duration::from_millis(50) {
+            sound_ticked = Instant::now();
+            audio.handle().tick(false, &|_| None);
+        }
         if !typed.is_empty() {
             menu.text_input(&typed);
             typed.clear();
@@ -1238,6 +1271,25 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             if wanted.game != applied.game {
                 apply_game_options(&mut renderer, &wanted.game);
             }
+            if wanted.sound != applied.sound {
+                let sound = audio.handle();
+                sound.set_volumes(wanted.sound.volumes());
+                // Outside a world, the slider moved plays its category's sound.
+                let moved = SoundSource::ALL
+                    .into_iter()
+                    .find(|s| wanted.sound.volumes[s.index()] != applied.sound.volumes[s.index()]);
+                if let Some(s) = moved
+                    && menu.session_stats().is_none()
+                {
+                    let volume = wanted.sound.volumes[s.index()] as f32;
+                    sound_preview.slider_moved(
+                        &sound,
+                        s,
+                        volume,
+                        started.elapsed().as_nanos() as i64,
+                    );
+                }
+            }
             applied = wanted.clone();
         }
         if std::mem::take(&mut toggle_vsync) {
@@ -1330,6 +1382,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         // The world as the game thread last published it, seen from where the mouse
         // has turned to: taken before the menus borrow themselves for the frame.
         let world = menu.world_view();
+        if let Some(w) = &world {
+            audio.set_listener(&crate::sound::listener(&w.camera));
+        }
         let hud = menu.hud_params();
         renderer.set_key_bindings(menu.bound_keys());
         let gui = if opts.empty_window {

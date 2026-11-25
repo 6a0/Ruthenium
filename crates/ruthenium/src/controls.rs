@@ -51,7 +51,7 @@ pub fn parse_options(text: &str) -> MouseOptions {
 
 /// `options.txt` files in the launchers' game folders: the official launcher's, and
 /// each instance's or profile's of the others.
-fn options_files(env: &Env) -> Vec<PathBuf> {
+pub(crate) fn options_files(env: &Env) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut add = |p: PathBuf| {
         if p.is_file() && !found.contains(&p) {
@@ -75,7 +75,7 @@ fn options_files(env: &Env) -> Vec<PathBuf> {
     found
 }
 
-fn modified(p: &Path) -> SystemTime {
+pub(crate) fn modified(p: &Path) -> SystemTime {
     std::fs::metadata(p)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH)
