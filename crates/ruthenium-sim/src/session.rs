@@ -38,6 +38,7 @@ use ruthenium_net::connection::{
 use ruthenium_protocol::packets::configuration::{self as cfg, RegistryEntry, RegistryTags};
 use ruthenium_protocol::packets::{Common, KnownPack, PackAction, play, read_brand};
 
+use crate::avatar::Swing;
 use crate::biome::Climate;
 use crate::blocks::{BlockTags, Blocks};
 use crate::clock::{self, TickClock};
@@ -589,6 +590,8 @@ struct Game {
     /// on a reconfiguration).
     players: PlayerInfos,
     teams: Teams,
+    /// How many chunks from the player the server ticks.
+    simulation_distance: i32,
 }
 
 /// The feature flag that switches minecarts to their new movement, which doesn't
@@ -743,6 +746,7 @@ impl Game {
             uuid: 0,
             players: PlayerInfos::default(),
             teams: Teams::default(),
+            simulation_distance: i32::MAX,
         }
     }
 
@@ -939,6 +943,9 @@ impl Game {
                         pose: e.pose,
                         baby: e.baby,
                         vehicle: e.vehicle,
+                        avatar: w
+                            .entities
+                            .avatar_record(e, &self.teams, p.spectator, &self.name),
                     });
                 }
             },
@@ -1256,7 +1263,9 @@ impl Game {
             .features
             .iter()
             .any(|f| f == MINECART_IMPROVEMENTS);
-        Entities::new(player_id, improved)
+        let mut entities = Entities::new(player_id, improved);
+        entities.simulation_distance = self.simulation_distance;
+        entities
     }
 
     /// The block tags movement reads, from the server's tags (block registry ids).
@@ -1629,6 +1638,7 @@ impl Game {
                     login.spawn.game_type
                 );
                 let (level, biome_bits) = self.new_level(&login.spawn);
+                self.simulation_distance = login.simulation_distance;
                 let entities = self.new_entities(login.player_id);
                 let environment = self.environment(login.spawn.dimension_type);
                 self.publisher.begin_level(Dims::of(&level));
@@ -2164,6 +2174,48 @@ impl Game {
             play::Clientbound::SetEquipment { entity_id, slots } => {
                 if let Some(w) = &mut self.world {
                     w.entities.set_equipment(entity_id, &slots);
+                    if let Some(physics) = &self.physics {
+                        w.entities.set_worn(entity_id, &slots, &physics.items);
+                    }
+                }
+            }
+            play::Clientbound::SetSimulationDistance { distance } => {
+                self.simulation_distance = distance;
+                if let Some(w) = &mut self.world {
+                    w.entities.simulation_distance = distance;
+                }
+            }
+            play::Clientbound::RotateHead {
+                entity_id,
+                y_head_rot,
+            } => {
+                if let Some(w) = &mut self.world {
+                    w.entities.rotate_head(entity_id, y_head_rot);
+                }
+            }
+            play::Clientbound::DamageEvent { entity_id } => {
+                if let Some(w) = &mut self.world {
+                    w.entities.damaged(entity_id);
+                }
+            }
+            play::Clientbound::HurtAnimation { entity_id } => {
+                if let Some(w) = &mut self.world {
+                    w.entities.hurt(entity_id);
+                }
+            }
+            play::Clientbound::SwingAnimation {
+                entity_id,
+                off_hand,
+                animation,
+                duration,
+            } => {
+                if let Some(w) = &mut self.world {
+                    let swing = Swing {
+                        off_hand,
+                        kind: animation,
+                        duration,
+                    };
+                    w.entities.swing(entity_id, swing);
                 }
             }
             // `handleSetTime`: the game time, then the clocks tick up to it and take

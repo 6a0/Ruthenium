@@ -24,11 +24,13 @@ layout(location = 2) out vec2 v_uv;
 layout(location = 3) out float v_spherical;
 layout(location = 4) out float v_cylindrical;
 layout(location = 5) flat out uint v_texture;
+layout(location = 6) flat out vec3 v_added;
 
 // How far inside the edge of its texels a glyph's picture is sampled, in texels.
 const float INSIDE = 0.01;
 
 void main() {
+    v_added = vec3(0.0);
     if (pc.signs == 0u) {
         gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
         v_front = vec4(0.0);

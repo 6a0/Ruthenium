@@ -220,6 +220,11 @@ pub const MODEL_PART: Record = Record {
             ty: Ty::Uint,
             doc: "An index into the texture table.",
         },
+        Field {
+            name: "overlay",
+            ty: Ty::Uint,
+            doc: "1 if it is tinted red, hurt; else 0.",
+        },
     ],
 };
 
@@ -389,7 +394,7 @@ mod tests {
         assert_eq!(SECTION.offset("visibility"), 3);
         assert_eq!(SECTION.bytes(), 16);
         assert_eq!(MODEL_PART.offset("light"), 12);
-        assert_eq!(MODEL_PART.bytes(), 60);
+        assert_eq!((MODEL_PART.offset("overlay"), MODEL_PART.bytes()), (15, 64));
         assert_eq!((SIGN.offset("light"), SIGN.words()), (12, 14));
         assert_eq!((GLYPH.offset("sign"), GLYPH.words()), (11, 13));
         for r in RECORDS {

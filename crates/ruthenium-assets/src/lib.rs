@@ -20,6 +20,7 @@ pub mod mipmap;
 pub mod model;
 pub mod pack;
 pub mod resources;
+pub mod skin;
 pub mod stitch;
 pub mod zip;
 

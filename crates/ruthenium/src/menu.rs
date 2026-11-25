@@ -500,18 +500,26 @@ impl Menu {
     }
 
     /// Hands the world's drawing assets to the renderer once they are built (they
-    /// start building when the first session starts), and has it forget the meshes of
-    /// a session that is over.
+    /// start building when the first session starts) and the skins it asks for, and has
+    /// it forget the meshes of a session that is over.
     fn sync_world(&mut self, renderer: &mut Renderer) {
         if std::mem::take(&mut self.forget_world) {
             renderer.clear_world();
         }
-        if self.session.is_none() || renderer.has_world() {
-            return;
-        }
-        let Some(joiner) = &mut self.joiner else {
+        let Some(joiner) = self.joiner.as_mut().filter(|_| self.session.is_some()) else {
             return;
         };
+        if renderer.has_world() {
+            let wanted = renderer.take_skin_requests();
+            let skins = joiner.skins();
+            for source in wanted {
+                skins.request(source);
+            }
+            while let Some((source, skin)) = skins.take() {
+                renderer.skin_found(&source, skin);
+            }
+            return;
+        }
         joiner.start_world_assets(renderer.gpu().caps().max_image_dimension_2d);
         if let Some(assets) = joiner.take_world_assets()
             && let Err(e) = renderer.load_world(assets, self.mesh_workers)

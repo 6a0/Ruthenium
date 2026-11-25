@@ -25,6 +25,7 @@ use ruthenium_sim::session::{DimensionType, Physics, Session, SessionOptions};
 use ruthenium_sim::use_on::Transformers;
 
 use crate::account::Accounts;
+use crate::skins::SkinLoader;
 
 /// The brand Ruthenium sends (PLAN D6).
 pub const BRAND: &str = "ruthenium";
@@ -455,8 +456,8 @@ pub struct Joiner {
     data: Data,
     game: Option<PathBuf>,
     world: WorldLoad,
-    /// For the services' discovery document (online logins).
-    #[cfg_attr(feature = "dev-offline", allow(dead_code))]
+    skins: Option<SkinLoader>,
+    /// For the services' discovery document (online logins) and the skins.
     cache_dir: Option<PathBuf>,
 }
 
@@ -467,7 +468,8 @@ enum Data {
 }
 
 impl Joiner {
-    /// `game`: the imported game files; `cache_dir`: for the services' discovery document.
+    /// `game`: the imported game files; `cache_dir`: for the services' discovery document
+    /// and the skins.
     pub fn new(game: Option<PathBuf>, cache_dir: Option<PathBuf>) -> Joiner {
         let data = match game.clone() {
             Some(dir) => match std::thread::Builder::new()
@@ -483,6 +485,7 @@ impl Joiner {
             data,
             game,
             world: WorldLoad::NotStarted,
+            skins: None,
             cache_dir,
         }
     }
@@ -506,6 +509,12 @@ impl Joiner {
                 WorldLoad::Done
             }
         };
+    }
+
+    /// What loads the skins of players, once a world is entered.
+    pub fn skins(&mut self) -> &SkinLoader {
+        self.skins
+            .get_or_insert_with(|| SkinLoader::new(self.game.clone(), self.cache_dir.clone()))
     }
 
     /// The world's drawing assets once they are built: handed over once.

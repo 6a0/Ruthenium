@@ -28,12 +28,15 @@ layout(location = 2) out vec2 v_uv;
 layout(location = 3) out float v_spherical;
 layout(location = 4) out float v_cylindrical;
 layout(location = 5) flat out uint v_texture;
+layout(location = 6) flat out vec3 v_added;
 
 // A banner's patterns lie in its cloth's plane: their depths have to come out the same.
 invariant gl_Position;
 
 const float AMBIENT = 0.4;
 const float POWER = 0.6;
+// How much of its own colour something hurt keeps; the rest is red.
+const float HURT_KEEPS = 178.0 / 255.0;
 
 float shade(vec2 light) {
     vec2 lit = max(light, vec2(0.0));
@@ -49,6 +52,7 @@ void main() {
         v_spherical = 0.0;
         v_cylindrical = 0.0;
         v_texture = 0u;
+        v_added = vec3(0.0);
         return;
     }
     uint part = pc.parts + uint(gl_InstanceIndex) * MODEL_PART_WORDS;
@@ -67,9 +71,13 @@ void main() {
     uint packed_light = model_part_light(part);
     vec2 light = vec2(packed_light & 0xFFu, packed_light >> 8u & 0xFFu);
     vec2 light_uv = clamp(light / 256.0 + 0.5 / 16.0, vec2(0.5 / 16.0), vec2(15.5 / 16.0));
-    vec4 color = unpackUnorm4x8(model_part_colour(part)) * textureLod(
+    vec4 lit = textureLod(
         sampler2D(u_textures[nonuniformEXT(world_lightmap(pc.world))], u_samplers[SAMPLER_LINEAR_CLAMP]),
         light_uv, 0.0);
+    vec4 color = unpackUnorm4x8(model_part_colour(part)) * lit;
+    bool hurt = model_part_overlay(part) != 0u;
+    color.rgb *= hurt ? HURT_KEEPS : 1.0;
+    v_added = hurt ? vec3(1.0 - HURT_KEEPS, 0.0, 0.0) * lit.rgb : vec3(0.0);
     v_front = vec4(color.rgb * shade(facing), color.a);
     v_back = vec4(color.rgb * shade(-facing), color.a);
     v_uv = a_uv;

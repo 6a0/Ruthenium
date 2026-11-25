@@ -2152,6 +2152,7 @@ dependencies = [
 name = "ruthenium"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "profiling",
  "ruthenium-assets",
  "ruthenium-auth",
@@ -2188,7 +2189,9 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.4.3",
  "keyring",
+ "rsa",
  "serde_json",
+ "sha1",
  "sha2",
  "ureq",
 ]

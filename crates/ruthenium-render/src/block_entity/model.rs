@@ -29,10 +29,15 @@ pub enum Model {
     StandingFlag,
     WallBanner,
     WallFlag,
+    /// A player with wide arms, and one with thin ones.
+    Player,
+    PlayerSlim,
+    /// A cape, at its place on a player's body.
+    Cape,
 }
 
 impl Model {
-    pub const ALL: [Model; 15] = [
+    pub const ALL: [Model; 18] = [
         Model::Chest,
         Model::ChestLeft,
         Model::ChestRight,
@@ -48,6 +53,9 @@ impl Model {
         Model::StandingFlag,
         Model::WallBanner,
         Model::WallFlag,
+        Model::Player,
+        Model::PlayerSlim,
+        Model::Cape,
     ];
 
     /// The game's model layer.
@@ -68,6 +76,9 @@ impl Model {
             Model::StandingFlag => "minecraft:standing_banner#flag",
             Model::WallBanner => "minecraft:wall_banner#main",
             Model::WallFlag => "minecraft:wall_banner#flag",
+            Model::Player => "minecraft:player#main",
+            Model::PlayerSlim => "minecraft:player_slim#main",
+            Model::Cape => "minecraft:player#cape",
         }
     }
 
@@ -104,8 +115,21 @@ struct Part {
     /// Radians about x, y and z.
     rotation: [f32; 3],
     scale: [f32; 3],
+    /// It is of a skin's second layer.
+    over: bool,
     first_quad: u32,
     quads: u32,
+}
+
+/// Where a part is put on what carries it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Moved {
+    /// In sixteenths of a block.
+    pub position: [f32; 3],
+    /// Radians about x, y and z.
+    pub rotation: [f32; 3],
+    /// Done to the part before it is turned so.
+    pub then: Affine,
 }
 
 /// A part to draw: its quads, and its place in the model's space (in blocks).
@@ -114,6 +138,8 @@ pub struct PartDraw {
     pub first_quad: u32,
     pub quads: u32,
     pub transform: Affine,
+    /// It is of a skin's second layer.
+    pub over: bool,
 }
 
 /// Every model's parts and the quads of all of them.
@@ -152,6 +178,7 @@ impl ModelSet {
             position: from.position,
             rotation: from.rotation,
             scale: from.scale,
+            over: super::avatar::is_layer(name),
             first_quad: self.quads.len() as u32,
             quads: from.faces.len() as u32,
         });
@@ -167,24 +194,60 @@ impl ModelSet {
 
     /// Adds a model's parts that have quads to `out`, posed.
     pub fn draw(&self, model: Model, pose: Pose, out: &mut Vec<PartDraw>) {
+        self.draw_by(model, out, |name, part| {
+            move_part(pose, name, &mut part.position, &mut part.rotation);
+            true
+        });
+    }
+
+    /// The same, with each part moved by `moves`, which says whether it and what it
+    /// carries are shown. Parts are given in the model's order, each after the one that
+    /// carries it.
+    pub fn draw_by(
+        &self,
+        model: Model,
+        out: &mut Vec<PartDraw>,
+        mut moves: impl FnMut(&str, &mut Moved) -> bool,
+    ) {
         let parts = &self.models[model.index()];
-        let mut placed: Vec<Affine> = Vec::with_capacity(parts.len());
+        // None for those not shown.
+        let mut placed: Vec<Option<Affine>> = Vec::with_capacity(parts.len());
         for part in parts {
-            let (mut position, mut rotation) = (part.position, part.rotation);
-            move_part(pose, &part.name, &mut position, &mut rotation);
-            let parent = part.parent.map_or(Affine::IDENTITY, |p| placed[p]);
-            let transform = parent
-                .translate(position.map(|c| c / 16.0))
-                .rotate_z(rotation[2])
-                .rotate_y(rotation[1])
-                .rotate_x(rotation[0])
-                .scale(part.scale);
-            placed.push(transform);
+            let mut moved = Moved {
+                position: part.position,
+                rotation: part.rotation,
+                then: Affine::IDENTITY,
+            };
+            let shown = moves(&part.name, &mut moved);
+            let parent = part.parent.map_or(Some(Affine::IDENTITY), |p| placed[p]);
+            let Some(parent) = parent.filter(|_| shown) else {
+                placed.push(None);
+                continue;
+            };
+            let mut transform = parent.translate(moved.position.map(|c| c / 16.0));
+            let [x, y, z] = moved.rotation;
+            if z != 0.0 {
+                transform = transform.rotate_z(z);
+            }
+            if y != 0.0 {
+                transform = transform.rotate_y(y);
+            }
+            if x != 0.0 {
+                transform = transform.rotate_x(x);
+            }
+            if moved.then != Affine::IDENTITY {
+                transform = transform.then_inner(moved.then);
+            }
+            if part.scale != [1.0; 3] {
+                transform = transform.scale(part.scale);
+            }
+            placed.push(Some(transform));
             if part.quads > 0 {
                 out.push(PartDraw {
                     first_quad: part.first_quad,
                     quads: part.quads,
                     transform,
+                    over: part.over,
                 });
             }
         }

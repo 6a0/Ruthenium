@@ -913,6 +913,15 @@ impl ModelLayers {
     }
 }
 
+/// Of layers by their names, in any order.
+impl FromIterator<(String, ModelPart)> for ModelLayers {
+    fn from_iter<T: IntoIterator<Item = (String, ModelPart)>>(layers: T) -> ModelLayers {
+        let mut layers: Vec<_> = layers.into_iter().collect();
+        layers.sort_by(|a, b| a.0.cmp(&b.0));
+        ModelLayers { layers }
+    }
+}
+
 /// Parts inside parts at most: the game's models stay far below, a broken file must not
 /// overflow the stack.
 const MAX_PART_DEPTH: usize = 64;

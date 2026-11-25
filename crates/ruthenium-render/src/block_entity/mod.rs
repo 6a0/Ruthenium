@@ -1,14 +1,18 @@
-//! Block entities drawn from models (chests, shulker boxes, skulls and banners) and the text
-//! on signs.
+//! Block entities drawn from models (chests, shulker boxes, skulls and banners), the text
+//! on signs, and players.
 
 pub mod affine;
+mod avatar;
 pub mod model;
 pub mod place;
 pub mod renderer;
 pub(crate) mod sign;
+pub mod skins;
 
 #[cfg(test)]
 mod golden;
+#[cfg(test)]
+mod player_golden;
 #[cfg(test)]
 mod sign_golden;
 

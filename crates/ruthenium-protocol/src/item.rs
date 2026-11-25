@@ -23,6 +23,7 @@
 
 use ruthenium_data::v26_3::registries::DataComponentType as Kind;
 
+use crate::profile::ResolvableProfile;
 use crate::wire::{MAX_STRING, Reader, WireError};
 
 /// How deeply stacks and recursive values (a stack in a bundle in a bundle, an effect's
@@ -683,7 +684,9 @@ fn skip_value(r: &mut Reader<'_>, k: Kind, depth: u32) -> Result<(), WireError> 
             r.varint()?;
             skip_list(r, 256, firework_explosion)?;
         }
-        Kind::Profile => profile(r)?,
+        Kind::Profile => {
+            ResolvableProfile::read(r)?;
+        }
         Kind::BannerPatterns => skip_list(r, usize::MAX, |r| {
             holder(r, |r| {
                 r.identifier()?;
@@ -965,30 +968,6 @@ fn block_predicate(r: &mut Reader<'_>, depth: u32) -> Result<BlockPredicate, Wir
         nbt: nbt_condition,
         components: !exact.is_empty() || !partial.is_empty(),
     })
-}
-
-/// `ResolvableProfile.STREAM_CODEC`: a full game profile (true) or a partial one
-/// (false), then the skin patch.
-fn profile(r: &mut Reader<'_>) -> Result<(), WireError> {
-    if r.bool()? {
-        r.uuid()?;
-        r.string(16)?;
-    } else {
-        opt(r, |r| r.string(16).map(drop))?;
-        opt(r, |r| r.uuid())?;
-    }
-    // Properties: name, value, optional signature.
-    skip_list(r, 16, |r| {
-        r.string(64)?;
-        r.string(MAX_STRING)?;
-        opt(r, |r| r.string(1024).map(drop)).map(drop)
-    })?;
-    // Skin patch: body, cape and elytra textures, the model (slim or not).
-    for _ in 0..3 {
-        opt(r, |r| r.identifier())?;
-    }
-    opt(r, |r| r.bool())?;
-    Ok(())
 }
 
 /// `Filterable.streamCodec`: the raw value, then optionally the filtered one.

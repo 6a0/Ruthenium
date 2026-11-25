@@ -1,6 +1,6 @@
 //! Draws block entities: instances of model parts, gathered each frame from the sections in
-//! view, a draw for all instances of one part in one layer; and the text of signs, a draw
-//! for all glyphs.
+//! view, a draw for all instances of one part in one layer; the text of signs, a draw for
+//! all glyphs; and players, from the same parts as their heads.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,14 +12,18 @@ use ruthenium_gpu::{
     TextureId, TextureTable, UploadRing, UploadTicket, VertexAttribute, VertexInput, vk,
 };
 use ruthenium_protocol::nbt;
+use ruthenium_protocol::profile::ResolvableProfile;
 use ruthenium_shaders::interface::{GLYPH, MODEL_PART, SIGN};
+use ruthenium_sim::avatar::{DEFAULT_SKINS, SkinSource};
 use ruthenium_sim::environment::CardinalLight;
 use ruthenium_sim::scene::{Frame, SectionKey, Terrain};
 
 use super::affine::Affine;
+use super::avatar::{self, Figure, Moment};
 use super::model::{Model, ModelSet, PartDraw, Pose, Skull};
 use super::place::{self, Chest, DYE_COLOURS, DYES, Kind};
 use super::sign::{self, GLYPH_WORDS, GlyphPages, SignText};
+use super::skins::{LoadedSkin, Look, Skins, default_path};
 use crate::atmosphere::Fog;
 use crate::pipelines::PipelineId;
 use crate::sky::SkyImage;
@@ -67,6 +71,7 @@ const MAX_PATTERNS: usize = 16;
 /// Banners whose patterns, and signs whose text, are kept between frames.
 const KEPT_PATTERNS: usize = 4096;
 const KEPT_SIGNS: usize = 4096;
+const KEPT_HEADS: usize = 4096;
 /// How near the player has to be for glowing text to have its outline, in blocks.
 const OUTLINE_DISTANCE: f64 = 16.0;
 /// Bytes of the frame's data left for what is drawn after block entities.
@@ -76,6 +81,8 @@ const GLYPH_BYTES: u64 = 2 << 20;
 
 /// A colour that leaves the texture as it is.
 const WHITE: u32 = u32::MAX;
+/// What an invisible player is tinted with for those who see it.
+const INVISIBLE: u32 = 0x26FF_FFFF;
 
 /// What block entities are drawn from: the models, and the pictures by their path below
 /// `textures/entity` without the suffix.
@@ -115,6 +122,12 @@ pub fn texture_paths() -> Vec<String> {
     out.push("shulker/shulker".to_owned());
     out.extend(DYES.map(|d| format!("shulker/shulker_{d}")));
     out.extend(SKULLS.map(|s| skull_texture(s).to_owned()));
+    for i in 0..DEFAULT_SKINS {
+        let path = default_path(i);
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
     out
 }
 
@@ -147,6 +160,28 @@ fn skull_texture(skull: Skull) -> &'static str {
         Skull::Creeper => "creeper/creeper",
         Skull::Piglin => "piglin/piglin",
         Skull::Dragon => "enderdragon/dragon",
+    }
+}
+
+/// The layer a skin is drawn in.
+fn skin_layer(look: &Look) -> u8 {
+    if look.blended { SKIN_SORTED } else { SKIN }
+}
+
+/// Whether a model of this kind is drawn nearer than it is: a plain skull. (A head with a
+/// skin of its own is where it is.)
+fn is_nearer(kind: Kind, layer: u8) -> bool {
+    matches!(kind, Kind::Skull { .. }) && layer == CUTOUT_FACES
+}
+
+/// Gives what is drawn from back to front its place among the others, each one's second
+/// layer over its first.
+fn order(sorted: &mut [(f32, std::ops::Range<usize>)], instances: &mut [Instance]) {
+    sorted.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (n, (_, range)) in sorted.iter().enumerate() {
+        for i in &mut instances[range.clone()] {
+            i.batch.1 += n as u32 * 2;
+        }
     }
 }
 
@@ -189,6 +224,8 @@ pub struct BlockEntityStats {
     /// Their parts, and the draws that drew them.
     pub parts: u32,
     pub draws: u32,
+    /// Players and mannequins drawn.
+    pub players: u32,
     /// Sides of signs drawn, and their glyphs.
     pub texts: u32,
     pub glyphs: u32,
@@ -198,13 +235,14 @@ pub struct BlockEntityStats {
 
 /// One part to draw: its record, and what it is sorted into draws by.
 struct Instance {
-    /// The layer, then the part's first quad.
-    batch: (u8, u32),
+    /// The layer; its place in it, where that matters; then the part's first quad.
+    batch: (u8, u32, u32),
     quads: u32,
     transform: Affine,
     light: u32,
     colour: u32,
     texture: TextureId,
+    hurt: bool,
 }
 
 /// The layers, in the order they are drawn in: patterns lie over the cloth they are on.
@@ -212,17 +250,33 @@ const SOLID: u8 = 0;
 const CUTOUT: u8 = 1;
 const CUTOUT_FACES: u8 = 2;
 const PATTERN: u8 = 3;
-const LAYERS: [PipelineId; 4] = [
+/// Skins: those whose texels are whole or clear, in any order; those with others, from back
+/// to front; and the invisible.
+const SKIN: u8 = 4;
+const SKIN_SORTED: u8 = 5;
+const SKIN_INVISIBLE: u8 = 6;
+const LAYERS: [PipelineId; 7] = [
     PipelineId::ModelSolid,
     PipelineId::ModelCutout,
     PipelineId::ModelCutoutFaces,
     PipelineId::ModelPattern,
+    PipelineId::ModelTranslucent,
+    PipelineId::ModelTranslucent,
+    PipelineId::ModelTranslucentFront,
 ];
 
 /// A banner's patterns as last read from its data: their textures and colours.
 struct Patterns {
     tag: Arc<nbt::Tag>,
     layers: Vec<(TextureId, u32)>,
+}
+
+/// A player's head as last read from its data: whose it is.
+struct Head {
+    /// As a sign's.
+    stamp: (u64, u64),
+    tag: Option<Arc<nbt::Tag>>,
+    owner: Option<Arc<SkinSource>>,
 }
 
 /// One side of a sign, laid out.
@@ -277,6 +331,10 @@ pub(crate) struct BlockEntityRenderer {
     lang: HashMap<String, String>,
     pages: GlyphPages,
     signs: HashMap<[i32; 3], Sign>,
+    heads: HashMap<[i32; 3], Head>,
+    skins: Skins,
+    /// What is drawn from back to front: how far it is, and where its instances are.
+    sorted: Vec<(f32, std::ops::Range<usize>)>,
     runs: Vec<SignRun>,
     /// State of the numbers obfuscated text is picked by.
     random: u64,
@@ -389,7 +447,6 @@ impl BlockEntityRenderer {
             upload: None,
             ready: false,
             models: assets.models,
-            textures: ids,
             chests,
             shulkers,
             skulls,
@@ -399,10 +456,14 @@ impl BlockEntityRenderer {
             lang: assets.lang,
             pages: GlyphPages::default(),
             signs: HashMap::new(),
+            heads: HashMap::new(),
+            skins: Skins::new(std::array::from_fn(|i| ids.get(&default_path(i)).copied())),
+            sorted: Vec::new(),
             runs: Vec::new(),
             random: 0x9E37_79B9_7F4A_7C15,
             instances: Vec::new(),
             parts: Vec::new(),
+            textures: ids,
             christmas: is_christmas(SystemTime::now()),
             stats: BlockEntityStats::default(),
         })
@@ -416,6 +477,7 @@ impl BlockEntityRenderer {
     /// before the frame's `UploadRing::record`.
     pub fn stage(&mut self, textures: &mut TextureTable, uploads: &mut UploadRing) {
         self.pages.stage(textures, uploads);
+        self.skins.stage(textures, uploads);
         if self.upload.is_none()
             && let Some(range) = self.pool.resolve(self.range)
         {
@@ -436,9 +498,21 @@ impl BlockEntityRenderer {
         }
     }
 
+    /// The skins that are wanted and have not been asked for.
+    pub fn take_skin_requests(&mut self) -> Vec<Arc<SkinSource>> {
+        self.skins.take_requests()
+    }
+
+    /// The answer to one of [`Self::take_skin_requests`].
+    pub fn skin_found(&mut self, source: &Arc<SkinSource>, skin: LoadedSkin) {
+        self.skins.found(source, skin);
+    }
+
     /// Starts a frame's gathering.
     pub fn begin(&mut self) {
         self.instances.clear();
+        self.sorted.clear();
+        self.skins.begin();
         self.runs.clear();
         self.stats = BlockEntityStats {
             overflowed: self.stats.overflowed,
@@ -565,6 +639,21 @@ impl BlockEntityRenderer {
                     );
                 }
                 Kind::Skull { skull, .. } => {
+                    let model = Model::Skull(skull);
+                    let still = Pose::Skull(0.0);
+                    if skull == Skull::Player
+                        && let Some(owner) = self.owner(terrain, pos)
+                    {
+                        let Some(look) = self.skins.look(&owner, textures) else {
+                            continue;
+                        };
+                        let first = self.instances.len();
+                        let layer = skin_layer(&look);
+                        self.add(kind, state, model, still, place, layer, look.body, WHITE);
+                        self.sort(first, layer);
+                        self.stats.drawn += 1;
+                        continue;
+                    }
                     let i = SKULLS.iter().position(|s| *s == skull).unwrap_or(0);
                     let Some(texture) = usable(self.skulls[i]) else {
                         continue;
@@ -572,8 +661,8 @@ impl BlockEntityRenderer {
                     self.add(
                         kind,
                         state,
-                        Model::Skull(skull),
-                        Pose::Skull(0.0),
+                        model,
+                        still,
                         place,
                         CUTOUT_FACES,
                         texture,
@@ -610,6 +699,159 @@ impl BlockEntityRenderer {
             }
             self.stats.drawn += 1;
         }
+    }
+
+    /// Adds the players and mannequins that are in view and in a section that is shown.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_players(
+        &mut self,
+        frame: &Frame,
+        terrain: &Terrain,
+        view_distance: i32,
+        partial: f32,
+        camera: [f64; 3],
+        view: &View,
+        textures: &TextureTable,
+        shown: impl Fn([i32; 3]) -> bool,
+    ) {
+        // `Entity.getViewScale`.
+        let scale = (f64::from(view_distance) / 8.0).clamp(1.0, 2.5);
+        for e in &frame.entities {
+            let Some(r) = e.avatar.as_deref().filter(|r| !r.hidden) else {
+                continue;
+            };
+            // The game may be frozen: then only players go on.
+            let goes_on = matches!(*r.skin, SkinSource::Player { .. });
+            let partial = if frame.frozen && !goes_on {
+                1.0
+            } else {
+                partial
+            };
+            let at = Moment { partial, camera };
+            let here = avatar::position(e, partial);
+            let [width, height] = r.size.map(f64::from);
+            let reach = (width + height + width) / 3.0 * 10.0 * 64.0 * scale;
+            let away: f64 = (0..3).map(|i| (e.position[i] - camera[i]).powi(2)).sum();
+            // (What is not a number is left out too.)
+            if away >= reach * reach || away.is_nan() {
+                continue;
+            }
+            let low = [here[0] - width / 2.0, here[1], here[2] - width / 2.0];
+            let size = [width, height, width];
+            let corner = |by: f64, high: f64| -> [f32; 3] {
+                std::array::from_fn(|i| {
+                    (low[i] + size[i] * high + by - f64::from(view.block[i])) as f32
+                })
+            };
+            if !view.sees(corner(-0.5, 0.0), corner(0.5, 1.0))
+                || !shown(e.position.map(|c| c.floor() as i32))
+            {
+                continue;
+            }
+            let Some(look) = self.skins.look(&r.skin, textures) else {
+                continue;
+            };
+            let eyes = [here[0], here[1] + f64::from(r.eye_height), here[2]];
+            let light = terrain
+                .probe(eyes.map(|c| c.floor() as i32))
+                .map_or((0, 15), |p| (p.block_light, p.sky_light));
+            let light = record_light(if r.on_fire { 15 } else { light.0 }, light.1);
+            let figure = Figure::new(e, r, at);
+            let (layer, colour) = if r.invisible {
+                (SKIN_INVISIBLE, INVISIBLE)
+            } else {
+                (skin_layer(&look), WHITE)
+            };
+            let model = if look.slim {
+                Model::PlayerSlim
+            } else {
+                Model::Player
+            };
+            let first = self.instances.len();
+            self.parts.clear();
+            self.models
+                .draw_by(model, &mut self.parts, |name, m| figure.place(name, m));
+            for p in &self.parts {
+                self.instances.push(Instance {
+                    batch: (layer, u32::from(p.over), p.first_quad),
+                    quads: p.quads,
+                    transform: figure.transform.then_inner(p.transform),
+                    light,
+                    colour,
+                    texture: look.body,
+                    hurt: r.hurt,
+                });
+            }
+            self.sort(first, layer);
+            if let Some(cape) = look.cape
+                && !r.invisible
+                && figure.wears_cape()
+            {
+                self.parts.clear();
+                self.models
+                    .draw_by(Model::Cape, &mut self.parts, |name, m| {
+                        figure.place_cape(name, m)
+                    });
+                let place = figure.cape_transform();
+                for p in &self.parts {
+                    self.instances.push(Instance {
+                        batch: (SOLID, 0, p.first_quad),
+                        quads: p.quads,
+                        transform: place.then_inner(p.transform),
+                        light,
+                        colour: WHITE,
+                        texture: cape,
+                        // A cape does not redden.
+                        hurt: false,
+                    });
+                }
+            }
+            self.stats.players += 1;
+        }
+    }
+
+    /// Notes that the instances from `first` on are drawn from back to front with what
+    /// else is, if their layer is.
+    fn sort(&mut self, first: usize, layer: u8) {
+        if matches!(layer, SKIN_SORTED | SKIN_INVISIBLE)
+            && let Some(i) = self.instances.get(first)
+        {
+            let away = i.transform.0.iter().map(|row| row[3] * row[3]).sum();
+            self.sorted.push((away, first..self.instances.len()));
+        }
+    }
+
+    /// Whose head the one at `pos` is.
+    fn owner(&mut self, terrain: &Terrain, pos: [i32; 3]) -> Option<Arc<SkinSource>> {
+        let column = terrain.column(pos[0] >> 4, pos[2] >> 4)?;
+        let stamp = (column.generation(), column.block_entities_rev());
+        if self.heads.get(&pos).is_none_or(|h| h.stamp != stamp) {
+            let tag = column
+                .block_entities()
+                .iter()
+                .find(|e| e.pos == pos)
+                .and_then(|e| e.tag.clone());
+            let same = |h: &Head| match (&h.tag, &tag) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            match self.heads.get_mut(&pos) {
+                Some(h) if same(h) => h.stamp = stamp,
+                _ => {
+                    if self.heads.len() >= KEPT_HEADS {
+                        self.heads.clear();
+                    }
+                    let owner = tag
+                        .as_deref()
+                        .and_then(|t| t.as_compound()?.get("profile"))
+                        .and_then(ResolvableProfile::from_nbt)
+                        .map(|p| Arc::new(SkinSource::Profile(p)));
+                    self.heads.insert(pos, Head { stamp, tag, owner });
+                }
+            }
+        }
+        self.heads.get(&pos)?.owner.clone()
     }
 
     /// Adds the sides of a sign that have text and face the camera.
@@ -774,7 +1016,8 @@ impl BlockEntityRenderer {
                 p.transform = outer.then_inner(p.transform);
             }
         }
-        let nearer = matches!(kind, Kind::Skull { .. });
+        // (A head with a skin of its own is where it is.)
+        let nearer = is_nearer(kind, layer);
         for p in &self.parts {
             let mut transform = p.transform;
             for (row, origin) in transform.0.iter_mut().zip(place.origin) {
@@ -784,12 +1027,13 @@ impl BlockEntityRenderer {
                 }
             }
             self.instances.push(Instance {
-                batch: (layer, p.first_quad),
+                batch: (layer, u32::from(p.over), p.first_quad),
                 quads: p.quads,
                 transform,
                 light: place.light,
                 colour,
                 texture,
+                hurt: false,
             });
         }
     }
@@ -850,6 +1094,8 @@ impl BlockEntityRenderer {
         if self.instances.is_empty() {
             return;
         }
+        // From back to front, each one's second layer over its first.
+        order(&mut self.sorted, &mut self.instances);
         // Stable: the patterns of a banner stay in their order.
         self.instances.sort_by_key(|i| i.batch);
         let Some((world, matrix)) = write_world(frame_data, view, [1.0; 2], lightmap) else {
@@ -899,7 +1145,7 @@ impl BlockEntityRenderer {
                     if pushed { &[] } else { &push },
                     quads * 6,
                     0,
-                    (batch.1 * 4) as i32,
+                    (batch.2 * 4) as i32,
                     at as u32,
                     run as u32,
                 );
@@ -1071,6 +1317,10 @@ fn write_part(bytes: &mut [u8], i: &Instance) {
     for (n, c) in i.transform.0.as_flattened().iter().enumerate() {
         put(rows + n, c.to_ne_bytes());
     }
+    put(
+        MODEL_PART.offset("overlay") as usize,
+        u32::from(i.hurt).to_ne_bytes(),
+    );
     put(MODEL_PART.offset("light") as usize, i.light.to_ne_bytes());
     put(MODEL_PART.offset("colour") as usize, i.colour.to_ne_bytes());
     put(
@@ -1121,7 +1371,7 @@ mod tests {
     #[test]
     fn a_part_is_written_where_the_shader_reads_it() {
         let i = Instance {
-            batch: (SOLID, 0),
+            batch: (SOLID, 0, 0),
             quads: 1,
             transform: Affine(std::array::from_fn(|r| {
                 std::array::from_fn(|c| (r * 4 + c) as f32)
@@ -1129,6 +1379,7 @@ mod tests {
             light: 0x70F0,
             colour: 0xFF12_3456,
             texture: TextureId::MISSING,
+            hurt: true,
         };
         let mut bytes = [0xAAu8; PART_BYTES];
         write_part(&mut bytes, &i);
@@ -1138,6 +1389,7 @@ mod tests {
         }
         assert_eq!((word(12), word(13)), (0x70F0, 0xFF12_3456));
         assert_eq!(word(14), TextureId::MISSING.index());
+        assert_eq!(word(15), 1);
     }
 
     #[test]
@@ -1170,6 +1422,42 @@ mod tests {
         }
         assert_eq!((word(&out, 10), word(&out, 12)), (9, 12));
         assert_eq!(word(&out, 11), 77);
+    }
+
+    #[test]
+    fn the_seen_through_are_drawn_from_back_to_front() {
+        let part = |over: u32| Instance {
+            batch: (SKIN_SORTED, over, 7 * over),
+            quads: 6,
+            transform: Affine::IDENTITY,
+            light: 0,
+            colour: WHITE,
+            texture: TextureId::MISSING,
+            hurt: false,
+        };
+        let mut instances = vec![part(0), part(1), part(0), part(1), part(0), part(1)];
+        let mut sorted = vec![(4.0, 0..2), (9.0, 2..4), (1.0, 4..6)];
+        order(&mut sorted, &mut instances);
+        let places: Vec<u32> = instances.iter().map(|i| i.batch.1).collect();
+        assert_eq!(places, [2, 3, 0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn skins_have_their_layers() {
+        let look = |blended| Look {
+            body: TextureId::MISSING,
+            cape: None,
+            slim: false,
+            blended,
+        };
+        assert_eq!(skin_layer(&look(false)), SKIN);
+        assert_eq!(skin_layer(&look(true)), SKIN_SORTED);
+        let head = Kind::Skull {
+            skull: Skull::Player,
+            wall: false,
+        };
+        assert!(is_nearer(head, CUTOUT_FACES) && !is_nearer(head, SKIN));
+        assert!(!is_nearer(Kind::Shulker(None), CUTOUT_FACES));
     }
 
     #[test]
@@ -1242,7 +1530,7 @@ mod tests {
             assert!(paths.iter().any(|q| q == p), "{p}");
         }
         assert!(!paths.iter().any(|p| p == "chest/ender_left"));
-        // 22 chests, 17 shulker boxes, 7 skulls.
-        assert_eq!(paths.len(), 22 + 17 + 7);
+        // 22 chests, 17 shulker boxes, 7 skulls, 18 skins (one of which a skull has).
+        assert_eq!(paths.len(), 22 + 17 + 7 + 17);
     }
 }

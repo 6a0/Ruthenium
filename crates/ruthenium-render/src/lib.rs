@@ -47,10 +47,12 @@ use ruthenium_gpu::{
     Validation, vk,
 };
 use ruthenium_platform::{Platform, Window};
+use ruthenium_sim::avatar::SkinSource;
 use ruthenium_sim::scene::{Frame, Scene};
 
 use atmosphere::{Atmosphere, Look, WaterOverlay};
 use block_entity::renderer::BlockEntityRenderer;
+use block_entity::skins::LoadedSkin;
 use ruthenium_gpu::SamplerId;
 use ruthenium_sim::environment::CardinalLight;
 use ruthenium_ui::Quad;
@@ -298,6 +300,8 @@ pub struct Renderer {
     /// The block entities' models and pictures, with them; and whether they are drawn.
     block_entities: Option<BlockEntityRenderer>,
     show_block_entities: bool,
+    /// Whether players are drawn.
+    show_players: bool,
     /// The terrain's part of the last frame.
     world_times: WorldTimes,
     /// The number of the last frame recorded.
@@ -407,6 +411,7 @@ impl Renderer {
             sky: None,
             block_entities: None,
             show_block_entities: true,
+            show_players: true,
             world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
@@ -528,6 +533,29 @@ impl Renderer {
 
     pub fn block_entities(&self) -> bool {
         self.show_block_entities
+    }
+
+    /// Whether other players and mannequins are drawn (they are unless said otherwise).
+    pub fn set_players(&mut self, on: bool) {
+        self.show_players = on;
+    }
+
+    pub fn players(&self) -> bool {
+        self.show_players
+    }
+
+    /// The skins that are wanted for what is in view and have not been asked for.
+    pub fn take_skin_requests(&mut self) -> Vec<Arc<SkinSource>> {
+        self.block_entities
+            .as_mut()
+            .map_or_else(Vec::new, BlockEntityRenderer::take_skin_requests)
+    }
+
+    /// The answer to one of [`Self::take_skin_requests`].
+    pub fn skin_found(&mut self, source: &Arc<SkinSource>, skin: LoadedSkin) {
+        if let Some(b) = &mut self.block_entities {
+            b.skin_found(source, skin);
+        }
     }
 
     /// How the terrain's texels are filtered (as vanilla's RGSS unless said otherwise).
@@ -696,7 +724,6 @@ impl Renderer {
         stats.block_entities = self
             .block_entities
             .as_ref()
-            .filter(|_| self.show_block_entities)
             .map(BlockEntityRenderer::stats)
             .unwrap_or_default();
         Some(stats)
@@ -1109,24 +1136,34 @@ impl Renderer {
         let cardinal = world.as_ref().map_or(CardinalLight::Default, |w| {
             w.frame.environment.cardinal_light
         });
-        if let (Some(w), Some((view, ..)), Some(renderer), Some(models)) = (
-            &world,
-            &view,
-            &mut self.world,
-            self.block_entities
-                .as_mut()
-                .filter(|_| self.show_block_entities),
-        ) {
+        if let (Some(w), Some((view, ..)), Some(renderer), Some(models)) =
+            (&world, &view, &mut self.world, &mut self.block_entities)
+        {
             let started = std::time::Instant::now();
-            renderer.gather_block_entities(
-                models,
-                w.scene,
-                w.frame,
-                w.partial_tick,
-                w.camera.position,
-                view,
-                &self.textures,
-            );
+            models.begin();
+            if self.show_block_entities {
+                renderer.gather_block_entities(
+                    models,
+                    w.scene,
+                    w.frame,
+                    w.partial_tick,
+                    w.camera.position,
+                    view,
+                    &self.textures,
+                );
+            }
+            if self.show_players {
+                renderer.gather_players(
+                    models,
+                    w.scene,
+                    w.frame,
+                    w.view_distance,
+                    w.partial_tick,
+                    w.camera.position,
+                    view,
+                    &self.textures,
+                );
+            }
             self.world_times.stage_ns += started.elapsed().as_nanos() as u64;
         }
         self.frame_data.begin_frame(ctx.slot());
@@ -1174,10 +1211,7 @@ impl Renderer {
                                 view,
                                 look,
                                 *front,
-                                self.block_entities
-                                    .as_mut()
-                                    .filter(|_| self.show_block_entities)
-                                    .map(|m| (m, cardinal)),
+                                self.block_entities.as_mut().map(|m| (m, cardinal)),
                             );
                         }
                         pass.finish();
@@ -1302,10 +1336,7 @@ impl Renderer {
                             view,
                             look,
                             front,
-                            self.block_entities
-                                .as_mut()
-                                .filter(|_| self.show_block_entities)
-                                .map(|m| (m, cardinal)),
+                            self.block_entities.as_mut().map(|m| (m, cardinal)),
                         );
                         self.world_times.draw_ns = started.elapsed().as_nanos() as u64;
                     }

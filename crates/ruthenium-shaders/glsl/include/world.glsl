@@ -64,7 +64,7 @@ mat4 sky_transform(uint at) {
 }
 
 // One part of a model: record number gl_InstanceIndex from the offset in push constants.
-#define MODEL_PART_WORDS 15u
+#define MODEL_PART_WORDS 16u
 
 // From the part's own space to blocks relative to the camera: the first row.
 vec4 model_part_row_x(uint at) {
@@ -94,6 +94,11 @@ uint model_part_colour(uint at) {
 // An index into the texture table.
 uint model_part_texture(uint at) {
     return frame_words[at + 14u];
+}
+
+// 1 if it is tinted red, hurt; else 0.
+uint model_part_overlay(uint at) {
+    return frame_words[at + 15u];
 }
 
 // One side of a sign: found by its glyphs.

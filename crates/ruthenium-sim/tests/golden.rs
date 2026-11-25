@@ -852,6 +852,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             &[play::PlayerInfoEntry {
                 uuid,
                 name: Some(name.clone()),
+                properties: Vec::new(),
                 game_mode: Some(0),
             }],
         );

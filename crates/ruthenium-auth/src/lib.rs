@@ -19,6 +19,7 @@ pub mod msa;
 pub mod pkce;
 pub mod skin;
 pub mod store;
+pub mod textures;
 pub mod xbox;
 
 use std::path::{Path, PathBuf};

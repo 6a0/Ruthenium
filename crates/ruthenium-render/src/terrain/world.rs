@@ -1792,7 +1792,6 @@ impl WorldRenderer {
         textures: &TextureTable,
     ) {
         profiling::scope!("block_entities_gather");
-        renderer.begin();
         let tracker = &self.tracker;
         self.block_entities.retain(|key, _| tracker.tracks(*key));
         if self.block_entities.is_empty() {
@@ -1823,6 +1822,48 @@ impl WorldRenderer {
                     textures,
                 );
             }
+        });
+    }
+
+    /// Gathers the players in view, for this frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_players(
+        &self,
+        renderer: &mut BlockEntityRenderer,
+        scene: &Scene,
+        frame: &Frame,
+        view_distance: i32,
+        partial: f32,
+        camera: [f64; 3],
+        view: &View,
+        textures: &TextureTable,
+    ) {
+        profiling::scope!("players_gather");
+        if frame.entities.iter().all(|e| e.avatar.is_none()) {
+            return;
+        }
+        let now = Instant::now();
+        scene.with_terrain(|terrain| {
+            let dims = terrain.dims();
+            renderer.gather_players(
+                frame,
+                terrain,
+                view_distance,
+                partial,
+                camera,
+                view,
+                textures,
+                |block| {
+                    let key = block.map(|c| c >> 4);
+                    // Above and below the level there are no sections.
+                    if !(0..dims.sections).contains(&(key[1] - dims.min_section)) {
+                        return true;
+                    }
+                    self.tracker
+                        .meshed_since(key)
+                        .is_some_and(|s| visibility(now, s, self.fade_ms) >= MIN_VISIBILITY)
+                },
+            );
         });
     }
 

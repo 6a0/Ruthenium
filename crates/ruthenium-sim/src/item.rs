@@ -470,6 +470,25 @@ impl Components {
             .map(|(_, v)| v.as_str())
     }
 
+    /// `getUseAnimation` ([`animation`]).
+    pub fn use_animation(&self) -> i32 {
+        match self.class {
+            Class::Bow => animation::BOW,
+            Class::Crossbow => animation::CROSSBOW,
+            Class::Trident => animation::TRIDENT,
+            Class::Spyglass => animation::SPYGLASS,
+            Class::Instrument => animation::TOOT_HORN,
+            Class::Bundle => animation::BUNDLE,
+            _ if self.is("BrushItem") => animation::BRUSH,
+            _ => match self.consumable {
+                Some(c) => c.animation,
+                None if self.blocks_attacks => animation::BLOCK,
+                None if self.kinetic_weapon => animation::SPEAR,
+                None => animation::NONE,
+            },
+        }
+    }
+
     /// `useOnRelease`: crossbows.
     pub fn use_on_release(&self) -> bool {
         self.class == Class::Crossbow

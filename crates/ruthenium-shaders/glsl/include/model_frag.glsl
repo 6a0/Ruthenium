@@ -23,6 +23,7 @@ layout(location = 2) in vec2 v_uv;
 layout(location = 3) in float v_spherical;
 layout(location = 4) in float v_cylindrical;
 layout(location = 5) flat in uint v_texture;
+layout(location = 6) flat in vec3 v_added;
 layout(location = 0) out vec4 o_color;
 
 void main() {
@@ -37,6 +38,7 @@ void main() {
 #else
     color *= v_front;
 #endif
+    color.rgb += v_added;
     float amount = max(
         fog_amount(v_spherical, pc.fog_environmental),
         fog_amount(v_cylindrical, pc.fog_render_distance));

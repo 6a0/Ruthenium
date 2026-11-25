@@ -595,6 +595,8 @@ pub struct EntityRecord {
     pub baby: bool,
     /// The entity it rides.
     pub vehicle: Option<i32>,
+    /// A player's or mannequin's pose and skin.
+    pub avatar: Option<Box<crate::avatar::AvatarRecord>>,
 }
 
 /// The local player as drawing and the HUD need it.
@@ -1591,6 +1593,7 @@ mod tests {
                         pose: 0,
                         baby: false,
                         vehicle: None,
+                        avatar: None,
                     }));
                 },
             );

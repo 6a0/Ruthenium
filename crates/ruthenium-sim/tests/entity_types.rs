@@ -33,6 +33,21 @@ fn exported_entity_types() {
     let player = by("minecraft:player");
     assert!(player.is("Avatar") && player.is("Player"));
     assert_eq!(player.update_interval, 2);
+    // What an avatar's pose is read from.
+    let mannequin = by("minecraft:mannequin");
+    for t in [player, mannequin] {
+        for field in [
+            "Entity.DATA_SHARED_FLAGS_ID",
+            "Entity.DATA_TICKS_FROZEN",
+            "LivingEntity.DATA_LIVING_ENTITY_FLAGS",
+            "LivingEntity.SLEEPING_POS_ID",
+            "Avatar.DATA_PLAYER_MAIN_HAND",
+            "Avatar.DATA_PLAYER_MODE_CUSTOMISATION",
+        ] {
+            assert!(t.field(field).is_some(), "{}: {field}", t.key);
+        }
+    }
+    assert!(mannequin.is("Avatar") && mannequin.field("Mannequin.DATA_PROFILE").is_some());
 
     let slime = by("minecraft:slime");
     assert!(slime.field("AbstractCubeMob.ID_SIZE").is_some());

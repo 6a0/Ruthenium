@@ -32,8 +32,12 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use ruthenium_data::v26_3::registries::Item;
 use ruthenium_javamath::mth;
 use ruthenium_prepare::exporters::EntityTypeData;
+use ruthenium_protocol::packets::Property;
 use ruthenium_protocol::packets::play::{self, DataValue, PositionPath, VecDelta};
+use ruthenium_protocol::profile::ResolvableProfile;
 
+use crate::avatar::{Avatar, AvatarFields, AvatarRecord, Chest, SkinSource, Swing, TickInput};
+use crate::item::{Items, Stack};
 use crate::player::{
     Attribute, DEG_TO_RAD_F, Env, LocalPlayer, Modifier, Riding, VehicleMove, rotate_y,
 };
@@ -296,6 +300,8 @@ pub struct TypeInfo {
     suffocating_field: Option<u8>,
     /// `TamableAnimal.DATA_FLAGS_ID`.
     tame_flags_field: Option<u8>,
+    /// An avatar's own fields.
+    avatar_fields: AvatarFields,
 }
 
 /// When a saddle counts (`canUseSlot(SADDLE)`).
@@ -541,6 +547,15 @@ impl EntityTypes {
                     .field("Pig.DATA_BOOST_TIME")
                     .or_else(|| d.field("Strider.DATA_BOOST_TIME")),
                 suffocating_field: d.field("Strider.DATA_SUFFOCATING"),
+                avatar_fields: AvatarFields {
+                    shared_flags: d.field("Entity.DATA_SHARED_FLAGS_ID"),
+                    ticks_frozen: d.field("Entity.DATA_TICKS_FROZEN"),
+                    living_flags: d.field("LivingEntity.DATA_LIVING_ENTITY_FLAGS"),
+                    sleeping_pos: d.field("LivingEntity.SLEEPING_POS_ID"),
+                    main_hand: d.field("Avatar.DATA_PLAYER_MAIN_HAND"),
+                    customisation: d.field("Avatar.DATA_PLAYER_MODE_CUSTOMISATION"),
+                    profile: d.field("Mannequin.DATA_PROFILE"),
+                },
                 tame_flags_field: d.field("TamableAnimal.DATA_FLAGS_ID"),
             };
             let i = d.id as usize;
@@ -835,6 +850,8 @@ pub struct Entity {
     pub(crate) suffocating: bool,
     /// `TamableAnimal.isTame`.
     pub(crate) tame: bool,
+    /// How a player or mannequin holds itself.
+    pub(crate) avatar: Option<Box<Avatar>>,
 }
 
 const ATTRIBUTE_SCALE: &str = "minecraft:scale";
@@ -856,7 +873,7 @@ impl Entity {
     fn new(
         p: &play::AddEntity,
         info: &TypeInfo,
-        name: Option<&str>,
+        player: Option<&PlayerInfo>,
         minecart_improvements: bool,
     ) -> Entity {
         let follow = if info.minecart && minecart_improvements {
@@ -913,7 +930,7 @@ impl Entity {
             codec_base: [0.0; 3],
             interpolation,
             no_physics: info.player,
-            scoreboard_name: name.map_or_else(|| uuid_string(p.uuid), str::to_owned),
+            scoreboard_name: player.map_or_else(|| uuid_string(p.uuid), |i| i.name.clone()),
             section: 0,
             info: info.clone(),
             body: (info.ride != RideKind::None).then(|| Box::new(Body::new(info.ride))),
@@ -927,6 +944,7 @@ impl Entity {
             boost_time_total: 0,
             suffocating: false,
             tame: false,
+            avatar: None,
         };
         if let Some(b) = e.body.as_deref_mut() {
             for (name, base) in &info.default_attributes {
@@ -954,6 +972,18 @@ impl Entity {
         }
         e.delta = p.movement;
         e.section = section_key(e.position);
+        e.avatar = info.avatar.then(|| {
+            let skin = match player {
+                Some(i) => SkinSource::Player {
+                    id: p.uuid,
+                    textures: i.textures.clone(),
+                },
+                None => SkinSource::Profile(ResolvableProfile::default()),
+            };
+            let head = mth::unpack_degrees(p.y_head_rot);
+            let rot = (e.y_rot, e.x_rot);
+            Box::new(Avatar::new(info.player, skin, rot, head, p.movement))
+        });
         e
     }
 
@@ -1110,6 +1140,10 @@ impl Entity {
         self.set_x_rot(x);
         self.old_position = p;
         self.set_pos(p);
+        let rot = (self.y_rot, self.x_rot);
+        if let Some(a) = &mut self.avatar {
+            a.set_old_rot(rot.0, rot.1);
+        }
     }
 
     fn current(&self) -> PosRot {
@@ -1302,6 +1336,11 @@ impl Entity {
     /// One field of entity data.
     fn set_data(&mut self, field: u8, value: &DataValue, types: &EntityTypes) {
         let t = &self.info;
+        if let Some(a) = &mut self.avatar
+            && a.set_data(&t.avatar_fields, field, value)
+        {
+            return;
+        }
         if t.living
             && Some(field) == types.health_field
             && let DataValue::Float(h) = value
@@ -1373,6 +1412,21 @@ impl Entity {
     }
 }
 
+/// Whether there is water in a box (`isInWater`, as far as its drawing shows it).
+fn touches_water(env: &Env<'_>, b: &Aabb) -> bool {
+    let b = b.inflate([-0.001; 3]);
+    let range = |i: usize| mth::floor(b.min[i])..mth::ceil(b.max[i]);
+    range(0).any(|x| {
+        range(1).any(|y| {
+            range(2).any(|z| {
+                let p = [x, y, z];
+                let f = env.fluid(p);
+                f.fluid.is_water() && f64::from(y) + f64::from(env.fluid_height(p, f)) > b.min[1]
+            })
+        })
+    })
+}
+
 /// `SectionPos.asLong` of a position's block.
 fn section_key(p: [f64; 3]) -> i64 {
     let (x, y, z) = (
@@ -1396,6 +1450,8 @@ fn section_chunk(key: i64) -> (i32, i32) {
 pub struct Team {
     pub name: String,
     pub collision_rule: i32,
+    /// Its members see those of it who are invisible.
+    pub see_invisible: bool,
 }
 
 /// The scoreboard's teams and who is on which (`Scoreboard`'s team part).
@@ -1420,6 +1476,7 @@ impl Teams {
             self.teams.entry(name.to_owned()).or_insert(Team {
                 name: name.to_owned(),
                 collision_rule: rule::ALWAYS,
+                see_invisible: true,
             });
         } else if !self.teams.contains_key(name) {
             return;
@@ -1428,6 +1485,7 @@ impl Teams {
             && let Some(t) = self.teams.get_mut(name)
         {
             // Unknown ids read as the first rule.
+            t.see_invisible = p.options & 2 != 0;
             t.collision_rule = if (0..=3).contains(&p.collision_rule) {
                 p.collision_rule
             } else {
@@ -1466,6 +1524,8 @@ impl Teams {
 pub struct PlayerInfo {
     pub name: String,
     pub game_mode: i32,
+    /// Its profile's skin.
+    pub textures: Option<Property>,
 }
 
 /// The player list (`ClientPacketListener.playerInfoMap`).
@@ -1483,6 +1543,7 @@ impl PlayerInfos {
                     self.players.entry(e.uuid).or_insert(PlayerInfo {
                         name: name.clone(),
                         game_mode: 0,
+                        textures: e.properties.iter().find(|p| p.name == "textures").cloned(),
                     });
                 }
             }
@@ -1570,6 +1631,8 @@ pub struct Entities {
     /// The items in the local player's hands (`isHolding`): a pig or strider follows
     /// a rider holding its item on a stick.
     local_holding: [i32; 2],
+    /// How many chunks from the player the server ticks.
+    pub simulation_distance: i32,
 }
 
 impl Entities {
@@ -1580,6 +1643,7 @@ impl Entities {
             ticking: vec![local_id],
             local_id: Some(local_id),
             minecart_improvements,
+            simulation_distance: i32::MAX,
             ..Entities::default()
         }
     }
@@ -1750,9 +1814,9 @@ impl Entities {
             );
             return;
         };
-        let name = if info.player {
+        let player = if info.player {
             match players.get(p.uuid) {
-                Some(i) => Some(i.name.as_str()),
+                Some(i) => Some(i),
                 None => {
                     eprintln!(
                         "[entities] the server added player {} before its player info",
@@ -1766,7 +1830,7 @@ impl Entities {
         };
         // `ClientLevel.addEntity`: one with the same id goes first.
         self.remove(p.entity_id);
-        let e = Entity::new(p, info, name, self.minecart_improvements);
+        let e = Entity::new(p, info, player, self.minecart_improvements);
         let (id, section) = (e.id, e.section);
         self.entities.insert(id, e);
         self.sections.entry(section).or_default().push(id);
@@ -2149,11 +2213,120 @@ impl Entities {
     pub fn set_motion(&mut self, id: i32, movement: [f64; 3]) {
         if let Some(e) = self.entities.get_mut(&id) {
             e.delta = movement;
+            if let (Some(a), Follow::Stepped(interval)) = (&mut e.avatar, e.info.follow) {
+                a.lerp_motion(movement, interval);
+            }
             // `AbstractArrow.lerpMotion`: moving again, so out of the ground.
             if matches!(e.info.pickable, Pickable::Arrow { .. }) && length_sqr(movement) > 0.0 {
                 e.in_ground = false;
             }
         }
+    }
+
+    /// The avatar of `id`, if it is one.
+    fn avatar(&mut self, id: i32) -> Option<&mut Avatar> {
+        self.entities.get_mut(&id)?.avatar.as_deref_mut()
+    }
+
+    /// `handleRotateMob`.
+    pub fn rotate_head(&mut self, id: i32, y_head_rot: i8) {
+        if let Some(a) = self.avatar(id) {
+            a.turn_head(mth::unpack_degrees(y_head_rot));
+        }
+    }
+
+    /// `handleDamageEvent`.
+    pub fn damaged(&mut self, id: i32) {
+        if let Some(a) = self.avatar(id) {
+            a.damaged();
+        }
+    }
+
+    /// `handleHurtAnimation`.
+    pub fn hurt(&mut self, id: i32) {
+        if let Some(a) = self.avatar(id) {
+            a.hurt();
+        }
+    }
+
+    /// `handleSwingAnimation`.
+    pub fn swing(&mut self, id: i32, swing: Swing) {
+        if let Some(a) = self.avatar(id) {
+            a.swing(swing);
+        }
+    }
+
+    /// `handleSetEquipment` for what an avatar holds and wears, as far as it shows.
+    pub fn set_worn(
+        &mut self,
+        id: i32,
+        slots: &[(u8, ruthenium_protocol::item::ItemStack)],
+        items: &Items,
+    ) {
+        let Some(a) = self.avatar(id) else {
+            return;
+        };
+        for (slot, stack) in slots {
+            let stack = if stack.count > 0 {
+                items.stack(stack)
+            } else {
+                Stack::empty()
+            };
+            match *slot {
+                play::EQUIPMENT_MAINHAND => a.set_held(false, stack),
+                play::EQUIPMENT_OFFHAND => a.set_held(true, stack),
+                play::EQUIPMENT_CHEST => {
+                    let name = u32::try_from(stack.item()).ok().and_then(Item::from_id);
+                    a.set_chest(match name.map_or("", |i| i.name()) {
+                        "minecraft:elytra" => Chest::Wings,
+                        n if n.ends_with("_chestplate") => Chest::Armour,
+                        _ => Chest::Bare,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// What drawing needs of the avatar `e`, for a viewer who is a spectator or not and
+    /// has this scoreboard name.
+    pub fn avatar_record(
+        &self,
+        e: &Entity,
+        teams: &Teams,
+        spectator: bool,
+        viewer: &str,
+    ) -> Option<Box<AvatarRecord>> {
+        let a = e.avatar.as_deref()?;
+        let scale = e.scale.value() as f32;
+        let eyes = match e.pose {
+            pose::SLEEPING => 0.2,
+            pose::FALL_FLYING | pose::SWIMMING | pose::SPIN_ATTACK => 0.4 * scale,
+            pose::CROUCHING => 1.27 * scale,
+            pose::DYING => 1.62,
+            _ => 1.62 * scale,
+        };
+        let sees = spectator
+            || teams.team_of(&e.scoreboard_name).is_some_and(|t| {
+                t.see_invisible && teams.team_of(viewer).is_some_and(|v| v.name == t.name)
+            });
+        let vehicle = e.vehicle.and_then(|v| self.entities.get(&v));
+        let mut r = a.record();
+        r.hidden = a.is_invisible() && !sees;
+        r.alive = !e.removed && e.health > 0.0;
+        r.upside_down = e.info.player
+            && r.parts & 1 != 0
+            && matches!(e.scoreboard_name.as_str(), "Dinnerbone" | "Grumm");
+        r.age = e.tick_count;
+        r.scale = scale;
+        r.size = [e.size.width, e.size.height];
+        r.eye_height = eyes;
+        r.vehicle_body = vehicle.filter(|v| v.info.living).map(|v| {
+            v.avatar
+                .as_deref()
+                .map_or((v.y_rot, v.y_rot), Avatar::body_rots)
+        });
+        Some(Box::new(r))
     }
 
     /// `handleSetEntityData`.
@@ -2508,6 +2681,9 @@ impl Entities {
                 let target = delta.clamp(-105.0, 105.0);
                 p.set_y_rot(p.y_rot + target - delta);
             }
+            if let Some(a) = &mut p.avatar {
+                a.turned_by_boat(body);
+            }
         }
         self.moved(passenger);
     }
@@ -2627,13 +2803,21 @@ impl Entities {
         };
         // `commonTick`.
         e.old_position = e.position;
+        let rot = (e.y_rot, e.x_rot);
+        if let Some(a) = &mut e.avatar {
+            a.set_old_rot(rot.0, rot.1);
+        }
         e.interpolate(speed, &free);
         e.tick_count += 1;
         if riding {
             e.delta = [0.0; 3];
+            if let Some(a) = &mut e.avatar {
+                a.set_movement([0.0; 3]);
+            }
         }
         self.moved(id);
         self.entity_tick(id, cx, player);
+        self.avatar_tick(id, cx, player, riding);
         // `rideTick`: seated where its vehicle says; a living one's fall forgotten.
         if riding && let Some(vehicle) = self.vehicle_of(id) {
             self.position_rider(vehicle, id, player);
@@ -2665,6 +2849,54 @@ impl Entities {
             if ok && self.ticking.contains(&p) {
                 self.tick_one(p, cx, player, speed, true, tick_player);
             }
+        }
+    }
+
+    /// An avatar's part of its tick: what only its drawing shows.
+    fn avatar_tick(
+        &mut self,
+        id: i32,
+        cx: &TickContext<'_, '_>,
+        player: &LocalPlayer,
+        riding: bool,
+    ) {
+        let simulation_distance = self.simulation_distance;
+        let Some(e) = self.entities.get_mut(&id) else {
+            return;
+        };
+        let interpolating = e.is_interpolating();
+        let spectator = e.is_spectator(cx.players);
+        let Some(a) = &mut e.avatar else {
+            return;
+        };
+        let chunk = |p: [f64; 3], i: usize| mth::floor(p[i]) >> 4;
+        let away = [0, 2]
+            .map(|i| (chunk(e.position, i) - chunk(player.position, i)).abs())
+            .into_iter()
+            .max();
+        let bed = a.sleeping_pos.and_then(|p| {
+            let state = cx.env.state(p);
+            let block = ruthenium_data::v26_3::blocks::BlockState::from_id(state)?.block();
+            block.name().ends_with("_bed").then_some(())?;
+            crate::block::state::get_dir(state, "facing")
+        });
+        a.tick(&TickInput {
+            position: e.position,
+            old_position: e.old_position,
+            y_rot: e.y_rot,
+            x_rot: e.x_rot,
+            pose: e.pose,
+            health: e.health,
+            passenger: riding,
+            interpolating,
+            simulated: away.is_some_and(|d| d <= simulation_distance),
+            in_water: touches_water(cx.env, &e.bounding_box),
+            bed,
+            spectator,
+        });
+        // `isSleeping`.
+        if a.sleeping_pos.is_some() {
+            e.x_rot = 0.0;
         }
     }
 
@@ -3019,7 +3251,7 @@ mod tests {
                 "minecraft:player",
                 &["Player", "Avatar", "LivingEntity", "Entity"],
                 (0.6, 1.8),
-                &[],
+                &[("Entity.DATA_SHARED_FLAGS_ID", 0)],
             ),
         ])
     }
@@ -3150,6 +3382,7 @@ mod tests {
             &[play::PlayerInfoEntry {
                 uuid: 1007,
                 name: Some("Alex".into()),
+                properties: Vec::new(),
                 game_mode: None,
             }],
         );
@@ -3205,6 +3438,7 @@ mod tests {
             &[play::PlayerInfoEntry {
                 uuid: 1007,
                 name: None,
+                properties: Vec::new(),
                 game_mode: Some(play::SPECTATOR),
             }],
         );
@@ -3533,5 +3767,163 @@ mod tests {
         let pig = e.get(8).unwrap();
         assert!(pig.position[2] > 0.5);
         assert_eq!(pig.position[0], 0.5);
+    }
+
+    /// A player in the player list and the level.
+    fn add_player(e: &mut Entities, id: i32, name: &str, position: [f64; 3]) {
+        let mut players = PlayerInfos::default();
+        let uuid = 1000 + id as u128;
+        let textures = Property {
+            name: "textures".into(),
+            value: "e30=".into(),
+            signature: None,
+        };
+        players.update(
+            play::PLAYER_INFO_ADD,
+            &[play::PlayerInfoEntry {
+                uuid,
+                name: Some(name.into()),
+                properties: vec![
+                    Property {
+                        name: "other".into(),
+                        value: "e31=".into(),
+                        signature: None,
+                    },
+                    textures,
+                ],
+                game_mode: None,
+            }],
+        );
+        let p = play::AddEntity {
+            entity_id: id,
+            uuid,
+            entity_type: REMOTE_PLAYER,
+            position,
+            movement: [0.0; 3],
+            x_rot: 0,
+            y_rot: 0,
+            y_head_rot: 64,
+            data: 0,
+        };
+        e.add(&p, &types(), &players);
+    }
+
+    fn record(e: &Entities, id: i32, teams: &Teams, spectator: bool) -> Option<AvatarRecord> {
+        let found = e.get(id).unwrap();
+        e.avatar_record(found, teams, spectator, "Developer")
+            .map(|r| *r)
+    }
+
+    #[test]
+    fn a_players_pose_is_kept_for_drawing() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        e.chunk_loaded(0, 0);
+        add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
+        add(&mut e, 8, ZOMBIE, [8.5, -60.0, 5.5]);
+        let mut player = player_at([0.5, -60.0, 0.5]);
+        let none = Teams::default();
+        assert!(record(&e, 8, &none, false).is_none());
+        let r = record(&e, 9, &none, false).unwrap();
+        let SkinSource::Player { id, textures } = &*r.skin else {
+            panic!("{:?}", r.skin);
+        };
+        assert_eq!(
+            (*id, textures.as_ref().unwrap().value.as_str()),
+            (1009, "e30=")
+        );
+        // It faces the way its head does.
+        assert_eq!((r.head_rot, r.body_rot), ((90.0, 90.0), (90.0, 90.0)));
+        assert!((r.eye_height - 1.62).abs() < 1e-6);
+        e.rotate_head(9, 0);
+        e.damaged(9);
+        e.swing(
+            9,
+            Swing {
+                off_hand: true,
+                kind: 1,
+                duration: 6,
+            },
+        );
+        tick(&mut e, &none, &mut player);
+        let r = record(&e, 9, &none, false).unwrap();
+        assert!(r.hurt && r.swing.is_some_and(|s| s.off_hand));
+        assert!((r.head_rot.1 - 60.0).abs() < 1e-3, "{:?}", r.head_rot);
+        assert_eq!(r.age, 1);
+        // Nothing of the kind for others, and nothing at all for those not there.
+        e.rotate_head(8, 0);
+        e.hurt(77);
+        // Dead, and out of the server's reach: its death waits.
+        e.entities.get_mut(&9).unwrap().health = 0.0;
+        e.simulation_distance = -1;
+        tick(&mut e, &none, &mut player);
+        let r = record(&e, 9, &none, false).unwrap();
+        assert!(!r.alive && r.death_time == 0);
+        e.simulation_distance = 4;
+        tick(&mut e, &none, &mut player);
+        assert_eq!(record(&e, 9, &none, false).unwrap().death_time, 1);
+    }
+
+    #[test]
+    fn what_a_player_holds_and_wears_shows() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
+        let stack = |item: Item| ruthenium_protocol::item::ItemStack {
+            item: item.id() as i32,
+            count: 1,
+            patch: Default::default(),
+        };
+        let items = Items::default();
+        let teams = Teams::default();
+        let wear = |e: &mut Entities, slot, s| {
+            e.set_worn(9, &[(slot, s)], &items);
+            record(e, 9, &teams, false).unwrap()
+        };
+        let r = wear(&mut e, play::EQUIPMENT_OFFHAND, stack(Item::Stone));
+        assert_eq!(
+            (r.left_arm, r.right_arm),
+            (crate::avatar::ArmPose::Item, crate::avatar::ArmPose::Empty)
+        );
+        assert_eq!(
+            wear(&mut e, play::EQUIPMENT_CHEST, stack(Item::IronChestplate)).chest,
+            Chest::Armour
+        );
+        assert_eq!(
+            wear(&mut e, play::EQUIPMENT_CHEST, stack(Item::Elytra)).chest,
+            Chest::Wings
+        );
+        let none = ruthenium_protocol::item::ItemStack {
+            count: 0,
+            ..stack(Item::Elytra)
+        };
+        assert_eq!(wear(&mut e, play::EQUIPMENT_CHEST, none).chest, Chest::Bare);
+    }
+
+    #[test]
+    fn the_invisible_are_seen_by_their_team_and_by_spectators() {
+        let mut e = Entities::new(PLAYER_ID, false);
+        add_player(&mut e, 9, "Kai", [5.5, -60.0, 5.5]);
+        let mut teams = Teams::default();
+        let team = |options| play::TeamParameters {
+            name_tag_visibility: 0,
+            collision_rule: 0,
+            color: None,
+            options,
+        };
+        let kai = ["Kai".to_owned()];
+        teams.apply("red", 0, Some(&team(2)), &kai);
+        assert!(!record(&e, 9, &teams, false).unwrap().hidden);
+        e.set_data(9, &[(0, DataValue::Byte(0x20))], &types());
+        let r = record(&e, 9, &teams, false).unwrap();
+        assert!(r.invisible && r.hidden);
+        assert!(!record(&e, 9, &teams, true).unwrap().hidden);
+        teams.apply("red", 3, None, &["Developer".to_owned()]);
+        assert!(!record(&e, 9, &teams, false).unwrap().hidden);
+        // Not if the team does not see its own.
+        teams.apply("red", 2, Some(&team(1)), &[]);
+        assert!(record(&e, 9, &teams, false).unwrap().hidden);
+        // Another team's.
+        teams.apply("red", 2, Some(&team(2)), &[]);
+        teams.apply("blue", 0, Some(&team(2)), &["Developer".to_owned()]);
+        assert!(record(&e, 9, &teams, false).unwrap().hidden);
     }
 }

@@ -38,12 +38,16 @@ pub enum PipelineId {
     TerrainPlainCutout,
     TerrainPlainTranslucent,
     /// Models made of parts (block entities): without holes; with holes, seen from the
-    /// front; with holes, seen from both sides; and what is blended over a model in the
-    /// plane it lies in (a banner's patterns).
+    /// front; with holes, seen from both sides; what is blended over a model in the
+    /// plane it lies in (a banner's patterns); and what is blended over what is behind it
+    /// (players and their heads), seen from both sides or (the invisible, as those see
+    /// them who do) from the front.
     ModelSolid,
     ModelCutout,
     ModelCutoutFaces,
     ModelPattern,
+    ModelTranslucent,
+    ModelTranslucentFront,
     /// The text on signs, and what surrounds it where it glows.
     SignText,
     SignOutline,
@@ -67,7 +71,7 @@ pub enum PipelineId {
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 34] = [
+    pub const ALL: [PipelineId; 36] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -90,6 +94,8 @@ impl PipelineId {
         PipelineId::ModelCutout,
         PipelineId::ModelCutoutFaces,
         PipelineId::ModelPattern,
+        PipelineId::ModelTranslucent,
+        PipelineId::ModelTranslucentFront,
         PipelineId::SignText,
         PipelineId::SignOutline,
         PipelineId::SkyFlat,
@@ -280,6 +286,20 @@ impl PipelineId {
                 &shaders::MODEL_SOLID_FRAG,
                 Blend::Alpha,
                 Depth::Test,
+                true,
+            ),
+            PipelineId::ModelTranslucent => model(
+                "model_translucent",
+                &shaders::MODEL_CUTOUT_FACES_FRAG,
+                Blend::Alpha,
+                Depth::TestAndWrite,
+                false,
+            ),
+            PipelineId::ModelTranslucentFront => model(
+                "model_translucent_front",
+                &shaders::MODEL_CUTOUT_FRAG,
+                Blend::Alpha,
+                Depth::TestAndWrite,
                 true,
             ),
             PipelineId::SignText => sign("sign_text", &shaders::SIGN_TEXT_VERT, Depth::Decal),

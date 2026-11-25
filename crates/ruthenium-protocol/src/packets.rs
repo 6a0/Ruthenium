@@ -10,6 +10,7 @@ use ruthenium_data::v26_3::packets::{configuration as cfg, login as lg, play as 
 
 use crate::item::ItemStack;
 use crate::nbt::Tag;
+use crate::profile::ResolvableProfile;
 use crate::wire::{self, MAX_STRING, Reader, WireError};
 
 /// The longest player name (`ByteBufCodecs.PLAYER_NAME`).
@@ -22,7 +23,7 @@ pub const MAX_COOKIE: usize = 5120;
 pub const MAX_LOGIN_REASON: usize = 262_144;
 
 /// A game profile property: textures, usually (`ByteBufCodecs.GAME_PROFILE_PROPERTIES`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Property {
     pub name: String,
     pub value: String,
@@ -40,22 +41,7 @@ impl GameProfile {
     fn read(r: &mut Reader<'_>) -> Result<GameProfile, WireError> {
         let id = r.uuid()?;
         let name = r.string(MAX_NAME)?.to_owned();
-        let n = r.count(16)?;
-        let mut properties = Vec::with_capacity(n);
-        for _ in 0..n {
-            let name = r.string(64)?.to_owned();
-            let value = r.string(MAX_STRING)?.to_owned();
-            let signature = if r.bool()? {
-                Some(r.string(1024)?.to_owned())
-            } else {
-                None
-            };
-            properties.push(Property {
-                name,
-                value,
-                signature,
-            });
-        }
+        let properties = Property::read_list(r)?;
         Ok(GameProfile {
             id,
             name,
@@ -888,6 +874,8 @@ pub mod play {
         /// An item stack (possibly empty): a dropped item, a firework, an item frame's
         /// item.
         Item(ItemStack),
+        /// A mannequin's profile.
+        Profile(Box<ResolvableProfile>),
     }
 
     /// The `minecraft:entity_effect` particle type, the one particle the client reads
@@ -896,7 +884,7 @@ pub mod play {
 
     impl DataValue {
         /// The value for serializer `kind`, or `None` for a kind the client can't read
-        /// yet (other particles, inline painting variants, profiles): everything after it
+        /// yet (other particles, inline painting variants): everything after it
         /// is then lost.
         fn read(r: &mut Reader<'_>, kind: i32) -> Result<Option<DataValue>, WireError> {
             let block_pos = |r: &mut Reader<'_>| r.i64().map(unpack_block_pos);
@@ -955,7 +943,8 @@ pub mod play {
                 }
                 39 => DataValue::Vector3([r.f32()?, r.f32()?, r.f32()?]),
                 40 => DataValue::Quaternion([r.f32()?, r.f32()?, r.f32()?, r.f32()?]),
-                // Particles (16) and profiles (41).
+                41 => DataValue::Profile(Box::new(ResolvableProfile::read(r)?)),
+                // Particles (16).
                 _ => return Ok(None),
             };
             Ok(Some(v))
@@ -979,8 +968,9 @@ pub mod play {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct PlayerInfoEntry {
         pub uuid: u128,
-        /// With `ADD_PLAYER`: the profile's name.
+        /// With `ADD_PLAYER`: the profile's name and properties.
         pub name: Option<String>,
+        pub properties: Vec<Property>,
         /// With `UPDATE_GAME_MODE`.
         pub game_mode: Option<i32>,
     }
@@ -999,17 +989,13 @@ pub mod play {
         let mut e = PlayerInfoEntry {
             uuid: r.uuid()?,
             name: None,
+            properties: Vec::new(),
             game_mode: None,
         };
         let has = |bit: u8| actions & 1 << bit != 0;
         if has(0) {
             e.name = Some(r.string(MAX_NAME)?.to_owned());
-            let n = r.count(16)?;
-            for _ in 0..n {
-                r.string(64)?;
-                r.string(MAX_STRING)?;
-                optional(r, |r| r.string(1024).map(|_| ()))?;
-            }
+            e.properties = Property::read_list(r)?;
         }
         if has(1) {
             // The chat session: its id, the key's expiry, the key and its signature.
@@ -1369,6 +1355,31 @@ pub mod play {
         SetEquipment {
             entity_id: i32,
             slots: Vec<(u8, ItemStack)>,
+        },
+        /// `ClientboundSetSimulationDistancePacket`, in chunks.
+        SetSimulationDistance {
+            distance: i32,
+        },
+        /// `ClientboundRotateHeadPacket`: the way an entity's head turns to.
+        RotateHead {
+            entity_id: i32,
+            y_head_rot: i8,
+        },
+        /// `ClientboundDamageEventPacket`: an entity was hurt (what by is not read).
+        DamageEvent {
+            entity_id: i32,
+        },
+        /// `ClientboundHurtAnimationPacket`.
+        HurtAnimation {
+            entity_id: i32,
+        },
+        /// `ClientboundSwingAnimationPacket`: an entity swings a hand. `animation` is
+        /// none (0), a whack (1) or a stab (2).
+        SwingAnimation {
+            entity_id: i32,
+            off_hand: bool,
+            animation: i32,
+            duration: i32,
         },
         /// `ClientboundSetTimePacket`: the level's game time and the world clocks that
         /// changed, each by its id in the `world_clock` registry.
@@ -1859,6 +1870,34 @@ pub mod play {
                     }
                     Clientbound::SetEquipment { entity_id, slots }
                 }
+                C::SetSimulationDistance => Clientbound::SetSimulationDistance {
+                    distance: r.varint()?,
+                },
+                C::RotateHead => Clientbound::RotateHead {
+                    entity_id: r.varint()?,
+                    y_head_rot: r.u8()? as i8,
+                },
+                C::DamageEvent => {
+                    let entity_id = r.varint()?;
+                    // The kind of damage, who and what caused it (one above their ids),
+                    // and where it came from.
+                    for _ in 0..3 {
+                        r.varint()?;
+                    }
+                    optional(&mut r, vec3)?;
+                    Clientbound::DamageEvent { entity_id }
+                }
+                C::HurtAnimation => {
+                    let entity_id = r.varint()?;
+                    r.f32()?;
+                    Clientbound::HurtAnimation { entity_id }
+                }
+                C::SwingAnimation => Clientbound::SwingAnimation {
+                    entity_id: r.varint()?,
+                    off_hand: r.varint()? == 1,
+                    animation: r.varint()?,
+                    duration: r.varint()?,
+                },
                 C::SetTime => {
                     let game_time = r.i64()?;
                     let n = r.count(1024)?;
@@ -2080,6 +2119,7 @@ pub mod play {
     /// `EquipmentSlot` ordinals.
     pub const EQUIPMENT_MAINHAND: u8 = 0;
     pub const EQUIPMENT_OFFHAND: u8 = 1;
+    pub const EQUIPMENT_CHEST: u8 = 4;
     pub const EQUIPMENT_BODY: u8 = 6;
     pub const EQUIPMENT_SADDLE: u8 = 7;
 
@@ -2657,9 +2697,45 @@ mod tests {
                 entries: vec![play::PlayerInfoEntry {
                     uuid: 77,
                     name: Some("Alex".into()),
+                    properties: Vec::new(),
                     game_mode: Some(3),
                 }],
             }
+        );
+    }
+
+    #[test]
+    fn play_reads_how_entities_move_their_parts() {
+        let decode =
+            |kind: pl::Clientbound, b: &[u8]| play::Clientbound::decode(kind.id(), b).unwrap();
+        assert_eq!(
+            decode(pl::Clientbound::RotateHead, &[5, 0xC0]),
+            play::Clientbound::RotateHead {
+                entity_id: 5,
+                y_head_rot: -64
+            }
+        );
+        assert_eq!(
+            decode(pl::Clientbound::SwingAnimation, &[5, 1, 2, 13]),
+            play::Clientbound::SwingAnimation {
+                entity_id: 5,
+                off_hand: true,
+                animation: 2,
+                duration: 13
+            }
+        );
+        let hurt = play::Clientbound::DamageEvent { entity_id: 5 };
+        assert_eq!(decode(pl::Clientbound::DamageEvent, &[5, 1, 8, 0, 0]), hurt);
+        let mut from = vec![5, 1, 0, 0, 1];
+        for c in [1.0, 2.0, 3.0] {
+            wire::write_f64(&mut from, c);
+        }
+        assert_eq!(decode(pl::Clientbound::DamageEvent, &from), hurt);
+        let mut b = vec![5];
+        wire::write_f32(&mut b, 90.0);
+        assert_eq!(
+            decode(pl::Clientbound::HurtAnimation, &b),
+            play::Clientbound::HurtAnimation { entity_id: 5 }
         );
     }
 

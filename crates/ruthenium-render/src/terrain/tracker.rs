@@ -268,6 +268,11 @@ impl<M> Tracker<M> {
             .and_then(|e| e.first_at)
     }
 
+    /// Since when the section has had a mesh, whether or not it is reached now.
+    pub fn meshed_since(&self, key: SectionKey) -> Option<Instant> {
+        self.sections.get(&key).and_then(|e| e.first_at)
+    }
+
     /// Whether the section is of a loaded chunk.
     pub fn tracks(&self, key: SectionKey) -> bool {
         self.sections.contains_key(&key)
