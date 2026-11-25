@@ -155,6 +155,8 @@ pub struct Dims {
     /// A flat world, as the server says: where the horizon is and how soon the void
     /// darkens depend on it.
     pub flat: bool,
+    /// The level's sea level: the snow line is 17 blocks above it.
+    pub sea_level: i32,
 }
 
 impl Dims {
@@ -165,6 +167,7 @@ impl Dims {
             has_skylight: level.has_skylight(),
             biome_seed: level.biomes.seed,
             flat: level.flat,
+            sea_level: level.biomes.sea_level,
         }
     }
 }

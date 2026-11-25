@@ -56,6 +56,9 @@ pub(crate) struct Options {
     /// With a picture: vanilla draws its clouds (`fast` or `fancy`) where they are at
     /// this game time.
     pub clouds: Option<(String, i64)>,
+    /// With a picture: vanilla scrolls rain and snow to this game time and makes no
+    /// splashes.
+    pub weather_time: Option<i64>,
     pub render_distance: u32,
     pub gpu: Gpu,
 }
@@ -78,6 +81,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         hud: false,
         player_list: false,
         clouds: None,
+        weather_time: None,
         render_distance: 12,
         gpu: Gpu::Auto,
     };
@@ -284,6 +288,9 @@ pub(crate) fn launch(
     if let Some((mode, time)) = &o.clouds {
         jvm_args.push(format!("-Druthenium.bench.clouds={mode}"));
         jvm_args.push(format!("-Druthenium.bench.cloudTime={time}"));
+    }
+    if let Some(time) = o.weather_time {
+        jvm_args.push(format!("-Druthenium.bench.weatherTime={time}"));
     }
     if let Some((address, route)) = &run.dedicated {
         let route = std::path::absolute(route).map_err(|e| e.to_string())?;

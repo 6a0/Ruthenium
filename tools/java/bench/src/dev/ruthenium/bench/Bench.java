@@ -164,6 +164,12 @@ public final class Bench {
             if (mc.options.fovEffectScale().get() != 0.0) {
                 mc.options.fovEffectScale().set(0.0);
             }
+            // Rain and snow at a fixed time (WeatherEffectRendererMixin), without the
+            // splashes Ruthenium has no particles for.
+            if (System.getProperty("ruthenium.bench.weatherTime") != null
+                    && mc.options.particles().get() != net.minecraft.server.level.ParticleStatus.MINIMAL) {
+                mc.options.particles().set(net.minecraft.server.level.ParticleStatus.MINIMAL);
+            }
             // Clouds only where asked for, at a fixed time (CloudRendererMixin).
             String clouds = System.getProperty("ruthenium.bench.clouds", "off");
             net.minecraft.client.CloudStatus status = switch (clouds) {

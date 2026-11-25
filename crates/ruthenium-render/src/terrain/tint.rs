@@ -375,6 +375,7 @@ pub(crate) mod tests {
             temperature,
             downfall,
             has_precipitation: true,
+            frozen: false,
             attributes: Value::Null,
             effects,
         }

@@ -72,6 +72,8 @@ pub struct BiomeLook {
     /// It rains or snows there (`has_precipitation`; yes where the definition does not
     /// say).
     pub has_precipitation: bool,
+    /// `temperature_modifier: frozen`: warmer patches by noise (frozen oceans).
+    pub frozen: bool,
     /// Its environment attribute overrides (`attributes`).
     pub attributes: Value,
     /// Its special effects (`effects`: water, grass and foliage colours, the grass
@@ -170,6 +172,7 @@ impl Environment {
                     temperature: number("temperature"),
                     downfall: number("downfall"),
                     has_precipitation: d.get("has_precipitation").and_then(truthy).unwrap_or(true),
+                    frozen: d.get("temperature_modifier").and_then(Value::as_str) == Some("frozen"),
                     attributes: d.get("attributes").cloned().unwrap_or(Value::Null),
                     effects: d.get("effects").cloned().unwrap_or(Value::Null),
                 }

@@ -451,8 +451,51 @@ pub const CRACK: Record = Record {
     ],
 };
 
+/// One column of rain or snow around the camera.
+pub const WEATHER: Record = Record {
+    name: "weather",
+    doc: "One column of falling rain or snow: record number gl_InstanceIndex from the offset in push constants.",
+    fields: &[
+        Field {
+            name: "start",
+            ty: Ty::Vec2,
+            doc: "The quad's first side, x and z in blocks relative to the camera.",
+        },
+        Field {
+            name: "end",
+            ty: Ty::Vec2,
+            doc: "Its other side.",
+        },
+        Field {
+            name: "y",
+            ty: Ty::Vec2,
+            doc: "Its bottom and top, in blocks relative to the camera.",
+        },
+        Field {
+            name: "u",
+            ty: Ty::Vec2,
+            doc: "Where the picture is read across, at the first side and the other (it repeats).",
+        },
+        Field {
+            name: "v",
+            ty: Ty::Vec2,
+            doc: "Where it is read down, at the top and the bottom.",
+        },
+        Field {
+            name: "alpha",
+            ty: Ty::Uint,
+            doc: "How much of it shows, 0 to 255.",
+        },
+        Field {
+            name: "light",
+            ty: Ty::Uint,
+            doc: "Block light in the low half and sky light in the high one, each 0 to 240.",
+        },
+    ],
+};
+
 /// Every record `world.glsl` has accessors for.
-pub const RECORDS: [&Record; 11] = [
+pub const RECORDS: [&Record; 12] = [
     &WORLD,
     &WORLD_MATRIX,
     &SECTION,
@@ -464,6 +507,7 @@ pub const RECORDS: [&Record; 11] = [
     &GLINT,
     &LINE,
     &CRACK,
+    &WEATHER,
 ];
 
 /// The text of `glsl/include/world.glsl`.

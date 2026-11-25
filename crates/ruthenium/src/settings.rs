@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use ruthenium_render::clouds::CloudMode;
+use ruthenium_render::weather;
 use ruthenium_sim::input::MouseOptions;
 use ruthenium_ui::hud::AttackIndicator;
 use ruthenium_ui::modern::{ControlSpec, SectionSpec, SettingSpec};
@@ -92,6 +93,8 @@ pub struct GameOptions {
     /// Clouds: off, flat or with sides; and how far out, in chunks.
     pub clouds: CloudMode,
     pub cloud_distance: u32,
+    /// How far from the camera rain and snow fall, in blocks.
+    pub weather_radius: u32,
 }
 
 impl Default for GameOptions {
@@ -107,6 +110,7 @@ impl Default for GameOptions {
             fov_effects: 100,
             clouds: CloudMode::Fancy,
             cloud_distance: CLOUD_DISTANCE_MAX,
+            weather_radius: weather::MAX_RADIUS,
         }
     }
 }
@@ -190,6 +194,7 @@ pub enum Row {
     FovEffects,
     Clouds,
     CloudDistance,
+    WeatherRadius,
 }
 
 /// A titled group of rows.
@@ -217,6 +222,7 @@ pub const GAME: [Group; 9] = [
             Row::EntityShadows,
             Row::Clouds,
             Row::CloudDistance,
+            Row::WeatherRadius,
             Row::Vignette,
         ],
     ),
@@ -323,6 +329,11 @@ impl Settings {
                 "cloud_distance",
                 CLOUD_DISTANCE_MIN..=CLOUD_DISTANCE_MAX,
                 g.cloud_distance,
+            ),
+            weather_radius: number(
+                "weather_radius",
+                weather::MIN_RADIUS..=weather::MAX_RADIUS,
+                g.weather_radius,
             ),
         };
         Ok(Settings {
@@ -454,6 +465,15 @@ impl Settings {
                         .collect(),
                 ),
             ),
+            Row::WeatherRadius => (
+                "Weather Radius",
+                "How far around you rain and snow fall",
+                Slider(
+                    (weather::MIN_RADIUS..=weather::MAX_RADIUS)
+                        .map(|b| format!("{b} blocks"))
+                        .collect(),
+                ),
+            ),
             Row::FovEffects => (
                 "FOV Effects",
                 "How far speed and fluids change the view",
@@ -505,6 +525,10 @@ impl Settings {
                 .cloud_distance
                 .clamp(CLOUD_DISTANCE_MIN, CLOUD_DISTANCE_MAX)
                 .abs_diff(CLOUD_DISTANCE_MIN) as usize,
+            Row::WeatherRadius => g
+                .weather_radius
+                .clamp(weather::MIN_RADIUS, weather::MAX_RADIUS)
+                .abs_diff(weather::MIN_RADIUS) as usize,
         }
     }
 
@@ -550,6 +574,9 @@ impl Settings {
             }
             Row::CloudDistance => {
                 g.cloud_distance = (CLOUD_DISTANCE_MIN + value as u32).min(CLOUD_DISTANCE_MAX);
+            }
+            Row::WeatherRadius => {
+                g.weather_radius = (weather::MIN_RADIUS + value as u32).min(weather::MAX_RADIUS);
             }
         }
     }
@@ -601,7 +628,9 @@ impl Settings {
              fov_effects = {}\n\
              # \"off\", \"fast\" or \"fancy\"; {CLOUD_DISTANCE_MIN} to {CLOUD_DISTANCE_MAX} chunks.\n\
              clouds = \"{}\"\n\
-             cloud_distance = {}\n",
+             cloud_distance = {}\n\
+             # {} to {} blocks.\n\
+             weather_radius = {}\n",
             self.vsync,
             self.fullscreen,
             self.frame_stats,
@@ -620,6 +649,9 @@ impl Settings {
             self.game.fov_effects,
             CLOUDS[self.get(Row::Clouds)].1,
             self.game.cloud_distance,
+            weather::MIN_RADIUS,
+            weather::MAX_RADIUS,
+            self.game.weather_radius,
         )
     }
 }
@@ -775,6 +807,7 @@ mod tests {
                 fov_effects: 0,
                 clouds: CloudMode::Fast,
                 cloud_distance: 12,
+                weather_radius: 5,
             },
         };
         assert_eq!(Settings::parse(&s.to_toml()), Ok(s.clone()));
@@ -838,7 +871,7 @@ vsync = true
         // Out of range in the file.
         let s = Settings::parse(
             "[game]\nfov = 111\ngui_scale = -1\nvignette = 3\nattack_indicator = \"x\"\n\
-             damage_tilt = 101\nfov_effects = \"all\"\nclouds = true\ncloud_distance = 129\n",
+             damage_tilt = 101\nfov_effects = \"all\"\nclouds = true\ncloud_distance = 129\nweather_radius = 2\n",
         )
         .unwrap();
         assert_eq!(s.game, GameOptions::default());

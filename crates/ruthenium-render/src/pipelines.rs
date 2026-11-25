@@ -76,6 +76,8 @@ pub enum PipelineId {
     /// squares seen from both sides.
     CloudsFancy,
     CloudsFast,
+    /// Rain and snow, blended over the world, seen from both sides.
+    Weather,
     /// The four pipelines that also draw over the world, built for a pass with a depth
     /// attachment (which they neither test nor write).
     WorldGui,
@@ -92,7 +94,7 @@ pub enum PipelineId {
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 46] = [
+    pub const ALL: [PipelineId; 47] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -132,6 +134,7 @@ impl PipelineId {
         PipelineId::SkyGlowBehind,
         PipelineId::CloudsFancy,
         PipelineId::CloudsFast,
+        PipelineId::Weather,
         PipelineId::WorldGui,
         PipelineId::WorldShape,
         PipelineId::WorldText,
@@ -395,6 +398,17 @@ impl PipelineId {
             PipelineId::SkyGlowBehind => sky("sky_glow_behind", Blend::Glow, Depth::Test),
             PipelineId::CloudsFancy => clouds("clouds_fancy", true),
             PipelineId::CloudsFast => clouds("clouds_fast", false),
+            // Tested against the world's depth, not written, as vanilla's.
+            PipelineId::Weather => GraphicsDesc {
+                name: "weather",
+                vertex: shaders::WEATHER_VERT.words(),
+                fragment: shaders::WEATHER_FRAG.words(),
+                topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+                blend: Blend::Alpha,
+                vertex_input: None,
+                depth: Depth::Test,
+                cull_back: false,
+            },
             // Handled above.
             PipelineId::TerrainNearest
             | PipelineId::TerrainNearestCutout

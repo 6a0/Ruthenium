@@ -206,6 +206,9 @@ pub struct Options {
     pub cloud_time: Option<i64>,
     /// The Cloud Distance option for the run, in chunks.
     pub cloud_distance: Option<u32>,
+    /// Whether rain and snow are drawn (the default), and a game time to scroll them to.
+    pub weather: Option<bool>,
+    pub weather_time: Option<i64>,
 }
 
 impl Options {
@@ -282,6 +285,8 @@ impl Options {
             clouds: None,
             cloud_time: None,
             cloud_distance: None,
+            weather: None,
+            weather_time: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -475,7 +480,7 @@ impl Options {
                 "--fog" | "--light-flicker" | "--translucent" | "--animations"
                 | "--fov-effects" | "--block-entities" | "--players" | "--entity-shadows"
                 | "--hand" | "--block-outline" | "--view-bobbing" | "--crosshair" | "--hud"
-                | "--vignette" | "--player-list" => {
+                | "--vignette" | "--player-list" | "--weather" => {
                     let on = match value("on or off")?.as_str() {
                         "on" => true,
                         "off" => false,
@@ -496,6 +501,7 @@ impl Options {
                         "--hud" => o.hud = Some(on),
                         "--vignette" => o.vignette = Some(on),
                         "--player-list" => o.player_list = Some(on),
+                        "--weather" => o.weather = Some(on),
                         _ => o.translucent = Some(on),
                     }
                 }
@@ -525,6 +531,15 @@ impl Options {
                             .ok()
                             .filter(|c| (2..=128).contains(c))
                             .ok_or(format!("--cloud-distance: not 2 to 128 chunks: {v}"))?,
+                    );
+                }
+                "--weather-time" => {
+                    let v = value("game ticks")?;
+                    o.weather_time = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|t| *t >= 0)
+                            .ok_or(format!("--weather-time: not a game time in ticks: {v}"))?,
                     );
                 }
                 "--cloud-time" => {
@@ -617,6 +632,7 @@ fn apply_game_options(renderer: &mut Renderer, game: &crate::settings::GameOptio
         mode: game.clouds,
         range: game.cloud_distance,
     });
+    renderer.set_weather_radius(game.weather_radius);
     renderer.set_view_options(ruthenium_render::ViewOptions {
         bobbing: game.view_bobbing,
         damage_tilt: game.damage_tilt as f32 / 100.0,
@@ -854,6 +870,10 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         renderer.set_sky_order(order);
     }
     renderer.set_cloud_time(opts.cloud_time);
+    if let Some(on) = opts.weather {
+        renderer.set_weather(on);
+    }
+    renderer.set_weather_time(opts.weather_time);
     if let Some(on) = opts.translucent {
         renderer.set_translucent(on);
     }

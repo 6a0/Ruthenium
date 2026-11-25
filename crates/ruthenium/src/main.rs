@@ -158,6 +158,9 @@ With no command, opens the game window. Options:
                          Effects at 100% or at 0%
   --clouds <off|fast|fancy>
                          the clouds, as vanilla's Clouds option (fancy, the default)
+  --weather <on|off>     whether rain and snow are drawn (on, the default)
+  --weather-time <ticks> scroll rain and snow to that game time, for a picture to hold
+                         against another client's
   --cloud-distance <chunks>
                          how far out clouds are drawn, 2 to 128 (128, the default),
                          as vanilla's Cloud Distance

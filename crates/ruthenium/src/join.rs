@@ -281,8 +281,10 @@ const DRY_FOLIAGE_MAP: &str = "textures/colormap/dry_foliage.png";
 const SUN: &str = "textures/environment/celestial/sun.png";
 const MOON_DIR: &str = "textures/environment/celestial/moon/";
 const END_SKY: &str = "textures/environment/end_sky.png";
-/// The clouds' cells.
+/// The clouds' cells, and the pictures of rain and snow.
 const CLOUDS: &str = "textures/environment/clouds.png";
+const RAIN: &str = "textures/environment/rain.png";
+const SNOW: &str = "textures/environment/snow.png";
 /// What darkens the corners of the frame in the dark.
 const VIGNETTE: &str = "textures/misc/vignette.png";
 /// What is before a player's eyes in water.
@@ -447,6 +449,8 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         colour_maps,
         sky,
         clouds: sky_image(CLOUDS),
+        rain: sky_image(RAIN),
+        snow: sky_image(SNOW),
         block_entities,
         cracks,
         gui,

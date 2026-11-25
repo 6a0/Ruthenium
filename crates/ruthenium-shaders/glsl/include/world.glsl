@@ -293,3 +293,41 @@ vec2 crack_uv_c(uint at) {
 vec2 crack_uv_d(uint at) {
     return vec2(uintBitsToFloat(frame_words[at + 18u]), uintBitsToFloat(frame_words[at + 19u]));
 }
+
+// One column of falling rain or snow: record number gl_InstanceIndex from the offset in push constants.
+#define WEATHER_WORDS 12u
+
+// The quad's first side, x and z in blocks relative to the camera.
+vec2 weather_start(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 0u]), uintBitsToFloat(frame_words[at + 1u]));
+}
+
+// Its other side.
+vec2 weather_end(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 2u]), uintBitsToFloat(frame_words[at + 3u]));
+}
+
+// Its bottom and top, in blocks relative to the camera.
+vec2 weather_y(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 4u]), uintBitsToFloat(frame_words[at + 5u]));
+}
+
+// Where the picture is read across, at the first side and the other (it repeats).
+vec2 weather_u(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 6u]), uintBitsToFloat(frame_words[at + 7u]));
+}
+
+// Where it is read down, at the top and the bottom.
+vec2 weather_v(uint at) {
+    return vec2(uintBitsToFloat(frame_words[at + 8u]), uintBitsToFloat(frame_words[at + 9u]));
+}
+
+// How much of it shows, 0 to 255.
+uint weather_alpha(uint at) {
+    return frame_words[at + 10u];
+}
+
+// Block light in the low half and sky light in the high one, each 0 to 240.
+uint weather_light(uint at) {
+    return frame_words[at + 11u];
+}

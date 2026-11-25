@@ -42,7 +42,7 @@ use crate::gpu::Gpu;
 use crate::routes::{self, Checked, Route};
 use crate::server::{self, Server};
 
-const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--hand-picture] [--hud-picture] [--at <x,y,z[,yaw,pitch]>] [--setup <console command>]... [--tick <command>]... [--player-list] [--clouds <fast|fancy>[@<game time>]] [--time <ticks of the day>] [--keep-worlds]";
+const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--hand-picture] [--hud-picture] [--at <x,y,z[,yaw,pitch]>] [--setup <console command>]... [--tick <command>]... [--player-list] [--clouds <fast|fancy>[@<game time>]] [--weather-time <game time>] [--time <ticks of the day>] [--keep-worlds]";
 /// The view and simulation distance of the server and the render distance of the
 /// clients, as in the integrated-server scenes.
 const VIEW_DISTANCE: i32 = 12;
@@ -115,6 +115,9 @@ struct Options {
     /// With the pictures: both clients draw clouds (`fast` or `fancy`) where they are at
     /// this game time, instead of none.
     clouds: Option<(String, i64)>,
+    /// With the pictures: both clients scroll rain and snow to this game time, and
+    /// vanilla's rain makes no splashes.
+    weather_time: Option<i64>,
     keep_worlds: bool,
     accept_eula: bool,
 }
@@ -154,6 +157,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         at: None,
         setup: Vec::new(),
         clouds: None,
+        weather_time: None,
         keep_worlds: false,
         accept_eula: false,
     };
@@ -248,6 +252,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
                         o.at = Some(([n[0], n[1], n[2]], yaw, pitch));
                     }
                     "--setup" => o.setup.push(value.clone()),
+                    "--weather-time" => o.weather_time = Some(num(value)? as i64),
                     "--clouds" => {
                         let (mode, time) = value.split_once('@').unwrap_or((value, "0"));
                         if !matches!(mode, "fast" | "fancy") {
@@ -715,6 +720,9 @@ impl Harness<'_> {
         if self.o.bare {
             command.args(["--hand", "off", "--block-outline", "off"]);
         }
+        if let Some(time) = self.o.weather_time {
+            command.args(["--weather-time", &time.to_string()]);
+        }
         // The clouds as vanilla's options file has them, or at a fixed time for a
         // picture, or none in a picture without them (vanilla's are switched off then).
         command.args(["--cloud-distance", "64"]);
@@ -1157,6 +1165,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         hud: o.hud,
         player_list: o.player_list,
         clouds: o.clouds.clone(),
+        weather_time: o.weather_time,
         render_distance: VIEW_DISTANCE as u32,
         gpu: o.gpu,
     };

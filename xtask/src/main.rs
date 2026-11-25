@@ -70,7 +70,8 @@ tasks:
         [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]...
         [--results <folder>] [--compare <folder>] [--timeout S] [--width W]
         [--height H] [--any-drawable] [--screenshot] [--bare-picture | --hand-picture | --hud-picture]
-        [--clouds <fast|fancy>[@<game time>]] [--time <ticks of the day>] [--keep-worlds]
+        [--clouds <fast|fancy>[@<game time>]] [--weather-time <game time>]
+        [--time <ticks of the day>] [--keep-worlds]
       The world scenes on a vanilla 26.3 dedicated server (a server.jar you
       supply, by default reference/26.3/jars/server.jar), started per trial on a
       fresh copy of the benchmark world, in offline mode on 127.0.0.1, and stopped

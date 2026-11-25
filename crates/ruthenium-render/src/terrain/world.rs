@@ -310,6 +310,9 @@ pub struct WorldAssets {
     pub sky: crate::sky::SkyImages,
     /// The clouds picture (`textures/environment/clouds.png`): one cell a texel.
     pub clouds: Option<crate::sky::SkyImage>,
+    /// Rain's and snow's pictures (`textures/environment/rain.png`, `snow.png`).
+    pub rain: Option<crate::sky::SkyImage>,
+    pub snow: Option<crate::sky::SkyImage>,
     /// What block entities are drawn from; without it they are not drawn.
     pub block_entities: Option<crate::block_entity::renderer::BlockEntityAssets>,
     /// The cracks in a block being broken: its ten stages' pictures in order

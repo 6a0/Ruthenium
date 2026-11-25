@@ -25,6 +25,9 @@ mod table_check;
 pub mod terrain;
 mod terrain_check;
 mod terrain_vertex;
+pub mod weather;
+#[cfg(test)]
+mod weather_golden;
 
 pub use atmosphere::{AtmosphereOptions, Fog, FogInputs, Medium, fog, rain_fog_target};
 pub use backdrop::Veil;
@@ -71,6 +74,7 @@ use ruthenium_ui::Quad;
 use sky::{Sky, SkyRenderer};
 use terrain::View;
 use terrain::world::WorldRenderer;
+use weather::WeatherRenderer;
 
 /// Creates the Vulkan instance, the window's surface and the device.
 ///
@@ -208,6 +212,7 @@ struct Overhead<'a> {
     clouds: Option<&'a mut CloudRenderer>,
     cloud_fog_end: f32,
     frame: u64,
+    weather: Option<&'a mut WeatherRenderer>,
 }
 
 /// Draws the world and its sky into `pass`, which has a depth attachment, in the order
@@ -283,7 +288,8 @@ unsafe fn draw_world(
         // SAFETY: the caller's; `draw` has run for this frame just above.
         unsafe { models.draw_over(pass) };
     }
-    // Then the clouds, as vanilla draws them after the translucent terrain.
+    // Then the clouds and the weather, as vanilla draws them after the translucent
+    // terrain.
     if let Some(clouds) = overhead.clouds {
         // SAFETY: the caller's.
         unsafe {
@@ -293,6 +299,21 @@ unsafe fn draw_world(
                 view,
                 overhead.cloud_fog_end,
                 overhead.frame,
+            )
+        };
+    }
+    if let (Some(weather), Some((lightmap, _))) = (overhead.weather, world.shared())
+        && let Some((world_record, matrix)) =
+            terrain::world::write_world(frame_data, view, [1.0, 1.0], lightmap)
+    {
+        // SAFETY: the caller's; the records were written just above.
+        unsafe {
+            weather.draw(
+                pass,
+                frame_data,
+                (matrix, world_record),
+                textures,
+                &look.fog,
             )
         };
     }
@@ -451,6 +472,13 @@ pub struct Renderer {
     clouds: Option<CloudRenderer>,
     cloud_options: CloudOptions,
     cloud_time: Option<i64>,
+    /// Rain and snow, once the world's assets are loaded; whether they are drawn, and
+    /// the Weather Radius option.
+    weather: Option<WeatherRenderer>,
+    show_weather: bool,
+    weather_radius: u32,
+    /// A game time to scroll rain and snow to instead of the level's (for pictures).
+    weather_time: Option<i64>,
     /// The block entities' models and pictures, with them; and whether they are drawn.
     block_entities: Option<BlockEntityRenderer>,
     show_block_entities: bool,
@@ -579,6 +607,10 @@ impl Renderer {
             clouds: None,
             cloud_options: CloudOptions::default(),
             cloud_time: None,
+            weather: None,
+            show_weather: true,
+            weather_radius: weather::MAX_RADIUS,
+            weather_time: None,
             block_entities: None,
             show_block_entities: true,
             show_players: true,
@@ -639,6 +671,19 @@ impl Renderer {
                         .inspect_err(|e| eprintln!("[render] no clouds: {e}"))
                         .ok()
                 });
+            let mut picture = |image: &Option<SkyImage>| {
+                let i = image.as_ref()?;
+                self.textures
+                    .create_with(
+                        &mut self.uploads,
+                        TextureDesc::rgba8(i.width, i.height),
+                        &[&i.rgba],
+                        Arrival::NextFrame,
+                    )
+                    .ok()
+            };
+            let (rain, snow) = (picture(&assets.rain), picture(&assets.snow));
+            self.weather = Some(WeatherRenderer::new(rain, snow));
             self.block_entities = assets.block_entities.take().and_then(|models| {
                 BlockEntityRenderer::new(&gpu, &mut self.textures, &mut self.uploads, models)
                     .inspect_err(|e| eprintln!("[render] no block entities: {e}"))
@@ -709,6 +754,27 @@ impl Renderer {
 
     pub fn clouds(&self) -> CloudOptions {
         self.cloud_options
+    }
+
+    /// Whether rain and snow are drawn (they are unless said otherwise).
+    pub fn set_weather(&mut self, on: bool) {
+        self.show_weather = on;
+    }
+
+    pub fn weather(&self) -> bool {
+        self.show_weather
+    }
+
+    /// Scrolls rain and snow to the game time `ticks` (and no part of a tick) instead of
+    /// the level's: two clients then draw them alike.
+    pub fn set_weather_time(&mut self, ticks: Option<i64>) {
+        self.weather_time = ticks;
+    }
+
+    /// The Weather Radius option: how far from the camera rain and snow fall, in blocks
+    /// (3 to 10).
+    pub fn set_weather_radius(&mut self, blocks: u32) {
+        self.weather_radius = blocks.clamp(weather::MIN_RADIUS, weather::MAX_RADIUS);
     }
 
     /// Draws the clouds at the game time `ticks` (and no part of a tick) instead of the
@@ -1369,6 +1435,21 @@ impl Renderer {
                         partial,
                     );
                 }
+                if let Some(weather) = &mut self.weather {
+                    let (game_time, partial) = self
+                        .weather_time
+                        .map_or((w.frame.game_time, w.partial_tick), |t| (t, 0.0));
+                    let moment = weather::Moment {
+                        camera: camera.position,
+                        radius: self.weather_radius as i32,
+                        intensity: if self.show_weather { w.frame.rain } else { 0.0 },
+                        game_time,
+                        partial,
+                    };
+                    let (environment, stamp) = (&w.frame.environment, w.frame.terrain_stamp);
+                    w.scene
+                        .with_terrain(|t| weather.prepare(t, environment, stamp, moment));
+                }
                 renderer.set_environment(&w.frame.environment);
                 renderer.animate(w.frame, &mut self.textures, &mut self.uploads);
                 renderer.update(
@@ -1601,6 +1682,7 @@ impl Renderer {
                                     clouds: self.clouds.as_mut(),
                                     cloud_fog_end: seen.look.cloud_fog_end,
                                     frame: number,
+                                    weather: self.weather.as_mut(),
                                 },
                             );
                             // The HUD stays under a menu, and is blurred with the world.
@@ -1769,6 +1851,7 @@ impl Renderer {
                                 clouds: self.clouds.as_mut(),
                                 cloud_fog_end: seen.look.cloud_fog_end,
                                 frame: number,
+                                weather: self.weather.as_mut(),
                             },
                         );
                         // The HUD, over the world and the hands.

@@ -451,6 +451,22 @@ From the working tree on top of `c21bc81`, 2026-11-25, with the 26.3 Vulkan clie
 - **When lists are made:** only when the camera's cell, its place below, inside or above the layer, or the options change, as vanilla's rule; a worker thread makes them (1.5 ms at the largest distance in a release build), and until a new list has arrived the old one is drawn from its own cell.
 - **Not there:** the Improved Transparency (order-independent) path; clouds through the darkness and blindness fogs and the boss bar's fog, which the rest of the world does not have either.
 
+## Rain and snow
+
+From the working tree on top of `b4653da`, 2026-11-25, same machine and pictures (1920 × 1080). `--weather-time <ticks>` has both clients scroll their rain and snow to where they are at that game time and no part of a tick (vanilla's bench mod fixes the time `WeatherEffectRenderer` gives its columns), and turns vanilla's particles to Minimal, so that its rain makes no splashes: Ruthenium has no particles yet. The rain is the server's (`--setup 'weather rain'`, ten seconds of warm-up for the level to reach 1). Both clients' PNGs are under `cache/bench/results/weather-2026-11-25-rtx4060`.
+
+| View (`--at`) | Equal | Within one step |
+|---|---:|---:|
+| Rain over the shore (`4.5,74,2.5,30,15`) | 77.37% | 95.94%; the rest is the sea's animated water and two cows |
+| Rain over land (`4.5,74,2.5,-40,10`) | 87.76% | 99.58%; the rest is animals and a pond |
+| Snow there, the biome made snowy plains with `fillbiome` | 87.91% | 99.63%; the same |
+
+Every streak and flake is where vanilla's is; the pixels one step apart are where columns overlap and blending rounds.
+
+- **Checked by rule:** which columns fall and how, against the game's own `WeatherEffectRenderer` run headless (its `extractRenderState` over a made-up level, then `prepareInstances`): 2000 cases of camera places, radii 3 to 10, rain levels, game times past the wrap of 131072 ticks, partial ticks, heights, rain, snow or nothing, and light: the number of rain and snow columns and a hash of every vertex (place, picture coordinates, colour, light) agree.
+- **When columns are gathered:** only when the camera enters another block, the level changes or the radius does; each frame only scrolls and places them (at most 440 records of 12 words).
+- **Not there:** rain's splashes and smoke on lava (no particles yet), its sound, lightning and the sky's flash; a block's own light at a column's foot (the light engine's is used: the same wherever the light is in place); the Improved Transparency path.
+
 ## Where a frame's time goes
 
 Medians of the runs' medians, in milliseconds, at the default options. Work is the main thread's own: events, the game's frame, the GUI, recording and submitting. The governor is the wait for the GPU to finish the frame before, which is what one frame ahead removes.
@@ -572,6 +588,10 @@ cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium \
 cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium \
     --variant 'ruthenium=--light-flicker off --fov-effects off' --scene idle --reps 1 --warmup 5 --duration 10 \
     --bare-picture --clouds fancy@1000 --at 4.5,110,2.5,0,-40
+# Rain at a fixed game time, without vanilla's splashes
+cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium \
+    --variant 'ruthenium=--light-flicker off --fov-effects off' --scene idle --reps 1 --warmup 10 --duration 10 \
+    --bare-picture --setup 'weather rain' --weather-time 5000 --at 4.5,74,2.5,-40,10
 # One frame of each client, vanilla's without HUD, hand, vignette and clouds (its PNG is
 # cache/bench/game/screenshots/ruthenium-bench-idle.png, Ruthenium's in the results folder)
 cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium --variant 'ruthenium=--light-flicker off' \

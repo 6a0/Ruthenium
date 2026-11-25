@@ -127,6 +127,12 @@ pub static TEXT_FRAG: Spirv = crate::spirv!("text.frag");
 /// `glsl/text.vert`
 pub static TEXT_VERT: Spirv = crate::spirv!("text.vert");
 
+/// `glsl/weather.frag`
+pub static WEATHER_FRAG: Spirv = crate::spirv!("weather.frag");
+
+/// `glsl/weather.vert`
+pub static WEATHER_VERT: Spirv = crate::spirv!("weather.vert");
+
 /// Every shader, in file-name order.
 pub static ALL: &[&Spirv] = &[
     &BACKGROUND_FRAG,
@@ -169,4 +175,6 @@ pub static ALL: &[&Spirv] = &[
     &TERRAIN_RGSS_TRANSLUCENT_FRAG,
     &TEXT_FRAG,
     &TEXT_VERT,
+    &WEATHER_FRAG,
+    &WEATHER_VERT,
 ];
