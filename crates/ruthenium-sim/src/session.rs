@@ -49,6 +49,7 @@ use crate::effect::Effect;
 use crate::entity::{Entities, EntityTypes, Local as LocalInfo, PlayerInfos, Teams, TickContext};
 use crate::environment::{Clocks, Environment, LocalRegistries};
 use crate::first_person::{self, Destruction};
+use crate::fov::{self, FovEase, FovInputs};
 use crate::handoff::{Handoff, HandoffStats, Item, Limits, Take, Taken};
 use crate::hud_text::{ChatTypes, HudTextState};
 use crate::input::next_scroll_selection;
@@ -207,6 +208,8 @@ struct FrameInput {
     scrolls: Vec<i32>,
     /// The frame's turn of the camera (`Entity.turn`'s amounts), after its ticks.
     turns: Vec<(f64, f64)>,
+    /// The FOV Effects option, when it was set this frame.
+    fov_effects: Option<f32>,
 }
 
 /// The local player as of the last tick, for the screen.
@@ -494,6 +497,12 @@ impl Session {
         lock(&self.input).player_list = shown;
     }
 
+    /// The FOV Effects option (0 to 1, the option's value, not its slider's place): how
+    /// far speed, flight and a drawn bow change the field of view from the next tick on.
+    pub fn set_fov_effects(&self, scale: f32) {
+        lock(&self.input).fov_effects = Some(scale.clamp(0.0, 1.0));
+    }
+
     /// The game is paused (`pauseGame`: the Game Menu opens): breaking a block stops.
     pub fn pause(&self) {
         lock(&self.input).paused = true;
@@ -634,6 +643,9 @@ struct Game {
     /// The outline last published, with the block state, the place and whether the
     /// held item filled it that it was made for.
     outline: Option<(Target, bool)>,
+    /// The camera's field of view modifier, and the FOV Effects option it is eased with.
+    fov: FovEase,
+    fov_effects: f32,
 }
 
 /// The feature flag that switches minecarts to their new movement, which doesn't
@@ -806,6 +818,8 @@ impl Game {
             simulation_distance: i32::MAX,
             own_skin: Arc::new(SkinSource::Profile(Default::default())),
             outline: None,
+            fov: FovEase::default(),
+            fov_effects: 1.0,
         }
     }
 
@@ -1033,6 +1047,7 @@ impl Game {
         let (hud_text, players) = (&mut self.hud_text, &self.players);
         let (teams, scoreboard) = (&self.teams, &self.scoreboard);
         let (own_name, list, faces) = (&self.name, self.player_list, self.online_mode);
+        let fov = self.fov;
         self.publisher.publish_frame(
             || Frame::new(now, w.environment.clone(), w.dimension_name.clone()),
             |f| {
@@ -1084,6 +1099,7 @@ impl Game {
                 s.vehicle = p.riding.as_ref().map(|r| r.vehicle);
                 s.placements = w.placements;
                 s.target = target;
+                s.fov = fov;
                 let r = &mut s.first_person;
                 p.first_person.record(r);
                 if !Arc::ptr_eq(&r.skin, own_skin) {
@@ -1167,6 +1183,9 @@ impl Game {
         self.use_keys.attack_clicks += input.attack_clicks;
         self.screen_open = input.screen_open;
         self.player_list = input.player_list;
+        if let Some(scale) = input.fov_effects {
+            self.fov_effects = scale;
+        }
         // The death screen or the bed screen took the keys (`KeyMapping.releaseAll`)
         // and keeps them.
         if self.death_screen.is_some() || self.bed_screen {
@@ -1703,6 +1722,9 @@ impl Game {
             colliders: &[],
             others: None,
         };
+        // `gameRenderer.tick`: the camera's field of view eases towards the player's.
+        let target = fov::modifier(&FovInputs::of(&w.player), true, self.fov_effects);
+        self.fov.tick(target);
         // `level.tickEntities`: the entities in order, the player among them, which
         // ticks and sends its changes (`sendPosition`) only once it has loaded.
         let cx = TickContext {

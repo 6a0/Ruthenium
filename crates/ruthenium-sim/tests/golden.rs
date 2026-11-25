@@ -14,6 +14,7 @@ use ruthenium_protocol::wire::Reader;
 use ruthenium_sim::blocks::{BlockTags, Blocks};
 use ruthenium_sim::effect::Effect;
 use ruthenium_sim::entity::{Entities, EntityTypes, Local, PlayerInfos, Teams, TickContext};
+use ruthenium_sim::fov::{self, FovEase, FovInputs};
 use ruthenium_sim::interact::{self, GameMode, UseKeys};
 use ruthenium_sim::inventory::{Hand, SLOT_OFFHAND};
 use ruthenium_sim::item::Items;
@@ -838,6 +839,14 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
     }
     // The client's item use: the first tick's slot was sent before the trace began.
     let mut game_mode = GameMode::default();
+    // The camera's field of view modifier, where the trace records it: from where its
+    // first tick found it.
+    let mut fov = t
+        .records
+        .iter()
+        .find(|r| r.kind == "state")
+        .and_then(|r| r.f32("fovOld"))
+        .map_or(FovEase::default(), |old| FovEase { old, now: old });
     cl.predictions
         .set_sequence(first_sequence(&t).map_or(0, |s| s - 1));
     let mut first_tick = true;
@@ -1034,6 +1043,16 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             game_mode.handle_keybinds(&mut p, &mut world, &hit, &mut use_keys, &mut sent);
         }
         let sets_got = world.set_log.take().unwrap_or_default();
+        // `gameRenderer.tick`: the camera's field of view eases, with the FOV Effects
+        // option the tick's state record says it ran with.
+        if let Some(scale) = records[i..]
+            .iter()
+            .take_while(|q| q.kind != "tick")
+            .find(|q| q.kind == "state")
+            .and_then(|q| q.f64("fovScale"))
+        {
+            fov.tick(fov::modifier(&FovInputs::of(&p), true, scale as f32));
+        }
         let env = Env {
             level: &cl.level,
             blocks,
@@ -1262,6 +1281,18 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                     ),
                 ));
             }
+        }
+        // The camera's field of view modifier, where the trace records it.
+        if let (Some(now), Some(old)) = (s.f32("fov"), s.f32("fovOld"))
+            && (fov.now.to_bits(), fov.old.to_bits()) != (now.to_bits(), old.to_bits())
+        {
+            return Err((
+                n,
+                format!(
+                    "tick {n}: the field of view modifier differs\n  got  {} (from {})\n  want {now} (from {old})",
+                    fov.now, fov.old
+                ),
+            ));
         }
         // What exactly the crosshair is on, to the bit.
         if let Some(kind) = s.str("hit")
@@ -1505,7 +1536,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 const LOOSE_CROSSHAIR: [&str; 2] = ["wind_charge", "shulker_box"];
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 87] = [
+const EXACT: [&str; 88] = [
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1593,6 +1624,7 @@ const EXACT: [&str; 87] = [
     "riptide_hit",
     "attack_range",
     "sulfur_cube",
+    "fov",
 ];
 
 #[test]
@@ -1704,6 +1736,7 @@ fn golden_traces() {
         "riptide_hit",
         "attack_range",
         "sulfur_cube",
+        "fov",
     ];
     // RUTHENIUM_TRACES=a,b replays only those.
     let only = std::env::var("RUTHENIUM_TRACES").ok();

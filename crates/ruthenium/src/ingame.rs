@@ -188,7 +188,8 @@ pub struct WorldView {
 
 /// The world as the session's latest frame has it, seen from the player's eyes: the
 /// player's place between its last two ticks (`now` says how far), looking where the
-/// mouse has turned to since, with a field of view of `fov` degrees from top to bottom.
+/// mouse has turned to since, with a field of view of `fov` degrees from top to bottom as
+/// the player's speed, flight and items widen or narrow it.
 pub fn world_view(session: &Session, now: Instant, fov: f32) -> Option<WorldView> {
     let camera = session.camera()?;
     let f = &camera.frame;
@@ -204,7 +205,8 @@ pub fn world_view(session: &Session, now: Instant, fov: f32) -> Option<WorldView
             position,
             y_rot: camera.y_rot,
             x_rot: camera.x_rot,
-            fov,
+            // The option's degrees times the eased modifier (`Camera.calculateFov`).
+            fov: fov * p.fov.at(partial_tick),
         },
         // What every session tells its server (`crate::join`).
         view_distance: i32::from(ClientInformation::default().view_distance),

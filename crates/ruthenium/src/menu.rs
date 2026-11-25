@@ -798,6 +798,7 @@ impl Menu {
                 r.step(s, s.view().as_ref(), terrain);
             }
             s.set_screen_open(!in_world);
+            s.set_fov_effects(self.settings.settings.game.fov_effects as f32 / 100.0);
             s.frame();
         }
     }

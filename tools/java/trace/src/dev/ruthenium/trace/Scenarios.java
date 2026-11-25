@@ -3069,6 +3069,67 @@ public final class Scenarios {
                         server.runCommand("fillbiome 12 30 -12 23 50 4 minecraft:plains");
                         server.runCommand("fillbiome 26 4 -8 31 35 -1 minecraft:plains");
                         ctx.waitTicks(5);
+                    }),
+            new Scenario("fov",
+                    "The camera's field of view modifier (fov, fovOld and the FOV Effects option, fovScale, in the state records): standing, walking, sprinting and stopping by letting go of forward; walking and sprinting with speed II, walking with slowness III; sprinting with the option at 0.5 and at 0, standing as it goes back to 1; a bow drawn for 30 ticks and shot, one drawn for 8 ticks and let go, one drawn with the option at 0.5; a spyglass held with the option at 0; creative flight taken off with a double-tapped jump, flown and sprint-flown, landed by survival mode.",
+                    List.of(), start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        server.runCommand("item replace entity @a hotbar.0 with minecraft:bow");
+                        server.runCommand("item replace entity @a hotbar.1 with minecraft:spyglass");
+                        server.runCommand("item replace entity @a inventory.0 with minecraft:arrow 16");
+                        ctx.waitTicks(5);
+                        hold(ctx, 10, W);
+                        ctx.getInput().holdKey(W);
+                        ctx.getInput().holdKey(SPRINT);
+                        ctx.waitTicks(15);
+                        ctx.getInput().releaseKey(W);
+                        ctx.getInput().releaseKey(SPRINT);
+                        ctx.waitTicks(12);
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        server.runCommand("effect give @a minecraft:speed 60 1");
+                        ctx.waitTicks(8);
+                        hold(ctx, 8, W);
+                        hold(ctx, 10, W, SPRINT);
+                        ctx.waitTicks(4);
+                        server.runCommand("effect clear @a minecraft:speed");
+                        server.runCommand("effect give @a minecraft:slowness 60 2");
+                        ctx.waitTicks(8);
+                        hold(ctx, 10, W);
+                        server.runCommand("effect clear @a minecraft:slowness");
+                        ctx.waitTicks(10);
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        ctx.runOnClient(mc -> mc.options.fovEffectScale().set(0.5));
+                        hold(ctx, 12, W, SPRINT);
+                        ctx.waitTicks(6);
+                        ctx.runOnClient(mc -> mc.options.fovEffectScale().set(0.0));
+                        hold(ctx, 12, W, SPRINT);
+                        ctx.waitTicks(3);
+                        ctx.runOnClient(mc -> mc.options.fovEffectScale().set(1.0));
+                        ctx.waitTicks(10);
+                        tp(ctx, server, 0.5, -60, 0.5, -90, 0);
+                        hold(ctx, 30, USE);
+                        ctx.waitTicks(10);
+                        hold(ctx, 8, USE);
+                        ctx.waitTicks(10);
+                        ctx.runOnClient(mc -> mc.options.fovEffectScale().set(0.5));
+                        hold(ctx, 25, USE);
+                        ctx.waitTicks(8);
+                        slot(ctx, 1);
+                        ctx.runOnClient(mc -> mc.options.fovEffectScale().set(0.0));
+                        hold(ctx, 10, USE);
+                        ctx.waitTicks(5);
+                        ctx.runOnClient(mc -> mc.options.fovEffectScale().set(1.0));
+                        ctx.waitTicks(8);
+                        server.runCommand("gamemode creative @a");
+                        ctx.waitTicks(5);
+                        doubleTapJump(ctx, 6);
+                        ctx.waitTicks(10);
+                        hold(ctx, 10, W);
+                        hold(ctx, 12, W, SPRINT);
+                        ctx.waitTicks(10);
+                        server.runCommand("gamemode survival @a");
+                        ctx.waitTicks(30);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(5);
                     }));
 
     /**

@@ -412,7 +412,7 @@ impl Settings {
             ),
             Row::FovEffects => (
                 "FOV Effects",
-                "How far liquids narrow the view",
+                "How far speed and fluids change the view",
                 Slider(percents(100)),
             ),
         };

@@ -640,6 +640,8 @@ pub struct PlayerState {
     pub first_person: crate::first_person::FirstPersonRecord,
     /// The block the crosshair is on, if its outline is to be drawn.
     pub target: Option<Target>,
+    /// The field of view's modifier, eased by the ticks (draw it at the partial tick).
+    pub fov: crate::fov::FovEase,
 }
 
 /// The block the crosshair is on, as of the frame (not of its last tick: the mouse
@@ -754,6 +756,7 @@ impl Frame {
                 placements: 0,
                 first_person: crate::first_person::FirstPersonRecord::default(),
                 target: None,
+                fov: crate::fov::FovEase::default(),
             },
             hud: crate::hud::HudRecord::default(),
             lids: Vec::new(),

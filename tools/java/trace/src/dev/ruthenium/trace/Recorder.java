@@ -293,6 +293,12 @@ public final class Recorder {
                 o.addProperty("vControlled", root.isLocalInstanceAuthoritative());
             }
             o.addProperty("jumpScale", p.getJumpRidingScale());
+            // The camera's field of view modifier after its tick, the one before, and the
+            // FOV Effects option it was eased with.
+            net.minecraft.client.Camera camera = mc.gameRenderer.mainCamera();
+            o.addProperty("fov", (Float) field(net.minecraft.client.Camera.class, camera, "fovModifier"));
+            o.addProperty("fovOld", (Float) field(net.minecraft.client.Camera.class, camera, "oldFovModifier"));
+            o.addProperty("fovScale", mc.options.fovEffectScale().get());
             o.addProperty("handsBusy", p.isHandsBusy());
             Input in = p.input.keyPresses;
             JsonArray input = new JsonArray();
@@ -364,6 +370,17 @@ public final class Recorder {
                 o.addProperty("destroyDelay", a.ruthenium$destroyDelay());
             }
             write(o);
+        }
+    }
+
+    /** A private field's value. */
+    private static Object field(Class<?> owner, Object target, String name) {
+        try {
+            java.lang.reflect.Field f = owner.getDeclaredField(name);
+            f.setAccessible(true);
+            return f.get(target);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(e);
         }
     }
 
