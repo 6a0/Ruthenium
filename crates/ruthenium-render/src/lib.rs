@@ -8,6 +8,9 @@ mod backdrop;
 pub mod block_entity;
 mod block_marks;
 mod check_pass;
+pub mod clouds;
+#[cfg(test)]
+mod clouds_golden;
 mod colour_check;
 mod gui;
 mod hud;
@@ -61,6 +64,7 @@ use block_entity::affine::Affine;
 use block_entity::renderer::{BlockEntityRenderer, PlayerView};
 use block_entity::skins::LoadedSkin;
 use block_marks::{BlockMarks, When};
+use clouds::{CloudCells, CloudOptions, CloudRenderer};
 use ruthenium_gpu::SamplerId;
 use ruthenium_sim::environment::CardinalLight;
 use ruthenium_ui::Quad;
@@ -198,6 +202,14 @@ struct Front {
     size: [f32; 2],
 }
 
+/// What is drawn over the world in the air: the clouds, with where they fade out, in the
+/// frame numbered `frame`.
+struct Overhead<'a> {
+    clouds: Option<&'a mut CloudRenderer>,
+    cloud_fog_end: f32,
+    frame: u64,
+}
+
 /// Draws the world and its sky into `pass`, which has a depth attachment, in the order
 /// asked for, and `front` over them.
 ///
@@ -218,6 +230,7 @@ unsafe fn draw_world(
     mut marks: Option<&mut BlockMarks>,
     hand: Option<&View>,
     size: [f32; 2],
+    overhead: Overhead<'_>,
 ) {
     let mut sky = sky.filter(|_| order != SkyOrder::Off && look.sky != Sky::None);
     let mut draw_sky = |pass: &mut ruthenium_gpu::Pass<'_>, frame_data: &mut FrameData, behind| {
@@ -269,6 +282,19 @@ unsafe fn draw_world(
     if let Some(((models, _), _)) = &mut models {
         // SAFETY: the caller's; `draw` has run for this frame just above.
         unsafe { models.draw_over(pass) };
+    }
+    // Then the clouds, as vanilla draws them after the translucent terrain.
+    if let Some(clouds) = overhead.clouds {
+        // SAFETY: the caller's.
+        unsafe {
+            clouds.draw(
+                pass,
+                frame_data,
+                view,
+                overhead.cloud_fog_end,
+                overhead.frame,
+            )
+        };
     }
     // The player's own hands, before everything: the depths of the world are gone
     // first, and they are seen with a field of view of their own.
@@ -420,6 +446,11 @@ pub struct Renderer {
     /// world's assets are loaded.
     atmosphere: Atmosphere,
     sky: Option<SkyRenderer>,
+    /// The clouds, once the world's assets are loaded; the Clouds and Cloud Distance
+    /// options, and a game time to draw them at instead of the level's (for pictures).
+    clouds: Option<CloudRenderer>,
+    cloud_options: CloudOptions,
+    cloud_time: Option<i64>,
     /// The block entities' models and pictures, with them; and whether they are drawn.
     block_entities: Option<BlockEntityRenderer>,
     show_block_entities: bool,
@@ -545,6 +576,9 @@ impl Renderer {
             atmosphere_options: AtmosphereOptions::default(),
             atmosphere: Atmosphere::new(),
             sky: None,
+            clouds: None,
+            cloud_options: CloudOptions::default(),
+            cloud_time: None,
             block_entities: None,
             show_block_entities: true,
             show_players: true,
@@ -595,6 +629,16 @@ impl Renderer {
                         None
                     }
                 };
+            // Without the clouds picture there are no clouds.
+            self.clouds = assets
+                .clouds
+                .as_ref()
+                .and_then(|i| CloudCells::from_rgba(i.width, i.height, &i.rgba))
+                .and_then(|cells| {
+                    CloudRenderer::new(&gpu, cells)
+                        .inspect_err(|e| eprintln!("[render] no clouds: {e}"))
+                        .ok()
+                });
             self.block_entities = assets.block_entities.take().and_then(|models| {
                 BlockEntityRenderer::new(&gpu, &mut self.textures, &mut self.uploads, models)
                     .inspect_err(|e| eprintln!("[render] no block entities: {e}"))
@@ -655,6 +699,22 @@ impl Renderer {
 
     pub fn animate(&self) -> bool {
         self.animate
+    }
+
+    /// The Clouds and Cloud Distance options.
+    pub fn set_clouds(&mut self, options: CloudOptions) {
+        self.cloud_options = options;
+        self.atmosphere_options.cloud_range = options.range;
+    }
+
+    pub fn clouds(&self) -> CloudOptions {
+        self.cloud_options
+    }
+
+    /// Draws the clouds at the game time `ticks` (and no part of a tick) instead of the
+    /// level's: two clients then draw them in the same place.
+    pub fn set_cloud_time(&mut self, ticks: Option<i64>) {
+        self.cloud_time = ticks;
     }
 
     /// The FOV Effects option, 0 to 1 (1 unless said otherwise): how much of the field
@@ -1256,6 +1316,7 @@ impl Renderer {
         profiling::scope!("render");
         let (mut ctx, gpu_time) = self.frames.begin()?;
         self.last_frame = ctx.number;
+        let number = ctx.number;
         let completed = self.frames.completed()?;
         // The swapchain this frame draws to, replaced first if the window changed, so that
         // everything below is chosen and recorded for its format and size.
@@ -1295,6 +1356,19 @@ impl Renderer {
                     started,
                     &self.atmosphere_options,
                 );
+                if let Some(clouds) = &mut self.clouds {
+                    let (time, partial) = self
+                        .cloud_time
+                        .map_or((w.frame.game_time, w.partial_tick), |t| (t, 0.0));
+                    clouds.stage(
+                        &mut self.uploads,
+                        self.cloud_options,
+                        &look.clouds,
+                        camera.position,
+                        time,
+                        partial,
+                    );
+                }
                 renderer.set_environment(&w.frame.environment);
                 renderer.animate(w.frame, &mut self.textures, &mut self.uploads);
                 renderer.update(
@@ -1376,6 +1450,10 @@ impl Renderer {
             renderer.install_ready(w.scene, &self.uploads, ctx.number);
             if let Some(sky) = &mut self.sky {
                 sky.note_ready(&self.uploads);
+            }
+            if let Some(clouds) = &mut self.clouds {
+                clouds.note_ready(&self.uploads);
+                clouds.maintain(&self.uploads.completed());
             }
             if let Some(models) = &mut self.block_entities {
                 models.note_ready(&self.uploads);
@@ -1519,6 +1597,11 @@ impl Renderer {
                                 self.marks.as_mut(),
                                 self.show_hand.then_some(&seen.hand),
                                 seen.size,
+                                Overhead {
+                                    clouds: self.clouds.as_mut(),
+                                    cloud_fog_end: seen.look.cloud_fog_end,
+                                    frame: number,
+                                },
                             );
                             // The HUD stays under a menu, and is blurred with the world.
                             if let (Some(hud), Some(models)) =
@@ -1682,6 +1765,11 @@ impl Renderer {
                             self.marks.as_mut(),
                             self.show_hand.then_some(&seen.hand),
                             seen.size,
+                            Overhead {
+                                clouds: self.clouds.as_mut(),
+                                cloud_fog_end: seen.look.cloud_fog_end,
+                                frame: number,
+                            },
                         );
                         // The HUD, over the world and the hands.
                         if let (Some(hud), Some(models)) = (&mut self.hud, &mut self.block_entities)

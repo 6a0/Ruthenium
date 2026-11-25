@@ -153,8 +153,16 @@ With no command, opens the game window. Options:
                          its HUD
   --animations <on|off>  whether animated textures (water, lava, fire) play (on, the
                          default); off, they show their first frame
-  --fov-effects <on|off> whether the field of view narrows in water and lava (on, the
-                         default), as vanilla's FOV Effects at 100% or at 0%
+  --fov-effects <on|off> whether the field of view widens and narrows with speed,
+                         flight, bows and fluids (on, the default), as vanilla's FOV
+                         Effects at 100% or at 0%
+  --clouds <off|fast|fancy>
+                         the clouds, as vanilla's Clouds option (fancy, the default)
+  --cloud-distance <chunks>
+                         how far out clouds are drawn, 2 to 128 (128, the default),
+                         as vanilla's Cloud Distance
+  --cloud-time <ticks>   draw the clouds where they are at that game time, for a
+                         picture to hold against another client's
   --light-flicker <on|off>
                          whether block light flickers (on, the default); off, two
                          frames of one place and time are the same picture

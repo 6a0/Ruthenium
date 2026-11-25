@@ -42,7 +42,7 @@ use crate::gpu::Gpu;
 use crate::routes::{self, Checked, Route};
 use crate::server::{self, Server};
 
-const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--hand-picture] [--hud-picture] [--at <x,y,z[,yaw,pitch]>] [--setup <console command>]... [--tick <command>]... [--player-list] [--time <ticks of the day>] [--keep-worlds]";
+const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--hand-picture] [--hud-picture] [--at <x,y,z[,yaw,pitch]>] [--setup <console command>]... [--tick <command>]... [--player-list] [--clouds <fast|fancy>[@<game time>]] [--time <ticks of the day>] [--keep-worlds]";
 /// The view and simulation distance of the server and the render distance of the
 /// clients, as in the integrated-server scenes.
 const VIEW_DISTANCE: i32 = 12;
@@ -112,6 +112,9 @@ struct Options {
     /// Console commands run once the player is there, before the scene begins (blocks
     /// to look at).
     setup: Vec<String>,
+    /// With the pictures: both clients draw clouds (`fast` or `fancy`) where they are at
+    /// this game time, instead of none.
+    clouds: Option<(String, i64)>,
     keep_worlds: bool,
     accept_eula: bool,
 }
@@ -150,6 +153,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         time: 6000,
         at: None,
         setup: Vec::new(),
+        clouds: None,
         keep_worlds: false,
         accept_eula: false,
     };
@@ -244,6 +248,16 @@ fn parse(args: &[String]) -> Result<Options, String> {
                         o.at = Some(([n[0], n[1], n[2]], yaw, pitch));
                     }
                     "--setup" => o.setup.push(value.clone()),
+                    "--clouds" => {
+                        let (mode, time) = value.split_once('@').unwrap_or((value, "0"));
+                        if !matches!(mode, "fast" | "fancy") {
+                            return Err(format!("--clouds: not fast or fancy: {mode}"));
+                        }
+                        let time: i64 = time
+                            .parse()
+                            .map_err(|e| format!("--clouds: the game time: {e}"))?;
+                        o.clouds = Some((mode.to_owned(), time));
+                    }
                     "--tick" => o.tick.push(value.clone()),
                     "--width" => o.width = num(value)? as u32,
                     "--height" => o.height = num(value)? as u32,
@@ -701,6 +715,18 @@ impl Harness<'_> {
         if self.o.bare {
             command.args(["--hand", "off", "--block-outline", "off"]);
         }
+        // The clouds as vanilla's options file has them, or at a fixed time for a
+        // picture, or none in a picture without them (vanilla's are switched off then).
+        command.args(["--cloud-distance", "64"]);
+        match &self.o.clouds {
+            Some((mode, time)) => {
+                command.args(["--clouds", mode, "--cloud-time", &time.to_string()]);
+            }
+            None if self.o.bare || self.o.hand || self.o.hud => {
+                command.args(["--clouds", "off"]);
+            }
+            None => {}
+        }
         if self.o.player_list {
             command.args(["--player-list", "on"]);
         }
@@ -1130,6 +1156,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         hand: o.hand,
         hud: o.hud,
         player_list: o.player_list,
+        clouds: o.clouds.clone(),
         render_distance: VIEW_DISTANCE as u32,
         gpu: o.gpu,
     };

@@ -41,6 +41,7 @@ pub const SKY_VERTEX: VertexInput = VertexInput {
             format: vk::Format::R8G8B8A8_UNORM,
         },
     ],
+    per_instance: false,
 };
 
 /// `sky.frag`'s kinds of draw.

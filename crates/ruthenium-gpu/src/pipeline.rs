@@ -121,7 +121,9 @@ pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
         match &d.vertex_input {
             None => h.u32(0),
             Some(v) => {
-                h.u32(v.stride).u32(v.attributes.len() as u32);
+                h.u32(v.stride)
+                    .u32(v.attributes.len() as u32)
+                    .u32(u32::from(v.per_instance));
                 for a in v.attributes {
                     h.u32(a.offset).u32(a.format.as_raw() as u32);
                 }
@@ -393,11 +395,14 @@ pub enum Depth {
 }
 
 /// The layout of the one vertex buffer a pipeline reads (binding 0, a vertex per
-/// `stride` bytes); the attribute at index `i` is the shader's input at location `i`.
+/// `stride` bytes, or with `per_instance` an instance per `stride` bytes, every vertex of
+/// an instance reading the same); the attribute at index `i` is the shader's input at
+/// location `i`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VertexInput {
     pub stride: u32,
     pub attributes: &'static [VertexAttribute],
+    pub per_instance: bool,
 }
 
 /// One graphics pipeline of the closed set: what differs between pipelines. Everything
@@ -830,7 +835,11 @@ fn build_one(
     let bindings = [vk::VertexInputBindingDescription::default()
         .binding(0)
         .stride(d.vertex_input.map_or(0, |v| v.stride))
-        .input_rate(vk::VertexInputRate::VERTEX)];
+        .input_rate(if d.vertex_input.is_some_and(|v| v.per_instance) {
+            vk::VertexInputRate::INSTANCE
+        } else {
+            vk::VertexInputRate::VERTEX
+        })];
     let attributes: Vec<vk::VertexInputAttributeDescription> = d
         .vertex_input
         .iter()

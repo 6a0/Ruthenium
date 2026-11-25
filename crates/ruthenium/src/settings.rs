@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ruthenium_render::clouds::CloudMode;
 use ruthenium_sim::input::MouseOptions;
 use ruthenium_ui::hud::AttackIndicator;
 use ruthenium_ui::modern::{ControlSpec, SectionSpec, SettingSpec};
@@ -88,6 +89,9 @@ pub struct GameOptions {
     /// percent.
     pub damage_tilt: u32,
     pub fov_effects: u32,
+    /// Clouds: off, flat or with sides; and how far out, in chunks.
+    pub clouds: CloudMode,
+    pub cloud_distance: u32,
 }
 
 impl Default for GameOptions {
@@ -101,9 +105,22 @@ impl Default for GameOptions {
             attack_indicator: AttackIndicator::Crosshair,
             damage_tilt: 100,
             fov_effects: 100,
+            clouds: CloudMode::Fancy,
+            cloud_distance: CLOUD_DISTANCE_MAX,
         }
     }
 }
+
+/// Vanilla's Cloud Distance slider, in chunks.
+const CLOUD_DISTANCE_MIN: u32 = 2;
+const CLOUD_DISTANCE_MAX: u32 = 128;
+
+/// The Clouds option's choices: its key in the file, its label.
+const CLOUDS: [(CloudMode, &str, &str); 3] = [
+    (CloudMode::Off, "off", "Off"),
+    (CloudMode::Fast, "fast", "Fast"),
+    (CloudMode::Fancy, "fancy", "Fancy"),
+];
 
 /// The attack indicator's places: its key in the file, its label.
 const INDICATORS: [(AttackIndicator, &str, &str); 3] = [
@@ -171,6 +188,8 @@ pub enum Row {
     InvertY,
     DamageTilt,
     FovEffects,
+    Clouds,
+    CloudDistance,
 }
 
 /// A titled group of rows.
@@ -196,6 +215,8 @@ pub const GAME: [Group; 9] = [
             Row::AttackIndicator,
             Row::ViewBobbing,
             Row::EntityShadows,
+            Row::Clouds,
+            Row::CloudDistance,
             Row::Vignette,
         ],
     ),
@@ -294,6 +315,15 @@ impl Settings {
                 .map_or(g.attack_indicator, |i| i.0),
             damage_tilt: number("damage_tilt", 0..=100, g.damage_tilt),
             fov_effects: number("fov_effects", 0..=100, g.fov_effects),
+            clouds: get(game, "clouds")
+                .and_then(toml::Value::as_str)
+                .and_then(|s| CLOUDS.into_iter().find(|c| c.1 == s))
+                .map_or(g.clouds, |c| c.0),
+            cloud_distance: number(
+                "cloud_distance",
+                CLOUD_DISTANCE_MIN..=CLOUD_DISTANCE_MAX,
+                g.cloud_distance,
+            ),
         };
         Ok(Settings {
             game,
@@ -410,6 +440,20 @@ impl Settings {
                 "How far the view tilts when you are hurt",
                 Slider(percents(100)),
             ),
+            Row::Clouds => (
+                "Clouds",
+                "Flat, or with sides and depth",
+                Choice(CLOUDS.iter().map(|c| c.2.to_owned()).collect()),
+            ),
+            Row::CloudDistance => (
+                "Cloud Distance",
+                "How far out clouds are drawn",
+                Slider(
+                    (CLOUD_DISTANCE_MIN..=CLOUD_DISTANCE_MAX)
+                        .map(|c| format!("{c} chunks"))
+                        .collect(),
+                ),
+            ),
             Row::FovEffects => (
                 "FOV Effects",
                 "How far speed and fluids change the view",
@@ -456,6 +500,11 @@ impl Settings {
             Row::InvertY => self.mouse.invert_y.into(),
             Row::DamageTilt => g.damage_tilt as usize,
             Row::FovEffects => g.fov_effects as usize,
+            Row::Clouds => CLOUDS.iter().position(|c| c.0 == g.clouds).unwrap_or(2),
+            Row::CloudDistance => g
+                .cloud_distance
+                .clamp(CLOUD_DISTANCE_MIN, CLOUD_DISTANCE_MAX)
+                .abs_diff(CLOUD_DISTANCE_MIN) as usize,
         }
     }
 
@@ -494,6 +543,14 @@ impl Settings {
             Row::InvertY => self.mouse.invert_y = value != 0,
             Row::DamageTilt => g.damage_tilt = percent,
             Row::FovEffects => g.fov_effects = percent,
+            Row::Clouds => {
+                if let Some(c) = CLOUDS.get(value) {
+                    g.clouds = c.0;
+                }
+            }
+            Row::CloudDistance => {
+                g.cloud_distance = (CLOUD_DISTANCE_MIN + value as u32).min(CLOUD_DISTANCE_MAX);
+            }
         }
     }
 
@@ -541,7 +598,10 @@ impl Settings {
              attack_indicator = \"{}\"\n\
              # Percent.\n\
              damage_tilt = {}\n\
-             fov_effects = {}\n",
+             fov_effects = {}\n\
+             # \"off\", \"fast\" or \"fancy\"; {CLOUD_DISTANCE_MIN} to {CLOUD_DISTANCE_MAX} chunks.\n\
+             clouds = \"{}\"\n\
+             cloud_distance = {}\n",
             self.vsync,
             self.fullscreen,
             self.frame_stats,
@@ -558,6 +618,8 @@ impl Settings {
             INDICATORS[self.get(Row::AttackIndicator)].1,
             self.game.damage_tilt,
             self.game.fov_effects,
+            CLOUDS[self.get(Row::Clouds)].1,
+            self.game.cloud_distance,
         )
     }
 }
@@ -711,6 +773,8 @@ mod tests {
                 attack_indicator: AttackIndicator::Hotbar,
                 damage_tilt: 35,
                 fov_effects: 0,
+                clouds: CloudMode::Fast,
+                cloud_distance: 12,
             },
         };
         assert_eq!(Settings::parse(&s.to_toml()), Ok(s.clone()));
@@ -774,7 +838,7 @@ vsync = true
         // Out of range in the file.
         let s = Settings::parse(
             "[game]\nfov = 111\ngui_scale = -1\nvignette = 3\nattack_indicator = \"x\"\n\
-             damage_tilt = 101\nfov_effects = \"all\"\n",
+             damage_tilt = 101\nfov_effects = \"all\"\nclouds = true\ncloud_distance = 129\n",
         )
         .unwrap();
         assert_eq!(s.game, GameOptions::default());

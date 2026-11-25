@@ -64,6 +64,7 @@ pub const VERTEX_BYTES: usize = 16;
 pub const TERRAIN_VERTEX: VertexInput = VertexInput {
     stride: VERTEX_BYTES as u32,
     attributes: TERRAIN_VERTEX_CANDIDATES[0].attributes,
+    per_instance: false,
 };
 
 /// Position codes per block, and the blocks before a section's corner that code 0 is.

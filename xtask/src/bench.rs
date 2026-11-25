@@ -53,6 +53,9 @@ pub(crate) struct Options {
     pub hud: bool,
     /// With the player list showing.
     pub player_list: bool,
+    /// With a picture: vanilla draws its clouds (`fast` or `fancy`) where they are at
+    /// this game time.
+    pub clouds: Option<(String, i64)>,
     pub render_distance: u32,
     pub gpu: Gpu,
 }
@@ -74,6 +77,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         hand: false,
         hud: false,
         player_list: false,
+        clouds: None,
         render_distance: 12,
         gpu: Gpu::Auto,
     };
@@ -277,6 +281,10 @@ pub(crate) fn launch(
         format!("-Druthenium.bench.hud={}", o.hud),
         format!("-Druthenium.bench.playerList={}", o.player_list),
     ];
+    if let Some((mode, time)) = &o.clouds {
+        jvm_args.push(format!("-Druthenium.bench.clouds={mode}"));
+        jvm_args.push(format!("-Druthenium.bench.cloudTime={time}"));
+    }
     if let Some((address, route)) = &run.dedicated {
         let route = std::path::absolute(route).map_err(|e| e.to_string())?;
         jvm_args.push(format!("-Druthenium.bench.route={}", route.display()));

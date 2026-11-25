@@ -72,6 +72,10 @@ pub enum PipelineId {
     SkyFlatBehind,
     SkyBlendBehind,
     SkyGlowBehind,
+    /// The clouds, blended over the world: Fancy cells seen from outside, and Fast
+    /// squares seen from both sides.
+    CloudsFancy,
+    CloudsFast,
     /// The four pipelines that also draw over the world, built for a pass with a depth
     /// attachment (which they neither test nor write).
     WorldGui,
@@ -88,7 +92,7 @@ pub enum PipelineId {
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 44] = [
+    pub const ALL: [PipelineId; 46] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -126,6 +130,8 @@ impl PipelineId {
         PipelineId::SkyFlatBehind,
         PipelineId::SkyBlendBehind,
         PipelineId::SkyGlowBehind,
+        PipelineId::CloudsFancy,
+        PipelineId::CloudsFast,
         PipelineId::WorldGui,
         PipelineId::WorldShape,
         PipelineId::WorldText,
@@ -256,6 +262,17 @@ impl PipelineId {
             depth,
             cull_back: false,
         };
+        // The clouds are blended and write their depth, as vanilla's.
+        let clouds = |name, cull_back| GraphicsDesc {
+            name,
+            vertex: shaders::CLOUDS_VERT.words(),
+            fragment: shaders::CLOUDS_FRAG.words(),
+            topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+            blend: Blend::Alpha,
+            vertex_input: Some(crate::clouds::CLOUD_FACE),
+            depth: Depth::TestAndWrite,
+            cull_back,
+        };
         if let Some((name, vertex, fragment)) = self.terrain_stages() {
             let blend = if self.is_translucent_terrain() {
                 Blend::Alpha
@@ -376,6 +393,8 @@ impl PipelineId {
             PipelineId::SkyFlatBehind => sky("sky_flat_behind", Blend::Opaque, Depth::Test),
             PipelineId::SkyBlendBehind => sky("sky_blend_behind", Blend::Alpha, Depth::Test),
             PipelineId::SkyGlowBehind => sky("sky_glow_behind", Blend::Glow, Depth::Test),
+            PipelineId::CloudsFancy => clouds("clouds_fancy", true),
+            PipelineId::CloudsFast => clouds("clouds_fast", false),
             // Handled above.
             PipelineId::TerrainNearest
             | PipelineId::TerrainNearestCutout

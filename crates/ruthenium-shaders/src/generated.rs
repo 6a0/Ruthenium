@@ -13,6 +13,12 @@ pub static BACKGROUND_VERT: Spirv = crate::spirv!("background.vert");
 /// `glsl/blur.frag`
 pub static BLUR_FRAG: Spirv = crate::spirv!("blur.frag");
 
+/// `glsl/clouds.frag`
+pub static CLOUDS_FRAG: Spirv = crate::spirv!("clouds.frag");
+
+/// `glsl/clouds.vert`
+pub static CLOUDS_VERT: Spirv = crate::spirv!("clouds.vert");
+
 /// `glsl/crack.vert`
 pub static CRACK_VERT: Spirv = crate::spirv!("crack.vert");
 
@@ -126,6 +132,8 @@ pub static ALL: &[&Spirv] = &[
     &BACKGROUND_FRAG,
     &BACKGROUND_VERT,
     &BLUR_FRAG,
+    &CLOUDS_FRAG,
+    &CLOUDS_VERT,
     &CRACK_VERT,
     &GUI_FRAG,
     &GUI_VERT,

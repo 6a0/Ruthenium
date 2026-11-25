@@ -201,6 +201,11 @@ pub struct Options {
     pub animations: Option<bool>,
     /// Whether the field of view narrows in water and lava (the default).
     pub fov_effects: Option<bool>,
+    /// The Clouds option for the run, and a game time to draw the clouds at.
+    pub clouds: Option<ruthenium_render::clouds::CloudMode>,
+    pub cloud_time: Option<i64>,
+    /// The Cloud Distance option for the run, in chunks.
+    pub cloud_distance: Option<u32>,
 }
 
 impl Options {
@@ -274,6 +279,9 @@ impl Options {
             player_list: None,
             animations: None,
             fov_effects: None,
+            clouds: None,
+            cloud_time: None,
+            cloud_distance: None,
         };
         let mut it = args.iter();
         while let Some(a) = it.next() {
@@ -501,6 +509,33 @@ impl Options {
                     // Whole milliseconds, as the game counts the fade.
                     o.chunk_fade_ms = Some((seconds * 1000.0) as u32);
                 }
+                "--clouds" => {
+                    use ruthenium_render::clouds::CloudMode;
+                    o.clouds = Some(match value("off, fast or fancy")?.as_str() {
+                        "off" => CloudMode::Off,
+                        "fast" => CloudMode::Fast,
+                        "fancy" => CloudMode::Fancy,
+                        v => return Err(format!("--clouds: not off, fast or fancy: {v}")),
+                    });
+                }
+                "--cloud-distance" => {
+                    let v = value("chunks from 2 to 128")?;
+                    o.cloud_distance = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|c| (2..=128).contains(c))
+                            .ok_or(format!("--cloud-distance: not 2 to 128 chunks: {v}"))?,
+                    );
+                }
+                "--cloud-time" => {
+                    let v = value("game ticks")?;
+                    o.cloud_time = Some(
+                        v.parse()
+                            .ok()
+                            .filter(|t| *t >= 0)
+                            .ok_or(format!("--cloud-time: not a game time in ticks: {v}"))?,
+                    );
+                }
                 "--sky" => {
                     let v = value("late, first or off")?;
                     o.sky = Some(
@@ -578,6 +613,10 @@ pub fn run(opts: &Options, started: Instant) -> ExitCode {
 fn apply_game_options(renderer: &mut Renderer, game: &crate::settings::GameOptions) {
     renderer.set_entity_shadows(game.entity_shadows);
     renderer.set_fov_effects(game.fov_effects as f32 / 100.0);
+    renderer.set_clouds(ruthenium_render::clouds::CloudOptions {
+        mode: game.clouds,
+        range: game.cloud_distance,
+    });
     renderer.set_view_options(ruthenium_render::ViewOptions {
         bobbing: game.view_bobbing,
         damage_tilt: game.damage_tilt as f32 / 100.0,
@@ -647,6 +686,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     if let Some(on) = opts.fov_effects {
         game.fov_effects = if on { 100 } else { 0 };
     }
+    game.clouds = opts.clouds.unwrap_or(game.clouds);
+    game.cloud_distance = opts.cloud_distance.unwrap_or(game.cloud_distance);
     let mut menu = Menu::new(servers_file, accounts, settings);
     if let Some(n) = opts.mesh_workers {
         menu.set_mesh_workers(n);
@@ -812,6 +853,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     if let Some(order) = opts.sky {
         renderer.set_sky_order(order);
     }
+    renderer.set_cloud_time(opts.cloud_time);
     if let Some(on) = opts.translucent {
         renderer.set_translucent(on);
     }

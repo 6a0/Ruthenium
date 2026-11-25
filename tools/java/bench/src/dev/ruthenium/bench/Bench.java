@@ -164,8 +164,15 @@ public final class Bench {
             if (mc.options.fovEffectScale().get() != 0.0) {
                 mc.options.fovEffectScale().set(0.0);
             }
-            if (mc.options.cloudStatus().get() != net.minecraft.client.CloudStatus.OFF) {
-                mc.options.cloudStatus().set(net.minecraft.client.CloudStatus.OFF);
+            // Clouds only where asked for, at a fixed time (CloudRendererMixin).
+            String clouds = System.getProperty("ruthenium.bench.clouds", "off");
+            net.minecraft.client.CloudStatus status = switch (clouds) {
+                case "fast" -> net.minecraft.client.CloudStatus.FAST;
+                case "fancy" -> net.minecraft.client.CloudStatus.FANCY;
+                default -> net.minecraft.client.CloudStatus.OFF;
+            };
+            if (mc.options.cloudStatus().get() != status) {
+                mc.options.cloudStatus().set(status);
             }
         }
         switch (phase) {

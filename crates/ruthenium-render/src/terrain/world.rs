@@ -308,6 +308,8 @@ pub struct WorldAssets {
     pub colour_maps: ColourMaps,
     /// The sun, the moon's phases and the End's sky.
     pub sky: crate::sky::SkyImages,
+    /// The clouds picture (`textures/environment/clouds.png`): one cell a texel.
+    pub clouds: Option<crate::sky::SkyImage>,
     /// What block entities are drawn from; without it they are not drawn.
     pub block_entities: Option<crate::block_entity::renderer::BlockEntityAssets>,
     /// The cracks in a block being broken: its ten stages' pictures in order

@@ -434,6 +434,23 @@ In the second scene the hand rises and sinks with every renewed item, in both cl
 - **Cost.** The first scene's text with the player list showing, five messages of chat arriving every tick, against `--hud off`, one 20-second pair over the terrain at the spawn: main-thread work 0.148 against 0.107 ms a frame at the median, GPU 0.332 against 0.283 ms; all of the HUD, not its text alone. No full campaign was run.
 - **Not there:** typing in the chat, its scrolling, links and hover texts; text that runs from right to left, fonts other than the usual one, pictures within text; the options (chat scale, width, opacity and delay, backgrounds behind all text, notification time, GUI scale); blocked players; subtitles, toasts and F3; a boss bar's darkened sky, fog and music. Faces in the player list show on servers that check accounts and were not compared (the test server does not). The chat and the player list ask for memory every frame they show.
 
+## The clouds
+
+From the working tree on top of `c21bc81`, 2026-11-25, with the 26.3 Vulkan client at 1920 × 1080 on the RTX 4060 Laptop (display scale 2, `--width 960 --height 540`). `--clouds fancy@1000` (or `fast@1000`) has both clients draw their clouds where they are at game time 1000 and no part of a tick: vanilla's bench mod fixes the time `CloudRenderer.prepare` is given, Ruthenium takes `--clouds` and `--cloud-time`. Otherwise the bench keeps both clients' clouds off in pictures, and gives Ruthenium vanilla's Cloud Distance of its options file (64 chunks) in every run. Both clients' PNGs are under `cache/bench/results/clouds-2026-11-25-rtx4060`.
+
+| View (`--at`) | Clouds | Equal |
+|---|---|---:|
+| From below, looking up (`4.5,110,2.5,0,-40`) | Fancy | 100% |
+| The same | Fast | 100% |
+| The same, at dusk (`--time 12800`, looking west, game time 51234) | Fancy | 100% |
+| Inside the layer, in a gap (`4.5,192.5,2.5,30,-5`) | Fancy | 100% |
+| Inside a cloud's cell (`54.5,192.5,-17.5,30,-5`) | Fancy | 100% |
+| From above, looking down (`4.5,205,2.5,0,35`) | Fancy | 85.43%; every cloud pixel equal, the rest is the sea's animated water |
+
+- **Checked by rule:** the cells and faces, against the game's own `CloudRenderer` run headless on 3000 made-up pictures (8 to 64 cells wide, alpha around the cut of 10, every camera position and both kinds, radii 1 to 30): the number and order of faces and an FNV-1a hash of them. Where the layer is, how it drifts and wraps, the colour's steps and the fog's end are unit tests.
+- **When lists are made:** only when the camera's cell, its place below, inside or above the layer, or the options change, as vanilla's rule; a worker thread makes them (1.5 ms at the largest distance in a release build), and until a new list has arrived the old one is drawn from its own cell.
+- **Not there:** the Improved Transparency (order-independent) path; clouds through the darkness and blindness fogs and the boss bar's fog, which the rest of the world does not have either.
+
 ## Where a frame's time goes
 
 Medians of the runs' medians, in milliseconds, at the default options. Work is the main thread's own: events, the game's frame, the GUI, recording and submitting. The governor is the wait for the GPU to finish the frame before, which is what one frame ahead removes.
@@ -551,6 +568,10 @@ cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium \
     --variant 'ruthenium=--light-flicker off' --scene idle --at 4.5,71,2.5,0,-90 \
     --reps 1 --warmup 40 --duration 5 --width 960 --height 540 --hud-picture \
     --tick 'title @a title {text:"Title"}' --tick 'tellraw @a {text:"a message"}'
+# The clouds from below, Fancy, at a fixed game time
+cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium \
+    --variant 'ruthenium=--light-flicker off --fov-effects off' --scene idle --reps 1 --warmup 5 --duration 10 \
+    --bare-picture --clouds fancy@1000 --at 4.5,110,2.5,0,-40
 # One frame of each client, vanilla's without HUD, hand, vignette and clouds (its PNG is
 # cache/bench/game/screenshots/ruthenium-bench-idle.png, Ruthenium's in the results folder)
 cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium --variant 'ruthenium=--light-flicker off' \

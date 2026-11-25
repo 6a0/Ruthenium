@@ -65,6 +65,7 @@ pub const MODEL_VERTEX: VertexInput = VertexInput {
             format: vk::Format::R8G8B8A8_SNORM,
         },
     ],
+    per_instance: false,
 };
 
 /// Where the models' push constants are, in bytes: four words the vertex stage reads, then

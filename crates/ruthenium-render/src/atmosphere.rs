@@ -23,6 +23,7 @@ use ruthenium_sim::environment::Environment;
 use ruthenium_sim::player::Pose;
 use ruthenium_sim::scene::{Frame, Scene};
 
+use crate::clouds::CloudLook;
 use crate::sky::{OverworldSky, Sky};
 use crate::terrain::{CameraPose, LightmapInputs};
 
@@ -284,6 +285,8 @@ pub struct AtmosphereOptions {
     pub flicker: bool,
     /// The Brightness option, 0 to 1.
     pub brightness: f32,
+    /// The Cloud Distance option, in chunks: where the clouds' fog ends at the most.
+    pub cloud_range: u32,
 }
 
 impl Default for AtmosphereOptions {
@@ -292,6 +295,7 @@ impl Default for AtmosphereOptions {
             fog: true,
             flicker: true,
             brightness: 0.5,
+            cloud_range: 128,
         }
     }
 }
@@ -305,6 +309,19 @@ pub struct Look {
     pub water: Option<WaterOverlay>,
     /// What the sky's light lacks to its full strength, as of the tick (`getSkyDarken`).
     pub sky_darken: i32,
+    /// The clouds' colour and height, and where they have faded out.
+    pub clouds: CloudLook,
+    pub cloud_fog_end: f32,
+}
+
+/// Where the clouds have faded out (`FogData.cloudEnd`): in the air at the Cloud
+/// Distance or where the `cloud_fog_end_distance` attribute says, if that is nearer;
+/// inside anything else where its fog is complete.
+pub fn cloud_fog_end(medium: Medium, range: u32, attribute: f32, environmental_end: f32) -> f32 {
+    match medium {
+        Medium::Air => ((range * 16) as f32).min(attribute),
+        Medium::Water | Medium::Lava | Medium::PowderSnow => environmental_end,
+    }
 }
 
 fn float(v: Value) -> f32 {
@@ -509,6 +526,12 @@ impl Atmosphere {
                 .any(|e| e.0 == MobEffect::FireResistance.id() as i32),
             water_vision: frame.player.water_vision,
         });
+        let cloud_fog_end = cloud_fog_end(
+            medium,
+            options.cloud_range,
+            float(read(Attribute::CloudFogEndDistance)),
+            fog.environmental[1],
+        );
         if !options.fog {
             fog.environmental = Fog::NONE.environmental;
             fog.render_distance = Fog::NONE.render_distance;
@@ -564,6 +587,11 @@ impl Atmosphere {
             lightmap: self.lightmap,
             water,
             sky_darken: (15.0 - float(self.probe.value(Attribute::SkyLightLevel, 1.0))) as i32,
+            clouds: CloudLook {
+                colour: argb(read(Attribute::CloudColor)),
+                height: float(read(Attribute::CloudHeight)),
+            },
+            cloud_fog_end,
         }
     }
 }
@@ -597,6 +625,16 @@ mod tests {
             spectator: false,
             fire_resistance: false,
             water_vision: 1.0,
+        }
+    }
+
+    #[test]
+    fn the_clouds_fade_out_at_their_distance_or_in_the_medium_s_fog() {
+        assert_eq!(cloud_fog_end(Medium::Air, 128, 2048.0, 192.0), 2048.0);
+        assert_eq!(cloud_fog_end(Medium::Air, 64, 2048.0, 192.0), 1024.0);
+        assert_eq!(cloud_fog_end(Medium::Air, 128, 300.0, 192.0), 300.0);
+        for m in [Medium::Water, Medium::Lava, Medium::PowderSnow] {
+            assert_eq!(cloud_fog_end(m, 128, 2048.0, 24.0), 24.0);
         }
     }
 
