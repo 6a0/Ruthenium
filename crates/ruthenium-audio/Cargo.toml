@@ -1,0 +1,29 @@
+[package]
+name = "ruthenium-audio"
+description = "Sound as vanilla plays it: sounds.json, Vorbis decoding, a lock-free mixer with OpenAL Soft's distance model and panning, and the output device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# The sound card, through cpal. Without it everything but the device builds and runs
+# (tests, a WAV file in place of the device).
+device = ["dep:cpal"]
+
+[dependencies]
+cpal = { version = "0.18.2", optional = true }
+rtrb = "0.4.1"
+# Only to read `sounds.json` objects in file order, as vanilla's Gson does.
+serde = "1.0.229"
+ruthenium-assets = { path = "../ruthenium-assets" }
+ruthenium-javamath = { path = "../ruthenium-javamath" }
+serde_json = "1.0.154"
+symphonia = { version = "0.6.1", default-features = false, features = ["ogg", "vorbis"] }
+
+[dev-dependencies]
+rayon = "1.12.0"

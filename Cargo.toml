@@ -38,6 +38,13 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.fdeflate]
 opt-level = 3
+# Sounds decode on a thread of their own, but a slow decode still delays a first play.
+[profile.dev.package.symphonia-core]
+opt-level = 3
+[profile.dev.package.symphonia-codec-vorbis]
+opt-level = 3
+[profile.dev.package.symphonia-format-ogg]
+opt-level = 3
 
 [profile.release]
 lto = "thin"
