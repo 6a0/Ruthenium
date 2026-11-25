@@ -192,7 +192,7 @@ impl ScrollList {
             rect: px_rect(s, self.area.outset(margin)),
             fade_top: self.scroll.min(FADE) * s.px,
             fade_bottom: (self.max_scroll() - self.scroll).clamp(0.0, FADE) * s.px,
-            opacity: 1.0,
+            ..Clip::NONE
         }
     }
 

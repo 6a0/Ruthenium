@@ -24,6 +24,7 @@ mod terrain_check;
 mod terrain_vertex;
 
 pub use atmosphere::{AtmosphereOptions, Fog, FogInputs, Medium, fog, rain_fog_target};
+pub use backdrop::Veil;
 pub use block_entity::renderer::ViewOptions;
 pub use block_marks::{MarkStats, STAGES as CRACK_STAGES};
 pub use colour_check::ColourCheckReport;
@@ -296,6 +297,78 @@ unsafe fn draw_world(
     }
 }
 
+/// Bytes of `shape.frag`'s push constants.
+pub(crate) const SHAPE_PUSH: usize = 32;
+
+/// Draws a frame's GUI on a target of `size` pixels: quads, shapes, text. The glass of its
+/// shapes samples `backdrop`, graded as the window shows it. `over_world`: the pass has a
+/// depth attachment.
+///
+/// # Safety
+/// The GUI's textures and the backdrop's images have arrived, and none is the target.
+unsafe fn draw_gui(
+    pass: &mut ruthenium_gpu::Pass<'_>,
+    frame_data: &mut FrameData,
+    g: &GuiFrame<'_>,
+    size: [f32; 2],
+    backdrop: Option<(TextureId, TextureId)>,
+    over_world: bool,
+) {
+    let pipeline = |id: PipelineId| {
+        if over_world {
+            id.over_world().index()
+        } else {
+            id.index()
+        }
+    };
+    // What every GUI pipeline's push constants start with: the target's size.
+    let mut screen = [0u8; 8];
+    screen[0..4].copy_from_slice(&size[0].to_ne_bytes());
+    screen[4..8].copy_from_slice(&size[1].to_ne_bytes());
+    // SAFETY (every draw): the push constants are laid out as the pipeline's shaders
+    // declare them, and the elements they point at were written just before; the rest is
+    // the caller's.
+    unsafe {
+        if !g.quads.is_empty()
+            && g.scale > 0
+            && let Some((first, bytes)) = frame_data.alloc(g.quads.len() as u32, gui::QUAD_BYTES)
+        {
+            gui::write_quads(g.quads, bytes);
+            let mut push = [0u8; 16];
+            push[0..8].copy_from_slice(&screen);
+            push[8..12].copy_from_slice(&(g.scale as f32).to_ne_bytes());
+            push[12..16].copy_from_slice(&first.to_ne_bytes());
+            pass.draw(pipeline(PipelineId::Gui), &push, 6, g.quads.len() as u32);
+        }
+        if !g.shapes.is_empty()
+            && let Some((first, bytes)) = frame_data.alloc(g.shapes.len() as u32, gui::SHAPE_BYTES)
+        {
+            gui::write_shapes(g.shapes, bytes);
+            let (scene, blurred) = backdrop.unwrap_or((TextureId::MISSING, TextureId::MISSING));
+            let [saturation, brightness] = g.veil.map_or([1.0; 2], |v| v.grade());
+            let mut push = [0u8; SHAPE_PUSH];
+            push[0..8].copy_from_slice(&screen);
+            push[8..12].copy_from_slice(&scene.index().to_ne_bytes());
+            push[12..16].copy_from_slice(&blurred.index().to_ne_bytes());
+            push[16..20].copy_from_slice(&first.to_ne_bytes());
+            push[20..24].copy_from_slice(&u32::from(backdrop.is_some()).to_ne_bytes());
+            push[24..28].copy_from_slice(&saturation.to_ne_bytes());
+            push[28..32].copy_from_slice(&brightness.to_ne_bytes());
+            pass.draw(pipeline(PipelineId::Shape), &push, 6, g.shapes.len() as u32);
+        }
+        if !g.glyphs.is_empty()
+            && let Some((first, bytes)) = frame_data.alloc(g.glyphs.len() as u32, gui::GLYPH_BYTES)
+        {
+            gui::write_glyphs(g.glyphs, bytes);
+            let mut push = [0u8; 16];
+            push[0..8].copy_from_slice(&screen);
+            push[8..12].copy_from_slice(&g.font_atlas.to_ne_bytes());
+            push[12..16].copy_from_slice(&first.to_ne_bytes());
+            pass.draw(pipeline(PipelineId::Text), &push, 6, g.glyphs.len() as u32);
+        }
+    }
+}
+
 /// Staging ring size (research 04 §4.3: 8 MiB on the lowest tier, 16 MiB by default).
 const UPLOAD_RING_BYTES: u64 = 16 << 20;
 /// Bytes one frame may upload: less on integrated GPUs, which share memory bandwidth
@@ -389,6 +462,8 @@ pub struct Renderer {
     screenshot_of: Option<(u64, u32, bool)>,
     /// The menus' backdrop, while frames draw shapes.
     backdrop: Option<backdrop::Backdrop>,
+    /// What a menu over the world is drawn into while it comes or goes.
+    layer: Option<backdrop::Layer>,
     /// Frames that drew glass shapes into the window without a backdrop to sample.
     glass_fallbacks: u64,
     /// `--exercise-swapchain`: every so often a frame replaces its swapchain twice.
@@ -494,6 +569,7 @@ impl Renderer {
             screenshot: None,
             screenshot_of: None,
             backdrop: None,
+            layer: None,
             glass_fallbacks: 0,
             exercise_recreation: false,
         })
@@ -1127,6 +1203,26 @@ impl Renderer {
         }
     }
 
+    /// The layer's images, as [`Self::update_backdrop`]: there for as long as a menu is
+    /// over the world, so that its going needs none made.
+    fn update_layer(&mut self, wanted: bool, surface: Option<SwapchainInfo>) {
+        let keep = match (&self.layer, surface) {
+            _ if !wanted => false,
+            (Some(l), Some(s)) => l.matches(s.format, s.extent),
+            _ => true,
+        };
+        if !keep && let Some(old) = self.layer.take() {
+            old.destroy(&mut self.textures);
+        }
+        if wanted
+            && self.layer.is_none()
+            && let Some(s) = surface
+        {
+            // Without it the menu is there at once.
+            self.layer = backdrop::Layer::new(&mut self.textures, s.format, s.extent).ok();
+        }
+    }
+
     /// Rebuilds the pipelines if the swapchain's format changed (rare: a different monitor
     /// or surface), before the frame records anything with them. Waits for earlier frames,
     /// which may still use the old pipelines. Returns whether the pipelines were rebuilt
@@ -1172,8 +1268,11 @@ impl Renderer {
             self.ensure_format(s.format)?;
         }
         // Only glass samples what is behind the menus.
-        let wants_backdrop = gui.is_some_and(|g| g.shapes.iter().any(|s| s.glass));
+        let veil = gui.and_then(|g| g.veil);
+        let wants_backdrop =
+            veil.is_some() || gui.is_some_and(|g| g.shapes.iter().any(|s| s.glass));
         self.update_backdrop(wants_backdrop, surface);
+        self.update_layer(veil.is_some(), surface);
         // The world's work that stages uploads, before the frame's copies are recorded:
         // what changed in the level, finished meshes, new jobs.
         self.world_times = WorldTimes::default();
@@ -1421,6 +1520,18 @@ impl Renderer {
                                 self.show_hand.then_some(&seen.hand),
                                 seen.size,
                             );
+                            // The HUD stays under a menu, and is blurred with the world.
+                            if let (Some(hud), Some(models)) =
+                                (&mut self.hud, &mut self.block_entities)
+                            {
+                                hud.draw(
+                                    &mut pass,
+                                    &mut self.frame_data,
+                                    seen.size,
+                                    models,
+                                    renderer.shared(),
+                                );
+                            }
                         }
                         pass.finish();
                         b.blur(&mut encoder, &self.pipelines, &self.textures);
@@ -1436,6 +1547,28 @@ impl Renderer {
                 }
                 self.frames.zone_end(&ctx, zone);
                 Some(b.textures())
+            }
+            _ => None,
+        };
+        // A menu that comes or goes over the world: drawn apart, and blurred.
+        let layer = match (&self.layer, veil, surface, gui) {
+            (Some(l), Some(v), Some(s), Some(g))
+                if v.wants_layer() && backdrop.is_some() && l.matches(s.format, s.extent) =>
+            {
+                let zone = self.frames.zone_begin(&ctx, "menu layer");
+                let size = [s.extent.width as f32, s.extent.height as f32];
+                let mut pass = encoder.texture_pass_cleared(
+                    &self.pipelines,
+                    &self.textures,
+                    l.full(),
+                    [0.0; 4],
+                );
+                // SAFETY: as the window's pass below, where the same is drawn.
+                unsafe { draw_gui(&mut pass, &mut self.frame_data, &g, size, backdrop, false) };
+                pass.finish();
+                l.blur(&mut encoder, &self.pipelines, &self.textures, v.menu_blur);
+                self.frames.zone_end(&ctx, zone);
+                Some(l.push(&v))
             }
             _ => None,
         };
@@ -1563,12 +1696,12 @@ impl Renderer {
                         }
                         self.world_times.draw_ns = started.elapsed().as_nanos() as u64;
                     }
-                    (_, _, Some((scene, _))) => pass.draw(
-                        PipelineId::Blur.index(),
-                        &backdrop::blur_push_copy(scene),
-                        3,
-                        1,
-                    ),
+                    (_, _, Some(_)) => {
+                        if let Some(b) = &self.backdrop {
+                            let push = b.copy_push(veil.as_ref().filter(|_| world_in_backdrop));
+                            pass.draw(PipelineId::Blur.index(), &push, 3, 1);
+                        }
+                    }
                     _ => pass.draw(
                         PipelineId::Background.index(),
                         &background.push_constants(self.stars),
@@ -1576,44 +1709,21 @@ impl Renderer {
                         1,
                     ),
                 }
-                if let Some(g) = gui.filter(|g| !g.quads.is_empty() && g.scale > 0)
-                    && let Some((first, bytes)) =
-                        self.frame_data.alloc(g.quads.len() as u32, gui::QUAD_BYTES)
-                {
-                    gui::write_quads(g.quads, bytes);
-                    let mut push = [0u8; 16];
-                    push[0..8].copy_from_slice(&screen);
-                    push[8..12].copy_from_slice(&(g.scale as f32).to_ne_bytes());
-                    push[12..16].copy_from_slice(&first.to_ne_bytes());
-                    pass.draw(over(PipelineId::Gui), &push, 6, g.quads.len() as u32);
-                }
-                if let Some(g) = gui.filter(|g| !g.shapes.is_empty())
-                    && let Some((first, bytes)) = self
-                        .frame_data
-                        .alloc(g.shapes.len() as u32, gui::SHAPE_BYTES)
-                {
-                    gui::write_shapes(g.shapes, bytes);
-                    let (scene, blurred) =
-                        backdrop.unwrap_or((TextureId::MISSING, TextureId::MISSING));
-                    let mut push = [0u8; 24];
-                    push[0..8].copy_from_slice(&screen);
-                    push[8..12].copy_from_slice(&scene.index().to_ne_bytes());
-                    push[12..16].copy_from_slice(&blurred.index().to_ne_bytes());
-                    push[16..20].copy_from_slice(&first.to_ne_bytes());
-                    push[20..24].copy_from_slice(&u32::from(backdrop.is_some()).to_ne_bytes());
-                    pass.draw(over(PipelineId::Shape), &push, 6, g.shapes.len() as u32);
-                }
-                if let Some(g) = gui.filter(|g| !g.glyphs.is_empty())
-                    && let Some((first, bytes)) = self
-                        .frame_data
-                        .alloc(g.glyphs.len() as u32, gui::GLYPH_BYTES)
-                {
-                    gui::write_glyphs(g.glyphs, bytes);
-                    let mut push = [0u8; 16];
-                    push[0..8].copy_from_slice(&screen);
-                    push[8..12].copy_from_slice(&g.font_atlas.to_ne_bytes());
-                    push[12..16].copy_from_slice(&first.to_ne_bytes());
-                    pass.draw(over(PipelineId::Text), &push, 6, g.glyphs.len() as u32);
+                match layer {
+                    Some(push) => pass.draw(PipelineId::Layer.index(), &push, 3, 1),
+                    None => {
+                        if let Some(g) = &gui {
+                            let size = [t.extent.width as f32, t.extent.height as f32];
+                            draw_gui(
+                                &mut pass,
+                                &mut self.frame_data,
+                                g,
+                                size,
+                                backdrop,
+                                in_window.is_some(),
+                            );
+                        }
+                    }
                 }
                 let rects = self.overlay.build(t.extent.width, t.extent.height);
                 if let Some((first, bytes)) = self

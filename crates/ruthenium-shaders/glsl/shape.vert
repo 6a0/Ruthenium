@@ -11,7 +11,7 @@ struct Shape {
     vec4 uv;     // image: u0, v0, u1, v1
     uvec4 tex;   // x: image texture index; y: ring width (float bits); z, w: clip fades (float bits)
     vec4 clip;   // x0, y0, x1, y1 in pixels
-    vec4 extra;  // x: opacity; y: glass bevel width (px)
+    vec4 extra;  // x: opacity; y: glass bevel width (px); z, w: the clip's side fades (px)
 };
 #define FRAME_ELEMENT Shape
 #include "frame.glsl"
@@ -22,6 +22,7 @@ layout(push_constant) uniform Push {
     uint blurred;
     uint first;
     uint backdrop; // 1 when scene and blurred are drawn and may be sampled
+    vec2 grade;    // how the window shows the backdrop: its saturation and brightness
 } pc;
 
 layout(location = 0) flat out uint v_index;

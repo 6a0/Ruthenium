@@ -8,14 +8,18 @@ use crate::text::{Fonts, GlyphAtlas, Line, TextList, TextStyle, Weight};
 pub mod accounts;
 pub mod form;
 pub mod list;
+pub mod pause;
 pub mod servers;
 pub mod settings;
+pub mod transition;
 
 pub use accounts::{AccountView, AccountsScreen};
 pub use form::{Field, FormButton, FormScreen, FormSpec, TextField};
 pub use list::ScrollList;
+pub use pause::PauseScreen;
 pub use servers::{Ping, RowView, ServerListScreen};
 pub use settings::{ControlSpec, SectionSpec, SettingSpec, SettingsEvent, SettingsScreen};
+pub use transition::{MenuLook, MenuTransition};
 
 /// Window pixels per UI unit: the layout is designed for a window 900 units tall, so it
 /// keeps its proportions at any size (never below 0.75 px per unit, so text stays
@@ -269,6 +273,8 @@ pub fn px_rect(scale: &UiScale, r: Rect) -> [f32; 4] {
 pub enum Action {
     Multiplayer,
     Settings,
+    /// The game's own options (the Game Menu's).
+    GameSettings,
     Quit,
     /// Back to the previous screen (also Escape).
     Back,

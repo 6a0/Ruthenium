@@ -193,6 +193,8 @@ pub struct Options {
     pub hud: Option<bool>,
     /// Whether the frame's corners darken in the dark (the default).
     pub vignette: Option<bool>,
+    /// Development: show the Game Menu as soon as the world is there.
+    pub game_menu: Option<crate::menu::ShownMenu>,
     /// Show the player list without its key (default: no).
     pub player_list: Option<bool>,
     /// Whether animated textures play (the default) or hold still.
@@ -268,6 +270,7 @@ impl Options {
             crosshair: None,
             hud: None,
             vignette: None,
+            game_menu: None,
             player_list: None,
             animations: None,
             fov_effects: None,
@@ -506,6 +509,12 @@ impl Options {
                     );
                 }
                 "--servers-file" => o.servers_file = Some(value("a file")?.into()),
+                "--game-menu" => {
+                    let v = value("0 to 1, ruthenium, mc or mc:<page>")?;
+                    o.game_menu = Some(crate::menu::ShownMenu::parse(&v).ok_or(format!(
+                        "--game-menu: not 0 to 1, ruthenium, mc or mc:<page>: {v}"
+                    ))?);
+                }
                 "--screen" => o.screen = Some(value("a screen name")?),
                 "--select" => {
                     let v = value("a server number")?;
@@ -565,6 +574,16 @@ pub fn run(opts: &Options, started: Instant) -> ExitCode {
     }
 }
 
+/// The game's options the renderer keeps (the menu hands over the others every frame).
+fn apply_game_options(renderer: &mut Renderer, game: &crate::settings::GameOptions) {
+    renderer.set_entity_shadows(game.entity_shadows);
+    renderer.set_fov_effects(game.fov_effects as f32 / 100.0);
+    renderer.set_view_options(ruthenium_render::ViewOptions {
+        bobbing: game.view_bobbing,
+        damage_tilt: game.damage_tilt as f32 / 100.0,
+    });
+}
+
 fn policy(vsync: bool) -> PresentPolicy {
     if vsync {
         PresentPolicy::VSync
@@ -621,6 +640,13 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     if opts.overlay {
         settings.settings.frame_stats = true;
     }
+    let game = &mut settings.settings.game;
+    game.vignette = opts.vignette.unwrap_or(game.vignette);
+    game.entity_shadows = opts.entity_shadows.unwrap_or(game.entity_shadows);
+    game.view_bobbing = opts.view_bobbing.unwrap_or(game.view_bobbing);
+    if let Some(on) = opts.fov_effects {
+        game.fov_effects = if on { 100 } else { 0 };
+    }
     let mut menu = Menu::new(servers_file, accounts, settings);
     if let Some(n) = opts.mesh_workers {
         menu.set_mesh_workers(n);
@@ -631,8 +657,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     if let Some(on) = opts.hud {
         menu.set_hud(on);
     }
-    if let Some(on) = opts.vignette {
-        menu.set_vignette(on);
+    if let Some(shown) = opts.game_menu {
+        menu.show_menu(shown);
     }
     if let Some(on) = opts.player_list {
         menu.set_player_list(on);
@@ -795,26 +821,15 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     if let Some(on) = opts.players {
         renderer.set_players(on);
     }
-    if let Some(on) = opts.entity_shadows {
-        renderer.set_entity_shadows(on);
-    }
+    apply_game_options(&mut renderer, &applied.game);
     if let Some(on) = opts.hand {
         renderer.set_hand(on);
     }
     if let Some(on) = opts.block_outline {
         renderer.set_block_outline(on);
     }
-    if let Some(on) = opts.view_bobbing {
-        renderer.set_view_options(ruthenium_render::ViewOptions {
-            bobbing: on,
-            ..renderer.view_options()
-        });
-    }
     if let Some(on) = opts.animations {
         renderer.set_animate(on);
-    }
-    if let Some(on) = opts.fov_effects {
-        renderer.set_fov_effects(if on { 1.0 } else { 0.0 });
     }
     {
         let mut air = renderer.atmosphere_options();
@@ -1092,6 +1107,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             }
             if wanted.frame_stats != applied.frame_stats {
                 renderer.overlay_mut().set_visible(wanted.frame_stats);
+            }
+            if wanted.game != applied.game {
+                apply_game_options(&mut renderer, &wanted.game);
             }
             applied = wanted.clone();
         }

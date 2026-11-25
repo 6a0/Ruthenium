@@ -22,14 +22,17 @@ pub struct GuiFrame<'a> {
     /// Text, drawn after the shapes, from the glyph atlas texture `font_atlas`.
     pub glyphs: &'a [GlyphQuad],
     pub font_atlas: u32,
+    /// How the world is seen behind the menu, and the menu while it comes or goes.
+    pub veil: Option<crate::Veil>,
 }
 
-/// Bytes per glyph in the frame's data (std430: five vec4s).
-pub const GLYPH_BYTES: u32 = 80;
+/// Bytes per glyph in the frame's data (std430: six vec4s).
+pub const GLYPH_BYTES: u32 = 96;
 
 pub fn write_glyphs(glyphs: &[GlyphQuad], out: &mut [u8]) {
-    for (g, chunk) in glyphs.iter().zip(out.as_chunks_mut::<80>().0) {
+    for (g, chunk) in glyphs.iter().zip(out.as_chunks_mut::<96>().0) {
         let params = [g.range, g.clip.fade_top, g.clip.fade_bottom, g.clip.opacity];
+        let sides = [g.clip.fade_left, g.clip.fade_right, 0.0, 0.0];
         let words = chunk.as_chunks_mut::<4>().0;
         for (w, v) in words.iter_mut().zip(
             g.rect
@@ -37,7 +40,8 @@ pub fn write_glyphs(glyphs: &[GlyphQuad], out: &mut [u8]) {
                 .chain(&g.uv)
                 .chain(&g.color)
                 .chain(&params)
-                .chain(&g.clip.rect),
+                .chain(&g.clip.rect)
+                .chain(&sides),
         ) {
             *w = v.to_ne_bytes();
         }
@@ -72,8 +76,8 @@ pub fn write_shapes(shapes: &[Shape], out: &mut [u8]) {
         }
         words[24] = s.clip.opacity.to_ne_bytes();
         words[25] = s.bevel.to_ne_bytes();
-        words[26] = [0; 4];
-        words[27] = [0; 4];
+        words[26] = s.clip.fade_left.to_ne_bytes();
+        words[27] = s.clip.fade_right.to_ne_bytes();
     }
 }
 

@@ -83,10 +83,12 @@ pub enum PipelineId {
     /// darkens it.
     Crosshair,
     Vignette,
+    /// A menu's layer laid over the world behind it.
+    Layer,
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 43] = [
+    pub const ALL: [PipelineId; 44] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -130,6 +132,7 @@ impl PipelineId {
         PipelineId::WorldOverlay,
         PipelineId::Crosshair,
         PipelineId::Vignette,
+        PipelineId::Layer,
     ];
 
     /// The pipeline that draws the same in a pass with a depth attachment, for the
@@ -409,6 +412,12 @@ impl PipelineId {
                 shaders::BACKGROUND_VERT.words(),
                 shaders::BLUR_FRAG.words(),
                 Blend::Opaque,
+            ),
+            PipelineId::Layer => GraphicsDesc::flat(
+                "layer",
+                shaders::BACKGROUND_VERT.words(),
+                shaders::BLUR_FRAG.words(),
+                Blend::Premultiplied,
             ),
             PipelineId::Shape => GraphicsDesc::flat(
                 "shape",

@@ -8,6 +8,7 @@
 #include "push.glsl"
 #include "textures.glsl"
 #include "clip.glsl"
+#include "grade.glsl"
 
 struct Shape {
     vec4 rect;
@@ -27,6 +28,7 @@ layout(push_constant) uniform Push {
     uint blurred;
     uint first;
     uint backdrop;
+    vec2 grade; // how the window shows the backdrop: its saturation and brightness
 } pc;
 
 layout(location = 0) flat in uint v_index;
@@ -50,7 +52,8 @@ void main() {
     if (ring > 0.0) {
         coverage *= clamp(d + ring + 0.5, 0.0, 1.0);
     }
-    coverage *= clip_coverage(s.clip, uintBitsToFloat(s.tex.z), uintBitsToFloat(s.tex.w)) * s.extra.x;
+    vec4 fade = vec4(uintBitsToFloat(s.tex.z), uintBitsToFloat(s.tex.w), s.extra.zw);
+    coverage *= clip_coverage(s.clip, fade) * s.extra.x;
     if (coverage <= 0.0) {
         discard;
     }
@@ -95,7 +98,7 @@ void main() {
     vec3 frost = sample_texture(pc.blurred, SAMPLER_LINEAR_CLAMP, uv).rgb;
     vec3 sharp = sample_texture(pc.scene, SAMPLER_LINEAR_CLAMP, uv).rgb;
     // Mostly frosted, a little of the sharp scene at the rim where the glass is thin.
-    vec3 c = mix(frost, sharp, 0.35 * rim);
+    vec3 c = graded(mix(frost, sharp, 0.35 * rim), pc.grade);
     // Glass lifts what is behind it slightly, then the tint.
     c = c * 1.03 + 0.012;
     c = mix(c, s.fill.rgb, s.fill.a);

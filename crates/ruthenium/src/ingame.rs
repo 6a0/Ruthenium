@@ -173,9 +173,6 @@ impl InGame {
     }
 }
 
-/// The field of view from top to bottom, in degrees: the FOV option's default.
-const FOV: f32 = 70.0;
-
 /// What a frame draws of the world: what the game thread published, and where it is
 /// seen from.
 #[derive(Debug, Clone)]
@@ -191,8 +188,8 @@ pub struct WorldView {
 
 /// The world as the session's latest frame has it, seen from the player's eyes: the
 /// player's place between its last two ticks (`now` says how far), looking where the
-/// mouse has turned to since.
-pub fn world_view(session: &Session, now: Instant) -> Option<WorldView> {
+/// mouse has turned to since, with a field of view of `fov` degrees from top to bottom.
+pub fn world_view(session: &Session, now: Instant, fov: f32) -> Option<WorldView> {
     let camera = session.camera()?;
     let f = &camera.frame;
     let partial_tick = f.partial_tick(now);
@@ -207,7 +204,7 @@ pub fn world_view(session: &Session, now: Instant) -> Option<WorldView> {
             position,
             y_rot: camera.y_rot,
             x_rot: camera.x_rot,
-            fov: FOV,
+            fov,
         },
         // What every session tells its server (`crate::join`).
         view_distance: i32::from(ClientInformation::default().view_distance),

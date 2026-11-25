@@ -107,6 +107,7 @@ pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
                 Blend::Multiply => 3,
                 Blend::Invert => 4,
                 Blend::Darken => 5,
+                Blend::Premultiplied => 6,
             })
             .u32(match d.depth {
                 Depth::None => 0,
@@ -360,6 +361,9 @@ pub enum Blend {
     /// What is there darkened by the source: `(1 - src) * dst`; the target's alpha
     /// stays (vanilla's blend of the vignette).
     Darken,
+    /// Alpha already multiplied in: `src + (1 - src.a) * dst` (a layer drawn over
+    /// nothing, laid over a picture).
+    Premultiplied,
 }
 
 /// How much nearer a [`Depth::Decal`] is drawn: steps of the depth format, and times the
@@ -917,6 +921,15 @@ fn build_one(
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ZERO)
             .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA),
+        Blend::Premultiplied => vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA),
     };

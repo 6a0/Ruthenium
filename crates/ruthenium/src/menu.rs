@@ -31,8 +31,8 @@ use ruthenium_render::{GuiFrame, Renderer};
 use ruthenium_ui::logo::Logo;
 use ruthenium_ui::modern::{
     AccountView, AccountsScreen, Action, ButtonStates, Ease, Field, FormButton, FormScreen,
-    FormSpec, Key, Presence, SettingsEvent, SettingsScreen, ShapeList, TitleScreen, UiScale,
-    WEIGHTS,
+    FormSpec, Key, MenuTransition, PauseScreen, Presence, SettingsEvent, SettingsScreen, ShapeList,
+    TitleScreen, UiScale, WEIGHTS,
 };
 use ruthenium_ui::text::{ATLAS_SIZE, Fonts, GlyphAtlas, TextList, TextStyle, Weight};
 
@@ -46,7 +46,7 @@ use crate::ingame::InGame;
 use crate::join::Joiner;
 use crate::route::RoutePlayer;
 use crate::servers::{Servers, valid_address};
-use crate::settings::{FRAME_STATS, FULLSCREEN, Settings, SettingsFile};
+use crate::settings::{GAME, Group, RUTHENIUM, Row, Settings, SettingsFile, all_groups, rows_of};
 
 /// The characters a form's message line holds.
 const MESSAGE_WIDTH: usize = 52;
@@ -67,8 +67,10 @@ const SCANCODE_TAB: u32 = 43;
 const SCANCODE_SPACE: u32 = 44;
 const SCANCODE_F5: u32 = 62;
 const SCANCODE_HOME: u32 = 74;
+const SCANCODE_PAGE_UP: u32 = 75;
 const SCANCODE_DELETE: u32 = 76;
 const SCANCODE_END: u32 = 77;
+const SCANCODE_PAGE_DOWN: u32 = 78;
 const SCANCODE_RIGHT: u32 = 79;
 const SCANCODE_LEFT: u32 = 80;
 const SCANCODE_DOWN: u32 = 81;
@@ -245,8 +247,6 @@ enum FormKind {
     CodeOfConduct,
     /// Configured, the level loading, and Disconnect.
     Playing,
-    /// The Game Menu over the world: Back to Game and Disconnect.
-    Paused,
     /// Why the session ended.
     Disconnected,
     /// The death screen: Respawn (Spectate World in hardcore) and Title Screen, working
@@ -292,6 +292,57 @@ enum Screen {
     Form(FormKind, Box<FormScreen>, PackStatus),
     /// In the world, no screen open: the mouse turns the camera.
     Game,
+    /// The Game Menu over the world.
+    Paused,
+}
+
+/// Which settings the Settings screen shows, and from where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsOf {
+    /// All of them, from the title screen.
+    Title,
+    /// Ruthenium's, and the game's own, from the Game Menu.
+    Ruthenium,
+    Game,
+}
+
+impl SettingsOf {
+    fn groups(self) -> Vec<Group> {
+        match self {
+            SettingsOf::Title => all_groups(),
+            SettingsOf::Ruthenium => RUTHENIUM.to_vec(),
+            SettingsOf::Game => GAME.to_vec(),
+        }
+    }
+}
+
+/// Development: what of the Game Menu to show for a screenshot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShownMenu {
+    /// The menu, so far come (0 to 1).
+    Coming(f32),
+    RutheniumOptions,
+    /// MC Options, on this page.
+    GameOptions(usize),
+}
+
+impl ShownMenu {
+    pub fn parse(s: &str) -> Option<ShownMenu> {
+        match s {
+            "ruthenium" => Some(ShownMenu::RutheniumOptions),
+            "mc" => Some(ShownMenu::GameOptions(0)),
+            _ if s.starts_with("mc:") => {
+                let page: usize = s["mc:".len()..].parse().ok()?;
+                (page < GAME.len()).then_some(ShownMenu::GameOptions(page))
+            }
+            _ => {
+                let share: f32 = s.parse().ok()?;
+                (0.0..=1.0)
+                    .contains(&share)
+                    .then_some(ShownMenu::Coming(share))
+            }
+        }
+    }
 }
 
 /// See the module docs.
@@ -312,6 +363,13 @@ pub struct Menu {
     settings_changed: Option<Instant>,
     /// The Settings screen, while it shows.
     settings_screen: Option<SettingsScreen>,
+    settings_of: SettingsOf,
+    /// The Game Menu, while it or its options show and until it has gone; how it comes
+    /// and goes.
+    pause: Option<PauseScreen>,
+    transition: MenuTransition,
+    /// Development: shown as soon as the world is.
+    shown_menu: Option<ShownMenu>,
     accounts: Accounts,
     /// The Accounts screen, while it or one of its forms shows.
     accounts_screen: Option<AccountsScreen>,
@@ -352,8 +410,6 @@ pub struct Menu {
     /// Whether the crosshair is drawn over the world, and the HUD at all.
     crosshair: bool,
     hud: bool,
-    /// Whether the frame's corners darken in the dark (vanilla's Vignette option).
-    vignette: bool,
     /// The route played once the session is in the world (`--route`).
     route: Option<RoutePlayer>,
 }
@@ -442,6 +498,10 @@ impl Menu {
             settings,
             settings_changed: None,
             settings_screen: None,
+            settings_of: SettingsOf::Title,
+            pause: None,
+            transition: MenuTransition::default(),
+            shown_menu: None,
             accounts,
             accounts_screen: None,
             accounts_seen: None,
@@ -464,7 +524,6 @@ impl Menu {
             mesh_workers: default_mesh_workers(),
             crosshair: true,
             hud: true,
-            vignette: true,
             route: None,
         }
     }
@@ -512,9 +571,9 @@ impl Menu {
         self.hud = on;
     }
 
-    /// Whether the vignette is drawn (it is unless said otherwise).
-    pub fn set_vignette(&mut self, on: bool) {
-        self.vignette = on;
+    /// Development: shows the Game Menu as soon as the world is there.
+    pub fn show_menu(&mut self, menu: ShownMenu) {
+        self.shown_menu = Some(menu);
     }
 
     /// Whether the player list shows without its key held (it does not unless said
@@ -523,15 +582,16 @@ impl Menu {
         self.game.set_player_list(on);
     }
 
-    /// How this frame's HUD is to be drawn: over the world while no screen is open,
-    /// unless it is switched off.
+    /// How this frame's HUD is to be drawn: over the world, and under a screen that is
+    /// open over it, unless it is switched off.
     pub fn hud_params(&self) -> Option<ruthenium_render::HudParams> {
-        (self.hud && matches!(self.screen, Screen::Game)).then(|| ruthenium_render::HudParams {
-            gui_scale: 0,
-            vignette: self.vignette,
+        let game = &self.settings.settings.game;
+        (self.hud && self.session.is_some()).then(|| ruthenium_render::HudParams {
+            gui_scale: game.gui_scale,
+            vignette: game.vignette,
             options: ruthenium_ui::hud::HudOptions {
                 crosshair: self.crosshair,
-                ..Default::default()
+                attack_indicator: game.attack_indicator,
             },
             millis: self.started.elapsed().as_millis() as i64,
             now: Instant::now(),
@@ -540,7 +600,8 @@ impl Menu {
 
     /// The world to draw this frame, if the session is in one.
     pub fn world_view(&self) -> Option<crate::ingame::WorldView> {
-        crate::ingame::world_view(self.session.as_ref()?, Instant::now())
+        let fov = self.settings.settings.game.fov as f32;
+        crate::ingame::world_view(self.session.as_ref()?, Instant::now(), fov)
     }
 
     /// Hands the world's drawing assets to the renderer once they are built (they
@@ -586,6 +647,11 @@ impl Menu {
         buttons: Vec<FormButton>,
     ) {
         let Some(scale) = self.scale else { return };
+        // (Options that were open over the world.)
+        if matches!(self.screen, Screen::Settings) {
+            self.settings_screen = None;
+            self.save_settings();
+        }
         let message = lines
             .iter()
             .flat_map(|l| crate::join::wrap(l, MESSAGE_WIDTH))
@@ -643,7 +709,29 @@ impl Menu {
     /// Into the world, no screen open (`setScreen(null)`, which grabs the mouse).
     fn enter_game(&mut self) {
         self.game.enter(self.session.as_ref());
+        if matches!(self.screen, Screen::Settings) {
+            self.settings_screen = None;
+            self.save_settings();
+        }
+        match (&self.screen, &mut self.pause) {
+            // The Game Menu goes as it came.
+            (Screen::Paused, Some(p)) => {
+                p.states.cancel();
+                p.states.hover(None);
+                p.states.set_focus(None, false);
+            }
+            _ => self.pause = None,
+        }
         self.screen = Screen::Game;
+    }
+
+    /// Whether the Game Menu or its options are open.
+    fn game_menu_open(&self) -> bool {
+        match self.screen {
+            Screen::Paused => true,
+            Screen::Settings => self.settings_of != SettingsOf::Title,
+            _ => false,
+        }
     }
 
     /// The Game Menu (`pauseGame`): keys let go, the mouse freed.
@@ -652,16 +740,9 @@ impl Menu {
         if let Some(s) = &self.session {
             s.pause();
         }
-        let title = self.server_name.clone();
-        self.session_form(
-            FormKind::Paused,
-            "Game Menu",
-            &[&title],
-            vec![
-                button("Back to Game", Action::Confirm),
-                button("Disconnect", Action::Cancel),
-            ],
-        );
+        let Some(scale) = self.scale else { return };
+        self.pause = Some(PauseScreen::new(scale, &self.fonts));
+        self.screen = Screen::Paused;
     }
 
     /// Shows the death screen as it stands: its buttons work once it has been open 20
@@ -742,6 +823,8 @@ impl Menu {
         }
         self.death = None;
         self.leaving = true;
+        self.pause = None;
+        self.transition.end();
         self.screen = Screen::Servers;
     }
 
@@ -751,16 +834,14 @@ impl Menu {
             return;
         };
         let events: Vec<SessionEvent> = session.poll().collect();
-        let ours = matches!(
-            self.screen,
-            Screen::Form(
-                FormKind::Connecting
-                    | FormKind::CodeOfConduct
-                    | FormKind::Playing
-                    | FormKind::Paused,
-                ..
-            )
-        );
+        let ours = self.game_menu_open()
+            || matches!(
+                self.screen,
+                Screen::Form(
+                    FormKind::Connecting | FormKind::CodeOfConduct | FormKind::Playing,
+                    ..
+                )
+            );
         for e in events {
             match e {
                 SessionEvent::Stage(s) if ours && !self.leaving => self.connecting_form(s),
@@ -852,6 +933,10 @@ impl Menu {
                     self.forget_world = true;
                     if self.leaving || crate::join::left_on_purpose(&c) {
                         self.leaving = false;
+                        if self.game_menu_open() {
+                            self.settings_screen = None;
+                            self.screen = Screen::Servers;
+                        }
                         if let Some(r) = &mut self.route {
                             r.fail("the session was left".into());
                         }
@@ -902,6 +987,9 @@ impl Menu {
         if let Some(s) = &mut self.settings_screen {
             s.cancel();
         }
+        if let Some(p) = &mut self.pause {
+            p.states.cancel();
+        }
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.states.cancel();
         }
@@ -912,23 +1000,25 @@ impl Menu {
         &self.settings.settings
     }
 
-    /// Changes setting `i` (a Settings screen row) from outside the screen, which shows
-    /// it.
-    fn set_setting(&mut self, i: usize, value: usize) {
+    /// Changes a setting from outside the settings screen, which shows it if it has it.
+    fn set_setting(&mut self, row: Row, value: usize) {
         let before = self.settings.settings.clone();
-        self.settings.settings.set(i, value);
+        self.settings.settings.set(row, value);
         if self.settings.settings != before {
             self.settings_changed = Some(Instant::now());
         }
         if let Some(s) = &mut self.settings_screen {
-            s.set_value(i, self.settings.settings.get(i));
+            let rows = rows_of(&self.settings_of.groups());
+            if let Some(i) = rows.iter().position(|r| *r == row) {
+                s.set_value(i, self.settings.settings.get(row));
+            }
         }
     }
 
     /// F3: shows or hides the frame stats.
     pub fn toggle_frame_stats(&mut self) {
         self.set_setting(
-            FRAME_STATS,
+            Row::FrameStats,
             usize::from(!self.settings.settings.frame_stats),
         );
     }
@@ -940,7 +1030,7 @@ impl Menu {
 
     /// The window went in or out of fullscreen (F11, or the window manager).
     pub fn set_fullscreen(&mut self, on: bool) {
-        self.set_setting(FULLSCREEN, usize::from(on));
+        self.set_setting(Row::Fullscreen, usize::from(on));
     }
 
     /// Saves the settings if they changed.
@@ -953,20 +1043,39 @@ impl Menu {
     fn settings_event(&mut self, e: SettingsEvent) {
         match e {
             SettingsEvent::Changed { setting, value } => {
-                self.settings.settings.set(setting, value);
-                self.settings_changed = Some(Instant::now());
+                if let Some(row) = rows_of(&self.settings_of.groups()).get(setting) {
+                    self.settings.settings.set(*row, value);
+                    self.settings_changed = Some(Instant::now());
+                }
             }
             SettingsEvent::Done => {
                 self.settings_screen = None;
-                self.screen = Screen::Title;
+                self.screen = if self.settings_of == SettingsOf::Title {
+                    Screen::Title
+                } else {
+                    self.transition.change_screen();
+                    Screen::Paused
+                };
                 self.save_settings();
             }
         }
     }
 
     /// Opens the Settings screen.
-    fn open_settings(&mut self, scale: UiScale) {
-        let mut screen = SettingsScreen::new(scale, &self.fonts, self.settings.settings.sections());
+    fn open_settings(&mut self, scale: UiScale, of: SettingsOf) {
+        let sections = self.settings.settings.sections(&of.groups());
+        let fonts = &self.fonts;
+        if of != SettingsOf::Title {
+            self.transition.change_screen();
+        }
+        self.settings_of = of;
+        let mut screen = match of {
+            SettingsOf::Title => SettingsScreen::paged(scale, fonts, "Settings", sections),
+            SettingsOf::Ruthenium => {
+                SettingsScreen::new(scale, fonts, "Ruthenium Options", sections)
+            }
+            SettingsOf::Game => SettingsScreen::paged(scale, fonts, "MC Options", sections),
+        };
         screen.set_reduce_motion(self.settings.settings.reduce_motion);
         self.settings_screen = Some(screen);
         self.screen = Screen::Settings;
@@ -986,6 +1095,9 @@ impl Menu {
         }
         if let Some(s) = &mut self.settings_screen {
             s.set_reduce_motion(still);
+        }
+        if let Some(p) = &mut self.pause {
+            p.states.set_reduce_motion(still);
         }
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.states.set_reduce_motion(still);
@@ -1019,6 +1131,9 @@ impl Menu {
         }
         if let Some(s) = &mut self.settings_screen {
             s.layout(scale, &self.fonts);
+        }
+        if let Some(p) = &mut self.pause {
+            p.layout(scale, &self.fonts);
         }
         self.accounts_seen = None;
         self.sync_accounts();
@@ -1233,7 +1348,6 @@ impl Menu {
             FormKind::Connecting
             | FormKind::CodeOfConduct
             | FormKind::Playing
-            | FormKind::Paused
             | FormKind::Disconnected
             | FormKind::Died
             | FormKind::InBed
@@ -1258,7 +1372,6 @@ impl Menu {
             | FormKind::Connecting
             | FormKind::CodeOfConduct
             | FormKind::Playing
-            | FormKind::Paused
             | FormKind::Disconnected
             | FormKind::Died
             | FormKind::InBed
@@ -1291,7 +1404,7 @@ impl Menu {
             }
             (Screen::Title, Action::Quit) => return Some(Action::Quit),
             (Screen::Title, Action::Accounts) => self.open_accounts(scale),
-            (Screen::Title, Action::Settings) => self.open_settings(scale),
+            (Screen::Title, Action::Settings) => self.open_settings(scale, SettingsOf::Title),
             (Screen::Title, other) => eprintln!("[ruthenium] {other:?}: not there yet"),
             (Screen::Servers, Action::Back) => {
                 // Without a renderer at hand (a key), the next frame frees the icons.
@@ -1312,10 +1425,10 @@ impl Menu {
                 Screen::Form(FormKind::Connecting | FormKind::Playing, ..),
                 Action::Cancel | Action::Back,
             ) => self.leave(),
-            (Screen::Form(FormKind::Paused, ..), Action::Confirm | Action::Back) => {
-                self.enter_game();
-            }
-            (Screen::Form(FormKind::Paused, ..), Action::Cancel) => self.leave(),
+            (Screen::Paused, Action::Back) => self.enter_game(),
+            (Screen::Paused, Action::Settings) => self.open_settings(scale, SettingsOf::Ruthenium),
+            (Screen::Paused, Action::GameSettings) => self.open_settings(scale, SettingsOf::Game),
+            (Screen::Paused, Action::Cancel) => self.leave(),
             (Screen::Form(FormKind::CodeOfConduct, ..), Action::Confirm) => {
                 if let Some(s) = &self.session {
                     s.answer_code_of_conduct(true);
@@ -1489,7 +1602,6 @@ impl Menu {
                     FormKind::Connecting
                     | FormKind::CodeOfConduct
                     | FormKind::Playing
-                    | FormKind::Paused
                     | FormKind::Disconnected
                     | FormKind::Died
                     | FormKind::InBed
@@ -1552,20 +1664,35 @@ impl Menu {
                 self.game.key(scancode, down, self.session.as_ref());
                 return None;
             }
-            Screen::Form(FormKind::Paused, ..) if escape => {
-                return self.act(Action::Back, None, clipboard);
-            }
+            Screen::Paused if escape => return self.act(Action::Back, None, clipboard),
             _ => {}
         }
         let action = match &mut self.screen {
             // Handled above.
             Screen::Game => None,
+            Screen::Paused => {
+                let screen = self.pause.as_mut()?;
+                let key = match scancode {
+                    SCANCODE_DOWN | SCANCODE_RIGHT => Some(Key::Next),
+                    SCANCODE_UP | SCANCODE_LEFT => Some(Key::Previous),
+                    SCANCODE_RETURN | SCANCODE_KP_ENTER | SCANCODE_SPACE if !repeat => {
+                        Some(Key::Activate)
+                    }
+                    _ => nav,
+                }?;
+                let i = screen.states.key(key, down)?;
+                Some(screen.buttons[i].action)
+            }
             Screen::Settings => {
                 let screen = self.settings_screen.as_mut()?;
                 let e = match scancode {
                     SCANCODE_ESCAPE if down && !repeat => Some(SettingsEvent::Done),
                     SCANCODE_DOWN => screen.key(Key::Next, down),
                     SCANCODE_UP => screen.key(Key::Previous, down),
+                    SCANCODE_PAGE_UP | SCANCODE_PAGE_DOWN if down => {
+                        screen.turn(if scancode == SCANCODE_PAGE_UP { -1 } else { 1 });
+                        None
+                    }
                     SCANCODE_LEFT | SCANCODE_RIGHT if down => {
                         screen.adjust(if scancode == SCANCODE_LEFT { -1 } else { 1 })
                     }
@@ -1772,6 +1899,17 @@ impl Menu {
                 self.game.mouse_button(1, down, self.session.as_ref());
                 None
             }
+            Screen::Paused => {
+                let screen = self.pause.as_mut()?;
+                let hit = screen.hit(ux, uy);
+                if down {
+                    screen.states.mouse_down(hit);
+                    None
+                } else {
+                    let i = screen.states.mouse_up(hit)?;
+                    Some(screen.buttons[i].action)
+                }
+            }
             Screen::Settings => {
                 let screen = self.settings_screen.as_mut()?;
                 let e = if down {
@@ -1972,6 +2110,22 @@ impl Menu {
         if matches!(self.screen, Screen::Game) && self.game.should_pause() {
             self.pause();
         }
+        if matches!(self.screen, Screen::Game)
+            && renderer.world_ready()
+            && let Some(shown) = self.shown_menu
+        {
+            self.pause();
+            match shown {
+                ShownMenu::Coming(_) => {}
+                ShownMenu::RutheniumOptions => self.open_settings(scale, SettingsOf::Ruthenium),
+                ShownMenu::GameOptions(page) => {
+                    self.open_settings(scale, SettingsOf::Game);
+                    if let Some(s) = &mut self.settings_screen {
+                        s.turn_to(page);
+                    }
+                }
+            }
+        }
         let pointer = self
             .mouse
             .map(|(x, y)| scale.from_window(x, y, window_size, pixel_size));
@@ -2029,8 +2183,34 @@ impl Menu {
         }
         self.appear.step(1.0, dt, APPEAR_TAU, APPEAR_TAU);
         let time = self.started.elapsed().as_secs_f64();
+        if self.session.is_none() {
+            self.transition.end();
+        }
+        let options = matches!(self.screen, Screen::Settings);
+        self.transition.step(self.game_menu_open(), options, dt);
+        if let Some(ShownMenu::Coming(share)) = self.shown_menu {
+            self.transition = MenuTransition::at(share);
+        }
+        if !self.transition.shows() && !self.game_menu_open() {
+            self.pause = None;
+        }
         let mut settings_ev = None;
         match &mut self.screen {
+            // The Game Menu on its way out: nothing of it is there to be clicked.
+            Screen::Game if self.transition.menu_shows() && self.pause.is_some() => {
+                if let Some(p) = &mut self.pause {
+                    p.states.update(dt);
+                    p.draw(&mut self.shapes, &mut self.text, atlas, logo);
+                }
+            }
+            Screen::Paused => {
+                if let Some(p) = &mut self.pause {
+                    let hit = pointer.and_then(|(x, y)| p.hit(x, y));
+                    p.states.hover(hit);
+                    p.states.update(dt);
+                    p.draw(&mut self.shapes, &mut self.text, atlas, logo);
+                }
+            }
             Screen::Game => {
                 let drawn = renderer.world_ready();
                 let debug = self.settings.settings.frame_stats;
@@ -2110,10 +2290,26 @@ impl Menu {
             self.shapes.fade_all(self.appear.value);
             self.text.fade_all(self.appear.value);
         }
+        let veil = (self.transition.shows() && renderer.world_ready()).then(|| {
+            let look = self
+                .transition
+                .look(scale.px, self.settings.settings.reduce_motion);
+            // Only the Game Menu and its options come and go.
+            let menu = self.game_menu_open()
+                || matches!(self.screen, Screen::Game) && self.transition.menu_shows();
+            ruthenium_render::Veil {
+                saturation: look.saturation,
+                brightness: look.brightness,
+                blur: look.blur,
+                menu_blur: if menu { look.menu_blur } else { 0.0 },
+                menu_opacity: if menu { look.menu_opacity } else { 1.0 },
+            }
+        });
         GuiFrame {
             shapes: self.shapes.shapes(),
             glyphs: self.text.quads(),
             font_atlas: texture,
+            veil,
             ..GuiFrame::default()
         }
     }
@@ -2183,7 +2379,7 @@ impl Menu {
     /// focused.
     pub fn open_settings_named(&mut self, pixel_size: (u32, u32), focus: Option<usize>) {
         let scale = self.layout(pixel_size);
-        self.open_settings(scale);
+        self.open_settings(scale, SettingsOf::Title);
         if let Some(s) = &mut self.settings_screen {
             s.focus(focus);
         }
@@ -2451,6 +2647,14 @@ mod tests {
         press(&mut m, SCANCODE_DOWN, false, false, &clip);
         press(&mut m, SCANCODE_RETURN, false, false, &clip);
         assert!(matches!(m.screen, Screen::Settings));
+        // Ruthenium's own first; the next page is Video.
+        press(&mut m, SCANCODE_PAGE_DOWN, false, false, &clip);
+        assert_eq!(m.settings_screen.as_ref().unwrap().page(), 1);
+        // Menu Size, its third row: the next layout is larger.
+        for _ in 0..3 {
+            press(&mut m, SCANCODE_DOWN, false, false, &clip);
+        }
+        press(&mut m, SCANCODE_RIGHT, false, false, &clip);
         // VSync off with Left, then the frame rate one step down from Unlimited.
         press(&mut m, SCANCODE_DOWN, false, false, &clip);
         press(&mut m, SCANCODE_LEFT, false, false, &clip);
@@ -2458,17 +2662,12 @@ mod tests {
         press(&mut m, SCANCODE_DOWN, false, false, &clip);
         press(&mut m, SCANCODE_LEFT, false, false, &clip);
         assert_eq!(m.settings().max_fps, Some(crate::settings::FPS_MAX));
-        // Menu Size: the next layout is larger.
-        for _ in 0..3 {
-            press(&mut m, SCANCODE_DOWN, false, false, &clip);
-        }
-        press(&mut m, SCANCODE_RIGHT, false, false, &clip);
         let after = m.layout((1600, 900));
         assert!(after.px > before.px, "{} -> {}", before.px, after.px);
         // F3 from anywhere shows on the screen too.
         m.toggle_frame_stats();
         let s = m.settings_screen.as_ref().unwrap();
-        assert_eq!(s.value(crate::settings::FRAME_STATS), Some(1));
+        assert_eq!(s.value(0), Some(1));
         assert!(!path.exists(), "saved only after a pause or on leaving");
         press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
         assert!(matches!(m.screen, Screen::Title));
@@ -2476,6 +2675,111 @@ mod tests {
         assert_eq!(&saved, m.settings());
         assert!(saved.frame_stats && !saved.vsync);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_game_menu_opens_its_options_and_goes_as_it_came() {
+        let dir = temp("game-menu");
+        let (accounts, _) = accounts_in(&dir, &["Alex"], None);
+        let clip = FakeClipboard::default();
+        let mut m = Menu::new(None, accounts, SettingsFile::transient());
+        m.layout((1600, 900));
+        m.screen = Screen::Game;
+        let key = |m: &mut Menu, code| press(m, code, false, false, &clip);
+        // Escape opens it and closes it; it is kept until it has gone.
+        key(&mut m, SCANCODE_ESCAPE);
+        assert!(matches!(m.screen, Screen::Paused) && m.game_menu_open());
+        assert!(!m.wants_mouse_grab());
+        key(&mut m, SCANCODE_DOWN);
+        key(&mut m, SCANCODE_ESCAPE);
+        assert!(matches!(m.screen, Screen::Game) && !m.game_menu_open());
+        assert!(m.wants_mouse_grab());
+        let pause = m.pause.as_ref().unwrap();
+        assert_eq!(pause.states.focused(), None);
+        // Back to Game, by the keyboard: the first key shows where the focus starts.
+        key(&mut m, SCANCODE_ESCAPE);
+        key(&mut m, SCANCODE_DOWN);
+        key(&mut m, SCANCODE_RETURN);
+        assert!(matches!(m.screen, Screen::Game));
+        // The two options beside each other, and back to the menu from both.
+        for (moves, of, name) in [
+            (2, SettingsOf::Ruthenium, "Overlay"),
+            (3, SettingsOf::Game, "Video"),
+        ] {
+            key(&mut m, SCANCODE_ESCAPE);
+            for _ in 0..moves {
+                key(&mut m, SCANCODE_RIGHT);
+            }
+            m.transition = MenuTransition::at(1.0);
+            key(&mut m, SCANCODE_RETURN);
+            assert!(matches!(m.screen, Screen::Settings) && m.game_menu_open());
+            assert_eq!(m.settings_of, of);
+            let screen = m.settings_screen.as_ref().unwrap();
+            assert_eq!(screen.sections[0].title, name);
+            // They come as the menu did.
+            assert!(m.transition.shows() && !m.transition.menu_shows());
+            key(&mut m, SCANCODE_ESCAPE);
+            assert!(matches!(m.screen, Screen::Paused) && m.settings_screen.is_none());
+            key(&mut m, SCANCODE_ESCAPE);
+        }
+        // What is changed there is what is kept: vignette off, in the game's own.
+        m.screen = Screen::Paused;
+        m.act(Action::GameSettings, None, &clip);
+        let row = |row| rows_of(&GAME).iter().position(|r| *r == row).unwrap();
+        m.settings_event(SettingsEvent::Changed {
+            setting: row(Row::Vignette),
+            value: 0,
+        });
+        assert!(!m.settings().game.vignette && !m.settings().reduce_motion);
+        // F3's row is not one of these; F11's is.
+        m.toggle_frame_stats();
+        assert!(m.settings().frame_stats);
+        m.toggle_fullscreen();
+        let screen = m.settings_screen.as_ref().unwrap();
+        assert_eq!(screen.value(row(Row::Fullscreen)), Some(1));
+        assert_eq!(
+            screen.value(0),
+            Some(40),
+            "the field of view's is as it was"
+        );
+        // The world takes the player back from the options: nothing of them stays.
+        m.enter_game();
+        assert!(m.settings_screen.is_none() && m.pause.is_none());
+        // Disconnect.
+        key(&mut m, SCANCODE_ESCAPE);
+        m.transition = MenuTransition::at(1.0);
+        m.act(Action::Cancel, None, &clip);
+        assert!(m.leaving && matches!(m.screen, Screen::Servers));
+        assert!(m.pause.is_none() && !m.transition.shows());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_option_s_words_fit_at_every_menu_size() {
+        let settings = Settings::default();
+        let fonts = Fonts::new(&ruthenium_ui::modern::WEIGHTS);
+        for of in [SettingsOf::Title, SettingsOf::Ruthenium, SettingsOf::Game] {
+            for factor in [0.9, 1.0, 1.15, 1.3] {
+                let scale = UiScale::sized(1600, 900, factor);
+                let sections = settings.sections(&of.groups());
+                let screen = SettingsScreen::paged(scale, &fonts, "x", sections);
+                assert!(screen.cut_off().is_empty(), "{of:?} {:?}", screen.cut_off());
+            }
+        }
+    }
+
+    #[test]
+    fn what_of_the_menu_to_show_is_read() {
+        assert_eq!(ShownMenu::parse("0.5"), Some(ShownMenu::Coming(0.5)));
+        assert_eq!(ShownMenu::parse("mc"), Some(ShownMenu::GameOptions(0)));
+        assert_eq!(ShownMenu::parse("mc:4"), Some(ShownMenu::GameOptions(4)));
+        assert_eq!(
+            ShownMenu::parse("ruthenium"),
+            Some(ShownMenu::RutheniumOptions)
+        );
+        for bad in ["", "1.5", "-1", "x", "NaN", "mc:", "mc:9"] {
+            assert_eq!(ShownMenu::parse(bad), None, "{bad}");
+        }
     }
 
     #[test]

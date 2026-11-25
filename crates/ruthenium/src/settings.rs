@@ -9,6 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use ruthenium_sim::input::MouseOptions;
+use ruthenium_ui::hud::AttackIndicator;
 use ruthenium_ui::modern::{ControlSpec, SectionSpec, SettingSpec};
 
 /// Vanilla's frame-rate slider: 10 to 250 FPS in steps of 10, then Unlimited
@@ -63,6 +64,54 @@ impl MenuSize {
     }
 }
 
+/// Vanilla's field of view slider, in degrees.
+pub const FOV_MIN: u32 = 30;
+pub const FOV_MAX: u32 = 110;
+const FOV_NORMAL: u32 = 70;
+/// The largest GUI Scale offered (0: as large as fits; a scale that does not fit is not
+/// taken).
+const GUI_SCALE_MAX: u32 = 8;
+/// Steps of the sensitivity slider over 0 to 1: one for each percent vanilla shows.
+const SENSITIVITY_STEPS: usize = 200;
+
+/// The game's own options, as vanilla has them, as far as there are any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameOptions {
+    /// From top to bottom, in degrees.
+    pub fov: u32,
+    pub gui_scale: u32,
+    pub view_bobbing: bool,
+    pub entity_shadows: bool,
+    pub vignette: bool,
+    pub attack_indicator: AttackIndicator,
+    /// How far the view tilts when hurt, and how far the field of view changes, in
+    /// percent.
+    pub damage_tilt: u32,
+    pub fov_effects: u32,
+}
+
+impl Default for GameOptions {
+    fn default() -> GameOptions {
+        GameOptions {
+            fov: FOV_NORMAL,
+            gui_scale: 0,
+            view_bobbing: true,
+            entity_shadows: true,
+            vignette: true,
+            attack_indicator: AttackIndicator::Crosshair,
+            damage_tilt: 100,
+            fov_effects: 100,
+        }
+    }
+}
+
+/// The attack indicator's places: its key in the file, its label.
+const INDICATORS: [(AttackIndicator, &str, &str); 3] = [
+    (AttackIndicator::Off, "off", "Off"),
+    (AttackIndicator::Crosshair, "crosshair", "Crosshair"),
+    (AttackIndicator::Hotbar, "hotbar", "Hotbar"),
+];
+
 /// See the module docs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -83,6 +132,7 @@ pub struct Settings {
     /// The mouse's sensitivity (0 to 1, exactly as vanilla's `mouseSensitivity`) and
     /// inversion. Imported from vanilla's `options.txt` when the file has none.
     pub mouse: MouseOptions,
+    pub game: GameOptions,
 }
 
 impl Default for Settings {
@@ -96,17 +146,79 @@ impl Default for Settings {
             reduce_motion: false,
             last_server: String::new(),
             mouse: MouseOptions::DEFAULT,
+            game: GameOptions::default(),
         }
     }
 }
 
-/// The Settings screen's rows, in order (counted over every section).
-pub const VSYNC: usize = 0;
-pub const MAX_FPS: usize = 1;
-pub const FULLSCREEN: usize = 2;
-pub const FRAME_STATS: usize = 3;
-pub const MENU_SIZE: usize = 4;
-pub const REDUCE_MOTION: usize = 5;
+/// What can be set on a settings screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    FrameStats,
+    ReduceMotion,
+    Fov,
+    GuiScale,
+    MenuSize,
+    Vsync,
+    MaxFps,
+    Fullscreen,
+    AttackIndicator,
+    ViewBobbing,
+    EntityShadows,
+    Vignette,
+    Sensitivity,
+    InvertX,
+    InvertY,
+    DamageTilt,
+    FovEffects,
+}
+
+/// A titled group of rows.
+pub type Group = (&'static str, &'static [Row]);
+
+/// What is Ruthenium's own.
+pub const RUTHENIUM: [Group; 2] = [
+    ("Overlay", &[Row::FrameStats]),
+    ("Menus", &[Row::ReduceMotion]),
+];
+
+/// What vanilla has too, under vanilla's headings. Those without any are to come.
+pub const GAME: [Group; 9] = [
+    (
+        "Video",
+        &[
+            Row::Fov,
+            Row::GuiScale,
+            Row::MenuSize,
+            Row::Vsync,
+            Row::MaxFps,
+            Row::Fullscreen,
+            Row::AttackIndicator,
+            Row::ViewBobbing,
+            Row::EntityShadows,
+            Row::Vignette,
+        ],
+    ),
+    ("Controls", &[Row::Sensitivity, Row::InvertX, Row::InvertY]),
+    ("Online", &[]),
+    ("Resources", &[]),
+    ("Accessibility", &[Row::DamageTilt, Row::FovEffects]),
+    ("Sound", &[]),
+    ("Chat", &[]),
+    ("Skin", &[]),
+    ("Language", &[]),
+];
+
+/// All of it, for the title screen's Settings.
+pub fn all_groups() -> Vec<Group> {
+    let own: Group = ("Ruthenium", &[Row::FrameStats, Row::ReduceMotion]);
+    std::iter::once(own).chain(GAME).collect()
+}
+
+/// The rows of some groups, in the order a screen counts them.
+pub fn rows_of(groups: &[Group]) -> Vec<Row> {
+    groups.iter().flat_map(|g| g.1).copied().collect()
+}
 
 /// The frame-rate slider's steps: 10, 20, ... 250, then Unlimited.
 const FPS_STEPS: usize = (FPS_MAX / FPS_STEP) as usize + 1;
@@ -120,11 +232,12 @@ impl Settings {
         let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
         let d = Settings::default();
         let section = |name: &str| table.get(name).and_then(toml::Value::as_table);
-        let (display, interface, multiplayer, controls) = (
+        let (display, interface, multiplayer, controls, game) = (
             section("display"),
             section("interface"),
             section("multiplayer"),
             section("controls"),
+            section("game"),
         );
         fn get<'a>(t: Option<&'a toml::Table>, key: &str) -> Option<&'a toml::Value> {
             t.and_then(|t| t.get(key))
@@ -161,7 +274,29 @@ impl Settings {
             invert_x: flag(controls, "invert_mouse_x", d.mouse.invert_x),
             invert_y: flag(controls, "invert_mouse_y", d.mouse.invert_y),
         };
+        let number = |key, range: std::ops::RangeInclusive<u32>, default| {
+            get(game, key)
+                .and_then(toml::Value::as_integer)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| range.contains(n))
+                .unwrap_or(default)
+        };
+        let g = d.game;
+        let game = GameOptions {
+            fov: number("fov", FOV_MIN..=FOV_MAX, g.fov),
+            gui_scale: number("gui_scale", 0..=GUI_SCALE_MAX, g.gui_scale),
+            view_bobbing: flag(game, "view_bobbing", g.view_bobbing),
+            entity_shadows: flag(game, "entity_shadows", g.entity_shadows),
+            vignette: flag(game, "vignette", g.vignette),
+            attack_indicator: get(game, "attack_indicator")
+                .and_then(toml::Value::as_str)
+                .and_then(|s| INDICATORS.into_iter().find(|i| i.1 == s))
+                .map_or(g.attack_indicator, |i| i.0),
+            damage_tilt: number("damage_tilt", 0..=100, g.damage_tilt),
+            fov_effects: number("fov_effects", 0..=100, g.fov_effects),
+        };
         Ok(Settings {
+            game,
             vsync: flag(display, "vsync", d.vsync),
             max_fps,
             fullscreen: flag(display, "fullscreen", d.fullscreen),
@@ -182,103 +317,183 @@ impl Settings {
         })
     }
 
-    /// What the Settings screen shows, with these values.
-    pub fn sections(&self) -> Vec<SectionSpec> {
-        let setting = |i: usize, label: &str, detail: &str, control| SettingSpec {
+    /// What a screen of these groups shows, with these values.
+    pub fn sections(&self, groups: &[Group]) -> Vec<SectionSpec> {
+        groups
+            .iter()
+            .map(|(title, rows)| SectionSpec {
+                title: (*title).into(),
+                settings: rows.iter().map(|&r| self.spec(r)).collect(),
+            })
+            .collect()
+    }
+
+    /// One row as its screen starts with it.
+    fn spec(&self, row: Row) -> SettingSpec {
+        use ControlSpec::{Choice, Slider, Switch};
+        let percents = |last: u32| (0..=last).map(|p| format!("{p}%")).collect();
+        let (label, detail, control) = match row {
+            Row::FrameStats => (
+                "Frame Stats",
+                "Frame rate and frame times in a corner; F3 too",
+                Switch,
+            ),
+            Row::ReduceMotion => (
+                "Reduce Motion",
+                "Buttons and switches fade instead of moving",
+                Switch,
+            ),
+            Row::Fov => (
+                "FOV",
+                "How much of the world is in view",
+                Slider(
+                    (FOV_MIN..=FOV_MAX)
+                        .map(|f| match f {
+                            FOV_NORMAL => "Normal".to_owned(),
+                            FOV_MAX => "Quake Pro".to_owned(),
+                            f => f.to_string(),
+                        })
+                        .collect(),
+                ),
+            ),
+            Row::GuiScale => (
+                "GUI Scale",
+                "The HUD's size, as far as it fits",
+                Slider(
+                    std::iter::once("Auto".to_owned())
+                        .chain((1..=GUI_SCALE_MAX).map(|s| s.to_string()))
+                        .collect(),
+                ),
+            ),
+            Row::MenuSize => (
+                "Menu Size",
+                "How large these menus are",
+                Choice(MenuSize::ALL.iter().map(|m| m.label().to_owned()).collect()),
+            ),
+            Row::Vsync => (
+                "VSync",
+                "Waits for the display, so frames never tear",
+                Switch,
+            ),
+            Row::MaxFps => (
+                "Max Frame Rate",
+                "The most frames drawn each second",
+                Slider(
+                    (1..FPS_STEPS as u32)
+                        .map(|k| format!("{} FPS", k * FPS_STEP))
+                        .chain(std::iter::once("Unlimited".to_owned()))
+                        .collect(),
+                ),
+            ),
+            Row::Fullscreen => (
+                "Fullscreen",
+                "Fills the screen; F11 switches it too",
+                Switch,
+            ),
+            Row::AttackIndicator => (
+                "Attack Indicator",
+                "Where an attack's charge shows",
+                Choice(INDICATORS.iter().map(|i| i.2.to_owned()).collect()),
+            ),
+            Row::ViewBobbing => ("View Bobbing", "The view sways with your steps", Switch),
+            Row::EntityShadows => ("Entity Shadows", "Shadows under players", Switch),
+            Row::Vignette => ("Vignette", "The corners darken in the dark", Switch),
+            Row::Sensitivity => (
+                "Sensitivity",
+                "How far the mouse turns the view",
+                Slider(percents(SENSITIVITY_STEPS as u32)),
+            ),
+            Row::InvertX => ("Invert Mouse X", "Left turns right", Switch),
+            Row::InvertY => ("Invert Mouse Y", "Up looks down", Switch),
+            Row::DamageTilt => (
+                "Damage Tilt",
+                "How far the view tilts when you are hurt",
+                Slider(percents(100)),
+            ),
+            Row::FovEffects => (
+                "FOV Effects",
+                "How far liquids narrow the view",
+                Slider(percents(100)),
+            ),
+        };
+        SettingSpec {
             label: label.into(),
             detail: detail.into(),
             control,
-            value: self.get(i),
-        };
-        let rates = (1..FPS_STEPS as u32)
-            .map(|k| format!("{} FPS", k * FPS_STEP))
-            .chain(std::iter::once("Unlimited".to_owned()))
-            .collect();
-        let sizes = MenuSize::ALL.iter().map(|m| m.label().to_owned()).collect();
-        vec![
-            SectionSpec {
-                title: "Display".into(),
-                settings: vec![
-                    setting(
-                        VSYNC,
-                        "VSync",
-                        "Waits for the display, so frames never tear",
-                        ControlSpec::Switch,
-                    ),
-                    setting(
-                        MAX_FPS,
-                        "Max Frame Rate",
-                        "The most frames drawn each second",
-                        ControlSpec::Slider(rates),
-                    ),
-                    setting(
-                        FULLSCREEN,
-                        "Fullscreen",
-                        "Fills the screen; F11 switches it too",
-                        ControlSpec::Switch,
-                    ),
-                    setting(
-                        FRAME_STATS,
-                        "Frame Stats",
-                        "Frame rate and frame times in a corner; F3 too",
-                        ControlSpec::Switch,
-                    ),
-                ],
-            },
-            SectionSpec {
-                title: "Menus".into(),
-                settings: vec![
-                    setting(
-                        MENU_SIZE,
-                        "Menu Size",
-                        "How large these menus are",
-                        ControlSpec::Choice(sizes),
-                    ),
-                    setting(
-                        REDUCE_MOTION,
-                        "Reduce Motion",
-                        "Buttons and switches fade instead of moving",
-                        ControlSpec::Switch,
-                    ),
-                ],
-            },
-        ]
-    }
-
-    /// Row `i`'s value as the screen counts it.
-    pub fn get(&self, i: usize) -> usize {
-        match i {
-            VSYNC => self.vsync.into(),
-            MAX_FPS => self
-                .max_fps
-                .map_or(FPS_STEPS - 1, |f| (f / FPS_STEP) as usize - 1),
-            FULLSCREEN => self.fullscreen.into(),
-            FRAME_STATS => self.frame_stats.into(),
-            MENU_SIZE => MenuSize::ALL
-                .iter()
-                .position(|&m| m == self.menu_size)
-                .unwrap_or(1),
-            REDUCE_MOTION => self.reduce_motion.into(),
-            _ => 0,
+            value: self.get(row),
         }
     }
 
-    /// Sets row `i` from the screen's `value`.
-    pub fn set(&mut self, i: usize, value: usize) {
-        match i {
-            VSYNC => self.vsync = value != 0,
-            MAX_FPS => {
-                self.max_fps = (value + 1 < FPS_STEPS).then(|| (value as u32 + 1) * FPS_STEP);
+    /// A row's value as its screen counts it.
+    pub fn get(&self, row: Row) -> usize {
+        let g = &self.game;
+        match row {
+            Row::FrameStats => self.frame_stats.into(),
+            Row::ReduceMotion => self.reduce_motion.into(),
+            Row::Fov => g.fov.clamp(FOV_MIN, FOV_MAX).abs_diff(FOV_MIN) as usize,
+            Row::GuiScale => g.gui_scale as usize,
+            Row::MenuSize => MenuSize::ALL
+                .iter()
+                .position(|&m| m == self.menu_size)
+                .unwrap_or(1),
+            Row::Vsync => self.vsync.into(),
+            Row::MaxFps => self
+                .max_fps
+                .map_or(FPS_STEPS - 1, |f| (f / FPS_STEP) as usize - 1),
+            Row::Fullscreen => self.fullscreen.into(),
+            Row::AttackIndicator => INDICATORS
+                .iter()
+                .position(|p| p.0 == g.attack_indicator)
+                .unwrap_or(0),
+            Row::ViewBobbing => g.view_bobbing.into(),
+            Row::EntityShadows => g.entity_shadows.into(),
+            Row::Vignette => g.vignette.into(),
+            // (Vanilla's own may lie between two steps: the nearest shows.)
+            Row::Sensitivity => {
+                (self.mouse.sensitivity * SENSITIVITY_STEPS as f64).round() as usize
             }
-            FULLSCREEN => self.fullscreen = value != 0,
-            FRAME_STATS => self.frame_stats = value != 0,
-            MENU_SIZE => {
+            Row::InvertX => self.mouse.invert_x.into(),
+            Row::InvertY => self.mouse.invert_y.into(),
+            Row::DamageTilt => g.damage_tilt as usize,
+            Row::FovEffects => g.fov_effects as usize,
+        }
+    }
+
+    /// Sets a row from its screen's `value`.
+    pub fn set(&mut self, row: Row, value: usize) {
+        let g = &mut self.game;
+        let percent = (value as u32).min(100);
+        match row {
+            Row::FrameStats => self.frame_stats = value != 0,
+            Row::ReduceMotion => self.reduce_motion = value != 0,
+            Row::Fov => g.fov = (FOV_MIN + value as u32).min(FOV_MAX),
+            Row::GuiScale => g.gui_scale = (value as u32).min(GUI_SCALE_MAX),
+            Row::MenuSize => {
                 if let Some(&m) = MenuSize::ALL.get(value) {
                     self.menu_size = m;
                 }
             }
-            REDUCE_MOTION => self.reduce_motion = value != 0,
-            _ => {}
+            Row::Vsync => self.vsync = value != 0,
+            Row::MaxFps => {
+                self.max_fps = (value + 1 < FPS_STEPS).then(|| (value as u32 + 1) * FPS_STEP);
+            }
+            Row::Fullscreen => self.fullscreen = value != 0,
+            Row::AttackIndicator => {
+                if let Some(p) = INDICATORS.get(value) {
+                    g.attack_indicator = p.0;
+                }
+            }
+            Row::ViewBobbing => g.view_bobbing = value != 0,
+            Row::EntityShadows => g.entity_shadows = value != 0,
+            Row::Vignette => g.vignette = value != 0,
+            Row::Sensitivity => {
+                let step = value.min(SENSITIVITY_STEPS);
+                self.mouse.sensitivity = step as f64 / SENSITIVITY_STEPS as f64;
+            }
+            Row::InvertX => self.mouse.invert_x = value != 0,
+            Row::InvertY => self.mouse.invert_y = value != 0,
+            Row::DamageTilt => g.damage_tilt = percent,
+            Row::FovEffects => g.fov_effects = percent,
         }
     }
 
@@ -312,7 +527,21 @@ impl Settings {
              # camera turns as vanilla's would at the same value.\n\
              mouse_sensitivity = {:?}\n\
              invert_mouse_x = {}\n\
-             invert_mouse_y = {}\n",
+             invert_mouse_y = {}\n\
+             \n\
+             [game]\n\
+             # {FOV_MIN} to {FOV_MAX} degrees.\n\
+             fov = {}\n\
+             # 1 to {GUI_SCALE_MAX}, or 0: as large as fits.\n\
+             gui_scale = {}\n\
+             view_bobbing = {}\n\
+             entity_shadows = {}\n\
+             vignette = {}\n\
+             # \"off\", \"crosshair\" or \"hotbar\".\n\
+             attack_indicator = \"{}\"\n\
+             # Percent.\n\
+             damage_tilt = {}\n\
+             fov_effects = {}\n",
             self.vsync,
             self.fullscreen,
             self.frame_stats,
@@ -321,6 +550,14 @@ impl Settings {
             self.mouse.sensitivity,
             self.mouse.invert_x,
             self.mouse.invert_y,
+            self.game.fov,
+            self.game.gui_scale,
+            self.game.view_bobbing,
+            self.game.entity_shadows,
+            self.game.vignette,
+            INDICATORS[self.get(Row::AttackIndicator)].1,
+            self.game.damage_tilt,
+            self.game.fov_effects,
         )
     }
 }
@@ -465,6 +702,16 @@ mod tests {
                 invert_x: false,
                 invert_y: true,
             },
+            game: GameOptions {
+                fov: 95,
+                gui_scale: 3,
+                view_bobbing: false,
+                entity_shadows: false,
+                vignette: false,
+                attack_indicator: AttackIndicator::Hotbar,
+                damage_tilt: 35,
+                fov_effects: 0,
+            },
         };
         assert_eq!(Settings::parse(&s.to_toml()), Ok(s.clone()));
         assert!(Settings::has_mouse(&s.to_toml()));
@@ -487,27 +734,95 @@ vsync = true
     #[test]
     fn screen_values_map_to_settings_and_back() {
         let mut s = Settings::default();
-        let rows: usize = s.sections().iter().map(|x| x.settings.len()).sum();
-        assert_eq!(rows, REDUCE_MOTION + 1);
-        assert_eq!(s.get(MAX_FPS), FPS_STEPS - 1, "unlimited is the last step");
-        s.set(MAX_FPS, 0);
-        assert_eq!(s.max_fps, Some(10));
-        s.set(MAX_FPS, 11);
-        assert_eq!(s.max_fps, Some(120));
-        assert_eq!(s.get(MAX_FPS), 11);
-        s.set(MAX_FPS, FPS_STEPS - 1);
-        assert_eq!(s.max_fps, None);
-        s.set(MENU_SIZE, 3);
-        assert_eq!(s.menu_size, MenuSize::Larger);
-        for i in [VSYNC, FULLSCREEN, FRAME_STATS, REDUCE_MOTION] {
-            let before = s.get(i);
-            s.set(i, 1 - before);
-            assert_eq!(s.get(i), 1 - before);
+        let rows = rows_of(&all_groups());
+        // Every row keeps what it is set to, and each is a row of its own.
+        for (i, &row) in rows.iter().enumerate() {
+            let others: Vec<usize> = rows.iter().map(|&r| s.get(r)).collect();
+            let new = usize::from(others[i] == 0);
+            s.set(row, new);
+            for (j, &other) in rows.iter().enumerate() {
+                let want = if i == j { new } else { others[j] };
+                assert_eq!(s.get(other), want, "{row:?} {other:?}");
+            }
         }
-        let ControlSpec::Slider(steps) = &s.sections()[0].settings[MAX_FPS].control else {
-            panic!("not a slider");
+        let mut s = Settings::default();
+        assert_eq!(
+            s.get(Row::MaxFps),
+            FPS_STEPS - 1,
+            "unlimited is the last step"
+        );
+        s.set(Row::MaxFps, 0);
+        assert_eq!(s.max_fps, Some(10));
+        s.set(Row::MaxFps, 11);
+        assert_eq!((s.max_fps, s.get(Row::MaxFps)), (Some(120), 11));
+        s.set(Row::MaxFps, FPS_STEPS - 1);
+        assert_eq!(s.max_fps, None);
+        s.set(Row::MenuSize, 3);
+        assert_eq!(s.menu_size, MenuSize::Larger);
+        assert_eq!(s.get(Row::Fov), 40);
+        s.set(Row::Fov, 80);
+        assert_eq!(s.game.fov, 110);
+        s.set(Row::Fov, 999);
+        s.set(Row::DamageTilt, 999);
+        assert_eq!((s.game.fov, s.game.damage_tilt), (FOV_MAX, 100));
+        // Vanilla's 100% is a half; one between two steps stays as it is until it is set.
+        assert_eq!(s.get(Row::Sensitivity), 100);
+        s.mouse.sensitivity = 0.274_647_887_323_943_63;
+        assert_eq!(s.get(Row::Sensitivity), 55);
+        s.set(Row::Sensitivity, 200);
+        assert_eq!(s.mouse.sensitivity, 1.0);
+        // Out of range in the file.
+        let s = Settings::parse(
+            "[game]\nfov = 111\ngui_scale = -1\nvignette = 3\nattack_indicator = \"x\"\n\
+             damage_tilt = 101\nfov_effects = \"all\"\n",
+        )
+        .unwrap();
+        assert_eq!(s.game, GameOptions::default());
+    }
+
+    #[test]
+    fn sliders_have_a_label_for_every_step() {
+        let s = Settings::default();
+        let labels = |row| match s.spec(row).control {
+            ControlSpec::Slider(l) => l,
+            other => panic!("{other:?}"),
         };
-        assert_eq!((steps[0].as_str(), steps.len()), ("10 FPS", FPS_STEPS));
+        let fov = labels(Row::Fov);
+        assert_eq!([&fov[0], &fov[40], &fov[80]], ["30", "Normal", "Quake Pro"]);
+        let scale = labels(Row::GuiScale);
+        assert_eq!((scale[0].as_str(), scale.len()), ("Auto", 9));
+        let fps = labels(Row::MaxFps);
+        assert_eq!((fps[0].as_str(), fps.len()), ("10 FPS", FPS_STEPS));
+        assert_eq!(labels(Row::Sensitivity).len(), 201);
+        assert_eq!(labels(Row::FovEffects)[100], "100%");
+        // What is shown first is what is set.
+        for row in rows_of(&all_groups()) {
+            let spec = s.spec(row);
+            let steps = match &spec.control {
+                ControlSpec::Switch => 2,
+                ControlSpec::Slider(l) | ControlSpec::Choice(l) => l.len(),
+            };
+            assert!(spec.value < steps && !spec.label.is_empty(), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn what_vanilla_has_is_the_games_and_the_rest_ruthenium_s() {
+        let (own, game) = (rows_of(&RUTHENIUM), rows_of(&GAME));
+        assert_eq!(own, [Row::FrameStats, Row::ReduceMotion]);
+        for row in [Row::MenuSize, Row::Vsync, Row::MaxFps, Row::Fullscreen] {
+            assert!(game.contains(&row) && !own.contains(&row));
+        }
+        // The title screen has all of them, each once.
+        let all = rows_of(&all_groups());
+        assert_eq!(all.len(), own.len() + game.len());
+        for (i, r) in all.iter().enumerate() {
+            assert!(!all[..i].contains(r), "{r:?}");
+            assert!(own.contains(r) || game.contains(r));
+        }
+        let titles: Vec<&str> = GAME.iter().map(|g| g.0).collect();
+        let first = ["Video", "Controls", "Online", "Resources", "Accessibility"];
+        assert_eq!(titles[..5], first);
     }
 
     #[test]

@@ -172,6 +172,35 @@ impl<'f> Encoder<'f> {
         )
     }
 
+    /// [`Self::texture_pass`] cleared to `clear` first.
+    ///
+    /// # Panics
+    /// As [`Self::texture_pass`].
+    pub fn texture_pass_cleared<'e>(
+        &'e mut self,
+        pipelines: &'e Pipelines,
+        textures: &TextureTable,
+        id: TextureId,
+        clear: [f32; 4],
+    ) -> Pass<'e> {
+        let (image, view, desc) = textures.target(id);
+        assert_eq!(pipelines.format(), desc.format, "pipelines for {id:?}");
+        let extent = vk::Extent2D {
+            width: desc.width,
+            height: desc.height,
+        };
+        self.pass(
+            pipelines,
+            image,
+            view,
+            extent,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            Some(clear),
+            None,
+            End::Sampled(image),
+        )
+    }
+
     /// [`Self::texture_pass`] cleared to `clear` first, with `depth` as its depth
     /// attachment (see [`Self::window_pass_with_depth`]).
     ///
