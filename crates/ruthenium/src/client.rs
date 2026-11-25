@@ -188,8 +188,11 @@ pub struct Options {
     pub hand: Option<bool>,
     pub block_outline: Option<bool>,
     pub view_bobbing: Option<bool>,
-    /// Whether the crosshair is drawn (the default).
+    /// Whether the crosshair is drawn (the default), and the HUD at all (the default).
     pub crosshair: Option<bool>,
+    pub hud: Option<bool>,
+    /// Whether the frame's corners darken in the dark (the default).
+    pub vignette: Option<bool>,
     /// Whether animated textures play (the default) or hold still.
     pub animations: Option<bool>,
     /// Whether the field of view narrows in water and lava (the default).
@@ -261,6 +264,8 @@ impl Options {
             block_outline: None,
             view_bobbing: None,
             crosshair: None,
+            hud: None,
+            vignette: None,
             animations: None,
             fov_effects: None,
         };
@@ -455,7 +460,8 @@ impl Options {
                 }
                 "--fog" | "--light-flicker" | "--translucent" | "--animations"
                 | "--fov-effects" | "--block-entities" | "--players" | "--entity-shadows"
-                | "--hand" | "--block-outline" | "--view-bobbing" | "--crosshair" => {
+                | "--hand" | "--block-outline" | "--view-bobbing" | "--crosshair" | "--hud"
+                | "--vignette" => {
                     let on = match value("on or off")?.as_str() {
                         "on" => true,
                         "off" => false,
@@ -473,6 +479,8 @@ impl Options {
                         "--block-outline" => o.block_outline = Some(on),
                         "--view-bobbing" => o.view_bobbing = Some(on),
                         "--crosshair" => o.crosshair = Some(on),
+                        "--hud" => o.hud = Some(on),
+                        "--vignette" => o.vignette = Some(on),
                         _ => o.translucent = Some(on),
                     }
                 }
@@ -615,6 +623,12 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     if let Some(on) = opts.crosshair {
         menu.set_crosshair(on);
+    }
+    if let Some(on) = opts.hud {
+        menu.set_hud(on);
+    }
+    if let Some(on) = opts.vignette {
+        menu.set_vignette(on);
     }
     if let Some(path) = &opts.route {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1161,6 +1175,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         // The world as the game thread last published it, seen from where the mouse
         // has turned to: taken before the menus borrow themselves for the frame.
         let world = menu.world_view();
+        let hud = menu.hud_params();
         let gui = if opts.empty_window {
             None
         } else {
@@ -1207,6 +1222,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             view_distance: w.view_distance,
             frame: &w.frame,
             partial_tick: w.partial_tick,
+            hud,
         });
         let report = renderer.render(&BACKGROUND, world, gui)?;
         if opts.exercise_swapchain

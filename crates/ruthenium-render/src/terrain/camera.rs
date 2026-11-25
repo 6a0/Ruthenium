@@ -128,6 +128,25 @@ impl View {
         }
     }
 
+    /// The view of a GUI's models on a target of `size` pixels: positions are pixels from
+    /// the target's top left corner, and depths from 1000 behind the screen to 1000 before
+    /// it (`GuiItemAtlas`'s projection). Everything is seen.
+    pub fn gui(size: [f32; 2]) -> View {
+        // Rows: x and y to clip space, the depth (nearer is greater), and no division.
+        let rows = [
+            [2.0 / size[0], 0.0, 0.0, -1.0],
+            [0.0, 2.0 / size[1], 0.0, -1.0],
+            [0.0, 0.0, 1.0 / 2000.0, 0.5],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        View {
+            block: [0; 3],
+            offset: [0.0; 3],
+            view_projection: std::array::from_fn(|i| rows[i % 4][i / 4]),
+            planes: [[0.0, 0.0, 0.0, 1.0]; 5],
+        }
+    }
+
     /// Whether any of a box can be on screen. Its corners are in blocks from the
     /// camera's block. A box partly outside counts as seen.
     pub fn sees(&self, min: [f32; 3], max: [f32; 3]) -> bool {
@@ -171,6 +190,23 @@ mod tests {
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn a_guis_view_is_in_pixels_and_sees_everything() {
+        let v = View::gui([1920.0, 1080.0]);
+        let clip = |p: [f32; 3]| {
+            let m = v.view_projection;
+            let row = |r: usize| m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r];
+            [row(0), row(1), row(2), row(3)]
+        };
+        // The corners of the target, and its middle at the screen's own depth.
+        assert_eq!(clip([0.0, 0.0, 0.0]), [-1.0, -1.0, 0.5, 1.0]);
+        assert_eq!(clip([1920.0, 1080.0, 0.0]), [1.0, 1.0, 0.5, 1.0]);
+        // Nearer is greater, from 1000 behind the screen to 1000 before it.
+        assert_eq!(clip([960.0, 540.0, 1000.0])[2], 1.0);
+        assert_eq!(clip([960.0, 540.0, -1000.0])[2], 0.0);
+        assert!(v.sees([-5000.0; 3], [-4000.0; 3]));
     }
 
     #[test]

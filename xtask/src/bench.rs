@@ -48,6 +48,9 @@ pub(crate) struct Options {
     /// With the screenshot: vanilla keeps the player's hand and the outline of the block
     /// it looks at, and draws nothing else of its HUD, no clouds either.
     pub hand: bool,
+    /// With the screenshot: vanilla keeps its whole HUD, without clouds, and the picture
+    /// is taken at the route's end.
+    pub hud: bool,
     pub render_distance: u32,
     pub gpu: Gpu,
 }
@@ -67,6 +70,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         screenshot: false,
         bare: false,
         hand: false,
+        hud: false,
         render_distance: 12,
         gpu: Gpu::Auto,
     };
@@ -85,6 +89,11 @@ fn parse(args: &[String]) -> Result<Options, String> {
         if arg == "--hand-picture" {
             o.screenshot = true;
             o.hand = true;
+            continue;
+        }
+        if arg == "--hud-picture" {
+            o.screenshot = true;
+            o.hud = true;
             continue;
         }
         let value = it.next().ok_or_else(|| format!("{arg} needs a value"))?;
@@ -262,6 +271,7 @@ pub(crate) fn launch(
         format!("-Druthenium.bench.screenshot={}", o.screenshot),
         format!("-Druthenium.bench.bare={}", o.bare),
         format!("-Druthenium.bench.hand={}", o.hand),
+        format!("-Druthenium.bench.hud={}", o.hud),
     ];
     if let Some((address, route)) = &run.dedicated {
         let route = std::path::absolute(route).map_err(|e| e.to_string())?;

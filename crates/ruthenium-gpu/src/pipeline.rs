@@ -105,6 +105,8 @@ pub fn interface_hash(descs: &[GraphicsDesc], textures: &TextureTable) -> u64 {
                 Blend::Alpha => 1,
                 Blend::Glow => 2,
                 Blend::Multiply => 3,
+                Blend::Invert => 4,
+                Blend::Darken => 5,
             })
             .u32(match d.depth {
                 Depth::None => 0,
@@ -351,6 +353,13 @@ pub enum Blend {
     /// it; the target's alpha becomes the source's (vanilla's blend of the cracks in a
     /// block being broken).
     Multiply,
+    /// What is there turned to its opposite where the source is white:
+    /// `(1 - dst) * src + (1 - src) * dst`; the target's alpha becomes the source's
+    /// (vanilla's blend of the crosshair).
+    Invert,
+    /// What is there darkened by the source: `(1 - src) * dst`; the target's alpha
+    /// stays (vanilla's blend of the vignette).
+    Darken,
 }
 
 /// How much nearer a [`Depth::Decal`] is drawn: steps of the depth format, and times the
@@ -890,6 +899,24 @@ fn build_one(
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE)
             .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA),
+        Blend::Invert => vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE_MINUS_DST_COLOR)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_COLOR)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA),
+        Blend::Darken => vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ZERO)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_COLOR)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE)
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA),
     };

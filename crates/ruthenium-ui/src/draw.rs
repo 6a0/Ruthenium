@@ -150,8 +150,13 @@ impl DrawList {
         h: i32,
         color: u32,
     ) {
-        let s = *sprites.get(id);
-        let t = sprites.texture();
+        self.blit(sprites.get(id), sprites.texture(), x, y, w, h, color);
+    }
+
+    /// As [`Self::blit_sprite`], for a sprite looked up before, of the texture `t`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit(&mut self, s: &SpriteInfo, t: u32, x: i32, y: i32, w: i32, h: i32, color: u32) {
+        let s = *s;
         match s.scaling {
             GuiScaling::Stretch => {
                 if w != 0 && h != 0 {
@@ -183,6 +188,26 @@ impl DrawList {
                 );
             }
         }
+    }
+
+    /// A part of a sprite (`blitSprite` with a sprite size and a texel origin): texels
+    /// `[tx, tx + w) x [ty, ty + h)` of a sprite treated as `sw` x `sh`, at `(x, y)`.
+    /// Only sprites that stretch are drawn so; vanilla clips the others, which nothing
+    /// here does yet.
+    #[allow(clippy::too_many_arguments)]
+    pub fn blit_part(
+        &mut self,
+        s: &SpriteInfo,
+        t: u32,
+        [sw, sh]: [i32; 2],
+        [tx, ty]: [i32; 2],
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        color: u32,
+    ) {
+        self.sub(s, t, sw, sh, tx, ty, x, y, w, h, color);
     }
 
     /// Texels `[tx, tx + w) x [ty, ty + h)` of a sprite treated as `sw` x `sh`, at `(x, y)`.

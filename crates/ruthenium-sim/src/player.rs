@@ -325,6 +325,10 @@ pub struct Attributes {
     pub submerged_mining_speed: Attribute,
     /// The player's size: its box, its eyes and its attachment points.
     pub scale: Attribute,
+    /// What the HUD shows of the player: how many hearts it can have and how much
+    /// armour it wears.
+    pub max_health: Attribute,
+    pub armor: Attribute,
 }
 
 impl Default for Attributes {
@@ -348,6 +352,8 @@ impl Default for Attributes {
             block_break_speed: Attribute::new(1.0, 0.0, 1024.0),
             submerged_mining_speed: Attribute::new(0.2, 0.0, 20.0),
             scale: Attribute::new(1.0, 0.0625, 16.0),
+            max_health: Attribute::new(20.0, 1.0, 1024.0),
+            armor: Attribute::new(0.0, 0.0, 30.0),
         }
     }
 }
@@ -374,6 +380,8 @@ impl Attributes {
             "minecraft:block_break_speed" => &mut self.block_break_speed,
             "minecraft:submerged_mining_speed" => &mut self.submerged_mining_speed,
             "minecraft:scale" => &mut self.scale,
+            "minecraft:max_health" => &mut self.max_health,
+            "minecraft:armor" => &mut self.armor,
             _ => return None,
         })
     }
@@ -400,6 +408,8 @@ impl Attributes {
             &mut a.block_break_speed,
             &mut a.submerged_mining_speed,
             &mut a.scale,
+            &mut a.max_health,
+            &mut a.armor,
         ] {
             attribute.modifiers.clear();
         }
@@ -735,6 +745,14 @@ pub struct LocalPlayer {
     pub cooldowns: Cooldowns,
     /// `FoodData.saturationLevel` (`set_health`, and eating).
     pub saturation: f32,
+    /// `experienceProgress` (how far the bar is filled, 0 to 1), `experienceLevel` and
+    /// `totalExperience`, as the server set them.
+    pub experience_progress: f32,
+    pub experience_level: i32,
+    pub total_experience: i32,
+    /// `damageCooldownTime`: set when the server changes the health (20 for less, 10
+    /// for more), counted down by the ticks. The HUD's hearts blink by it.
+    pub damage_cooldown: i32,
     /// `LivingEntity.useItem` and `useItemRemaining`; `LocalPlayer.startedUsingItem`
     /// and `usingItemHand` (kept after the use ends, as vanilla keeps it).
     use_item: Stack,
@@ -932,6 +950,10 @@ impl LocalPlayer {
             inventory: Inventory::default(),
             cooldowns: Cooldowns::default(),
             saturation: 5.0,
+            experience_progress: 0.0,
+            experience_level: 0,
+            total_experience: 0,
+            damage_cooldown: 0,
             use_item: Stack::empty(),
             use_remaining: 0,
             started_using: false,
@@ -1941,6 +1963,16 @@ impl LocalPlayer {
     /// `LocalPlayer.hurtTo`: the health the server sets; less than before is a hurt
     /// to flinch from, but for the first it sends.
     pub fn hurt_to(&mut self, health: f32) {
+        // But for the first health the server sends: a loss holds off the next for 20
+        // ticks, a gain for 10.
+        if self.first_person.health_was_set() {
+            let damage = self.health - health;
+            if damage > 0.0 {
+                self.damage_cooldown = 20;
+            } else if damage < 0.0 {
+                self.damage_cooldown = 10;
+            }
+        }
         self.first_person.health_set(self.health, health);
         self.health = health;
     }
@@ -1963,6 +1995,9 @@ impl LocalPlayer {
         }
         self.first_tick = false;
         self.first_person.tick_hurt();
+        if self.damage_cooldown > 0 {
+            self.damage_cooldown -= 1;
+        }
         // LivingEntity.baseTick: tickDeath (the client level ticks deaths within the
         // simulation distance of the player, which the player always is), then
         // tickEffects. After the removal the tick goes on without `aiStep`.
@@ -3988,6 +4023,45 @@ mod tests {
         jump: false,
         ..JUMP
     };
+
+    #[test]
+    fn a_change_of_health_holds_off_the_next_for_ticks_that_count_down() {
+        let (level, blocks, tags) = world();
+        let env = Env {
+            level: &level,
+            blocks: &blocks,
+            tags: &tags,
+            colliders: &[],
+            others: None,
+        };
+        let mut p = standing(&env, play::SURVIVAL);
+        // The first health the server sends is where the player starts from.
+        p.hurt_to(20.0);
+        assert_eq!(p.damage_cooldown, 0);
+        p.hurt_to(15.0);
+        assert_eq!((p.health, p.damage_cooldown), (15.0, 20));
+        p.tick(&env, NONE);
+        p.tick(&env, NONE);
+        assert_eq!(p.damage_cooldown, 18);
+        // Healed: ten ticks, whatever was left; the same health changes nothing.
+        p.hurt_to(16.0);
+        assert_eq!(p.damage_cooldown, 10);
+        p.tick(&env, NONE);
+        p.hurt_to(16.0);
+        assert_eq!(p.damage_cooldown, 9);
+        for _ in 0..20 {
+            p.tick(&env, NONE);
+        }
+        assert_eq!(p.damage_cooldown, 0);
+        // What the HUD shows of the worn and the wounded comes from the attributes.
+        assert_eq!(p.attributes.max_health.value(), 20.0);
+        p.attributes.get_mut("minecraft:armor").unwrap().base = 7.0;
+        p.attributes.get_mut("minecraft:max_health").unwrap().base = 30.0;
+        let mut record = crate::hud::HudRecord::default();
+        record.fill(&crate::hud::HudState::default(), &p, true, false, false);
+        assert_eq!((record.armor, record.max_health), (7, 30.0));
+        assert!(record.survival && record.hardcore && !record.spectator);
+    }
 
     #[test]
     fn creative_flight_starts_on_a_double_tap_and_ends_on_landing() {

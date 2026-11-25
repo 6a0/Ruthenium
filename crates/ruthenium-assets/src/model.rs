@@ -310,6 +310,9 @@ pub(crate) struct RawModel {
     pub(crate) textures: Vec<(String, Slot)>,
     /// How it is placed where items are shown (`display`), by the place's name.
     pub(crate) display: Vec<(String, crate::item::ItemTransform)>,
+    /// `gui_light`: lit from the side in a GUI, as a block (`side`), or from the front,
+    /// as a flat picture (`front`).
+    pub(crate) gui_side_lit: Option<bool>,
 }
 
 fn number(v: &Value, what: &str) -> Result<f32, String> {
@@ -550,6 +553,10 @@ pub(crate) fn parse_model(text: &str) -> Result<RawModel, String> {
         },
         textures,
         display: crate::item::parse_display(v.get("display")),
+        gui_side_lit: v
+            .get("gui_light")
+            .and_then(Value::as_str)
+            .map(|light| light != "front"),
     })
 }
 
@@ -575,6 +582,7 @@ fn missing_model() -> RawModel {
         }]),
         ambient_occlusion: None,
         display: Vec::new(),
+        gui_side_lit: None,
         textures: vec![
             ("particle".into(), Slot::Reference("missingno".into())),
             (

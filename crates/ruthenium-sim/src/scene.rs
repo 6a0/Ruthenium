@@ -693,6 +693,8 @@ pub struct Frame {
     pub dimension: Arc<str>,
     pub environment: Arc<Environment>,
     pub player: PlayerState,
+    /// What the HUD shows of the player.
+    pub hud: crate::hud::HudRecord,
     /// The lids of chests and shulker boxes that are not shut, by position.
     pub lids: Vec<crate::block_entity::LidRecord>,
     /// The blocks being broken, by the player or by others, and how far: a stage from
@@ -753,6 +755,7 @@ impl Frame {
                 first_person: crate::first_person::FirstPersonRecord::default(),
                 target: None,
             },
+            hud: crate::hud::HudRecord::default(),
             lids: Vec::new(),
             breaking: Vec::new(),
             entities: Vec::new(),

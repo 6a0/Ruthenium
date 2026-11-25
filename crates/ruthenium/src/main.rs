@@ -143,8 +143,12 @@ With no command, opens the game window. Options:
   --view-bobbing <on|off>
                          whether the view sways with the player's steps (on, the
                          default), as vanilla's View Bobbing
-  --crosshair <on|off>   whether the crosshair is drawn (on, the default); off, for a
-                         picture to hold against another client's without its HUD
+  --crosshair <on|off>   whether the crosshair is drawn (on, the default)
+  --vignette <on|off>    whether the frame's corners darken in the dark (on, the
+                         default), as vanilla's Vignette
+  --hud <on|off>         whether the HUD is drawn over the world (on, the default);
+                         off, for a picture to hold against another client's without
+                         its HUD
   --animations <on|off>  whether animated textures (water, lava, fire) play (on, the
                          default); off, they show their first frame
   --fov-effects <on|off> whether the field of view narrows in water and lava (on, the

@@ -10,6 +10,7 @@ mod block_marks;
 mod check_pass;
 mod colour_check;
 mod gui;
+mod hud;
 mod overlay;
 mod pipelines;
 #[cfg(test)]
@@ -27,6 +28,7 @@ pub use block_entity::renderer::ViewOptions;
 pub use block_marks::{MarkStats, STAGES as CRACK_STAGES};
 pub use colour_check::ColourCheckReport;
 pub use gui::GuiFrame;
+pub use hud::{HudParams, HudStats};
 pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
 pub use sky::{MOON_PHASES, SkyImage, SkyImages, SkyOrder};
@@ -140,6 +142,8 @@ pub struct WorldFrame<'a> {
     /// and how far its tick has come.
     pub frame: &'a Frame,
     pub partial_tick: f32,
+    /// The HUD over it, unless it is hidden.
+    pub hud: Option<HudParams>,
 }
 
 /// The colour the world's pass is cleared to: the fog's, as in vanilla. Where no sky is
@@ -356,6 +360,8 @@ pub struct Renderer {
     /// Whether the player's own hands are drawn, and how its view moves with it.
     show_hand: bool,
     view_options: ViewOptions,
+    /// The HUD, with the world's assets.
+    hud: Option<hud::Hud>,
     /// The terrain's part of the last frame.
     world_times: WorldTimes,
     /// The number of the last frame recorded.
@@ -471,6 +477,7 @@ impl Renderer {
             block_outline: true,
             show_hand: true,
             view_options: ViewOptions::default(),
+            hud: None,
             world_times: WorldTimes::default(),
             last_frame: 0,
             frame_data,
@@ -519,6 +526,12 @@ impl Renderer {
             if let Some(b) = &mut self.block_entities {
                 b.set_shadows(self.entity_shadows);
             }
+            // Without the GUI's sprites there is no HUD.
+            let vignette = assets.vignette.take();
+            self.hud = assets
+                .gui
+                .take()
+                .map(|atlas| hud::Hud::new(atlas, vignette));
             let mut marks = BlockMarks::new(&mut self.textures, &mut self.uploads, &assets.cracks);
             marks.set_outline(self.block_outline);
             self.marks = Some(marks);
@@ -831,6 +844,11 @@ impl Renderer {
         if let Some(w) = &mut self.world {
             w.clear(&mut self.uploads, self.last_frame);
         }
+    }
+
+    /// What the last frame's HUD was made of, if there is one.
+    pub fn hud_stats(&self) -> Option<HudStats> {
+        self.hud.as_ref().map(hud::Hud::stats)
     }
 
     /// What the terrain is doing, if a world is loaded.
@@ -1194,6 +1212,9 @@ impl Renderer {
                 if let Some(models) = &mut self.block_entities {
                     models.stage(&mut self.textures, &mut self.uploads);
                 }
+                if let Some(hud) = &mut self.hud {
+                    hud.stage(&mut self.textures, &mut self.uploads);
+                }
                 self.world_times.stage_ns = started.elapsed().as_nanos() as u64;
                 let front = match (&look.water, self.underwater) {
                     (Some(water), Some(texture)) if self.textures.is_ready(texture) => {
@@ -1288,6 +1309,9 @@ impl Renderer {
             let (view, look) = (&seen.view, &seen.look);
             let started = std::time::Instant::now();
             models.begin();
+            if let Some(hud) = &mut self.hud {
+                hud.begin();
+            }
             if self.show_block_entities {
                 renderer.gather_block_entities(
                     models,
@@ -1318,6 +1342,30 @@ impl Renderer {
                     &seen,
                     &self.textures,
                     self.view_options,
+                );
+            }
+            if let (Some(hud), Some(params), Some(s)) = (&mut self.hud, &w.hud, surface) {
+                // The light at the eyes, as the vignette takes it.
+                let eyes = w.camera.position.map(|c| c.floor() as i32);
+                let (block, sky) = w
+                    .scene
+                    .with_terrain(|t| t.probe(eyes))
+                    .map_or((0, 15), |p| {
+                        (i32::from(p.block_light), i32::from(p.sky_light))
+                    });
+                let light = hud::EyeLight {
+                    level: block.max(sky - look.sky_darken),
+                    ambient: w.frame.environment.ambient_light,
+                };
+                hud.gather(
+                    w.frame,
+                    w.partial_tick,
+                    [s.extent.width, s.extent.height],
+                    params,
+                    light,
+                    models,
+                    renderer.block_atlas(),
+                    &self.textures,
                 );
             }
             self.world_times.stage_ns += started.elapsed().as_nanos() as u64;
@@ -1501,6 +1549,17 @@ impl Renderer {
                             self.show_hand.then_some(&seen.hand),
                             seen.size,
                         );
+                        // The HUD, over the world and the hands.
+                        if let (Some(hud), Some(models)) = (&mut self.hud, &mut self.block_entities)
+                        {
+                            hud.draw(
+                                &mut pass,
+                                &mut self.frame_data,
+                                seen.size,
+                                models,
+                                renderer.shared(),
+                            );
+                        }
                         self.world_times.draw_ns = started.elapsed().as_nanos() as u64;
                     }
                     (_, _, Some((scene, _))) => pass.draw(

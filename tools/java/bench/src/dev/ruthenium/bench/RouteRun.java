@@ -173,8 +173,9 @@ final class RouteRun {
     /** Why the player isn't at the route's start yet, or null when it is. */
     private String notAtStart(Minecraft mc, LocalPlayer player, String chunks) {
         double[] p = position(player);
-        if (mc.gameMode == null || mc.gameMode.getPlayerMode() != GameType.CREATIVE) {
-            return "the game mode is not creative";
+        GameType mode = route.survival ? GameType.SURVIVAL : GameType.CREATIVE;
+        if (mc.gameMode == null || mc.gameMode.getPlayerMode() != mode) {
+            return "the game mode is not " + mode.getName();
         } else if (!samePosition(p, route.position)) {
             return "the player is at " + p[0] + " " + p[1] + " " + p[2] + ", the route starts at " + route.position[0] + " "
                     + route.position[1] + " " + route.position[2];

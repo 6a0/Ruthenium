@@ -47,6 +47,8 @@ pub struct Route {
     pub yaw: f32,
     pub pitch: f32,
     pub flying: bool,
+    /// Begun in survival mode instead of creative: for pictures of the HUD.
+    pub survival: bool,
     stationary: bool,
     pub warmup_ticks: u64,
     pub capture_ticks: u64,
@@ -110,6 +112,7 @@ impl Route {
             yaw: 0.0,
             pitch: if scene == DIG { 90.0 } else { 0.0 },
             flying,
+            survival: false,
             stationary: matches!(scene, "idle" | "spin"),
             warmup_ticks,
             capture_ticks,
@@ -127,6 +130,15 @@ impl Route {
         self.yaw = yaw;
         self.pitch = pitch;
         self.flying = true;
+        self.id = fnv1a(&self.json().to_string());
+        self
+    }
+
+    /// The same route begun in survival mode, on the ground: for pictures of the HUD.
+    pub fn survival(mut self) -> Route {
+        self.survival = true;
+        self.flying = false;
+        self.id.clear();
         self.id = fnv1a(&self.json().to_string());
         self
     }
@@ -159,6 +171,10 @@ impl Route {
             "markEvery": MARK_EVERY,
             "stationary": self.stationary,
         });
+        // (Only where it is: the other routes keep their identifiers.)
+        if self.survival {
+            v["start"]["survival"] = json!(true);
+        }
         if !self.id.is_empty() {
             v["id"] = json!(self.id);
         }

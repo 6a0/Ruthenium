@@ -479,6 +479,17 @@ impl GlyphPages {
         }
     }
 
+    /// A glyph's picture for a GUI's quad: its page's texture and where on it the picture
+    /// is, once it can be sampled.
+    pub fn picture(&mut self, ink: Ink, font: &Font) -> Option<(u32, [f32; 4])> {
+        let slot = self.slot(ink, font).filter(|s| self.arrived(s.serial))?;
+        let texture = self.pages.get(slot.page)?.texture?.index();
+        let side = PAGE as f32;
+        let (x, y) = (slot.x as f32, slot.y as f32);
+        let uv = [x, y, x + slot.width as f32, y + slot.height as f32].map(|c| c / side);
+        Some((texture, uv))
+    }
+
     /// Whether the pictures up to `serial` can be sampled.
     pub fn arrived(&self, serial: u64) -> bool {
         serial <= self.ready

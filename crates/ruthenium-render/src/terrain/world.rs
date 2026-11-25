@@ -313,6 +313,11 @@ pub struct WorldAssets {
     /// The cracks in a block being broken: its ten stages' pictures in order
     /// (`textures/block/destroy_stage_0.png` to `_9`); a stage without one is not drawn.
     pub cracks: Vec<crate::sky::SkyImage>,
+    /// The GUI's atlas, which the HUD's sprites are in; without it there is no HUD.
+    pub gui: Option<ruthenium_assets::atlas::Atlas>,
+    /// The picture that darkens the frame's corners in the dark
+    /// (`textures/misc/vignette.png`).
+    pub vignette: Option<crate::sky::SkyImage>,
 }
 
 /// The indices of quads as two triangles each, sharing the diagonal from a quad's first
@@ -1870,6 +1875,11 @@ impl WorldRenderer {
     }
 
     /// Gathers the player's own hands, for this frame.
+    /// The block atlas, which items that are blocks are drawn from.
+    pub fn block_atlas(&self) -> TextureId {
+        self.atlas
+    }
+
     pub fn gather_hand(
         &self,
         renderer: &mut BlockEntityRenderer,

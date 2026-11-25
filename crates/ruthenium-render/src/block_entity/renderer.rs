@@ -23,6 +23,8 @@ use ruthenium_sim::environment::CardinalLight;
 use ruthenium_sim::item::{Components, EquipmentSlot, Stack, Trim};
 use ruthenium_sim::scene::{Frame, SectionKey, Terrain};
 use ruthenium_sim::scoreboard::{NameRecord, NameText};
+use ruthenium_ui::Quad;
+use ruthenium_ui::hud::{HudItem, HudText};
 
 use super::affine::Affine;
 use super::avatar::{self, Figure, Moment};
@@ -374,6 +376,8 @@ pub struct BlockEntityStats {
     pub players: u32,
     /// Parts of the player's own hands and of what they hold.
     pub hand_parts: u32,
+    /// Parts of the items a GUI shows.
+    pub gui_parts: u32,
     /// Sides of signs drawn, and their glyphs.
     pub texts: u32,
     pub glyphs: u32,
@@ -559,11 +563,29 @@ struct HeldHow {
     left: bool,
     /// Seen by the one who holds it.
     first_person: bool,
+    /// Not held at all: in a slot of a GUI.
+    gui: bool,
     left_handed: bool,
     /// The hand uses it, for so many ticks, with so many left.
     using: bool,
     use_ticks: i32,
     use_remaining: i32,
+}
+
+/// Which lights shade a model (`model.vert`'s `lights`): the level's usual two, the
+/// Nether's, and those of an item in a GUI, a flat one's and a block's.
+const LIGHTS_USUAL: u32 = 1;
+const LIGHTS_NETHER: u32 = 2;
+const LIGHTS_GUI_FLAT: u32 = 3;
+const LIGHTS_GUI_SIDE: u32 = 4;
+
+/// The light of what a GUI shows: the brightest of both kinds.
+const GUI_LIGHT: (u8, u8) = (15, 15);
+
+/// A text's shadow: a quarter as bright (`ARGB.scaleRGB(color, 0.25)`).
+fn shadow_colour(color: u32) -> u32 {
+    let quarter = |shift: u32| ((color >> shift & 0xFF) as f32 * 0.25) as u32;
+    color & 0xFF00_0000 | quarter(16) << 16 | quarter(8) << 8 | quarter(0)
 }
 
 /// What is held is drawn with: the atlases its pictures are in.
@@ -643,6 +665,9 @@ pub(crate) struct BlockEntityRenderer {
     /// what of them is drawn from back to front.
     hand: Vec<Instance>,
     hand_sorted: Vec<(f32, std::ops::Range<usize>)>,
+    /// The items a GUI shows, drawn over everything with a view and lights of their own:
+    /// the flat ones, and those lit from the side as blocks are.
+    gui: [Vec<Instance>; 2],
     parts: Vec<PartDraw>,
     christmas: bool,
     stats: BlockEntityStats,
@@ -836,6 +861,7 @@ impl BlockEntityRenderer {
             instances: Vec::new(),
             hand: Vec::new(),
             hand_sorted: Vec::new(),
+            gui: [Vec::new(), Vec::new()],
             parts: Vec::new(),
             textures: ids,
             christmas: is_christmas(SystemTime::now()),
@@ -969,6 +995,7 @@ impl BlockEntityRenderer {
         self.sorted.clear();
         self.hand.clear();
         self.hand_sorted.clear();
+        self.gui.iter_mut().for_each(Vec::clear);
         self.skins.begin();
         self.runs.clear();
         self.name_runs.clear();
@@ -1411,12 +1438,13 @@ impl BlockEntityRenderer {
                     let how = HeldHow {
                         left: !hands.is_right(off_hand),
                         first_person: true,
+                        gui: false,
                         left_handed: r.left_handed,
                         using: r.using == Some(off_hand),
                         use_ticks: r.use_duration[usize::from(off_hand)] - r.use_remaining,
                         use_remaining: r.use_remaining,
                     };
-                    self.add_held_at(stack, at, how, light, atlases, textures);
+                    let _ = self.add_held_at(stack, at, how, light, atlases, textures);
                 }
             }
         }
@@ -1957,16 +1985,18 @@ impl BlockEntityRenderer {
         let how = HeldHow {
             left,
             first_person: false,
+            gui: false,
             left_handed: r.left_handed,
             using: r.using.is_some_and(|(_, off)| off == off_hand),
             use_ticks: r.using.map_or(0, |u| u.0),
             use_remaining: r.use_remaining,
         };
-        self.add_held_at(stack, hand, how, light, atlases, textures);
+        let _ = self.add_held_at(stack, hand, how, light, atlases, textures);
     }
 
     /// Adds a stack's models where a hand at `hand` holds it, as its item's definition
-    /// says for a stack held so.
+    /// says for a stack held so. Returns how a GUI lights the first of them: from the
+    /// side, as a block, or not; nothing for a stack that has no model.
     fn add_held_at(
         &mut self,
         stack: &Stack,
@@ -1975,15 +2005,12 @@ impl BlockEntityRenderer {
         light: u32,
         atlases: Atlases,
         textures: &TextureTable,
-    ) {
+    ) -> Option<bool> {
         let c = &stack.c;
-        let Some(id) = c.item_model.as_deref().filter(|_| !stack.is_empty()) else {
-            return;
-        };
+        let id = c.item_model.as_deref().filter(|_| !stack.is_empty())?;
         // (Taken out for as long as its leaves are read.)
-        let Some(items) = self.items.take() else {
-            return;
-        };
+        let items = self.items.take()?;
+        let mut side_lit = None;
         let left = how.left;
         let has_component = |name: &str, _ignore_default: bool| {
             stack.patch.added.iter().any(|(kind, _)| {
@@ -1995,6 +2022,7 @@ impl BlockEntityRenderer {
         };
         let held = Held {
             context: match (how.first_person, left) {
+                _ if how.gui => "gui",
                 (false, true) => "thirdperson_lefthand",
                 (false, false) => "thirdperson_righthand",
                 (true, true) => "firstperson_lefthand",
@@ -2040,13 +2068,15 @@ impl BlockEntityRenderer {
                 let Some(model) = items.mesh(mesh) else {
                     return;
                 };
-                let places = if how.first_person {
-                    &model.first_person
+                side_lit.get_or_insert(model.gui_side_lit);
+                let place = if how.gui {
+                    model.gui
+                } else if how.first_person {
+                    model.first_person[usize::from(left)]
                 } else {
-                    &model.hands
+                    model.hands[usize::from(left)]
                 };
-                let placed = place_item(hand, places[usize::from(left)], left)
-                    .then_inner(Affine(*transformation));
+                let placed = place_item(hand, place, left).then_inner(Affine(*transformation));
                 match leaf {
                     Drawn::Model { tints, .. } => self.add_item(
                         mesh,
@@ -2065,6 +2095,7 @@ impl BlockEntityRenderer {
             });
         }
         self.items = Some(items);
+        side_lit
     }
 
     /// Adds an item's model where `placed` puts it: its quads by the atlas they are of
@@ -2255,7 +2286,10 @@ impl BlockEntityRenderer {
                 frame_data,
                 view,
                 fog,
-                cardinal,
+                match cardinal {
+                    CardinalLight::Default => LIGHTS_USUAL,
+                    CardinalLight::Nether => LIGHTS_NETHER,
+                },
                 lightmap,
                 indices,
                 (range.buffer, range.offset),
@@ -2303,7 +2337,10 @@ impl BlockEntityRenderer {
                 frame_data,
                 view,
                 fog,
-                cardinal,
+                match cardinal {
+                    CardinalLight::Default => LIGHTS_USUAL,
+                    CardinalLight::Nether => LIGHTS_NETHER,
+                },
                 lightmap,
                 indices,
                 (range.buffer, range.offset),
@@ -2313,6 +2350,168 @@ impl BlockEntityRenderer {
         self.shadows = shadows;
         std::mem::swap(&mut self.instances, &mut self.hand);
         std::mem::swap(&mut self.sorted, &mut self.hand_sorted);
+    }
+
+    /// The game's font, as the signs are written in it.
+    pub fn font(&self) -> &Font {
+        &self.font
+    }
+
+    /// Adds the items a GUI shows (`GuiGraphicsExtractor.item`, `GuiItemAtlas.drawToSlot`):
+    /// each of `items` holds `slots`' stack of its number in a square of 16 GUI units,
+    /// which are `scale` pixels each. `using` is the slot whose stack is being used, for
+    /// so many ticks with so many left.
+    pub fn gather_gui_items(
+        &mut self,
+        items: &[HudItem],
+        slots: &[Stack],
+        scale: f32,
+        using: Option<(usize, i32, i32)>,
+        block_atlas: TextureId,
+        textures: &TextureTable,
+    ) {
+        let atlases = Atlases {
+            items: self.item_atlas.filter(|t| textures.is_ready(*t)),
+            blocks: Some(block_atlas).filter(|t| textures.is_ready(*t)),
+        };
+        let light = record_light(GUI_LIGHT.0, GUI_LIGHT.1);
+        let side = 16.0 * scale;
+        let sorted = std::mem::take(&mut self.sorted);
+        let mut gathered = std::mem::take(&mut self.instances);
+        for item in items {
+            let Some(stack) = slots.get(item.slot) else {
+                continue;
+            };
+            // Pixels from the target's corner: the slot's middle, the model a slot wide
+            // and upright, towards the eyes.
+            let mut at = Affine::IDENTITY;
+            if let Some([wide, tall]) = item.squeeze {
+                let about = [
+                    (item.x + 8) as f32 * scale,
+                    (item.y + 12) as f32 * scale,
+                    0.0,
+                ];
+                at = at
+                    .translate(about)
+                    .scale([wide, tall, 1.0])
+                    .translate(about.map(|c| -c));
+            }
+            let at = at
+                .translate([
+                    (item.x + 8) as f32 * scale,
+                    (item.y + 8) as f32 * scale,
+                    0.0,
+                ])
+                .scale([side, -side, side]);
+            let used = using.filter(|u| u.0 == item.slot);
+            let how = HeldHow {
+                left: false,
+                first_person: false,
+                gui: true,
+                left_handed: false,
+                using: used.is_some(),
+                use_ticks: used.map_or(0, |u| u.1),
+                use_remaining: used.map_or(0, |u| u.2),
+            };
+            // How its first model is lit, all of it is.
+            if let Some(side_lit) = self.add_held_at(stack, at, how, light, atlases, textures) {
+                self.gui[usize::from(side_lit)].append(&mut self.instances);
+            }
+            self.instances.clear();
+            self.sorted.clear();
+        }
+        std::mem::swap(&mut self.instances, &mut gathered);
+        self.sorted = sorted;
+    }
+
+    /// Draws the items a GUI shows, as [`Self::gather_gui_items`] left them, into
+    /// `pass`, whose depths have been cleared, on a target of `size` pixels.
+    ///
+    /// # Safety
+    /// As [`Self::draw`].
+    pub unsafe fn draw_gui_items(
+        &mut self,
+        pass: &mut Pass<'_>,
+        frame_data: &mut FrameData,
+        size: [f32; 2],
+        lightmap: TextureId,
+        indices: (vk::Buffer, u64),
+    ) {
+        if self.gui.iter().all(Vec::is_empty) {
+            return;
+        }
+        let Some(range) = self.pool.resolve(self.range).filter(|_| self.ready) else {
+            return;
+        };
+        let view = View::gui(size);
+        let sorted = std::mem::take(&mut self.sorted);
+        let shadows = std::mem::take(&mut self.shadows);
+        let parts = self.stats.parts;
+        let mut drawn = 0;
+        for (list, lights) in [LIGHTS_GUI_FLAT, LIGHTS_GUI_SIDE].into_iter().enumerate() {
+            std::mem::swap(&mut self.instances, &mut self.gui[list]);
+            // SAFETY: the caller's.
+            unsafe {
+                self.draw_models(
+                    pass,
+                    frame_data,
+                    &view,
+                    &Fog::NONE,
+                    lights,
+                    lightmap,
+                    indices,
+                    (range.buffer, range.offset),
+                )
+            };
+            drawn += std::mem::replace(&mut self.stats.parts, 0);
+            std::mem::swap(&mut self.instances, &mut self.gui[list]);
+        }
+        self.stats.gui_parts = drawn;
+        self.stats.parts = parts;
+        self.shadows = shadows;
+        self.sorted = sorted;
+    }
+
+    /// Lines of text as a GUI's quads, in the game's font: every line's shadows, then
+    /// its glyphs. A glyph whose picture has not arrived yet is left out.
+    pub fn gui_text(&mut self, texts: &[HudText], out: &mut Vec<Quad>) {
+        for text in texts {
+            for shadow in [true, false] {
+                if shadow && !text.shadow {
+                    continue;
+                }
+                let mut x = text.x as f32;
+                for c in text.text.chars() {
+                    let glyph = self.font.glyph(c);
+                    let pen = x;
+                    x += glyph.advance(false);
+                    let Some(picture) = glyph.picture else {
+                        continue;
+                    };
+                    let Some((texture, uv)) = self.pages.picture(sign::Ink::Char(c), &self.font)
+                    else {
+                        continue;
+                    };
+                    let (by, color) = if shadow {
+                        (glyph.shadow_offset, shadow_colour(text.color))
+                    } else {
+                        (0.0, text.color)
+                    };
+                    let y = text.y as f32;
+                    out.push(Quad {
+                        rect: [
+                            pen + by,
+                            y + picture.top + by,
+                            pen + picture.right + by,
+                            y + picture.bottom + by,
+                        ],
+                        uv,
+                        color,
+                        texture,
+                    });
+                }
+            }
+        }
     }
 
     /// Draws what is seen through everything else, into `pass`: the names over heads,
@@ -2338,7 +2537,7 @@ impl BlockEntityRenderer {
         frame_data: &mut FrameData,
         view: &View,
         fog: &Fog,
-        cardinal: CardinalLight,
+        lights: u32,
         lightmap: TextureId,
         indices: (vk::Buffer, u64),
         vertices: (vk::Buffer, u64),
@@ -2389,10 +2588,6 @@ impl BlockEntityRenderer {
         {
             write_part(record, i, glints);
         }
-        let lights = match cardinal {
-            CardinalLight::Default => 1,
-            CardinalLight::Nether => 2,
-        };
         let push = model_push([world, matrix, first, lights], fog);
         self.stats.parts = count as u32;
         // Shadows lie under what is seen through: they are drawn before the skins.
@@ -2903,6 +3098,13 @@ pub(crate) fn model_push(words: [u32; 4], fog: &Fog) -> [u8; MODEL_PUSH_BYTES] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_texts_shadow_is_a_quarter_as_bright() {
+        assert_eq!(shadow_colour(0xFFFF_FFFF), 0xFF3F_3F3F);
+        assert_eq!(shadow_colour(0x80FF_8004), 0x803F_2001);
+        assert_eq!(shadow_colour(0xFF00_0000), 0xFF00_0000);
+    }
 
     #[test]
     fn colours_and_lights_are_packed_as_the_shader_unpacks_them() {

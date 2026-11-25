@@ -16,7 +16,8 @@ layout(push_constant) uniform Push {
     uint world;  // word offset of the frame's WORLD record
     uint matrix; // of its WORLD_MATRIX record
     uint parts;  // of the first MODEL_PART record
-    uint lights; // 0: draw nothing (the start-up warm-up); 1: the usual lights; 2: the Nether's
+    uint lights; // 0: draw nothing (the start-up warm-up); 1: the usual lights; 2: the Nether's;
+                 // 3, 4: those of an item in a GUI, a flat one's and a block's
 } pc;
 
 layout(location = 0) in vec3 a_position;
@@ -73,6 +74,15 @@ void main() {
         dot(rows[0].xyz, a_normal.xyz), dot(rows[1].xyz, a_normal.xyz), dot(rows[2].xyz, a_normal.xyz)));
     vec3 first = normalize(vec3(0.2, 1.0, -0.7));
     vec3 second = normalize(vec3(-0.2, pc.lights == 2u ? -1.0 : 1.0, 0.7));
+    // The usual two as the game turns them for its GUI (`Lighting.ITEMS_FLAT` and
+    // `ITEMS_3D`), where y points down the screen.
+    if (pc.lights == 3u) {
+        first = vec3(-0.222519, -0.17149863, 0.9597257);
+        second = vec3(-0.21501213, -0.97182524, 0.0965678);
+    } else if (pc.lights == 4u) {
+        first = vec3(-0.9334392, -0.26269472, -0.24430016);
+        second = vec3(-0.10357137, -0.9766068, 0.18844642);
+    }
     vec2 facing = vec2(dot(first, n), dot(second, n));
 
     uint packed_light = model_part_light(part);

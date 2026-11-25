@@ -349,8 +349,11 @@ pub struct Menu {
     forget_world: bool,
     /// Meshing threads to start with the world's assets.
     mesh_workers: usize,
-    /// Whether the crosshair is drawn over the world.
+    /// Whether the crosshair is drawn over the world, and the HUD at all.
     crosshair: bool,
+    hud: bool,
+    /// Whether the frame's corners darken in the dark (vanilla's Vignette option).
+    vignette: bool,
     /// The route played once the session is in the world (`--route`).
     route: Option<RoutePlayer>,
 }
@@ -460,6 +463,8 @@ impl Menu {
             forget_world: false,
             mesh_workers: default_mesh_workers(),
             crosshair: true,
+            hud: true,
+            vignette: true,
             route: None,
         }
     }
@@ -500,6 +505,30 @@ impl Menu {
     /// Whether the crosshair is drawn over the world (it is unless said otherwise).
     pub fn set_crosshair(&mut self, on: bool) {
         self.crosshair = on;
+    }
+
+    /// Whether the HUD is drawn over the world (it is unless said otherwise).
+    pub fn set_hud(&mut self, on: bool) {
+        self.hud = on;
+    }
+
+    /// Whether the vignette is drawn (it is unless said otherwise).
+    pub fn set_vignette(&mut self, on: bool) {
+        self.vignette = on;
+    }
+
+    /// How this frame's HUD is to be drawn: over the world while no screen is open,
+    /// unless it is switched off.
+    pub fn hud_params(&self) -> Option<ruthenium_render::HudParams> {
+        (self.hud && matches!(self.screen, Screen::Game)).then(|| ruthenium_render::HudParams {
+            gui_scale: 0,
+            vignette: self.vignette,
+            options: ruthenium_ui::hud::HudOptions {
+                crosshair: self.crosshair,
+                ..Default::default()
+            },
+            millis: self.started.elapsed().as_millis() as i64,
+        })
     }
 
     /// The world to draw this frame, if the session is in one.
@@ -2014,7 +2043,8 @@ impl Menu {
                         server: &self.server_name,
                         drawn,
                         debug,
-                        crosshair: self.crosshair,
+                        // The HUD has its own once the world is drawn.
+                        crosshair: self.crosshair && !(drawn && renderer.hud_stats().is_some()),
                     },
                     &scale,
                     &self.fonts,

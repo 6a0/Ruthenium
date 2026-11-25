@@ -12,3 +12,4 @@
 #![forbid(unsafe_code)]
 
 pub mod mth;
+pub mod random;

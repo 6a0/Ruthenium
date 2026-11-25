@@ -1331,6 +1331,13 @@ pub mod play {
             food: i32,
             saturation: f32,
         },
+        /// `ClientboundSetExperiencePacket`: how far the bar is filled (0 to 1), the
+        /// level, and all the points so far.
+        SetExperience {
+            progress: f32,
+            level: i32,
+            total: i32,
+        },
         /// `ClientboundPlayerCombatKillPacket`: a player died (the local player, for
         /// this client), with the death message.
         PlayerCombatKill {
@@ -1890,6 +1897,11 @@ pub mod play {
                     health: r.f32()?,
                     food: r.varint()?,
                     saturation: r.f32()?,
+                },
+                C::SetExperience => Clientbound::SetExperience {
+                    progress: r.f32()?,
+                    level: r.varint()?,
+                    total: r.varint()?,
                 },
                 C::PlayerCombatKill => Clientbound::PlayerCombatKill {
                     player_id: r.varint()?,
@@ -2750,6 +2762,37 @@ mod tests {
         let id = pl::Serverbound::PlayerAbilities.id() as u8;
         assert_eq!(play::player_abilities(true), [id, 2]);
         assert_eq!(play::player_abilities(false), [id, 0]);
+    }
+
+    #[test]
+    fn play_reads_health_and_experience() {
+        // Health as a float, the food as a number, its saturation as a float.
+        let mut b = 13.5f32.to_be_bytes().to_vec();
+        wire::write_varint(&mut b, 17);
+        b.extend(2.25f32.to_be_bytes());
+        assert_eq!(
+            play::Clientbound::decode(pl::Clientbound::SetHealth.id(), &b).unwrap(),
+            play::Clientbound::SetHealth {
+                health: 13.5,
+                food: 17,
+                saturation: 2.25,
+            }
+        );
+        // How far the bar is filled, then the level, then all the points: not in the
+        // order the packet's constructor takes them.
+        let mut b = 0.25f32.to_be_bytes().to_vec();
+        wire::write_varint(&mut b, 7);
+        wire::write_varint(&mut b, 300);
+        assert_eq!(b, [0x3E, 0x80, 0, 0, 7, 0xAC, 2]);
+        assert_eq!(
+            play::Clientbound::decode(pl::Clientbound::SetExperience.id(), &b).unwrap(),
+            play::Clientbound::SetExperience {
+                progress: 0.25,
+                level: 7,
+                total: 300,
+            }
+        );
+        assert!(play::Clientbound::decode(pl::Clientbound::SetExperience.id(), &b[..5]).is_err());
     }
 
     #[test]

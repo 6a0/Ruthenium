@@ -30,8 +30,9 @@ const SETTLE_TICKS: u64 = 40;
 const JOIN_LIMIT: Duration = Duration::from_secs(60);
 const START_LIMIT: Duration = Duration::from_secs(120);
 const SETTLE_LIMIT: Duration = Duration::from_secs(30);
-/// `GameType.CREATIVE`'s id.
+/// `GameType.CREATIVE`'s id, and `SURVIVAL`'s.
 const CREATIVE: i32 = 1;
+const SURVIVAL: i32 = 0;
 
 /// What is held during a tick and the turn of the camera (`Entity.turn`'s amounts)
 /// applied before it.
@@ -82,6 +83,8 @@ pub struct Route {
     yaw: f32,
     pitch: f32,
     flying: bool,
+    /// Begun in survival mode instead of creative.
+    survival: bool,
     /// The chunks loaded at the start, sorted.
     start_chunks: Vec<(i32, i32)>,
     segments: Vec<Segment>,
@@ -143,6 +146,7 @@ impl Route {
             yaw: number(&start["yaw"], "start yaw")? as f32,
             pitch: number(&start["pitch"], "start pitch")? as f32,
             flying: start["flying"].as_bool().ok_or("no start flying")?,
+            survival: start["survival"].as_bool().unwrap_or(false),
             start_chunks,
             segments,
             warmup_ticks: count(&v["warmupTicks"], "warmupTicks")?,
@@ -317,8 +321,8 @@ fn not_at_start(v: &PlayerView, route: &Route, chunks: &[(i32, i32)]) -> Option<
     let p = v.position;
     if !v.loaded {
         Some("the player hasn't loaded into the level".into())
-    } else if v.game_type != CREATIVE {
-        Some(format!("the game mode is {}, not creative", v.game_type))
+    } else if v.game_type != if route.survival { SURVIVAL } else { CREATIVE } {
+        Some(format!("the game mode is {}, not the route's", v.game_type))
     } else if !same_position(p, route.position) {
         Some(format!(
             "the player is at {} {} {}, the route starts at {} {} {}",

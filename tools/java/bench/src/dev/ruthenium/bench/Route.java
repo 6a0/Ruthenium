@@ -30,6 +30,8 @@ final class Route {
     final float yaw;
     final float pitch;
     final boolean flying;
+    /** Begun in survival mode instead of creative. */
+    final boolean survival;
     /** The chunks loaded at the start as {@code x,z;} each, sorted by x, then z. */
     final String startChunks;
     final List<Segment> segments = new ArrayList<>();
@@ -54,6 +56,7 @@ final class Route {
         yaw = start.get("yaw").getAsFloat();
         pitch = start.get("pitch").getAsFloat();
         flying = start.get("flying").getAsBoolean();
+        survival = start.has("survival") && start.get("survival").getAsBoolean();
         List<int[]> chunks = new ArrayList<>();
         for (JsonElement c : start.getAsJsonArray("chunks")) {
             JsonArray xz = c.getAsJsonArray();

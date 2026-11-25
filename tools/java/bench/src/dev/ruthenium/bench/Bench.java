@@ -149,7 +149,9 @@ public final class Bench {
         boolean bare = Boolean.getBoolean("ruthenium.bench.bare");
         // (With the hand: the HUD stays on and draws nothing, see HudMixin.)
         boolean hand = Boolean.getBoolean("ruthenium.bench.hand");
-        if (bare || hand) {
+        // (With the HUD: all of it stays, for a picture of it.)
+        boolean hud = Boolean.getBoolean("ruthenium.bench.hud");
+        if (bare || hand || hud) {
             // A picture of the world alone, to hold another client's picture against:
             // no HUD, hand or vignette, no clouds, and the same field of view in flight
             // as on the ground. Not a run to take times from.
@@ -284,13 +286,16 @@ public final class Bench {
             gcTimeStart = gc[1];
             lastFrameNs = now;
             capturing = true;
-            if (Boolean.getBoolean("ruthenium.bench.screenshot") && !Boolean.getBoolean("ruthenium.bench.hand")) {
+            if (Boolean.getBoolean("ruthenium.bench.screenshot")
+                    && !Boolean.getBoolean("ruthenium.bench.hand")
+                    && !Boolean.getBoolean("ruthenium.bench.hud")) {
                 net.minecraft.client.Screenshot.grab(
                         mc.gameDirectory, "ruthenium-bench-" + scene + ".png", mc.gameRenderer.mainRenderTarget(), 1, msg -> {});
             }
         }
         if (routeRun.finished()) {
-            if (Boolean.getBoolean("ruthenium.bench.hand") && mc.level != null && mc.player != null && !pictureSaved) {
+            boolean endPicture = Boolean.getBoolean("ruthenium.bench.hand") || Boolean.getBoolean("ruthenium.bench.hud");
+            if (endPicture && mc.level != null && mc.player != null && !pictureSaved) {
                 if (!pictureRequested) {
                     pictureRequested = true;
                     Path picture = out.resolveSibling(out.getFileName().toString().replaceFirst("\\.json$", "") + ".png");

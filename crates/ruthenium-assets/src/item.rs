@@ -204,6 +204,11 @@ pub struct ItemMesh {
     pub first_person: [Option<ItemTransform>; 2],
     /// On a head.
     pub head: Option<ItemTransform>,
+    /// In a slot of a GUI.
+    pub gui: Option<ItemTransform>,
+    /// How a GUI lights it (`gui_light`, the first of the model and its parents that
+    /// says): from the side, as a block, unless from the front, as a flat picture.
+    pub gui_side_lit: bool,
 }
 
 /// What colours the quads of one tint index (`ItemTintSource`). Colours are 0xRRGGBB.
@@ -739,6 +744,8 @@ impl<'a> Baker<'a> {
             place("firstperson_lefthand"),
         ];
         mesh.head = place("head");
+        mesh.gui = place("gui");
+        mesh.gui_side_lit = chain.iter().find_map(|m| m.gui_side_lit).unwrap_or(true);
         mesh
     }
 

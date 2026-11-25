@@ -135,7 +135,8 @@ A ratio above compares two different pictures.
 - **Also drawn since those runs.** Water and lava, including fluid in waterlogged blocks, and translucent block faces such as stained glass and ice.
 - **Block entities since 2026-11-25:** [chests, shulker boxes, skulls and banners](#block-entities).
 - **Also drawn since then.** Players and mannequins, the first-person hand, the targeted block outline and breaking stages.
-- **Still left out:** the other block entities, most other entities, clouds, particles, the weather's rain and snow, the overlays of a burning player and of a player inside a block, the effects on the player (blindness, darkness, night vision, a conduit's) and every part of the HUD but the crosshair.
+- **The HUD since 2026-11-25:** [the crosshair, the hotbar and its items, hearts, armour, food, air, experience, effect icons and the vignette](#the-hud).
+- **Still left out:** the other block entities, most other entities, clouds, particles, the weather's rain and snow, the overlays of a burning player and of a player inside a block, the effects on the player (blindness, darkness, night vision, a conduit's) and the HUD's text (chat, titles, the sidebar, boss bars, the tab list).
 - **Drawn in excess, in the first measurement:** every loaded section that had anything to draw got a mesh, and every one of those inside the view's frustum was drawn, hidden or not: at the spawn 925 sections and 522,119 quads in view, of 4,037 with a mesh among 15,288 loaded. Vanilla builds and draws only what its occlusion graph reaches, and with [cave culling](#cave-culling) so does Ruthenium, by the same rules: 405 sections and 291,723 quads, of 1,409 with a mesh. One difference remains: Ruthenium meshes what the walk reaches behind the camera too, where vanilla builds a section when it is first inside the view.
 - **The same pixels whichever way the sections are drawn.** The frame after the route's end, captured with `--screenshot`, is the same file byte for byte with direct, paged and indirect draws, at the spawn and at the end of the fly route.
 
@@ -395,6 +396,26 @@ A second comparison kept the chest, hand, outline and invisible remote player in
 
 Breaking overlays use the posed geometry of chests, shulker boxes, skulls and banners as well as terrain models. Spectators get an outline for menu providers and portals, including the lid checks on both halves of a chest. Filled maps still use the ordinary held-item path. The live pictures cover idle arms, a sword, stationary outlines and a remote miner. The animated hand poses have numerical checks.
 
+## The HUD
+
+Compared on 2026-11-25 with the 26.3 Vulkan client at 1920 × 1080 (GUI scale 4) on the RTX 4060 Laptop. The bench's `--hud-picture` begins the idle route in survival mode on the ground, leaves vanilla's HUD on (clouds off, FOV effects 0) and writes both clients' end-of-route PNGs beside their JSON; `--setup` commands stage the player. The warm-up was 40 seconds, so that the vignette, which follows the light a hundredth a tick, had settled in both clients. Results are under `cache/bench/results/hud-2026-11-25-rtx4060`.
+
+Staged in every picture: nine stacks in the hotbar (a sword, 64 stone, 5 golden apples, a bow, 16 ender pearls, a worn pickaxe, 7 stairs, 3 glass, 12 torches), a shield in the off hand, armour, level 30 with 60 points more.
+
+| Scene | Hotbar and its items | Hearts, armour, food, experience | Effect icons | Crosshair | Whole frame |
+|---|---:|---:|---:|---:|---:|
+| Looking up at noon; full health, four absorption hearts, hunger, three armour points, four effects | 100% (97.79% equal) | 100% (99.97% equal) | 100% (99.999% equal) | equal | 99.9994%, 12 pixels more than one step apart |
+| The same view; 13 of 20 health, three and a half armour points, three effects | 100% (97.79% equal) | 100% (99.93% equal) | 100% (99.999% equal) | equal | 98.01% |
+| The same view at midnight, no effects | 100% (97.79% equal) | equal | (none) | equal | 99.9996% (98.68% equal), 8 pixels more |
+| That midnight frame without Ruthenium's vignette (`--vignette off`) | | | | | 75.91% |
+
+Each figure is the share of a region's pixels within one step of 255 in every channel: the hotbar's is 976 × 96 pixels, the bars' 736 × 152, the icons' 320 × 216, the crosshair's 80 × 80. What is left of the second frame is vanilla's particles of the player's own effects, which Ruthenium does not draw. A first pair over the terrain at the spawn had the hotbar within one step in 99.96% of its pixels; the 36 others were single pixels of the grass seen through it.
+
+- **Items** are not copied from an atlas as in vanilla, which draws each into a square of 16 GUI units and blits that: Ruthenium draws their models straight into the frame, through the same orthographic view and with the two lights vanilla's GUI has for flat items and for blocks. The pictures above are what says the two agree.
+- **What moves** is checked by rule, against values the game's own classes give: the shaking of hearts, food and air draws `java.util.Random` as vanilla seeds it (thirty draws from the JVM), and the blinking, the regeneration wave, the bursting bubbles, the order and the flashing of effect icons, the bulge of a stack that grew and the cooldown's cover follow `Hud.java` in tests. 52 mutations of the new code each fail a test, 45 at once and 7 after their tests were made to tell (an indicator step, the wear bar's width, the second the lost hearts show, the experience bar's last unit, an icon's flashing, a stack replaced by one as large, the vignette across levels).
+- **Cost.** With the second picture's HUD drawn (ten items, 61 quads of crosshair, hotbar, bars and icons, 28 glyphs) against `--hud off`, one 20-second pair at the spawn with a video encoding session open: main-thread work 0.124 against 0.109 ms a frame at the median, GPU 0.326 against 0.295 ms. That includes the vignette's quad over the whole frame, which is drawn for as long as it darkens anything (in daylight, about the first half minute in a level) and left out once it has faded. No full campaign was run.
+- **Not drawn yet:** the selected item's name (its timer is kept); a mount's hearts and jump bar, the locator bar; a spectator's hotbar and its crosshair on what it can open; boss bars, the sidebar, titles and the action bar, chat, the tab list, subtitles and F3; the scope of a spyglass, a carved pumpkin's overlay, powder snow's frost, the portal's and nausea's overlays, the sleep fade, and the world border's red in the vignette. The HUD is drawn only while no screen is open (vanilla keeps it under one). The glint of an enchanted item in a slot is drawn as on a held one and was not compared (it moves with the clock). A bundle's bar, items larger than their slot (vanilla clips them), and the bubbles' popping sound are missing. The attack indicator can stand beside the hotbar in the layout, but no setting chooses it or the GUI scale yet.
+
 ## Where a frame's time goes
 
 Medians of the runs' medians, in milliseconds, at the default options. Work is the main thread's own: events, the game's frame, the GUI, recording and submitting. The governor is the wait for the GPU to finish the frame before, which is what one frame ahead removes.
@@ -503,6 +524,10 @@ cargo xtask bench dedicated --accept-eula --client ruthenium --scene idle,fly --
 # First-person view over existing terrain. Both PNGs are in the results directory.
 cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium --variant 'ruthenium=--light-flicker off' \
     --scene idle --at 4.5,72,2.5,32,72 --reps 1 --warmup 5 --duration 6 --hand-picture
+# The HUD in survival mode over the sky, both clients' PNGs in the results directory
+cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium --variant 'ruthenium=--light-flicker off' \
+    --scene idle --at 4.5,71,2.5,0,-90 --reps 1 --warmup 40 --duration 5 --hud-picture \
+    --setup 'give @a stone 64' --setup 'xp set @a 30 levels'
 # One frame of each client, vanilla's without HUD, hand, vignette and clouds (its PNG is
 # cache/bench/game/screenshots/ruthenium-bench-idle.png, Ruthenium's in the results folder)
 cargo xtask bench dedicated --accept-eula --client vanilla,ruthenium --variant 'ruthenium=--light-flicker off' \

@@ -281,6 +281,8 @@ const DRY_FOLIAGE_MAP: &str = "textures/colormap/dry_foliage.png";
 const SUN: &str = "textures/environment/celestial/sun.png";
 const MOON_DIR: &str = "textures/environment/celestial/moon/";
 const END_SKY: &str = "textures/environment/end_sky.png";
+/// What darkens the corners of the frame in the dark.
+const VIGNETTE: &str = "textures/misc/vignette.png";
 /// What is before a player's eyes in water.
 const UNDERWATER: &str = "textures/misc/underwater.png";
 
@@ -417,6 +419,12 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         ruthenium_data::v26_3::blocks::STATE_COUNT,
         table.part_count(),
     );
+    // The GUI's sprites, which the HUD is made of.
+    let gui = ruthenium_assets::atlas::atlas_def("gui").and_then(|def| {
+        ruthenium_assets::atlas::build(&resources, def, &options)
+            .inspect_err(|e| eprintln!("[ruthenium] no GUI atlas, so no HUD: {e}"))
+            .ok()
+    });
     // The cracks in a block being broken, a picture for each stage.
     let cracks = (0..ruthenium_render::CRACK_STAGES)
         .map(|stage| {
@@ -438,6 +446,8 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         sky,
         block_entities,
         cracks,
+        gui,
+        vignette: sky_image(VIGNETTE),
     })
 }
 

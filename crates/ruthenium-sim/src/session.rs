@@ -597,6 +597,8 @@ struct Game {
     held_keys: Keys,
     /// The world is hardcore (the login says).
     hardcore: bool,
+    /// The HUD's own counters (`Hud.tick`).
+    hud: crate::hud::HudState,
     /// The profile name the server knows the player by (its scoreboard name), and its
     /// UUID (its player list entry).
     name: String,
@@ -770,6 +772,7 @@ impl Game {
             bed_screen: false,
             held_keys: Keys::default(),
             hardcore: false,
+            hud: crate::hud::HudState::default(),
             name: String::new(),
             uuid: 0,
             players: PlayerInfos::default(),
@@ -923,20 +926,41 @@ impl Game {
         // What the crosshair is on now (`Minecraft.pick` with the frame's partial
         // tick), where its outline is drawn (`shouldRenderBlockOutline`,
         // `extractBlockOutline`).
+        let hit = self
+            .physics
+            .as_ref()
+            .filter(|_| w.loaded && w.player.is_alive())
+            .map(|physics| {
+                let env = Env {
+                    level: &w.level,
+                    blocks: &physics.blocks,
+                    tags: &self.tags,
+                    colliders: &[],
+                    others: None,
+                };
+                let partial = self.clock.partial_tick();
+                frame_hit(&env, &w.entities, &self.players, &w.player, partial)
+            });
+        // `Hud.extractCrosshair`'s part of the full attack indicator: the crosshair is
+        // on something that lives, within what the held item reaches.
+        let target_alive = match hit {
+            Some(pick::HitResult::Entity { id, location }) => {
+                let p = &w.player;
+                w.entities
+                    .get(id)
+                    .is_some_and(|e| e.info.living && !e.removed && e.health > 0.0)
+                    && p.active_item().c.attack_range.is_none_or(|range| {
+                        range.is_in_range(p.eye_position(), location, p.creative)
+                    })
+            }
+            _ => false,
+        };
         let target = self.physics.as_ref().and_then(|physics| {
             let p = &w.player;
-            if !w.loaded || !p.is_alive() {
-                return None;
-            }
-            let env = Env {
-                level: &w.level,
-                blocks: &physics.blocks,
-                tags: &self.tags,
-                colliders: &[],
-                others: None,
+            let pos = match hit? {
+                pick::HitResult::Block(b) if !b.miss => b.pos,
+                _ => return None,
             };
-            let partial = self.clock.partial_tick();
-            let pos = frame_target(&env, &w.entities, &self.players, p, partial)?;
             let state = w.level.block(pos[0], pos[1], pos[2]);
             if physics.blocks.is_air(state) || !w.level.border.block_within_bounds(pos) {
                 return None;
@@ -980,6 +1004,7 @@ impl Game {
             Some(target)
         });
         let own_skin = &self.own_skin;
+        let (hud, hardcore) = (&self.hud, self.hardcore);
         self.publisher.publish_frame(
             || Frame::new(now, w.environment.clone(), w.dimension_name.clone()),
             |f| {
@@ -1038,6 +1063,7 @@ impl Game {
                 }
                 r.parts = self.information.model_parts;
                 r.left_handed = self.information.main_hand == MainHand::Left;
+                f.hud.fill(hud, p, hardcore, r.left_handed, target_alive);
                 r.invisible = p.data.flags & crate::player::flag::INVISIBLE != 0;
                 r.on_fire = p.data.flags & crate::player::flag::ON_FIRE != 0;
                 r.sleeping = p.is_sleeping();
@@ -1459,6 +1485,8 @@ impl Game {
         let Some(w) = &mut self.world else {
             return;
         };
+        // `gui.tick`, before anything of the level ticks.
+        self.hud.tick(&w.player);
         let mut out = Vec::new();
         // `rightClickDelay`, then `gameMode.tick`: the held slot first, then the
         // connection's tick, where the listener lets the player in once the level is
@@ -2237,6 +2265,18 @@ impl Game {
                     w.player.saturation = saturation;
                 }
             }
+            play::Clientbound::SetExperience {
+                progress,
+                level,
+                total,
+            } => {
+                // `setExperienceValues`.
+                if let Some(w) = &mut self.world {
+                    w.player.experience_progress = progress;
+                    w.player.experience_level = level;
+                    w.player.total_experience = total;
+                }
+            }
             play::Clientbound::ContainerSetContent {
                 container_id,
                 state_id,
@@ -2253,6 +2293,7 @@ impl Game {
                     w.player
                         .inventory
                         .initialize(state_id, stacks, it.stack(&carried));
+                    self.hud.slots_replaced();
                 }
             }
             play::Clientbound::ContainerSetSlot {
@@ -2266,6 +2307,17 @@ impl Game {
                     && container_id == 0
                 {
                     let s = physics.items.stack(&item);
+                    // `InventoryMenu.isHotbarSlot`: the hotbar, then the off hand.
+                    if let Some(shown @ 0..crate::hud::SLOTS) =
+                        usize::try_from(slot).ok().and_then(|i| i.checked_sub(36))
+                    {
+                        let at = if shown == crate::hud::OFF_HAND {
+                            crate::inventory::SLOT_OFFHAND
+                        } else {
+                            shown
+                        };
+                        self.hud.slot_set(shown, w.player.inventory.get(at), &s);
+                    }
                     w.player
                         .inventory
                         .set_menu_slot(i32::from(slot), state_id, s);
@@ -2277,6 +2329,13 @@ impl Game {
                     && let Ok(slot) = usize::try_from(slot)
                 {
                     w.player.inventory.set(slot, physics.items.stack(&item));
+                    match slot {
+                        0..9 => self.hud.slot_replaced(slot),
+                        crate::inventory::SLOT_OFFHAND => {
+                            self.hud.slot_replaced(crate::hud::OFF_HAND);
+                        }
+                        _ => {}
+                    }
                 }
             }
             play::Clientbound::SetCursorItem { item } => {
@@ -2472,15 +2531,15 @@ impl Game {
     }
 }
 
-/// The block the crosshair is on `partial` of the way into the tick
+/// What the crosshair is on `partial` of the way into the tick
 /// (`raycastHitResult(partialTicks)`): the eyes and the view where they are drawn.
-fn frame_target(
+fn frame_hit(
     env: &Env<'_>,
     entities: &Entities,
     players: &PlayerInfos,
     player: &LocalPlayer,
     partial: f32,
-) -> Option<[i32; 3]> {
+) -> pick::HitResult {
     let eye_height = (player.eye_position()[1] - player.position[1]) as f32;
     let (old_y_rot, old_x_rot) = player.old_rot;
     let camera = pick::Camera {
@@ -2503,7 +2562,7 @@ fn frame_target(
             head_look: pick::view_vector(player.x_rot, player.head_y_rot),
             movement: player.delta,
         });
-    let hit = pick::raycast(
+    pick::raycast(
         env,
         entities,
         players,
@@ -2512,11 +2571,7 @@ fn frame_target(
         player.hand(Hand::Main).c.name,
         player.attributes.block_interaction_range.value(),
         player.attributes.entity_interaction_range.value(),
-    );
-    match hit {
-        pick::HitResult::Block(b) if !b.miss => Some(b.pos),
-        _ => None,
-    }
+    )
 }
 
 /// `LocalPlayer.raycastHitResult`: what the crosshair is on, from the eyes as the
@@ -3164,6 +3219,63 @@ mod tests {
         let (sent, position, ..) = outcome(&mut r);
         assert_ne!(position, [8.5, 0.0, 8.5]);
         assert!(sent.len() > 100, "{} packets", sent.len());
+    }
+
+    #[test]
+    fn what_the_hud_shows_reaches_the_frame() {
+        let mut r = rig(None);
+        r.packet(login());
+        let f = r.frame(10);
+        assert_eq!((f.hud.experience_level, f.hud.damage_cooldown), (0, 0));
+        assert_eq!(
+            f.hud.survival,
+            matches!(f.player.game_type, play::SURVIVAL | play::ADVENTURE)
+        );
+        let ticks = f.hud.ticks;
+
+        r.packet(play::Clientbound::SetExperience {
+            progress: 0.25,
+            level: 7,
+            total: 100,
+        });
+        r.packet(play::Clientbound::SetHealth {
+            health: 20.0,
+            food: 18,
+            saturation: 1.5,
+        });
+        let f = r.frame(10);
+        assert_eq!(
+            (f.hud.experience_progress, f.hud.experience_level),
+            (0.25, 7)
+        );
+        assert_eq!(f.hud.experience_needed(), 21);
+        assert_eq!(
+            (f.hud.health, f.hud.food, f.hud.saturation),
+            (20.0, 18, 1.5)
+        );
+        // The first health a server sends is no change to blink at.
+        assert_eq!(f.hud.damage_cooldown, 0);
+
+        // Less health holds off the next hurt for 20 ticks, more for 10; the same, not
+        // at all.
+        let health = |health| play::Clientbound::SetHealth {
+            health,
+            food: 18,
+            saturation: 1.5,
+        };
+        r.packet(health(14.0));
+        let f = r.frame(1);
+        assert_eq!((f.hud.health, f.hud.damage_cooldown), (14.0, 20));
+        r.packet(health(16.0));
+        let f = r.frame(1);
+        assert_eq!((f.hud.health, f.hud.damage_cooldown), (16.0, 10));
+        r.packet(health(16.0));
+        assert_eq!(r.frame(1).hud.damage_cooldown, 10);
+
+        // The HUD's own ticks go on with the game's.
+        let f = r.frame(100);
+        assert_eq!(f.hud.ticks, ticks + i32::try_from(f.ticks).unwrap());
+        assert!(f.hud.ticks > ticks);
     }
 
     #[test]

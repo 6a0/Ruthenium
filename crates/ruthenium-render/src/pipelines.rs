@@ -78,10 +78,15 @@ pub enum PipelineId {
     WorldShape,
     WorldText,
     WorldOverlay,
+    /// GUI quads of the HUD that are not blended as the others are, over the world: the
+    /// crosshair, which turns what is behind it to its opposite, and the vignette, which
+    /// darkens it.
+    Crosshair,
+    Vignette,
 }
 
 impl PipelineId {
-    pub const ALL: [PipelineId; 41] = [
+    pub const ALL: [PipelineId; 43] = [
         PipelineId::Background,
         PipelineId::Blur,
         PipelineId::Gui,
@@ -123,6 +128,8 @@ impl PipelineId {
         PipelineId::WorldShape,
         PipelineId::WorldText,
         PipelineId::WorldOverlay,
+        PipelineId::Crosshair,
+        PipelineId::Vignette,
     ];
 
     /// The pipeline that draws the same in a pass with a depth attachment, for the
@@ -383,6 +390,14 @@ impl PipelineId {
             PipelineId::WorldShape => over_world("shape_world", PipelineId::Shape),
             PipelineId::WorldText => over_world("text_world", PipelineId::Text),
             PipelineId::WorldOverlay => over_world("overlay_world", PipelineId::Overlay),
+            PipelineId::Crosshair => GraphicsDesc {
+                blend: Blend::Invert,
+                ..over_world("crosshair", PipelineId::Gui)
+            },
+            PipelineId::Vignette => GraphicsDesc {
+                blend: Blend::Darken,
+                ..over_world("vignette", PipelineId::Gui)
+            },
             PipelineId::Background => GraphicsDesc::flat(
                 "background",
                 shaders::BACKGROUND_VERT.words(),

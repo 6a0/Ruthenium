@@ -199,6 +199,11 @@ impl FirstPerson {
         }
     }
 
+    /// `flashOnSetHealth`: the server has set the health before.
+    pub fn health_was_set(&self) -> bool {
+        self.flash_on_set_health
+    }
+
     /// `LocalPlayer.hurtTo`'s flinch: health the server sets lower than it was, but
     /// for the first it sends.
     pub fn health_set(&mut self, old: f32, new: f32) {

@@ -41,6 +41,7 @@ pub mod environment;
 pub mod first_person;
 pub mod fluid;
 pub mod handoff;
+pub mod hud;
 pub mod input;
 pub mod inside;
 pub mod interact;

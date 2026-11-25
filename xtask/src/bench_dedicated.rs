@@ -42,7 +42,7 @@ use crate::gpu::Gpu;
 use crate::routes::{self, Checked, Route};
 use crate::server::{self, Server};
 
-const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--hand-picture] [--at <x,y,z[,yaw,pitch]>] [--setup <console command>]... [--time <ticks of the day>] [--keep-worlds]";
+const USAGE: &str = "usage: cargo xtask bench dedicated --accept-eula [--client vanilla,headless,ruthenium] [--variant <label>[=<client options>]]... [--baseline <folder>] [--backend vulkan,opengl] [--scene idle,spin,walk,fly,dig] [--reps N] [--headless-reps N] [--warmup S] [--duration S] [--gpu <name>] [--java <java>] [--server-jar <server.jar>] [--bin <ruthenium>] [--data-dir <folder>] [--expect <scene>=<positions>[,<footprint>]]... [--results <folder>] [--compare <folder>] [--timeout S] [--width W] [--height H] [--any-drawable] [--screenshot] [--bare-picture] [--hand-picture] [--hud-picture] [--at <x,y,z[,yaw,pitch]>] [--setup <console command>]... [--time <ticks of the day>] [--keep-worlds]";
 /// The view and simulation distance of the server and the render distance of the
 /// clients, as in the integrated-server scenes.
 const VIEW_DISTANCE: i32 = 12;
@@ -96,6 +96,9 @@ struct Options {
     bare: bool,
     /// The same with the player's hand and the outline of the block it looks at kept.
     hand: bool,
+    /// Pictures of the HUD: the route begins in survival mode, on the ground, and vanilla
+    /// keeps its HUD.
+    hud: bool,
     /// The time of day the scenes are set to, in ticks of the day (noon unless said
     /// otherwise: the baselines').
     time: u32,
@@ -137,6 +140,7 @@ fn parse(args: &[String]) -> Result<Options, String> {
         screenshot: false,
         bare: false,
         hand: false,
+        hud: false,
         time: 6000,
         at: None,
         setup: Vec::new(),
@@ -156,6 +160,10 @@ fn parse(args: &[String]) -> Result<Options, String> {
             "--hand-picture" => {
                 o.screenshot = true;
                 o.hand = true;
+            }
+            "--hud-picture" => {
+                o.screenshot = true;
+                o.hud = true;
             }
             "--keep-worlds" => o.keep_worlds = true,
             "--any-drawable" => o.any_drawable = true,
@@ -392,7 +400,13 @@ fn place_player(server: &mut Server, route: &Route, setup: &[String]) -> Result<
             }
         }
     }
-    server.command(&format!("gamemode creative {PLAYER}"), "Creative")?;
+    if route.survival {
+        // (Nothing is answered if a setup command has done it already, as one must that
+        // wants the player hurt.)
+        server.command(&format!("gamemode survival {PLAYER}"), "")?;
+    } else {
+        server.command(&format!("gamemode creative {PLAYER}"), "Creative")?;
+    }
     Ok(())
 }
 
@@ -405,10 +419,11 @@ impl Harness<'_> {
             self.o.duration,
             VIEW_DISTANCE,
         )?;
-        Ok(match self.o.at {
+        let route = match self.o.at {
             Some((position, yaw, pitch)) => route.at(position, yaw, pitch),
             None => route,
-        })
+        };
+        Ok(if self.o.hud { route.survival() } else { route })
     }
 
     /// A fresh world copy and a server on it, set up for `scene`.
@@ -648,7 +663,7 @@ impl Harness<'_> {
             .arg("--bench-out")
             .arg(&summary);
         if self.o.hand || self.o.bare {
-            command.args(["--crosshair", "off"]);
+            command.args(["--hud", "off"]);
         }
         if self.o.bare {
             command.args(["--hand", "off", "--block-outline", "off"]);
@@ -1077,6 +1092,7 @@ pub fn run(root: &Path, args: &[String]) -> Result<(), String> {
         screenshot: o.screenshot,
         bare: o.bare,
         hand: o.hand,
+        hud: o.hud,
         render_distance: VIEW_DISTANCE as u32,
         gpu: o.gpu,
     };

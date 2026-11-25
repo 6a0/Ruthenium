@@ -217,6 +217,16 @@ impl Cooldowns {
         }
     }
 
+    /// A group's cooldown as of this tick, for drawing between ticks.
+    pub fn of(&self, group: &str) -> crate::hud::Cooldown {
+        self.cooldowns
+            .get(group)
+            .map_or_else(Default::default, |&(start, end)| crate::hud::Cooldown {
+                left: end as f32 - self.tick_count as f32,
+                of: (end - start) as f32,
+            })
+    }
+
     pub fn tick(&mut self) {
         self.tick_count += 1;
         let now = self.tick_count;
