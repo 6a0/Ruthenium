@@ -1258,6 +1258,24 @@ vsync = true
     }
 
     #[test]
+    fn volume_sliders_are_percent_and_keep_vanillas_doubles() {
+        let mut s = Settings::default();
+        assert_eq!(s.get(Row::Volume(SoundSource::Master)), 100);
+        s.set(Row::Volume(SoundSource::Players), 37);
+        assert_eq!(s.sound.volumes[SoundSource::Players.index()], 0.37);
+        assert_eq!(s.get(Row::Volume(SoundSource::Players)), 37);
+        s.set(Row::Volume(SoundSource::Players), 500);
+        assert_eq!(s.sound.volumes[SoundSource::Players.index()], 1.0);
+        // A value of vanilla's between two steps shows as the nearest.
+        s.sound.volumes[SoundSource::Ui.index()] = 0.3943661971830986;
+        assert_eq!(s.get(Row::Volume(SoundSource::Ui)), 39);
+        assert_eq!(
+            s.sound.volumes().get(SoundSource::Ui),
+            0.3943661971830986f64 as f32
+        );
+    }
+
+    #[test]
     fn screen_values_map_to_settings_and_back() {
         let mut s = Settings::default();
         // (Key bindings' rows have no values: they act.)

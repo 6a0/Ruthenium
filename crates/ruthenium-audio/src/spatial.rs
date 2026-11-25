@@ -267,6 +267,18 @@ mod tests {
         let l = Listener::camera([0.0, 64.0, 0.0], 30.0, 90.0);
         let below = l.to_local([0.0, 60.0, 0.0]);
         assert!((below[2] + 4.0).abs() < 1e-5, "{below:?}");
+        // Looking down at 45 degrees: up stays square to forward, east stays left, and
+        // what is straight ahead along the look is ahead.
+        let l = Listener::camera([0.0, 64.0, 0.0], 0.0, 45.0);
+        assert!(dot(l.forward, l.up).abs() < 1e-6 && (l.up[1] - 0.5f32.sqrt()).abs() < 1e-6);
+        assert!(l.up[2] > 0.0, "{:?}", l.up);
+        let east = l.to_local([1.0, 64.0, 0.0]);
+        assert!((east[0] + 1.0).abs() < 1e-5, "{east:?}");
+        let ahead = l.to_local([0.0, 62.0, 2.0]);
+        assert!(
+            ahead[0].abs() < 1e-5 && ahead[1].abs() < 1e-5 && ahead[2] < 0.0,
+            "{ahead:?}"
+        );
     }
 
     #[test]

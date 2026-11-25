@@ -4287,6 +4287,13 @@ mod tests {
         // Flying: nothing.
         let (steps, walked, _) = walk(forward, true);
         assert!(steps.is_empty() && walked > 3.0, "{walked}");
+        // Jumping in place: the way up and down isn't walked (only climbing counts it).
+        let jump = Keys { jump: true, ..NONE };
+        let (steps, walked, p) = walk(jump, false);
+        assert!(
+            steps.is_empty() && walked == 0.0 && p.move_dist == 0.0,
+            "{steps:?}"
+        );
     }
 
     #[test]
