@@ -27,6 +27,18 @@ pub fn vanilla(game: &Path) -> Result<Arc<Resources>, String> {
     Ok(resources)
 }
 
+/// A stack of vanilla's pack with `server` over it (lowest first): vanilla's opened anew
+/// (the shared one belongs to the menus and is never stacked under a server's packs),
+/// or the shared one when there are none.
+pub fn with_server_packs(game: &Path, server: Vec<Pack>) -> Result<Arc<Resources>, String> {
+    if server.is_empty() {
+        return vanilla(game);
+    }
+    let mut packs = vec![pack(game)?];
+    packs.extend(server);
+    Ok(Arc::new(Resources::new(packs)))
+}
+
 /// The vanilla pack of the game imported in `game`, opened anew.
 fn pack(game: &Path) -> Result<Pack, String> {
     let version = ruthenium_prepare::supported_version();

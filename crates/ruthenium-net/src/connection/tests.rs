@@ -243,7 +243,7 @@ fn offline_login_configuration_and_play() {
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, Event::LoggedIn { profile } if profile.name == "Dev"))
+            .any(|e| matches!(e, Event::LoggedIn { profile, .. } if profile.name == "Dev"))
     );
     assert!(
         events.contains(&Event::Configuration(cfg::Clientbound::SelectKnownPacks(

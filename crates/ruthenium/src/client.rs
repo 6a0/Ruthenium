@@ -112,6 +112,11 @@ pub struct Options {
     pub window_size: (u32, u32),
     /// Development: join this server (an address as typed) from the server list at once.
     pub join: Option<String>,
+    /// With `join`: the server's Server Resource Packs setting, in place of its server
+    /// list entry's (development).
+    pub server_packs: Option<ruthenium_net::server_list::PackStatus>,
+    /// With `rejoin_after`: join this server instead of the first (development).
+    pub rejoin_address: Option<String>,
     /// Benchmarks: how many frames the GPU may still be working on when the next one
     /// samples input (0 or 1), over what the present policy would choose.
     pub frames_ahead: Option<u64>,
@@ -258,6 +263,8 @@ impl Options {
             input: None,
             window_size: DEFAULT_SIZE,
             join: None,
+            server_packs: None,
+            rejoin_address: None,
             frames_ahead: None,
             empty_window: false,
             frame_log: None,
@@ -471,6 +478,20 @@ impl Options {
                 "--adapter-report" => o.adapter_report = Some(value("a file")?.into()),
                 "--data-dir" => o.data_dir = Some(value("a folder")?.into()),
                 "--join" => o.join = Some(value("a server address")?),
+                "--rejoin-address" => o.rejoin_address = Some(value("a server address")?),
+                "--server-packs" => {
+                    use ruthenium_net::server_list::PackStatus;
+                    o.server_packs = Some(match value("prompt, enabled or disabled")?.as_str() {
+                        "prompt" => PackStatus::Prompt,
+                        "enabled" => PackStatus::Enabled,
+                        "disabled" => PackStatus::Disabled,
+                        v => {
+                            return Err(format!(
+                                "--server-packs: not prompt, enabled or disabled: {v}"
+                            ));
+                        }
+                    });
+                }
                 "--rejoin-after" => {
                     let v = value("a number of seconds")?;
                     let s: f64 = v
@@ -782,6 +803,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     if let Some(on) = opts.crosshair {
         menu.set_crosshair(on);
+    }
+    if let Some(s) = opts.server_packs {
+        menu.set_server_packs(s);
     }
     if let Some(on) = opts.hud {
         menu.set_hud(on);
@@ -1432,7 +1456,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
         {
             // Joining again drops the session there is, which disconnects it.
             rejoin_after = None;
-            eprintln!("[ruthenium] leaving and joining {address} again");
+            let address = opts.rejoin_address.as_ref().unwrap_or(address);
+            eprintln!("[ruthenium] leaving and joining {address}");
             menu.join_now(address, window.pixel_size());
         }
         let t_gui = Instant::now();

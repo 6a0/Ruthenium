@@ -679,6 +679,11 @@ impl<P: Clone> ServerPacks<P> {
         self.manager.prompt
     }
 
+    /// The packs the manager keeps (pushed, and not yet gone).
+    pub fn tracked(&self) -> usize {
+        self.manager.packs.len()
+    }
+
     /// A batch's result (on its way to the game thread: it runs with the tasks).
     pub fn downloaded(&mut self, batch: u64, result: Vec<(u128, Result<PathBuf, ()>)>) {
         self.source.tasks.push_back(Task::Downloaded(batch, result));

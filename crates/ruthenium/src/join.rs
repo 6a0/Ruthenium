@@ -23,7 +23,7 @@ use ruthenium_sim::blocks::Blocks;
 use ruthenium_sim::enchantment::Enchantments;
 use ruthenium_sim::entity::EntityTypes;
 use ruthenium_sim::item::Items;
-use ruthenium_sim::session::{DimensionType, Physics, Session, SessionOptions};
+use ruthenium_sim::session::{DimensionType, Physics, ServerPackSetup, Session, SessionOptions};
 use ruthenium_sim::use_on::Transformers;
 
 use crate::account::Accounts;
@@ -31,6 +31,9 @@ use crate::skins::SkinLoader;
 
 /// The brand Ruthenium sends (PLAN D6).
 pub const BRAND: &str = "ruthenium";
+
+/// The folder of Ruthenium's cache that servers' resource packs are downloaded into.
+pub const SERVER_PACKS_DIR: &str = "server-packs";
 
 /// Present in development builds that can join offline-mode servers, and only there: CI
 /// checks that release binaries don't contain it (PLAN D3).
@@ -299,25 +302,29 @@ const VIGNETTE: &str = "textures/misc/vignette.png";
 /// What is before a player's eyes in water.
 const UNDERWATER: &str = "textures/misc/underwater.png";
 
-/// Builds what drawing a world needs from the imported game in `game`: the block atlas
-/// with its mip levels, and every block state's baked model and drawing rules.
-/// `max_texture` is the largest texture the GPU takes.
-pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, String> {
+/// Builds what drawing a world needs from the imported game in `game` and the resources
+/// of `resources` (vanilla's pack, with a server's packs over it or not): the block atlas
+/// with its mip levels, and every block state's baked model and drawing rules; the block
+/// tags and the exported tables are the game's own. `max_texture` is the largest
+/// texture the GPU takes.
+pub fn load_world_assets_from(
+    game: &Path,
+    resources: &Resources,
+    max_texture: u32,
+) -> Result<WorldAssets, String> {
     let started = std::time::Instant::now();
     let version = ruthenium_prepare::supported_version();
     let imported = ruthenium_prepare::import::open(version, game)
         .ok_or("the game files are not imported; run `ruthenium prepare`")?;
-    // The vanilla pack the sound files and the menus read too.
-    let resources = crate::game_files::vanilla(game)?;
     let def = ruthenium_assets::atlas::atlas_def("blocks").expect("a known atlas");
     let options = AtlasOptions {
         max_size: max_texture,
         ..AtlasOptions::default()
     };
-    let mut atlas = ruthenium_assets::atlas::build(&resources, def, &options)
+    let mut atlas = ruthenium_assets::atlas::build(resources, def, &options)
         .map_err(|e| format!("the block atlas: {e}"))?;
     let stitched = started.elapsed();
-    let models = BlockModels::bake(&*resources, &atlas);
+    let models = BlockModels::bake(resources, &atlas);
     for w in &models.warnings {
         eprintln!("[ruthenium] block models: {w}");
     }
@@ -339,12 +346,12 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
     let items_started = std::time::Instant::now();
     let items = ruthenium_assets::atlas::atlas_def("items")
         .and_then(|def| {
-            ruthenium_assets::atlas::build(&resources, def, &options)
+            ruthenium_assets::atlas::build(resources, def, &options)
                 .inspect_err(|e| eprintln!("[ruthenium] no item atlas: {e}"))
                 .ok()
         })
         .map(|item_atlas| {
-            let models = ItemModels::bake(&resources, &atlas, &item_atlas, grass_map.as_ref());
+            let models = ItemModels::bake(resources, &atlas, &item_atlas, grass_map.as_ref());
             for w in &models.warnings {
                 eprintln!("[ruthenium] item models: {w}");
             }
@@ -401,7 +408,7 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         })
         .collect();
     let exports = ruthenium_prepare::exporters::exports_dir(&imported);
-    let mut block_entities = block_entity_assets(&exports, &resources, &sky_image)
+    let mut block_entities = block_entity_assets(&exports, resources, &sky_image)
         .inspect_err(|e| eprintln!("[ruthenium] no block entities: {e}; run `ruthenium prepare`"))
         .ok();
     if let Some(b) = &mut block_entities {
@@ -429,7 +436,7 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
     );
     // The GUI's sprites, which the HUD is made of.
     let gui = ruthenium_assets::atlas::atlas_def("gui").and_then(|def| {
-        ruthenium_assets::atlas::build(&resources, def, &options)
+        ruthenium_assets::atlas::build(resources, def, &options)
             .inspect_err(|e| eprintln!("[ruthenium] no GUI atlas, so no HUD: {e}"))
             .ok()
     });
@@ -578,23 +585,16 @@ fn block_entity_assets(
     })
 }
 
-/// The world's drawing assets on their way: built on a thread from the first join on.
-#[derive(Debug, Default)]
-enum WorldLoad {
-    #[default]
-    NotStarted,
-    Loading(JoinHandle<Result<WorldAssets, String>>),
-    /// Handed over, or failed (said once).
-    Done,
-}
-
 /// Starts joining servers: loads the game data on a thread meanwhile.
 #[derive(Debug)]
 pub struct Joiner {
     data: Data,
     game: Option<PathBuf>,
-    world: WorldLoad,
     skins: Option<SkinLoader>,
+    /// The language server messages are read in: the server packs' over vanilla's,
+    /// once a reload has brought one (none: vanilla's).
+    server_lang: Option<Arc<HashMap<String, String>>>,
+    vanilla_lang: Option<Arc<HashMap<String, String>>>,
     /// For the services' discovery document (online logins) and the skins.
     cache_dir: Option<PathBuf>,
     /// Where the sessions' sounds go.
@@ -628,8 +628,9 @@ impl Joiner {
         Joiner {
             data,
             game,
-            world: WorldLoad::NotStarted,
             skins: None,
+            server_lang: None,
+            vanilla_lang: None,
             cache_dir,
             sound: ruthenium_audio::SoundHandle::off(),
             #[cfg(not(feature = "dev-offline"))]
@@ -650,52 +651,38 @@ impl Joiner {
         self.sound = sound;
     }
 
-    /// Starts building the world's drawing assets on a thread, the first time it is
-    /// called (when a world is first entered).
-    pub fn start_world_assets(&mut self, max_texture: u32) {
-        if !matches!(self.world, WorldLoad::NotStarted) {
-            return;
-        }
-        self.world = match self.game.clone().map(|game| {
-            std::thread::Builder::new()
-                .name("world-assets".into())
-                .spawn(move || load_world_assets(&game, max_texture))
-        }) {
-            Some(Ok(thread)) => WorldLoad::Loading(thread),
-            _ => {
-                eprintln!(
-                    "[ruthenium] the world is not drawn: there are no game files to draw it from"
-                );
-                WorldLoad::Done
-            }
-        };
-    }
-
     /// What loads the skins of players, once a world is entered.
     pub fn skins(&mut self) -> &SkinLoader {
         self.skins
             .get_or_insert_with(|| SkinLoader::new(self.game.clone(), self.cache_dir.clone()))
     }
 
-    /// The world's drawing assets once they are built: handed over once.
-    pub fn take_world_assets(&mut self) -> Option<WorldAssets> {
-        if !matches!(&self.world, WorldLoad::Loading(t) if t.is_finished()) {
-            return None;
+    /// The imported game's folder.
+    pub fn game(&self) -> Option<PathBuf> {
+        self.game.clone()
+    }
+
+    /// Where the sessions' sounds go.
+    pub fn sound(&self) -> &ruthenium_audio::SoundHandle {
+        &self.sound
+    }
+
+    /// The language server messages and the HUD are read in now: the reload's, or
+    /// vanilla's (`None`).
+    pub fn set_server_lang(&mut self, lang: Option<Arc<HashMap<String, String>>>) {
+        self.server_lang = lang;
+    }
+
+    /// The language of server messages (death messages, disconnect reasons): the server
+    /// packs' over vanilla's. The menus' own words stay vanilla's (`data().lang`).
+    pub fn server_lang(&mut self) -> Arc<HashMap<String, String>> {
+        if let Some(l) = &self.server_lang {
+            return l.clone();
         }
-        let WorldLoad::Loading(thread) = std::mem::replace(&mut self.world, WorldLoad::Done) else {
-            unreachable!()
-        };
-        match thread.join() {
-            Ok(Ok(assets)) => Some(assets),
-            Ok(Err(e)) => {
-                eprintln!("[ruthenium] the world is not drawn: {e}");
-                None
-            }
-            Err(_) => {
-                eprintln!("[ruthenium] the world is not drawn: its assets' thread panicked");
-                None
-            }
+        if self.vanilla_lang.is_none() {
+            self.vanilla_lang = Some(Arc::new(self.data().lang.clone()));
         }
+        self.vanilla_lang.clone().unwrap_or_default()
     }
 
     /// The game data, waiting for it if it is still loading.
@@ -713,8 +700,14 @@ impl Joiner {
         }
     }
 
-    /// Starts a session with the server at `address` (as typed), or says why it can't.
-    pub fn join(&mut self, address: &str, accounts: &Accounts) -> Result<Session, String> {
+    /// Starts a session with the server at `address` (as typed), whose server list entry
+    /// says `packs` of its resource packs, or says why it can't.
+    pub fn join(
+        &mut self,
+        address: &str,
+        accounts: &Accounts,
+        packs: ruthenium_net::server_list::PackStatus,
+    ) -> Result<Session, String> {
         let (identity, auth, local_only) = self.who(accounts)?;
         let profile_keys = self.profile_keys(accounts);
         let data = self.data();
@@ -734,6 +727,11 @@ impl Joiner {
                 data.block_sounds.clone(),
             ),
             profile_keys,
+            server_packs: ServerPackSetup {
+                status: packs,
+                cache_dir: self.cache_dir.as_deref().map(|d| d.join(SERVER_PACKS_DIR)),
+                check: Arc::new(crate::resource_reload::is_loadable),
+            },
         })
         .map_err(|e| format!("couldn't start the connection: {e}"))
     }

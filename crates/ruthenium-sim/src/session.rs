@@ -28,8 +28,11 @@
 //! is parsed against the server's commands to find its arguments to sign
 //! ([`crate::command`]).
 //!
-//! Not yet: server resource packs (every offer is declined; a server that requires its
-//! pack will refuse the player), transfers (the session ends with a message), dialogs
+//! Server resource packs: see [`packs`] (the prompt, the downloads, the statuses) and
+//! [`crate::server_pack`] (vanilla's manager); the client reloads its resources when
+//! asked ([`SessionEvent::ReloadResources`]).
+//!
+//! Not yet: transfers (the session ends with a message), dialogs
 //! and server links (ignored), and anything in play beyond pings, cookies and the switch
 //! back to configuration.
 
@@ -46,7 +49,7 @@ use ruthenium_protocol::commands::CommandTree;
 use ruthenium_protocol::nbt::{Compound, Tag};
 use ruthenium_protocol::packets::configuration::{self as cfg, RegistryEntry, RegistryTags};
 use ruthenium_protocol::packets::{
-    ClientInformation, Common, KnownPack, MainHand, PackAction, play, read_brand,
+    ClientInformation, Common, KnownPack, MainHand, play, read_brand,
 };
 
 use crate::avatar::{SkinSource, Swing};
@@ -79,7 +82,12 @@ use crate::weather::Weather;
 use crate::world::{BiomeInfo, ChunkPacket, Level, global_bits};
 
 mod containers;
+mod packs;
 pub use containers::{At, ContainerView, Pointer, ScreenInput};
+pub use packs::{
+    DownloadProgress, MAX_ACTIVE, MAX_PROMPTED, MAX_TRACKED, PackPrompt, PackToast, ResourceReload,
+    ServerPackSetup, download_headers,
+};
 use ruthenium_audio::SoundSource;
 use ruthenium_protocol::profile::ResolvableProfile;
 
@@ -97,6 +105,8 @@ pub struct SessionOptions {
     /// The signed-in player's chat key pair (none: chat goes unsigned, as without a
     /// Microsoft account).
     pub profile_keys: Option<Arc<dyn crate::chat::ProfileKeySource>>,
+    /// The server list's setting for the server's resource packs, and where they go.
+    pub server_packs: ServerPackSetup,
 }
 
 /// The prepared game's data movement uses.
@@ -181,6 +191,18 @@ pub enum SessionEvent {
     ContainerOpened,
     /// The container screen closed.
     ContainerClosed,
+    /// The server offered resource packs and the player is asked
+    /// (`addOrUpdatePackPrompt`): show the prompt, or update the one showing. Answer with
+    /// [`Session::answer_pack_prompt`].
+    PackPrompt(PackPrompt),
+    /// The prompt was answered: the server list entry's Server Resource Packs setting is
+    /// this now (`ServerData.setResourcePackStatus`, `ServerList.saveSingleServer`).
+    PackStatus(ruthenium_net::server_list::PackStatus),
+    /// The packs' download toast changed.
+    PackToast(PackToast),
+    /// Load the game's resources again with these server packs over vanilla's
+    /// (`reloadResourcePacks`); say how it went with [`Session::resources_reloaded`].
+    ReloadResources(ResourceReload),
     /// The last event.
     Closed(Closed),
 }
@@ -196,6 +218,10 @@ enum Command {
     /// A chat message or, with its slash, a command, made tidy
     /// ([`crate::chat::normalize`]).
     Chat(String),
+    /// The pack prompt's answer (`None`: put away without one).
+    PackPrompt(Option<bool>),
+    /// The client's reload of the resources ended (it worked or not).
+    ResourcesReloaded(bool),
 }
 
 /// The local camera for drawing: the latest frame, and where the player looks once
@@ -325,6 +351,7 @@ impl Session {
             information,
             options.sound,
             options.profile_keys,
+            options.server_packs,
         )
     }
 
@@ -336,6 +363,7 @@ impl Session {
         information: ClientInformation,
         sound: crate::sound::GameSounds,
         profile_keys: Option<Arc<dyn crate::chat::ProfileKeySource>>,
+        server_packs: ServerPackSetup,
     ) -> std::io::Result<Session> {
         let handoff = Arc::new(Handoff::new(Limits::default()));
         let (publisher, scene) = Scene::new(DEFAULT_DIRTY_CAPACITY);
@@ -357,6 +385,7 @@ impl Session {
                 game.container_view = game_container_view;
                 game.sounds = sound;
                 game.profile_keys = profile_keys;
+                game.packs = packs::Packs::new(server_packs);
                 game.run(&game_handoff);
             })?;
         Ok(Session {
@@ -378,6 +407,22 @@ impl Session {
 
     pub fn answer_code_of_conduct(&self, accept: bool) {
         self.handoff.push_control(Command::CodeOfConduct(accept));
+    }
+
+    /// The pack prompt's Yes (Proceed) or No (Disconnect).
+    pub fn answer_pack_prompt(&self, accept: bool) {
+        self.handoff.push_control(Command::PackPrompt(Some(accept)));
+    }
+
+    /// The pack prompt went away unanswered (another screen took its place): its packs
+    /// are forgotten, as vanilla forgets them.
+    pub fn dismiss_pack_prompt(&self) {
+        self.handoff.push_control(Command::PackPrompt(None));
+    }
+
+    /// The reload [`SessionEvent::ReloadResources`] asked for ended.
+    pub fn resources_reloaded(&self, ok: bool) {
+        self.handoff.push_control(Command::ResourcesReloaded(ok));
     }
 
     /// Disconnects; a [`SessionEvent::Closed`] follows. It doesn't wait its turn behind
@@ -738,6 +783,10 @@ struct Game {
     profile_keys: Option<Arc<dyn crate::chat::ProfileKeySource>>,
     keys_pending: bool,
     chat_session: Option<crate::chat::LocalChatSession>,
+    /// The server's resource packs.
+    packs: packs::Packs,
+    /// What the session's end is put down to when the client closes it itself.
+    close_reason: Option<Reason>,
 }
 
 /// The feature flag that switches minecarts to their new movement, which doesn't
@@ -931,6 +980,8 @@ impl Game {
             profile_keys: None,
             keys_pending: false,
             chat_session: None,
+            packs: packs::Packs::default(),
+            close_reason: None,
         }
     }
 
@@ -940,6 +991,8 @@ impl Game {
 
     fn run(&mut self, handoff: &Handoff<FrameInput, Command>) {
         while self.step(handoff.take()) {}
+        // The server's packs go with the session (`clearDownloadedResourcePacks`).
+        self.pack_cleanup();
         // Leaving stops every sound (`Minecraft.disconnect`).
         self.sounds.stop_all();
         // A main thread waiting for room in the queue goes on.
@@ -1001,6 +1054,8 @@ impl Game {
             }
             Command::CodeOfConduct(_) => {}
             Command::Chat(message) => self.send_chat(&message),
+            Command::PackPrompt(answer) => self.answer_pack_prompt(answer),
+            Command::ResourcesReloaded(ok) => self.resources_reloaded(ok),
         }
     }
 
@@ -1091,6 +1146,7 @@ impl Game {
     /// that has arrived, the frame's input, the ticks, and the camera's turn. False once
     /// the session has ended.
     fn frame(&mut self, input: FrameInput) -> bool {
+        self.pack_frame_start();
         let ticks = self.clock.advance(self.millis(), self.ms_per_tick());
         loop {
             match self.connection.events().try_recv() {
@@ -1109,6 +1165,8 @@ impl Game {
                 }
             }
         }
+        // `runAllTasks`.
+        self.pack_tasks();
         self.take_input(&input);
         for _ in 0..ticks {
             self.tick();
@@ -1518,7 +1576,8 @@ impl Game {
     fn handle(&mut self, event: Event) -> bool {
         match event {
             Event::Stage(s) => self.report(SessionEvent::Stage(s)),
-            Event::LoggedIn { profile } => {
+            Event::LoggedIn { profile, peer } => {
+                self.packs.peer = peer;
                 self.phase = Phase::Configuration;
                 eprintln!("[session] logged in as {}", profile.name);
                 self.name = profile.name.clone();
@@ -1537,8 +1596,14 @@ impl Game {
                     self.connection.close();
                 }
             }
-            Event::Closed(c) => {
+            Event::Closed(mut c) => {
+                if c.reason == Reason::Local(Local::Closed)
+                    && let Some(r) = self.close_reason.take()
+                {
+                    c.reason = r;
+                }
                 log_closed(&c);
+                self.pack_cleanup();
                 self.report(SessionEvent::Closed(c));
                 return false;
             }
@@ -2066,13 +2131,12 @@ impl Game {
         self.connection.send(play::client_tick_end());
     }
 
-    /// The packets every phase handles alike. `cookie` and `pack` build the phase's
+    /// The packets every phase handles alike. `cookie` and `pong` build the phase's
     /// answers.
     fn common(
         &mut self,
         p: Common,
         cookie: fn(&str, Option<&[u8]>) -> Vec<u8>,
-        pack: fn(u128, PackAction) -> Vec<u8>,
         pong: fn(i32) -> Vec<u8>,
     ) {
         match p {
@@ -2092,26 +2156,8 @@ impl Game {
                     }
                 }
             }
-            Common::ResourcePackPush(push) => {
-                // Vanilla answers a URL that isn't http(s) at once.
-                let web = push.url.starts_with("http://") || push.url.starts_with("https://");
-                let action = if web {
-                    eprintln!(
-                        "[session] server resource pack {} declined: not supported yet{}",
-                        push.url,
-                        if push.required {
-                            " (the server requires it)"
-                        } else {
-                            ""
-                        }
-                    );
-                    PackAction::Declined
-                } else {
-                    PackAction::InvalidUrl
-                };
-                self.connection.send(pack(push.id, action));
-            }
-            Common::ResourcePackPop { .. } => {}
+            Common::ResourcePackPush(push) => self.handle_pack_push(push),
+            Common::ResourcePackPop { id } => self.handle_pack_pop(id),
             Common::Transfer { host, port } => {
                 eprintln!("[session] the server transfers to {host}:{port}: not supported yet");
                 self.connection.close();
@@ -2124,9 +2170,7 @@ impl Game {
 
     fn configuration(&mut self, p: cfg::Clientbound) -> Result<(), String> {
         match p {
-            cfg::Clientbound::Common(c) => {
-                self.common(c, cfg::cookie_response, cfg::resource_pack, cfg::pong)
-            }
+            cfg::Clientbound::Common(c) => self.common(c, cfg::cookie_response, cfg::pong),
             cfg::Clientbound::SelectKnownPacks(asked) => {
                 let ours: Vec<KnownPack> = asked
                     .into_iter()
@@ -2187,9 +2231,7 @@ impl Game {
     fn play(&mut self, p: play::Clientbound) -> Result<(), String> {
         let now = self.millis();
         match p {
-            play::Clientbound::Common(c) => {
-                self.common(c, play::cookie_response, play::resource_pack, play::pong)
-            }
+            play::Clientbound::Common(c) => self.common(c, play::cookie_response, play::pong),
             play::Clientbound::StartConfiguration => {
                 // What was taken in of the chat first. The level goes (`clearLevel`), and
                 // with it the ticks' packets.
@@ -4292,6 +4334,7 @@ mod tests {
             ClientInformation::default(),
             crate::sound::GameSounds::default(),
             None,
+            ServerPackSetup::default(),
         )
         .unwrap();
         assert!(session.camera().is_none());

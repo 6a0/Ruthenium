@@ -55,6 +55,8 @@ use chat::{ChatHistory, ChatMethod, ChatOutcome, ChatScreen, Drafts, ExitReason}
 mod chat;
 mod container;
 mod keys;
+mod packs;
+pub use packs::{prompt_lines, toast_lines};
 
 /// Side of the logo texture's top level.
 const LOGO_SIZE: u32 = 512;
@@ -261,6 +263,8 @@ enum FormKind {
     Connecting,
     /// The server's code of conduct, to accept or decline.
     CodeOfConduct,
+    /// The server's resource packs, to accept or decline (`PackConfirmScreen`).
+    PackPrompt,
     /// Configured, the level loading, and Disconnect.
     Playing,
     /// Why the session ended.
@@ -457,6 +461,8 @@ pub struct Menu {
     /// The fallback fonts' revision the text was shaped with: text is shaped again when a
     /// font arrives (Unifont, read meanwhile).
     fonts_revision: u32,
+    /// The server's resource packs: the prompt, the toast, the reloads.
+    packs: packs::PackState,
 }
 
 impl std::fmt::Debug for Menu {
@@ -650,6 +656,7 @@ impl Menu {
             chat_history: ChatHistory::default(),
             chat_drafts: Drafts::default(),
             fonts_revision: ruthenium_ui::text::fallback::revision(),
+            packs: packs::PackState::default(),
         }
     }
 
@@ -859,6 +866,9 @@ impl Menu {
         if std::mem::take(&mut self.forget_world) {
             renderer.clear_world();
         }
+        // The world's assets (vanilla's for the first world, then whatever a server's
+        // packs make them) come with the reloads.
+        self.sync_reloads(renderer);
         let Some(joiner) = self.joiner.as_mut().filter(|_| self.session.is_some()) else {
             return;
         };
@@ -871,13 +881,6 @@ impl Menu {
             while let Some((source, skin)) = skins.take() {
                 renderer.skin_found(&source, skin);
             }
-            return;
-        }
-        joiner.start_world_assets(renderer.gpu().caps().max_image_dimension_2d);
-        if let Some(assets) = joiner.take_world_assets()
-            && let Err(e) = renderer.load_world(assets, self.mesh_workers)
-        {
-            eprintln!("[ruthenium] the world is not drawn: {e}");
         }
     }
 
@@ -993,11 +996,17 @@ impl Menu {
         self.server_name = name.to_owned();
         self.server_address = address.to_owned();
         self.leaving = false;
-        // A session still closing is dropped (and so disconnected) here.
-        self.session = None;
+        // A session still closing is dropped (and so disconnected) here; the resources
+        // go back to vanilla's (its own request for that goes with it).
+        if self.session.take().is_some() {
+            self.packs_back_to_vanilla();
+        }
         self.forget_world = true;
+        self.packs.session_number += 1;
+        self.packs.prompt = None;
+        let pack_status = self.entry_pack_status(name, address);
         let started = match &mut self.joiner {
-            Some(j) => j.join(address, &self.accounts),
+            Some(j) => j.join(address, &self.accounts, pack_status),
             None => Err("Joining servers isn't possible here".into()),
         };
         match started {
@@ -1227,9 +1236,9 @@ impl Menu {
                     if let Some(r) = &mut self.route {
                         r.fail("the player died".into());
                     }
-                    let lang = self.joiner.as_mut().map(|j| j.data());
+                    let lang = self.joiner.as_mut().map(|j| j.server_lang());
                     let empty = std::collections::HashMap::new();
-                    let lang = lang.as_ref().map_or(&empty, |d| &d.lang);
+                    let lang = lang.as_deref().unwrap_or(&empty);
                     let mut lines = Vec::new();
                     if let Some(c) = &cause {
                         lines.push(crate::join::plain_text(c, lang));
@@ -1247,6 +1256,16 @@ impl Menu {
                     });
                     self.death_form();
                 }
+                SessionEvent::PackPrompt(p) if !self.leaving => self.pack_prompt_arrived(p),
+                SessionEvent::PackStatus(s) => self.pack_status_changed(s),
+                SessionEvent::PackToast(t) => {
+                    self.packs.toast = match t {
+                        ruthenium_sim::session::PackToast::Hide => None,
+                        t => Some((t, Instant::now())),
+                    };
+                }
+                // (Also once the session is over: the client goes back to vanilla's.)
+                SessionEvent::ReloadResources(r) => self.reload_asked(r),
                 SessionEvent::ContainerOpened if !self.leaving => self.container_opened(),
                 SessionEvent::ContainerClosed => self.container_closed(),
                 SessionEvent::InBed if !self.leaving => self.in_bed(),
@@ -1267,6 +1286,8 @@ impl Menu {
                     self.session = None;
                     self.bed = false;
                     self.forget_world = true;
+                    self.packs.prompt = None;
+                    self.packs.toast = None;
                     if self.leaving || crate::join::left_on_purpose(&c) {
                         self.leaving = false;
                         if self.game_menu_open() {
@@ -1277,10 +1298,10 @@ impl Menu {
                             r.fail("the session was left".into());
                         }
                     } else {
-                        let lang = self.joiner.as_mut().map(|j| j.data());
+                        let lang = self.joiner.as_mut().map(|j| j.server_lang());
                         let empty = std::collections::HashMap::new();
                         let (title, reason) =
-                            crate::join::closed_text(&c, lang.as_ref().map_or(&empty, |d| &d.lang));
+                            crate::join::closed_text(&c, lang.as_deref().unwrap_or(&empty));
                         if let Some(r) = &mut self.route {
                             r.fail(format!("{title}: {reason}"));
                         }
@@ -1708,6 +1729,7 @@ impl Menu {
             // Opened by the session as it goes.
             FormKind::Connecting
             | FormKind::CodeOfConduct
+            | FormKind::PackPrompt
             | FormKind::Playing
             | FormKind::Disconnected
             | FormKind::Died
@@ -1731,6 +1753,7 @@ impl Menu {
             | FormKind::SignOut(_)
             | FormKind::Connecting
             | FormKind::CodeOfConduct
+            | FormKind::PackPrompt
             | FormKind::Playing
             | FormKind::Disconnected
             | FormKind::Died
@@ -1806,6 +1829,12 @@ impl Menu {
                 }
                 self.answered_code_of_conduct(false);
                 self.leave();
+            }
+            (Screen::Form(FormKind::PackPrompt, ..), Action::Confirm) => {
+                self.answer_pack_prompt(true);
+            }
+            (Screen::Form(FormKind::PackPrompt, ..), Action::Cancel | Action::Back) => {
+                self.answer_pack_prompt(false);
             }
             (Screen::Form(FormKind::CodeOfConduct, form, _), Action::Cycle) => {
                 if let Some((_, remember)) = &mut self.conduct {
@@ -1972,6 +2001,7 @@ impl Menu {
                     // Handled above.
                     FormKind::Connecting
                     | FormKind::CodeOfConduct
+                    | FormKind::PackPrompt
                     | FormKind::Playing
                     | FormKind::Disconnected
                     | FormKind::Died
@@ -2253,6 +2283,10 @@ impl Menu {
 
     /// The wheel turned `notches` (positive: up); `raw` is SDL's `(x, y)` as it came.
     pub fn wheel(&mut self, notches: f32, raw: (f32, f32)) {
+        // A form's message that is longer than it shows (the pack prompt) scrolls.
+        if let Screen::Form(_, form, _) = &mut self.screen {
+            form.wheel(notches);
+        }
         // (Shift held: one line a notch.)
         let held = self.keys.physical();
         if let Screen::Chat(chat) = &mut self.screen {
@@ -2602,6 +2636,8 @@ impl Menu {
         self.last_frame = Some(now);
         let scale = self.layout(pixel_size);
         self.poll_session();
+        self.check_pack_prompt();
+        self.expire_pack_toast();
         // The chat screen, as the HUD draws it.
         let chat = match &mut self.screen {
             Screen::Chat(chat) => {
@@ -2810,6 +2846,14 @@ impl Menu {
                 form.draw(&mut self.shapes, &mut self.text, atlas);
             }
         }
+        packs::draw_pack_toast(
+            self.packs.toast.as_ref().map(|(t, _)| t),
+            &scale,
+            &self.fonts,
+            atlas,
+            &mut self.shapes,
+            &mut self.text,
+        );
         if let Some(e) = settings_ev {
             self.settings_event(e);
         }

@@ -178,6 +178,8 @@ pub enum Event {
     /// The login is done and the configuration has begun.
     LoggedIn {
         profile: GameProfile,
+        /// The server's address, as connected to.
+        peer: Option<IpAddr>,
     },
     Configuration(configuration::Clientbound),
     Play(play::Clientbound),
@@ -347,6 +349,8 @@ struct Net<'a> {
     /// The login has seen the server's hello.
     hello_seen: bool,
     chunk_batches: ChunkBatchSize,
+    /// The server's address.
+    peer: Option<IpAddr>,
 }
 
 /// How many chunks a tick the client asks for (`ChunkBatchSizeCalculator`): the time
@@ -506,7 +510,8 @@ impl Net<'_> {
                 self.send(&configuration::brand(&o.brand)).await?;
                 self.send(&configuration::client_information(&o.information))
                     .await?;
-                self.event(Event::LoggedIn { profile });
+                let peer = self.peer;
+                self.event(Event::LoggedIn { profile, peer });
                 Ok(())
             }
             login::Clientbound::Compression { threshold } => {
@@ -591,6 +596,7 @@ async fn run(
         events,
         hello_seen: false,
         chunk_batches: ChunkBatchSize::default(),
+        peer: Some(socket.ip()),
     };
     let mut host = host;
     if host.encode_utf16().count() > MAX_HOST {

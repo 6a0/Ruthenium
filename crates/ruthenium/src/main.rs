@@ -16,12 +16,15 @@ mod input_script;
 mod join;
 mod menu;
 mod prepare_cmd;
+mod resource_reload;
 mod route;
 mod servers;
 mod settings;
 mod skins;
 mod sound;
 mod telemetry;
+#[cfg(test)]
+mod test_zip;
 
 use std::process::ExitCode;
 use std::time::Instant;
@@ -105,8 +108,13 @@ With no command, opens the game window. Options:
   --data-dir <folder>    Ruthenium's data folder (accounts, servers, settings in
                          config/client.toml); default: the per-user one
   --join <address>       join this server at once (development)
+  --server-packs <prompt|enabled|disabled>
+                         with --join: the server's Server Resource Packs setting, in
+                         place of its server list entry's (development)
   --mesh-workers <n>     threads that mesh the world (default: by the machine's size)
   --rejoin-after <s>     with --join: leave after this long and join again (development)
+  --rejoin-address <address>
+                         with --rejoin-after: join this server the second time (development)
   --terrain-draws <direct|paged|mdi>
                          how the world's sections are drawn: one draw each, nearest
                          first (default); one draw each, a buffer page at a time; or

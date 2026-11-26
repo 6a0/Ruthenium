@@ -57,10 +57,15 @@ use ruthenium_sim::menu::screen::Binds;
 use ruthenium_sim::player::{Keys, Pose};
 use ruthenium_sim::session::{At, PlayerView, ScreenInput, Session, SessionEvent};
 
+use ruthenium_net::server_list::PackStatus;
+
 use crate::account::{AccountStatus, Accounts};
 use crate::join::{Joiner, closed_text, plain_text, stage_text};
 use crate::route::{Expected, Route, RoutePlayer};
 use crate::settings::SettingsFile;
+
+/// The largest texture a reload's atlases may be without a window (a common limit).
+const HEADLESS_MAX_TEXTURE: u32 = 16384;
 
 /// The frame rate without a window: vanilla's default frame limit's neighbourhood.
 const FRAME: Duration = Duration::from_micros(16_667);
@@ -489,6 +494,8 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut route_out = None;
     let mut expected = Expected::default();
     let mut sound = crate::sound::SoundMode::Off;
+    let mut server_packs = PackStatus::Prompt;
+    let mut pack_answer = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -527,6 +534,21 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                     Some("on") => crate::sound::SoundMode::Device,
                     Some("off") => crate::sound::SoundMode::Off,
                     _ => return Err("--sound needs on or off".into()),
+                };
+            }
+            "--server-packs" => {
+                server_packs = match it.next().map(String::as_str) {
+                    Some("prompt") => PackStatus::Prompt,
+                    Some("enabled") => PackStatus::Enabled,
+                    Some("disabled") => PackStatus::Disabled,
+                    _ => return Err("--server-packs needs prompt, enabled or disabled".into()),
+                };
+            }
+            "--pack-answer" => {
+                pack_answer = match it.next().map(String::as_str) {
+                    Some("yes") => true,
+                    Some("no") => false,
+                    _ => return Err("--pack-answer needs yes or no".into()),
                 };
             }
             "--sound-wav" => {
@@ -593,7 +615,8 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut joiner = Joiner::new(Some(data_dir.join("game")), cache_dir);
     joiner.set_sound(audio.handle());
     let data = joiner.data();
-    let session = joiner.join(&address, &accounts)?;
+    let session = joiner.join(&address, &accounts, server_packs)?;
+    let mut reloader = crate::resource_reload::Reloader::new(Some(data_dir.join("game")), true);
     if let Some(route) = route {
         return run_route(&session, route, expected, route_out.as_deref(), &data.lang);
     }
@@ -651,6 +674,46 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                 SessionEvent::Respawned => println!("{t:7.3}s  respawned"),
                 SessionEvent::InBed => println!("{t:7.3}s  in bed"),
                 SessionEvent::WokeUp => println!("{t:7.3}s  woke up"),
+                SessionEvent::PackPrompt(p) => {
+                    let text = p
+                        .prompt
+                        .as_ref()
+                        .map(|t| plain_text(t, &data.lang))
+                        .unwrap_or_default();
+                    println!(
+                        "{t:7.3}s  resource pack prompt ({} pack(s){}): {:?}; answering {}",
+                        p.packs,
+                        if p.required { ", required" } else { "" },
+                        crate::menu::prompt_lines(&text).join(" / "),
+                        if pack_answer { "yes" } else { "no" }
+                    );
+                    session.answer_pack_prompt(pack_answer);
+                }
+                SessionEvent::PackStatus(s) => {
+                    println!("{t:7.3}s  the server's pack setting is now {s:?}");
+                }
+                SessionEvent::PackToast(toast) => {
+                    if let Some((title, line)) = crate::menu::toast_lines(toast) {
+                        println!(
+                            "{t:7.3}s  {title}{}",
+                            line.map_or_else(String::new, |l| format!(": {l}"))
+                        );
+                    }
+                }
+                SessionEvent::ReloadResources(r) => {
+                    println!(
+                        "{t:7.3}s  reloading resources with {} server pack(s){}",
+                        r.packs.len(),
+                        if r.recovery { " (recovery)" } else { "" }
+                    );
+                    reloader.request(
+                        crate::resource_reload::Request {
+                            packs: r.packs.clone(),
+                            session: 1,
+                        },
+                        HEADLESS_MAX_TEXTURE,
+                    );
+                }
                 SessionEvent::ContainerOpened => println!("{t:7.3}s  container screen open"),
                 SessionEvent::ContainerClosed => println!("{t:7.3}s  container screen closed"),
                 SessionEvent::Closed(c) => {
@@ -668,6 +731,32 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                 ExitCode::FAILURE
             });
         }
+        // A reload that ended: how it went goes to the session (the world's assets are
+        // built and checked, not drawn).
+        if let Some((request, result)) = reloader.poll(HEADLESS_MAX_TEXTURE) {
+            let t = started.elapsed().as_secs_f64();
+            match result {
+                Ok(r) => {
+                    println!(
+                        "{t:7.3}s  resources reloaded with {} server pack(s)",
+                        request.packs.len()
+                    );
+                    joiner.set_server_lang((r.packs > 0).then(|| r.lang.clone()));
+                    joiner.sound().replace_files(r.sounds);
+                    if let Some(world) = &r.world {
+                        println!(
+                            "{t:7.3}s  block atlas {}x{}",
+                            world.atlas_width, world.atlas_height
+                        );
+                    }
+                    session.resources_reloaded(true);
+                }
+                Err(e) => {
+                    println!("{t:7.3}s  the resource reload failed: {e}");
+                    session.resources_reloaded(false);
+                }
+            }
+        }
         // A frame: the script's input, then the session's frame (packets, ticks, turn).
         if scripting && let Some(p) = &mut player {
             scripting = p.frame(&session);
@@ -681,7 +770,10 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                 .unwrap_or(chat.len());
             let t = started.elapsed().as_secs_f64();
             for m in chat[..new].iter().rev() {
-                println!("{t:7.3}s  chat: {}", plain_text(&m.content, &data.lang));
+                println!(
+                    "{t:7.3}s  chat: {}",
+                    plain_text(&m.content, &joiner.server_lang())
+                );
             }
             chat_seen = chat.first().cloned();
         }
