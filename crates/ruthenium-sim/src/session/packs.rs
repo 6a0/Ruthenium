@@ -16,6 +16,7 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -125,6 +126,9 @@ pub(super) struct Downloads {
     jobs: Option<Sender<Batch>>,
     results_tx: Sender<BatchResult>,
     results: Receiver<BatchResult>,
+    /// Set when the session ends: a download under way stops between reads, and the
+    /// rest of its batch fails, instead of running on after the player has left.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Default for Downloads {
@@ -134,7 +138,14 @@ impl Default for Downloads {
             jobs: None,
             results_tx,
             results,
+            cancel: Arc::default(),
         }
+    }
+}
+
+impl Drop for Downloads {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -462,11 +473,12 @@ impl Game {
             let (jobs, rx) = channel::<Batch>();
             let results = self.packs.downloads.results_tx.clone();
             let events = self.events.clone();
+            let cancel = self.packs.downloads.cancel.clone();
             let spawned = std::thread::Builder::new()
                 .name("pack-download".into())
                 .spawn(move || {
                     for batch in rx {
-                        let r = run_batch(&config, &batch, &events);
+                        let r = run_batch(&config, &batch, &events, &cancel);
                         if results.send(r).is_err() {
                             return;
                         }
@@ -512,6 +524,7 @@ fn run_batch(
     config: &download::DownloadConfig,
     batch: &Batch,
     events: &Sender<SessionEvent>,
+    cancel: &Arc<AtomicBool>,
 ) -> BatchResult {
     let requests: Vec<download::PackRequest> = batch
         .requests
@@ -522,7 +535,7 @@ fn run_batch(
             sha1: r.hash,
         })
         .collect();
-    let mut toast = Toast::new(requests.len(), events.clone());
+    let mut toast = Toast::new(requests.len(), events.clone(), cancel.clone());
     let results = download::download_batch(config, &requests, &mut toast);
     let out = results
         .into_iter()
@@ -550,10 +563,11 @@ struct Toast {
     size: Option<u64>,
     events: Sender<SessionEvent>,
     last: Option<Instant>,
+    cancel: Arc<AtomicBool>,
 }
 
 impl Toast {
-    fn new(total: usize, events: Sender<SessionEvent>) -> Toast {
+    fn new(total: usize, events: Sender<SessionEvent>, cancel: Arc<AtomicBool>) -> Toast {
         Toast {
             total,
             count: 0,
@@ -561,6 +575,7 @@ impl Toast {
             size: None,
             events,
             last: None,
+            cancel,
         }
     }
 
@@ -609,6 +624,10 @@ impl download::Progress for Toast {
         self.progress(bytes, false);
     }
 
+    fn cancelled(&mut self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
     fn request_finished(&mut self, ok: bool) {
         if !ok {
             self.failed += 1;
@@ -634,6 +653,19 @@ mod tests {
     use ruthenium_protocol::packets::ClientInformation;
 
     const ID: u128 = 0x1111_2222_3333_4444_5555_6666_7777_8888;
+
+    /// A session that ends (its downloads dropped) stops a download under way: the
+    /// downloader asks the toast between reads.
+    #[test]
+    fn leaving_the_server_cancels_its_downloads() {
+        use download::Progress as _;
+        let downloads = Downloads::default();
+        let (events, _rx) = channel();
+        let mut toast = Toast::new(1, events, downloads.cancel.clone());
+        assert!(!toast.cancelled());
+        drop(downloads);
+        assert!(toast.cancelled());
+    }
 
     struct Rig {
         game: Game,
