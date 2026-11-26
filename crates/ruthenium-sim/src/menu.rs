@@ -1602,7 +1602,10 @@ mod tests {
             let (packet, outcome) = m
                 .handle_container_input(&mut inv, &who, id, slot, button, i, &NoRegistries)
                 .unwrap();
-            let hex: String = packet[1..].iter().map(|b| format!("{b:02x}")).collect();
+            let hex: String = zero_hashes(&packet[1..])
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             out += &format!(
                 "{input}:{slot}:{button}|{}|c={}|d={}|p={hex}\n",
                 contents(&m, &inv),
@@ -1610,6 +1613,53 @@ mod tests {
                 outcome.dropped.len()
             );
         }
+        out
+    }
+
+    /// The click's body with every component hash 0, as the tool wrote it: the cases
+    /// check the packet's layout and order, whatever hashes the stacks get.
+    fn zero_hashes(body: &[u8]) -> Vec<u8> {
+        let mut out = body.to_vec();
+        let mut at = 0;
+        let varint = |at: &mut usize| {
+            let mut v = 0u32;
+            for shift in (0..35).step_by(7) {
+                let b = body[*at];
+                *at += 1;
+                v |= u32::from(b & 0x7F) << shift;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            v
+        };
+        let stack = |at: &mut usize, out: &mut Vec<u8>| {
+            let present = body[*at] != 0;
+            *at += 1;
+            if !present {
+                return;
+            }
+            varint(at);
+            varint(at);
+            for _ in 0..varint(at) {
+                varint(at);
+                out[*at..*at + 4].fill(0);
+                *at += 4;
+            }
+            for _ in 0..varint(at) {
+                varint(at);
+            }
+        };
+        varint(&mut at);
+        varint(&mut at);
+        at += 3;
+        varint(&mut at);
+        for _ in 0..varint(&mut at) {
+            at += 2;
+            stack(&mut at, &mut out);
+        }
+        stack(&mut at, &mut out);
+        assert_eq!(at, body.len());
         out
     }
 
