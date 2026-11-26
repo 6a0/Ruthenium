@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use serde_json::Value;
 
 use crate::id::{valid_namespace, valid_path};
@@ -81,25 +81,50 @@ pub(crate) enum Loc {
 /// `filter.block` of a pack's metadata (`server/packs/resources/ResourceFilterSection.java`).
 #[derive(Debug)]
 pub struct Filter {
-    blocks: Vec<(Option<Regex>, Option<Regex>)>,
+    /// Each pattern's namespace regex (none: every namespace).
+    namespaces: Vec<Option<Regex>>,
+    /// Some pattern has no path regex: it filters every path.
+    every_path: bool,
+    /// The path regexes, tried in one pass: a path is asked about on every lookup below
+    /// the pack.
+    paths: RegexSet,
 }
 
 impl Filter {
     /// Whether any block pattern's namespace regex matches. A pattern without
     /// one matches every namespace.
     pub fn filters_namespace(&self, namespace: &str) -> bool {
-        self.blocks
+        self.namespaces
             .iter()
-            .any(|(ns, _)| ns.as_ref().is_none_or(|r| r.is_match(namespace)))
+            .any(|ns| ns.as_ref().is_none_or(|r| r.is_match(namespace)))
     }
 
     /// Whether any block pattern's path regex matches. Vanilla does not pair
     /// a pattern's namespace with its path.
     pub fn filters_path(&self, path: &str) -> bool {
-        self.blocks
-            .iter()
-            .any(|(_, p)| p.as_ref().is_none_or(|r| r.is_match(path)))
+        self.every_path || self.paths.is_match(path)
     }
+}
+
+/// The longest regular expression a pack may give (filters, atlas `filter` sources):
+/// the game's are a few dozen characters.
+pub const MAX_PATTERN_BYTES: usize = 1024;
+/// What one compiled expression may take, and its lazy DFA's cache: a pattern such as
+/// `a{1000}{1000}` compiles to gigabytes otherwise (the regex crate's defaults are 10 and
+/// 2 MiB).
+const REGEX_BYTES: usize = 1 << 20;
+
+/// A pack's regular expression, no longer than [`MAX_PATTERN_BYTES`] and compiled into at
+/// most [`REGEX_BYTES`]. (The regex crate matches in time linear in the text.)
+pub(crate) fn pack_regex(pattern: &str) -> Result<Regex, String> {
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(format!("a pattern longer than {MAX_PATTERN_BYTES} bytes"));
+    }
+    RegexBuilder::new(pattern)
+        .size_limit(REGEX_BYTES)
+        .dfa_size_limit(REGEX_BYTES)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 /// A loaded pack.
@@ -210,7 +235,8 @@ fn overlays(meta: &Value) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn filter(meta: &Value) -> Result<Option<Filter>, String> {
+/// The `filter` section, of at most `max` patterns ([`Limits::pack_filters`]).
+fn filter(meta: &Value, max: usize) -> Result<Option<Filter>, String> {
     let Some(section) = meta.get("filter") else {
         return Ok(None);
     };
@@ -218,18 +244,84 @@ fn filter(meta: &Value) -> Result<Option<Filter>, String> {
         .get("block")
         .and_then(Value::as_array)
         .ok_or("filter: no \"block\" list")?;
-    let regex = |p: &Value, key: &str| -> Result<Option<Regex>, String> {
+    if blocks.len() > max {
+        return Err(format!("filter: more than {max} patterns"));
+    }
+    let text = |p: &'_ Value, key: &str| -> Result<Option<String>, String> {
         match p.get(key) {
             None => Ok(None),
-            Some(Value::String(s)) => Regex::new(s).map(Some).map_err(|e| format!("filter: {e}")),
+            Some(Value::String(s)) if s.len() > MAX_PATTERN_BYTES => Err(format!(
+                "filter: a pattern longer than {MAX_PATTERN_BYTES} bytes"
+            )),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
             Some(_) => Err(format!("filter: \"{key}\" is not a string")),
         }
     };
-    let blocks = blocks
-        .iter()
-        .map(|p| Ok((regex(p, "namespace")?, regex(p, "path")?)))
-        .collect::<Result<_, String>>()?;
-    Ok(Some(Filter { blocks }))
+    let mut namespaces = Vec::with_capacity(blocks.len());
+    let mut paths = Vec::new();
+    let mut every_path = false;
+    for b in blocks {
+        namespaces.push(
+            text(b, "namespace")?
+                .map(|s| pack_regex(&s).map_err(|e| format!("filter: {e}")))
+                .transpose()?,
+        );
+        match text(b, "path")? {
+            // Each within its own limit, before the set of them is built.
+            Some(p) => {
+                pack_regex(&p).map_err(|e| format!("filter: {e}"))?;
+                paths.push(p);
+            }
+            None => every_path = true,
+        }
+    }
+    let paths = RegexSetBuilder::new(&paths)
+        .size_limit(REGEX_BYTES * max.clamp(1, 64))
+        .dfa_size_limit(REGEX_BYTES)
+        .build()
+        .map_err(|e| format!("filter: {e}"))?;
+    Ok(Some(Filter {
+        namespaces,
+        every_path,
+        paths,
+    }))
+}
+
+/// A server pack's `pack.mcmeta`, parsed and checked as `Pack.readPackMetadata` does:
+/// the metadata, and the overlays that apply.
+fn untrusted_metadata(
+    path: &Path,
+    bytes: &[u8],
+    limits: &Limits,
+) -> Result<(Value, Vec<String>), PackError> {
+    let bad = |why: String| PackError::BadMetadata(path.to_owned(), why);
+    let metadata: Value = crate::meta::parse_json(bytes).map_err(bad)?;
+    let pack = metadata.get("pack").filter(|p| p.is_object());
+    if pack.is_none_or(|p| p.get("description").is_none()) {
+        return Err(PackError::NoMetadata(path.to_owned()));
+    }
+    let entries = metadata
+        .get("overlays")
+        .and_then(|s| s.get("entries"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if entries > limits.pack_overlays {
+        return Err(bad(format!("more than {} overlays", limits.pack_overlays)));
+    }
+    let overlays = overlays(&metadata).map_err(bad)?;
+    Ok((metadata, overlays))
+}
+
+/// The pack's filter, or none if the section does not read: vanilla logs "Failed to get
+/// filter section" and loads the pack without one (`MultiPackResourceManager`).
+fn filter_or_none(path: &Path, meta: &Value, max: usize) -> Option<Filter> {
+    filter(meta, max).unwrap_or_else(|e| {
+        eprintln!(
+            "[assets] {}: {e}; the pack is loaded without its filter",
+            path.display()
+        );
+        None
+    })
 }
 
 impl Pack {
@@ -311,7 +403,7 @@ impl Pack {
         if !metadata.get("pack").is_some_and(Value::is_object) {
             return Err(PackError::NoMetadata(path.to_owned()));
         }
-        let filter = filter(&metadata).map_err(bad)?;
+        let filter = filter_or_none(path, &metadata, usize::MAX);
         let overlays = overlays(&metadata).map_err(bad)?;
 
         // Highest priority first: the last applicable overlay, ..., the root.
@@ -388,34 +480,13 @@ impl Pack {
         let i = zip
             .find("pack.mcmeta")
             .ok_or_else(|| PackError::NoMetadata(path.to_owned()))?;
-        let bad = |why: String| PackError::BadMetadata(path.to_owned(), why);
         if zip.size(i) > limits.json_bytes {
-            return Err(bad(format!("{} bytes is too large", zip.size(i))));
+            let why = format!("{} bytes is too large", zip.size(i));
+            return Err(PackError::BadMetadata(path.to_owned(), why));
         }
         let meta_bytes = zip.read(i).map_err(io_err(path))?;
-        let metadata: Value = crate::meta::parse_json(&meta_bytes).map_err(bad)?;
-        let pack = metadata.get("pack").filter(|p| p.is_object());
-        if pack.is_none_or(|p| p.get("description").is_none()) {
-            return Err(PackError::NoMetadata(path.to_owned()));
-        }
-        let count = |section: &str, list: &str| {
-            metadata
-                .get(section)
-                .and_then(|s| s.get(list))
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len)
-        };
-        if count("overlays", "entries") > limits.pack_overlays {
-            return Err(bad(format!("more than {} overlays", limits.pack_overlays)));
-        }
-        if count("filter", "block") > limits.pack_filters {
-            return Err(bad(format!(
-                "more than {} filter patterns",
-                limits.pack_filters
-            )));
-        }
-        let filter = filter(&metadata).map_err(bad)?;
-        let overlays = overlays(&metadata).map_err(bad)?;
+        let (metadata, overlays) = untrusted_metadata(path, &meta_bytes, limits)?;
+        let filter = filter_or_none(path, &metadata, limits.pack_filters);
         let mut layers = Vec::new();
         for dir in overlays
             .iter()
@@ -450,6 +521,29 @@ impl Pack {
             budget,
             untrusted: true,
         })
+    }
+
+    /// Whether a server's downloaded pack can be loaded, as cheaply as can be: what
+    /// vanilla's `Pack.readPackMetadata` checks (a `pack.mcmeta` with a `pack` section
+    /// and a `description`, and readable overlays), read under `limits`. Only
+    /// `pack.mcmeta` is read ([`Zip::read_one_untrusted`]): no other entry, no filter's
+    /// regular expressions (vanilla reads the filter later, and ignores a broken one).
+    /// [`Self::open_untrusted`] can still refuse an archive this passes.
+    pub fn check_untrusted(path: &Path, limits: &Limits) -> Result<(), PackError> {
+        if !path.is_file() {
+            return Err(PackError::Io(
+                path.to_owned(),
+                io::Error::new(io::ErrorKind::InvalidInput, "not a zip file"),
+            ));
+        }
+        let limits = Limits {
+            entry_bytes: limits.entry_bytes.min(limits.json_bytes),
+            ..*limits
+        };
+        let bytes = Zip::read_one_untrusted(path, "pack.mcmeta", &limits)
+            .map_err(io_err(path))?
+            .ok_or_else(|| PackError::NoMetadata(path.to_owned()))?;
+        untrusted_metadata(path, &bytes, &limits).map(|_| ())
     }
 
     /// What the pack's files are read under.
@@ -655,13 +749,23 @@ mod tests {
         assert!(overlays(&bad_dir).is_err());
     }
 
+    /// A short pattern that compiles to megabytes is refused, though the regex crate's
+    /// own limits would take it; real patterns compile.
+    #[test]
+    fn pack_patterns_compile_small() {
+        assert!(Regex::new("a{50000}").is_ok());
+        assert!(pack_regex("a{50000}").is_err());
+        assert!(pack_regex("^textures/block/(stone|dirt)$").is_ok());
+        assert!(pack_regex(&"a".repeat(MAX_PATTERN_BYTES + 1)).is_err());
+    }
+
     #[test]
     fn filter_patterns_are_not_paired() {
         let meta = serde_json::json!({"filter": {"block": [
             {"namespace": "^minecraft$", "path": "^textures/block/"},
             {"namespace": "^other$"},
         ]}});
-        let f = filter(&meta).unwrap().unwrap();
+        let f = filter(&meta, usize::MAX).unwrap().unwrap();
         assert!(f.filters_namespace("minecraft"));
         assert!(f.filters_namespace("other"));
         assert!(!f.filters_namespace("third"));

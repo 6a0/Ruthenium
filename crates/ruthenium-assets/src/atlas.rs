@@ -271,8 +271,9 @@ fn parse_source(v: &Value) -> Result<Source, String> {
                 pattern
                     .get(k)
                     .map(|p| {
-                        Regex::new(p.as_str().ok_or_else(|| format!("{k}: not a string"))?)
-                            .map_err(|e| e.to_string())
+                        crate::pack::pack_regex(
+                            p.as_str().ok_or_else(|| format!("{k}: not a string"))?,
+                        )
                     })
                     .transpose()
             };

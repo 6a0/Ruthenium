@@ -69,20 +69,22 @@ fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+// Offsets come from the archive (a zip64 one may be near `usize::MAX`): `at + n` is
+// checked, so that a reading past the end fails instead of wrapping or panicking.
 fn u16_at(b: &[u8], at: usize) -> io::Result<u16> {
-    b.get(at..at + 2)
+    b.get(at..at.checked_add(2).ok_or_else(|| bad("truncated zip"))?)
         .map(|s| u16::from_le_bytes([s[0], s[1]]))
         .ok_or_else(|| bad("truncated zip"))
 }
 
 fn u32_at(b: &[u8], at: usize) -> io::Result<u32> {
-    b.get(at..at + 4)
+    b.get(at..at.checked_add(4).ok_or_else(|| bad("truncated zip"))?)
         .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
         .ok_or_else(|| bad("truncated zip"))
 }
 
 fn u64_at(b: &[u8], at: usize) -> io::Result<u64> {
-    b.get(at..at + 8)
+    b.get(at..at.checked_add(8).ok_or_else(|| bad("truncated zip"))?)
         .map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
         .ok_or_else(|| bad("truncated zip"))
 }
@@ -134,6 +136,56 @@ impl Zip {
         )
     }
 
+    /// One file of an untrusted archive, read under `limits` without opening the whole
+    /// archive: the directory is walked to find the name (the last entry of that name, as
+    /// [`Self::find`] would), and only that entry's header and data are read. For a
+    /// check that has to be cheap (whether a downloaded pack can be loaded); what it reads
+    /// is held to the same limits as [`Self::open_untrusted`]'s reads, but the archive's
+    /// other entries are not checked, so a later full opening can still refuse it.
+    pub fn read_one_untrusted(
+        path: &Path,
+        name: &str,
+        limits: &Limits,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let len = std::fs::metadata(path)?.len();
+        if len > limits.pack_bytes {
+            return Err(bad(format!(
+                "{len} bytes is larger than a pack may be ({})",
+                limits.pack_bytes
+            )));
+        }
+        let map = crate::map::MappedFile::open(path)?;
+        let b: &[u8] = &map;
+        let (start, end, _, _) = locate(b, Some(limits))?;
+        let (mut at, mut seen, mut found) = (start, 0usize, None);
+        while at < end {
+            if u32_at(b, at)? != CENTRAL_SIG {
+                return Err(bad("bad central directory entry"));
+            }
+            seen += 1;
+            if seen > limits.zip_entries {
+                return Err(bad("more entries than a pack may have"));
+            }
+            let (next, entry_name, entry) = central(b, at)?;
+            at = next;
+            if at > end {
+                return Err(bad("central directory entry out of range"));
+            }
+            if entry_name == name.as_bytes() {
+                found = Some(entry);
+            }
+        }
+        let Some(mut e) = found else {
+            return Ok(None);
+        };
+        if e.encrypted {
+            return Err(bad(format!("{name} is encrypted")));
+        }
+        e.data = Some(span(b, &e, start, name)?);
+        check_size(&e, name, limits)?;
+        contents(b, &e, name).map(|c| Some(c.into_owned()))
+    }
+
     /// [`Self::open_untrusted`] for an archive held in memory (a zip inside a pack).
     pub fn from_vec_untrusted(
         bytes: Vec<u8>,
@@ -152,46 +204,7 @@ impl Zip {
 
     fn parse(bytes: Bytes, guard: Option<Guard>) -> io::Result<Zip> {
         let b: &[u8] = &bytes;
-        if b.len() < 22 {
-            return Err(bad("not a zip file"));
-        }
-        // The end record is the last 22 bytes plus a comment of up to 64 KiB.
-        let lowest = b.len().saturating_sub(22 + 0xFFFF);
-        let eocd = (lowest..=b.len() - 22)
-            .rev()
-            .find(|&i| u32_at(b, i).is_ok_and(|s| s == EOCD_SIG))
-            .ok_or_else(|| bad("no end of central directory"))?;
-        let mut count = u64::from(u16_at(b, eocd + 10)?);
-        let mut cd_size = u64::from(u32_at(b, eocd + 12)?);
-        let mut cd_offset = u64::from(u32_at(b, eocd + 16)?);
-        // Where the directory must end: at the end record, or at the zip64 one.
-        let mut cd_limit = eocd;
-        if eocd >= 20 && u32_at(b, eocd - 20)? == ZIP64_LOCATOR_SIG {
-            let z64 = usize::try_from(u64_at(b, eocd - 12)?).map_err(|_| bad("bad zip64"))?;
-            if z64 >= eocd - 20 || u32_at(b, z64)? != ZIP64_EOCD_SIG {
-                return Err(bad("bad zip64 end record"));
-            }
-            count = u64_at(b, z64 + 32)?;
-            cd_size = u64_at(b, z64 + 40)?;
-            cd_offset = u64_at(b, z64 + 48)?;
-            cd_limit = z64;
-        }
-        let start = usize::try_from(cd_offset).map_err(|_| bad("bad offset"))?;
-        let end = start
-            .checked_add(usize::try_from(cd_size).map_err(|_| bad("bad size"))?)
-            .filter(|&e| e <= b.len())
-            .ok_or_else(|| bad("central directory out of range"))?;
-        if let Some(g) = &guard {
-            if end > cd_limit {
-                return Err(bad("central directory overlaps its end record"));
-            }
-            if count > g.limits.zip_entries as u64 {
-                return Err(bad(format!(
-                    "{count} entries is more than a pack may have ({})",
-                    g.limits.zip_entries
-                )));
-            }
-        }
+        let (start, end, count, cd_size) = locate(b, guard.as_ref().map(|g| &g.limits))?;
 
         // An entry takes at least 46 bytes of the directory, whatever its count says.
         let room = (cd_size / 46).min(count).min(1 << 20);
@@ -208,67 +221,19 @@ impl Zip {
             {
                 return Err(bad("more entries than a pack may have"));
             }
-            let flags = u16_at(b, at + 8)?;
-            let method = u16_at(b, at + 10)?;
-            let mut compressed = u64::from(u32_at(b, at + 20)?);
-            let mut size = u64::from(u32_at(b, at + 24)?);
-            let name_len = usize::from(u16_at(b, at + 28)?);
-            let extra_len = usize::from(u16_at(b, at + 30)?);
-            let comment_len = usize::from(u16_at(b, at + 32)?);
-            let mut local_header = u64::from(u32_at(b, at + 42)?);
-            let name = b
-                .get(at + 46..at + 46 + name_len)
-                .ok_or_else(|| bad("truncated zip"))?;
-            let extra = b
-                .get(at + 46 + name_len..at + 46 + name_len + extra_len)
-                .ok_or_else(|| bad("truncated zip"))?;
-            // Zip64 extra field: the 0xFFFFFFFF fields, in order.
-            let mut x = 0;
-            while x + 4 <= extra.len() {
-                let id = u16_at(extra, x)?;
-                let len = usize::from(u16_at(extra, x + 2)?);
-                if id == 1 {
-                    let mut p = x + 4;
-                    for field in [&mut size, &mut compressed, &mut local_header] {
-                        if *field == 0xFFFF_FFFF {
-                            *field = u64_at(extra, p)?;
-                            p += 8;
-                        }
-                    }
-                }
-                x += 4 + len;
-            }
-            at += 46 + name_len + extra_len + comment_len;
+            let (next, name, mut entry) = central(b, at)?;
+            at = next;
             if at > end {
                 return Err(bad("central directory entry out of range"));
             }
             let Ok(name) = std::str::from_utf8(name) else {
                 continue;
             };
-            let mut entry = Entry {
-                method,
-                encrypted: flags & 1 != 0,
-                compressed,
-                size,
-                local_header,
-                data: None,
-            };
             if let Some(g) = &guard {
                 // Where its data lies, which must be inside the file and before the
                 // directory. Checked for every entry, kept or not, so that none can
                 // overlap another unseen.
-                let lh = usize::try_from(local_header).map_err(|_| bad("bad offset"))?;
-                if u32_at(b, lh)? != LOCAL_SIG {
-                    return Err(bad(format!("{name}: bad local header")));
-                }
-                let data =
-                    lh + 30 + usize::from(u16_at(b, lh + 26)?) + usize::from(u16_at(b, lh + 28)?);
-                let data_end = usize::try_from(compressed)
-                    .ok()
-                    .and_then(|c| data.checked_add(c))
-                    .filter(|&e| e <= start)
-                    .ok_or_else(|| bad(format!("{name}: data out of range")))?;
-                entry.data = Some((data as u64, data_end as u64));
+                entry.data = Some(span(b, &entry, start, name)?);
                 if name.len() > g.limits.zip_name_bytes || !plain_name(name) {
                     // Spans are still checked below.
                     list.push((Box::from(""), entry));
@@ -369,23 +334,7 @@ impl Zip {
             return Err(bad(format!("{name} is encrypted")));
         }
         if let Some(g) = &self.guard {
-            if e.size > g.limits.entry_bytes {
-                return Err(bad(format!(
-                    "{name}: {} bytes is larger than a file may be ({})",
-                    e.size, g.limits.entry_bytes
-                )));
-            }
-            if e.method == 8
-                && e.size
-                    > e.compressed
-                        .saturating_mul(DEFLATE_RATIO)
-                        .saturating_add(1024)
-            {
-                return Err(bad(format!(
-                    "{name}: {} bytes cannot inflate to {}",
-                    e.compressed, e.size
-                )));
-            }
+            check_size(&e, name, &g.limits)?;
             if budgeted && !g.budget.take_bytes(e.size, &g.limits) {
                 return Err(bad(format!(
                     "{name}: the pack has inflated more than a load may ({} bytes)",
@@ -393,32 +342,166 @@ impl Zip {
                 )));
             }
         }
-        let b: &[u8] = &self.bytes;
-        let data = match e.data {
-            Some((from, to)) => b.get(from as usize..to as usize),
-            None => {
-                let lh = usize::try_from(e.local_header).map_err(|_| bad("bad offset"))?;
-                if u32_at(b, lh)? != LOCAL_SIG {
-                    return Err(bad(format!("{name}: bad local header")));
-                }
-                let data =
-                    lh + 30 + usize::from(u16_at(b, lh + 26)?) + usize::from(u16_at(b, lh + 28)?);
-                usize::try_from(e.compressed)
-                    .ok()
-                    .and_then(|len| b.get(data..data.checked_add(len)?))
+        contents(&self.bytes, &e, name)
+    }
+}
+
+/// An untrusted entry's sizes: no larger than a file may be, and no more than deflate
+/// can give of its compressed bytes.
+fn check_size(e: &Entry, name: &str, limits: &Limits) -> io::Result<()> {
+    if e.size > limits.entry_bytes {
+        return Err(bad(format!(
+            "{name}: {} bytes is larger than a file may be ({})",
+            e.size, limits.entry_bytes
+        )));
+    }
+    if e.method == 8
+        && e.size
+            > e.compressed
+                .saturating_mul(DEFLATE_RATIO)
+                .saturating_add(1024)
+    {
+        return Err(bad(format!(
+            "{name}: {} bytes cannot inflate to {}",
+            e.compressed, e.size
+        )));
+    }
+    Ok(())
+}
+
+/// An entry's contents: borrowed if stored, inflated otherwise.
+fn contents<'a>(b: &'a [u8], e: &Entry, name: &str) -> io::Result<Cow<'a, [u8]>> {
+    let data = match e.data {
+        Some((from, to)) => b.get(from as usize..to as usize),
+        None => {
+            let lh = usize::try_from(e.local_header).map_err(|_| bad("bad offset"))?;
+            if u32_at(b, lh)? != LOCAL_SIG {
+                return Err(bad(format!("{name}: bad local header")));
             }
-        }
-        .ok_or_else(|| bad(format!("{name}: data out of range")))?;
-        let size = usize::try_from(e.size).map_err(|_| bad("entry too large"))?;
-        match e.method {
-            0 if data.len() == size => Ok(Cow::Borrowed(data)),
-            0 => Err(bad(format!("{name}: stored size mismatch"))),
-            8 => inflate(data, size)
-                .map(Cow::Owned)
-                .ok_or_else(|| bad(format!("{name}: corrupt deflate data"))),
-            m => Err(bad(format!("{name}: unsupported compression method {m}"))),
+            let data =
+                lh + 30 + usize::from(u16_at(b, lh + 26)?) + usize::from(u16_at(b, lh + 28)?);
+            usize::try_from(e.compressed)
+                .ok()
+                .and_then(|len| b.get(data..data.checked_add(len)?))
         }
     }
+    .ok_or_else(|| bad(format!("{name}: data out of range")))?;
+    let size = usize::try_from(e.size).map_err(|_| bad("entry too large"))?;
+    match e.method {
+        0 if data.len() == size => Ok(Cow::Borrowed(data)),
+        0 => Err(bad(format!("{name}: stored size mismatch"))),
+        8 => inflate(data, size)
+            .map(Cow::Owned)
+            .ok_or_else(|| bad(format!("{name}: corrupt deflate data"))),
+        m => Err(bad(format!("{name}: unsupported compression method {m}"))),
+    }
+}
+
+/// The directory entry at `at`: where the next one begins, its name's bytes, and what
+/// it says of its data (zip64's extra field read).
+fn central(b: &[u8], at: usize) -> io::Result<(usize, &[u8], Entry)> {
+    let flags = u16_at(b, at + 8)?;
+    let method = u16_at(b, at + 10)?;
+    let mut compressed = u64::from(u32_at(b, at + 20)?);
+    let mut size = u64::from(u32_at(b, at + 24)?);
+    let name_len = usize::from(u16_at(b, at + 28)?);
+    let extra_len = usize::from(u16_at(b, at + 30)?);
+    let comment_len = usize::from(u16_at(b, at + 32)?);
+    let mut local_header = u64::from(u32_at(b, at + 42)?);
+    let name = b
+        .get(at + 46..at + 46 + name_len)
+        .ok_or_else(|| bad("truncated zip"))?;
+    let extra = b
+        .get(at + 46 + name_len..at + 46 + name_len + extra_len)
+        .ok_or_else(|| bad("truncated zip"))?;
+    // Zip64 extra field: the 0xFFFFFFFF fields, in order.
+    let mut x = 0;
+    while x + 4 <= extra.len() {
+        let id = u16_at(extra, x)?;
+        let len = usize::from(u16_at(extra, x + 2)?);
+        if id == 1 {
+            let mut p = x + 4;
+            for field in [&mut size, &mut compressed, &mut local_header] {
+                if *field == 0xFFFF_FFFF {
+                    *field = u64_at(extra, p)?;
+                    p += 8;
+                }
+            }
+        }
+        x += 4 + len;
+    }
+    let entry = Entry {
+        method,
+        encrypted: flags & 1 != 0,
+        compressed,
+        size,
+        local_header,
+        data: None,
+    };
+    Ok((at + 46 + name_len + extra_len + comment_len, name, entry))
+}
+
+/// Where an untrusted entry's data lies: inside the file, and before the directory
+/// (which starts at `directory`).
+fn span(b: &[u8], e: &Entry, directory: usize, name: &str) -> io::Result<(u64, u64)> {
+    let lh = usize::try_from(e.local_header).map_err(|_| bad("bad offset"))?;
+    if u32_at(b, lh)? != LOCAL_SIG {
+        return Err(bad(format!("{name}: bad local header")));
+    }
+    let data = lh + 30 + usize::from(u16_at(b, lh + 26)?) + usize::from(u16_at(b, lh + 28)?);
+    let data_end = usize::try_from(e.compressed)
+        .ok()
+        .and_then(|c| data.checked_add(c))
+        .filter(|&end| end <= directory)
+        .ok_or_else(|| bad(format!("{name}: data out of range")))?;
+    Ok((data as u64, data_end as u64))
+}
+
+/// Where an archive's directory is: its start and end, and the entries and bytes its
+/// end record says it has. Under `limits` (an untrusted archive) the directory must end
+/// before its end record and claim no more entries than an archive may have.
+fn locate(b: &[u8], limits: Option<&Limits>) -> io::Result<(usize, usize, u64, u64)> {
+    if b.len() < 22 {
+        return Err(bad("not a zip file"));
+    }
+    // The end record is the last 22 bytes plus a comment of up to 64 KiB.
+    let lowest = b.len().saturating_sub(22 + 0xFFFF);
+    let eocd = (lowest..=b.len() - 22)
+        .rev()
+        .find(|&i| u32_at(b, i).is_ok_and(|s| s == EOCD_SIG))
+        .ok_or_else(|| bad("no end of central directory"))?;
+    let mut count = u64::from(u16_at(b, eocd + 10)?);
+    let mut cd_size = u64::from(u32_at(b, eocd + 12)?);
+    let mut cd_offset = u64::from(u32_at(b, eocd + 16)?);
+    // Where the directory must end: at the end record, or at the zip64 one.
+    let mut cd_limit = eocd;
+    if eocd >= 20 && u32_at(b, eocd - 20)? == ZIP64_LOCATOR_SIG {
+        let z64 = usize::try_from(u64_at(b, eocd - 12)?).map_err(|_| bad("bad zip64"))?;
+        if z64 >= eocd - 20 || u32_at(b, z64)? != ZIP64_EOCD_SIG {
+            return Err(bad("bad zip64 end record"));
+        }
+        count = u64_at(b, z64 + 32)?;
+        cd_size = u64_at(b, z64 + 40)?;
+        cd_offset = u64_at(b, z64 + 48)?;
+        cd_limit = z64;
+    }
+    let start = usize::try_from(cd_offset).map_err(|_| bad("bad offset"))?;
+    let end = start
+        .checked_add(usize::try_from(cd_size).map_err(|_| bad("bad size"))?)
+        .filter(|&e| e <= b.len())
+        .ok_or_else(|| bad("central directory out of range"))?;
+    if let Some(limits) = limits {
+        if end > cd_limit {
+            return Err(bad("central directory overlaps its end record"));
+        }
+        if count > limits.zip_entries as u64 {
+            return Err(bad(format!(
+                "{count} entries is more than a pack may have ({})",
+                limits.zip_entries
+            )));
+        }
+    }
+    Ok((start, end, count, cd_size))
 }
 
 /// A name that means a place inside the archive only: no `..` segment, no leading `/`,
