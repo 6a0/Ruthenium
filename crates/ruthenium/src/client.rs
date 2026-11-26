@@ -400,11 +400,15 @@ impl Options {
                     };
                 }
                 // A process-wide switch, set as soon as it is read.
-                "--font-fallback" => match value("on or off")?.as_str() {
-                    "on" => ruthenium_ui::text::fallback::set_enabled(true),
-                    "off" => ruthenium_ui::text::fallback::set_enabled(false),
-                    v => return Err(format!("--font-fallback: not on or off: {v}")),
-                },
+                "--font-fallback" => {
+                    use ruthenium_ui::text::fallback::{Mode, set_mode};
+                    match value("on, unifont or off")?.as_str() {
+                        "on" => set_mode(Mode::On),
+                        "unifont" => set_mode(Mode::Unifont),
+                        "off" => set_mode(Mode::Off),
+                        v => return Err(format!("--font-fallback: not on, unifont or off: {v}")),
+                    }
+                }
                 "--gpu-spin" => {
                     let v = value("microseconds")?;
                     let us: u64 = v
@@ -771,6 +775,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     game.clouds = opts.clouds.unwrap_or(game.clouds);
     game.cloud_distance = opts.cloud_distance.unwrap_or(game.cloud_distance);
     let mut menu = Menu::new(servers_file, accounts, settings);
+    crate::menu::load_unifont(data_dir.as_ref().map(|d| d.join("game")));
     menu.set_command_history(data_dir.as_ref().map(|d| d.join("command_history.txt")));
     if let Some(n) = opts.mesh_workers {
         menu.set_mesh_workers(n);

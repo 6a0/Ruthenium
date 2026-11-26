@@ -168,10 +168,11 @@ With no command, opens the game window. Options:
                          device and decodes nothing
   --sound-wav <file>     write what the mixer makes to a WAV file (32-bit float,
                          stereo, 48 kHz, in real time) instead of playing it
-  --font-fallback <on|off>
+  --font-fallback <on|unifont|off>
                          whether the menus draw what Nunito lacks (small capitals,
-                         CJK, symbols) from the system's fonts (on, the default); off
-                         leaves it out, to measure the fonts' loading against
+                         CJK, symbols) from the system's fonts and then the game's
+                         Unifont (on, the default), from Unifont alone (unifont), or
+                         leave it out (off), to measure the fonts' loading against
   --fov-effects <on|off> whether the field of view widens and narrows with speed,
                          flight, bows and fluids (on, the default), as vanilla's FOV
                          Effects at 100% or at 0%

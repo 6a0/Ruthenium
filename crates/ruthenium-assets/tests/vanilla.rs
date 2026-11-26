@@ -26,6 +26,39 @@ fn vanilla() -> Option<Resources> {
     Some(Resources::new(vec![pack]))
 }
 
+/// The menus' Unifont (`include/unifont`) and the game's default font read the same
+/// file once: the second load finds the first's glyphs.
+#[test]
+fn unifont_is_read_once_for_the_menus_and_the_hud() {
+    let Some(res) = vanilla() else {
+        eprintln!("RUTHENIUM_GAME_DIR not set; skipped");
+        return;
+    };
+    let timed = |name: &str| {
+        let start = std::time::Instant::now();
+        let font = ruthenium_assets::Font::load(&res, &Id::minecraft(name).unwrap());
+        (font, start.elapsed())
+    };
+    let (unifont, first) = timed("include/unifont");
+    assert!(unifont.warnings.is_empty(), "{:?}", unifont.warnings);
+    // A character of Ol Onal (Unicode 16), in no font of this system's; an ideograph
+    // with its size override; no private use.
+    assert!(unifont.has('\u{1E5D0}') && unifont.has('日'));
+    assert_eq!(unifont.glyph('日').advance, 9.0);
+    assert!(!unifont.has('\u{E000}'));
+    let (default, second) = timed("default");
+    assert_eq!(default.glyph('\u{1E5D0}'), unifont.glyph('\u{1E5D0}'));
+    let bytes = unifont.unihex_bytes();
+    eprintln!(
+        "Unifont: {:.1} MiB, read in {first:.0?}; the default font with it in {second:.0?}",
+        bytes as f64 / (1024.0 * 1024.0)
+    );
+    drop((unifont, default));
+    let (_, alone) = timed("default");
+    eprintln!("the default font alone: {alone:.0?}");
+    assert!(second < alone, "{second:?} vs {alone:?}");
+}
+
 /// Atlas sizes vanilla 26.3 logs at start-up (`Created: WxHxM`) with default
 /// options and no resource packs.
 const VANILLA_SIZES: [(&str, u32, u32, u32); 12] = [

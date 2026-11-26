@@ -7,7 +7,6 @@
 //! are reported as unreadable.
 
 use std::borrow::Cow;
-use std::fs::File;
 use std::io;
 use std::path::Path;
 
@@ -21,7 +20,7 @@ const CENTRAL_SIG: u32 = 0x0201_4b50;
 const LOCAL_SIG: u32 = 0x0403_4b50;
 
 enum Bytes {
-    Mapped(memmap2::Mmap),
+    Mapped(crate::map::MappedFile),
     Owned(Vec<u8>),
 }
 
@@ -85,13 +84,7 @@ fn u64_at(b: &[u8], at: usize) -> io::Result<u64> {
 impl Zip {
     /// Maps `path` and reads its central directory.
     pub fn open(path: &Path) -> io::Result<Zip> {
-        let file = File::open(path)?;
-        // SAFETY: the map is read-only. Ruthenium opens jars it imported into
-        // its own cache and packs from its own folder; if another process
-        // truncates one while it is open, reads past the new end fault. That is
-        // the accepted cost of reading in place (no copy of a 40 MiB jar).
-        let map = unsafe { memmap2::Mmap::map(&file)? };
-        Zip::parse(Bytes::Mapped(map))
+        Zip::parse(Bytes::Mapped(crate::map::MappedFile::open(path)?))
     }
 
     /// An archive held in memory (tests, downloaded packs).

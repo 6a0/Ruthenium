@@ -441,6 +441,9 @@ pub struct Menu {
     chat_history: ChatHistory,
     /// The chat's draft, and a chat screen put away while a level loads.
     chat_drafts: Drafts,
+    /// The fallback fonts' revision the text was shaped with: text is shaped again when a
+    /// font arrives (Unifont, read meanwhile).
+    fonts_revision: u32,
 }
 
 impl std::fmt::Debug for Menu {
@@ -471,14 +474,68 @@ fn glyph_atlas() -> GlyphAtlas {
     if !atlas.add_many(&fonts, &glyphs) {
         eprintln!("[ruthenium] the glyph atlas is full; some menu text is missing");
     }
-    // Find the system's fonts now, off the main thread, for the first text that needs them.
-    ruthenium_ui::text::fallback::warm();
     atlas
+}
+
+/// Finds the system's fonts and reads which characters each has, off the main thread and
+/// beside the atlas, for the first text that needs them.
+fn warm_fallback() {
+    let warmed = ruthenium_ui::text::fallback::warm();
+    if warmed.families > 0 {
+        eprintln!(
+            "[ruthenium] menu fallback fonts: {} families' characters ({} KiB) read in {:.0} ms",
+            warmed.families,
+            warmed.cmap_bytes / 1024,
+            warmed.ms
+        );
+    }
+}
+
+/// Reads the game's GNU Unifont, the menus' last fallback font, on a thread of its own:
+/// from the game imported in `game`; without one (or with the fallback off), none.
+pub fn load_unifont(game: Option<PathBuf>) {
+    use ruthenium_ui::text::fallback;
+    let Some(game) = game.filter(|_| fallback::mode() != fallback::Mode::Off) else {
+        return;
+    };
+    let spawned = std::thread::Builder::new()
+        .name("menu-unifont".into())
+        .spawn(move || {
+            let started = Instant::now();
+            let Some(resources) = crate::skins::open(&game) else {
+                return;
+            };
+            let id = ruthenium_assets::Id::minecraft("include/unifont").expect("a valid id");
+            let font = ruthenium_assets::Font::load(&resources, &id);
+            for w in &font.warnings {
+                eprintln!("[ruthenium] menu fallback: {w}");
+            }
+            if !font.has('A') {
+                eprintln!("[ruthenium] menu fallback: no Unifont in the game files");
+                return;
+            }
+            eprintln!(
+                "[ruthenium] menu fallback: Unifont ({:.1} MiB) read in {:.0} ms",
+                font.unihex_bytes() as f64 / (1024.0 * 1024.0),
+                started.elapsed().as_secs_f64() * 1e3
+            );
+            fallback::set_unifont(font);
+        });
+    if let Err(e) = spawned {
+        eprintln!("[ruthenium] no thread for Unifont: {e}");
+    }
 }
 
 /// The glyph atlas and the logo, side by side.
 fn prepare() -> Prepared {
     let started = Instant::now();
+    // (Not waited for: the menus' text does not need it to show.)
+    if let Err(e) = std::thread::Builder::new()
+        .name("menu-fallback".into())
+        .spawn(warm_fallback)
+    {
+        eprintln!("[ruthenium] no thread for the fallback fonts: {e}");
+    }
     let (atlas, logo) = std::thread::scope(|s| {
         let logo = s.spawn(|| Logo::new(LOGO_SIZE, ICON_SIZE));
         let atlas = glyph_atlas();
@@ -576,6 +633,7 @@ impl Menu {
             keys,
             chat_history: ChatHistory::default(),
             chat_drafts: Drafts::default(),
+            fonts_revision: ruthenium_ui::text::fallback::revision(),
         }
     }
 
@@ -1306,10 +1364,12 @@ impl Menu {
     fn layout(&mut self, pixel_size: (u32, u32)) -> UiScale {
         let factor = self.settings.settings.menu_size.factor();
         let scale = UiScale::sized(pixel_size.0, pixel_size.1, factor);
-        if self.scale == Some(scale) {
+        let revision = ruthenium_ui::text::fallback::revision();
+        if self.scale == Some(scale) && self.fonts_revision == revision {
             return scale;
         }
         self.scale = Some(scale);
+        self.fonts_revision = revision;
         let version = concat!("Ruthenium ", env!("CARGO_PKG_VERSION"));
         let title = TitleScreen::new(scale, &self.fonts, version);
         if title.controls() != self.title_states.len() {
@@ -2806,6 +2866,24 @@ mod tests {
             Screen::Form(k, f, _) => Some((*k, f.spec.message.clone())),
             _ => None,
         }
+    }
+
+    /// Text is shaped again once a fallback font arrives (Unifont, read at start-up).
+    #[test]
+    fn the_menus_are_laid_out_again_when_a_fallback_font_comes() {
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.title = None;
+        m.layout((1600, 900));
+        assert!(m.title.is_none(), "nothing changed: not laid out again");
+        // (A font of one character no other test draws: the process keeps it.)
+        let font = ruthenium_assets::Font::of_unihex(&format!("01E5D0:{}\n", "F".repeat(64)));
+        ruthenium_ui::text::fallback::set_unifont(font.unwrap());
+        m.layout((1600, 900));
+        assert!(m.title.is_some());
+        m.title = None;
+        m.layout((1600, 900));
+        assert!(m.title.is_none());
     }
 
     #[test]

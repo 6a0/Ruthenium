@@ -5,9 +5,9 @@
 //! Each weight is a static instance of Nunito with overlaps removed (distance fields need
 //! that; see `fonts/README.md`); each has its own atlas entries.
 //!
-//! Characters Nunito lacks come from fonts already on the system ([`fallback`]). A word
-//! that needs one is set wholly in it where it can be, so a word in small capitals does not
-//! mix two typefaces. The atlas starts with what the menus' own text needs and takes in
+//! Characters Nunito lacks come from fonts already on the system ([`fallback`]), and
+//! after them from the game's own GNU Unifont ([`unifont`]). A word that needs one is set
+//! wholly in it where it can be, so a word in small capitals does not mix two typefaces. The atlas starts with what the menus' own text needs and takes in
 //! the glyphs of other text (server names and messages, typed text) as it is drawn:
 //! [`TextList`] notes the glyphs it had to leave out, and they are rendered and added.
 
@@ -25,8 +25,10 @@ use rustybuzz::ttf_parser::GlyphId;
 use rustybuzz::{Face, UnicodeBuffer};
 
 pub mod fallback;
+mod unifont;
 
-use fallback::{SystemFonts, has_outline};
+use fallback::{Chain, SystemFonts, has_outline};
+use fdsm::shape::Contour;
 
 /// The bundled fonts, by weight (`fonts/README.md`).
 const FONTS: [(Weight, &[u8]); 4] = [
@@ -74,6 +76,8 @@ pub enum FaceId {
     Nunito(Weight),
     /// A system font, by its file's place in the fallback list.
     System(u16),
+    /// The game's Unifont: the plane of the character, whose place in it is the glyph id.
+    Unifont(u8),
 }
 
 /// One glyph of a shaped line: its font, its id there, and its pen position.
@@ -92,7 +96,7 @@ impl Glyph {
     }
 }
 
-/// The menus' typeface at a set of weights, and the system's fonts behind it.
+/// The menus' typeface at a set of weights, and the fallback fonts behind it.
 pub struct Fonts {
     faces: Vec<(Weight, Face<'static>)>,
     fallback: Fallback,
@@ -102,9 +106,10 @@ pub struct Fonts {
 #[derive(Clone, Copy)]
 enum Fallback {
     None,
-    /// The system's fonts (found the first time a character needs them).
+    /// The process's: the system's fonts (found the first time a character needs them)
+    /// and Unifont (once it has come), as [`fallback::set_mode`] says.
     System,
-    Given(&'static SystemFonts),
+    Given(Chain),
 }
 
 impl std::fmt::Debug for Fonts {
@@ -146,8 +151,19 @@ impl Fonts {
 
     /// Like [`Fonts::new`], with these fallback fonts instead of the system's.
     pub fn with_fallback(weights: &[Weight], fallback: &'static SystemFonts) -> Fonts {
+        Fonts::with_chain(
+            weights,
+            Chain {
+                system: Some(fallback),
+                unifont: None,
+            },
+        )
+    }
+
+    /// Like [`Fonts::new`], with these fallback fonts instead of the process's.
+    pub fn with_chain(weights: &[Weight], chain: Chain) -> Fonts {
         Fonts {
-            fallback: Fallback::Given(fallback),
+            fallback: Fallback::Given(chain),
             ..Fonts::nunito(weights)
         }
     }
@@ -184,20 +200,45 @@ impl Fonts {
     }
 
     /// The fallback fonts, if there are any.
-    fn fallback(&self) -> Option<&'static SystemFonts> {
+    fn fallback(&self) -> Option<Chain> {
         match self.fallback {
             Fallback::None => None,
-            Fallback::System => fallback::system(),
-            Fallback::Given(f) => Some(f),
+            Fallback::System => Chain::current(),
+            Fallback::Given(c) => Some(c),
         }
     }
 
-    /// The face a glyph of `id` comes from.
+    /// The face a glyph of `id` comes from (none for Unifont's, which have no face).
     fn face_of(&self, id: FaceId) -> Option<&Face<'static>> {
         match id {
             FaceId::Nunito(w) => Some(self.face(w)),
-            FaceId::System(file) => self.fallback()?.face(file),
+            FaceId::System(file) => self.fallback()?.system?.face(file),
+            FaceId::Unifont(_) => None,
         }
+    }
+
+    /// The outline of a glyph, in its font's units, its box (`x_min, y_min, x_max, y_max`)
+    /// and the units to the em.
+    fn outline(
+        &self,
+        (id, glyph): (FaceId, u16),
+    ) -> Option<(fdsm::shape::Shape<Contour>, [f64; 4], f64)> {
+        if let FaceId::Unifont(plane) = id {
+            let c = unifont::char_of(plane, glyph)?;
+            let (shape, bbox) = unifont::outline(self.fallback()?.unifont?, c)?;
+            return Some((shape, bbox, unifont::ROWS_PER_EM));
+        }
+        let face = self.face_of(id)?;
+        let gid = GlyphId(glyph);
+        // A variable font's set weight moves the outline from its stored box: measure it.
+        let bbox = if face.is_variable() {
+            face.outline_glyph(gid, &mut NoOutline)?
+        } else {
+            face.glyph_bounding_box(gid)?
+        };
+        let shape = fdsm_ttf_parser::load_shape_from_face(face, gid)?;
+        let bbox = [bbox.x_min, bbox.y_min, bbox.x_max, bbox.y_max].map(f64::from);
+        Some((shape, bbox, f64::from(face.units_per_em())))
     }
 
     pub fn weights(&self) -> impl Iterator<Item = Weight> + '_ {
@@ -219,6 +260,29 @@ impl Fonts {
         let mut glyphs = Vec::with_capacity(text.len());
         let mut x = 0.0f32;
         for (range, id) in self.runs(text, style.weight) {
+            if let FaceId::Unifont(_) = id {
+                let Some(font) = self.fallback().and_then(|c| c.unifont) else {
+                    continue;
+                };
+                // Pictures, not outlines to shape: each at vanilla's advance.
+                for c in text[range].chars() {
+                    if unifont::invisible(c) || !font.has(c) {
+                        continue;
+                    }
+                    if !glyphs.is_empty() {
+                        x += track;
+                    }
+                    let (plane, id) = unifont::key(c);
+                    glyphs.push(Glyph {
+                        face: FaceId::Unifont(plane),
+                        id,
+                        x,
+                        y: 0.0,
+                    });
+                    x += unifont::advance(font, c) * style.size;
+                }
+                continue;
+            }
             let Some(face) = self.face_of(id) else {
                 continue;
             };
@@ -255,6 +319,7 @@ impl Fonts {
     /// `text` in runs of one font each: Nunito wherever it has the characters; a word it
     /// can't set in the first fallback font that has all of the word, else character by
     /// character in the first that has each (Nunito's missing glyph when none has it).
+    /// Unifont's runs are `FaceId::Unifont(0)`; [`Fonts::shape`] gives each glyph its plane.
     fn runs(&self, text: &str, weight: Weight) -> Vec<(std::ops::Range<usize>, FaceId)> {
         let nunito = FaceId::Nunito(weight);
         let primary = self.face(weight);
@@ -273,12 +338,13 @@ impl Fonts {
         };
         let bold = weight.0 >= 600;
         let coverage = |c: char| has_outline(primary, c);
-        itemize(text, coverage, fallback)
+        itemize(text, coverage, &fallback)
             .into_iter()
             .map(|(range, font)| {
-                let id = match font {
-                    Some(f) => FaceId::System(fallback.file(f, bold)),
-                    None => nunito,
+                let id = match (font, fallback.system) {
+                    (Some(f), _) if fallback.is_unifont(f) => FaceId::Unifont(0),
+                    (Some(f), Some(system)) => FaceId::System(system.file(f, bold)),
+                    _ => nunito,
                 };
                 (range, id)
             })
@@ -448,7 +514,7 @@ impl Rendered {
         todo.dedup();
         Rendered(
             todo.into_par_iter()
-                .map(|k| (k, fonts.face_of(k.0).and_then(|f| render_glyph(f, k.1))))
+                .map(|k| (k, render_glyph(fonts, k)))
                 .collect(),
         )
     }
@@ -658,27 +724,19 @@ impl rustybuzz::ttf_parser::OutlineBuilder for NoOutline {
 }
 
 /// The MSDF of one glyph, or `None` if it has no outline.
-fn render_glyph(face: &Face<'_>, glyph: u16) -> Option<Field> {
-    let gid = GlyphId(glyph);
-    // A variable font's set weight moves the outline from its stored box: measure it.
-    let bbox = if face.is_variable() {
-        face.outline_glyph(gid, &mut NoOutline)?
-    } else {
-        face.glyph_bounding_box(gid)?
-    };
-    let mut shape = fdsm_ttf_parser::load_shape_from_face(face, gid)?;
-    let upem = f64::from(face.units_per_em());
+fn render_glyph(fonts: &Fonts, key: (FaceId, u16)) -> Option<Field> {
+    let (mut shape, [x_min, y_min, x_max, y_max], upem) = fonts.outline(key)?;
     let s = EM_TEXELS / upem;
-    let w = ((f64::from(bbox.x_max) - f64::from(bbox.x_min)) * s + 2.0 * PAD).ceil() as u32;
-    let h = ((f64::from(bbox.y_max) - f64::from(bbox.y_min)) * s + 2.0 * PAD).ceil() as u32;
+    let w = ((x_max - x_min) * s + 2.0 * PAD).ceil() as u32;
+    let h = ((y_max - y_min) * s + 2.0 * PAD).ceil() as u32;
     // Font units (y up) to field texels (y down), with the padding.
     let m = nalgebra::Matrix3::new(
         s,
         0.0,
-        PAD - f64::from(bbox.x_min) * s,
+        PAD - x_min * s,
         0.0,
         -s,
-        PAD + f64::from(bbox.y_max) * s,
+        PAD + y_max * s,
         0.0,
         0.0,
         1.0,
@@ -700,8 +758,8 @@ fn render_glyph(face: &Face<'_>, glyph: u16) -> Option<Field> {
         .pixels()
         .map(|p| p.0.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8))
         .collect();
-    let x0 = (f64::from(bbox.x_min) / upem - PAD / EM_TEXELS) as f32;
-    let y0 = (-f64::from(bbox.y_max) / upem - PAD / EM_TEXELS) as f32;
+    let x0 = (x_min / upem - PAD / EM_TEXELS) as f32;
+    let y0 = (-y_max / upem - PAD / EM_TEXELS) as f32;
     Some(Field {
         w,
         h,
@@ -1070,6 +1128,169 @@ mod tests {
         list.line(&atlas, &fonts.shape("abba c", style), 0.0, 0.0, [1.0; 4]);
         assert_eq!(list.quads().len(), 5);
         assert!(list.take_missing().is_empty());
+    }
+
+    /// GNU Unifont's lines for a ring 'A' (columns 1 to 6, rows 2 to 11), 'a', a small
+    /// capital, the zero-width joiner's box, a block in plane 1 that no other font has and
+    /// a private-use character.
+    const HEX: &str = "0041:00007E42424242424242427E00000000
+0061:00000000000000003C043C44443C0000
+1D00:00000000000018242442427E42420000
+200D:000000007E7E7E7E7E7E7E7E00000000
+01E5D0:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+E000:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+";
+
+    fn unifont() -> &'static ruthenium_assets::Font {
+        static FONT: std::sync::OnceLock<ruthenium_assets::Font> = std::sync::OnceLock::new();
+        FONT.get_or_init(|| ruthenium_assets::Font::of_unihex(HEX).expect("the test's unihex"))
+    }
+
+    fn nunito_as_system() -> &'static SystemFonts {
+        static FONTS: std::sync::OnceLock<SystemFonts> = std::sync::OnceLock::new();
+        FONTS.get_or_init(|| {
+            let path =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fonts/Nunito-Regular.ttf");
+            SystemFonts::from_files(vec![(path, None)])
+        })
+    }
+
+    /// Unifont is one family more, after the system's, and never has private-use
+    /// characters.
+    #[test]
+    fn unifont_comes_after_the_system_fonts() {
+        let both = Chain {
+            system: Some(nunito_as_system()),
+            unifont: Some(unifont()),
+        };
+        assert_eq!(both.families(), 2);
+        assert_eq!(both.covering('a'), Some(0));
+        assert_eq!(both.covering('\u{1E5D0}'), Some(1));
+        assert_eq!(both.covering('\u{1D00}'), Some(1));
+        assert_eq!(both.covering('\u{E000}'), None);
+        assert_eq!(both.covering('\u{1E5D1}'), None);
+        assert!(both.family_has(1, 'a') && !both.family_has(0, '\u{1E5D0}'));
+        assert!(!both.family_has(1, '\u{E000}'));
+        assert!(both.is_unifont(1) && !both.is_unifont(0));
+        let alone = Chain {
+            system: None,
+            unifont: Some(unifont()),
+        };
+        assert_eq!(alone.families(), 1);
+        assert_eq!(alone.covering('\u{1E5D0}'), Some(0));
+        assert!(alone.is_unifont(0));
+        let system = Chain {
+            system: Some(nunito_as_system()),
+            unifont: None,
+        };
+        assert_eq!((system.families(), system.covering('\u{1E5D0}')), (1, None));
+        assert!(!system.is_unifont(1) && !system.is_unifont(0));
+    }
+
+    #[test]
+    fn unifont_sets_words_at_vanillas_advances() {
+        let fonts = Fonts::with_chain(
+            &[Weight::REGULAR],
+            Chain {
+                system: Some(nunito_as_system()),
+                unifont: Some(unifont()),
+            },
+        );
+        let style = TextStyle {
+            size: 16.0,
+            weight: Weight::REGULAR,
+            tracking: 0.0,
+        };
+        let faces = |s: &str| -> Vec<(FaceId, u16)> {
+            fonts
+                .shape(s, style)
+                .glyphs
+                .iter()
+                .map(Glyph::key)
+                .collect()
+        };
+        let line = fonts.shape("x \u{1E5D0}\u{1E5D0}", style);
+        let unifont_glyph = (FaceId::Unifont(1), 0xE5D0);
+        assert_eq!(line.glyphs.len(), 4);
+        assert_eq!(line.glyphs[0].face, FaceId::Nunito(Weight::REGULAR));
+        assert_eq!(line.glyphs[2].key(), unifont_glyph);
+        // 16 columns: vanilla's 9 units, 18 rows; 16 rows to the em, here 16 pixels.
+        let start = line.glyphs[2].x;
+        assert_eq!(line.glyphs[3].x - start, 18.0);
+        assert_eq!(line.width - start, 36.0);
+        assert_eq!(line.glyphs[2].y, 0.0);
+        // The whole word in Unifont, which has its 'a' too; joiners are left out.
+        assert_eq!(
+            faces("a\u{1E5D0}\u{200D}\u{FE0F}"),
+            [(FaceId::Unifont(0), 0x61), unifont_glyph]
+        );
+        // A word Unifont can't set whole: each character where it is.
+        assert_eq!(
+            faces("b\u{1E5D0}"),
+            [
+                (FaceId::Nunito(Weight::REGULAR), faces("b")[0].1),
+                unifont_glyph
+            ]
+        );
+        // Without it, Nunito's missing glyph; tracking goes between Unifont's glyphs too.
+        let none = Fonts::with_fallback(&[Weight::REGULAR], nunito_as_system());
+        assert_eq!(
+            none.shape("\u{1E5D0}", style).glyphs[0].key(),
+            (FaceId::Nunito(Weight::REGULAR), 0)
+        );
+        let tracked = fonts.shape(
+            "\u{1E5D0}\u{1E5D0}",
+            TextStyle {
+                tracking: 0.5,
+                ..style
+            },
+        );
+        assert_eq!(tracked.width, 36.0 + 8.0);
+    }
+
+    #[test]
+    fn unifont_glyphs_are_drawn_from_their_pixels() {
+        let fonts = Fonts::with_chain(
+            &[Weight::REGULAR],
+            Chain {
+                system: None,
+                unifont: Some(unifont()),
+            },
+        );
+        let mut atlas = GlyphAtlas::new(256);
+        let ring = (FaceId::Unifont(0), u16::from(b'A'));
+        assert!(atlas.add_many(&fonts, &[ring, (FaceId::Unifont(0), 0x20)]));
+        let slot = atlas.get(ring).expect("the ring has a field");
+        // Columns 1 to 6 from the pen (the picture starts at its ink), rows 2 to 11 of
+        // 16 with 14 above the baseline: 3 texels a row, 4 of padding around.
+        let pad = (PAD / EM_TEXELS) as f32;
+        let expected = [
+            -pad,
+            -12.0 / 16.0 - pad,
+            6.0 / 16.0 + pad,
+            -2.0 / 16.0 + pad,
+        ];
+        for (a, b) in slot.plane.iter().zip(expected) {
+            assert!((a - b).abs() < 1e-3, "{:?} vs {expected:?}", slot.plane);
+        }
+        let [u0, v0, u1, v1] = slot.uv.map(|v| v * 256.0);
+        assert_eq!((u1 - u0, v1 - v0), (26.0, 38.0));
+        let texel = |x: f32, y: f32| {
+            let i = (((v0 + y) as usize) * 256 + (u0 + x) as usize) * 4;
+            let mut c = [atlas.pixels[i], atlas.pixels[i + 1], atlas.pixels[i + 2]];
+            c.sort();
+            c[1]
+        };
+        // In the ring's left column, its top row; the hole; the padding.
+        assert!(texel(5.5, 19.0) > 160, "{}", texel(5.5, 19.0));
+        assert!(texel(13.0, 5.5) > 160, "{}", texel(13.0, 5.5));
+        assert!(texel(13.0, 19.0) < 100, "{}", texel(13.0, 19.0));
+        assert!(texel(1.0, 1.0) < 100 && texel(24.0, 36.0) < 100);
+        // Its corners are sharp: just inside one is inside.
+        assert!(texel(4.5, 4.5) > 128, "{}", texel(4.5, 4.5));
+        assert!(texel(3.5, 3.5) < 128, "{}", texel(3.5, 3.5));
+        // A character without ink (not in this font) has nothing to draw.
+        assert_eq!(atlas.known((FaceId::Unifont(0), 0x20)), Known::Blank);
     }
 
     /// With the system's fonts (where there are any), small capitals are drawn from one.

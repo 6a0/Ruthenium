@@ -1,6 +1,6 @@
 //! Game assets, read in place from the imported install and resource packs.
 //!
-//! - [`zip`]: the client jar and zipped packs, memory-mapped.
+//! - [`zip`]: the client jar and zipped packs, memory-mapped ([`map`]).
 //! - [`pack`] + [`resources`]: the pack stack (vanilla at the bottom) with
 //!   vanilla's lookup, metadata and filter rules.
 //! - [`image`]: PNG decoding to RGBA, as vanilla's loader does it.
@@ -16,6 +16,7 @@ pub mod font;
 pub mod id;
 pub mod image;
 pub mod item;
+pub mod map;
 pub mod meta;
 pub mod mipmap;
 pub mod model;

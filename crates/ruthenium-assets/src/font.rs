@@ -9,6 +9,8 @@
 //! TrueType providers are left out: no font of the game's own has one.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::Value;
 
@@ -75,16 +77,46 @@ struct Bitmap {
     cells: HashMap<u32, ([u32; 2], f32)>,
 }
 
+/// A unihex file's glyphs: each character's rows (leftmost column in the highest bit),
+/// and the first and last column drawn.
 struct Unihex {
-    /// Each character's rows (leftmost column in the highest bit), and the first and last
-    /// column drawn.
-    glyphs: HashMap<u32, ([u32; UNIHEX_ROWS as usize], i32, i32)>,
+    /// Glyphs at most 16 columns wide (every one of the game's), in half the room.
+    narrow: HashMap<u32, ([u16; UNIHEX_ROWS as usize], i32, i32)>,
+    /// 24 and 32 columns wide.
+    wide: HashMap<u32, ([u32; UNIHEX_ROWS as usize], i32, i32)>,
+}
+
+impl Unihex {
+    /// A character's rows (as wide ones), and its first and last column drawn.
+    fn get(&self, c: u32) -> Option<([u32; UNIHEX_ROWS as usize], i32, i32)> {
+        if let Some((rows, left, right)) = self.narrow.get(&c) {
+            return Some((rows.map(|r| u32::from(r) << 16), *left, *right));
+        }
+        self.wide.get(&c).copied()
+    }
+
+    fn characters(&self) -> impl Iterator<Item = u32> + '_ {
+        self.narrow.keys().chain(self.wide.keys()).copied()
+    }
+
+    /// Bytes its tables take up, roughly: entries and their control bytes.
+    fn heap_bytes(&self) -> usize {
+        let table = |capacity: usize, entry: usize| capacity * (entry + 1);
+        table(
+            self.narrow.capacity(),
+            size_of::<(u32, ([u16; UNIHEX_ROWS as usize], i32, i32))>(),
+        ) + table(
+            self.wide.capacity(),
+            size_of::<(u32, ([u32; UNIHEX_ROWS as usize], i32, i32))>(),
+        )
+    }
 }
 
 enum Provider {
     Bitmap(Box<Bitmap>),
     Space(HashMap<u32, f32>),
-    Unihex(Unihex),
+    /// Shared by every font that reads the same file ([`shared_unihex`]).
+    Unihex(Arc<Unihex>),
     Fixed(HashMap<u32, Glyph>),
 }
 
@@ -115,7 +147,7 @@ impl Provider {
                     ..plain(advance)
                 }
             }),
-            Provider::Unihex(u) => u.glyphs.get(&c).map(|&(_, left, right)| {
+            Provider::Unihex(u) => u.get(c).map(|(_, left, right)| {
                 let width = right - left + 1;
                 Glyph {
                     advance: (width / 2 + 1) as f32,
@@ -142,7 +174,7 @@ impl Provider {
                     .sub_image(x * b.cell[0], y * b.cell[1], b.cell[0], b.cell[1])
             }
             Provider::Unihex(u) => {
-                let (rows, left, right) = u.glyphs.get(&c)?;
+                let (rows, left, right) = u.get(c)?;
                 let width = u32::try_from(right - left + 1).ok().filter(|w| *w > 0)?;
                 let mut image = Image::new(width, UNIHEX_ROWS);
                 for (y, row) in (0..).zip(rows) {
@@ -163,7 +195,7 @@ impl Provider {
             Provider::Bitmap(b) => Box::new(b.cells.keys().copied()),
             Provider::Space(s) => Box::new(s.keys().copied()),
             Provider::Fixed(f) => Box::new(f.keys().copied()),
-            Provider::Unihex(u) => Box::new(u.glyphs.keys().copied()),
+            Provider::Unihex(u) => Box::new(u.characters()),
         }
     }
 }
@@ -315,8 +347,8 @@ impl Font {
             Some("unihex") => {
                 let file = id("hex_file")?;
                 let bytes = read(res, &file)?;
-                let unihex =
-                    unihex(&bytes, &p["size_overrides"]).map_err(|e| format!("{file}: {e}"))?;
+                let unihex = shared_unihex(bytes, &p["size_overrides"])
+                    .map_err(|e| format!("{file}: {e}"))?;
                 self.providers.push(Provider::Unihex(unihex));
             }
             other => return Err(format!("a {} provider", other.unwrap_or("nameless"))),
@@ -326,6 +358,44 @@ impl Font {
 
     fn provider(&self, c: u32) -> Option<&Provider> {
         self.providers.iter().find(|p| p.glyph(c).is_some())
+    }
+
+    /// Whether some provider has a glyph for `c`.
+    pub fn has(&self, c: char) -> bool {
+        self.provider(u32::from(c)).is_some()
+    }
+
+    /// Bytes its unihex glyphs take up, roughly (each file once, however many fonts
+    /// share it).
+    pub fn unihex_bytes(&self) -> usize {
+        let mut seen = Vec::new();
+        let mut bytes = 0;
+        for p in &self.providers {
+            if let Provider::Unihex(u) = p
+                && !seen.iter().any(|s| Arc::ptr_eq(s, u))
+            {
+                bytes += u.heap_bytes();
+                seen.push(u.clone());
+            }
+        }
+        bytes
+    }
+
+    /// A font of one unihex provider read from `hex` (the lines of a `.hex` file), with no
+    /// size overrides: for tests of what draws its glyphs.
+    #[doc(hidden)]
+    pub fn of_unihex(hex: &str) -> Result<Font, String> {
+        let unihex = parse_unihex(
+            std::iter::once(Ok(std::borrow::Cow::Borrowed(hex.as_bytes()))),
+            &Value::Null,
+        )?;
+        let mut font = Font {
+            providers: vec![Provider::Unihex(Arc::new(unihex))],
+            by_advance: HashMap::new(),
+            warnings: Vec::new(),
+        };
+        font.index();
+        Ok(font)
     }
 
     /// The glyph of a character: [`Glyph::MISSING`'s if the font has none.
@@ -419,21 +489,43 @@ fn bitmap(png: &[u8], grid: &[Vec<u32>], height: f32, ascent: f32) -> Result<Bit
     })
 }
 
-fn unihex(zip: &[u8], overrides: &Value) -> Result<Unihex, String> {
-    let zip = Zip::from_vec(zip.to_vec()).map_err(|e| e.to_string())?;
-    let mut lines: HashMap<u32, ([u32; UNIHEX_ROWS as usize], u32)> = HashMap::new();
-    for i in 0..zip.len() {
-        if !zip.name(i).ends_with(".hex") {
-            continue;
-        }
-        let bytes = zip.read(i).map_err(|e| e.to_string())?;
-        for line in bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-            let (c, rows) =
-                hex_line(line).ok_or_else(|| format!("{}: not a unihex line", zip.name(i)))?;
-            lines.insert(c, rows);
-        }
+/// Unihex files read so far, by a hash of their bytes and size overrides. The game's
+/// font and the menus' fallback read the same Unifont: the second gets the first's.
+static READ: Mutex<Vec<(u64, Weak<Unihex>)>> = Mutex::new(Vec::new());
+
+/// The glyphs of the zipped unihex file `zip`, shared with any font that has read it.
+fn shared_unihex(zip: Vec<u8>, overrides: &Value) -> Result<Arc<Unihex>, String> {
+    let mut hasher = DefaultHasher::new();
+    zip.hash(&mut hasher);
+    overrides.to_string().hash(&mut hasher);
+    let key = hasher.finish();
+    // Held while the file is read, so that a second reader waits for the first's.
+    let mut read = READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    read.retain(|(_, w)| w.strong_count() > 0);
+    if let Some(u) = read
+        .iter()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, w)| w.upgrade())
+    {
+        return Ok(u);
     }
-    let mut sized = HashMap::new();
+    let zip = Zip::from_vec(zip).map_err(|e| e.to_string())?;
+    let files = (0..zip.len())
+        .filter(|&i| zip.name(i).ends_with(".hex"))
+        .map(|i| zip.read(i).map_err(|e| format!("{}: {e}", zip.name(i))));
+    let unihex = Arc::new(parse_unihex(files, overrides)?);
+    read.push((key, Arc::downgrade(&unihex)));
+    Ok(unihex)
+}
+
+fn parse_unihex<'a>(
+    files: impl Iterator<Item = Result<std::borrow::Cow<'a, [u8]>, String>>,
+    overrides: &Value,
+) -> Result<Unihex, String> {
+    // The character ranges whose sides are given: the first that has a character counts.
+    let mut sized = Vec::new();
     for o in overrides.as_array().map_or(&[][..], Vec::as_slice) {
         let character = |key: &str| o[key].as_str()?.chars().next().map(u32::from);
         let side = |key: &str| o[key].as_i64().map(|v| v as i32);
@@ -445,31 +537,52 @@ fn unihex(zip: &[u8], overrides: &Value) -> Result<Unihex, String> {
         ) else {
             return Err("a bad size override".into());
         };
-        for c in from..=to {
-            if lines.contains_key(&c) {
-                // The first that names a character counts.
-                sized.entry(c).or_insert((left, right));
+        sized.push((from..=to, (left, right)));
+    }
+    let mut unihex = Unihex {
+        narrow: HashMap::new(),
+        wide: HashMap::new(),
+    };
+    // Straight into the tables, sized beforehand: a table grown by doubling, or one read
+    // first and copied, would leave a few MiB more of the heap taken for good (the
+    // allocator keeps what a thread freed).
+    for bytes in files {
+        let bytes = bytes?;
+        let lines = bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty());
+        unihex.narrow.reserve(lines.clone().count());
+        for line in lines {
+            let (c, (rows, width)) = hex_line(line).ok_or("not a unihex line")?;
+            let (left, right) = sized
+                .iter()
+                .find(|(range, _)| range.contains(&c))
+                .map_or_else(
+                    || {
+                        let mask = rows.iter().fold(0, |m, r| m | r);
+                        if mask == 0 {
+                            (0, width as i32)
+                        } else {
+                            (
+                                mask.leading_zeros() as i32,
+                                31 - mask.trailing_zeros() as i32,
+                            )
+                        }
+                    },
+                    |&(_, sides)| sides,
+                );
+            // A later line for a character replaces an earlier one.
+            if width <= 16 {
+                let narrow = rows.map(|r| (r >> 16) as u16);
+                unihex.narrow.insert(c, (narrow, left, right));
+                unihex.wide.remove(&c);
+            } else {
+                unihex.wide.insert(c, (rows, left, right));
+                unihex.narrow.remove(&c);
             }
         }
     }
-    let glyphs = lines
-        .into_iter()
-        .map(|(c, (rows, width))| {
-            let (left, right) = sized.get(&c).copied().unwrap_or_else(|| {
-                let mask = rows.iter().fold(0, |m, r| m | r);
-                if mask == 0 {
-                    (0, width as i32)
-                } else {
-                    (
-                        mask.leading_zeros() as i32,
-                        31 - mask.trailing_zeros() as i32,
-                    )
-                }
-            });
-            (c, (rows, left, right))
-        })
-        .collect();
-    Ok(Unihex { glyphs })
+    unihex.narrow.shrink_to_fit();
+    unihex.wide.shrink_to_fit();
+    Ok(unihex)
 }
 
 /// `<code point>:<rows>` in hexadecimal: the character, its rows with the leftmost column in
@@ -693,6 +806,74 @@ mod tests {
         assert_eq!((one.advance, one.picture.unwrap().width), (8.0, 15));
         let t = font.texels('\u{4e00}').unwrap();
         assert_eq!((t.get(0, 0), t.get(14, 0)), (0, u32::MAX));
+    }
+
+    #[test]
+    fn fonts_that_read_the_same_unihex_file_share_it() {
+        let hex = |c: &str| format!("{c}:{}", "18".repeat(16));
+        // 24 and 32 columns wide, kept apart from the narrow ones.
+        let wide = format!(
+            "0042:{}\n0043:{}\n",
+            "800001".repeat(16),
+            "80000001".repeat(16)
+        );
+        // 16 columns is narrow; a later line replaces an earlier one, of another width too.
+        let sixteen = format!("0045:{}\n", "8001".repeat(16));
+        let again = format!("0046:{}\n0046:{}\n", "800001".repeat(16), "81".repeat(16));
+        let text = [hex("0041"), hex("0044")].join("\n") + "\n" + &wide + &sixteen + &again;
+        let z = stored_zip("a.hex", text.as_bytes());
+        let provider =
+            br#"{"type":"unihex","hex_file":"minecraft:font/u.zip","size_overrides":[]}"#;
+        let json = |p: &[u8]| [&br#"{"providers":["#[..], p, b"]}"].concat();
+        let (default, other) = (json(provider), json(provider));
+        // Of two size overrides that name a character, the first counts.
+        let overridden = json(
+            br#"{"type":"unihex","hex_file":"minecraft:font/u.zip","size_overrides":[{"from":"A","to":"A","left":0,"right":15},{"from":"A","to":"D","left":0,"right":3}]}"#,
+        );
+        let (res, _dir) = pack(
+            "shared",
+            &[
+                ("assets/minecraft/font/default.json", &default),
+                ("assets/minecraft/font/other.json", &other),
+                ("assets/minecraft/font/sized.json", &overridden),
+                ("assets/minecraft/font/u.zip", &z),
+            ],
+        );
+        let load = |name: &str| Font::load(&res, &Id::minecraft(name).unwrap());
+        let (a, b, sized) = (load("default"), load("other"), load("sized"));
+        assert!(a.warnings.is_empty(), "{:?}", a.warnings);
+        let unihex = |f: &Font| match &f.providers[0] {
+            Provider::Unihex(u) => u.clone(),
+            _ => unreachable!(),
+        };
+        assert!(Arc::ptr_eq(&unihex(&a), &unihex(&b)));
+        // Other size overrides are another reading.
+        assert!(!Arc::ptr_eq(&unihex(&a), &unihex(&sized)));
+        assert_eq!(sized.glyph('A').picture.unwrap().width, 16);
+        assert_eq!(sized.glyph('B').picture.unwrap().width, 4);
+        let u = unihex(&a);
+        assert_eq!((u.narrow.len(), u.wide.len()), (4, 2));
+        assert_eq!(a.glyph('E').picture.unwrap().width, 16);
+        assert_eq!(a.glyph('F').picture.unwrap().width, 8);
+        assert!(a.unihex_bytes() >= 2 * 44 + 2 * 76);
+        // Narrow and wide glyphs read as they were written.
+        assert_eq!(a.glyph('A').picture.unwrap().width, 2);
+        let b24 = a.glyph('B');
+        assert_eq!((b24.picture.unwrap().width, b24.advance), (24, 13.0));
+        assert_eq!(a.glyph('C').picture.unwrap().width, 32);
+        let t = a.texels('C').unwrap();
+        assert_eq!(
+            (t.get(0, 3), t.get(1, 3), t.get(31, 3)),
+            (u32::MAX, 0, u32::MAX)
+        );
+        let t = a.texels('A').unwrap();
+        assert_eq!((t.get(0, 0), t.get(1, 15)), (u32::MAX, u32::MAX));
+        assert!(a.has('A') && a.has('C') && !a.has('G'));
+        // Once no font holds it, it is read again.
+        let first = Arc::downgrade(&u);
+        drop((u, a, b));
+        assert!(first.upgrade().is_none());
+        assert_eq!(load("other").glyph('D').advance, 2.0);
     }
 
     /// A zip with one stored file.

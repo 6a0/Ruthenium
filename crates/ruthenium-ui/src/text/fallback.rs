@@ -1,12 +1,15 @@
 //! Fonts already on the system, for the characters Nunito does not have: small capitals
 //! and phonetic letters (servers write their names with them), CJK, symbols, other
-//! scripts, monochrome emoji.
+//! scripts, monochrome emoji. Behind them all, the game's own GNU Unifont, as in
+//! vanilla's font chain ([`set_unifont`]).
 //!
 //! Only well-known families with wide coverage are looked for, by file name, in the
-//! usual font folders. Which characters a file has is read from its `cmap` table alone;
-//! the whole file is read only once text is set in it, and kept for the rest of the run.
-//! A character no font has is drawn with Nunito's own missing-glyph box; private-use
-//! characters (a resource pack's pictures) are never looked for.
+//! usual font folders. Which characters a file has is read from its `cmap` table alone,
+//! every family's at start-up off the main thread ([`warm`]). A file is memory-mapped
+//! once text is set in it, and stays mapped for the rest of the run: that costs address
+//! space, and only the pages of it that are read take memory, which the system can take
+//! back. A character no font has is drawn with Nunito's own missing-glyph box;
+//! private-use characters (a resource pack's pictures) are never looked for.
 //!
 //! Distance fields need outlines without overlaps, so static files come before variable
 //! ones, and a face without outlines (colour bitmaps, colour layers) never counts as
@@ -15,10 +18,13 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use rustybuzz::Face;
+use ruthenium_assets::Font;
+use ruthenium_assets::map::MappedFile;
 
 /// Font files looked for, best first: a regular file and, where the family has one, a
 /// bold one. Stems are matched without case.
@@ -97,29 +103,149 @@ fn other_script(stem: &str) -> Option<u8> {
     }
 }
 
-static ENABLED: AtomicBool = AtomicBool::new(true);
-static SYSTEM: OnceLock<SystemFonts> = OnceLock::new();
-
-/// Turns the system fonts off (or on) for every `Fonts` made afterwards (`--font-fallback`).
-pub fn set_enabled(on: bool) {
-    ENABLED.store(on, Ordering::Relaxed);
+/// Which fonts stand behind Nunito (`--font-fallback`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// The system's fonts, then Unifont.
+    On = 0,
+    /// Unifont alone: what a system without the fonts looked for gets.
+    Unifont = 1,
+    /// Nothing: Nunito's missing-glyph box.
+    Off = 2,
 }
 
-/// Finds the system's fonts and reads the first family's regular face, so the first text
-/// that needs them does not wait (call it off the main thread).
-pub fn warm() {
-    if let Some(s) = system()
-        && let Some(f) = s.families.first()
-    {
-        s.face(f.regular);
+static MODE: AtomicU8 = AtomicU8::new(Mode::On as u8);
+static SYSTEM: OnceLock<SystemFonts> = OnceLock::new();
+static UNIFONT: OnceLock<Font> = OnceLock::new();
+/// Bumped when a fallback font arrives (see [`revision`]).
+static REVISION: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the fallback fonts for every `Fonts` made afterwards, and for those made with
+/// [`Fonts::new`](super::Fonts::new) already.
+pub fn set_mode(mode: Mode) {
+    MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+/// The fallback fonts set.
+pub fn mode() -> Mode {
+    Mode::from_bits(MODE.load(Ordering::Relaxed))
+}
+
+impl Mode {
+    fn from_bits(bits: u8) -> Mode {
+        match bits {
+            0 => Mode::On,
+            1 => Mode::Unifont,
+            _ => Mode::Off,
+        }
+    }
+}
+
+/// Gives the menus the game's GNU Unifont (`minecraft:include/unifont`, read from the
+/// imported game off the main thread), the last font they look in. The first one given
+/// stays; text shaped before it came is shaped again once [`revision`] says so.
+pub fn set_unifont(font: Font) {
+    if UNIFONT.set(font).is_ok() {
+        REVISION.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Changes each time a fallback font arrives: text shaped before then may draw a
+/// missing-glyph box that it now has.
+pub fn revision() -> u32 {
+    REVISION.load(Ordering::Acquire)
+}
+
+/// What [`warm`] did.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Warmed {
+    /// Families found, and the `cmap` bytes read of them.
+    pub families: usize,
+    pub cmap_bytes: usize,
+    /// How long finding the files and reading their `cmap`s took.
+    pub ms: f64,
+}
+
+/// Finds the system's fonts and reads which characters every family has, so text laid
+/// out afterwards finds the answers in memory (call it off the main thread). Text laid
+/// out meanwhile waits for the family being read, or reads the next itself.
+pub fn warm() -> Warmed {
+    let started = Instant::now();
+    let Some(s) = system() else {
+        return Warmed::default();
+    };
+    let cmap_bytes = s.read_coverage();
+    Warmed {
+        families: s.families.len(),
+        cmap_bytes,
+        ms: started.elapsed().as_secs_f64() * 1e3,
     }
 }
 
 /// The system's fonts, if they are on; found the first time they are asked for.
 pub(crate) fn system() -> Option<&'static SystemFonts> {
-    ENABLED
-        .load(Ordering::Relaxed)
-        .then(|| SYSTEM.get_or_init(SystemFonts::discover))
+    (mode() == Mode::On).then(|| SYSTEM.get_or_init(SystemFonts::discover))
+}
+
+/// The game's Unifont, if it is on and has come.
+pub(crate) fn unifont() -> Option<&'static Font> {
+    if mode() == Mode::Off {
+        return None;
+    }
+    UNIFONT.get()
+}
+
+/// The fallback fonts in the order they are looked in: the system's families, then
+/// Unifont as one more family.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Chain {
+    pub system: Option<&'static SystemFonts>,
+    pub unifont: Option<&'static Font>,
+}
+
+impl Chain {
+    /// The process's fallback fonts, as they are now (none: no font to fall back on).
+    pub(crate) fn current() -> Option<Chain> {
+        let chain = Chain {
+            system: system(),
+            unifont: unifont(),
+        };
+        (super::Coverage::families(&chain) > 0).then_some(chain)
+    }
+
+    fn system_families(&self) -> u16 {
+        self.system.map_or(0, |s| s.families.len() as u16)
+    }
+
+    /// Whether family `family` is Unifont.
+    pub(crate) fn is_unifont(&self, family: u16) -> bool {
+        self.unifont.is_some() && family == self.system_families()
+    }
+}
+
+impl super::Coverage for Chain {
+    fn families(&self) -> u16 {
+        self.system_families() + u16::from(self.unifont.is_some())
+    }
+
+    fn covering(&self, c: char) -> Option<u16> {
+        self.system
+            .and_then(|s| s.covering(c))
+            .or_else(|| self.unifont_has(c).then(|| self.system_families()))
+    }
+
+    fn family_has(&self, family: u16, c: char) -> bool {
+        match self.system {
+            Some(s) if family < self.system_families() => s.family_has(family, c),
+            _ => self.unifont_has(c),
+        }
+    }
+}
+
+impl Chain {
+    fn unifont_has(&self, c: char) -> bool {
+        !private_use(c) && self.unifont.is_some_and(|u| u.has(c))
+    }
 }
 
 struct File {
@@ -174,15 +300,19 @@ impl File {
         }
     }
 
+    /// The file's `cmap` table, read the first time it is asked for.
+    fn cmap(&self) -> Option<&[u8]> {
+        self.cmap
+            .get_or_init(|| read_cmap(&self.path).ok().flatten())
+            .as_deref()
+    }
+
     /// Whether the file has `c`: from the face if it is read, else from its `cmap`.
     fn has(&self, c: char) -> bool {
         if let Some(face) = self.face.get() {
             return face.as_ref().is_some_and(|f| has_outline(f, c));
         }
-        let cmap = self
-            .cmap
-            .get_or_init(|| read_cmap(&self.path).ok().flatten());
-        cmap.as_deref()
+        self.cmap()
             .and_then(rustybuzz::ttf_parser::cmap::Table::parse)
             .is_some_and(|t| {
                 t.subtables
@@ -191,13 +321,13 @@ impl File {
             })
     }
 
-    /// The face, read and parsed the first time; kept for the rest of the run.
+    /// The face, mapped and parsed the first time; kept for the rest of the run.
     fn face(&self) -> Option<&Face<'static>> {
         self.face
             .get_or_init(|| {
-                let bytes = std::fs::read(&self.path).ok()?;
-                // Faces borrow their bytes; a font, once read, lives as long as the game.
-                let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+                // Faces borrow their bytes; a font, once mapped, stays mapped as long as
+                // the game runs.
+                let bytes = MappedFile::open_for_good(&self.path).ok()?;
                 let Some(mut face) = Face::from_slice(bytes, 0) else {
                     eprintln!("[ui] couldn't read the font {}", self.path.display());
                     return None;
@@ -370,6 +500,19 @@ impl SystemFonts {
         self.families.push(Family { regular, bold });
     }
 
+    /// Reads which characters each family has (the regular file's `cmap`, which
+    /// [`Coverage`](super::Coverage) asks), if it hasn't yet. Returns the bytes read.
+    fn read_coverage(&self) -> usize {
+        self.families
+            .iter()
+            .map(|f| {
+                self.files[usize::from(f.regular)]
+                    .cmap()
+                    .map_or(0, <[u8]>::len)
+            })
+            .sum()
+    }
+
     /// How many families there are.
     pub fn len(&self) -> usize {
         self.families.len()
@@ -477,6 +620,36 @@ mod tests {
         let face = whole.face().unwrap();
         assert!(face.glyph_index('\u{200B}').is_some());
         assert!(!has_outline(face, '\u{200B}') && has_outline(face, ' '));
+    }
+
+    #[test]
+    fn warming_reads_every_familys_coverage_and_no_face() {
+        let nunito = Path::new(env!("CARGO_MANIFEST_DIR")).join("fonts/Nunito-Regular.ttf");
+        let bold = Path::new(env!("CARGO_MANIFEST_DIR")).join("fonts/Nunito-ExtraBold.ttf");
+        let fonts = SystemFonts::from_files(vec![
+            ("/nowhere/font.ttf".into(), None),
+            (nunito.clone(), Some(bold)),
+            (nunito, None),
+        ]);
+        let bytes = fonts.read_coverage();
+        assert!(bytes > 100, "{bytes}");
+        assert_eq!(fonts.files.len(), 4);
+        assert_eq!(fonts.files[0].cmap.get(), Some(&None));
+        for i in [1, 3] {
+            assert!(fonts.files[i].cmap.get().unwrap().is_some(), "file {i}");
+        }
+        // The bold file is not asked which characters it has; and no face was mapped.
+        assert!(fonts.files[2].cmap.get().is_none());
+        assert!(fonts.files.iter().all(|f| f.face.get().is_none()));
+        // Twice reads nothing more, and says the same.
+        assert_eq!(fonts.read_coverage(), bytes);
+    }
+
+    #[test]
+    fn modes_are_kept_as_they_are_set() {
+        for m in [Mode::On, Mode::Unifont, Mode::Off] {
+            assert_eq!(Mode::from_bits(m as u8), m);
+        }
     }
 
     #[test]

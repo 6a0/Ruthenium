@@ -302,7 +302,8 @@ fn picture(shared: &Shared, id: &str) -> Option<SkyImage> {
     decode(&png, MAX_SIDE).as_ref().map(sky_image)
 }
 
-fn open(game: &Path) -> Option<Resources> {
+/// The vanilla pack of the game imported in `game`.
+pub(crate) fn open(game: &Path) -> Option<Resources> {
     let imported = ruthenium_prepare::import::open(ruthenium_prepare::supported_version(), game)?;
     let pack = Pack::vanilla(
         &imported.client_jar,
