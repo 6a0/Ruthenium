@@ -94,6 +94,8 @@ With no command, opens the game window. Options:
   --exercise-terrain     draw a made-up scene with the terrain pipelines, off screen,
                          and read every pixel back (development; a wrong one fails the
                          run)
+  --exercise-sky         draw fogged pieces of sky and cloud faces, off screen, and
+                         read every pixel back (development; a wrong one fails the run)
   --screenshot <file>    write the window to a PNG, then quit (development); runs
                          on the default settings unless --data-dir is given
   --screenshot-resize <WxH>

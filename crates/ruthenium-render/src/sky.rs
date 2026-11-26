@@ -46,8 +46,8 @@ pub const SKY_VERTEX: VertexInput = VertexInput {
 };
 
 /// `sky.frag`'s kinds of draw.
-const FOGGED: u32 = 0;
-const COLOURED: u32 = 1;
+pub(crate) const FOGGED: u32 = 0;
+pub(crate) const COLOURED: u32 = 1;
 const TEXTURED: u32 = 2;
 
 /// How far out the dome reaches and how high above (or below) the camera its middle
@@ -205,7 +205,7 @@ fn chain(steps: &[Matrix]) -> Matrix {
     steps.iter().fold(IDENTITY, |m, s| after(&m, s))
 }
 
-fn vertex(out: &mut Vec<u8>, position: [f32; 3], uv: [f32; 2], colour: [u8; 4]) {
+pub(crate) fn vertex(out: &mut Vec<u8>, position: [f32; 3], uv: [f32; 2], colour: [u8; 4]) {
     for c in position {
         out.extend_from_slice(&c.to_le_bytes());
     }

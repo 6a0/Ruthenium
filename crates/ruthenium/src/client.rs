@@ -148,6 +148,9 @@ pub struct Options {
     /// Development: draw a made-up scene with the terrain pipelines every frame, off
     /// screen, and read it back; a wrong pixel fails the run.
     pub exercise_terrain: bool,
+    /// Development: draw pieces of fogged sky and cloud faces every frame, off screen,
+    /// and read them back; a wrong pixel fails the run.
+    pub exercise_sky: bool,
     /// Write what the GPU reported and what was chosen from it to this JSON file, once the
     /// renderer exists.
     pub adapter_report: Option<std::path::PathBuf>,
@@ -269,6 +272,7 @@ impl Options {
             exercise_textures: false,
             exercise_colour: false,
             exercise_terrain: false,
+            exercise_sky: false,
             adapter_report: None,
             mesh_workers: None,
             rejoin_after: None,
@@ -459,6 +463,7 @@ impl Options {
                 "--exercise-textures" => o.exercise_textures = true,
                 "--exercise-colour" => o.exercise_colour = true,
                 "--exercise-terrain" => o.exercise_terrain = true,
+                "--exercise-sky" => o.exercise_sky = true,
                 "--adapter-report" => o.adapter_report = Some(value("a file")?.into()),
                 "--data-dir" => o.data_dir = Some(value("a folder")?.into()),
                 "--join" => o.join = Some(value("a server address")?),
@@ -986,6 +991,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     }
     if opts.exercise_terrain {
         renderer.enable_terrain_check()?;
+    }
+    if opts.exercise_sky {
+        renderer.enable_sky_check()?;
     }
     if opts.exercise_textures {
         renderer.enable_table_check()?;
@@ -1833,6 +1841,13 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     if let Some(c) = renderer.terrain_check() {
         eprintln!(
             "[ruthenium] terrain check: {} frames of {} rectangles compared, {} wrong",
+            c.compared, c.probes, c.mismatches
+        );
+        failed |= !c.passed();
+    }
+    if let Some(c) = renderer.sky_check() {
+        eprintln!(
+            "[ruthenium] sky check: {} frames of {} squares compared, {} wrong",
             c.compared, c.probes, c.mismatches
         );
         failed |= !c.passed();

@@ -7,6 +7,8 @@
 //!   layout, quad indices, pooled ranges, frame records, depth) and read back pixel by
 //!   pixel, with direct draws and again with draws read as commands from the frame's
 //!   data;
+//! - the sky check: pieces of sky and cloud faces drawn with the real sky and cloud
+//!   pipelines in fog and without, and read back pixel by pixel;
 //! - the streaming check (a texture larger than the upload ring in tiles, worker-written
 //!   blocks, pooled ranges) on the copy queue the GPU has and, if that is a transfer
 //!   queue, once more with every upload on the graphics queue;
@@ -29,6 +31,8 @@ const SHOWN: &[&str] = &[
     "streaming check",
     "terrain check",
     "[terrain-check]",
+    "sky check",
+    "[sky-check]",
     "[stream-check]",
     "[colour-check]",
     "[table-check]",
@@ -160,6 +164,10 @@ fn run_inner(root: &Path, args: &[String]) -> Result<bool, String> {
             &o.seconds,
             &["--exercise-terrain", "--terrain-draws", "mdi"],
         ),
+    );
+    check(
+        "sky and clouds",
+        launch(&binary, &o, "sky", &o.seconds, &["--exercise-sky"]),
     );
     let streamed = check(
         "streaming, the GPU's copy queue",

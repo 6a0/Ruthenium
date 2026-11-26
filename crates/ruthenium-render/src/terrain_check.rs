@@ -31,13 +31,21 @@
 //!   beyond, with their texels' alpha kept.
 //! - **Fog and filtering**: every frame draws the scene with the next of the terrain's
 //!   shaders and, every fourth frame, the next of a few fogs: none, the fog of the
-//!   place, the fog at the edge of the view, both, and a fog that is half there. What
+//!   place, the fog at the edge of the view, both, a fog that is half there, and both
+//!   again starting beyond the nearest quads, where neither has begun. What
 //!   comes back is compared pixel by pixel with the scene as a small rasteriser here
 //!   draws it from the same vertices, by the shaders' own arithmetic. The scene's
 //!   texels are larger than its pixels, where every filter must give the same bytes;
 //!   one quad shows four texels a pixel of an evenly coloured stretch of the atlas, and
 //!   two show nearly two and two and a half texels a pixel of stripes, along one row:
 //!   where RGSS blends the nearest texel with the averaged ones, and beyond.
+//! - **Mip levels**: a second atlas with as many levels as the game's block atlas has
+//!   (the first and four smaller ones), each of one colour of its own, so that the
+//!   level a pixel reads, or the two it mixes, shows in its colour. Ten quads show
+//!   from a quarter to thirty-two of its texels a pixel, alike and unlike across and
+//!   down: the level vanilla's RGSS works out from the derivatives, in both of its
+//!   shaders, and the level the sampler picks for the hard-edged ones from the
+//!   derivatives they hand it.
 
 use std::sync::Arc;
 
@@ -109,6 +117,44 @@ const STRIPES: [Rgba; 2] = [[20, 40, 60, 255], [240, 220, 200, 255]];
 const STRIPES_AT: u32 = 200;
 const STRIPES_WIDTH: u32 = 64;
 
+/// The atlas with mip levels: its size (one level's sizes are the last one's halved),
+/// and the colour of each of its levels, as many as the game's block atlas has by
+/// default. The game's levels are box-filtered from the first, which leaves an even
+/// stretch the same in every level: these are painted one by one instead, so that a
+/// level read in the wrong place cannot pass for the right one. Every channel is even,
+/// so that half of one level and half of the next is a whole step.
+const MIP_ATLAS: [u32; 2] = [64, 32];
+const MIP_COLOURS: [Rgba; 5] = [
+    [240, 20, 20, 255],
+    [20, 200, 40, 255],
+    [30, 60, 230, 255],
+    [236, 214, 10, 255],
+    [12, 220, 210, 255],
+];
+/// The draw of the quads that show the atlas with mip levels: the last.
+const MIPPED: usize = ORIGINS.len() + 2;
+
+/// The quads of the atlas with mip levels, one a cell: the cell, how many of the
+/// atlas's texels a pixel shows across and down, and what it shows. The hard-edged
+/// shaders' sampler picks the logarithm of the larger, which the probes name where it is
+/// a whole level. RGSS asks for the logarithm of the two's geometric mean in the shorter
+/// side of a texel (this atlas's texels are twice as high as they are wide in its
+/// coordinates): half a level more than the sampler where the two are alike. Some quads
+/// reach beyond the last level, some between two, one into the band where RGSS blends
+/// the nearest texel with the averaged ones.
+const MIP_QUADS: [([u32; 2], [f32; 2], &str); 10] = [
+    ([6, 2], [2.0, 1.0], "mip level 1"),
+    ([7, 2], [4.0, 2.0], "mip level 2"),
+    ([8, 2], [8.0, 4.0], "mip level 3"),
+    ([9, 2], [16.0, 8.0], "mip level 4"),
+    ([10, 2], [32.0, 16.0], "beyond the last mip level"),
+    ([11, 2], [4.0, 4.0], "between two mip levels"),
+    ([8, 5], [16.0, 1.0], "a mip level from unlike steps"),
+    ([9, 5], [1.0, 4.0], "a mip level from unlike steps, down"),
+    ([10, 5], [1.5, 0.5], "a mip level where RGSS blends"),
+    ([11, 5], [2.0, 0.25], "the first mip level averaged"),
+];
+
 /// Where each section's corner is, in blocks from the scene's corner, and how far each
 /// has faded in. The fourth is 12 blocks behind the others.
 const ORIGINS: [[i32; 3]; 4] = [[0, 0, 0], [-12, 0, 0], [4, 0, 0], [0, 0, -12]];
@@ -116,7 +162,7 @@ const VISIBILITY: [f32; 4] = [1.0, 1.0, 1.0, 0.25];
 
 /// The fogs the scene is drawn in, in turn. Their ranges lie inside the scene's own
 /// distances (at most 21 blocks from its corner, where the camera is).
-const FOGS: [Fog; 5] = [
+const FOGS: [Fog; 6] = [
     // None, in a colour no pixel may show but the fading section's.
     Fog {
         colour: [1.0, 0.0, 1.0, 1.0],
@@ -150,6 +196,15 @@ const FOGS: [Fog; 5] = [
         colour: [1.0, 1.0, 1.0, 0.5],
         environmental: [3.0, 19.0],
         render_distance: [f32::MAX; 2],
+        sky_end: f32::MAX,
+    },
+    // Both, starting beyond the nearest quads, as the game's fogs do: there each line is
+    // below none, and only the clamp keeps the amount at none (in the fogs above, the
+    // other line's none hides it).
+    Fog {
+        colour: [0.4, 0.9, 0.3, 1.0],
+        environmental: [4.0, 20.0],
+        render_distance: [3.0, 15.0],
         sky_end: f32::MAX,
     },
 ];
@@ -256,10 +311,11 @@ struct Probe {
 #[derive(Debug, Default)]
 struct Scene {
     /// Solid quads of the four sections, then the cutout quads and the translucent
-    /// quads (both of the first).
+    /// quads (both of the first), then the quads of the atlas with mip levels (solid,
+    /// of the first section).
     vertices: Vec<u8>,
-    /// Quads of each of the six draws.
-    quads: [u32; 6],
+    /// Quads of each of the seven draws.
+    quads: [u32; 7],
     /// The order the translucent quads are drawn in, as their indices say: not the
     /// order of their vertices.
     order: Vec<u32>,
@@ -354,6 +410,7 @@ impl Scene {
         let mut solid: [Vec<Quad>; 4] = Default::default();
         let mut cutout: Vec<Quad> = Vec::new();
         let mut translucent: Vec<Quad> = Vec::new();
+        let mut mipped: Vec<Quad> = Vec::new();
         let mut probes = Vec::new();
         let mut probe = |what, rect: [f32; 4], want: Rgba, tolerance: u8| {
             probes.push(Probe {
@@ -599,7 +656,7 @@ impl Scene {
         );
         probe("half a block before it", [3.5, 2.0, 4.0, 3.0], FAR, 0);
         probe("beside them", [0.0, 2.0, 3.5, 3.0], CLEAR, 0);
-        probe("beside them", [4.5, 2.0, 12.0, 3.0], CLEAR, 0);
+        probe("beside them", [4.5, 2.0, 6.0, 3.0], CLEAR, 0);
 
         // Four texels a pixel along the atlas, of an even stretch of it: whatever is
         // sampled there, and however often, is its colour.
@@ -663,6 +720,26 @@ impl Scene {
             });
         }
 
+        // The atlas with mip levels.
+        for &(at, steps, what) in &MIP_QUADS {
+            let [kx, ky]: [f32; 2] = steps;
+            let rect = cell(at[0], at[1]);
+            mipped.push(Quad {
+                uv: [0.0, 0.0, kx * SCALE as f32, ky * SCALE as f32],
+                ..Quad::texel(rect, [0, 0])
+            });
+            // A whole level, as a texel of it is wide: the sampler's alone.
+            let level = kx.max(ky).log2();
+            let want = (level.fract() == 0.0)
+                .then(|| MIP_COLOURS[(level as usize).min(MIP_COLOURS.len() - 1)]);
+            probes.push(Probe {
+                what,
+                rect: pixels(rect),
+                want,
+                tolerance: 1,
+            });
+        }
+
         let mut probe = |what, rect: [f32; 4], want: Rgba, tolerance: u8| {
             probes.push(Probe {
                 what,
@@ -689,9 +766,13 @@ impl Scene {
         probe("right of the border quads", [8.0, 3.0, 12.0, 4.0], CLEAR, 0);
         probe("right of the cutout quad", [8.0, 6.0, 12.0, 7.0], CLEAR, 0);
         probe("left of the turned square", [0.0, 5.0, 3.0, 6.0], CLEAR, 0);
-        probe("right of the depth quads", [7.0, 5.0, 12.0, 6.0], CLEAR, 0);
+        probe("right of the depth quads", [7.0, 5.0, 8.0, 6.0], CLEAR, 0);
 
-        for (i, quads) in solid.iter().chain([&cutout, &translucent]).enumerate() {
+        for (i, quads) in solid
+            .iter()
+            .chain([&cutout, &translucent, &mipped])
+            .enumerate()
+        {
             scene.quads[i] = quads.len() as u32;
             for q in quads {
                 q.pack(&mut scene.vertices);
@@ -739,6 +820,46 @@ fn matrix() -> [f32; 16] {
     ]
 }
 
+/// An atlas as the scene samples it: its size, and its levels from the first, each half
+/// as large as the one before (and at least a texel).
+struct Atlas {
+    size: [u32; 2],
+    levels: Vec<Vec<Rgba>>,
+}
+
+impl Atlas {
+    /// The fixture's block atlas, of one level.
+    fn blocks() -> Atlas {
+        Atlas {
+            size: ATLAS,
+            levels: vec![atlas_texels()],
+        }
+    }
+
+    /// The atlas with mip levels, each of one colour.
+    fn mipped() -> Atlas {
+        Atlas {
+            size: MIP_ATLAS,
+            levels: (0..MIP_COLOURS.len())
+                .map(|level| {
+                    let [w, h] = mip_size(MIP_ATLAS, level);
+                    vec![MIP_COLOURS[level]; (w * h) as usize]
+                })
+                .collect(),
+        }
+    }
+
+    /// The last level there is.
+    fn top(&self) -> usize {
+        self.levels.len() - 1
+    }
+}
+
+/// The size of level `level` of an atlas of `size`.
+fn mip_size(size: [u32; 2], level: usize) -> [u32; 2] {
+    size.map(|s| (s >> level).max(1))
+}
+
 /// The fixture's atlas: every texel a quad shows, the even stretch, and poison.
 fn atlas_texels() -> Vec<Rgba> {
     let mut texels = vec![POISON; (ATLAS[0] * ATLAS[1]) as usize];
@@ -775,16 +896,21 @@ fn lit(light: [u8; 2]) -> [f32; 4] {
     })
 }
 
-/// The atlas read between its texels' centres at `at` (in texels), as the linear
-/// sampler reads its one level: nothing beyond the edges but the edge.
-fn bilinear(texels: &[Rgba], at: [f32; 2]) -> [f32; 4] {
-    let (x, y) = (at[0] - 0.5, at[1] - 0.5);
+/// Level `level` of the atlas (or its last) read between its texels' centres at `at`
+/// (in texels of the first level), as the linear sampler reads one level: nothing
+/// beyond the edges but the edge.
+fn bilinear(atlas: &Atlas, level: usize, at: [f32; 2]) -> [f32; 4] {
+    let level = level.min(atlas.top());
+    let [w, h] = mip_size(atlas.size, level);
+    let texels = &atlas.levels[level];
+    let shrink = (1u32 << level) as f32;
+    let (x, y) = (at[0] / shrink - 0.5, at[1] / shrink - 0.5);
     let (x0, y0) = (x.floor(), y.floor());
     let (fx, fy) = (x - x0, y - y0);
     let texel = |dx: f32, dy: f32| {
-        let tx = (x0 + dx).clamp(0.0, (ATLAS[0] - 1) as f32) as u32;
-        let ty = (y0 + dy).clamp(0.0, (ATLAS[1] - 1) as f32) as u32;
-        texels[(ty * ATLAS[0] + tx) as usize].map(|c| f32::from(c) / 255.0)
+        let tx = (x0 + dx).clamp(0.0, (w - 1) as f32) as u32;
+        let ty = (y0 + dy).clamp(0.0, (h - 1) as f32) as u32;
+        texels[(ty * w + tx) as usize].map(|c| f32::from(c) / 255.0)
     };
     let (t00, t10, t01, t11) = (
         texel(0.0, 0.0),
@@ -797,13 +923,28 @@ fn bilinear(texels: &[Rgba], at: [f32; 2]) -> [f32; 4] {
     })
 }
 
+/// The atlas at `at` (in texels of its first level) as the linear sampler reads it at
+/// level `lambda`: the first level up to it, the last beyond, and between two levels
+/// both, by how far it is between them.
+fn trilinear(atlas: &Atlas, lambda: f32, at: [f32; 2]) -> [f32; 4] {
+    let lambda = lambda.clamp(0.0, atlas.top() as f32);
+    let low = lambda.floor();
+    let between = lambda - low;
+    let near = bilinear(atlas, low as usize, at);
+    if between == 0.0 {
+        return near;
+    }
+    let next = bilinear(atlas, low as usize + 1, at);
+    std::array::from_fn(|i| near[i] * (1.0 - between) + next[i] * between)
+}
+
 /// The atlas's colour at `at` (in texels) as vanilla's sampleNearest and sampleRGSS
 /// work it out, square roots and divisions and all (`terrain_frag.glsl` keeps that
 /// arithmetic for rgss-reference; its other shaders multiply instead). `du` and
 /// `dv` are how far the place moves, in texels, from one pixel to the next across and
 /// down the screen. `rgss`: with far texels averaged.
-fn sampled(texels: &[Rgba], at: [f32; 2], du: [f32; 2], dv: [f32; 2], rgss: bool) -> [f32; 4] {
-    let size = [ATLAS[0] as f32, ATLAS[1] as f32];
+fn sampled(atlas: &Atlas, at: [f32; 2], du: [f32; 2], dv: [f32; 2], rgss: bool) -> [f32; 4] {
+    let size = atlas.size.map(|s| s as f32);
     // The shader works in coordinates from 0 to 1 across the whole atlas: a texel is
     // not as wide there as it is high, in this atlas.
     let texel = [1.0 / size[0], 1.0 / size[1]];
@@ -818,26 +959,47 @@ fn sampled(texels: &[Rgba], at: [f32; 2], du: [f32; 2], dv: [f32; 2], rgss: bool
         let along = ((at[i] - border - 0.5) * texel[i] / pixel[i] + 0.5).clamp(0.0, 1.0);
         border + along
     });
-    let nearest = bilinear(texels, snapped);
+    // The sampler's level, from the derivatives the shader hands it: the longer of the
+    // two steps in texels of the first level (Vulkan's rho, as it is defined).
+    let rho = |d: [f32; 2]| ((d[0] * size[0]).powi(2) + (d[1] * size[1]).powi(2)).sqrt();
+    let nearest = trilinear(atlas, rho(du).max(rho(dv)).log2(), snapped);
     if !rgss {
         return nearest;
     }
     let texel_size = texel[0].min(texel[1]);
     let edge = ((pixel[0].max(pixel[1]) - texel_size) / texel_size).clamp(0.0, 1.0);
     let blend = edge * edge * (3.0 - 2.0 * edge);
-    // Four samples a pixel. (The fixture's atlas has one level, so the two levels the
-    // shader reads them at are the same.)
+    // Four samples a pixel at each of the two levels around the one the pixel's size
+    // asks for: the logarithm of the two steps' geometric mean, in the shorter side of
+    // a texel.
+    let (du_length, dv_length) = (du[0].hypot(du[1]), dv[0].hypot(dv[1]));
+    let derivative = (du_length.min(dv_length) * du_length.max(dv_length)).sqrt();
+    let level = (derivative / texel_size).log2().max(0.0);
+    let low = level.floor();
+    let between = level - low;
     let offsets = [
         [0.125, 0.375],
         [-0.125, -0.375],
         [0.375, -0.125],
         [-0.375, 0.125],
     ];
-    let mut far = [0.0_f32; 4];
-    for o in offsets {
-        let tap = bilinear(texels, [at[0] + o[0], at[1] + o[1]]);
-        for (sum, c) in far.iter_mut().zip(tap) {
-            *sum += c;
+    let four = |level: usize| {
+        let mut sum = [0.0_f32; 4];
+        for o in offsets {
+            let tap = bilinear(atlas, level, [at[0] + o[0], at[1] + o[1]]);
+            for (sum, c) in sum.iter_mut().zip(tap) {
+                *sum += c;
+            }
+        }
+        sum
+    };
+    let (low, high) = (low as usize, low as usize + 1);
+    let mut far = four(low);
+    // (Beyond the last level both are the last.)
+    if between > 0.0 && low < atlas.top() {
+        let next = four(high);
+        for (f, n) in far.iter_mut().zip(next) {
+            *f = *f * (1.0 - between) + n * between;
         }
     }
     std::array::from_fn(|i| nearest[i] * (1.0 - blend) + far[i] * 0.25 * blend)
@@ -845,7 +1007,7 @@ fn sampled(texels: &[Rgba], at: [f32; 2], du: [f32; 2], dv: [f32; 2], rgss: bool
 
 /// How much fog there is at a distance, as vanilla's linear fog works it out: the
 /// shaders take it as a line (`fog_line`), which this checks them against.
-fn fog_amount(distance: f32, range: [f32; 2]) -> f32 {
+pub(crate) fn fog_amount(distance: f32, range: [f32; 2]) -> f32 {
     if distance <= range[0] {
         0.0
     } else if distance >= range[1] {
@@ -865,7 +1027,7 @@ fn picture(scene: &Scene, case: Case) -> Vec<u8> {
     let fog = &FOGS[case.fog];
     let fogged = case.fogged();
     let rgss = case.rgss();
-    let texels = atlas_texels();
+    let atlases = [Atlas::blocks(), Atlas::mipped()];
     let mut colour = vec![CLEAR; (WIDTH * HEIGHT) as usize];
     let mut depth = vec![0.0_f32; (WIDTH * HEIGHT) as usize];
     let quads: Vec<[Vertex; 4]> = scene
@@ -879,14 +1041,16 @@ fn picture(scene: &Scene, case: Case) -> Vec<u8> {
         .collect();
     let mut next = 0;
     for (draw, &count) in scene.quads.iter().enumerate() {
-        // The last two draws are the first section's cutout and translucent layers.
+        // The last three draws are the first section's cutout and translucent layers
+        // and its quads of the atlas with mip levels.
         let section = if draw < ORIGINS.len() { draw } else { 0 };
         let translucent = draw == ORIGINS.len() + 1;
+        let atlas = &atlases[usize::from(draw == MIPPED)];
         // Below how much alpha a fragment is left out.
         let threshold = match draw.checked_sub(ORIGINS.len()) {
             Some(0) => 0.5,
-            Some(_) => 0.1,
-            None => 0.0,
+            Some(1) => 0.1,
+            _ => 0.0,
         };
         let origin = ORIGINS[section].map(|c| c as f32);
         let of_draw = &quads[next..next + count as usize];
@@ -955,7 +1119,7 @@ fn picture(scene: &Scene, case: Case) -> Vec<u8> {
                     let uv: [f32; 2] = std::array::from_fn(|a| {
                         uv0[a] + (uv3[a] - uv0[a]) * s + (uv1[a] - uv0[a]) * t
                     });
-                    let texel = sampled(&texels, uv, du, dv, rgss);
+                    let texel = sampled(atlas, uv, du, dv, rgss);
                     let mut c: [f32; 4] = std::array::from_fn(|i| texel[i] * lit_colour[i]);
                     if fogged {
                         // Towards the fog's colour, with the texel's own alpha.
@@ -1030,6 +1194,8 @@ pub(crate) struct TerrainCheck {
     /// The three buffers' uploads, once staged.
     uploads: [Option<UploadTicket>; 3],
     atlas: TextureId,
+    /// The atlas with mip levels.
+    mipped: TextureId,
     lightmap: TextureId,
     /// What each kind of frame must read ([`Case::picture`]), once one was drawn.
     pictures: Vec<Option<Vec<u8>>>,
@@ -1083,6 +1249,20 @@ impl TerrainCheck {
             &[&texels],
             Arrival::NextFrame,
         )?;
+        let levels: Vec<Vec<u8>> = Atlas::mipped()
+            .levels
+            .into_iter()
+            .map(|level| level.into_iter().flatten().collect())
+            .collect();
+        let mipped = textures.create_with(
+            uploads,
+            TextureDesc {
+                mip_levels: levels.len() as u32,
+                ..TextureDesc::rgba8(MIP_ATLAS[0], MIP_ATLAS[1])
+            },
+            &levels.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            Arrival::NextFrame,
+        )?;
         let light: Vec<u8> = (0..16)
             .flat_map(|sky| (0..16).flat_map(move |block| light_texel(block, sky)))
             .collect();
@@ -1107,6 +1287,7 @@ impl TerrainCheck {
             sorted,
             uploads: [None; 3],
             atlas,
+            mipped,
             lightmap,
             pictures: vec![None; 2 * FOGS.len() + 1],
             report,
@@ -1176,6 +1357,7 @@ impl TerrainCheck {
             self.target = Readback::new(self.gpu.clone(), pipelines.format(), extent())?;
         }
         let ready = textures.is_ready(self.atlas)
+            && textures.is_ready(self.mipped)
             && textures.is_ready(self.lightmap)
             && self
                 .uploads
@@ -1201,24 +1383,30 @@ impl TerrainCheck {
         if !gap(frame_data, 3) {
             return Ok(());
         }
-        let Some((world, bytes)) = frame_data.alloc(WORLD.words(), 4) else {
-            return Ok(());
-        };
         let word = |bytes: &mut [u8], at: u32, v: [u8; 4]| {
             bytes[at as usize * 4..at as usize * 4 + 4].copy_from_slice(&v);
         };
-        let camera = WORLD.offset("camera_offset");
-        word(bytes, camera, (-shift as f32).to_ne_bytes());
-        word(bytes, camera + 1, 0f32.to_ne_bytes());
-        word(bytes, camera + 2, 0f32.to_ne_bytes());
-        let size = WORLD.offset("atlas_size");
-        word(bytes, size, (ATLAS[0] as f32).to_ne_bytes());
-        word(bytes, size + 1, (ATLAS[1] as f32).to_ne_bytes());
-        word(
-            bytes,
-            WORLD.offset("lightmap"),
-            self.lightmap.index().to_ne_bytes(),
-        );
+        // A world record for each atlas: the vertex stage reads the atlas's size there.
+        let lightmap = self.lightmap;
+        let world_record = |frame_data: &mut FrameData, atlas: [u32; 2]| {
+            let (at, bytes) = frame_data.alloc(WORLD.words(), 4)?;
+            let camera = WORLD.offset("camera_offset");
+            word(bytes, camera, (-shift as f32).to_ne_bytes());
+            word(bytes, camera + 1, 0f32.to_ne_bytes());
+            word(bytes, camera + 2, 0f32.to_ne_bytes());
+            let size = WORLD.offset("atlas_size");
+            word(bytes, size, (atlas[0] as f32).to_ne_bytes());
+            word(bytes, size + 1, (atlas[1] as f32).to_ne_bytes());
+            word(
+                bytes,
+                WORLD.offset("lightmap"),
+                lightmap.index().to_ne_bytes(),
+            );
+            Some(at)
+        };
+        let Some(world) = world_record(frame_data, ATLAS) else {
+            return Ok(());
+        };
         // The frame's fog and shader: the fog goes with the push constants.
         let case = Case::of(frame);
         let fog = &FOGS[case.fog];
@@ -1259,17 +1447,35 @@ impl TerrainCheck {
             self.atlas,
             [ATLAS[0] as f32, ATLAS[1] as f32],
         );
+        let Some(mip_world) = world_record(frame_data, MIP_ATLAS) else {
+            return Ok(());
+        };
+        let mip_push = terrain_push(
+            mip_world,
+            matrix_at,
+            sections,
+            fog,
+            self.mipped,
+            [MIP_ATLAS[0] as f32, MIP_ATLAS[1] as f32],
+        );
         let first = (vertices.offset / VERTEX_BYTES as u64) as u32;
         // The scene's draws: pipeline, instance, quads and first quad.
         let mut draws = Vec::with_capacity(self.scene.quads.len());
         let mut quad = 0;
-        // The translucent layer's own draw: its quads and its first.
+        // The translucent layer's own draw, and that of the atlas with mip levels: their
+        // quads and their first.
         let mut last = (0, 0);
+        let mut mips = (0, 0);
         for (i, &quads) in self.scene.quads.iter().enumerate() {
             let (pipeline, instance) = match i {
                 4 => (with_holes, 0),
                 5 => {
                     last = (quads, quad);
+                    quad += quads;
+                    continue;
+                }
+                MIPPED => {
+                    mips = (quads, quad);
                     quad += quads;
                     continue;
                 }
@@ -1319,6 +1525,18 @@ impl TerrainCheck {
             };
             bytes.copy_from_slice(&draw_command(last.0 * 6, first_sorted, last_vertex, 0));
             last_call = Some(offset);
+        }
+        let mips_vertex = (first + mips.1 * 4) as i32;
+        let mut mips_call = None;
+        if indirect {
+            if !gap(frame_data, 3) {
+                return Ok(());
+            }
+            let Some((offset, bytes)) = frame_data.alloc_draw_commands(1) else {
+                return Ok(());
+            };
+            bytes.copy_from_slice(&draw_command(mips.0 * 6, 0, mips_vertex, 0));
+            mips_call = Some(offset);
         }
         let commands = frame_data.buffer();
         let mut pass = encoder.readback_pass_with_depth(pipelines, &mut self.target, &self.depth);
@@ -1378,6 +1596,17 @@ impl TerrainCheck {
                     last_vertex,
                     0,
                 ),
+            }
+            // Then the quads of the atlas with mip levels, through the quads' indices
+            // again, with push constants of their own.
+            pass.bind_index_buffer(indices.buffer, indices.offset);
+            match mips_call {
+                Some(offset) => {
+                    pass.draw_indexed_indirect(solid.index(), &mip_push, commands, offset, 1);
+                }
+                None => {
+                    pass.draw_indexed(solid.index(), &mip_push, mips.0 * 6, 0, mips_vertex, 0);
+                }
             }
         }
         pass.finish();
@@ -1605,7 +1834,7 @@ mod tests {
 
     #[test]
     fn averaged_texels_are_the_mean_of_four_samples() {
-        let texels = atlas_texels();
+        let texels = Atlas::blocks();
         // A texel a pixel across and an eighth of one down, as most of the scene: by
         // vanilla's rule that is far in this atlas, where a texel is 512 times as high
         // as it is wide in the shader's coordinates.
@@ -1654,18 +1883,90 @@ mod tests {
     #[test]
     fn every_shader_draws_in_every_fog() {
         let mut seen = std::collections::HashSet::new();
-        for frame in 0..20 {
+        for frame in 0..(TerrainShader::ALL.len() * FOGS.len()) as u64 {
             let case = Case::of(frame);
             seen.insert((case.shader.name(), case.fog));
             assert!(case.picture() <= 2 * FOGS.len());
         }
         assert_eq!(seen.len(), TerrainShader::ALL.len() * FOGS.len());
+        // In the last, both lines start beyond the quad of four texels a pixel (at most
+        // 2.3 blocks from the camera), where each is below none of it.
+        let last = FOGS[FOGS.len() - 1];
+        assert!(last.environmental[0] > 2.3 && last.render_distance[0] > 2.3);
         // The fogs' ranges lie inside the scene, so that each does something.
         for fog in &FOGS[1..] {
             for range in [fog.environmental, fog.render_distance] {
                 assert!(range[0] == f32::MAX || (range[0] < range[1] && range[0] < 21.0));
             }
         }
+    }
+
+    #[test]
+    fn the_mip_quads_read_the_levels_the_shaders_work_out() {
+        let scene = Scene::build();
+        let middle = |image: &[u8], cell: [u32; 2]| {
+            let [x0, y0, ..] = pixels([
+                cell[0] as f32,
+                cell[1] as f32,
+                (cell[0] + 1) as f32,
+                (cell[1] + 1) as f32,
+            ]);
+            pixel(image, x0 + 4, y0 + 4)
+        };
+        // The colour of a level, or of two by how far it is between them.
+        let colour = |level: f32| -> [f32; 4] {
+            let top = (MIP_COLOURS.len() - 1) as f32;
+            let level = level.clamp(0.0, top);
+            let (low, between) = (level.floor(), level.fract());
+            let next = (low + 1.0).min(top);
+            std::array::from_fn(|i| {
+                f32::from(MIP_COLOURS[low as usize][i]) * (1.0 - between)
+                    + f32::from(MIP_COLOURS[next as usize][i]) * between
+            })
+        };
+        let near = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(a, b)| (a - b).abs() <= 1.0);
+        let read = |c: Rgba| c.map(f32::from);
+        let hard = picture(&scene, HARD);
+        let rgss = picture(
+            &scene,
+            Case {
+                shader: TerrainShader::Rgss,
+                fog: 0,
+            },
+        );
+        let size = MIP_ATLAS.map(|s| s as f32);
+        let scale = size[0].max(size[1]);
+        let (mut halved, mut taken_off, mut far) = (0, 0, 0);
+        for (cell, [kx, ky], what) in MIP_QUADS {
+            // The sampler's: the longer step, in texels.
+            let lambda = kx.max(ky).log2();
+            assert!(near(read(middle(&hard, cell)), colour(lambda)), "{what}");
+            // terrain_frag.glsl's for RGSS, from the steps in the atlas's coordinates: a
+            // quarter of the logarithm of the product of their squares, and the texel's
+            // scale's. Where the pixel reaches two texels it reads that alone.
+            let product = (kx / size[0]).powi(2) * (ky / size[1]).powi(2);
+            let level = (0.25 * product.log2() + scale.log2()).max(0.0);
+            let reach = (kx / size[0]).max(ky / size[1]).powi(2) * scale * scale;
+            if reach < 4.0 {
+                continue;
+            }
+            far += 1;
+            assert!(
+                near(read(middle(&rgss, cell)), colour(level)),
+                "{what}: level {level}"
+            );
+            // What the probe tells from a half for the quarter, and from the scale taken off.
+            halved += usize::from(!near(
+                colour(level),
+                colour((0.5 * product.log2() + scale.log2()).max(0.0)),
+            ));
+            taken_off += usize::from(!near(
+                colour(level),
+                colour((0.25 * product.log2() - scale.log2()).max(0.0)),
+            ));
+        }
+        // (The first level averaged is the first with the half as well.)
+        assert_eq!((far, halved, taken_off), (9, 7, 8));
     }
 
     #[test]

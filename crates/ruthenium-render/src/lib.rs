@@ -19,6 +19,7 @@ mod pipelines;
 #[cfg(test)]
 mod reflect;
 mod sky;
+mod sky_check;
 mod starfield;
 mod stats;
 mod table_check;
@@ -39,6 +40,7 @@ pub use hud::{HudParams, HudStats};
 pub use overlay::{LINES as OVERLAY_LINES, Overlay, OverlayStats};
 pub use pipelines::PipelineId;
 pub use sky::{MOON_PHASES, SkyImage, SkyImages, SkyOrder};
+pub use sky_check::SkyCheckReport;
 pub use stats::{FrameTimes, Summary};
 pub use table_check::TableCheckReport;
 pub use terrain::{
@@ -517,6 +519,8 @@ pub struct Renderer {
     colour_check: Option<colour_check::ColourCheck>,
     /// `--exercise-terrain`.
     terrain_check: Option<terrain_check::TerrainCheck>,
+    /// `--exercise-sky`.
+    sky_check: Option<sky_check::SkyCheck>,
     /// The backdrop could not be made in the last frame that wanted it.
     backdrop_failed: bool,
     /// The next presented frame is copied for a screenshot.
@@ -639,6 +643,7 @@ impl Renderer {
             table_check: None,
             colour_check: None,
             terrain_check: None,
+            sky_check: None,
             backdrop_failed: false,
             screenshot_requested: false,
             screenshot: None,
@@ -1201,6 +1206,23 @@ impl Renderer {
         Ok(())
     }
 
+    /// Starts drawing and reading back the sky and clouds fixture every frame (see
+    /// [`SkyCheckReport`]).
+    pub fn enable_sky_check(&mut self) -> Result<(), ruthenium_gpu::Error> {
+        if self.sky_check.is_none() {
+            self.sky_check = Some(sky_check::SkyCheck::new(
+                self.frames.gpu().clone(),
+                self.pipelines.format(),
+            )?);
+        }
+        Ok(())
+    }
+
+    /// What the sky check has seen, if it is on.
+    pub fn sky_check(&self) -> Option<SkyCheckReport> {
+        self.sky_check.as_ref().map(sky_check::SkyCheck::report)
+    }
+
     /// What the terrain check has seen, if it is on.
     pub fn terrain_check(&self) -> Option<TerrainCheckReport> {
         self.terrain_check
@@ -1540,6 +1562,9 @@ impl Renderer {
         if let Some(c) = &mut self.terrain_check {
             c.stage(&mut self.uploads);
         }
+        if let Some(c) = &mut self.sky_check {
+            c.stage(&mut self.uploads);
+        }
         // SAFETY: ctx.cmd is recording frame ctx.number on the graphics queue; completed
         // was just read from the timeline; every upload destination is owned by self and
         // outlives the frame.
@@ -1801,6 +1826,18 @@ impl Renderer {
                 &mut self.frame_data,
                 &self.pipelines,
                 indirect_check,
+            )?;
+            self.frames.zone_end(&ctx, zone);
+        }
+        if let Some(c) = &mut self.sky_check {
+            let zone = self.frames.zone_begin(&ctx, "sky check");
+            c.step(
+                &mut encoder,
+                completed,
+                ctx.number,
+                &self.uploads,
+                &mut self.frame_data,
+                &self.pipelines,
             )?;
             self.frames.zone_end(&ctx, zone);
         }

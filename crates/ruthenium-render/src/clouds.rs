@@ -208,12 +208,12 @@ pub fn radius_cells(range: u32) -> i32 {
 }
 
 /// A face's direction (`Direction.get3DDataValue`).
-const DOWN: u32 = 0;
-const UP: u32 = 1;
-const NORTH: u32 = 2;
-const SOUTH: u32 = 3;
-const WEST: u32 = 4;
-const EAST: u32 = 5;
+pub(crate) const DOWN: u32 = 0;
+pub(crate) const UP: u32 = 1;
+pub(crate) const NORTH: u32 = 2;
+pub(crate) const SOUTH: u32 = 3;
+pub(crate) const WEST: u32 = 4;
+pub(crate) const EAST: u32 = 5;
 /// Bits of a face word: the cell east and south of the camera's cell, offset by 512, in
 /// ten bits each; then the direction, and two flags.
 const FACE_DIRECTION_SHIFT: u32 = 20;
@@ -659,7 +659,7 @@ pub fn mesh_offset(p: &Placement, cell: [i32; 2], width: u32, height: u32) -> [f
 const CLOUD_PUSH_BYTES: usize = 48;
 
 /// The push constants of `clouds.vert` and `clouds.frag`.
-fn cloud_push(
+pub(crate) fn cloud_push(
     matrix: u32,
     colour: [f32; 4],
     offset: [f32; 3],
