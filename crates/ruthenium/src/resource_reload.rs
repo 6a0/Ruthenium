@@ -231,7 +231,9 @@ struct Running {
     started: Instant,
 }
 
-/// Makes one reload at a time. One asked for meanwhile waits (the newest only); one a
+/// Makes one reload at a time, on one thread at a time (a reload given up runs on until
+/// its next stage, and the next waits for it). One asked for meanwhile waits (the
+/// newest only); one a
 /// server asked for starts at least [`MIN_RELOAD_INTERVAL`] after the last such one; a
 /// reload overtaken by a newer one, cancelled with its session, or past
 /// [`RELOAD_DEADLINE`] is not applied, and its request comes back as failed, for an
@@ -242,6 +244,9 @@ pub struct Reloader {
     world: bool,
     build: Build,
     running: Option<Running>,
+    /// A reload given up whose thread has yet to stop (told to, at its next stage): no
+    /// other starts until it has, so given-up builds can't pile up.
+    abandoned: Option<JoinHandle<Result<Reloaded, String>>>,
     next: Option<Request>,
     last_server_start: Option<Instant>,
     answers: VecDeque<(Request, Result<Reloaded, String>)>,
@@ -277,6 +282,7 @@ impl Reloader {
             world,
             build: Arc::new(build),
             running: None,
+            abandoned: None,
             next: None,
             last_server_start: None,
             answers: VecDeque::new(),
@@ -298,6 +304,7 @@ impl Reloader {
     fn pump(&mut self, max_texture: u32) {
         let Some(next) = &self.next else { return };
         if self.running.is_some()
+            || self.abandoned.is_some()
             || next.session != 0
                 && self
                     .last_server_start
@@ -361,6 +368,7 @@ impl Reloader {
             && let Some(r) = self.running.take()
         {
             r.cancel.store(true, Ordering::Relaxed);
+            self.abandoned = Some(r.handle);
             self.answers
                 .push_back((r.request, Err("its session is over".into())));
         }
@@ -370,6 +378,12 @@ impl Reloader {
     /// A reload that has ended: its request and what it built (`Err`: it failed, and
     /// nothing changes).
     pub fn poll(&mut self, max_texture: u32) -> Option<(Request, Result<Reloaded, String>)> {
+        if self.abandoned.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(h) = self.abandoned.take()
+        {
+            // What it built, if anything, is let go of with it.
+            let _ = h.join();
+        }
         if self
             .running
             .as_ref()
@@ -377,6 +391,7 @@ impl Reloader {
             && let Some(r) = self.running.take()
         {
             r.cancel.store(true, Ordering::Relaxed);
+            self.abandoned = Some(r.handle);
             eprintln!(
                 "[ruthenium] the resource reload took longer than {:.0?}: given up",
                 self.deadline
@@ -486,6 +501,75 @@ mod tests {
         assert!(r.busy());
         r.cancel_session(8, 1024);
         assert_eq!(err(answer(&mut r)).0, 8);
+    }
+
+    /// A reload given up still runs until its next stage: no other starts until it has
+    /// stopped (not even the client's own way back to vanilla's), so given-up builds
+    /// can't pile up; then the waiting one starts.
+    #[test]
+    fn one_reload_thread_at_a_time() {
+        use std::sync::atomic::AtomicUsize;
+        let starts = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (s, rel) = (starts.clone(), release.clone());
+        let build: Build = Arc::new(
+            move |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &AtomicBool| {
+                s.fetch_add(1, Ordering::SeqCst);
+                // A stage that takes its time to see the flag.
+                while !(cancel.load(Ordering::Relaxed) && rel.load(Ordering::Relaxed)) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err("stopped".into())
+            },
+        );
+        let mut r = Reloader::with_build(build, Duration::ZERO, Duration::from_secs(60));
+        r.request(request(7), 1024);
+        r.cancel_session(7, 1024);
+        assert_eq!(err(answer(&mut r)).0, 7);
+        r.request(request(0), 1024);
+        for _ in 0..50 {
+            assert!(r.poll(1024).is_none());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "a second thread started");
+        release.store(true, Ordering::Relaxed);
+        let until = Instant::now() + Duration::from_secs(5);
+        while starts.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < until, "the waiting reload never started");
+            r.poll(1024);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The same past a deadline.
+        let mut r = Reloader::with_build(
+            endless_until(release.clone()),
+            Duration::ZERO,
+            Duration::from_millis(20),
+        );
+        release.store(false, Ordering::Relaxed);
+        r.request(request(3), 1024);
+        assert_eq!(err(answer(&mut r)), (3, "it took too long".into()));
+        r.request(request(0), 1024);
+        for _ in 0..30 {
+            assert!(r.poll(1024).is_none());
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            r.running.is_none(),
+            "a second thread started past the deadline"
+        );
+        release.store(true, Ordering::Relaxed);
+    }
+
+    /// Runs until cancelled and let go.
+    fn endless_until(release: Arc<AtomicBool>) -> Build {
+        Arc::new(
+            move |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &AtomicBool| {
+                while !(cancel.load(Ordering::Relaxed) && release.load(Ordering::Relaxed)) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err("stopped".into())
+            },
+        )
     }
 
     /// A reload still building at its deadline is given up.
