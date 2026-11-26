@@ -57,7 +57,7 @@ use crate::effect::Effect;
 use crate::entity::{Entities, EntityTypes, Local as LocalInfo, PlayerInfos, Teams, TickContext};
 use crate::environment::{Clocks, Environment, LocalRegistries};
 use crate::first_person::{self, Destruction};
-use crate::fov::{self, FovEase, FovInputs};
+use crate::fov::{self, EyeEase, FovEase, FovInputs};
 use crate::handoff::{Handoff, HandoffStats, Item, Limits, Take, Taken};
 use crate::hud_text::{ChatTypes, HudTextState};
 use crate::input::next_scroll_selection;
@@ -726,6 +726,9 @@ struct Game {
     outline: Option<(Target, bool)>,
     /// The camera's field of view modifier, and the FOV Effects option it is eased with.
     fov: FovEase,
+    /// The camera's eased eye height (`Camera.eyeHeight`); like the camera, it stays
+    /// through respawns.
+    camera_eye: EyeEase,
     fov_effects: f32,
     sounds: crate::sound::GameSounds,
     /// The server's commands, for what of a command to sign (the play listener's).
@@ -910,6 +913,7 @@ impl Game {
             own_skin: Arc::new(SkinSource::Profile(Default::default())),
             outline: None,
             fov: FovEase::default(),
+            camera_eye: EyeEase::default(),
             fov_effects: 1.0,
             sounds: crate::sound::GameSounds::default(),
             commands: CommandTree::default(),
@@ -1238,7 +1242,7 @@ impl Game {
         let (hud_text, players) = (&mut self.hud_text, &self.players);
         let (teams, scoreboard) = (&self.teams, &self.scoreboard);
         let (own_name, list, faces) = (&self.name, self.player_list, self.online_mode);
-        let fov = self.fov;
+        let (fov, camera_eye) = (self.fov, self.camera_eye);
         self.publisher.publish_frame(
             || Frame::new(now, w.environment.clone(), w.dimension_name.clone()),
             |f| {
@@ -1291,6 +1295,7 @@ impl Game {
                 s.placements = w.placements;
                 s.target = target;
                 s.fov = fov;
+                s.camera_eye = camera_eye;
                 let r = &mut s.first_person;
                 p.first_person.record(r);
                 if !Arc::ptr_eq(&r.skin, own_skin) {
@@ -1975,6 +1980,9 @@ impl Game {
         // `gameRenderer.tick`: the camera's field of view eases towards the player's.
         let target = fov::modifier(&FovInputs::of(&w.player), true, self.fov_effects);
         self.fov.tick(target);
+        // `Camera.tick`: the eye height eases towards the player's (the camera entity's).
+        self.camera_eye
+            .tick((w.player.eye_position()[1] - w.player.position[1]) as f32);
         // `level.tickEntities`: the entities in order, the player among them, which
         // ticks and sends its changes (`sendPosition`) only once it has loaded.
         let cx = TickContext {

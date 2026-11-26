@@ -103,9 +103,65 @@ impl FovEase {
     }
 }
 
+/// The camera's eye height (`Camera.eyeHeight` and `eyeHeightOld`): each tick, before
+/// the entities tick, it goes half the way to the camera entity's eye height, and it is
+/// drawn between the two by the partial tick. Sneaking, crawling, swimming or lying down
+/// lowers the view smoothly over a few ticks, while the entity's own eye height (which
+/// the crosshair's pick and movement read) changes at once.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EyeEase {
+    pub old: f32,
+    pub now: f32,
+    /// Ticked at least once. Vanilla's camera starts at 0 when the game starts, under the
+    /// level's loading screen; a session starts at rest at the entity's eye height.
+    started: bool,
+}
+
+impl EyeEase {
+    /// `Camera.tick`: half the way to the entity's `eye_height`.
+    pub fn tick(&mut self, eye_height: f32) {
+        if !self.started {
+            *self = EyeEase {
+                old: eye_height,
+                now: eye_height,
+                started: true,
+            };
+            return;
+        }
+        self.old = self.now;
+        self.now += (eye_height - self.now) * 0.5;
+    }
+
+    /// The eye height drawn `partial_tick` of the way through the tick (`alignWithEntity`),
+    /// once a tick has set it.
+    pub fn at(&self, partial_tick: f32) -> Option<f32> {
+        self.started
+            .then(|| mth::lerp(partial_tick, self.old, self.now))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Standing up from a sneak: 1.27 to 1.62, half the way each tick, drawn between.
+    #[test]
+    fn the_camera_eases_to_the_eye_height() {
+        let mut e = EyeEase::default();
+        assert_eq!(e.at(0.5), None);
+        e.tick(1.27);
+        assert_eq!((e.old, e.now, e.at(0.3)), (1.27, 1.27, Some(1.27)));
+        e.tick(1.62);
+        assert_eq!((e.old, e.now), (1.27, 1.27 + (1.62 - 1.27) * 0.5));
+        let mid = e.at(0.5).unwrap();
+        assert_eq!(mid, 1.27 + 0.5 * (e.now - 1.27));
+        e.tick(1.62);
+        assert_eq!(e.now, e.old + (1.62 - e.old) * 0.5);
+        for _ in 0..40 {
+            e.tick(1.62);
+        }
+        assert!((e.now - 1.62).abs() < 1e-6);
+    }
 
     fn walking() -> FovInputs {
         FovInputs {

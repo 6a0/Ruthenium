@@ -645,6 +645,8 @@ pub struct PlayerState {
     pub target: Option<Target>,
     /// The field of view's modifier, eased by the ticks (draw it at the partial tick).
     pub fov: crate::fov::FovEase,
+    /// The camera's eye height, eased by the ticks (draw it at the partial tick).
+    pub camera_eye: crate::fov::EyeEase,
 }
 
 /// The block the crosshair is on, as of the frame (not of its last tick: the mouse
@@ -760,6 +762,7 @@ impl Frame {
                 first_person: crate::first_person::FirstPersonRecord::default(),
                 target: None,
                 fov: crate::fov::FovEase::default(),
+                camera_eye: crate::fov::EyeEase::default(),
             },
             hud: crate::hud::HudRecord::default(),
             lids: Vec::new(),

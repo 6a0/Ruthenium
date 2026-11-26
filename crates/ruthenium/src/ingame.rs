@@ -328,7 +328,8 @@ pub fn world_view(session: &Session, now: Instant, fov: f32) -> Option<WorldView
     let p = &f.player;
     let mut position: [f64; 3] =
         std::array::from_fn(|i| p.old_position[i] + (p.position[i] - p.old_position[i]) * t);
-    position[1] += f64::from(p.eye_height);
+    // `Camera.alignWithEntity`: the camera's own eased eye height, not the player's.
+    position[1] += f64::from(p.camera_eye.at(partial_tick).unwrap_or(p.eye_height));
     Some(WorldView {
         scene: session.scene().clone(),
         camera: CameraPose {
