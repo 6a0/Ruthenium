@@ -25,6 +25,55 @@ use crate::nbt::Tag;
 
 const MAX_DEPTH: usize = 16;
 
+/// Characters one component may expand to: a translation's `%1$s` repeated, nested in
+/// arguments that repeat it again, grows as a power of the nesting (vanilla's own
+/// formatter has no such bound). Chat lines, titles, names and death and disconnect
+/// messages are far shorter; the rest is dropped.
+pub const MAX_EXPANDED_CHARS: usize = 32 * 1024;
+/// Runs of one style one component may expand to.
+pub const MAX_EXPANDED_SPANS: usize = 4096;
+/// Components and format pieces one expansion may go through, whatever they produce: a
+/// tree of empty arguments, each used many times, makes nothing and costs as much.
+pub const MAX_EXPANSION_STEPS: usize = 64 * 1024;
+
+/// What is left of one expansion's [`MAX_EXPANDED_CHARS`], [`MAX_EXPANDED_SPANS`] and
+/// [`MAX_EXPANSION_STEPS`]; once any is used up, nothing more is added.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    chars: usize,
+    steps: usize,
+}
+
+impl Budget {
+    fn new() -> Budget {
+        Budget {
+            chars: MAX_EXPANDED_CHARS,
+            steps: MAX_EXPANSION_STEPS,
+        }
+    }
+
+    /// Unbounded: for text already within bounds being split up.
+    fn unbounded() -> Budget {
+        Budget {
+            chars: usize::MAX,
+            steps: usize::MAX,
+        }
+    }
+
+    fn spent(&self) -> bool {
+        self.chars == 0 || self.steps == 0
+    }
+
+    /// One step taken; false if there were none left.
+    fn step(&mut self) -> bool {
+        if self.spent() {
+            return false;
+        }
+        self.steps -= 1;
+        true
+    }
+}
+
 /// Translation formats by key: a language file.
 pub trait Lang {
     fn get(&self, key: &str) -> Option<&str>;
@@ -415,7 +464,7 @@ impl StyledText {
     /// Plain text in one style (legacy codes in it still apply).
     pub fn literal(text: &str, style: Style) -> StyledText {
         let mut t = StyledText::default();
-        t.push_formatted(text, style);
+        t.push_formatted(text, style, &mut Budget::new());
         t
     }
 
@@ -427,7 +476,7 @@ impl StyledText {
     /// A component in its JSON form, translated with `lang`.
     pub fn from_json_in(v: &Value, lang: &dyn Lang) -> StyledText {
         let mut t = StyledText::default();
-        t.component(v, Style::default(), 0, lang);
+        t.component(v, Style::default(), 0, lang, &mut Budget::new());
         t
     }
 
@@ -448,21 +497,33 @@ impl StyledText {
     /// Split at line breaks.
     pub fn lines(&self) -> Vec<StyledText> {
         let mut lines = vec![StyledText::default()];
+        let mut b = Budget::unbounded();
         for span in &self.spans {
             for (i, part) in span.text.split('\n').enumerate() {
                 if i > 0 {
                     lines.push(StyledText::default());
                 }
-                lines.last_mut().unwrap().push(part, span.style);
+                lines.last_mut().unwrap().push(part, span.style, &mut b);
             }
         }
         lines
     }
 
-    fn push(&mut self, text: &str, style: Style) {
-        if text.is_empty() {
+    /// Appends `text` in `style`, as far as `b` allows.
+    fn push(&mut self, text: &str, style: Style, b: &mut Budget) {
+        if text.is_empty() || b.chars == 0 {
             return;
         }
+        let text = match text.char_indices().nth(b.chars) {
+            Some((cut, _)) => &text[..cut],
+            None => text,
+        };
+        let new_span = self.spans.last().is_none_or(|last| last.style != style);
+        if new_span && self.spans.len() >= MAX_EXPANDED_SPANS {
+            b.chars = 0;
+            return;
+        }
+        b.chars = b.chars.saturating_sub(text.chars().count());
         match self.spans.last_mut() {
             Some(last) if last.style == style => last.text.push_str(text),
             _ => self.spans.push(Span {
@@ -473,11 +534,14 @@ impl StyledText {
     }
 
     /// Appends `text`, applying legacy `§` codes on top of `base`.
-    fn push_formatted(&mut self, text: &str, base: Style) {
+    fn push_formatted(&mut self, text: &str, base: Style, b: &mut Budget) {
         let mut style = base;
         let mut rest = text;
         while let Some(at) = rest.find('§') {
-            self.push(&rest[..at], style);
+            if b.spent() {
+                return;
+            }
+            self.push(&rest[..at], style, b);
             let mut after = rest[at + '§'.len_utf8()..].chars();
             let Some(code) = after.next() else {
                 return;
@@ -487,7 +551,7 @@ impl StyledText {
             // pair there, and the half left over shows as U+FFFD.
             let lower = code.to_lowercase().next().unwrap_or(code);
             if code.len_utf16() == 2 {
-                self.push("\u{FFFD}", style);
+                self.push("\u{FFFD}", style, b);
             }
             style = match lower {
                 c @ ('0'..='9' | 'a'..='f') => Style {
@@ -520,17 +584,26 @@ impl StyledText {
             };
             rest = after.as_str();
         }
-        self.push(rest, style);
+        self.push(rest, style, b);
     }
 
-    fn component(&mut self, v: &Value, parent: Style, depth: usize, lang: &dyn Lang) {
-        if depth >= MAX_DEPTH {
+    fn component(
+        &mut self,
+        v: &Value,
+        parent: Style,
+        depth: usize,
+        lang: &dyn Lang,
+        b: &mut Budget,
+    ) {
+        // (A step even when too deep: a format that names a too-deep argument many
+        // times, nested, would otherwise be walked without end and cost nothing.)
+        if !b.step() || depth >= MAX_DEPTH {
             return;
         }
         match v {
-            Value::String(s) => self.push_formatted(s, parent),
-            Value::Number(n) => self.push_formatted(&n.to_string(), parent),
-            Value::Bool(b) => self.push_formatted(if *b { "true" } else { "false" }, parent),
+            Value::String(s) => self.push_formatted(s, parent, b),
+            Value::Number(n) => self.push_formatted(&n.to_string(), parent, b),
+            Value::Bool(x) => self.push_formatted(if *x { "true" } else { "false" }, parent, b),
             Value::Array(items) => {
                 // The first element is the parent of the rest: they inherit its style.
                 let Some((first, rest)) = items.split_first() else {
@@ -540,19 +613,19 @@ impl StyledText {
                     Value::Object(o) => Partial::from_json(o).over(parent),
                     _ => parent,
                 };
-                self.component(first, parent, depth + 1, lang);
+                self.component(first, parent, depth + 1, lang, b);
                 for item in rest {
-                    self.component(item, style, depth + 1, lang);
+                    self.component(item, style, depth + 1, lang, b);
                 }
             }
             Value::Object(o) => {
                 let style = Partial::from_json(o).over(parent);
                 if let Some(text) = o.get("text") {
                     match text {
-                        Value::String(s) => self.push_formatted(s, style),
-                        Value::Number(n) => self.push_formatted(&n.to_string(), style),
-                        Value::Bool(b) => {
-                            self.push_formatted(if *b { "true" } else { "false" }, style)
+                        Value::String(s) => self.push_formatted(s, style, b),
+                        Value::Number(n) => self.push_formatted(&n.to_string(), style, b),
+                        Value::Bool(x) => {
+                            self.push_formatted(if *x { "true" } else { "false" }, style, b)
                         }
                         _ => {}
                     }
@@ -562,13 +635,14 @@ impl StyledText {
                         .or_else(|| o.get("fallback").and_then(Value::as_str))
                         .unwrap_or(key);
                     let args = o.get("with").and_then(Value::as_array);
-                    self.translate(format, args.map_or(&[], Vec::as_slice), style, depth, lang);
+                    let args = args.map_or(&[][..], Vec::as_slice);
+                    self.translate(format, args, style, depth, lang, b);
                 } else if let Some(key) = o.get("keybind").and_then(Value::as_str) {
-                    self.push(&key_name(key, lang), style);
+                    self.push(&key_name(key, lang), style, b);
                 }
                 if let Some(Value::Array(extra)) = o.get("extra") {
                     for child in extra {
-                        self.component(child, style, depth + 1, lang);
+                        self.component(child, style, depth + 1, lang, b);
                     }
                 }
             }
@@ -586,6 +660,7 @@ impl StyledText {
         style: Style,
         depth: usize,
         lang: &dyn Lang,
+        b: &mut Budget,
     ) {
         let mut pieces: Vec<Result<&str, usize>> = Vec::new();
         let mut next = 0;
@@ -631,13 +706,13 @@ impl StyledText {
             }
         };
         if !ok {
-            self.push_formatted(format, style);
+            self.push_formatted(format, style, b);
             return;
         }
         for p in pieces {
             match p {
-                Ok(s) => self.push_formatted(s, style),
-                Err(i) => self.component(&args[i], style, depth + 1, lang),
+                Ok(s) => self.push_formatted(s, style, b),
+                Err(i) => self.component(&args[i], style, depth + 1, lang, b),
             }
         }
     }
@@ -674,6 +749,60 @@ mod tests {
         assert!(t.spans.last().unwrap().style.obfuscated);
         let t = StyledText::literal("§l§6Gold§zx", Style::default());
         assert_eq!(spans(&t), [("Goldx", Some(0xFFAA00), false)]);
+    }
+
+    /// A translation that repeats its argument, nested: the output grows as a power of
+    /// the nesting. It stops at the budget, quickly.
+    #[test]
+    fn nested_repeats_stop_at_the_budget() {
+        let nest = |repeats: usize, depth: usize, leaf: serde_json::Value| {
+            let format = "%1$s".repeat(repeats);
+            let mut v = leaf;
+            for _ in 0..depth {
+                v = json!({"translate": "k", "fallback": format, "with": [v]});
+            }
+            v
+        };
+        // 2^14 x 4 characters: past the budget.
+        let t = StyledText::from_json(&nest(2, 14, json!("abcd")));
+        assert_eq!(t.plain().chars().count(), MAX_EXPANDED_CHARS);
+        // 8^14: would never end.
+        let started = std::time::Instant::now();
+        let t = StyledText::from_json(&nest(8, 14, json!("abcd")));
+        assert!(t.plain().chars().count() <= MAX_EXPANDED_CHARS);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // Nothing made, everything walked: the steps run out, and what follows is not
+        // added.
+        let v = json!(["", nest(4, 9, json!("")), "END"]);
+        assert_eq!(StyledText::from_json(&v).plain(), "");
+        // Arguments past the depth limit show nothing, and still cost: a long format
+        // that names one many times would otherwise be walked for nothing, again and
+        // again.
+        let started = std::time::Instant::now();
+        let v = json!(["", nest(30_000, MAX_DEPTH, json!("x")), "END"]);
+        assert_eq!(StyledText::from_json(&v).plain(), "");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let small = json!(["", nest(2, 3, json!("")), "END"]);
+        assert_eq!(StyledText::from_json(&small).plain(), "END");
+    }
+
+    /// Text past the budget is cut, and so are styles past the span cap.
+    #[test]
+    fn long_text_and_many_styles_are_cut() {
+        let long = "y".repeat(MAX_EXPANDED_CHARS * 3);
+        assert_eq!(
+            StyledText::from_json(&json!(long)).plain().len(),
+            MAX_EXPANDED_CHARS
+        );
+        assert_eq!(
+            StyledText::literal(&long, Style::default()).plain().len(),
+            MAX_EXPANDED_CHARS
+        );
+        let many: Vec<serde_json::Value> = (0..MAX_EXPANDED_SPANS * 2)
+            .map(|i| json!({"text": "z", "color": if i % 2 == 0 { "red" } else { "blue" }}))
+            .collect();
+        let t = StyledText::from_json(&json!({"text": "", "extra": many}));
+        assert_eq!(t.spans.len(), MAX_EXPANDED_SPANS);
     }
 
     #[test]
