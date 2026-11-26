@@ -24,6 +24,7 @@ use serde_json::Value;
 use crate::atlas::{Atlas, Sprite};
 use crate::id::Id;
 use crate::image::Transparency;
+use crate::limits::Limits;
 use crate::resources::Resources;
 
 /// The six directions in `Direction`'s order: down, up, north, south, west, east.
@@ -315,10 +316,14 @@ pub(crate) struct RawModel {
     pub(crate) gui_side_lit: Option<bool>,
 }
 
+/// A JSON number as a finite `float`. JSON has no NaN or infinity, but a number past
+/// `f32::MAX` becomes one; such a model is broken here (vanilla bakes it into quads with
+/// infinite corners, which draw nothing or everything).
 fn number(v: &Value, what: &str) -> Result<f32, String> {
     v.as_f64()
         .map(|n| n as f32)
-        .ok_or_else(|| format!("{what} is not a number"))
+        .filter(|n| n.is_finite())
+        .ok_or_else(|| format!("{what} is not a finite number"))
 }
 
 fn vec3(v: Option<&Value>, what: &str) -> Result<Vec3, String> {
@@ -498,20 +503,34 @@ fn parse_element(v: &Value) -> Result<Element, String> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn parse_model(text: &str) -> Result<RawModel, String> {
+    parse_model_limited(text, usize::MAX)
+}
+
+/// [`parse_model`] for a model of at most `max_elements` elements
+/// ([`Limits::model_elements`]).
+pub(crate) fn parse_model_limited(text: &str, max_elements: usize) -> Result<RawModel, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     if !v.is_object() {
         return Err("not an object".into());
     }
     let elements = match v.get("elements") {
         None => None,
-        Some(list) => Some(
-            list.as_array()
-                .ok_or("elements is not a list")?
-                .iter()
-                .map(parse_element)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
+        Some(list) => {
+            let list = list.as_array().ok_or("elements is not a list")?;
+            if list.len() > max_elements {
+                return Err(format!(
+                    "{} elements is more than a model may have ({max_elements})",
+                    list.len()
+                ));
+            }
+            Some(
+                list.iter()
+                    .map(parse_element)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        }
     };
     let parent = match v.get("parent").and_then(Value::as_str) {
         None | Some("") => None,
@@ -645,12 +664,11 @@ fn rect_transparency(atlas: &Atlas, sprite: &Sprite, rect: [f32; 4]) -> Transpar
     match sprite.animated.and_then(|i| atlas.animated.get(i)) {
         // Every frame the animation shows, where it lies in the sprite's image.
         Some(animated) => {
-            let mut seen = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for &(frame, _) in &animated.animation.frames {
-                if seen.contains(&frame) {
+                if !seen.insert(frame) {
                     continue;
                 }
-                seen.push(frame);
                 let (fx, fy) = animated.animation.frame_pos(frame);
                 scan(&animated.levels[0], fx * w, fy * h);
             }
@@ -881,19 +899,27 @@ pub trait ModelFiles {
     /// Every pack's definition of a block's states (`blockstates/<path>.json`), bottom
     /// pack first.
     fn blockstates(&self, block: &Id) -> Vec<String>;
+    /// What the bake is held to: the strictest of the packs' limits.
+    fn limits(&self) -> Limits {
+        Limits::trusted()
+    }
 }
 
 impl ModelFiles for Resources {
     fn model(&self, id: &Id) -> Option<String> {
-        let bytes = self.get(&id.wrap("models/", ".json"))?.read().ok()?;
-        String::from_utf8(bytes.into_owned()).ok()
+        // A file too large for a JSON file is as one that is not there.
+        self.get(&id.wrap("models/", ".json"))?.text().ok()
     }
 
     fn blockstates(&self, block: &Id) -> Vec<String> {
         self.stack(&block.wrap("blockstates/", ".json"))
             .iter()
-            .filter_map(|r| String::from_utf8(r.read().ok()?.into_owned()).ok())
+            .filter_map(|r| r.text().ok())
             .collect()
+    }
+
+    fn limits(&self) -> Limits {
+        *Resources::limits(self)
     }
 }
 
@@ -933,8 +959,9 @@ fn parse_variant(v: &Value) -> Result<Variant, String> {
         .ok_or("a variant without a model")?;
     let turn = |key: &str| quadrant(int(v.get(key), 0, key)?);
     let weight = int(v.get("weight"), 1, "weight")?;
-    if weight < 1 {
-        return Err(format!("weight {weight} is not positive"));
+    // `ExtraCodecs.POSITIVE_INT`: a Java int.
+    if !(1..=i64::from(i32::MAX)).contains(&weight) {
+        return Err(format!("weight {weight} is not a positive int"));
     }
     Ok(Variant {
         model,
@@ -949,13 +976,22 @@ fn parse_variant(v: &Value) -> Result<Variant, String> {
 }
 
 /// A variant or a list of them (`BlockStateModel.Unbaked.CODEC`).
-fn parse_variants(v: &Value) -> Result<(Vec<Variant>, bool), String> {
+fn parse_variants(v: &Value, max: usize) -> Result<(Vec<Variant>, bool), String> {
     match v {
         Value::Array(list) if list.is_empty() => Err("an empty list of variants".into()),
-        Value::Array(list) => Ok((
-            list.iter().map(parse_variant).collect::<Result<_, _>>()?,
-            true,
+        Value::Array(list) if list.len() > max => Err(format!(
+            "{} variants is more than a list may have ({max})",
+            list.len()
         )),
+        Value::Array(list) => {
+            let list: Vec<Variant> = list.iter().map(parse_variant).collect::<Result<_, _>>()?;
+            // `WeightedRandom.getTotalWeight`: the sum must be an int too.
+            let total: u64 = list.iter().map(|v| u64::from(v.weight)).sum();
+            if total > i32::MAX as u64 {
+                return Err("Sum of weights must be <= 2147483647".into());
+            }
+            Ok((list, true))
+        }
         other => Ok((vec![parse_variant(other)?], false)),
     }
 }
@@ -1026,6 +1062,16 @@ fn parse_condition(v: &Value, block: &BlockInfo) -> Result<Condition, String> {
 }
 
 impl Condition {
+    /// Its terms, combined ones included: what testing it costs.
+    fn size(&self) -> usize {
+        match self {
+            Condition::And(terms) | Condition::Or(terms) => {
+                1 + terms.iter().map(Condition::size).sum::<usize>()
+            }
+            Condition::Property(..) => 1,
+        }
+    }
+
     fn holds(&self, block: &BlockInfo, state: u32) -> bool {
         match self {
             Condition::And(terms) => terms.iter().all(|t| t.holds(block, state)),
@@ -1118,6 +1164,9 @@ struct Baker<'a> {
     baked: HashMap<(Id, ModelRotation), u32>,
     parts: Vec<ModelPart>,
     warnings: Vec<String>,
+    limits: Limits,
+    /// Quads baked so far, against [`Limits::baked_quads`].
+    quads: usize,
 }
 
 impl Baker<'_> {
@@ -1132,7 +1181,12 @@ impl Baker<'_> {
         if let Some(m) = self.raw.get(id) {
             return m.clone();
         }
-        let model = match self.files.model(id).map(|text| parse_model(&text)) {
+        let max = self.limits.model_elements;
+        let model = match self
+            .files
+            .model(id)
+            .map(|text| parse_model_limited(&text, max))
+        {
             Some(Ok(m)) => Rc::new(m),
             Some(Err(e)) => {
                 self.warn(format!("model {id}: {e}"));
@@ -1149,12 +1203,22 @@ impl Baker<'_> {
 
     /// A model and its parents, the model first. A parent that leads back to one of
     /// its children is replaced by the missing model.
+    ///
+    /// A chain longer than [`Limits::model_parents`] ends in the missing model too.
     fn chain(&mut self, id: &Id) -> Vec<Rc<RawModel>> {
         let mut chain = vec![self.raw(id)];
         let mut seen = vec![id.clone()];
         while let Some(parent) = chain.last().and_then(|m| m.parent.clone()) {
             if seen.contains(&parent) {
                 self.warn(format!("model {id}: its parents form a loop at {parent}"));
+                chain.push(self.missing.clone());
+                break;
+            }
+            if seen.len() > self.limits.model_parents {
+                self.warn(format!(
+                    "model {id}: more parents than a model may have ({})",
+                    self.limits.model_parents
+                ));
                 chain.push(self.missing.clone());
                 break;
             }
@@ -1232,6 +1296,17 @@ impl Baker<'_> {
                 None => Default::default(),
             }
         };
+        let count: usize = groups.iter().map(Vec::len).sum();
+        let groups = if self.quads.saturating_add(count) > self.limits.baked_quads {
+            self.warn(format!(
+                "model {model}: the models have more quads than may be baked ({})",
+                self.limits.baked_quads
+            ));
+            Default::default()
+        } else {
+            self.quads += count;
+            groups
+        };
         let ambient_occlusion = chain
             .iter()
             .find_map(|m| m.ambient_occlusion)
@@ -1278,6 +1353,8 @@ impl BlockModels {
             baked: HashMap::new(),
             parts: Vec::new(),
             warnings: Vec::new(),
+            limits: files.limits(),
+            quads: 0,
         };
         let missing_id = Id::minecraft("builtin/missing").expect("a valid id");
         baker.raw.insert(missing_id.clone(), missing);
@@ -1392,6 +1469,17 @@ fn define(
     if variants.is_none() && parts.is_none() {
         return Err("neither 'variants' nor 'multipart' found".into());
     }
+    let max = baker.limits.blockstate_cases;
+    let count = |v: Option<&Value>| match v {
+        Some(Value::Object(m)) => m.len(),
+        Some(Value::Array(a)) => a.len(),
+        _ => 0,
+    };
+    if count(variants).saturating_add(count(parts)) > max {
+        return Err(format!(
+            "more cases than a block state file may have ({max})"
+        ));
+    }
     let mut covered = vec![false; block.state_count as usize];
     if let Some(variants) = variants {
         let map = variants.as_object().ok_or("variants is not an object")?;
@@ -1399,7 +1487,7 @@ fn define(
             return Err("variants is empty".into());
         }
         for (key, value) in map {
-            let (list, weighted) = parse_variants(value)?;
+            let (list, weighted) = parse_variants(value, max)?;
             let wanted = match parse_selector(key, block) {
                 Ok(w) => w,
                 Err(e) => {
@@ -1426,13 +1514,21 @@ fn define(
             return Err("multipart is empty".into());
         }
         let mut selectors = Vec::with_capacity(list.len());
+        let mut terms = 0usize;
         for part in list {
             let condition = part
                 .get("when")
                 .map(|w| parse_condition(w, block))
                 .transpose()?;
+            terms += condition.as_ref().map_or(0, Condition::size);
+            if terms > baker.limits.condition_terms {
+                return Err(format!(
+                    "more condition terms than a block state file may have ({})",
+                    baker.limits.condition_terms
+                ));
+            }
             let (variants, weighted) =
-                parse_variants(part.get("apply").ok_or("a part without 'apply'")?)?;
+                parse_variants(part.get("apply").ok_or("a part without 'apply'")?, max)?;
             let choice = choices.len() as u32;
             choices.push(baker.choice(&variants, weighted));
             selectors.push((condition, choice));
@@ -1440,6 +1536,12 @@ fn define(
         for state in block.states() {
             if covered[(state - block.first_state) as usize] {
                 continue;
+            }
+            if multipart.len().saturating_add(selectors.len()) > baker.limits.multipart_parts {
+                return Err(format!(
+                    "the block states have more multipart parts than may be baked ({})",
+                    baker.limits.multipart_parts
+                ));
             }
             let start = multipart.len() as u32;
             for (condition, choice) in &selectors {
@@ -1839,6 +1941,8 @@ mod tests {
             baked: HashMap::new(),
             parts: Vec::new(),
             warnings: Vec::new(),
+            limits: Limits::trusted(),
+            quads: 0,
         };
         let id = |path: &str| Id::minecraft(path).unwrap();
         let child = baker.part(&id("block/child"), ModelRotation::default());

@@ -14,9 +14,10 @@ use serde_json::Value;
 use crate::atlas::{Atlas, Sprite};
 use crate::id::Id;
 use crate::image::{Image, alpha};
+use crate::limits::Limits;
 use crate::model::{
     BakedQuad, Element, Face, Layer, Material, ModelFiles, ModelRotation, RawModel, Slot, Vec3,
-    bake_elements, bake_quad, parse_model,
+    bake_elements, bake_quad, parse_model_limited,
 };
 use crate::resources::Resources;
 
@@ -501,6 +502,9 @@ const LAYERS: [&str; 5] = ["layer0", "layer1", "layer2", "layer3", "layer4"];
 /// What a grass tint is where the colour map has nothing (`GrassColor`'s default).
 const NO_GRASS: u32 = 0xFF_00FF;
 
+/// A flat picture's quads, shared by every model that shows it.
+type FlatQuads = Option<Rc<Vec<BakedQuad>>>;
+
 struct Baker<'a> {
     files: &'a dyn ModelFiles,
     blocks: &'a Atlas,
@@ -510,6 +514,15 @@ struct Baker<'a> {
     baked: HashMap<Id, u32>,
     meshes: Vec<ItemMesh>,
     warnings: Vec<String>,
+    limits: Limits,
+    /// Quads baked so far, against [`Limits::baked_quads`].
+    quads: usize,
+    /// Definition nodes read so far, and how deep the one being read is.
+    nodes: usize,
+    depth: usize,
+    /// A flat picture's quads, by its atlas, sprite and layer: each picture is looked
+    /// through once, however many models show it. `None`: more quads than may be baked.
+    flat: HashMap<(usize, usize, i32), FlatQuads>,
 }
 
 fn colour(v: Option<&Value>, default: u32) -> u32 {
@@ -538,7 +551,12 @@ impl<'a> Baker<'a> {
         if let Some(m) = self.raw.get(id) {
             return m.clone();
         }
-        let model = match self.files.model(id).map(|text| parse_model(&text)) {
+        let max = self.limits.model_elements;
+        let model = match self
+            .files
+            .model(id)
+            .map(|text| parse_model_limited(&text, max))
+        {
             Some(Ok(m)) => Some(Rc::new(m)),
             Some(Err(e)) => {
                 self.warn(format!("model {id}: {e}"));
@@ -581,6 +599,13 @@ impl<'a> Baker<'a> {
             }
             if seen.contains(&at) {
                 self.warn(format!("model {id}: its parents form a loop at {at}"));
+                break;
+            }
+            if seen.len() > self.limits.model_parents {
+                self.warn(format!(
+                    "model {id}: more parents than a model may have ({})",
+                    self.limits.model_parents
+                ));
                 break;
             }
             let Some(model) = self.raw(&at) else {
@@ -634,11 +659,28 @@ impl<'a> Baker<'a> {
                     missing.push(sprite_id.to_string());
                 }
                 let before = quads.len();
-                quads.extend(
-                    flat_layer(atlas, sprite, layer as i32)
-                        .into_iter()
-                        .map(|q| (q, atlas)),
+                let key = (
+                    std::ptr::from_ref(atlas) as usize,
+                    std::ptr::from_ref(sprite) as usize,
+                    layer as i32,
                 );
+                let left = self.limits.baked_quads.saturating_sub(self.quads);
+                let flat = match self.flat.get(&key) {
+                    Some(f) => f.clone(),
+                    None => {
+                        let f = flat_layer(atlas, sprite, layer as i32, left).map(Rc::new);
+                        self.flat.insert(key, f.clone());
+                        f
+                    }
+                };
+                let Some(flat) = flat else {
+                    self.warn(format!(
+                        "model {id}: {sprite_id} has more edges than may be baked ({})",
+                        self.limits.baked_quads
+                    ));
+                    break;
+                };
+                quads.extend(flat.iter().map(|q| (q.clone(), atlas)));
                 // All of a picture's quads are drawn as the picture is.
                 for (q, _) in &mut quads[before..] {
                     q.layer = if sprite.transparency.translucent {
@@ -683,6 +725,16 @@ impl<'a> Baker<'a> {
             // As `QuadCollection.getAll` lists them.
             quads.extend(groups.into_iter().flatten().map(|q| (q, atlas)));
         }
+        let quads = if self.quads.saturating_add(quads.len()) > self.limits.baked_quads {
+            self.warn(format!(
+                "model {id}: the models have more quads than may be baked ({})",
+                self.limits.baked_quads
+            ));
+            Vec::new()
+        } else {
+            self.quads += quads.len();
+            quads
+        };
         let mesh = self.finish(&chain, quads);
         missing.sort();
         missing.dedup();
@@ -763,7 +815,31 @@ impl<'a> Baker<'a> {
         }
     }
 
+    /// A definition's node, no deeper than [`Limits::item_model_depth`] and no more of them
+    /// than [`Limits::item_model_nodes`]: past either, nothing is drawn.
     fn node(&mut self, v: &Value, parent: &Transformation) -> Node {
+        if self.depth >= self.limits.item_model_depth {
+            self.warn(format!(
+                "an item definition nests deeper than {}",
+                self.limits.item_model_depth
+            ));
+            return Node::Empty;
+        }
+        if self.nodes >= self.limits.item_model_nodes {
+            self.warn(format!(
+                "the item definitions have more than {} nodes",
+                self.limits.item_model_nodes
+            ));
+            return Node::Empty;
+        }
+        self.depth += 1;
+        self.nodes += 1;
+        let node = self.node_within(v, parent);
+        self.depth -= 1;
+        node
+    }
+
+    fn node_within(&mut self, v: &Value, parent: &Transformation) -> Node {
         let transformation = match v.get("transformation").and_then(parse_transformation) {
             Some(own) => compose(parent, &own),
             None => *parent,
@@ -927,7 +1003,16 @@ fn grass(map: Option<&Image>, temperature: f64, downfall: f64) -> u32 {
 /// The flat model the game makes of one of an item's pictures
 /// (`ItemModelGenerator.bakeExtrudedSprite`): the picture seen from the front and from
 /// behind, a sixteenth of a block apart, and a side for every edge of what it shows.
-fn flat_layer(atlas: &Atlas, sprite: &Sprite, layer: i32) -> Vec<BakedQuad> {
+/// `None` if it would have more than `max_quads` quads.
+fn flat_layer(
+    atlas: &Atlas,
+    sprite: &Sprite,
+    layer: i32,
+    max_quads: usize,
+) -> Option<Vec<BakedQuad>> {
+    if max_quads < 2 {
+        return None;
+    }
     let material = Material {
         atlas,
         sprite,
@@ -975,8 +1060,9 @@ fn flat_layer(atlas: &Atlas, sprite: &Sprite, layer: i32) -> Vec<BakedQuad> {
     {
         Some(animated) => {
             let mut seen = Vec::new();
+            let mut unique = std::collections::HashSet::new();
             for &(frame, _) in &animated.animation.frames {
-                if !seen.contains(&frame) {
+                if unique.insert(frame) {
                     seen.push(frame);
                 }
             }
@@ -1014,6 +1100,9 @@ fn flat_layer(atlas: &Atlas, sprite: &Sprite, layer: i32) -> Vec<BakedQuad> {
                     if clear(x + dx, y + dy) {
                         sides.insert((side, x, y));
                     }
+                }
+                if sides.len() + 2 > max_quads {
+                    return None;
                 }
             }
         }
@@ -1053,7 +1142,7 @@ fn flat_layer(atlas: &Atlas, sprite: &Sprite, layer: i32) -> Vec<BakedQuad> {
         let uvs = [u0 * x_scale, v0 * y_scale, u1 * x_scale, v1 * y_scale];
         out.push(quad(from, to, uvs, SIDES[side].2));
     }
-    out
+    Some(out)
 }
 
 impl ItemModels {
@@ -1070,7 +1159,7 @@ impl ItemModels {
             .iter()
             .filter_map(|(id, r)| {
                 let name = id.path().strip_prefix("items/")?.strip_suffix(".json")?;
-                let text = String::from_utf8(r.read().ok()?.into_owned()).ok()?;
+                let text = r.text().ok()?;
                 Some((format!("{}:{name}", id.namespace()), text))
             })
             .collect();
@@ -1094,6 +1183,11 @@ impl ItemModels {
             baked: HashMap::new(),
             meshes: Vec::new(),
             warnings: Vec::new(),
+            limits: files.limits(),
+            quads: 0,
+            nodes: 0,
+            depth: 0,
+            flat: HashMap::new(),
         };
         let mut out = HashMap::new();
         let mut swap_scales = HashMap::new();
