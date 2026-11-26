@@ -919,49 +919,10 @@ pub fn left_on_purpose(c: &Closed) -> bool {
     c.reason == Reason::Local(Local::Closed)
 }
 
-/// `text` in lines of at most `width` characters, broken at spaces where it can be.
-pub fn wrap(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for para in text.split('\n') {
-        let mut line = String::new();
-        for word in para.split(' ') {
-            let mut word = word.to_owned();
-            while word.chars().count() > width {
-                if !line.is_empty() {
-                    lines.push(std::mem::take(&mut line));
-                }
-                let cut: String = word.chars().take(width).collect();
-                word = word.chars().skip(width).collect();
-                lines.push(cut);
-            }
-            let need = line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
-            if need > width && !line.is_empty() {
-                lines.push(std::mem::take(&mut line));
-            }
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(&word);
-        }
-        lines.push(line);
-    }
-    while lines.last().is_some_and(String::is_empty) && lines.len() > 1 {
-        lines.pop();
-    }
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use ruthenium_protocol::nbt::Tag;
-
-    #[test]
-    fn wraps_at_spaces() {
-        assert_eq!(wrap("one two three", 7), ["one two", "three"]);
-        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
-        assert_eq!(wrap("a\nb", 10), ["a", "b"]);
-    }
 
     #[test]
     fn reasons_read_as_text() {

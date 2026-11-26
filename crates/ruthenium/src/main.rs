@@ -166,6 +166,10 @@ With no command, opens the game window. Options:
                          device and decodes nothing
   --sound-wav <file>     write what the mixer makes to a WAV file (32-bit float,
                          stereo, 48 kHz, in real time) instead of playing it
+  --font-fallback <on|off>
+                         whether the menus draw what Nunito lacks (small capitals,
+                         CJK, symbols) from the system's fonts (on, the default); off
+                         leaves it out, to measure the fonts' loading against
   --fov-effects <on|off> whether the field of view widens and narrows with speed,
                          flight, bows and fluids (on, the default), as vanilla's FOV
                          Effects at 100% or at 0%
@@ -238,6 +242,8 @@ commands:
 
 fn main() -> ExitCode {
     let started = Instant::now();
+    // Servers on Mojang's list of blocked servers don't resolve, as in the game.
+    ruthenium_net::resolve::check_blocked_servers(true);
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("version") => {

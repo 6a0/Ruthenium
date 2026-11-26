@@ -258,6 +258,64 @@ pub struct FormScreen {
     blink: f32,
 }
 
+/// The message lines' size.
+const MESSAGE_SIZE: f32 = 17.0;
+const MESSAGE_STYLE: TextStyle = TextStyle {
+    size: MESSAGE_SIZE,
+    weight: Weight::REGULAR,
+    tracking: 0.0,
+};
+
+impl TextStyle {
+    /// At `px` pixels per UI unit.
+    fn with_px(self, px: f32) -> TextStyle {
+        TextStyle {
+            size: self.size * px,
+            ..self
+        }
+    }
+}
+
+/// `text` in lines no wider than `max` pixels, broken after spaces where it can be and
+/// between characters where a word is wider than a line (text without spaces, as Chinese
+/// and Japanese are written).
+fn wrap_to(fonts: &Fonts, text: &str, style: TextStyle, max: f32) -> Vec<String> {
+    let width = |s: &str| fonts.shape(s, style).width;
+    if width(text) <= max {
+        return vec![text.to_owned()];
+    }
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_inclusive(' ') {
+        if width(format!("{line}{word}").trim_end()) <= max {
+            line.push_str(word);
+            continue;
+        }
+        if !line.is_empty() {
+            lines.push(line.trim_end().to_owned());
+            line.clear();
+        }
+        for c in word.chars() {
+            line.push(c);
+            // Closing punctuation never starts a line; it may overhang this one.
+            if width(line.trim_end()) > max && line.chars().count() > 1 && !closing(c) {
+                line.pop();
+                lines.push(std::mem::take(&mut line));
+                line.push(c);
+            }
+        }
+    }
+    if !line.trim_end().is_empty() {
+        lines.push(line.trim_end().to_owned());
+    }
+    lines
+}
+
+/// Punctuation that closes what comes before it (a line doesn't start with it).
+fn closing(c: char) -> bool {
+    "、。，．！？：；）」』】〉》〕”’…ー.,!?:;)]}".contains(c)
+}
+
 fn shape_value(fonts: &Fonts, scale: &UiScale, value: &str) -> (Text, Vec<(usize, f32)>) {
     let style = TextStyle {
         size: TEXT_SIZE * scale.px,
@@ -359,7 +417,13 @@ impl FormScreen {
             .count();
         let last_row = !self.spec.buttons.is_empty() && cycles < self.spec.buttons.len();
         let rows = cycles + usize::from(last_row);
-        let msg_h = self.spec.message.len() as f32 * 26.0;
+        let lines: Vec<String> = self
+            .spec
+            .message
+            .iter()
+            .flat_map(|m| wrap_to(fonts, m, MESSAGE_STYLE.with_px(scale.px), WIDTH * scale.px))
+            .collect();
+        let msg_h = lines.len() as f32 * 26.0;
         let code_h = if self.spec.code.is_some() {
             CODE_H
         } else {
@@ -392,12 +456,10 @@ impl FormScreen {
         if msg_h > 0.0 {
             y += 18.0;
         }
-        self.message = self
-            .spec
-            .message
+        self.message = lines
             .iter()
             .map(|m| {
-                let t = Text::new(fonts, m, &scale, 17.0, Weight::REGULAR, 0.0);
+                let t = Text::new(fonts, m, &scale, MESSAGE_SIZE, Weight::REGULAR, 0.0);
                 let r = Rect {
                     x,
                     y,
@@ -788,5 +850,34 @@ mod tests {
         form.set_button_enabled(1, false);
         form.mouse_down(done.x + 5.0, done.y + 5.0, false);
         assert_eq!(form.mouse_up(done.x + 5.0, done.y + 5.0), None);
+    }
+
+    #[test]
+    fn messages_wrap_to_the_form_by_width() {
+        let fonts = Fonts::new(&WEIGHTS);
+        let style = MESSAGE_STYLE.with_px(1.0);
+        let w = |s: &str| fonts.shape(s, style).width;
+        assert_eq!(wrap_to(&fonts, "Short.", style, 440.0), ["Short."]);
+        let long = "You were kicked from the server because the server is restarting now";
+        let lines = wrap_to(&fonts, long, style, 300.0);
+        assert!(
+            lines.len() > 1 && lines.iter().all(|l| w(l) <= 300.0),
+            "{lines:?}"
+        );
+        assert_eq!(lines.join(" "), long);
+        // Text without spaces breaks between characters.
+        let cjk = "服务器正在重新启动请稍后再试服务器正在重新启动请稍后再试服务器正在重新启动";
+        let lines = wrap_to(&fonts, cjk, style, 200.0);
+        assert!(
+            lines.len() > 1 && lines.iter().all(|l| w(l) <= 200.0),
+            "{lines:?}"
+        );
+        assert_eq!(lines.concat(), cjk);
+        assert!(
+            lines.iter().skip(1).all(|l| !l.starts_with('。')),
+            "{lines:?}"
+        );
+        let lines = wrap_to(&fonts, "一二三四五。六", style, w("一二三四五"));
+        assert_eq!(lines, ["一二三四五。", "六"]);
     }
 }

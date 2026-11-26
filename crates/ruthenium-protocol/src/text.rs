@@ -482,7 +482,14 @@ impl StyledText {
             let Some(code) = after.next() else {
                 return;
             };
-            style = match code.to_ascii_lowercase() {
+            // Java reads the code as one UTF-16 unit and lowers its case alone
+            // (`Character.toLowerCase`): the Kelvin sign is `k`. A code past the first plane is half a
+            // pair there, and the half left over shows as U+FFFD.
+            let lower = code.to_lowercase().next().unwrap_or(code);
+            if code.len_utf16() == 2 {
+                self.push("\u{FFFD}", style);
+            }
+            style = match lower {
                 c @ ('0'..='9' | 'a'..='f') => Style {
                     color: Some(NAMED_COLORS[c.to_digit(16).unwrap() as usize].1),
                     shadow: style.shadow,
@@ -661,6 +668,10 @@ mod tests {
             ]
         );
         // A colour code clears bold; unknown codes vanish.
+        // Codes past the first plane leave half a pair behind; case is lowered as Java does.
+        let t = StyledText::literal("§😀x§\u{212A}y", Style::default());
+        assert_eq!(t.plain(), "\u{FFFD}xy");
+        assert!(t.spans.last().unwrap().style.obfuscated);
         let t = StyledText::literal("§l§6Gold§zx", Style::default());
         assert_eq!(spans(&t), [("Goldx", Some(0xFFAA00), false)]);
     }

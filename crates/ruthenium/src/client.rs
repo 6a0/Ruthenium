@@ -395,6 +395,12 @@ impl Options {
                         }
                     };
                 }
+                // A process-wide switch, set as soon as it is read.
+                "--font-fallback" => match value("on or off")?.as_str() {
+                    "on" => ruthenium_ui::text::fallback::set_enabled(true),
+                    "off" => ruthenium_ui::text::fallback::set_enabled(false),
+                    v => return Err(format!("--font-fallback: not on or off: {v}")),
+                },
                 "--gpu-spin" => {
                     let v = value("microseconds")?;
                     let us: u64 = v

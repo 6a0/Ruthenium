@@ -34,7 +34,9 @@ use ruthenium_ui::modern::{
     FormSpec, Key, MenuTransition, PauseScreen, Presence, SettingsEvent, SettingsScreen, ShapeList,
     TitleScreen, UiScale, WEIGHTS,
 };
-use ruthenium_ui::text::{ATLAS_SIZE, Fonts, GlyphAtlas, TextList, TextStyle, Weight};
+use ruthenium_ui::text::{
+    ATLAS_SIZE, FaceId, Fonts, GlyphAtlas, MAX_ATLAS_SIZE, Rendered, TextList, TextStyle,
+};
 
 use ruthenium_ui::face::Face;
 
@@ -45,15 +47,13 @@ use crate::account::{AccountStatus, Accounts, Stage, failure_lines};
 use crate::ingame::InGame;
 use crate::join::Joiner;
 use crate::route::RoutePlayer;
-use crate::servers::{Servers, valid_address};
+use crate::servers::{Selected, Servers, valid_address};
 use crate::settings::{GAME, Group, RUTHENIUM, Row, Settings, SettingsFile, all_groups, rows_of};
 use chat::{ChatHistory, ChatOutcome, ChatScreen};
 
 mod chat;
 mod keys;
 
-/// The characters a form's message line holds.
-const MESSAGE_WIDTH: usize = 52;
 /// Side of the logo texture's top level.
 const LOGO_SIZE: u32 = 512;
 /// Side of the window icon.
@@ -121,6 +121,16 @@ enum Atlas {
         logo: TextureId,
     },
     Failed,
+}
+
+/// Glyphs on their way into the atlas: rendered on a thread, put in a copy of the atlas,
+/// uploaded, and swapped in once the GPU has them.
+#[derive(Debug, Default)]
+enum AtlasWork {
+    #[default]
+    Idle,
+    Rendering(JoinHandle<Rendered>),
+    Uploading(GlyphAtlas, Option<TextureId>),
 }
 
 /// The title's account chip for `status`.
@@ -355,6 +365,8 @@ impl ShownMenu {
 pub struct Menu {
     fonts: Fonts,
     atlas: Atlas,
+    /// Glyphs of text drawn since the atlas was made, on their way in.
+    atlas_work: AtlasWork,
     scale: Option<UiScale>,
     title: Option<TitleScreen>,
     /// The title screen's buttons: pointer, focus and motion (kept across layouts).
@@ -402,8 +414,11 @@ pub struct Menu {
     joiner: Option<Joiner>,
     /// The session with a server, while there is one.
     session: Option<Session>,
-    /// The server the session is with, as the list names it.
+    /// The server the session is with, as the list names it, and its address.
     server_name: String,
+    server_address: String,
+    /// The code of conduct showing: its hash, and whether to stop asking about it.
+    conduct: Option<(i32, bool)>,
     /// The player left the session (Cancel, Disconnect): its end needs no screen.
     leaving: bool,
     /// The death screen while the player is dead: its texts and buttons as shown.
@@ -434,9 +449,9 @@ impl std::fmt::Debug for Menu {
 
 fn glyph_atlas() -> GlyphAtlas {
     let fonts = Fonts::new(&WEIGHTS);
-    let mut atlas = GlyphAtlas::new(ATLAS_SIZE);
+    let mut atlas = GlyphAtlas::growing(ATLAS_SIZE, MAX_ATLAS_SIZE);
     // Every weight's glyphs in one batch, so they are generated in parallel.
-    let glyphs: Vec<(Weight, u16)> = WEIGHTS
+    let glyphs: Vec<(FaceId, u16)> = WEIGHTS
         .iter()
         .flat_map(|&w| {
             let style = TextStyle {
@@ -448,12 +463,14 @@ fn glyph_atlas() -> GlyphAtlas {
             [ASCII, LIGATURES]
                 .into_iter()
                 .flat_map(move |t| fonts.shape(t, style).glyphs)
-                .map(move |(g, _, _)| (w, g))
+                .map(|g| g.key())
         })
         .collect();
     if !atlas.add_many(&fonts, &glyphs) {
         eprintln!("[ruthenium] the glyph atlas is full; some menu text is missing");
     }
+    // Find the system's fonts now, off the main thread, for the first text that needs them.
+    ruthenium_ui::text::fallback::warm();
     atlas
 }
 
@@ -483,6 +500,12 @@ fn pack_label(p: PackStatus) -> String {
     format!("Server Resource Packs: {v}")
 }
 
+/// The code of conduct's choice button (vanilla's "Do not notify again for this Code of
+/// Conduct" box).
+fn conduct_label(remember: bool) -> String {
+    format!("Don't Ask Again: {}", if remember { "On" } else { "Off" })
+}
+
 fn button(label: &str, action: Action) -> FormButton {
     FormButton {
         label: label.to_owned(),
@@ -508,6 +531,7 @@ impl Menu {
         Menu {
             fonts: Fonts::new(&WEIGHTS),
             atlas: Atlas::Building(handle),
+            atlas_work: AtlasWork::Idle,
             scale: None,
             title: None,
             title_states: ButtonStates::new(0),
@@ -537,6 +561,8 @@ impl Menu {
             joiner: None,
             session: None,
             server_name: String::new(),
+            server_address: String::new(),
+            conduct: None,
             leaving: false,
             death: None,
             game,
@@ -710,7 +736,7 @@ impl Menu {
         }
         let message = lines
             .iter()
-            .flat_map(|l| crate::join::wrap(l, MESSAGE_WIDTH))
+            .flat_map(|l| l.split('\n').map(str::to_owned))
             .collect();
         let spec = FormSpec {
             title: title.into(),
@@ -733,9 +759,71 @@ impl Menu {
         );
     }
 
+    /// The server's code of conduct arrived: one accepted before and unchanged since is
+    /// accepted without asking (`ClientConfigurationPacketListenerImpl.handleCodeOfConduct`);
+    /// any other is shown.
+    fn code_of_conduct_arrived(&mut self, text: &str) {
+        let hash = crate::servers::java_hash(text);
+        if self.code_of_conduct() == hash {
+            if let Some(s) = &self.session {
+                s.answer_code_of_conduct(true);
+            }
+            return;
+        }
+        self.conduct = Some((hash, false));
+        self.session_form(
+            FormKind::CodeOfConduct,
+            "Code of Conduct",
+            &[text],
+            vec![
+                button(&conduct_label(false), Action::Cycle),
+                button("Accept", Action::Confirm),
+                button("Decline", Action::Cancel),
+            ],
+        );
+    }
+
+    /// The code of conduct accepted for the server joined (`servers.dat`'s hash; 0 for
+    /// none, and for a server not in the list).
+    fn code_of_conduct(&self) -> i32 {
+        let (name, ip) = (&self.server_name, &self.server_address);
+        let mut list = match (&self.servers, &self.servers_path) {
+            (Some(s), _) => s.list.clone(),
+            (None, Some(p)) => ruthenium_net::server_list::ServerList::load(p),
+            (None, None) => return 0,
+        };
+        crate::servers::entry_named(&mut list, name, ip).map_or(0, |e| e.accepted_code_of_conduct)
+    }
+
+    /// Keeps the answer to a code of conduct with the server joined, as
+    /// `CodeOfConductScreen.onResult` does: its hash if it was accepted with "Don't Ask
+    /// Again" on, else nothing.
+    fn answered_code_of_conduct(&mut self, accepted: bool) {
+        let Some((hash, remember)) = self.conduct.take() else {
+            return;
+        };
+        let value = if accepted && remember { hash } else { 0 };
+        let (name, ip) = (self.server_name.clone(), self.server_address.clone());
+        if let Some(s) = &mut self.servers {
+            if let Some(e) = crate::servers::entry_named(&mut s.list, &name, &ip) {
+                e.accepted_code_of_conduct = value;
+                s.save();
+            }
+        } else if let Some(p) = &self.servers_path {
+            let mut list = ruthenium_net::server_list::ServerList::load(p);
+            if let Some(e) = crate::servers::entry_named(&mut list, &name, &ip) {
+                e.accepted_code_of_conduct = value;
+                if let Err(e) = list.save(p) {
+                    eprintln!("[ruthenium] couldn't save {}: {e}", p.display());
+                }
+            }
+        }
+    }
+
     /// Starts joining `name` at `address`.
     fn start_join(&mut self, name: &str, address: &str) {
         self.server_name = name.to_owned();
+        self.server_address = address.to_owned();
         self.leaving = false;
         // A session still closing is dropped (and so disconnected) here.
         self.session = None;
@@ -906,15 +994,7 @@ impl Menu {
             match e {
                 SessionEvent::Stage(s) if ours && !self.leaving => self.connecting_form(s),
                 SessionEvent::CodeOfConduct(text) if !self.leaving => {
-                    self.session_form(
-                        FormKind::CodeOfConduct,
-                        "Code of Conduct",
-                        &[&text],
-                        vec![
-                            button("Accept", Action::Confirm),
-                            button("Decline", Action::Cancel),
-                        ],
-                    );
+                    self.code_of_conduct_arrived(&text);
                 }
                 SessionEvent::Playing if !self.leaving => {
                     let title = self.server_name.clone();
@@ -1489,8 +1569,13 @@ impl Menu {
                 self.screen = Screen::Title;
             }
             (Screen::Servers, Action::Join) => {
-                if let Some((_, s)) = self.servers.as_ref().and_then(Servers::selected) {
-                    let (name, ip) = (s.name.clone(), s.ip.clone());
+                // A LAN game joins under its message as its name, as vanilla's does.
+                let target = match self.servers.as_ref().and_then(Servers::selection) {
+                    Some(Selected::Saved(_, s)) => Some((s.name.clone(), s.ip.clone())),
+                    Some(Selected::Lan(l)) => Some((l.motd.clone(), l.address.clone())),
+                    Some(Selected::Scanning) | None => None,
+                };
+                if let Some((name, ip)) = target {
                     self.start_join(&name, &ip);
                 }
             }
@@ -1506,13 +1591,21 @@ impl Menu {
                 if let Some(s) = &self.session {
                     s.answer_code_of_conduct(true);
                 }
+                self.answered_code_of_conduct(true);
                 self.connecting_form(NetStage::Joining);
             }
             (Screen::Form(FormKind::CodeOfConduct, ..), Action::Cancel | Action::Back) => {
                 if let Some(s) = &self.session {
                     s.answer_code_of_conduct(false);
                 }
+                self.answered_code_of_conduct(false);
                 self.leave();
+            }
+            (Screen::Form(FormKind::CodeOfConduct, form, _), Action::Cycle) => {
+                if let Some((_, remember)) = &mut self.conduct {
+                    *remember = !*remember;
+                    form.set_button_label(CYCLE, &self.fonts, &conduct_label(*remember));
+                }
             }
             (Screen::Form(FormKind::Died, ..), Action::Confirm) => {
                 if self
@@ -2205,7 +2298,63 @@ impl Menu {
             }
             other => other,
         };
+        self.advance_glyphs(renderer);
         icon
+    }
+
+    /// Moves glyphs on their way into the atlas along; swaps the grown atlas in once the
+    /// GPU has its texture.
+    fn advance_glyphs(&mut self, renderer: &mut Renderer) {
+        let Atlas::Ready { atlas, texture, .. } = &mut self.atlas else {
+            return;
+        };
+        self.atlas_work = match std::mem::take(&mut self.atlas_work) {
+            AtlasWork::Rendering(h) if h.is_finished() => match h.join() {
+                Ok(rendered) => {
+                    let mut next = atlas.clone();
+                    next.insert(rendered);
+                    AtlasWork::Uploading(next, None)
+                }
+                Err(_) => {
+                    eprintln!("[ruthenium] the glyph thread panicked; some text is left out");
+                    AtlasWork::Idle
+                }
+            },
+            AtlasWork::Uploading(next, None) => {
+                let desc = TextureDesc::rgba8(next.size, next.size);
+                match renderer.create_texture(desc, &[&next.pixels], Arrival::Background) {
+                    Ok(t) => AtlasWork::Uploading(next, Some(t)),
+                    Err(e) if e.try_again() => AtlasWork::Uploading(next, None),
+                    Err(e) => {
+                        eprintln!("[ruthenium] glyph atlas upload: {e}");
+                        AtlasWork::Idle
+                    }
+                }
+            }
+            AtlasWork::Uploading(next, Some(t)) if renderer.texture_ready(t) => {
+                renderer.destroy_texture(std::mem::replace(texture, t));
+                *atlas = next;
+                AtlasWork::Idle
+            }
+            other => other,
+        };
+    }
+
+    /// Starts rendering the glyphs text drew without (the atlas didn't have them yet).
+    fn take_in_glyphs(&mut self, missing: Vec<(FaceId, u16)>) {
+        if missing.is_empty()
+            || !matches!(self.atlas_work, AtlasWork::Idle)
+            || !matches!(self.atlas, Atlas::Ready { .. })
+        {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("menu-glyphs".into())
+            .spawn(move || Rendered::new(&Fonts::new(&WEIGHTS), &missing));
+        match spawned {
+            Ok(h) => self.atlas_work = AtlasWork::Rendering(h),
+            Err(e) => eprintln!("[ruthenium] no thread for new glyphs: {e}"),
+        }
     }
 
     /// This frame's GUI.
@@ -2419,6 +2568,8 @@ impl Menu {
         if let Some(e) = settings_ev {
             self.settings_event(e);
         }
+        let missing = self.text.take_missing();
+        self.take_in_glyphs(missing);
         if self.appear.value < 1.0 {
             self.shapes.fade_all(self.appear.value);
             self.text.fade_all(self.appear.value);
@@ -2465,12 +2616,18 @@ impl Menu {
         self.screen = Screen::Servers;
     }
 
-    /// Development: opens a form over the server list (for screenshots): "add",
-    /// "direct" or "delete".
+    /// Development: opens a form over the server list (for screenshots): "add", "edit"
+    /// (the selected server), "direct" or "delete".
     pub fn open_form_named(&mut self, name: &str, pixel_size: (u32, u32)) {
         let scale = self.layout(pixel_size);
         let kind = match name {
             "add" => FormKind::Add,
+            "edit" => FormKind::Edit(
+                self.servers
+                    .as_ref()
+                    .and_then(Servers::selected)
+                    .map_or(0, |(i, _)| i),
+            ),
             "direct" => FormKind::Direct,
             "delete" => FormKind::Delete(0),
             _ => return,
@@ -2549,6 +2706,7 @@ mod tests {
 
     use super::*;
     use crate::account::tests::{accounts_held_in, accounts_in};
+    use crate::servers::java_hash;
 
     #[derive(Default)]
     struct FakeClipboard(RefCell<Option<String>>);
@@ -3004,6 +3162,100 @@ mod tests {
             "microsoft.com/link"
         );
         assert_eq!(short_url("http://example.com/"), "example.com");
+    }
+
+    #[test]
+    fn lan_games_join_under_their_message() {
+        let clip = FakeClipboard::default();
+        let path = temp("lan").join("servers.dat");
+        let mut list = ServerList::default();
+        list.add(ServerEntry::new("Saved", "127.0.0.1:1"), false);
+        list.save(&path).unwrap();
+        let mut m = Menu::new(
+            Some(path.clone()),
+            Accounts::disabled(),
+            SettingsFile::transient(),
+        );
+        m.layout((1600, 900));
+        m.open_servers((1600, 900));
+        let s = m.servers.as_mut().unwrap();
+        s.found_on_lan(ruthenium_net::lan::LanServer {
+            motd: "§aA ᴡᴏʀʟᴅ".into(),
+            address: "192.168.1.5:25565".into(),
+        });
+        s.sync_rows(&m.fonts);
+        // The saved server, the scanning line, the game.
+        s.screen.select(Some(1));
+        assert_eq!(s.selection(), Some(Selected::Scanning));
+        m.act(Action::Join, None, &clip);
+        assert!(
+            matches!(m.screen, Screen::Servers),
+            "the line joins nothing"
+        );
+        let s = m.servers.as_mut().unwrap();
+        s.screen.select(Some(2));
+        assert!(matches!(s.selection(), Some(Selected::Lan(_))));
+        // Edit and Delete are for saved servers only.
+        m.act(Action::EditServer, None, &clip);
+        m.act(Action::DeleteServer, None, &clip);
+        assert!(matches!(m.screen, Screen::Servers));
+        m.act(Action::Join, None, &clip);
+        assert_eq!(
+            (m.server_name.as_str(), m.server_address.as_str()),
+            ("§aA ᴡᴏʀʟᴅ", "192.168.1.5:25565")
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn codes_of_conduct_accepted_for_good_are_not_asked_again() {
+        let clip = FakeClipboard::default();
+        let path = temp("conduct").join("servers.dat");
+        let mut list = ServerList::default();
+        list.add(ServerEntry::new("Local", "127.0.0.1:25631"), false);
+        list.add(ServerEntry::new("Other", "127.0.0.1:25631"), false);
+        list.save(&path).unwrap();
+        let mut m = Menu::new(
+            Some(path.clone()),
+            Accounts::disabled(),
+            SettingsFile::transient(),
+        );
+        m.layout((1600, 900));
+        m.open_servers((1600, 900));
+        // No joiner here: the join ends at once, but the server joined is known.
+        m.start_join("Local", "127.0.0.1:25631");
+        let text = "Be kind. ʙᴇ ᴋɪɴᴅ. 日本語";
+        let shown = |m: &Menu| matches!(m.screen, Screen::Form(FormKind::CodeOfConduct, ..));
+        // Accepted once: asked again next time.
+        m.code_of_conduct_arrived(text);
+        assert!(shown(&m));
+        m.act(Action::Confirm, None, &clip);
+        assert_eq!(
+            ServerList::load(&path).servers[0].accepted_code_of_conduct,
+            0
+        );
+        m.code_of_conduct_arrived(text);
+        assert!(shown(&m));
+        // Accepted with "Don't Ask Again": kept as Java's hash of the text, by name and
+        // address, and not asked again while it doesn't change.
+        m.act(Action::Cycle, None, &clip);
+        m.act(Action::Confirm, None, &clip);
+        let saved = ServerList::load(&path);
+        assert_eq!(saved.servers[0].accepted_code_of_conduct, java_hash(text));
+        assert_eq!(saved.servers[1].accepted_code_of_conduct, 0);
+        m.screen = Screen::Servers;
+        m.code_of_conduct_arrived(text);
+        assert!(!shown(&m));
+        m.code_of_conduct_arrived("Be kinder.");
+        assert!(shown(&m));
+        // Declining forgets it.
+        m.act(Action::Cycle, None, &clip);
+        m.act(Action::Cancel, None, &clip);
+        assert_eq!(
+            ServerList::load(&path).servers[0].accepted_code_of_conduct,
+            0
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

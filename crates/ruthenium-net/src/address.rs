@@ -116,14 +116,44 @@ fn split(input: &str) -> Result<(&str, Option<u16>), &'static str> {
     Ok((host, Some(n)))
 }
 
-/// Java's `IDN.toASCII` without flags, closely enough: ASCII labels pass unchanged (63
-/// bytes at most), others become punycode.
+/// Java's `IDN.toASCII` without flags, label by label (labels end at any of the four
+/// full stops IDNA knows, and are joined with `.`):
+///
+/// - an ASCII label passes as it is, case and all;
+/// - another is mapped (lower case, compatibility forms, `ß` to `ss` as IDNA 2003 does)
+///   and becomes punycode, unless it maps to ASCII;
+/// - every label but a last one must be 1 to 63 bytes long, or the host has none.
+///
+/// Unlike Java, characters Unicode 3.2 did not have yet are not refused.
 fn to_ascii(host: &str) -> Option<String> {
-    if host.is_ascii() {
-        let ok = host.split('.').all(|label| label.len() <= 63);
-        return ok.then(|| host.to_owned());
+    let labels: Vec<&str> = host
+        .split(['.', '\u{3002}', '\u{FF0E}', '\u{FF61}'])
+        .collect();
+    let last = labels.len() - 1;
+    let mut out = Vec::with_capacity(labels.len());
+    for (i, label) in labels.into_iter().enumerate() {
+        let ascii = if label.is_ascii() {
+            label.to_owned()
+        } else {
+            // IDNA 2003's mappings where UTS 46 keeps the character (deviations).
+            let mut mapped = String::with_capacity(label.len());
+            for c in label.chars() {
+                match c {
+                    '\u{200C}' | '\u{200D}' => {}
+                    'ß' => mapped.push_str("ss"),
+                    'ς' => mapped.push('σ'),
+                    _ => mapped.push(c),
+                }
+            }
+            idna::domain_to_ascii(&mapped).ok()?
+        };
+        // A host may end with a full stop: its last label is then empty.
+        if ascii.len() > 63 || ascii.is_empty() && i != last || ascii.contains('.') {
+            return None;
+        }
+        out.push(ascii);
     }
-    idna::domain_to_ascii(host).ok()
+    Some(out.join("."))
 }
 
 #[cfg(test)]
@@ -170,6 +200,40 @@ mod tests {
         assert!(!ServerAddress::is_valid("host:99999"));
         assert!(ServerAddress::is_valid("play.example.org"));
         assert!(!ServerAddress::is_valid(&"a".repeat(64)));
+    }
+
+    /// What `java.net.IDN.toASCII` (Java 25) gives for these hosts.
+    #[test]
+    fn hosts_convert_as_javas_idn_does() {
+        for (host, java) in [
+            ("bücher.example", Some("xn--bcher-kva.example")),
+            ("Bücher.Example", Some("xn--bcher-kva.Example")),
+            ("BÜCHER.example", Some("xn--bcher-kva.example")),
+            ("straße.de", Some("strasse.de")),
+            ("ÖBB.at", Some("xn--bb-eka.at")),
+            ("日本語.jp", Some("xn--wgv71a119e.jp")),
+            ("xn--abc.com", Some("xn--abc.com")),
+            ("a..b", None),
+            ("ex ample.com", Some("ex ample.com")),
+            ("☃.net", Some("xn--n3h.net")),
+            ("mc.hypixel.net", Some("mc.hypixel.net")),
+            ("Mc.HyPixel.Net", Some("Mc.HyPixel.Net")),
+            ("siegelands.org.", Some("siegelands.org.")),
+            ("ｓｉｅｇｅ.org", Some("siege.org")),
+            ("faß.de", Some("fass.de")),
+            ("ﬁ.com", Some("fi.com")),
+            ("-a-.com", Some("-a-.com")),
+            ("a_b.com", Some("a_b.com")),
+            ("Ⅷ.com", Some("viii.com")),
+            ("\u{AD}.com", None),
+            ("é.com", Some("xn--9ca.com")),
+            ("e\u{301}.com", Some("xn--9ca.com")),
+            ("ق.com", Some("xn--ehb.com")),
+            ("a\u{200D}b.com", Some("ab.com")),
+            ("a。b", Some("a.b")),
+        ] {
+            assert_eq!(to_ascii(host).as_deref(), java, "{host:?}");
+        }
     }
 
     #[test]

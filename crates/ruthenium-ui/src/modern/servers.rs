@@ -1,5 +1,7 @@
 //! The server list (Multiplayer): saved servers as glass rows with their icon, name,
-//! message of the day, player count and latency, in a scrolling list; the buttons below.
+//! message of the day, player count and latency, in a scrolling list; under them a row
+//! saying the local network is being scanned, and the games found there; the buttons
+//! below. Hovering a player count shows who is online, as the server tells.
 //!
 //! The screen keeps layout, shaped text, scrolling, selection and hover; the client keeps
 //! the servers and their ping results and hands them over as [`RowView`]s whenever they
@@ -35,9 +37,30 @@ pub struct RowView<'a> {
     pub motd: &'a StyledText,
     /// Right-hand line: the player count, or the server's version when incompatible.
     pub status: &'a StyledText,
+    /// Shown over the player count: the server's sample of who is online.
+    pub players: &'a [StyledText],
     pub ping: Ping,
     /// The favicon's texture index, once uploaded.
     pub icon: Option<u32>,
+}
+
+/// A game found on the local network, as the list shows it.
+#[derive(Debug, Clone, Copy)]
+pub struct LanView<'a> {
+    /// Its message (legacy `§` codes apply).
+    pub motd: &'a StyledText,
+    pub address: &'a str,
+}
+
+/// What a row of the list is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    /// A saved server, by its place in the list.
+    Saved(usize),
+    /// The line saying the local network is being scanned (`LANHeader`).
+    Scanning,
+    /// A game on the local network, by its place among them.
+    Lan(usize),
 }
 
 /// Button indices, in tab order.
@@ -62,6 +85,15 @@ const RIGHT: f32 = 128.0;
 const BUTTON_H: f32 = 44.0;
 const BUTTON_GAP: f32 = 12.0;
 const FOOTER_MARGIN: f32 = 30.0;
+
+/// Vanilla's `lanServer.scanning` and `lanServer.title`.
+const SCANNING: &str = "Scanning for games on your local network";
+const LAN_TITLE: &str = "LAN World";
+/// The player count's tooltip: its padding, line height and gap from the list.
+const TIP_PAD: f32 = 12.0;
+const TIP_LINE: f32 = 19.0;
+const TIP_GAP: f32 = 14.0;
+const TIP_TINT: [f32; 4] = [0.80, 0.86, 1.0, 0.10];
 
 const ROW_TINT: [f32; 4] = [0.85, 0.88, 1.0, 0.03];
 const ROW_HOVER: [f32; 4] = [0.90, 0.93, 1.0, 0.08];
@@ -88,9 +120,19 @@ struct Row {
     initial: Text,
     motd: Vec<Vec<Run>>,
     status: Vec<Run>,
+    players: Vec<Vec<Run>>,
     latency: Option<Text>,
     ping: Ping,
     icon: Option<u32>,
+    hover: Ease,
+    selected: Ease,
+}
+
+/// A game on the local network's row.
+#[derive(Debug, Clone)]
+struct LanRow {
+    motd: Vec<Run>,
+    address: Text,
     hover: Ease,
     selected: Ease,
 }
@@ -198,6 +240,13 @@ pub struct ServerListScreen {
     title: Text,
     empty: [Text; 2],
     rows: Vec<Row>,
+    lan: Vec<LanRow>,
+    /// The scanning line, and the LAN rows' title.
+    scanning: Text,
+    lan_title: Text,
+    lan_tile: Text,
+    /// Where the pointer is (UI units).
+    pointer: Option<(f32, f32)>,
 }
 
 impl ServerListScreen {
@@ -242,6 +291,11 @@ impl ServerListScreen {
                 ),
             ],
             rows: Vec::new(),
+            lan: Vec::new(),
+            scanning: Text::new(fonts, SCANNING, &scale, 14.0, Weight::MEDIUM, 0.0),
+            lan_title: Text::new(fonts, LAN_TITLE, &scale, 17.0, Weight::SEMIBOLD, 0.0),
+            lan_tile: Text::new(fonts, "LAN", &scale, 15.0, Weight::EXTRABOLD, 0.04),
+            pointer: None,
         };
         screen.layout(scale, fonts);
         screen
@@ -291,6 +345,9 @@ impl ServerListScreen {
             .map(|b| Text::new(fonts, b.label, &scale, 16.0, Weight::SEMIBOLD, 0.01))
             .collect();
         self.title = Text::new(fonts, "Multiplayer", &scale, 28.0, Weight::SEMIBOLD, 0.01);
+        self.scanning = Text::new(fonts, SCANNING, &scale, 14.0, Weight::MEDIUM, 0.0);
+        self.lan_title = Text::new(fonts, LAN_TITLE, &scale, 17.0, Weight::SEMIBOLD, 0.0);
+        self.lan_tile = Text::new(fonts, "LAN", &scale, 15.0, Weight::EXTRABOLD, 0.04);
         self.empty = [
             Text::new(fonts, "No servers yet", &scale, 20.0, Weight::SEMIBOLD, 0.0),
             Text::new(
@@ -331,6 +388,11 @@ impl ServerListScreen {
                         .map(|l| runs(fonts, &s, l, 14.5, MOTD_DEFAULT))
                         .collect(),
                     status: runs(fonts, &s, v.status, 14.0, FAINT),
+                    players: v
+                        .players
+                        .iter()
+                        .map(|p| runs(fonts, &s, p, 14.0, SOFT))
+                        .collect(),
                     latency: match v.ping {
                         Ping::Latency(ms) => Some(Text::new(
                             fonts,
@@ -349,11 +411,59 @@ impl ServerListScreen {
                 }
             })
             .collect();
-        self.list.set_len(self.rows.len());
+        self.list.set_len(self.len());
+    }
+
+    /// Replaces the games found on the local network (in the order they were found).
+    pub fn set_lan(&mut self, fonts: &Fonts, views: &[LanView<'_>]) {
+        let s = self.scale;
+        let old = std::mem::take(&mut self.lan);
+        self.lan = views
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let (hover, selected) = old
+                    .get(i)
+                    .map_or_else(Default::default, |r| (r.hover, r.selected));
+                LanRow {
+                    motd: v
+                        .motd
+                        .lines()
+                        .first()
+                        .map(|l| runs(fonts, &s, l, 14.5, MOTD_DEFAULT))
+                        .unwrap_or_default(),
+                    address: Text::new(fonts, v.address, &s, 13.5, Weight::REGULAR, 0.0),
+                    hover,
+                    selected,
+                }
+            })
+            .collect();
+        self.list.set_len(self.len());
+    }
+
+    /// Rows in the list: the saved servers, the scanning line, the LAN games.
+    fn len(&self) -> usize {
+        self.rows.len() + 1 + self.lan.len()
+    }
+
+    /// What row `i` is.
+    pub fn entry(&self, i: usize) -> Option<Entry> {
+        let saved = self.rows.len();
+        match i {
+            _ if i < saved => Some(Entry::Saved(i)),
+            _ if i == saved => Some(Entry::Scanning),
+            _ if i - saved - 1 < self.lan.len() => Some(Entry::Lan(i - saved - 1)),
+            _ => None,
+        }
     }
 
     pub fn selected(&self) -> Option<usize> {
         self.list.selected()
+    }
+
+    /// What the selected row is.
+    pub fn selected_entry(&self) -> Option<Entry> {
+        self.entry(self.list.selected()?)
     }
 
     /// Selects a row (or none) and scrolls it into view.
@@ -378,6 +488,7 @@ impl ServerListScreen {
 
     /// The pointer moved to `(x, y)` (UI units), or left (`None`).
     pub fn pointer(&mut self, at: Option<(f32, f32)>) {
+        self.pointer = at;
         self.list.pointer(at);
         self.states
             .hover(at.and_then(|(x, y)| self.hit_button(x, y)));
@@ -393,15 +504,32 @@ impl ServerListScreen {
     /// need a selection.
     pub fn update(&mut self, dt: f32) {
         self.list.update(dt);
-        for (i, r) in self.rows.iter_mut().enumerate() {
+        let lan_start = self.rows.len() + 1;
+        let motion = self
+            .rows
+            .iter_mut()
+            .map(|r| (&mut r.hover, &mut r.selected))
+            .enumerate()
+            .chain(
+                self.lan
+                    .iter_mut()
+                    .map(|r| (&mut r.hover, &mut r.selected))
+                    .enumerate()
+                    .map(|(i, m)| (lan_start + i, m)),
+            );
+        for (i, (hover, selected)) in motion {
             let lit = f32::from(u8::from(self.list.hovered() == Some(i)));
-            r.hover.step(lit, dt, 0.06, 0.15);
+            hover.step(lit, dt, 0.06, 0.15);
             let sel = f32::from(u8::from(self.list.selected() == Some(i)));
-            r.selected.step(sel, dt, 0.05, 0.12);
+            selected.step(sel, dt, 0.05, 0.12);
         }
-        let has = self.list.selected().is_some();
-        for b in [JOIN, EDIT, DELETE] {
-            self.states.set_enabled(b, has);
+        // `JoinMultiplayerScreen.onSelectedChange`: any server joins; only saved ones edit.
+        let entry = self.selected_entry();
+        let saved = matches!(entry, Some(Entry::Saved(_)));
+        self.states
+            .set_enabled(JOIN, saved || matches!(entry, Some(Entry::Lan(_))));
+        for b in [EDIT, DELETE] {
+            self.states.set_enabled(b, saved);
         }
         self.states.update(dt);
     }
@@ -423,7 +551,7 @@ impl ServerListScreen {
                 h: 40.0,
             };
             self.title.centred(text, atlas, s, title, WHITE_TEXT);
-            if self.rows.is_empty() {
+            if self.rows.is_empty() && self.lan.is_empty() {
                 let area = self.list.area;
                 let mid = area.y + 0.4 * area.h;
                 let r0 = Rect {
@@ -447,15 +575,25 @@ impl ServerListScreen {
         let clip = self.list.clip(s, 8.0);
         shapes.set_clip(clip);
         text.set_clip(clip);
-        for (i, row) in self.rows.iter().enumerate() {
+        for i in 0..self.len() {
             let r = self.list.row_rect(i);
             if !self.list.shows(r, 8.0) {
                 continue;
             }
-            self.draw_row(shapes, text, atlas, row, r, i, time, clip);
+            match self.entry(i) {
+                Some(Entry::Saved(k)) => {
+                    self.draw_row(shapes, text, atlas, &self.rows[k], r, i, time, clip);
+                }
+                Some(Entry::Scanning) => self.draw_scanning(shapes, text, atlas, r, time),
+                Some(Entry::Lan(k)) => self.draw_lan(shapes, text, atlas, &self.lan[k], r),
+                None => {}
+            }
         }
         shapes.set_clip(Clip::NONE);
         text.set_clip(Clip::NONE);
+        if let Some(atlas) = atlas {
+            self.draw_players(shapes, text, atlas);
+        }
         for (i, (b, label)) in self.buttons.iter().zip(&self.labels).enumerate() {
             draw_button(
                 shapes,
@@ -467,6 +605,150 @@ impl ServerListScreen {
                 self.states.look(i),
                 self.states.enabled(i),
             );
+        }
+    }
+
+    /// The scanning line: faint, centred, with three dots that come and go
+    /// (`LoadingDotsWidget`).
+    fn draw_scanning(
+        &self,
+        shapes: &mut ShapeList,
+        text: &mut TextList,
+        atlas: Option<&GlyphAtlas>,
+        r: Rect,
+        time: f64,
+    ) {
+        let s = &self.scale;
+        let selected = self.list.selected() == self.list_index(Entry::Scanning);
+        draw_focus_ring(shapes, s, r, ROW_RADIUS, f32::from(u8::from(selected)));
+        let w = self.scanning.width(s);
+        let dots = 3.0 * 9.0;
+        let x = r.x + 0.5 * (r.w - w - dots);
+        let mid = r.y + 0.5 * r.h;
+        for k in 0..3 {
+            let phase = time as f32 * 4.0 - k as f32 * 0.8;
+            let a = 0.15 + 0.5 * (0.5 + 0.5 * phase.sin());
+            let d = Rect {
+                x: x + w + 8.0 + k as f32 * 9.0,
+                y: mid - 2.5,
+                w: 5.0,
+                h: 5.0,
+            };
+            shapes.rounded(s, d, 2.5, [0.85, 0.87, 1.0, a]);
+        }
+        if let Some(atlas) = atlas {
+            self.scanning
+                .left_in(text, atlas, s, Rect { x, ..r }, FAINT);
+        }
+    }
+
+    /// A LAN game's row: a tile, "LAN World", its message and its address.
+    fn draw_lan(
+        &self,
+        shapes: &mut ShapeList,
+        text: &mut TextList,
+        atlas: Option<&GlyphAtlas>,
+        row: &LanRow,
+        r: Rect,
+    ) {
+        let s = &self.scale;
+        let tint = mix(
+            mix(ROW_TINT, ROW_HOVER, row.hover.value),
+            ROW_SELECTED,
+            row.selected.value,
+        );
+        let lit = row.hover.value.max(row.selected.value);
+        shapes.glass_rect(s, r, ROW_RADIUS, tint, 0.55 + 0.3 * lit);
+        draw_focus_ring(shapes, s, r, ROW_RADIUS, row.selected.value);
+        let icon = Rect {
+            x: r.x + PAD,
+            y: r.y + PAD,
+            w: ICON,
+            h: ICON,
+        };
+        shapes.rounded(s, icon, ICON_RADIUS, [0.45, 0.62, 1.0, 0.16]);
+        let Some(atlas) = atlas else { return };
+        self.lan_tile
+            .centred(text, atlas, s, icon, [0.9, 0.92, 1.0, 0.7]);
+        let x = r.x + TEXT_X;
+        self.lan_title
+            .draw_at(text, atlas, s, x, r.y + 31.0, WHITE_TEXT);
+        let clip = text.clip();
+        let right = (r.x + r.w - PAD) * s.px;
+        text.set_clip(Clip {
+            rect: [
+                clip.rect[0],
+                clip.rect[1],
+                right.min(clip.rect[2]),
+                clip.rect[3],
+            ],
+            ..clip
+        });
+        draw_runs(shapes, text, atlas, s, &row.motd, x, r.y + 54.0);
+        row.address.draw_at(text, atlas, s, x, r.y + 73.0, FAINT);
+        text.set_clip(clip);
+    }
+
+    /// The list index of `entry`.
+    fn list_index(&self, entry: Entry) -> Option<usize> {
+        match entry {
+            Entry::Saved(i) => (i < self.rows.len()).then_some(i),
+            Entry::Scanning => Some(self.rows.len()),
+            Entry::Lan(i) => (i < self.lan.len()).then_some(self.rows.len() + 1 + i),
+        }
+    }
+
+    /// The player count of saved server `k` (in row rect `r`): where it is drawn.
+    fn status_rect(&self, row: &Row, r: Rect) -> Rect {
+        let w = runs_width(&row.status, &self.scale);
+        Rect {
+            x: r.x + r.w - PAD - 6.0 - w,
+            y: r.y + 40.0,
+            w,
+            h: 19.0,
+        }
+    }
+
+    /// Who is online, beside the list, while the pointer is on a player count
+    /// (`OnlineServerEntry`'s players tooltip). It stands outside the list so no other
+    /// text is under it.
+    fn draw_players(&self, shapes: &mut ShapeList, text: &mut TextList, atlas: &GlyphAtlas) {
+        let s = &self.scale;
+        let Some((px, py)) = self.pointer else {
+            return;
+        };
+        let area = self.list.area;
+        if !area.contains(px, py) {
+            return;
+        }
+        let hit = (0..self.rows.len()).find_map(|k| {
+            let r = self.list.row_rect(k);
+            let row = &self.rows[k];
+            (!row.players.is_empty() && self.status_rect(row, r).contains(px, py))
+                .then_some((row, r))
+        });
+        let Some((row, r)) = hit else {
+            return;
+        };
+        let w = row
+            .players
+            .iter()
+            .map(|l| runs_width(l, s))
+            .fold(0.0, f32::max)
+            + 2.0 * TIP_PAD;
+        let h = row.players.len() as f32 * TIP_LINE + 2.0 * TIP_PAD - 4.0;
+        let right = area.x + area.w + TIP_GAP;
+        let x = if right + w <= s.width - 8.0 {
+            right
+        } else {
+            (area.x - TIP_GAP - w).max(8.0)
+        };
+        let y = r.y.min(s.height - 8.0 - h).max(8.0);
+        let tip = Rect { x, y, w, h };
+        shapes.glass_rect(s, tip, 14.0, TIP_TINT, 0.6);
+        for (i, line) in row.players.iter().enumerate() {
+            let base = y + TIP_PAD + 10.0 + i as f32 * TIP_LINE;
+            draw_runs(shapes, text, atlas, s, line, x + TIP_PAD, base);
         }
     }
 
@@ -611,6 +893,7 @@ mod tests {
                 name: "A server",
                 motd: m,
                 status: &status,
+                players: &[],
                 ping: Ping::Latency(40),
                 icon: None,
             })
@@ -624,9 +907,10 @@ mod tests {
         let area = screen.list.area;
         assert!(last.y + last.h <= area.y + area.h + 0.01);
         assert!(screen.list.hit_row(last.x + 10.0, last.y + 10.0) == Some(19));
-        // Keyboard moves clamp; the wheel scrolls back up.
+        // Keyboard moves clamp (at the scanning line, last); the wheel scrolls back up.
         screen.move_selection(5);
-        assert_eq!(screen.selected(), Some(19));
+        assert_eq!(screen.selected(), Some(20));
+        assert_eq!(screen.selected_entry(), Some(Entry::Scanning));
         screen.wheel(100.0);
         screen.update(1.0);
         assert_eq!(screen.list.row_rect(0).y, area.y);
@@ -634,6 +918,105 @@ mod tests {
         screen.select(None);
         screen.update(0.0);
         assert!(!screen.states.enabled(JOIN) && screen.states.enabled(ADD));
+    }
+
+    #[test]
+    fn lan_games_follow_the_scanning_line() {
+        let fonts = Fonts::new(&WEIGHTS);
+        let mut screen = ServerListScreen::new(UiScale::new(1600, 900), &fonts);
+        let (motd, status) = rows(2);
+        let views: Vec<RowView> = motd
+            .iter()
+            .map(|m| RowView {
+                name: "x",
+                motd: m,
+                status: &status,
+                players: &[],
+                ping: Ping::Pinging,
+                icon: None,
+            })
+            .collect();
+        screen.set_rows(&fonts, &views);
+        let lan_motd = StyledText::literal("§aA ʟᴀɴ world", Style::default());
+        screen.set_lan(
+            &fonts,
+            &[LanView {
+                motd: &lan_motd,
+                address: "192.168.1.5:25565",
+            }],
+        );
+        assert_eq!(screen.list.len(), 4);
+        assert_eq!(screen.entry(1), Some(Entry::Saved(1)));
+        assert_eq!(screen.entry(2), Some(Entry::Scanning));
+        assert_eq!(screen.entry(3), Some(Entry::Lan(0)));
+        assert_eq!(screen.entry(4), None);
+        // Saved servers join, edit and delete; LAN games only join; the line nothing.
+        for (i, join, edit) in [(0, true, true), (2, false, false), (3, true, false)] {
+            screen.select(Some(i));
+            screen.update(0.0);
+            assert_eq!(screen.states.enabled(JOIN), join, "{i}");
+            assert_eq!(screen.states.enabled(EDIT), edit, "{i}");
+            assert_eq!(screen.states.enabled(DELETE), edit, "{i}");
+        }
+        let mut shapes = ShapeList::new();
+        let mut text = TextList::new();
+        let mut atlas = GlyphAtlas::new(1024);
+        screen.draw(&mut shapes, &mut text, Some(&atlas), 0.0);
+        // The atlas had none of the glyphs: every one asked for, the LAN row's too.
+        let missing = text.take_missing();
+        assert!(missing.len() > 20, "{}", missing.len());
+        atlas.add_many(&fonts, &missing);
+        text.clear();
+        screen.draw(&mut shapes, &mut text, Some(&atlas), 0.0);
+        assert!(text.take_missing().is_empty());
+        // The address line is drawn in the LAN row.
+        let lan = screen.list.row_rect(3);
+        let s = screen.scale;
+        assert!(text.quads().iter().any(|q| {
+            let y = q.rect[3] / s.px;
+            y > lan.y + 60.0 && y < lan.y + lan.h
+        }));
+    }
+
+    #[test]
+    fn the_player_count_shows_who_is_online() {
+        let fonts = Fonts::new(&WEIGHTS);
+        let mut screen = ServerListScreen::new(UiScale::new(1600, 900), &fonts);
+        let motd = StyledText::literal("Hello", Style::default());
+        let status = StyledText::literal("2 / 20", Style::default());
+        let players = [
+            StyledText::literal("§cᴀʟᴇx", Style::default()),
+            StyledText::literal("Steve", Style::default()),
+        ];
+        screen.set_rows(
+            &fonts,
+            &[RowView {
+                name: "x",
+                motd: &motd,
+                status: &status,
+                players: &players,
+                ping: Ping::Latency(20),
+                icon: None,
+            }],
+        );
+        let mut atlas = GlyphAtlas::new(2048);
+        atlas.add_text(&fonts, Weight::REGULAR, "2 / 20 ᴀʟᴇx Steve Hello x");
+        atlas.add_text(&fonts, Weight::SEMIBOLD, "x");
+        let draw = |screen: &ServerListScreen| {
+            let mut shapes = ShapeList::new();
+            let mut text = TextList::new();
+            screen.draw(&mut shapes, &mut text, Some(&atlas), 0.0);
+            (shapes.shapes().len(), text.quads().len())
+        };
+        let r = screen.list.row_rect(0);
+        let at = screen.status_rect(&screen.rows[0], r);
+        screen.pointer(Some((at.x + 2.0, at.y + 0.5 * at.h)));
+        let (shapes_on, glyphs_on) = draw(&screen);
+        screen.pointer(Some((r.x + 5.0, r.y + 5.0)));
+        let (shapes_off, glyphs_off) = draw(&screen);
+        // A panel, and the two names' glyphs.
+        assert_eq!(shapes_on, shapes_off + 1);
+        assert_eq!(glyphs_on - glyphs_off, "ᴀʟᴇxSteve".chars().count());
     }
 
     #[test]
@@ -647,6 +1030,7 @@ mod tests {
                 name: "x",
                 motd: m,
                 status: &status,
+                players: &[],
                 ping: Ping::Pinging,
                 icon: None,
             })
@@ -672,6 +1056,7 @@ mod tests {
                 name: "x",
                 motd: m,
                 status: &status,
+                players: &[],
                 ping: Ping::Latency(500),
                 icon: Some(7),
             })

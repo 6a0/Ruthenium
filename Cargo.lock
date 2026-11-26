@@ -2511,7 +2511,9 @@ dependencies = [
  "ruthenium-data",
  "ruthenium-protocol",
  "sha1",
+ "socket2",
  "tokio",
+ "ureq",
 ]
 
 [[package]]

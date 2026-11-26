@@ -2,8 +2,10 @@
 //!
 //! - [`address`]: server addresses as players type them (`host`, `host:port`,
 //!   `[v6]:port`).
-//! - [`resolve`]: the system resolver with Minecraft's SRV redirect.
-//! - [`ping`]: the server list's status ping, on a background thread.
+//! - [`resolve`]: the system resolver with Minecraft's SRV redirect and Mojang's list
+//!   of blocked servers.
+//! - [`ping`]: the server list's status ping (and the legacy one), on a background thread.
+//! - [`lan`]: games open to the local network, heard on their multicast group.
 //! - [`server_list`]: the saved list, `servers.dat`.
 //! - [`connection`]: a connection for playing, from the handshake into play, on its own
 //!   thread.
@@ -15,6 +17,7 @@
 pub mod address;
 pub mod connection;
 pub mod crypt;
+pub mod lan;
 pub mod ping;
 pub mod resolve;
 pub mod server_list;

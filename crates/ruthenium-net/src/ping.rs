@@ -7,7 +7,10 @@
 //! and time the pong. Each step reports as it happens, so the list can show the status
 //! before the latency arrives. A second status response is refused, as vanilla does.
 //!
-//! Not yet: vanilla's legacy (pre-1.7, `0xFE`) ping, which it tries after a failure.
+//! When the status ping fails after the address resolved, the legacy ping (`0xFE`, the
+//! server list ping of 1.4 to 1.6, `LegacyServerPinger.java`) is tried on the same
+//! address, as vanilla does; servers that still answer it report their version, message
+//! and player count.
 
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
@@ -34,13 +37,27 @@ const INTENT_STATUS: i32 = 1;
 /// The handshake's host field limit (`ClientIntentionPacket`).
 const MAX_HOST: usize = 255;
 
-/// What a ping reports, in order: `Status` then `Pong`, or `Failed` at any point.
+/// What a ping reports, in order: `Status` then `Pong`, or `Failed` at any point, and
+/// after a failure maybe `Legacy`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PingEvent {
     Status(ServerStatus),
     /// Milliseconds from the ping request to the pong.
     Pong(u64),
     Failed(PingError),
+    /// The server answered the legacy ping.
+    Legacy(LegacyStatus),
+}
+
+/// A legacy ping's answer (`LegacyServerPinger.Output`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyStatus {
+    pub protocol: i32,
+    pub version: String,
+    /// The message, with legacy `§` codes.
+    pub motd: String,
+    pub players: i32,
+    pub max_players: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +174,92 @@ async fn ping(resolver: &Resolver, input: &str, mut report: impl FnMut(PingEvent
     };
     if let Err(e) = exchange(socket, &address, &mut report).await {
         report(PingEvent::Failed(PingError::Connection(e)));
+        if let Ok(Some(legacy)) = legacy_ping(socket, &address).await {
+            report(PingEvent::Legacy(legacy));
+        }
+    }
+}
+
+/// The legacy ping's request: `0xFE 0x01`, then a plugin message (`0xFA`) on
+/// `MC|PingHost` with protocol 127, the host and the port.
+fn legacy_request(host: &str, port: u16) -> Vec<u8> {
+    fn string(out: &mut Vec<u8>, s: &str) {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        out.extend_from_slice(&(units.len() as u16).to_be_bytes());
+        out.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+    }
+    let mut payload = vec![127];
+    string(&mut payload, host);
+    payload.extend_from_slice(&i32::from(port).to_be_bytes());
+    let mut out = vec![0xFE, 0x01, 0xFA];
+    string(&mut out, "MC|PingHost");
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend(payload);
+    out
+}
+
+/// Reads a legacy answer: `0xFF`, then a string (UTF-16 units, counted) of six fields
+/// split by NUL, the first `§1`. `None` until `bytes` holds all of it; `Some(None)` for
+/// an answer of another kind.
+fn legacy_answer(bytes: &[u8]) -> Option<Option<LegacyStatus>> {
+    let (&first, rest) = bytes.split_first()?;
+    if first != 0xFF {
+        return Some(None);
+    }
+    let count = i16::from_be_bytes([*rest.first()?, *rest.get(1)?]);
+    let Ok(count) = usize::try_from(count) else {
+        return Some(None);
+    };
+    let body = rest.get(2..2 + 2 * count)?;
+    let units: Vec<u16> = body
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes(*c))
+        .collect();
+    let text = String::from_utf16_lossy(&units);
+    let parts: Vec<&str> = text.splitn(6, '\0').collect();
+    if parts.len() < 6 || parts[0] != "§1" {
+        return Some(None);
+    }
+    let int = |s: &str, default| s.parse().unwrap_or(default);
+    Some(Some(LegacyStatus {
+        protocol: int(parts[1], 0),
+        version: parts[2].to_owned(),
+        motd: parts[3].to_owned(),
+        players: int(parts[4], -1),
+        max_players: int(parts[5], -1),
+    }))
+}
+
+/// The legacy ping: what the server answers, if it answers in kind.
+async fn legacy_ping(
+    socket: std::net::SocketAddr,
+    address: &ServerAddress,
+) -> Result<Option<LegacyStatus>, String> {
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(socket))
+        .await
+        .map_err(|_| "connection timed out".to_owned())?
+        .map_err(|e| e.to_string())?;
+    let _ = stream.set_nodelay(true);
+    stream
+        .write_all(&legacy_request(&address.host_ascii(), address.port()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    loop {
+        if let Some(answer) = legacy_answer(&buf) {
+            return Ok(answer);
+        }
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| "timed out".to_owned())?
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk[..n]);
     }
 }
 
@@ -306,6 +409,119 @@ mod tests {
         assert_eq!(got.len(), 2, "{got:?}");
         assert!(matches!(&got[0], (7, PingEvent::Status(s)) if s.description.plain() == "Hi"));
         assert!(matches!(got[1], (7, PingEvent::Pong(_))));
+    }
+
+    #[test]
+    fn legacy_request_layout() {
+        let r = legacy_request("ab", 25565);
+        let mut want = vec![0xFE, 0x01, 0xFA, 0, 11];
+        for c in "MC|PingHost".encode_utf16() {
+            want.extend_from_slice(&c.to_be_bytes());
+        }
+        // Payload: protocol 127, "ab" (2 units), port as an int.
+        want.extend_from_slice(&[
+            0,
+            1 + 2 + 4 + 4,
+            127,
+            0,
+            2,
+            0,
+            b'a',
+            0,
+            b'b',
+            0,
+            0,
+            0x63,
+            0xDD,
+        ]);
+        assert_eq!(r, want);
+    }
+
+    fn legacy_bytes(text: &str) -> Vec<u8> {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut out = vec![0xFF];
+        out.extend_from_slice(&(units.len() as u16).to_be_bytes());
+        out.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+        out
+    }
+
+    #[test]
+    fn legacy_answers() {
+        let b = legacy_bytes("§1\x00127\x001.6.4\x00§aHi \u{1F600}\x0012\x00x");
+        assert_eq!(legacy_answer(&b[..b.len() - 1]), None, "not all there yet");
+        assert_eq!(
+            legacy_answer(&b),
+            Some(Some(LegacyStatus {
+                protocol: 127,
+                version: "1.6.4".into(),
+                motd: "§aHi \u{1F600}".into(),
+                players: 12,
+                max_players: -1,
+            }))
+        );
+        // Pre-1.4 answers, other packets, too few fields: nothing.
+        assert_eq!(legacy_answer(&legacy_bytes("A server§0§20")), Some(None));
+        assert_eq!(legacy_answer(&[0x00, 1, 2]), Some(None));
+        assert_eq!(
+            legacy_answer(&legacy_bytes("§2\x0074\x00v\x00m\x001\x002")),
+            Some(None)
+        );
+        assert_eq!(legacy_answer(&legacy_bytes("§1\x00127\x00v")), Some(None));
+        // The sixth field keeps any further NULs.
+        let b = legacy_bytes("§1\x00x\x00v\x00m\x001\x002\x00extra");
+        assert_eq!(legacy_answer(&b).unwrap().unwrap().max_players, -1);
+        assert_eq!(
+            legacy_answer(&[0xFF, 0xFF, 0xFF]),
+            Some(None),
+            "negative length"
+        );
+    }
+
+    /// A pre-1.7 server: it closes on the modern handshake and answers the legacy ping.
+    #[test]
+    fn falls_back_to_the_legacy_ping() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        rt.spawn(async move {
+            // The status ping: refused by closing.
+            let (s, _) = listener.accept().await.unwrap();
+            drop(s);
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 3];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, [0xFE, 0x01, 0xFA]);
+            s.write_all(&legacy_bytes(
+                "§1\x0074\x001.6.4\x00Old §cserver\x003\x0020",
+            ))
+            .await
+            .unwrap();
+        });
+        let pinger = Pinger::new().unwrap();
+        pinger.ping(3, &format!("127.0.0.1:{port}"));
+        let mut got = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while got.len() < 2 && Instant::now() < deadline {
+            rt.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
+            got.extend(pinger.poll());
+        }
+        assert!(matches!(got[0], (3, PingEvent::Failed(_))), "{got:?}");
+        assert_eq!(
+            got[1],
+            (
+                3,
+                PingEvent::Legacy(LegacyStatus {
+                    protocol: 74,
+                    version: "1.6.4".into(),
+                    motd: "Old §cserver".into(),
+                    players: 3,
+                    max_players: 20,
+                })
+            )
+        );
     }
 
     #[test]

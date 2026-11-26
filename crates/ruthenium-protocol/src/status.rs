@@ -13,8 +13,15 @@ pub const MAX_RESPONSE: usize = 32767;
 pub struct Players {
     pub max: i32,
     pub online: i32,
-    /// Names from the sample, in order.
-    pub sample: Vec<String>,
+    /// The sample of who is online, in order.
+    pub sample: Vec<SamplePlayer>,
+}
+
+/// One player of a status's sample (servers often put lines of their own here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SamplePlayer {
+    pub name: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +49,8 @@ impl ServerStatus {
     /// Parses the response's JSON. Missing or malformed optional parts are left out; a
     /// response that is not a JSON object is an error.
     pub fn parse(json: &str) -> Result<ServerStatus, String> {
-        let v: Value = serde_json::from_str(json).map_err(|e| format!("status JSON: {e}"))?;
+        let json = mend_surrogates(json);
+        let v: Value = serde_json::from_str(&json).map_err(|e| format!("status JSON: {e}"))?;
         let o = v.as_object().ok_or("status is not a JSON object")?;
         let int = |v: &Value, k: &str| v.get(k).and_then(Value::as_i64).map(|n| n as i32);
         let players = o.get("players").and_then(|p| {
@@ -54,7 +62,12 @@ impl ServerStatus {
                     .and_then(Value::as_array)
                     .map(|s| {
                         s.iter()
-                            .filter_map(|e| Some(e.get("name")?.as_str()?.to_owned()))
+                            .filter_map(|e| {
+                                Some(SamplePlayer {
+                                    name: e.get("name")?.as_str()?.to_owned(),
+                                    id: e.get("id")?.as_str()?.to_owned(),
+                                })
+                            })
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -90,6 +103,45 @@ impl ServerStatus {
     }
 }
 
+/// `json` with every `\u` escape of half a surrogate pair that has no other half made
+/// U+FFFD: Gson reads such strings and the game shows the half as that, where a strict
+/// parser would refuse the whole status.
+fn mend_surrogates(json: &str) -> std::borrow::Cow<'_, str> {
+    let unit = |s: &str| -> Option<u16> {
+        let hex = s.strip_prefix("\\u")?.get(..4)?;
+        u16::from_str_radix(hex, 16).ok()
+    };
+    if !json.contains("\\u") {
+        return json.into();
+    }
+    let mut out = String::with_capacity(json.len());
+    let mut rest = json;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        match unit(rest) {
+            Some(0xD800..=0xDBFF)
+                if unit(&rest[6..]).is_some_and(|l| (0xDC00..=0xDFFF).contains(&l)) =>
+            {
+                out.push_str(&rest[..12]);
+                rest = &rest[12..];
+            }
+            Some(0xD800..=0xDFFF) => {
+                out.push_str("\\uFFFD");
+                rest = &rest[6..];
+            }
+            _ => {
+                // Any other escape: the backslash and what it escapes.
+                let len = rest[1..].chars().next().map_or(0, char::len_utf8);
+                out.push_str(&rest[..1 + len]);
+                rest = &rest[1 + len..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out.into()
+}
+
 /// Width and height from a PNG's header, if `bytes` starts like a PNG.
 pub fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -119,7 +171,10 @@ mod tests {
             Some(Players {
                 max: 100,
                 online: 3,
-                sample: vec!["Alex".into()]
+                sample: vec![SamplePlayer {
+                    name: "Alex".into(),
+                    id: "0541ed27-7a6e-4bb3-a0a4-1c56a1a3a9b5".into()
+                }]
             })
         );
         assert_eq!(s.version.unwrap().protocol, 777);
@@ -135,6 +190,15 @@ mod tests {
         assert_eq!(s.version, None);
         assert!(ServerStatus::parse("[]").is_err());
         assert!(ServerStatus::parse("{").is_err());
+    }
+
+    #[test]
+    fn lone_surrogates_show_as_replacement_characters() {
+        let s = ServerStatus::parse(
+            r#"{"description":"a\ud83d b\ude00 c\ud83d\ude00 \\ud83d \"\u00e9"}"#,
+        )
+        .unwrap();
+        assert_eq!(s.description.plain(), "a\u{FFFD} b\u{FFFD} c😀 \\ud83d \"é");
     }
 
     #[test]
