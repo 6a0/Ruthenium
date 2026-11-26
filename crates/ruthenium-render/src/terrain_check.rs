@@ -251,11 +251,19 @@ impl Case {
 }
 
 /// Where each texel a quad shows is in the atlas. The two texels around half opaque
-/// are not side by side: averaged, their border would be a hole or not by the last bit
-/// of a GPU's arithmetic.
-const TEXELS: [([u32; 2], Rgba); 24] = [
+/// are not side by side, and the two around a tenth have one of their own kind on
+/// either side: averaged, their border would be a hole or not by the last bit of a
+/// GPU's arithmetic. (With the two around a tenth side by side, llvmpipe, which rounds
+/// each filtered sample of an 8-bit texture to 8 bits, kept the last column of the one
+/// under: its four samples' mean came to 25.5 of 255, the tenth itself, where the
+/// arithmetic here makes 25.44.)
+const TEXELS: [([u32; 2], Rgba); 28] = [
+    ([19, 0], UNDER_A_TENTH),
     ([20, 0], UNDER_A_TENTH),
-    ([21, 0], OVER_A_TENTH),
+    ([21, 0], UNDER_A_TENTH),
+    ([24, 0], OVER_A_TENTH),
+    ([25, 0], OVER_A_TENTH),
+    ([26, 0], OVER_A_TENTH),
     ([22, 0], GLASS_NEAR),
     ([23, 0], GLASS_FAR),
     ([0, 0], WHITE),
@@ -563,7 +571,7 @@ impl Scene {
             z: -2.0,
             ..Quad::texel([3.5, 4.0, 4.0, 5.0], [2, 0])
         });
-        translucent.push(Quad::texel(cell(3, 4), [21, 0]));
+        translucent.push(Quad::texel(cell(3, 4), [25, 0]));
         probe(
             "a texel a tenth opaque",
             [3.0, 4.0, 3.5, 5.0],
@@ -942,8 +950,16 @@ fn trilinear(atlas: &Atlas, lambda: f32, at: [f32; 2]) -> [f32; 4] {
 /// work it out, square roots and divisions and all (`terrain_frag.glsl` keeps that
 /// arithmetic for rgss-reference; its other shaders multiply instead). `du` and
 /// `dv` are how far the place moves, in texels, from one pixel to the next across and
-/// down the screen. `rgss`: with far texels averaged.
-fn sampled(atlas: &Atlas, at: [f32; 2], du: [f32; 2], dv: [f32; 2], rgss: bool) -> [f32; 4] {
+/// down the screen. `rgss`: with far texels averaged. `lod`: how the sampler's level
+/// is cut.
+fn sampled(
+    atlas: &Atlas,
+    at: [f32; 2],
+    du: [f32; 2],
+    dv: [f32; 2],
+    rgss: bool,
+    lod: Lod,
+) -> [f32; 4] {
     let size = atlas.size.map(|s| s as f32);
     // The shader works in coordinates from 0 to 1 across the whole atlas: a texel is
     // not as wide there as it is high, in this atlas.
@@ -962,7 +978,7 @@ fn sampled(atlas: &Atlas, at: [f32; 2], du: [f32; 2], dv: [f32; 2], rgss: bool) 
     // The sampler's level, from the derivatives the shader hands it: the longer of the
     // two steps in texels of the first level (Vulkan's rho, as it is defined).
     let rho = |d: [f32; 2]| ((d[0] * size[0]).powi(2) + (d[1] * size[1]).powi(2)).sqrt();
-    let nearest = trilinear(atlas, rho(du).max(rho(dv)).log2(), snapped);
+    let nearest = trilinear(atlas, lod.cut(rho(du).max(rho(dv)).log2()), snapped);
     if !rgss {
         return nearest;
     }
@@ -1022,8 +1038,49 @@ pub(crate) fn fog_amount(distance: f32, range: [f32; 2]) -> f32 {
 /// at each corner and carried across each of a quad's two triangles; the atlas's
 /// colour as the case's shader filters it, times the lit colour; the fade towards the
 /// fog's colour; the cutout layer's holes; the fog. What a frame of `case` must read,
-/// pixel for pixel.
+/// pixel for pixel, with the sampler's level as it is worked out.
+#[cfg(test)]
 fn picture(scene: &Scene, case: Case) -> Vec<u8> {
+    rasterise(scene, case, Lod::Exact).0
+}
+
+/// Whether `alpha` is less than half a step of an 8-bit alpha from `threshold`: a GPU
+/// that rounds each filtered sample to 8 bits may put it on the other side. (A texel's
+/// own alpha may be half a step off, as 25 of 255 is from a tenth: that is not close.)
+fn by_a_hair(alpha: f32, threshold: f32) -> bool {
+    ((alpha - threshold) * 255.0).abs() < 0.499
+}
+
+/// How the sampler's level is taken where it falls between two levels: as it is
+/// worked out, or with what it takes of the next level cut to sixteenths, down or up.
+/// Vulkan lets a GPU blend two levels in as few as sixteenths (`mipmapPrecisionBits`
+/// is at least 4): llvmpipe in Mesa 26.2 takes 9/16 of the next level where the
+/// logarithm of 1.5 is 0.585. A frame must read between the pictures of the two cuts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Lod {
+    #[cfg_attr(not(test), allow(dead_code))]
+    Exact,
+    Down,
+    Up,
+}
+
+impl Lod {
+    fn cut(self, lambda: f32) -> f32 {
+        const STEPS: f32 = 16.0;
+        match self {
+            Lod::Exact => lambda,
+            Lod::Down => (lambda * STEPS).floor() / STEPS,
+            Lod::Up => (lambda * STEPS).ceil() / STEPS,
+        }
+    }
+}
+
+/// [`picture`] with the sampler's level taken as `lod` says, and the pixels where a
+/// fragment was kept or left out by less than half a step of its 8-bit alpha: where a
+/// GPU that rounds what it filters to 8 bits may decide the other way. The scene has
+/// none.
+fn rasterise(scene: &Scene, case: Case, lod: Lod) -> (Vec<u8>, Vec<[u32; 2]>) {
+    let mut close = Vec::new();
     let fog = &FOGS[case.fog];
     let fogged = case.fogged();
     let rgss = case.rgss();
@@ -1119,7 +1176,7 @@ fn picture(scene: &Scene, case: Case) -> Vec<u8> {
                     let uv: [f32; 2] = std::array::from_fn(|a| {
                         uv0[a] + (uv3[a] - uv0[a]) * s + (uv1[a] - uv0[a]) * t
                     });
-                    let texel = sampled(atlas, uv, du, dv, rgss);
+                    let texel = sampled(atlas, uv, du, dv, rgss, lod);
                     let mut c: [f32; 4] = std::array::from_fn(|i| texel[i] * lit_colour[i]);
                     if fogged {
                         // Towards the fog's colour, with the texel's own alpha.
@@ -1129,6 +1186,9 @@ fn picture(scene: &Scene, case: Case) -> Vec<u8> {
                             let from = fog.colour[i] * if i == 3 { alpha } else { 1.0 };
                             *v = from * (1.0 - f) + *v * f;
                         }
+                    }
+                    if threshold > 0.0 && by_a_hair(c[3], threshold) {
+                        close.push([px, py]);
                     }
                     if c[3] < threshold {
                         continue;
@@ -1159,7 +1219,7 @@ fn picture(scene: &Scene, case: Case) -> Vec<u8> {
         }
         next += count as usize;
     }
-    colour.into_iter().flatten().collect()
+    (colour.into_iter().flatten().collect(), close)
 }
 
 /// What the check has seen so far.
@@ -1197,8 +1257,9 @@ pub(crate) struct TerrainCheck {
     /// The atlas with mip levels.
     mipped: TextureId,
     lightmap: TextureId,
-    /// What each kind of frame must read ([`Case::picture`]), once one was drawn.
-    pictures: Vec<Option<Vec<u8>>>,
+    /// What each kind of frame must read between ([`Case::picture`], [`Lod`]), once one
+    /// was drawn.
+    pictures: Vec<Option<[Vec<u8>; 2]>>,
     report: TerrainCheckReport,
 }
 
@@ -1340,11 +1401,12 @@ impl TerrainCheck {
         if let Some((drawn, pixels)) = self.target.take(completed) {
             let case = Case::of(drawn);
             let scene = &self.scene;
-            let expected =
-                self.pictures[case.picture()].get_or_insert_with(|| picture(scene, case));
+            let [low, high] = self.pictures[case.picture()].get_or_insert_with(|| {
+                [Lod::Down, Lod::Up].map(|lod| rasterise(scene, case, lod).0)
+            });
             let ok = compare(
                 &self.scene.probes,
-                expected,
+                [low, high],
                 case,
                 drawn,
                 pixels,
@@ -1615,13 +1677,14 @@ impl TerrainCheck {
 }
 
 /// Judges every probe's pixels in an RGBA image of the scene drawn as `case` against
-/// `expected`, the rasteriser's picture of that case, and says so if one is wrong (in
-/// detail for the first few mismatching frames). In fog a pixel may be a step further
+/// `expected`, the rasteriser's pictures of that case with the sampler's level cut
+/// down and up ([`Lod`]): each channel must read between the two. Says so if one is
+/// wrong (in detail for the first few mismatching frames). In fog a pixel may be a step further
 /// off than its probe allows, and with averaged texels two: its colour went through
 /// more arithmetic.
 fn compare(
     probes: &[Probe],
-    expected: &[u8],
+    expected: [&[u8]; 2],
     case: Case,
     frame: u64,
     pixels: &[u8],
@@ -1641,20 +1704,27 @@ fn compare(
         let wrong = (y0..y1)
             .flat_map(|y| (x0..x1).map(move |x| (x, y)))
             .find(|&(x, y)| {
-                at(pixels, x, y)
-                    .iter()
-                    .zip(at(expected, x, y))
-                    .any(|(&got, want)| got.abs_diff(want) > tolerance)
+                let (low, high) = (at(expected[0], x, y), at(expected[1], x, y));
+                at(pixels, x, y).iter().enumerate().any(|(i, &got)| {
+                    let (from, to) = (low[i].min(high[i]), low[i].max(high[i]));
+                    got < from.saturating_sub(tolerance) || got > to.saturating_add(tolerance)
+                })
             });
         if let Some((x, y)) = wrong {
             if mismatches < PRINTED {
+                let (low, high) = (at(expected[0], x, y), at(expected[1], x, y));
+                let between = if low == high {
+                    String::new()
+                } else {
+                    format!(" and {high:?}")
+                };
                 eprintln!(
-                    "[terrain-check] frame {frame} ({}, fog {}), {}: pixel ({x}, {y}) reads {:?}, must be {:?} within {tolerance}",
+                    "[terrain-check] frame {frame} ({}, fog {}), {}: pixel ({x}, {y}) reads {:?}, must be {}{low:?}{between} within {tolerance}",
                     case.shader.name(),
                     case.fog,
                     p.what,
                     at(pixels, x, y),
-                    at(expected, x, y),
+                    if low == high { "" } else { "between " },
                 );
             }
             ok = false;
@@ -1701,7 +1771,7 @@ mod tests {
                 }
             }
         }
-        assert!(compare(&scene.probes, &image, HARD, 0, &image, 0));
+        assert!(compare(&scene.probes, [&image, &image], HARD, 0, &image, 0));
         // Every pixel is judged by some probe.
         let mut covered = vec![false; (WIDTH * HEIGHT) as usize];
         for p in &scene.probes {
@@ -1721,7 +1791,7 @@ mod tests {
         let fails = |change: &dyn Fn(&mut Vec<u8>)| {
             let mut image = good.clone();
             change(&mut image);
-            !compare(&scene.probes, &good, HARD, 0, &image, PRINTED)
+            !compare(&scene.probes, [&good, &good], HARD, 0, &image, PRINTED)
         };
         assert!(!fails(&|_| {}));
         // A grey one step off (an sRGB view would be tens off).
@@ -1746,7 +1816,7 @@ mod tests {
             for (b, expected) in pictures.iter().enumerate() {
                 let case = Case { fog: b, ..HARD };
                 assert_eq!(
-                    compare(&scene.probes, expected, case, 0, drawn, PRINTED),
+                    compare(&scene.probes, [expected, expected], case, 0, drawn, PRINTED),
                     a == b,
                     "fog {a} judged as fog {b}"
                 );
@@ -1840,14 +1910,21 @@ mod tests {
         // as it is wide in the shader's coordinates.
         let (du, dv) = ([0.125, 0.0], [0.0, 0.125]);
         // In the middle of the even stretch every sample reads its colour.
-        let even = sampled(&texels, [(EVEN_AT + 20) as f32 + 0.3, 5.4], du, dv, true);
+        let even = sampled(
+            &texels,
+            [(EVEN_AT + 20) as f32 + 0.3, 5.4],
+            du,
+            dv,
+            true,
+            Lod::Exact,
+        );
         for (got, want) in even.iter().zip(EVEN) {
             assert!((got * 255.0 - f32::from(want)).abs() < 0.01);
         }
         // At the middle of the grey texel, with white to its left, red to its right
         // and poison below: the four samples lie an eighth and three eighths of a
         // texel from it, so each reads some of a neighbour.
-        let grey = sampled(&texels, [1.5, 0.5], du, dv, true);
+        let grey = sampled(&texels, [1.5, 0.5], du, dv, true, Lod::Exact);
         let part = |x: f32, y: f32| -> [f32; 4] {
             // Towards the left neighbour for x below the middle, the right one above;
             // towards the row below for y above the middle (there is none above).
@@ -1871,7 +1948,7 @@ mod tests {
         }
         // With hard edges it is the grey itself, there and a pixel from its border.
         for x in [1.5, 1.0625, 1.9375] {
-            let hard = sampled(&texels, [x, 0.5], du, dv, false);
+            let hard = sampled(&texels, [x, 0.5], du, dv, false, Lod::Exact);
             assert_eq!(hard.map(|c| (c * 255.0).round() as u8), GREY);
         }
         // A square atlas would count the same texel as near, and give the grey with
@@ -1967,6 +2044,80 @@ mod tests {
         }
         // (The first level averaged is the first with the half as well.)
         assert_eq!((far, halved, taken_off), (9, 7, 8));
+    }
+
+    #[test]
+    fn no_fragment_is_kept_or_left_out_by_a_hair() {
+        // The mean llvmpipe made 25.5 of 255 where the arithmetic makes 25.44 is close;
+        // a texel a step under or over a tenth is not, nor one that is half opaque.
+        assert!(by_a_hair(25.4375 / 255.0, 0.1) && by_a_hair(25.5625 / 255.0, 0.1));
+        assert!(by_a_hair(127.6 / 255.0, 0.5));
+        for alpha in [25.0, 26.0, 24.9, 26.1, 127.0, 128.0] {
+            assert!(!by_a_hair(alpha / 255.0, 0.1), "{alpha}");
+        }
+        assert!(!by_a_hair(127.0 / 255.0, 0.5) && !by_a_hair(128.0 / 255.0, 0.5));
+        let scene = Scene::build();
+        for frame in 0..(TerrainShader::ALL.len() * FOGS.len()) as u64 {
+            let case = Case::of(frame);
+            for lod in [Lod::Exact, Lod::Down, Lod::Up] {
+                let (_, close) = rasterise(&scene, case, lod);
+                assert!(close.is_empty(), "{case:?}, {lod:?}: {close:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_sampler_may_blend_two_levels_in_sixteenths() {
+        let scene = Scene::build();
+        let [down, up] = [Lod::Down, Lod::Up].map(|lod| rasterise(&scene, HARD, lod).0);
+        let exact = picture(&scene, HARD);
+        // Only the quads between two levels differ, and there the exact level lies
+        // between the two cuts.
+        let mut differ = 0;
+        for i in 0..exact.len() {
+            let (from, to) = (down[i].min(up[i]), down[i].max(up[i]));
+            assert!((from..=to).contains(&exact[i]), "byte {i}");
+            differ += usize::from(down[i] != up[i]);
+        }
+        let [x0, y0, x1, y1] = pixels([10.0, 5.0, 11.0, 6.0]);
+        assert!(differ > 0 && differ <= ((x1 - x0) * (y1 - y0) * 4 * 4) as usize);
+        // What llvmpipe (Mesa 26.2) reads in the middle of the quad that shows one and a
+        // half texels a pixel (the logarithm 0.585, which it takes as 9/16) passes; the
+        // first level, the second, or a level a sixteenth beyond the cuts do not.
+        let (x, y) = (x0 + 4, y0 + 4);
+        let reads = |c: Rgba| {
+            let mut image = exact.clone();
+            let i = ((y * WIDTH + x) * 4) as usize;
+            image[i..i + 4].copy_from_slice(&c);
+            compare(&scene.probes, [&down, &up], HARD, 0, &image, PRINTED)
+        };
+        assert!(reads([116, 121, 31, 255]));
+        assert!(reads(pixel(&exact, x, y)));
+        let level = |lambda: f32| -> Rgba {
+            std::array::from_fn(|i| {
+                let (a, b) = (f32::from(MIP_COLOURS[0][i]), f32::from(MIP_COLOURS[1][i]));
+                (a + (b - a) * lambda).round() as u8
+            })
+        };
+        assert!(reads(level(9.0 / 16.0)) && reads(level(10.0 / 16.0)));
+        // The probe's step either side of the two cuts, and no more.
+        let (low, high) = (pixel(&down, x, y), pixel(&up, x, y));
+        let beyond = |from: Rgba, to: Rgba, steps: u8| -> Rgba {
+            std::array::from_fn(|i| {
+                if to[i] > from[i] {
+                    to[i] + steps
+                } else if to[i] < from[i] {
+                    to[i] - steps
+                } else {
+                    to[i]
+                }
+            })
+        };
+        assert!(reads(beyond(low, high, 1)) && reads(beyond(high, low, 1)));
+        assert!(!reads(beyond(low, high, 2)) && !reads(beyond(high, low, 2)));
+        for lambda in [0.0, 1.0, 8.0 / 16.0, 11.0 / 16.0] {
+            assert!(!reads(level(lambda)), "{lambda}");
+        }
     }
 
     #[test]
