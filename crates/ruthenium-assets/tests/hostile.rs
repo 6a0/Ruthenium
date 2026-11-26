@@ -1878,6 +1878,17 @@ fn a_cancelled_load_finds_nothing_and_builds_nothing() {
     );
     let items = ItemModels::bake(&res, &a, &a, None);
     assert_eq!(items.len(), 0);
+    // Definitions already read when the flag is set: the bake stops at the next one.
+    let definitions = vec![(
+        "minecraft:stone".to_owned(),
+        r#"{"model": {"type": "model", "model": "block/m"}}"#.to_owned(),
+    )];
+    let items = ItemModels::bake_from(&res, &definitions, &a, &a, None);
+    assert!(
+        items.warnings.iter().any(|w| w.contains("cancelled")),
+        "{:?}",
+        items.warnings
+    );
     assert!(!font(&res).has('a'));
 }
 

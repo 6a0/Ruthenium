@@ -342,10 +342,6 @@ impl Font {
             match file.json() {
                 Ok(json) => {
                     for p in json["providers"].as_array().map_or(&[][..], Vec::as_slice) {
-                        if res.cancelled() {
-                            self.warnings.push("the load was cancelled".into());
-                            break;
-                        }
                         if self.providers.len() >= self.limits.font_providers {
                             self.warnings.push(format!(
                                 "font {id}: more providers than a font may have ({})",
