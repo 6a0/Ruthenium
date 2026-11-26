@@ -10,7 +10,7 @@
 //! Every component type has a reader here. The ones the client simulation uses are
 //! [`Component`]'s typed variants; the rest are kept as their raw bytes
 //! ([`Component::Other`]). A typed value's bytes are kept too ([`RawValues`]), for
-//! what it leaves out. Types without a network codec of their own (custom data,
+//! what it leaves out: a container click hashes every field (`crate::hashed`). Types without a network codec of their own (custom data,
 //! locks, recipes...) go over the wire as one network NBT tag, as vanilla's fallback
 //! (`ByteBufCodecs.fromCodecWithRegistries`) sends them.
 //!
@@ -25,7 +25,7 @@
 use ruthenium_data::v26_3::registries::DataComponentType as Kind;
 
 use crate::profile::ResolvableProfile;
-use crate::wire::{MAX_STRING, Reader, WireError};
+use crate::wire::{self, MAX_STRING, Reader, WireError};
 
 /// How deeply stacks and recursive values (a stack in a bundle in a bundle, an effect's
 /// hidden effect) may nest before the reader refuses them, so that a hostile packet
@@ -120,7 +120,9 @@ pub struct ComponentPatch {
 }
 
 /// The bytes the typed components of a patch were read from, for what their typed value
-/// leaves out. Patches compare equal whatever their bytes.
+/// leaves out: hashing a stack (`crate::hashed`) writes every field. A value changed
+/// since it was read no longer reads back from its bytes, and is then written from the
+/// typed value instead. Patches compare equal whatever their bytes.
 #[derive(Clone, Default)]
 pub struct RawValues(Vec<(i32, Box<[u8]>)>);
 
@@ -191,6 +193,27 @@ impl ComponentPatch {
             removed,
             raw: RawValues(raw),
         })
+    }
+}
+
+/// A template nested `depth` deep in another value (for `crate::hashed`).
+pub(crate) fn read_template_at(r: &mut Reader<'_>, depth: u32) -> Result<ItemStack, WireError> {
+    read_template(r, depth)
+}
+
+/// Whether `raw` reads as exactly `value`, a component of type `kind`: compared by
+/// what each writes, so a NaN is the same NaN.
+pub(crate) fn reads_as(kind: Kind, raw: &[u8], value: &Component) -> bool {
+    let mut r = Reader::new(raw);
+    let Ok(read) = read_component(&mut r, kind.id() as i32, 0) else {
+        return false;
+    };
+    if r.finish().is_err() {
+        return false;
+    }
+    match (write_value(&read), write_value(value)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => read == *value,
     }
 }
 
@@ -637,6 +660,355 @@ fn read_component(r: &mut Reader<'_>, kind: i32, depth: u32) -> Result<Component
         }
     };
     Ok(c)
+}
+
+/// Writes a typed component's value as the server would send it, with what the typed
+/// value leaves out (sounds, effects, an inline value's description...) at its codec's
+/// default. For `crate::hashed`, when a value was built or changed rather than read.
+pub(crate) fn write_value(c: &Component) -> Result<Vec<u8>, &'static str> {
+    let mut o = Vec::new();
+    write_into(c, &mut o)?;
+    Ok(o)
+}
+
+fn sound_id(name: &str) -> i32 {
+    ruthenium_data::v26_3::registries::SoundEvent::from_name(name).map_or(0, |s| s.id() as i32)
+}
+
+fn write_holder_set(o: &mut Vec<u8>, s: &HolderSet) {
+    match s {
+        HolderSet::Tag(t) => {
+            wire::write_varint(o, 0);
+            wire::write_string(o, t);
+        }
+        HolderSet::Ids(ids) => {
+            wire::write_varint(o, ids.len() as i32 + 1);
+            for &id in ids {
+                wire::write_varint(o, id);
+            }
+        }
+    }
+}
+
+fn write_opt<T>(o: &mut Vec<u8>, v: &Option<T>, f: impl FnOnce(&mut Vec<u8>, &T)) {
+    wire::write_bool(o, v.is_some());
+    if let Some(v) = v {
+        f(o, v);
+    }
+}
+
+/// A trim's or banner's part: by id, or written out with an empty description.
+fn write_part(o: &mut Vec<u8>, p: &TrimPart, kind: u8) -> Result<(), &'static str> {
+    match p {
+        TrimPart::Id(id) => wire::write_varint(o, id + 1),
+        TrimPart::Inline { asset, decal } => {
+            wire::write_varint(o, 0);
+            wire::write_string(o, asset);
+            if kind == b'b' {
+                // A banner pattern's translation key.
+                wire::write_string(o, "");
+            } else {
+                crate::nbt::write_network(o, &crate::nbt::Tag::String(String::new()))
+                    .map_err(|_| "a trim's description")?;
+                if kind == b'p' {
+                    wire::write_bool(o, *decal);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_template(o: &mut Vec<u8>, s: &ItemStack) -> Result<(), &'static str> {
+    wire::write_varint(o, s.item);
+    wire::write_varint(o, s.count);
+    write_patch(o, &s.patch)
+}
+
+fn write_patch(o: &mut Vec<u8>, p: &ComponentPatch) -> Result<(), &'static str> {
+    wire::write_varint(o, p.added.len() as i32);
+    wire::write_varint(o, p.removed.len() as i32);
+    for (kind, c) in &p.added {
+        wire::write_varint(o, *kind);
+        let k = component_kind(*kind).map_err(|_| "a component type")?;
+        match p.raw.get(*kind).filter(|r| reads_as(k, r, c)) {
+            Some(r) => o.extend_from_slice(r),
+            None => write_into(c, o)?,
+        }
+    }
+    for kind in &p.removed {
+        wire::write_varint(o, *kind);
+    }
+    Ok(())
+}
+
+fn write_into(c: &Component, o: &mut Vec<u8>) -> Result<(), &'static str> {
+    use crate::wire::{write_bool, write_f32, write_i32, write_string, write_varint};
+    match c {
+        Component::MaxStackSize(n) | Component::MaxDamage(n) | Component::Damage(n) => {
+            write_varint(o, *n)
+        }
+        Component::Unbreakable | Component::Glider => {}
+        Component::UseEffects {
+            can_sprint,
+            interact_vibrations,
+            speed_multiplier,
+        } => {
+            write_bool(o, *can_sprint);
+            write_bool(o, *interact_vibrations);
+            write_f32(o, *speed_multiplier);
+        }
+        Component::MinimumAttackCharge(v) => write_f32(o, *v),
+        Component::Enchantments(v) | Component::StoredEnchantments(v) => {
+            write_varint(o, v.len() as i32);
+            for &(e, level) in v {
+                write_varint(o, e);
+                write_varint(o, level);
+            }
+        }
+        Component::Food {
+            nutrition,
+            saturation,
+            can_always_eat,
+        } => {
+            write_varint(o, *nutrition);
+            write_f32(o, *saturation);
+            write_bool(o, *can_always_eat);
+        }
+        Component::Consumable {
+            consume_seconds,
+            animation,
+            has_consume_particles,
+        } => {
+            write_f32(o, *consume_seconds);
+            write_varint(o, *animation);
+            write_varint(o, sound_id("minecraft:entity.generic.eat") + 1);
+            write_bool(o, *has_consume_particles);
+            write_varint(o, 0);
+        }
+        Component::UseRemainder(s) => write_template(o, s)?,
+        Component::UseCooldown {
+            seconds,
+            cooldown_group,
+        } => {
+            write_f32(o, *seconds);
+            write_opt(o, cooldown_group, |o, g| write_string(o, g));
+        }
+        Component::Weapon {
+            item_damage_per_attack,
+            disable_blocking_for_seconds,
+        } => {
+            write_varint(o, *item_damage_per_attack);
+            write_f32(o, *disable_blocking_for_seconds);
+        }
+        Component::AttackRange {
+            min_reach,
+            max_reach,
+            min_creative_reach,
+            max_creative_reach,
+            hitbox_margin,
+            mob_factor,
+        } => {
+            for v in [
+                min_reach,
+                max_reach,
+                min_creative_reach,
+                max_creative_reach,
+                hitbox_margin,
+                mob_factor,
+            ] {
+                write_f32(o, *v);
+            }
+        }
+        Component::Equippable {
+            slot,
+            asset,
+            swappable,
+            damage_on_hurt,
+            equip_on_interact,
+            can_be_sheared,
+        } => {
+            write_varint(o, *slot);
+            write_varint(o, sound_id("minecraft:item.armor.equip_generic") + 1);
+            write_opt(o, asset, |o, a| write_string(o, a));
+            write_bool(o, false);
+            write_bool(o, false);
+            write_bool(o, true);
+            for b in [swappable, damage_on_hurt, equip_on_interact, can_be_sheared] {
+                write_bool(o, *b);
+            }
+            write_varint(o, sound_id("minecraft:item.shears.snip") + 1);
+        }
+        Component::DeathProtection => write_varint(o, 0),
+        Component::BlocksAttacks {
+            block_delay_seconds,
+            disable_cooldown_scale,
+        } => {
+            write_f32(o, *block_delay_seconds);
+            write_f32(o, *disable_cooldown_scale);
+            // The default reduction and item damage, no bypass, no sounds.
+            write_varint(o, 1);
+            write_f32(o, 90.0);
+            write_bool(o, false);
+            write_f32(o, 0.0);
+            write_f32(o, 1.0);
+            for v in [1.0, 0.0, 1.0] {
+                write_f32(o, v);
+            }
+            for _ in 0..3 {
+                write_bool(o, false);
+            }
+        }
+        Component::PiercingWeapon {
+            deals_knockback,
+            dismounts,
+        } => {
+            write_bool(o, *deals_knockback);
+            write_bool(o, *dismounts);
+            write_bool(o, false);
+            write_bool(o, false);
+        }
+        Component::KineticWeapon(w) => {
+            write_varint(o, w.contact_cooldown_ticks);
+            write_varint(o, w.delay_ticks);
+            for c in [
+                &w.dismount_conditions,
+                &w.knockback_conditions,
+                &w.damage_conditions,
+            ] {
+                write_opt(o, c, |o, c| {
+                    write_varint(o, c.max_duration_ticks);
+                    write_f32(o, c.min_speed);
+                    write_f32(o, c.min_relative_speed);
+                });
+            }
+            write_f32(o, w.forward_movement);
+            write_f32(o, w.damage_multiplier);
+            write_bool(o, false);
+            write_bool(o, false);
+        }
+        Component::AttackAnimation(s) | Component::InteractAnimation(s) => {
+            write_varint(o, s.kind);
+            write_varint(o, s.duration);
+        }
+        Component::ChargedProjectiles(v) | Component::BundleContents(v) => {
+            write_varint(o, v.len() as i32);
+            for s in v {
+                write_template(o, s)?;
+            }
+        }
+        Component::PotionContents {
+            potion,
+            custom_color,
+            custom_name,
+        } => {
+            write_opt(o, potion, |o, p| write_varint(o, *p));
+            write_opt(o, custom_color, |o, c| write_i32(o, *c));
+            write_varint(o, 0);
+            write_opt(o, custom_name, |o, n| write_string(o, n));
+        }
+        Component::ItemModel(s) => write_string(o, s),
+        Component::DyedColor(v) => write_i32(o, *v),
+        Component::EnchantmentGlintOverride(b) => write_bool(o, *b),
+        Component::Trim { material, pattern } => {
+            write_part(o, material, b'm')?;
+            write_part(o, pattern, b'p')?;
+        }
+        Component::BaseColor(v) | Component::BlockTransformer(v) => write_varint(o, *v),
+        Component::BannerPatterns(v) => {
+            write_varint(o, v.len() as i32);
+            for (p, dye) in v {
+                write_part(o, p, b'b')?;
+                write_varint(o, *dye);
+            }
+        }
+        Component::Profile(p) => {
+            let whole = p.id.is_some() && p.name.is_some();
+            write_bool(o, whole);
+            if let (true, Some(id), Some(name)) = (whole, p.id, &p.name) {
+                wire::write_uuid(o, id);
+                write_string(o, name);
+            } else {
+                write_opt(o, &p.name, |o, n| write_string(o, n));
+                write_opt(o, &p.id, |o, id| wire::write_uuid(o, *id));
+            }
+            write_varint(o, p.properties.len() as i32);
+            for prop in &p.properties {
+                write_string(o, &prop.name);
+                write_string(o, &prop.value);
+                write_opt(o, &prop.signature, |o, s| write_string(o, s));
+            }
+            for t in [&p.patch.body, &p.patch.cape, &p.patch.elytra] {
+                write_opt(o, t, |o, t| write_string(o, t));
+            }
+            write_opt(o, &p.patch.slim, |o, s| write_bool(o, *s));
+        }
+        Component::Instrument(Holder::Id(id)) => write_varint(o, id + 1),
+        Component::Instrument(Holder::Inline) => return Err("an inline instrument"),
+        Component::Container(v) => {
+            write_varint(o, v.len() as i32);
+            for s in v {
+                write_bool(o, !s.is_empty());
+                if !s.is_empty() {
+                    write_template(o, s)?;
+                }
+            }
+        }
+        Component::Tool {
+            rules,
+            default_mining_speed,
+            damage_per_block,
+            can_destroy_blocks_in_creative,
+        } => {
+            write_varint(o, rules.len() as i32);
+            for r in rules {
+                write_holder_set(o, &r.blocks);
+                write_opt(o, &r.speed, |o, s| write_f32(o, *s));
+                write_opt(o, &r.correct_for_drops, |o, b| write_bool(o, *b));
+            }
+            write_f32(o, *default_mining_speed);
+            write_varint(o, *damage_per_block);
+            write_bool(o, *can_destroy_blocks_in_creative);
+        }
+        Component::CanBreak(v) | Component::CanPlaceOn(v) => {
+            write_varint(o, v.len() as i32);
+            for p in v {
+                if p.nbt || p.components {
+                    return Err("an adventure predicate's NBT or component conditions");
+                }
+                write_opt(o, &p.blocks, write_holder_set);
+                write_opt(o, &p.properties, |o, props| {
+                    write_varint(o, props.len() as i32);
+                    for m in props {
+                        write_string(o, &m.name);
+                        match &m.value {
+                            ValueMatcher::Exact(v) => {
+                                write_bool(o, true);
+                                write_string(o, v);
+                            }
+                            ValueMatcher::Range { min, max } => {
+                                write_bool(o, false);
+                                write_opt(o, min, |o, v| write_string(o, v));
+                                write_opt(o, max, |o, v| write_string(o, v));
+                            }
+                        }
+                    }
+                });
+                write_bool(o, false);
+                write_varint(o, 0);
+                write_varint(o, 0);
+            }
+        }
+        Component::BlockState(v) => {
+            write_varint(o, v.len() as i32);
+            for (k, val) in v {
+                write_string(o, k);
+                write_string(o, val);
+            }
+        }
+        Component::Other { data, .. } => o.extend_from_slice(data),
+    }
+    Ok(())
 }
 
 /// Reads past the value of a component that isn't typed.

@@ -6,6 +6,7 @@
 //! - [`text`]: text components, flattened into styled spans for drawing.
 //! - [`status`]: the server list's status response.
 //! - [`item`]: item stacks and their data components, as play packets carry them.
+//! - [`hashed`]: the hashes of item stacks a container click carries.
 //! - [`profile`]: profiles whose skin is shown.
 //! - [`packets`]: the login and configuration packets, and those play shares with them.
 //! - [`commands`]: the server's command graph.
@@ -13,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod commands;
+pub mod hashed;
 pub mod item;
 pub mod nbt;
 pub mod packets;
