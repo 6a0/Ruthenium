@@ -56,6 +56,46 @@ pub(super) struct PackState {
     pub stale: bool,
     /// The largest texture the GPU takes, once known.
     pub max_texture: Option<u32>,
+    /// Orders the sound engine's file swaps, so a late one can't undo a newer one.
+    pub sound_swaps: SoundSwaps,
+}
+
+/// Swaps of the sound engine's files, numbered: the swap back to vanilla's at a
+/// session's end is made on a thread, and a reload's own swap (the next server's sounds)
+/// may come first; the late one is then dropped instead of putting vanilla's over it.
+#[derive(Debug, Clone, Default)]
+pub struct SoundSwaps(std::sync::Arc<std::sync::Mutex<u64>>);
+
+impl SoundSwaps {
+    fn lock(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A swap to be made later (on a thread): its number.
+    pub fn begin(&self) -> u64 {
+        let mut n = self.lock();
+        *n += 1;
+        *n
+    }
+
+    /// Makes swap `n` with `swap`, unless a newer one has begun or been made since.
+    pub fn finish(&self, n: u64, swap: impl FnOnce()) -> bool {
+        let current = self.lock();
+        if *current != n {
+            return false;
+        }
+        swap();
+        true
+    }
+
+    /// Makes a swap now; any begun before it is dropped.
+    pub fn now(&self, swap: impl FnOnce()) {
+        let mut n = self.lock();
+        *n += 1;
+        swap();
+    }
 }
 
 /// The server's prompt as plain text, cut to size: control characters (but line breaks)
@@ -289,12 +329,21 @@ impl Menu {
             if !self.packs.sounds_of.is_empty() {
                 self.packs.sounds_of.clear();
                 let (sound, game) = (j.sound().clone(), j.game());
+                let swaps = self.packs.sound_swaps.clone();
+                let n = swaps.begin();
                 let spawned = std::thread::Builder::new()
                     .name("vanilla-sounds".into())
                     .spawn(move || {
                         let Some(game) = game else { return };
                         match crate::game_files::vanilla(&game) {
-                            Ok(r) => sound.replace_files(ruthenium_audio::SoundFiles::new(r)),
+                            Ok(r) => {
+                                let files = ruthenium_audio::SoundFiles::new(r);
+                                if !swaps.finish(n, || sound.replace_files(files)) {
+                                    eprintln!(
+                                        "[sound] vanilla's sounds came after newer ones: dropped"
+                                    );
+                                }
+                            }
                             Err(e) => eprintln!("[sound] no vanilla sounds: {e}"),
                         }
                     });
@@ -400,7 +449,8 @@ impl Menu {
         if let Some(j) = &mut self.joiner {
             j.set_server_lang((r.packs > 0).then(|| r.lang.clone()));
             if self.packs.sounds_of != request.packs {
-                j.sound().replace_files(r.sounds);
+                let sound = j.sound();
+                self.packs.sound_swaps.now(|| sound.replace_files(r.sounds));
                 self.packs.sounds_of = request.packs.clone();
             }
         }
@@ -535,6 +585,21 @@ mod tests {
         let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
         m.packs_session_over();
         assert!(!m.packs.stale && m.packs.wanted.is_empty());
+    }
+
+    /// The swap back to vanilla's sounds, made late, doesn't undo the next server's.
+    #[test]
+    fn a_late_sound_swap_is_dropped() {
+        let swaps = SoundSwaps::default();
+        let mut made = Vec::new();
+        let vanilla = swaps.begin();
+        swaps.now(|| made.push("B"));
+        assert!(!swaps.finish(vanilla, || made.push("vanilla")));
+        assert_eq!(made, ["B"]);
+        // On time, it is made.
+        let vanilla = swaps.begin();
+        assert!(swaps.finish(vanilla, || made.push("vanilla")));
+        assert_eq!(made, ["B", "vanilla"]);
     }
 
     /// Vanilla's toast texts, and `Unit.humanReadable`.
