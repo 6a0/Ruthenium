@@ -47,6 +47,9 @@ use crate::scoreboard::{NameRecord, NameText, Scoreboard, team_name};
 use crate::shape::Aabb;
 use crate::vehicle::{Body, Controller, RideKind};
 
+mod projectile;
+use projectile::{Flight, ProjectileState};
+
 /// `Pose` ordinals.
 pub mod pose {
     pub const STANDING: i32 = 0;
@@ -250,6 +253,12 @@ pub struct TypeInfo {
     pub hurt_by_attack: bool,
     /// A `Projectile`: picked with a radius of 1 (`getPickRadius`).
     projectile: bool,
+    /// How the client moves it, if it is a projectile it ticks.
+    flight: Option<Flight>,
+    /// An `AbstractWindCharge`: its box hangs 0.15 below its position.
+    wind_charge: bool,
+    /// `WitherSkull.DATA_DANGEROUS`.
+    dangerous_field: Option<u8>,
     /// `ArmorStand.DATA_CLIENT_FLAGS`.
     armor_stand_flags_field: Option<u8>,
     /// `AbstractArrow.IN_GROUND`.
@@ -386,6 +395,8 @@ pub struct EntityTypes {
     pose_field: Option<u8>,
     /// `LivingEntity.DATA_HEALTH_ID`.
     health_field: Option<u8>,
+    /// `Entity.DATA_NO_GRAVITY`.
+    no_gravity_field: Option<u8>,
     player: PlayerFields,
 }
 
@@ -393,6 +404,7 @@ impl EntityTypes {
     pub fn new(data: &[EntityTypeData]) -> EntityTypes {
         let mut types = Vec::new();
         let mut pose_field = None;
+        let mut no_gravity_field = None;
         let mut health_field = None;
         let mut player = PlayerFields::default();
         for d in data {
@@ -427,6 +439,7 @@ impl EntityTypes {
                 _ => 0.5,
             };
             pose_field = pose_field.or(d.field("Entity.DATA_POSE"));
+            no_gravity_field = no_gravity_field.or(d.field("Entity.DATA_NO_GRAVITY"));
             health_field = health_field.or(d.field("LivingEntity.DATA_HEALTH_ID"));
             let collider = if d.is("AbstractBoat") {
                 Collider::Always
@@ -468,6 +481,9 @@ impl EntityTypes {
                     || d.is("ShulkerBullet")
                     || d.is("EndCrystal"),
                 projectile: d.is("Projectile"),
+                flight: Flight::of(d),
+                wind_charge: d.is("AbstractWindCharge"),
+                dangerous_field: d.field("WitherSkull.DATA_DANGEROUS"),
                 armor_stand_flags_field: d.field("ArmorStand.DATA_CLIENT_FLAGS"),
                 in_ground_field: d.field("AbstractArrow.IN_GROUND"),
                 attached_to_field: d.field("FireworkRocketEntity.DATA_ATTACHED_TO_TARGET"),
@@ -578,6 +594,7 @@ impl EntityTypes {
         EntityTypes {
             types,
             pose_field,
+            no_gravity_field,
             health_field,
             player,
         }
@@ -831,6 +848,10 @@ pub struct Entity {
     pub attached_to: Option<i32>,
     /// `VecDeltaCodec`'s base: the last position the server sent.
     codec_base: [f64; 3],
+    /// `isNoGravity`.
+    pub(crate) no_gravity: bool,
+    /// A projectile the client moves: what it keeps of it.
+    pub(crate) projectile: Option<Box<ProjectileState>>,
     interpolation: Interpolation,
     /// A remote player that is a spectator goes through everything (`noPhysics`).
     no_physics: bool,
@@ -972,6 +993,8 @@ impl Entity {
             in_ground: false,
             attached_to: None,
             codec_base: [0.0; 3],
+            no_gravity: false,
+            projectile: info.flight.map(|_| Box::default()),
             interpolation,
             no_physics: info.player,
             scoreboard_name: player.map_or_else(|| uuid_string(p.uuid), |i| i.name.clone()),
@@ -1045,6 +1068,11 @@ impl Entity {
 
     pub fn info(&self) -> &TypeInfo {
         &self.info
+    }
+
+    /// Whether the client moves it between the server's updates (a projectile it runs).
+    pub fn flies(&self) -> bool {
+        self.info.flight.is_some()
     }
 
     /// `isSpectator`: a player by its player-list entry
@@ -1169,6 +1197,12 @@ impl Entity {
     pub(crate) fn set_pos(&mut self, p: [f64; 3]) {
         self.position = p;
         self.bounding_box = self.size.bounding_box(p);
+        if self.info.wind_charge {
+            // `AbstractWindCharge.makeBoundingBox`.
+            let h = f64::from(self.size.height);
+            self.bounding_box.min[1] = p[1] - 0.15000000596046448;
+            self.bounding_box.max[1] = p[1] - 0.15000000596046448 + h;
+        }
     }
 
     pub(crate) fn set_y_rot(&mut self, y: f32) {
@@ -1422,6 +1456,16 @@ impl Entity {
         {
             // `ArmorStand.CLIENT_FLAG_MARKER`.
             self.marker = b & 16 != 0;
+        } else if Some(field) == types.no_gravity_field
+            && let DataValue::Boolean(b) = value
+        {
+            self.no_gravity = *b;
+        } else if Some(field) == t.dangerous_field
+            && let DataValue::Boolean(b) = value
+        {
+            if let Some(p) = &mut self.projectile {
+                p.dangerous = *b;
+            }
         } else if Some(field) == t.in_ground_field
             && let DataValue::Boolean(b) = value
         {
@@ -1975,7 +2019,13 @@ impl Entities {
         };
         // `ClientLevel.addEntity`: one with the same id goes first.
         self.remove(p.entity_id);
-        let e = Entity::new(p, info, player, self.minecart_improvements);
+        let mut e = Entity::new(p, info, player, self.minecart_improvements);
+        // `Projectile.recreateFromPacket`: the owner the data names, if the level has it.
+        if let Some(st) = &mut e.projectile
+            && (Some(p.data) == self.local_id || self.entities.contains_key(&p.data))
+        {
+            st.owner = Some(p.data);
+        }
         let (id, section) = (e.id, e.section);
         self.entities.insert(id, e);
         self.sections.entry(section).or_default().push(id);
@@ -3188,6 +3238,10 @@ impl Entities {
         let Some(e) = self.entities.get_mut(&id) else {
             return;
         };
+        if e.info.flight.is_some() {
+            self.projectile_tick(id, cx, player);
+            return;
+        }
         if e.info.player {
             // `Player.tick`.
             e.no_physics = cx

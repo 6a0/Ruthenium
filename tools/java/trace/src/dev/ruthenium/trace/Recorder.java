@@ -352,6 +352,22 @@ public final class Recorder {
                 o.addProperty("hitEntity", e.getEntity().getId());
                 o.add("hitAt", vec(e.getLocation()));
             }
+            // The projectiles: where they are and how they move after the tick (the client
+            // ticks them itself between the server's updates).
+            if (mc.level != null) {
+                JsonArray projectiles = new JsonArray();
+                for (net.minecraft.world.entity.Entity e : mc.level.entitiesForRendering()) {
+                    if (e instanceof net.minecraft.world.entity.projectile.Projectile) {
+                        JsonObject j = new JsonObject();
+                        j.addProperty("id", e.getId());
+                        j.addProperty("type", BuiltInRegistries.ENTITY_TYPE.getKey(e.getType()).toString());
+                        j.add("pos", vec(e.position()));
+                        j.add("vel", vec(e.getDeltaMovement()));
+                        projectiles.add(j);
+                    }
+                }
+                o.add("projectiles", projectiles);
+            }
             // Breaking: the block (kept after breaking ends), its state now, the progress,
             // the ticks spent and the delay before the next block.
             MultiPlayerGameMode gameMode = mc.gameMode;

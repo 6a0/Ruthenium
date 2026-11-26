@@ -1299,6 +1299,35 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 ),
             ));
         }
+        // Where the projectiles the client moves are and how they move, to the bit.
+        if let Some(list) = s.value.get("projectiles").and_then(|v| v.as_array()) {
+            for j in list {
+                let id = j["id"].as_i64().unwrap() as i32;
+                let rec = ruthenium_trace::Record {
+                    kind: String::new(),
+                    value: j.clone(),
+                };
+                let (pos, vel) = (rec.vec3("pos").unwrap(), rec.vec3("vel").unwrap());
+                let Some(e) = client.entities.get(id) else {
+                    return Err((n, format!("tick {n}: projectile {id} is missing")));
+                };
+                if !e.flies() {
+                    continue;
+                }
+                let bits = |v: [f64; 3]| v.map(f64::to_bits);
+                if (bits(e.position), bits(e.delta)) != (bits(pos), bits(vel)) {
+                    return Err((
+                        n,
+                        format!(
+                            "tick {n}: projectile {id} ({}) differs\n  got  pos {:?} vel {:?}\n  want pos {pos:?} vel {vel:?}",
+                            e.info().key,
+                            e.position,
+                            e.delta
+                        ),
+                    ));
+                }
+            }
+        }
         // What exactly the crosshair is on, to the bit.
         if let Some(kind) = s.str("hit")
             && kind != "NONE"
@@ -1541,7 +1570,8 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 const LOOSE_CROSSHAIR: [&str; 2] = ["wind_charge", "shulker_box"];
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 88] = [
+const EXACT: [&str; 89] = [
+    "projectiles",
     "walk_directions",
     "mouse_turn",
     "step_up",
@@ -1679,6 +1709,7 @@ fn golden_traces() {
         "offhand",
         "ranged",
         "throwing",
+        "projectiles",
         "breaking",
         "placing",
         "using_blocks",

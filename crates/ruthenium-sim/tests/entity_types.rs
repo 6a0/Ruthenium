@@ -55,6 +55,42 @@ fn exported_entity_types() {
     let cow = by("minecraft:cow");
     assert!(cow.field("AgeableMob.DATA_BABY_ID").is_some() && cow.baby.is_some());
 
+    // What the client's projectile ticks are chosen by.
+    for (key, classes) in [
+        (
+            "minecraft:wind_charge",
+            &["AbstractWindCharge", "AbstractHurtingProjectile"][..],
+        ),
+        ("minecraft:snowball", &["ThrowableProjectile"]),
+        ("minecraft:ender_pearl", &["ThrowableProjectile"]),
+        (
+            "minecraft:experience_bottle",
+            &["ThrowableProjectile", "ThrownExperienceBottle"],
+        ),
+        (
+            "minecraft:splash_potion",
+            &["ThrowableProjectile", "AbstractThrownPotion"],
+        ),
+        (
+            "minecraft:wither_skull",
+            &["AbstractHurtingProjectile", "WitherSkull"],
+        ),
+    ] {
+        for c in classes {
+            assert!(by(key).is(c), "{key}: {c} in {:?}", by(key).classes);
+        }
+    }
+    assert!(
+        by("minecraft:snowball")
+            .field("Entity.DATA_NO_GRAVITY")
+            .is_some()
+    );
+    assert!(
+        by("minecraft:wither_skull")
+            .field("WitherSkull.DATA_DANGEROUS")
+            .is_some()
+    );
+
     assert!(by("minecraft:oak_boat").is("AbstractBoat"));
     assert!(!by("minecraft:oak_boat").is("LivingEntity"));
     assert!(by("minecraft:bat").is("Bat"));

@@ -2093,6 +2093,52 @@ public final class Scenarios {
                         server.runCommand("kill @e[type=!minecraft:player]");
                         ctx.waitTicks(25);
                     }),
+            new Scenario("projectiles",
+                    "Wind charges, snowballs and ender pearls thrown straight down at the floor, straight up, east at a stone wall at x = 8, and west into a two-deep water pool at x -6 to -3 (pearls only at the wall, into the pool and up, each a cooldown apart); a small fireball and a dangerous wither skull summoned flying east at z 5 into the wall (acceleration and inertia); then wind charges thrown 60 degrees down to the east with use and attack clicked every other tick, so the crosshair passes over flying wind charges.",
+                    List.of(UNHURT, "fill 8 -60 -3 8 -56 3 minecraft:stone", "fill -6 -62 -2 -3 -61 2 minecraft:water",
+                            "item replace entity @a hotbar.0 with minecraft:wind_charge 64",
+                            "item replace entity @a hotbar.1 with minecraft:snowball 16",
+                            "item replace entity @a hotbar.2 with minecraft:ender_pearl 16"),
+                    start(0.5, -60, 0.5, -90, 0), (ctx, server) -> {
+                        float[][] aims = {{-90, 90}, {-90, -90}, {-90, 0}, {90, 35}};
+                        for (int slot = 0; slot < 2; slot++) {
+                            ctx.getInput().pressKey(hotbar(slot));
+                            ctx.waitTicks(2);
+                            for (float[] aim : aims) {
+                                ctx.getInput().lookAt(aim[0], aim[1]);
+                                ctx.waitTicks(2);
+                                ctx.getInput().pressKey(USE);
+                                ctx.waitTicks(14);
+                            }
+                            ctx.waitTicks(20);
+                        }
+                        ctx.getInput().pressKey(hotbar(2));
+                        ctx.waitTicks(2);
+                        float[][] pearls = {{-90, 0}, {90, 35}, {-90, -90}};
+                        for (float[] aim : pearls) {
+                            ctx.getInput().lookAt(aim[0], aim[1]);
+                            ctx.waitTicks(2);
+                            ctx.getInput().pressKey(USE);
+                            ctx.waitTicks(30);
+                        }
+                        ctx.waitTicks(20);
+                        server.runCommand("summon minecraft:small_fireball 1.5 -58 5.5 {Motion:[0.3,0.0,0.0],acceleration_power:0.1d}");
+                        ctx.waitTicks(30);
+                        server.runCommand("summon minecraft:wither_skull 1.5 -58 5.5 {Motion:[0.3,0.0,0.0],dangerous:1b}");
+                        ctx.waitTicks(30);
+                        server.runCommand("tp @a 0.5 -60 0.5 -90 60");
+                        ctx.waitTicks(4);
+                        ctx.getInput().pressKey(hotbar(0));
+                        ctx.getInput().lookAt(-90, 60);
+                        ctx.waitTicks(2);
+                        for (int i = 0; i < 20; i++) {
+                            ctx.getInput().pressKey(USE);
+                            ctx.getInput().pressKey(ATTACK);
+                        }
+                        ctx.waitTicks(20);
+                        server.runCommand("kill @e[type=!minecraft:player]");
+                        ctx.waitTicks(5);
+                    }),
             new Scenario("wind_charge",
                     "Wearing an elytra: jump looking straight down and throw a wind charge at the floor near the top of the jump: the explosion's knockback (the server's explode packet) launches the player, who presses jump in the air to glide east and lands. Then the same without gliding.",
                     List.of(ELYTRA, UNHURT, "item replace entity @a hotbar.0 with minecraft:wind_charge 16"),

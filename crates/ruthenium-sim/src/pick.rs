@@ -537,6 +537,24 @@ pub fn clip(
     clip_blocks(env, from, to, fluid, held_item, Some(fluid_shapes))
 }
 
+/// `BlockGetter.clip` with `ClipContext.Block.COLLIDER` and no fluid: the first block
+/// collision shape the segment from `from` to `to` hits (as a projectile's move
+/// tests it), else a miss at `to`.
+pub fn clip_collider(env: &Env<'_>, from: [f64; 3], to: [f64; 3]) -> BlockHit {
+    traverse(
+        from,
+        to,
+        |pos| {
+            let state = env.level.block(pos[0], pos[1], pos[2]);
+            clip_shape(&env.blocks.collision(state, pos)?, from, to, pos)
+        },
+        || {
+            let delta = sub(from, to);
+            BlockHit::miss(to, Direction::approximate_nearest(delta), containing(to))
+        },
+    )
+}
+
 /// [`clip`], with no fluid cache needed for [`FluidMode::None`].
 fn clip_blocks(
     env: &Env<'_>,
