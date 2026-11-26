@@ -3260,6 +3260,29 @@ pub(crate) fn model_push(words: [u32; 4], fog: &Fog) -> [u8; MODEL_PUSH_BYTES] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_models_fog_is_pushed_as_lines() {
+        let fog = Fog {
+            colour: [0.1, 0.2, 0.3, 1.0],
+            environmental: [4.0, 5.0],
+            render_distance: [6.0, 8.0],
+            sky_end: 0.0,
+        };
+        let push = model_push([1, 2, 3, 4], &fog);
+        let float = |at: usize| f32::from_ne_bytes(push[at..at + 4].try_into().unwrap());
+        assert_eq!(push[12..16], 4u32.to_ne_bytes());
+        assert_eq!(
+            [float(16), float(20), float(24), float(28)],
+            [0.1, 0.2, 0.3, 1.0]
+        );
+        // From 4 to 5 blocks, and from 6 to 8: fog.glsl's scale and bias.
+        assert_eq!([float(32), float(36)], [1.0, -4.0]);
+        assert_eq!([float(40), float(44)], [0.5, -3.0]);
+        // No fog leaves every pixel as it is.
+        let none = model_push([0; 4], &Fog::NONE);
+        assert!(none[32..48].iter().all(|&b| b == 0));
+    }
+
     /// What is written with `style`: a glyph five wide from its line's top and eight high,
     /// with its picture there, and what follows it.
     fn written(style: Style, color: u32, shadow: bool, scale: f32, letters: usize) -> Vec<Quad> {

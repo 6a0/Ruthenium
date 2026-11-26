@@ -35,7 +35,9 @@
 //!   comes back is compared pixel by pixel with the scene as a small rasteriser here
 //!   draws it from the same vertices, by the shaders' own arithmetic. The scene's
 //!   texels are larger than its pixels, where every filter must give the same bytes;
-//!   one quad shows four texels a pixel of an evenly coloured stretch of the atlas.
+//!   one quad shows four texels a pixel of an evenly coloured stretch of the atlas, and
+//!   two show nearly two and two and a half texels a pixel of stripes, along one row:
+//!   where RGSS blends the nearest texel with the averaged ones, and beyond.
 
 use std::sync::Arc;
 
@@ -100,6 +102,12 @@ const AT_EDGE: Rgba = [250, 240, 230, 255];
 const EVEN: Rgba = [30, 144, 222, 255];
 const EVEN_AT: u32 = 96;
 const EVEN_WIDTH: u32 = 48;
+/// Stripes along the atlas, two texels wide and the same in every row, where averaged
+/// texels are not the nearest one: what the quads that show nearly two and two and a
+/// half texels a pixel are made of. Where they start and how many texels they are.
+const STRIPES: [Rgba; 2] = [[20, 40, 60, 255], [240, 220, 200, 255]];
+const STRIPES_AT: u32 = 200;
+const STRIPES_WIDTH: u32 = 64;
 
 /// Where each section's corner is, in blocks from the scene's corner, and how far each
 /// has faded in. The fourth is 12 blocks behind the others.
@@ -624,6 +632,37 @@ impl Scene {
                 tolerance: 1,
             });
         }
+
+        // Nearly two texels a pixel (1.9) and two and a half along the stripes, in one
+        // row of texels (it does not move down the screen). The pixel's reach is then
+        // between one texel and two, where vanilla's RGSS blends the nearest texel with
+        // the averaged ones, and beyond two, where it takes the averaged ones alone. No
+        // pixel's middle falls on a texel's middle, where GLSL's round of a half may go
+        // either way.
+        for (rect, uv, what) in [
+            (
+                [2.0, 1.0, 4.0, 2.0],
+                [202.5, 232.875],
+                "nearly two texels a pixel",
+            ),
+            (
+                [5.0, 1.0, 7.0, 2.0],
+                [204.5, 244.5],
+                "two texels and a half a pixel",
+            ),
+        ] {
+            solid[0].push(Quad {
+                uv: [uv[0], 3.25, uv[1], 3.25],
+                ..Quad::texel(rect, [STRIPES_AT, 3])
+            });
+            probes.push(Probe {
+                what,
+                rect: pixels(rect),
+                want: None,
+                tolerance: 1,
+            });
+        }
+
         let mut probe = |what, rect: [f32; 4], want: Rgba, tolerance: u8| {
             probes.push(Probe {
                 what,
@@ -637,7 +676,9 @@ impl Scene {
         probe("between the fading quads", [1.0, 0.0, 5.0, 1.0], CLEAR, 0);
         probe("between the fading quads", [6.0, 0.0, 8.0, 1.0], CLEAR, 0);
         probe("between the fading quads", [9.0, 0.0, 11.0, 1.0], CLEAR, 0);
-        probe("the empty row", [1.0, 1.0, 12.0, 2.0], CLEAR, 0);
+        probe("the empty row", [1.0, 1.0, 2.0, 2.0], CLEAR, 0);
+        probe("the empty row", [4.0, 1.0, 5.0, 2.0], CLEAR, 0);
+        probe("the empty row", [7.0, 1.0, 12.0, 2.0], CLEAR, 0);
         probe("between the translucent quads", cell(4, 4), CLEAR, 0);
         probe(
             "right of the translucent quads",
@@ -704,6 +745,11 @@ fn atlas_texels() -> Vec<Rgba> {
     for y in 4..7 {
         for x in EVEN_AT..EVEN_AT + EVEN_WIDTH {
             texels[(y * ATLAS[0] + x) as usize] = EVEN;
+        }
+    }
+    for y in 0..ATLAS[1] {
+        for x in STRIPES_AT..STRIPES_AT + STRIPES_WIDTH {
+            texels[(y * ATLAS[0] + x) as usize] = STRIPES[(x / 2 % 2) as usize];
         }
     }
     for (at, colour) in TEXELS {

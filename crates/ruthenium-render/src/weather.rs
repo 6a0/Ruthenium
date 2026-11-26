@@ -525,6 +525,26 @@ fn weather_push(
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_weather_s_fog_is_pushed_as_lines() {
+        let fog = Fog {
+            colour: [0.1, 0.2, 0.3, 1.0],
+            environmental: [4.0, 5.0],
+            render_distance: [6.0, 8.0],
+            sky_end: 0.0,
+        };
+        let push = weather_push((1, 2), 3, TextureId::MISSING, &fog);
+        let float = |at: usize| f32::from_ne_bytes(push[at..at + 4].try_into().unwrap());
+        assert_eq!(
+            [float(16), float(20), float(24), float(28)],
+            [0.1, 0.2, 0.3, 1.0]
+        );
+        // From 4 to 5 blocks, and from 6 to 8: fog.glsl's scale and bias.
+        assert_eq!([float(32), float(36)], [1.0, -4.0]);
+        assert_eq!([float(40), float(44)], [0.5, -3.0]);
+        assert_eq!(push[48..52], TextureId::MISSING.index().to_ne_bytes());
+    }
+
     /// The weather golden's generator (a 64-bit LCG, as the tool's).
     struct Lcg(u64);
 
