@@ -35,13 +35,20 @@ pub const MAX_EXPANDED_SPANS: usize = 4096;
 /// Components and format pieces one expansion may go through, whatever they produce: a
 /// tree of empty arguments, each used many times, makes nothing and costs as much.
 pub const MAX_EXPANSION_STEPS: usize = 64 * 1024;
+/// Bytes of literal text and translation formats one expansion may read, whatever they
+/// produce: a format of nothing but `§` codes, named many times through nested
+/// arguments, makes nothing and is read anew each time. Each byte read counts once per
+/// reading.
+pub const MAX_SCANNED_BYTES: usize = 1 << 20;
 
-/// What is left of one expansion's [`MAX_EXPANDED_CHARS`], [`MAX_EXPANDED_SPANS`] and
-/// [`MAX_EXPANSION_STEPS`]; once any is used up, nothing more is added.
+/// What is left of one expansion's [`MAX_EXPANDED_CHARS`], [`MAX_EXPANDED_SPANS`],
+/// [`MAX_EXPANSION_STEPS`] and [`MAX_SCANNED_BYTES`]; once any is used up, nothing more
+/// is added.
 #[derive(Debug, Clone, Copy)]
 struct Budget {
     chars: usize,
     steps: usize,
+    scanned: usize,
 }
 
 impl Budget {
@@ -49,6 +56,7 @@ impl Budget {
         Budget {
             chars: MAX_EXPANDED_CHARS,
             steps: MAX_EXPANSION_STEPS,
+            scanned: MAX_SCANNED_BYTES,
         }
     }
 
@@ -57,11 +65,12 @@ impl Budget {
         Budget {
             chars: usize::MAX,
             steps: usize::MAX,
+            scanned: usize::MAX,
         }
     }
 
     fn spent(&self) -> bool {
-        self.chars == 0 || self.steps == 0
+        self.chars == 0 || self.steps == 0 || self.scanned == 0
     }
 
     /// One step taken; false if there were none left.
@@ -70,6 +79,16 @@ impl Budget {
             return false;
         }
         self.steps -= 1;
+        true
+    }
+
+    /// `bytes` to be read; false (and nothing left at all) if there aren't that many.
+    fn scan(&mut self, bytes: usize) -> bool {
+        if self.spent() || bytes > self.scanned {
+            self.scanned = 0;
+            return false;
+        }
+        self.scanned -= bytes;
         true
     }
 }
@@ -535,6 +554,9 @@ impl StyledText {
 
     /// Appends `text`, applying legacy `§` codes on top of `base`.
     fn push_formatted(&mut self, text: &str, base: Style, b: &mut Budget) {
+        if !b.scan(text.len()) {
+            return;
+        }
         let mut style = base;
         let mut rest = text;
         while let Some(at) = rest.find('§') {
@@ -784,6 +806,30 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
         let small = json!(["", nest(2, 3, json!("")), "END"]);
         assert_eq!(StyledText::from_json(&small).plain(), "END");
+    }
+
+    /// A format of nothing but `§` codes, named 255 times by an argument named 255
+    /// times: nothing is made, and reading it again and again stops at the budget (it
+    /// took 16 s and longer before).
+    #[test]
+    fn formats_of_codes_alone_stop_at_the_budget() {
+        let codes = "§r".repeat(21_000);
+        let names = "%1$s".repeat(255);
+        let v = json!({"translate": "a", "fallback": names, "with": [
+            {"translate": "b", "fallback": names, "with": [
+                {"translate": "c", "fallback": codes}
+            ]}
+        ]});
+        let started = std::time::Instant::now();
+        let t = StyledText::from_json(&json!(["", v, "END"]));
+        assert_eq!(t.plain(), "");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // The same codes once, in a literal, read as before.
+        assert_eq!(StyledText::from_json(&json!([codes, "END"])).plain(), "END");
     }
 
     /// Text past the budget is cut, and so are styles past the span cap.
