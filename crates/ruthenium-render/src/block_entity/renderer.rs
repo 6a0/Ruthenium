@@ -38,6 +38,7 @@ use super::place::{self, Chest, DYE_COLOURS, DYES, Kind};
 use super::shadow::{self, Ground, Piece};
 use super::sign::{self, GLYPH_WORDS, GlyphPages, SignText};
 use super::skins::{LoadedSkin, Look, Skins, default_path};
+use super::trims::{TrimCache, trim_allowed};
 use crate::atmosphere::Fog;
 use crate::pipelines::PipelineId;
 use crate::sky::SkyImage;
@@ -115,8 +116,8 @@ const GLINT_SPEED: f64 = 0.5;
 /// small parts of an atlas) and of the models the game has for a shield or a trident
 /// (`ARMOR_ENTITY_GLINT_TEXTURING`, `GLINT_TEXTURING`, `ENTITY_GLINT_TEXTURING`).
 const GLINTS: [(usize, f32); 3] = [(0, 0.16), (1, 8.0), (1, 0.5)];
-/// Trims whose pictures are kept.
-const KEPT_TRIMS: usize = 1024;
+/// Trims whose places on armour are kept.
+const KEPT_TRIMS: usize = super::trims::KEPT_TRIMS;
 /// Bytes of the one page the items' models are copied into as they are first held.
 const ITEM_PAGE: u64 = 4 << 20;
 /// The picture of a trident's own model, below `textures/entity`.
@@ -795,8 +796,7 @@ pub(crate) struct BlockEntityRenderer {
     palettes: HashMap<String, Vec<u8>>,
     /// The trims' pictures in their palettes, as far as they were asked for: nothing for
     /// one that is asked for and not made yet, or cannot be.
-    trim_textures: HashMap<TrimKey, Option<TextureId>>,
-    trims_wanted: Vec<TrimKey>,
+    trims: TrimCache<TrimKey, TextureId>,
     /// The pictures of each equipment asset's layers, on the body and on the legs, once
     /// it has been worn.
     worn_pictures: [HashMap<String, Vec<Option<TextureId>>>; 2],
@@ -1038,8 +1038,7 @@ impl BlockEntityRenderer {
                 .into_iter()
                 .map(|(path, image)| (path, image.rgba))
                 .collect(),
-            trim_textures: HashMap::new(),
-            trims_wanted: Vec::new(),
+            trims: TrimCache::default(),
             worn_pictures: [HashMap::new(), HashMap::new()],
             trim_keys: HashMap::new(),
             worn: Vec::new(),
@@ -1097,7 +1096,7 @@ impl BlockEntityRenderer {
         gone.extend(self.shadow_picture.take());
         gone.extend(self.glint_pictures.iter_mut().filter_map(Option::take));
         gone.extend(self.item_atlas.take());
-        gone.extend(self.trim_textures.drain().filter_map(|(_, id)| id));
+        gone.extend(self.trims.clear());
         for worn in &mut self.worn_pictures {
             gone.extend(worn.drain().flat_map(|(_, layers)| layers).flatten());
         }
@@ -1154,7 +1153,6 @@ impl BlockEntityRenderer {
             .into_iter()
             .map(|(path, image)| (path, image.rgba))
             .collect();
-        self.trims_wanted.clear();
         self.trim_keys.clear();
         self.worn.clear();
         self.patterns.clear();
@@ -1170,7 +1168,16 @@ impl BlockEntityRenderer {
     pub fn stage(&mut self, textures: &mut TextureTable, uploads: &mut UploadRing) {
         self.pages.stage(textures, uploads);
         self.skins.stage(textures, uploads);
-        for key in std::mem::take(&mut self.trims_wanted) {
+        for id in self.trims.take_gone() {
+            textures.destroy(id);
+        }
+        let bases = &self.trim_bases;
+        let texels = |key: &TrimKey| {
+            bases
+                .get(&key.0)
+                .map_or(0, |(i, _)| i.width as usize * i.height as usize)
+        };
+        for key in self.trims.take_wanted(texels) {
             let made = self.trim_picture(&key).and_then(|(width, height, rgba)| {
                 textures
                     .create_with(
@@ -1181,7 +1188,9 @@ impl BlockEntityRenderer {
                     )
                     .ok()
             });
-            self.trim_textures.insert(key, made);
+            if let Some(id) = self.trims.made(&key, made) {
+                textures.destroy(id);
+            }
         }
         // The items' atlas, once the ring has a stream to spare for it.
         if let Some(atlas) = self.item_atlas_waiting.take() {
@@ -2171,20 +2180,11 @@ impl BlockEntityRenderer {
                 let key = equipment::trim_path(&picture, leggings).map(|base| (base, palette));
                 self.trim_keys.insert(at, (Arc::clone(trim), key));
             }
-            if let Some(key) = &self.trim_keys[&at].1 {
-                match self.trim_textures.get(key) {
-                    Some(Some(texture)) if textures.is_ready(*texture) => {
-                        drawn.push((*texture, WHITE));
-                    }
-                    Some(_) => {}
-                    None => {
-                        if self.trim_textures.len() >= KEPT_TRIMS {
-                            self.trim_textures.clear();
-                        }
-                        self.trim_textures.insert(key.clone(), None);
-                        self.trims_wanted.push(key.clone());
-                    }
-                }
+            if let Some(key) = &self.trim_keys[&at].1
+                && let Some(texture) = self.trims.get(key)
+                && textures.is_ready(texture)
+            {
+                drawn.push((texture, WHITE));
             }
         }
         // Enchanted, its first layer glints; with a trim, all of it does.
@@ -2525,9 +2525,22 @@ impl BlockEntityRenderer {
         }
     }
 
-    /// A trim's picture in its palette: its size and texels.
+    /// A trim's picture in its palette: its size and texels. Nothing for a picture
+    /// larger than [`MAX_TRIM_TEXELS`], or a palette of more than
+    /// [`MAX_PALETTE_COLOURS`].
     fn trim_picture(&self, key: &(String, Option<String>)) -> Option<(u32, u32, Vec<u8>)> {
         let (image, base) = self.trim_bases.get(&key.0)?;
+        let palettes: Vec<&[u8]> = [
+            base.as_deref(),
+            key.1.as_deref().and_then(equipment::palette_path),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| self.palettes.get(p).map(Vec::as_slice))
+        .collect();
+        if !trim_allowed(image.width as usize * image.height as usize, &palettes) {
+            return None;
+        }
         let mapped = key
             .1
             .as_deref()

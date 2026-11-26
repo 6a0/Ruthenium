@@ -12,6 +12,7 @@ pub mod renderer;
 pub(crate) mod shadow;
 pub(crate) mod sign;
 pub mod skins;
+pub(crate) mod trims;
 
 #[cfg(test)]
 mod golden;
