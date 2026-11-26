@@ -505,12 +505,16 @@ fn parse_element(v: &Value) -> Result<Element, String> {
 
 #[cfg(test)]
 pub(crate) fn parse_model(text: &str) -> Result<RawModel, String> {
-    parse_model_limited(text, usize::MAX)
+    parse_model_limited(text, usize::MAX, usize::MAX)
 }
 
 /// [`parse_model`] for a model of at most `max_elements` elements
 /// ([`Limits::model_elements`]).
-pub(crate) fn parse_model_limited(text: &str, max_elements: usize) -> Result<RawModel, String> {
+pub(crate) fn parse_model_limited(
+    text: &str,
+    max_elements: usize,
+    max_textures: usize,
+) -> Result<RawModel, String> {
     let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     if !v.is_object() {
         return Err("not an object".into());
@@ -538,7 +542,14 @@ pub(crate) fn parse_model_limited(text: &str, max_elements: usize) -> Result<Raw
     };
     let mut textures = Vec::new();
     if let Some(map) = v.get("textures") {
-        for (slot, value) in map.as_object().ok_or("textures is not an object")? {
+        let map = map.as_object().ok_or("textures is not an object")?;
+        if map.len() > max_textures {
+            return Err(format!(
+                "{} texture slots is more than a model may have ({max_textures})",
+                map.len()
+            ));
+        }
+        for (slot, value) in map {
             let contents = match value {
                 Value::String(s) if s.starts_with('#') => Slot::Reference(s[1..].to_owned()),
                 Value::String(s) => Slot::Material {
@@ -577,6 +588,55 @@ pub(crate) fn parse_model_limited(text: &str, max_elements: usize) -> Result<Raw
             .and_then(Value::as_str)
             .map(|light| light != "front"),
     })
+}
+
+/// Texture slots of a model and its parents (the model first): a child's entry replaces
+/// its parents' (`TextureSlots.Resolver`), and references (`#name`) are followed to a
+/// sprite. Each slot is followed once (what it leads to is kept for every slot on the
+/// way); one that leads nowhere or round in a loop has no sprite.
+pub(crate) fn resolve_slots(chain: &[Rc<RawModel>]) -> HashMap<&str, (&Id, bool)> {
+    let mut slots: HashMap<&str, &Slot> = HashMap::new();
+    for m in chain.iter().rev() {
+        for (name, contents) in &m.textures {
+            slots.insert(name, contents);
+        }
+    }
+    let mut found: HashMap<&str, Option<(&Id, bool)>> = HashMap::with_capacity(slots.len());
+    let mut path: Vec<&str> = Vec::new();
+    let mut on_path: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for &start in slots.keys() {
+        let mut at = start;
+        let material = loop {
+            if let Some(&known) = found.get(at) {
+                break known;
+            }
+            match slots.get(at) {
+                None => break None,
+                Some(Slot::Material {
+                    sprite,
+                    force_translucent,
+                }) => break Some((sprite, *force_translucent)),
+                // Back on the way it came: round in a loop.
+                Some(Slot::Reference(_)) if on_path.contains(at) => break None,
+                Some(Slot::Reference(target)) => {
+                    path.push(at);
+                    on_path.insert(at);
+                    at = target;
+                }
+            }
+        };
+        if slots.contains_key(at) {
+            found.entry(at).or_insert(material);
+        }
+        on_path.clear();
+        for slot in path.drain(..) {
+            found.insert(slot, material);
+        }
+    }
+    found
+        .into_iter()
+        .filter_map(|(slot, material)| Some((slot, material?)))
+        .collect()
 }
 
 /// The model every missing or broken model is replaced by: a full block showing the
@@ -1167,6 +1227,10 @@ struct Baker<'a> {
     limits: Limits,
     /// Quads baked so far, against [`Limits::baked_quads`].
     quads: usize,
+    /// Variants of the block states so far, against [`Limits::baked_variants`].
+    variants: usize,
+    /// The missing model's id, under which the missing model's parts are baked.
+    missing_id: Id,
 }
 
 impl Baker<'_> {
@@ -1181,11 +1245,11 @@ impl Baker<'_> {
         if let Some(m) = self.raw.get(id) {
             return m.clone();
         }
-        let max = self.limits.model_elements;
+        let (max, textures) = (self.limits.model_elements, self.limits.model_textures);
         let model = match self
             .files
             .model(id)
-            .map(|text| parse_model_limited(&text, max))
+            .map(|text| parse_model_limited(&text, max, textures))
         {
             Some(Ok(m)) => Rc::new(m),
             Some(Err(e)) => {
@@ -1229,43 +1293,36 @@ impl Baker<'_> {
     }
 
     /// Bakes a model under a rotation, once.
+    ///
+    /// Every model that is missing or broken shares the missing model's part (one for
+    /// each rotation), and past [`Limits::baked_parts`] every new one does: a pack's
+    /// ten thousand names of nothing are not ten thousand parts.
     fn part(&mut self, model: &Id, rotation: ModelRotation) -> u32 {
         let key = (model.clone(), rotation);
         if let Some(&i) = self.baked.get(&key) {
             return i;
         }
-        let chain = self.chain(model);
-        // Texture slots: a child's entry replaces its parents' (`TextureSlots.Resolver`),
-        // then references are followed until nothing changes.
-        let mut resolved: HashMap<&str, (&Id, bool)> = HashMap::new();
-        let mut unresolved: Vec<(&str, &str)> = Vec::new();
-        for m in chain.iter().rev() {
-            for (slot, contents) in &m.textures {
-                unresolved.retain(|(s, _)| s != slot);
-                resolved.remove(slot.as_str());
-                match contents {
-                    Slot::Material {
-                        sprite,
-                        force_translucent,
-                    } => {
-                        resolved.insert(slot, (sprite, *force_translucent));
-                    }
-                    Slot::Reference(target) => unresolved.push((slot, target)),
-                }
+        if *model != self.missing_id {
+            let missing = Rc::ptr_eq(&self.raw(model), &self.missing);
+            let full = self.parts.len() >= self.limits.baked_parts;
+            if full {
+                self.warn(format!(
+                    "model {model}: more parts than may be baked ({})",
+                    self.limits.baked_parts
+                ));
+            }
+            if missing || full {
+                let id = self.missing_id.clone();
+                self.raw
+                    .entry(id.clone())
+                    .or_insert_with(|| self.missing.clone());
+                let i = self.part(&id, rotation);
+                self.baked.insert(key, i);
+                return i;
             }
         }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            unresolved.retain(|(slot, target)| match resolved.get(target).copied() {
-                Some(material) => {
-                    resolved.insert(slot, material);
-                    changed = true;
-                    false
-                }
-                None => true,
-            });
-        }
+        let chain = self.chain(model);
+        let resolved = resolve_slots(&chain);
         let atlas = self.atlas;
         let mut missing_textures = Vec::new();
         let groups = {
@@ -1326,16 +1383,24 @@ impl Baker<'_> {
         index
     }
 
-    fn choice(&mut self, variants: &[Variant], weighted: bool) -> Choice {
+    /// Fails past [`Limits::baked_variants`] over the whole bake.
+    fn choice(&mut self, variants: &[Variant], weighted: bool) -> Result<Choice, String> {
+        self.variants = self.variants.saturating_add(variants.len());
+        if self.variants > self.limits.baked_variants {
+            return Err(format!(
+                "the block states have more variants than may be baked ({})",
+                self.limits.baked_variants
+            ));
+        }
         let entries: Vec<(u32, u32)> = variants
             .iter()
             .map(|v| (v.weight, self.part(&v.model, v.rotation)))
             .collect();
-        Choice {
+        Ok(Choice {
             total: entries.iter().map(|e| e.0).sum(),
             entries,
             weighted,
-        }
+        })
     }
 }
 
@@ -1355,8 +1420,10 @@ impl BlockModels {
             warnings: Vec::new(),
             limits: files.limits(),
             quads: 0,
+            variants: 0,
+            missing_id: Id::minecraft("builtin/missing").expect("a valid id"),
         };
-        let missing_id = Id::minecraft("builtin/missing").expect("a valid id");
+        let missing_id = baker.missing_id.clone();
         baker.raw.insert(missing_id.clone(), missing);
         let missing_part = baker.part(&missing_id, ModelRotation::default());
         let mut choices = vec![Choice {
@@ -1496,7 +1563,7 @@ fn define(
                 }
             };
             let choice = choices.len() as u32;
-            choices.push(baker.choice(&list, weighted));
+            choices.push(baker.choice(&list, weighted)?);
             for state in block.states() {
                 if wanted
                     .iter()
@@ -1530,7 +1597,7 @@ fn define(
             let (variants, weighted) =
                 parse_variants(part.get("apply").ok_or("a part without 'apply'")?, max)?;
             let choice = choices.len() as u32;
-            choices.push(baker.choice(&variants, weighted));
+            choices.push(baker.choice(&variants, weighted)?);
             selectors.push((condition, choice));
         }
         for state in block.states() {
@@ -1690,6 +1757,62 @@ mod tests {
 
     fn close(a: [f32; 2], b: [f32; 2]) -> bool {
         (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4
+    }
+
+    /// A child's slot replaces its parents'; references are followed to a sprite; a loop or
+    /// a reference to nothing has none. A chain of 50 000 references is followed once
+    /// (resolving a slot at a time, in a loop until nothing changed, took minutes).
+    #[test]
+    fn texture_slots_resolve_through_references_once() {
+        let sprite = |s: &str| Slot::Material {
+            sprite: Id::minecraft(s).unwrap(),
+            force_translucent: false,
+        };
+        let refer = |s: &str| Slot::Reference(s.to_owned());
+        let parent = RawModel {
+            textures: vec![
+                ("all".into(), sprite("block/parent")),
+                ("side".into(), refer("all")),
+                ("top".into(), sprite("block/top")),
+            ],
+            ..RawModel::default()
+        };
+        let child = RawModel {
+            textures: vec![
+                ("all".into(), sprite("block/child")),
+                ("a".into(), refer("b")),
+                ("b".into(), refer("a")),
+                ("lost".into(), refer("nowhere")),
+                ("deep".into(), refer("side")),
+            ],
+            ..RawModel::default()
+        };
+        let chain = [Rc::new(child), Rc::new(parent)];
+        let r = resolve_slots(&chain);
+        let name = |slot: &str| r.get(slot).map(|(id, _)| id.path().to_owned());
+        assert_eq!(name("side").as_deref(), Some("block/child"));
+        assert_eq!(name("deep").as_deref(), Some("block/child"));
+        assert_eq!(name("top").as_deref(), Some("block/top"));
+        assert_eq!((name("a"), name("b"), name("lost")), (None, None, None));
+        // A long chain, written from its far end, and a long loop.
+        let n = 50_000;
+        let mut textures: Vec<(String, Slot)> = (0..n)
+            .map(|i| (format!("s{i}"), refer(&format!("s{}", i + 1))))
+            .collect();
+        textures.push((format!("s{n}"), sprite("block/end")));
+        textures.extend((0..n).map(|i| (format!("l{i}"), refer(&format!("l{}", (i + 1) % n)))));
+        // And 25 000 loops of two.
+        textures.extend((0..n).map(|i| (format!("p{i}"), refer(&format!("p{}", i ^ 1)))));
+        textures.reverse();
+        let chain = [Rc::new(RawModel {
+            textures,
+            ..RawModel::default()
+        })];
+        let started = std::time::Instant::now();
+        let r = resolve_slots(&chain);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(r.len(), n + 1);
+        assert_eq!(r["s0"].0.path(), "block/end");
     }
 
     #[test]
@@ -1943,6 +2066,8 @@ mod tests {
             warnings: Vec::new(),
             limits: Limits::trusted(),
             quads: 0,
+            variants: 0,
+            missing_id: Id::minecraft("builtin/missing").unwrap(),
         };
         let id = |path: &str| Id::minecraft(path).unwrap();
         let child = baker.part(&id("block/child"), ModelRotation::default());

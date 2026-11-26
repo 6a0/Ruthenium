@@ -85,9 +85,18 @@ pub struct Limits {
     /// Elements of a model: 24 576 quads. Exported furniture models have up to a couple
     /// of thousand.
     pub model_elements: usize,
+    /// Texture slots of one model file. Each is followed through its references; the
+    /// game's models have at most 8.
+    pub model_textures: usize,
     /// Quads one bake (every block model, or every item model) may make: about 190 MiB.
     /// The game's blocks bake to 455 000, its items to 103 000.
     pub baked_quads: usize,
+    /// Distinct baked parts (a model under a rotation) of all block states: the game
+    /// bakes 7881.
+    pub baked_parts: usize,
+    /// Variants over all block-state files of a bake (each a model to pick); the game's
+    /// have 10 290.
+    pub baked_variants: usize,
     /// Variants of a block-state file (keys of `variants`, entries of `multipart`, models of
     /// a weighted list). The game's largest (the repeater's) has 64.
     pub blockstate_cases: usize,
@@ -148,7 +157,10 @@ impl Limits {
             animation_frames: usize::MAX,
             model_parents: usize::MAX,
             model_elements: usize::MAX,
+            model_textures: usize::MAX,
             baked_quads: usize::MAX,
+            baked_parts: usize::MAX,
+            baked_variants: usize::MAX,
             blockstate_cases: usize::MAX,
             condition_terms: usize::MAX,
             multipart_parts: usize::MAX,
@@ -186,7 +198,10 @@ impl Limits {
             animation_frames: 1 << 13,
             model_parents: 64,
             model_elements: 4096,
+            model_textures: 256,
             baked_quads: 1 << 21,
+            baked_parts: 1 << 16,
+            baked_variants: 1 << 18,
             blockstate_cases: 4096,
             condition_terms: 1 << 14,
             multipart_parts: 1 << 22,
@@ -224,7 +239,10 @@ impl Limits {
             animation_frames: self.animation_frames.min(o.animation_frames),
             model_parents: self.model_parents.min(o.model_parents),
             model_elements: self.model_elements.min(o.model_elements),
+            model_textures: self.model_textures.min(o.model_textures),
             baked_quads: self.baked_quads.min(o.baked_quads),
+            baked_parts: self.baked_parts.min(o.baked_parts),
+            baked_variants: self.baked_variants.min(o.baked_variants),
             blockstate_cases: self.blockstate_cases.min(o.blockstate_cases),
             condition_terms: self.condition_terms.min(o.condition_terms),
             multipart_parts: self.multipart_parts.min(o.multipart_parts),

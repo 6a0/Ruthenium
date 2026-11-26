@@ -16,7 +16,7 @@ use crate::id::Id;
 use crate::image::{Image, alpha};
 use crate::limits::Limits;
 use crate::model::{
-    BakedQuad, Element, Face, Layer, Material, ModelFiles, ModelRotation, RawModel, Slot, Vec3,
+    BakedQuad, Element, Face, Layer, Material, ModelFiles, ModelRotation, RawModel, Vec3,
     bake_elements, bake_quad, parse_model_limited,
 };
 use crate::resources::Resources;
@@ -551,11 +551,11 @@ impl<'a> Baker<'a> {
         if let Some(m) = self.raw.get(id) {
             return m.clone();
         }
-        let max = self.limits.model_elements;
+        let (max, textures) = (self.limits.model_elements, self.limits.model_textures);
         let model = match self
             .files
             .model(id)
-            .map(|text| parse_model_limited(&text, max))
+            .map(|text| parse_model_limited(&text, max, textures))
         {
             Some(Ok(m)) => Some(Rc::new(m)),
             Some(Err(e)) => {
@@ -615,37 +615,7 @@ impl<'a> Baker<'a> {
             chain.push(model);
             seen.push(at);
         }
-        // Texture slots: a child's entry replaces its parents', then references are
-        // followed until nothing changes.
-        let mut resolved: HashMap<&str, (&Id, bool)> = HashMap::new();
-        let mut unresolved: Vec<(&str, &str)> = Vec::new();
-        for m in chain.iter().rev() {
-            for (slot, contents) in &m.textures {
-                unresolved.retain(|(s, _)| s != slot);
-                resolved.remove(slot.as_str());
-                match contents {
-                    Slot::Material {
-                        sprite,
-                        force_translucent,
-                    } => {
-                        resolved.insert(slot, (sprite, *force_translucent));
-                    }
-                    Slot::Reference(target) => unresolved.push((slot, target)),
-                }
-            }
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            unresolved.retain(|(slot, target)| match resolved.get(target).copied() {
-                Some(material) => {
-                    resolved.insert(slot, material);
-                    changed = true;
-                    false
-                }
-                None => true,
-            });
-        }
+        let resolved = crate::model::resolve_slots(&chain);
         let mut missing: Vec<String> = Vec::new();
         // Each quad with the atlas it is of.
         let mut quads: Vec<(BakedQuad, &Atlas)> = Vec::new();
