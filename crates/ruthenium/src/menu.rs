@@ -30,10 +30,11 @@ impl Clipboard for Window {
 use ruthenium_render::{GuiFrame, Renderer};
 use ruthenium_ui::logo::Logo;
 use ruthenium_ui::modern::{
-    AccountView, AccountsScreen, Action, ButtonStates, Ease, Field, FormButton, FormScreen,
-    FormSpec, Key, MenuTransition, PauseScreen, Presence, SettingsEvent, SettingsScreen, ShapeList,
-    TitleScreen, UiScale, WEIGHTS,
+    AccountView, AccountsScreen, Action, BedScreen, ButtonStates, Ease, Field, FormButton,
+    FormScreen, FormSpec, Key, MenuTransition, PauseScreen, Presence, SettingsEvent,
+    SettingsScreen, ShapeList, TitleScreen, UiScale, WEIGHTS,
 };
+use ruthenium_ui::scale::GuiScale;
 use ruthenium_ui::text::{
     ATLAS_SIZE, FaceId, Fonts, GlyphAtlas, MAX_ATLAS_SIZE, Rendered, TextList, TextStyle,
 };
@@ -268,8 +269,6 @@ enum FormKind {
     Died,
     /// The death screen's Title Screen, confirmed (`DeathScreen.TitleConfirmScreen`).
     QuitConfirm,
-    /// The bed screen (`InBedChatScreen`): Leave Bed, until the server wakes the player.
-    InBed,
 }
 
 impl FormKind {
@@ -423,6 +422,11 @@ pub struct Menu {
     leaving: bool,
     /// The death screen while the player is dead: its texts and buttons as shown.
     death: Option<DeathForm>,
+    /// The session's bed screen is up (from [`SessionEvent::InBed`] until the player is
+    /// out of bed, dead, respawned or gone): the bed screen shows whenever no other does.
+    bed: bool,
+    /// The bed screen's Leave Bed, once it has shown.
+    bed_button: Option<BedScreen>,
     /// Input in the world.
     game: InGame,
     /// The session the terrain's meshes are of ended or was replaced: the renderer
@@ -624,6 +628,8 @@ impl Menu {
             conduct: None,
             leaving: false,
             death: None,
+            bed: false,
+            bed_button: None,
             game,
             forget_world: false,
             mesh_workers: default_mesh_workers(),
@@ -659,6 +665,44 @@ impl Menu {
         }
     }
 
+    /// The session's bed screen opened (`Gui.tick`: no screen, the player asleep): the bed
+    /// screen over the world. Over another screen (one opened in a frame the game thread
+    /// had not taken yet) it waits until that one closes to the world, as vanilla's next
+    /// tick would open it then.
+    fn in_bed(&mut self) {
+        self.bed = true;
+        if matches!(self.screen, Screen::Game) {
+            self.game.release(self.session.as_ref());
+            let chat = self.chat_drafts.open_in_bed(&self.chat_history);
+            self.screen = Screen::Chat(Box::new(chat));
+            self.bed_button = None;
+        }
+    }
+
+    /// The player is out of bed (`Gui.tick`, `InBedChatScreen.onPlayerWokeUp`): text
+    /// typed in the bed screen goes on in a plain chat screen (the draft goes); else it
+    /// closes, the draft kept as it was (and a chat screen put away comes back).
+    fn woke_up(&mut self) {
+        self.bed = false;
+        let Screen::Chat(chat) = &self.screen else {
+            return;
+        };
+        if !chat.in_bed() {
+            return;
+        }
+        match chat.woke_up() {
+            Some(text) => {
+                self.chat_removed(ExitReason::Done);
+                let chat = ChatScreen::new(&text, &self.chat_history);
+                self.screen = Screen::Chat(Box::new(chat));
+            }
+            None => {
+                self.chat_removed(ExitReason::Interrupted);
+                self.enter_game();
+            }
+        }
+    }
+
     /// The level loading screen, until the player is in the world
     /// (`startWaitingForNewLevel`); an open chat screen is put away meanwhile.
     fn level_loading(&mut self) {
@@ -688,14 +732,23 @@ impl Menu {
         let Screen::Chat(chat) = &mut self.screen else {
             return;
         };
+        let bed = chat.in_bed();
         match chat.key(scancode, shift, shortcut, &self.chat_history, clipboard) {
             ChatOutcome::Stay => {}
+            // The bed screen's Escape (`onClose`) asks to leave the bed; it stays.
+            ChatOutcome::Close if bed => {
+                if let Some(s) = &self.session {
+                    s.leave_bed();
+                }
+            }
             ChatOutcome::Close => {
                 self.chat_removed(ExitReason::Intentional);
                 self.enter_game();
             }
             ChatOutcome::Send(text) => {
-                self.chat_removed(ExitReason::Done);
+                if !bed {
+                    self.chat_removed(ExitReason::Done);
+                }
                 // `handleChatInput`: kept as sent, unless nothing is left of it.
                 let message = ruthenium_sim::chat::normalize(&text);
                 if !message.is_empty() {
@@ -704,7 +757,10 @@ impl Menu {
                         s.send_chat(&message);
                     }
                 }
-                self.enter_game();
+                match &mut self.screen {
+                    Screen::Chat(chat) if bed => chat.sent_in_bed(),
+                    _ => self.enter_game(),
+                }
             }
         }
     }
@@ -953,13 +1009,19 @@ impl Menu {
 
     /// Into the world, no screen open (`setScreen(null)`, which grabs the mouse); or the
     /// chat screen put away while a level loaded, back (`restoreChatScreen`), unless the
-    /// player is dead.
+    /// player is dead; or else, while the player is in bed, the bed screen (as the next
+    /// `Gui.tick` opens it).
     fn enter_game(&mut self) {
-        let chat = if self.death.is_none() {
+        let alive = self.death.is_none();
+        let mut chat = if alive {
             self.chat_drafts.restore(&self.chat_history)
         } else {
             None
         };
+        if chat.is_none() && alive && self.bed {
+            chat = Some(Box::new(self.chat_drafts.open_in_bed(&self.chat_history)));
+            self.bed_button = None;
+        }
         if chat.is_some() {
             self.game.release(self.session.as_ref());
         } else {
@@ -980,6 +1042,11 @@ impl Menu {
             _ => self.pause = None,
         }
         self.screen = chat.map_or(Screen::Game, Screen::Chat);
+        // A bed screen put away while a level loaded, back with the player out of bed:
+        // it goes as on waking (`Gui.tick`).
+        if !self.bed && matches!(&self.screen, Screen::Chat(c) if c.in_bed()) {
+            self.woke_up();
+        }
     }
 
     /// Whether the Game Menu or its options are open.
@@ -1082,6 +1149,7 @@ impl Menu {
             s.disconnect();
         }
         self.death = None;
+        self.bed = false;
         self.leaving = true;
         self.pause = None;
         self.transition.end();
@@ -1127,6 +1195,8 @@ impl Menu {
                     }
                     lines.push(format!("Score: {score}"));
                     self.game.release(self.session.as_ref());
+                    // (It takes the bed screen's place.)
+                    self.bed = false;
                     self.death = Some(DeathForm {
                         title: if hardcore { "Game Over!" } else { "You Died!" },
                         lines,
@@ -1136,20 +1206,8 @@ impl Menu {
                     });
                     self.death_form();
                 }
-                SessionEvent::InBed if !self.leaving => {
-                    self.game.release(self.session.as_ref());
-                    self.session_form(
-                        FormKind::InBed,
-                        "Sleeping",
-                        &[],
-                        vec![button("Leave Bed", Action::Confirm)],
-                    );
-                }
-                SessionEvent::WokeUp => {
-                    if matches!(self.screen, Screen::Form(FormKind::InBed, ..)) {
-                        self.enter_game();
-                    }
-                }
+                SessionEvent::InBed if !self.leaving => self.in_bed(),
+                SessionEvent::WokeUp => self.woke_up(),
                 SessionEvent::RespawnReady => {
                     if let Some(d) = &mut self.death {
                         d.ready = true;
@@ -1163,6 +1221,7 @@ impl Menu {
                     self.game.respawned(self.session.as_ref());
                     // The level loading screen, until the player is back in the world.
                     self.death = None;
+                    self.bed = false;
                     self.level_loading();
                 }
                 SessionEvent::Reconfiguring if !self.leaving => {
@@ -1170,6 +1229,7 @@ impl Menu {
                 }
                 SessionEvent::Closed(c) => {
                     self.session = None;
+                    self.bed = false;
                     self.forget_world = true;
                     if self.leaving || crate::join::left_on_purpose(&c) {
                         self.leaving = false;
@@ -1229,6 +1289,9 @@ impl Menu {
         }
         if let Some(p) = &mut self.pause {
             p.states.cancel();
+        }
+        if let Some(b) = &mut self.bed_button {
+            b.states.cancel();
         }
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.states.cancel();
@@ -1349,6 +1412,9 @@ impl Menu {
         if let Some(p) = &mut self.pause {
             p.states.set_reduce_motion(still);
         }
+        if let Some(b) = &mut self.bed_button {
+            b.states.set_reduce_motion(still);
+        }
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.states.set_reduce_motion(still);
         }
@@ -1387,6 +1453,9 @@ impl Menu {
         }
         if let Some(p) = &mut self.pause {
             p.layout(scale, &self.fonts);
+        }
+        if let Some(b) = &mut self.bed_button {
+            b.layout(scale, &self.fonts, None);
         }
         self.accounts_seen = None;
         self.sync_accounts();
@@ -1603,7 +1672,6 @@ impl Menu {
             | FormKind::Playing
             | FormKind::Disconnected
             | FormKind::Died
-            | FormKind::InBed
             | FormKind::QuitConfirm => return,
         };
         let form = FormScreen::new(scale, &self.fonts, spec);
@@ -1627,7 +1695,6 @@ impl Menu {
             | FormKind::Playing
             | FormKind::Disconnected
             | FormKind::Died
-            | FormKind::InBed
             | FormKind::QuitConfirm => None,
         };
         if let Some(f) = addr {
@@ -1731,9 +1798,8 @@ impl Menu {
                 ),
                 _ => {}
             },
-            // Leave Bed, and Escape (`onClose` sends the same): the screen stays until
-            // the server wakes the player.
-            (Screen::Form(FormKind::InBed, ..), Action::Confirm | Action::Back) => {
+            // The bed screen's Leave Bed: it stays until the server wakes the player.
+            (Screen::Chat(chat), Action::Confirm) if chat.in_bed() => {
                 if let Some(s) = &self.session {
                     s.leave_bed();
                 }
@@ -1870,7 +1936,6 @@ impl Menu {
                     | FormKind::Playing
                     | FormKind::Disconnected
                     | FormKind::Died
-                    | FormKind::InBed
                     | FormKind::QuitConfirm => {}
                     // Try Again, the same way as before.
                     FormKind::SignIn => {
@@ -2203,7 +2268,18 @@ impl Menu {
                 self.game.mouse_button(1, down, self.session.as_ref());
                 None
             }
-            // (Clicks in the edit box and on the chat's links: not yet.)
+            // The bed screen's Leave Bed. (Clicks in the edit box and on the chat's links:
+            // not yet.)
+            Screen::Chat(chat) if chat.in_bed() => {
+                let b = self.bed_button.as_mut()?;
+                let hit = b.hit(ux, uy);
+                if down {
+                    b.states.mouse_down(hit);
+                    None
+                } else {
+                    b.states.mouse_up(hit).map(|_| b.button.action)
+                }
+            }
             Screen::Chat(_) => None,
             Screen::Paused => {
                 let screen = self.pause.as_mut()?;
@@ -2577,6 +2653,18 @@ impl Menu {
             self.pause = None;
         }
         let mut settings_ev = None;
+        // The bed screen's Leave Bed, over the chat, where vanilla's is at the HUD's scale.
+        let bed = matches!(&self.screen, Screen::Chat(c) if c.in_bed());
+        if bed {
+            let b = self
+                .bed_button
+                .get_or_insert_with(|| BedScreen::new(scale, &self.fonts));
+            let gui = self.settings.settings.game.gui_scale;
+            b.place(Some(GuiScale::new(pixel_size.0, pixel_size.1, gui, false)));
+            let hit = pointer.and_then(|(x, y)| b.hit(x, y));
+            b.states.hover(hit);
+            b.states.update(dt);
+        }
         match &mut self.screen {
             // The Game Menu on its way out: nothing of it is there to be clicked.
             Screen::Game if self.transition.menu_shows() && self.pause.is_some() => {
@@ -2621,6 +2709,9 @@ impl Menu {
                     &mut self.shapes,
                     &mut self.text,
                 );
+                if let Some(b) = self.bed_button.as_ref().filter(|_| bed) {
+                    b.draw(&mut self.shapes, &mut self.text, atlas);
+                }
             }
             Screen::Title => {
                 let title = self.title.as_ref().unwrap();
@@ -3025,6 +3116,175 @@ mod tests {
         // Another screen in the loading's place leaves no chat to come back.
         press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
         m.session_form(FormKind::Playing, "Server", &[], Vec::new());
+        m.enter_game();
+        assert!(matches!(m.screen, Screen::Game));
+    }
+
+    /// What the bed screen shows, and whether as a draft (none: it isn't open).
+    fn bed_shows(m: &Menu) -> Option<(String, bool)> {
+        match &m.screen {
+            Screen::Chat(c) if c.in_bed() => Some((c.text().to_owned(), c.is_draft())),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_bed_screen_is_a_chat_screen_that_stays_until_the_player_wakes() {
+        let clip = FakeClipboard(RefCell::new(None));
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.screen = Screen::Game;
+        let some = |s: &str, draft| Some((s.to_owned(), draft));
+        // Into bed with a draft: it shows, as one.
+        press(&mut m, 23, false, false, &clip);
+        m.text_input("good night");
+        m.death = Some(dead());
+        m.death_form();
+        m.death = None;
+        m.enter_game();
+        m.in_bed();
+        assert_eq!(bed_shows(&m), some("good night", true));
+        assert!(m.wants_text_input() && !m.wants_mouse_grab() && !m.in_world());
+        // Enter sends it and empties the box; the screen stays (and isn't removed, so
+        // the draft stays until it is).
+        press(&mut m, SCANCODE_RETURN, false, false, &clip);
+        assert_eq!(bed_shows(&m), some("", false));
+        assert_eq!(m.chat_history.get(0), Some("good night"));
+        assert!(m.chat_drafts.latest().is_some());
+        // Escape asks to leave the bed: it stays too.
+        m.text_input("zz");
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        assert_eq!(bed_shows(&m), some("zz", false));
+        // Up and Down go on from where the screen opened (`historyPos` isn't moved on
+        // by what is sent): Up has nothing before, Down the text typed, then Up the
+        // message sent.
+        press(&mut m, SCANCODE_UP, false, false, &clip);
+        assert_eq!(bed_shows(&m), some("zz", false));
+        press(&mut m, SCANCODE_DOWN, false, false, &clip);
+        assert_eq!(bed_shows(&m), some("", false));
+        press(&mut m, SCANCODE_UP, false, false, &clip);
+        assert_eq!(bed_shows(&m), some("good night", false));
+        // Awake with text typed: the plain chat screen with it, no draft.
+        m.woke_up();
+        assert_eq!(chat_shows(&m), some("good night", false));
+        assert_eq!(bed_shows(&m), None);
+        assert_eq!(m.chat_drafts.latest(), None);
+        assert!(m.wants_text_input() && !m.wants_mouse_grab());
+        // That one closes on Enter.
+        press(&mut m, SCANCODE_RETURN, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Game));
+        // Awake with nothing typed: the world.
+        m.in_bed();
+        assert_eq!(bed_shows(&m), some("", false));
+        m.woke_up();
+        assert!(matches!(m.screen, Screen::Game));
+        // Awake with a draft as it was brought back: closed, the draft kept.
+        press(&mut m, 23, false, false, &clip);
+        m.text_input("for later");
+        m.session_form(FormKind::Playing, "Server", &[], Vec::new());
+        m.screen = Screen::Game;
+        m.in_bed();
+        assert_eq!(bed_shows(&m), some("for later", true));
+        m.woke_up();
+        assert!(matches!(m.screen, Screen::Game));
+        press(&mut m, 23, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("for later", true));
+        // Edited, then awake: the plain chat screen; Escape there (option off) drops it.
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        m.in_bed();
+        assert_eq!(bed_shows(&m), some("", false));
+        m.text_input("x");
+        press(&mut m, SCANCODE_BACKSPACE, false, false, &clip);
+        m.text_input(" ");
+        m.woke_up();
+        assert_eq!(chat_shows(&m), some(" ", false));
+    }
+
+    #[test]
+    fn the_bed_screen_waits_for_other_screens_and_goes_for_the_death_screen() {
+        let clip = FakeClipboard(RefCell::new(None));
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.screen = Screen::Game;
+        let some = |s: &str, draft| Some((s.to_owned(), draft));
+        // The chat opened just before: it stays open (and isn't the bed screen).
+        press(&mut m, 23, false, false, &clip);
+        m.text_input("hi");
+        m.in_bed();
+        assert_eq!(chat_shows(&m), some("hi", false));
+        assert_eq!(bed_shows(&m), None);
+        // Closed while in bed: the bed screen, with what it left (Escape, the option
+        // off: nothing).
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        assert_eq!(bed_shows(&m), some("", false));
+        // Sent from the chat: the bed screen, empty.
+        m.woke_up();
+        press(&mut m, 23, false, false, &clip);
+        m.in_bed();
+        m.text_input("sent");
+        press(&mut m, SCANCODE_RETURN, false, false, &clip);
+        assert_eq!(bed_shows(&m), some("", false));
+        // Awake while another screen shows: it is left alone, and the world after it.
+        m.woke_up();
+        m.pause();
+        m.in_bed();
+        assert!(matches!(m.screen, Screen::Paused));
+        m.woke_up();
+        m.enter_game();
+        assert!(matches!(m.screen, Screen::Game));
+        // The Game Menu closed while in bed: the bed screen.
+        m.pause();
+        m.in_bed();
+        m.enter_game();
+        assert_eq!(bed_shows(&m), some("", false));
+        // The death screen takes its place, keeping what was typed as the draft; while dead
+        // nothing comes back, and after the respawn the world, not the bed screen.
+        m.text_input("last words");
+        m.death = Some(dead());
+        m.death_form();
+        assert!(matches!(m.screen, Screen::Form(FormKind::Died, ..)));
+        m.enter_game();
+        assert!(matches!(m.screen, Screen::Game));
+        m.bed = false;
+        m.death = None;
+        m.enter_game();
+        assert!(matches!(m.screen, Screen::Game));
+        press(&mut m, 23, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("last words", true));
+        // Leaving the server: no bed screen in the next.
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        m.in_bed();
+        m.leave();
+        m.screen = Screen::Game;
+        m.enter_game();
+        assert!(matches!(m.screen, Screen::Game));
+    }
+
+    #[test]
+    fn a_bed_screen_put_away_by_a_level_load_comes_back_or_goes_as_on_waking() {
+        let clip = FakeClipboard(RefCell::new(None));
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.screen = Screen::Game;
+        let some = |s: &str, draft| Some((s.to_owned(), draft));
+        m.in_bed();
+        m.text_input("still here");
+        m.level_loading();
+        assert!(matches!(m.screen, Screen::Form(FormKind::Playing, ..)));
+        // Still in bed once loaded: the bed screen as it was.
+        m.enter_game();
+        assert_eq!(bed_shows(&m), some("still here", false));
+        // Out of bed by then (a respawn): as on waking, the plain chat screen.
+        m.level_loading();
+        m.bed = false;
+        m.enter_game();
+        assert_eq!(chat_shows(&m), some("still here", false));
+        assert_eq!(bed_shows(&m), None);
+        // With nothing typed: the world.
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        m.in_bed();
+        m.level_loading();
+        m.bed = false;
         m.enter_game();
         assert!(matches!(m.screen, Screen::Game));
     }

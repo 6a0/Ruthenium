@@ -18,6 +18,12 @@
 //! vanilla's chat keeps it. A chat screen open when a level starts loading (a respawn into
 //! another dimension) comes back as it was once the level has loaded.
 //!
+//! The bed screen (`InBedChatScreen`) is a chat screen too, opened with any draft while
+//! the player lies in bed: Enter sends and empties it, and it stays; Escape and its Leave
+//! Bed button ask the server to wake the player, and it stays until the player is up.
+//! It then becomes the plain chat screen with what was typed, unless that is nothing or
+//! the draft still as it was brought back, which closes it ([`ChatScreen::woke_up`]).
+//!
 //! Not yet: tab completion and the command's suggestions, clicking in the edit box or on
 //! the chat's links and hovering its text, and the chat restrictions.
 
@@ -177,6 +183,14 @@ impl Drafts {
         }
     }
 
+    /// The bed screen (`openScreen(MESSAGE, InBedChatScreen::new)`): any draft, or empty.
+    pub fn open_in_bed(&self, history: &ChatHistory) -> ChatScreen {
+        ChatScreen {
+            bed: true,
+            ..self.open(ChatMethod::Message, history)
+        }
+    }
+
     /// `ChatScreen.removed`: the chat scrolls back down, and the draft goes if the screen
     /// was closed on purpose (Enter, or Escape without `save_drafts`) or nothing but
     /// whitespace is typed; else what is typed becomes the draft, unless it is the draft
@@ -251,6 +265,8 @@ pub struct ChatScreen {
     lines: usize,
     /// It shows the draft brought back, not yet edited (`isDraft`).
     draft: bool,
+    /// It is the bed screen (`InBedChatScreen`).
+    bed: bool,
 }
 
 impl ChatScreen {
@@ -269,6 +285,7 @@ impl ChatScreen {
             new_since_scroll: false,
             lines: 0,
             draft,
+            bed: false,
         }
     }
 
@@ -294,6 +311,29 @@ impl ChatScreen {
     #[cfg(test)]
     pub fn is_draft(&self) -> bool {
         self.draft
+    }
+
+    /// Whether it is the bed screen.
+    pub fn in_bed(&self) -> bool {
+        self.bed
+    }
+
+    /// Enter on the bed screen, once the text has gone (`closeOnSubmit` off): it stays,
+    /// emptied (`setValue("")`, which tells the responder) and scrolled down; Up and Down
+    /// go on from where they were.
+    pub fn sent_in_bed(&mut self) {
+        self.field = TextField::new("", MAX_LENGTH);
+        self.draft = false;
+        self.focused = Instant::now();
+        self.reset_scroll();
+    }
+
+    /// `InBedChatScreen.onPlayerWokeUp`: the text that goes on in a plain chat screen,
+    /// if any (typed, so not the draft as it was brought back, and not empty); else the
+    /// screen just closes.
+    pub fn woke_up(&self) -> Option<String> {
+        let text = self.field.value();
+        (!self.draft && !text.is_empty()).then(|| text.to_owned())
     }
 
     /// Whether inserting into the edit box now tells its responder (`insertText`: when

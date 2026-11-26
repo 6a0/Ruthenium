@@ -6,6 +6,7 @@ use crate::Clip;
 use crate::text::{Fonts, GlyphAtlas, Line, TextList, TextStyle, Weight};
 
 pub mod accounts;
+pub mod bed;
 pub mod form;
 pub mod list;
 pub mod pause;
@@ -14,6 +15,7 @@ pub mod settings;
 pub mod transition;
 
 pub use accounts::{AccountView, AccountsScreen};
+pub use bed::BedScreen;
 pub use form::{Field, FormButton, FormScreen, FormSpec, TextField};
 pub use list::ScrollList;
 pub use pause::PauseScreen;
