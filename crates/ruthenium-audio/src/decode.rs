@@ -68,7 +68,12 @@ impl Decoder {
 
     /// A decoder for a file of a pack read under `limits`: a sample rate above
     /// [`Limits::sample_rate`] is refused (the stream buffers are seconds of it).
-    pub fn with_limits(bytes: Vec<u8>, limits: &Limits) -> Result<Decoder, String> {
+    /// `bytes` may be shared (`Arc<[u8]>`): a looping stream starts its decoder again
+    /// on the same bytes, not a copy of them.
+    pub fn with_limits(
+        bytes: impl AsRef<[u8]> + Send + Sync + 'static,
+        limits: &Limits,
+    ) -> Result<Decoder, String> {
         let source = MediaSourceStream::new(
             Box::new(Cursor::new(bytes)),
             MediaSourceStreamOptions::default(),

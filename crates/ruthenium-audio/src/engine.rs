@@ -201,6 +201,12 @@ pub struct Engine {
     decoding: HashMap<String, Vec<u16>>,
     listener: Arc<ListenerCell>,
     warned: HashSet<String>,
+    /// Files that could not be decoded or opened since the sounds were set (a reload):
+    /// they are not read again on every play. (Vanilla keeps a failed buffer's future
+    /// too, until the next reload.)
+    failed: HashSet<String>,
+    /// The file each slot waiting for its stream asked for.
+    streaming: Box<[Option<String>]>,
     /// Plays dropped because no output was open.
     pub dropped: u64,
 }
@@ -233,6 +239,8 @@ impl Engine {
             decoding: HashMap::new(),
             listener,
             warned: HashSet::new(),
+            failed: HashSet::new(),
+            streaming: vec![None; VOICES].into_boxed_slice(),
             dropped: 0,
         }
     }
@@ -242,6 +250,7 @@ impl Engine {
         self.stop_all();
         self.cache.clear();
         self.decoding.clear();
+        self.failed.clear();
         self.events = events;
         self.fetch = Some(fetch);
     }
@@ -425,14 +434,18 @@ impl Engine {
         i.delete_time = self.tick_count + MIN_SOURCE_LIFETIME;
         self.slots[usize::from(slot)] = Slot::Waiting(id);
         let file = chosen.file_id();
-        if chosen.stream {
+        let key = id_key(&file);
+        if self.failed.contains(&key) {
+            // It failed before: it plays nothing, as then.
+            self.release(slot);
+        } else if chosen.stream {
             self.waiting_params[usize::from(slot)] = Some((params, false));
+            self.streaming[usize::from(slot)] = Some(key);
             if let Some(f) = self.fetch.as_mut() {
                 f.stream(slot, &file, looping);
             }
         } else {
             self.waiting_params[usize::from(slot)] = Some((params, looping));
-            let key = id_key(&file);
             match self.cache.get(&key) {
                 Some(pcm) => self.begin(slot, Feed::Static(pcm)),
                 None => {
@@ -489,8 +502,19 @@ impl Engine {
         }
     }
 
-    /// A file's samples arrived (or couldn't be had).
+    /// A file's samples arrived (or couldn't be had: then it is not decoded again until
+    /// the sounds are set anew).
     pub fn decoded(&mut self, file: &Id, pcm: Result<Arc<Pcm>, String>) {
+        self.decoded_once(file, pcm, true);
+    }
+
+    /// A file couldn't be decoded for now (too much sound is decoded at once): the next
+    /// play tries again.
+    pub fn decoded_for_now(&mut self, file: &Id, why: String) {
+        self.decoded_once(file, Err(why), false);
+    }
+
+    fn decoded_once(&mut self, file: &Id, pcm: Result<Arc<Pcm>, String>, lasting: bool) {
         self.pump();
         let key = id_key(file);
         let slots = self.decoding.remove(&key).unwrap_or_default();
@@ -505,6 +529,9 @@ impl Engine {
                 if self.warned.insert(key.clone()) {
                     eprintln!("[sound] {key}: {e}");
                 }
+                if lasting {
+                    self.failed.insert(key);
+                }
                 for slot in slots {
                     if matches!(self.slots[usize::from(slot)], Slot::Waiting(_)) {
                         self.release(slot);
@@ -517,10 +544,17 @@ impl Engine {
     /// A stream is ready to play in `slot` (or couldn't be opened).
     pub fn stream_opened(&mut self, slot: u16, feed: Result<StreamFeed, String>) {
         self.pump();
+        let file = self
+            .streaming
+            .get_mut(usize::from(slot))
+            .and_then(Option::take);
         match feed {
             Ok(feed) => self.begin(slot, Feed::Stream(Box::new(feed))),
             Err(e) => {
                 eprintln!("[sound] stream: {e}");
+                if let Some(file) = file {
+                    self.failed.insert(file);
+                }
                 if matches!(self.slots.get(usize::from(slot)), Some(Slot::Waiting(_))) {
                     self.release(slot);
                 }
@@ -880,6 +914,52 @@ mod tests {
         r.engine.play(hit([0.0; 3]));
         assert_eq!(r.asked.lock().unwrap().decodes.len(), 1);
         assert_eq!(r.engine.voices_in_use(), (2, 0));
+    }
+
+    /// A file that could not be decoded or opened is not read again on every play: a
+    /// pack's broken 64 MiB file would be inflated each time the server plays it.
+    #[test]
+    fn a_failed_file_is_not_fetched_again_until_the_sounds_are_set() {
+        let mut r = rig();
+        let file = Id::minecraft("sounds/hit1.ogg").unwrap();
+        r.engine.play(hit([0.0; 3]));
+        r.engine.decoded(&file, Err("broken".into()));
+        assert_eq!(r.engine.voices_in_use(), (0, 0));
+        for _ in 0..5 {
+            r.engine.play(hit([0.0; 3]));
+        }
+        assert_eq!(r.asked.lock().unwrap().decodes.len(), 1);
+        assert_eq!(r.engine.voices_in_use(), (0, 0));
+        // A stream that would not open, likewise.
+        let song =
+            || SoundInstance::at("minecraft:song", SoundSource::Music, 1.0, 1.0, 7, [0.0; 3]);
+        r.engine.play(song());
+        let slot = r.asked.lock().unwrap().streams[0].0;
+        r.engine.stream_opened(slot, Err("broken".into()));
+        r.engine.play(song());
+        assert_eq!(r.asked.lock().unwrap().streams.len(), 1);
+        // Refused for now only (too much sound decoded at once): the next play asks again.
+        let big = Id::minecraft("sounds/big.ogg").unwrap();
+        let big_play =
+            || SoundInstance::at("minecraft:big", SoundSource::Players, 1.0, 1.0, 7, [0.0; 3]);
+        r.engine.play(big_play());
+        r.engine.decoded_for_now(&big, "too much at once".into());
+        r.engine.play(big_play());
+        assert_eq!(r.asked.lock().unwrap().decodes.len(), 3);
+        // A reload forgets the failures.
+        let (events, _) = SoundEvents::load(
+            [SoundsJson {
+                namespace: "minecraft",
+                pack: "test",
+                bytes: SOUNDS.as_bytes(),
+                limits: ruthenium_assets::Limits::trusted(),
+            }],
+            |_| true,
+        );
+        r.engine
+            .set_sounds(Arc::new(events), Box::new(FakeFetch(r.asked.clone())));
+        r.engine.play(hit([0.0; 3]));
+        assert_eq!(r.asked.lock().unwrap().decodes.len(), 4);
     }
 
     #[test]

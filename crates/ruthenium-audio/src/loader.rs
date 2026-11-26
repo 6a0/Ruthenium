@@ -76,7 +76,7 @@ pub(crate) fn spawn(
 
 struct OpenStream {
     file: Id,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     limits: Limits,
     decoder: Decoder,
     /// Nothing decoded since the decoder (re)started: a looping file that gives no
@@ -102,6 +102,12 @@ fn room(live: &mut Vec<Weak<Pcm>>) -> usize {
     LIVE_BYTES.saturating_sub(held) / 2
 }
 
+/// Whether the sounds alive now hold a new one to fewer samples than a sound may have:
+/// then a failure to decode it is for now only.
+fn held_back(room: usize, limits: &Limits) -> bool {
+    room < limits.sound_samples
+}
+
 fn lock(engine: &Weak<Mutex<Engine>>) -> Option<Arc<Mutex<Engine>>> {
     engine.upgrade()
 }
@@ -120,10 +126,14 @@ fn run(files: &SoundFiles, engine: &Weak<Mutex<Engine>>, rx: &Receiver<Job>) {
             Ok(Job::Decode(file)) => {
                 let started = Instant::now();
                 let room = room(&mut live);
+                // Held to less than a sound may have by the sounds alive now: a failure
+                // then is for now only.
+                let mut for_now = false;
                 let pcm = files
                     .open(&file)
                     .map_err(|e| e.to_string())
                     .and_then(|(bytes, limits)| {
+                        for_now = held_back(room, &limits);
                         guarded(&file, || decode_limited(bytes, &limits, room))
                     })
                     .map(Arc::new);
@@ -145,10 +155,11 @@ fn run(files: &SoundFiles, engine: &Weak<Mutex<Engine>>, rx: &Receiver<Job>) {
                     }
                 }
                 let Some(engine) = lock(engine) else { return };
-                engine
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .decoded(&file, pcm);
+                let mut engine = engine.lock().unwrap_or_else(PoisonError::into_inner);
+                match pcm {
+                    Err(e) if for_now => engine.decoded_for_now(&file, e),
+                    pcm => engine.decoded(&file, pcm),
+                }
             }
             Ok(Job::Stream {
                 slot,
@@ -177,6 +188,8 @@ fn open(files: &SoundFiles, file: &Id, looping: bool) -> Result<(OpenStream, Str
     let (bytes, limits) = files
         .open(file)
         .map_err(|e| format!("{}: {e}", id_key(file)))?;
+    // Shared by the decoder and every start over of a looping stream.
+    let bytes: Arc<[u8]> = bytes.into();
     let decoder = guarded(file, || Decoder::with_limits(bytes.clone(), &limits))
         .map_err(|e| format!("{}: {e}", id_key(file)))?;
     // In 64 bits: a rate is a pack's number (`Limits::sample_rate` bounds it).
@@ -255,6 +268,13 @@ fn fill(s: &mut OpenStream) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_decode_held_back_by_the_sounds_alive_fails_for_now_only() {
+        let limits = Limits::untrusted();
+        assert!(held_back(limits.sound_samples - 1, &limits));
+        assert!(!held_back(limits.sound_samples, &limits));
+    }
 
     #[test]
     fn whole_sounds_alive_at_once_are_bounded() {
@@ -343,7 +363,7 @@ mod tests {
         let ended = Arc::new(AtomicBool::new(false));
         let mut s = OpenStream {
             file,
-            bytes,
+            bytes: bytes.into(),
             limits: Limits::trusted(),
             decoder,
             fresh: true,
