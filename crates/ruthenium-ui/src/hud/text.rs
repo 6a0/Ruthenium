@@ -1,9 +1,12 @@
 //! The HUD's words (`Hud`, `ChatComponent`, `BossHealthOverlay`, `PlayerTabOverlay`), laid
 //! out as vanilla lays them out: the selected item's name, the boss bars, the sidebar, the
-//! message over the hotbar, the titles, the chat and the player list.
+//! message over the hotbar, the titles, the chat and the player list; and the chat screen
+//! over them (`ChatScreen`, its `EditBox`): the chat in the foreground, scrolled, and what
+//! is being typed.
 //!
 //! Not yet: text that runs from right to left, fonts other than the game's usual one, and
-//! pictures within text.
+//! pictures within text; the selection drawn inverted (it is see-through blue), and the
+//! tooltips and the cursor over the chat's text.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +18,10 @@ use ruthenium_protocol::text::{Lang, Style, StyledText};
 use ruthenium_sim::avatar::SkinSource;
 use ruthenium_sim::hud_text::{ChatMessage, ListScores, ListedPlayer};
 
-use super::{BLACK, Heart, HudLayout, HudSprites, HudView, WHITE, hsv_to_rgb, text_width, white};
+use super::{
+    BLACK, ChatInput, ChatShown, Heart, HudLayout, HudSprites, HudView, WHITE, hsv_to_rgb,
+    text_width, white,
+};
 
 /// Room between lines' tops.
 const LINE: i32 = 9;
@@ -27,6 +33,16 @@ const CHAT_LINES: usize = 10;
 const CHAT_GROUND: f32 = 0.5;
 /// Lines the chat keeps (`trimmedMessages`).
 const CHAT_KEPT: usize = 100;
+/// Lines the chat shows while it is typed in (`chatHeightFocused` at its default, 180
+/// units, over 9 a line).
+const CHAT_FOCUSED_LINES: i32 = 20;
+/// The chat screen's edit box: the ground behind it (`getBackgroundColor` with the
+/// background only for the chat), its text (`EditBox.DEFAULT_TEXT_COLOR`), the
+/// selection (`textHighlight`'s blue, drawn see-through) and its length in UTF-16 units.
+const CHAT_INPUT_GROUND: u32 = 0x8000_0000;
+const CHAT_INPUT_TEXT: u32 = 0xFFE0_E0E0;
+const CHAT_INPUT_SELECTION: u32 = 0x8000_00FF;
+const CHAT_INPUT_MAX: usize = 256;
 /// The room a changed message's icon takes.
 const CHAT_ICON: i32 = 9 + 4 + 2;
 /// What was laid out is forgotten after this many frames without it.
@@ -55,6 +71,30 @@ impl TextLine {
             width: width.ceil() as i32,
         }
     }
+}
+
+/// `Font.plainSubstrByWidth`: the longest start of `s` no wider than `width`.
+fn head_by_width<'a>(s: &'a str, width: i32, font: &Font) -> &'a str {
+    let mut used = 0.0f32;
+    for (i, c) in s.char_indices() {
+        used += font.glyph(c).advance(false);
+        if used > width as f32 {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+/// The same from the end: the longest end of `s` no wider than `width`.
+fn tail_by_width<'a>(s: &'a str, width: i32, font: &Font) -> &'a str {
+    let mut used = 0.0f32;
+    for (i, c) in s.char_indices().rev() {
+        used += font.glyph(c).advance(false);
+        if used > width as f32 {
+            return &s[i + c.len_utf8()..];
+        }
+    }
+    s
 }
 
 /// A component's characters.
@@ -173,6 +213,9 @@ pub struct HudMemory {
     lines: HashMap<(usize, Wrap), Kept>,
     frame: u64,
     healths: HashMap<u128, ListHealth>,
+    /// The chat screen's edit box: where its text is shown from (a byte offset), and the
+    /// text and caret it was last moved for.
+    edit: (usize, String, usize),
 }
 
 impl HudMemory {
@@ -188,6 +231,40 @@ impl HudMemory {
             let frame = self.frame;
             self.lines.retain(|_, k| frame - k.used < KEPT_FRAMES);
         }
+    }
+
+    /// Where the edit box shows `value` from with the caret at `caret`
+    /// (`EditBox.scrollTo`, each time the text or the caret has moved).
+    fn edit_display(&mut self, value: &str, caret: usize, font: &Font, width: i32) -> usize {
+        let (display, text, at) = &mut self.edit;
+        if text != value || *at != caret {
+            text.clear();
+            text.push_str(value);
+            *at = caret;
+            let mut d = (*display).min(value.len());
+            while !value.is_char_boundary(d) {
+                d -= 1;
+            }
+            let last = d + head_by_width(&value[d..], width, font).len();
+            if caret == d {
+                // (Back by what fits of the whole text's end, as vanilla counts it.)
+                let back = tail_by_width(value, width, font).chars().count();
+                for _ in 0..back {
+                    d = value[..d].char_indices().next_back().map_or(0, |(i, _)| i);
+                }
+            }
+            if caret > last {
+                // On by as many characters as the caret is past the end.
+                let past = value[last..caret].chars().count();
+                for _ in 0..past {
+                    d += value[d..].chars().next().map_or(0, char::len_utf8);
+                }
+            } else if caret <= d {
+                d = caret;
+            }
+            *display = d.min(value.len());
+        }
+        self.edit.0
     }
 
     fn lines(
@@ -511,6 +588,10 @@ impl HudLayout {
     /// `ChatComponent.extractRenderState`, for a chat that is not typed in.
     pub(super) fn chat(&mut self, w: &mut Words<'_, '_>) {
         let v = w.view;
+        // (`Hud.extractChat`: the chat screen draws it then.)
+        if v.chat.is_some() {
+            return;
+        }
         let bottom = v.height - 40;
         // The lines that show, the newest first: the first of them is the lowest.
         let mut shown: Vec<(&ChatMessage, f32, Arc<TextLine>)> = Vec::new();
@@ -747,6 +828,176 @@ impl HudLayout {
         self.title(w);
         self.chat(w);
         self.player_list(w);
+        self.chat_screen(w);
+    }
+
+    /// `ChatScreen.extractRenderState`, over the rest of the HUD: the edit box's ground,
+    /// the chat in the foreground (`DisplayMode.FOREGROUND`: its focused height, every
+    /// line at full strength, scrolled, with the scroll bar), and the edit box.
+    fn chat_screen(&mut self, w: &mut Words<'_, '_>) {
+        let v = w.view;
+        let Some(input) = v.chat else { return };
+        let (width, height) = (v.width, v.height);
+        self.over
+            .fill(2, height - 14, width - 2, height - 2, CHAT_INPUT_GROUND);
+        // Every line kept, the newest first (`trimmedMessages`).
+        let mut lines: Vec<(&ChatMessage, Arc<TextLine>)> = Vec::new();
+        let mut newer = 0;
+        let mut found = input.newest.is_none();
+        'messages: for message in v.hud.texts.chat.iter() {
+            if input
+                .newest
+                .as_ref()
+                .is_some_and(|n| Arc::ptr_eq(n, message))
+            {
+                found = true;
+            }
+            let icon = message.tag.is_some_and(|t| t.icon);
+            let wrap = CHAT_WIDTH - if icon { CHAT_ICON } else { 0 };
+            let split = w
+                .memory
+                .lines(&message.content, Wrap::Chat(wrap), w.font, w.lang);
+            for line in split.iter().rev() {
+                if lines.len() == CHAT_KEPT {
+                    break 'messages;
+                }
+                if !found {
+                    newer += 1;
+                }
+                lines.push((message, line.clone()));
+            }
+        }
+        // `addMessageToDisplayQueue` while scrolled up: `scrollChat(1)` a new line.
+        let total = lines.len() as i32;
+        let (mut scroll, mut new_since) = (input.scroll, input.new_since_scroll);
+        if scroll > 0 && found && newer > 0 {
+            scroll += newer;
+            new_since = true;
+        }
+        // (The screen takes the new lines in from `chat_shown` for the frames after.)
+        // `scrollChat`'s bounds.
+        scroll = scroll.min(total - CHAT_FOCUSED_LINES);
+        if scroll <= 0 {
+            scroll = 0;
+            new_since = false;
+        }
+        self.chat_shown = Some(ChatShown {
+            lines: lines.len(),
+            added: if found { newer } else { 0 },
+            newest: v.hud.texts.chat.first().cloned(),
+        });
+        let bottom = height - 40;
+        let page = &lines[scroll as usize
+            ..lines
+                .len()
+                .min(scroll as usize + CHAT_FOCUSED_LINES as usize)];
+        for i in (0..page.len()).rev() {
+            let y = bottom - i as i32 * LINE;
+            self.over
+                .fill(0, y - LINE, CHAT_WIDTH + 12, y, black(CHAT_GROUND));
+        }
+        for (i, (message, line)) in page.iter().enumerate().rev() {
+            let y = bottom - i as i32 * LINE;
+            self.plain(line, 4, y - 8, white(1.0), true);
+            if let Some(tag) = message.tag {
+                self.over.fill(0, y - LINE, 2, y, BLACK | tag.colour);
+            }
+        }
+        // The scroll bar (its `y` is mostly negative, so it is mostly faint).
+        let count = page.len() as i32;
+        if total > 0 && count != total {
+            let chat_height = count * LINE;
+            let virtual_height = total * LINE;
+            let y = scroll * chat_height / total - bottom;
+            let bar = chat_height * chat_height / virtual_height;
+            let alpha: u32 = if y > 0 { 170 } else { 96 };
+            let colour = if new_since { 0xCC_3333 } else { 0x33_33AA };
+            let x = 4 + CHAT_WIDTH + 4;
+            self.over.fill(x, -y, x + 2, -y - bar, alpha << 24 | colour);
+            self.over
+                .fill(x + 2, -y, x + 1, -y - bar, alpha << 24 | 0xCC_CCCC);
+        }
+        self.edit_box(w, input);
+    }
+
+    /// The chat screen's `EditBox` (`extractWidgetRenderState`): no border, at 4 and
+    /// 12 above the bottom, as wide as the screen less 4, the text from where it is
+    /// scrolled to, the caret (a bar inside the text, `_` at its end) and the selection.
+    fn edit_box(&mut self, w: &mut Words<'_, '_>, input: &ChatInput) {
+        let v = w.view;
+        let font = w.font;
+        let (x, text_y, box_width) = (4, v.height - 12, v.width - 4);
+        let value = input.text.as_str();
+        let display = w.memory.edit_display(value, input.caret, font, box_width);
+        let shown = head_by_width(&value[display..], box_width, font);
+        let shown_end = display + shown.len();
+        let on_screen = (display..=shown_end).contains(&input.caret);
+        let mut draw_x = x;
+        if !shown.is_empty() {
+            let half = if on_screen {
+                &value[display..input.caret]
+            } else {
+                shown
+            };
+            if !half.is_empty() {
+                self.text(
+                    format_args!("{half}"),
+                    draw_x,
+                    text_y,
+                    CHAT_INPUT_TEXT,
+                    true,
+                );
+            }
+            draw_x += text_width(font, half) + 1;
+        }
+        let insert = input.caret < value.len() || value.encode_utf16().count() >= CHAT_INPUT_MAX;
+        let mut cursor_x = draw_x;
+        if !on_screen {
+            cursor_x = if input.caret > display {
+                x + box_width
+            } else {
+                x
+            };
+        } else if insert {
+            cursor_x -= 1;
+            draw_x -= 1;
+        }
+        if !shown.is_empty() && on_screen && input.caret < shown_end {
+            let rest = &value[input.caret..shown_end];
+            self.text(
+                format_args!("{rest}"),
+                draw_x,
+                text_y,
+                CHAT_INPUT_TEXT,
+                true,
+            );
+        }
+        let anchor = input.anchor.clamp(display, shown_end);
+        if anchor != input.caret {
+            let highlight_x = x + text_width(font, &value[display..anchor]);
+            let right = x + box_width;
+            let (x0, x1) = (cursor_x.min(right), (highlight_x - 1).min(right));
+            self.over.fill(
+                x0.min(x1),
+                text_y - 1,
+                x0.max(x1),
+                text_y + 1 + LINE,
+                CHAT_INPUT_SELECTION,
+            );
+        }
+        if input.caret_on && on_screen {
+            if insert {
+                self.over.fill(
+                    cursor_x,
+                    text_y - 1,
+                    cursor_x + 1,
+                    text_y + LINE,
+                    CHAT_INPUT_TEXT,
+                );
+            } else {
+                self.text(format_args!("_"), cursor_x, text_y, CHAT_INPUT_TEXT, true);
+            }
+        }
     }
 }
 #[cfg(test)]
@@ -978,6 +1229,7 @@ mod tests {
             millis: 0,
             now,
             options: HudOptions::default(),
+            chat: None,
         };
         let mut health = HudHealth::default();
         layout.build(&sprites, &font(), &(), &view, &mut health, memory);
@@ -985,6 +1237,191 @@ mod tests {
             layout,
             names: names.into_inner(),
         }
+    }
+
+    /// The HUD of `lay_with` with the chat screen open over it.
+    fn lay_typing(hud: &HudRecord, input: &ChatInput, memory: &mut HudMemory) -> Laid {
+        let sprites = HudSprites::with(7, |_| SpriteInfo {
+            uv: [0.0, 0.0, 1.0, 1.0],
+            width: 16,
+            height: 16,
+            scaling: GuiScaling::Stretch,
+        });
+        let mut layout = HudLayout::new();
+        let view = HudView {
+            hud,
+            partial: 0.0,
+            width: 427,
+            height: 240,
+            millis: 0,
+            now: Instant::now(),
+            options: HudOptions::default(),
+            chat: Some(input),
+        };
+        layout.build(
+            &sprites,
+            &font(),
+            &(),
+            &view,
+            &mut HudHealth::default(),
+            memory,
+        );
+        Laid {
+            layout,
+            names: vec![String::new()],
+        }
+    }
+
+    /// `n` messages `m0` to `m{n-1}`, long faded, the newest first.
+    fn many(n: usize) -> HudRecord {
+        use ruthenium_sim::hud_text::HudTextState;
+        let mut state = HudTextState::default();
+        for i in 0..n {
+            state.system_message(0, Tag::String(format!("m{i}")));
+        }
+        let mut texts = HudTexts::default();
+        state.fill(
+            &mut texts,
+            0,
+            "",
+            false,
+            false,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        HudRecord {
+            ticks: 1000,
+            texts,
+            ..HudRecord::default()
+        }
+    }
+
+    #[test]
+    fn the_chat_screen_shows_twenty_lines_at_full_strength_scrolled() {
+        let hud = many(25);
+        // Not typed in, faded long ago: nothing.
+        assert!(
+            lay_with(&hud, 0.0, Instant::now(), &mut HudMemory::default())
+                .texts()
+                .is_empty()
+        );
+        let input = ChatInput::default();
+        let l = lay_typing(&hud, &input, &mut HudMemory::default());
+        let lines: Vec<_> = l
+            .texts()
+            .into_iter()
+            .filter(|t| t.0.starts_with('m'))
+            .collect();
+        assert_eq!(lines.len(), 20);
+        // The highest first; the newest lowest, at the chat's bottom less 8.
+        assert_eq!(lines[0], ("m5".into(), [4, 21], 1, WHITE));
+        assert_eq!(lines[19], ("m24".into(), [4, 192], 1, WHITE));
+        assert_eq!(l.layout.chat_shown.as_ref().unwrap().lines, 25);
+        // Each line's ground, the edit box's ground, and the scroll bar's two parts.
+        let over = l.over();
+        assert!(over.contains(&(String::new(), [2, 226, 423, 12], 0x8000_0000)));
+        assert!(over.contains(&(String::new(), [0, 191, 332, 9], 0x7F00_0000)));
+        // (Its `y` is the scroll's share less the chat's bottom: from 200 up, 180 * 180 / 225
+        // long.)
+        assert!(over.contains(&(String::new(), [328, 56, 2, 144], 96 << 24 | 0x33_33AA)));
+        assert!(over.contains(&(String::new(), [329, 56, 1, 144], 96 << 24 | 0xCC_CCCC)));
+
+        // Scrolled up three, and too far.
+        let up = |scroll| {
+            let input = ChatInput {
+                scroll,
+                ..ChatInput::default()
+            };
+            let l = lay_typing(&hud, &input, &mut HudMemory::default());
+            l.texts()
+                .into_iter()
+                .rfind(|t| t.0.starts_with('m'))
+                .unwrap()
+                .0
+        };
+        assert_eq!(up(3), "m21");
+        assert_eq!(up(100), "m19");
+        assert_eq!(up(-4), "m24");
+        // Two lines since the newest it was scrolled at: up two more, and the bar red.
+        let input = ChatInput {
+            scroll: 1,
+            newest: Some(hud.texts.chat[2].clone()),
+            ..ChatInput::default()
+        };
+        let l = lay_typing(&hud, &input, &mut HudMemory::default());
+        let last = l
+            .texts()
+            .into_iter()
+            .rfind(|t| t.0.starts_with('m'))
+            .unwrap();
+        assert_eq!(last.0, "m21");
+        assert_eq!(l.layout.chat_shown.as_ref().unwrap().added, 2);
+        assert!(l.over().iter().any(|q| q.2 == 96 << 24 | 0xCC_3333));
+        // At the bottom it stays there.
+        let input = ChatInput {
+            newest: Some(hud.texts.chat[2].clone()),
+            ..ChatInput::default()
+        };
+        let l = lay_typing(&hud, &input, &mut HudMemory::default());
+        let last = l
+            .texts()
+            .into_iter()
+            .rfind(|t| t.0.starts_with('m'))
+            .unwrap();
+        assert_eq!(last.0, "m24");
+    }
+
+    #[test]
+    fn the_edit_box_shows_the_text_the_caret_and_the_selection() {
+        let hud = HudRecord::default();
+        let typed = |text: &str, caret, anchor, caret_on, memory: &mut HudMemory| {
+            let input = ChatInput {
+                text: text.into(),
+                caret,
+                anchor,
+                caret_on,
+                ..ChatInput::default()
+            };
+            let l = lay_typing(&hud, &input, memory);
+            (l.texts(), l.over())
+        };
+        const T: u32 = 0xFFE0_E0E0;
+        let m = &mut HudMemory::default();
+        // At the end: the text and `_` after it, when the caret blinks on.
+        let (texts, _) = typed("hello", 5, 5, true, m);
+        assert_eq!(
+            texts,
+            [
+                ("hello".into(), [4, 228], 1, T),
+                ("_".into(), [35, 228], 1, T)
+            ]
+        );
+        let (texts, _) = typed("hello", 5, 5, false, m);
+        assert_eq!(texts, [("hello".into(), [4, 228], 1, T)]);
+        // Inside: the text in two, a bar between, and the selection back to the start.
+        let (texts, over) = typed("hello", 2, 0, true, m);
+        assert_eq!(
+            texts,
+            [
+                ("he".into(), [4, 228], 1, T),
+                ("llo".into(), [16, 228], 1, T)
+            ]
+        );
+        assert!(over.contains(&(String::new(), [16, 227, 1, 10], T)));
+        assert!(over.contains(&(String::new(), [3, 227, 13, 11], 0x8000_00FF)));
+        // Longer than the box: shown from where the caret's end fits.
+        let long = "a".repeat(100);
+        let (texts, _) = typed(&long, 100, 100, true, m);
+        assert_eq!(texts[0], ("a".repeat(70), [4, 228], 1, T));
+        assert_eq!(texts[1], ("_".into(), [425, 228], 1, T));
+        // Home: back to its start.
+        let (texts, _) = typed(&long, 0, 0, false, m);
+        assert_eq!(texts[0], ("a".repeat(70), [4, 228], 1, T));
+        let (texts, _) = typed(&long, 99, 99, false, m);
+        assert_eq!(texts, [("a".repeat(70), [4, 228], 1, T)]);
+        let (texts, _) = typed(&long, 100, 100, false, m);
+        assert_eq!(texts, [("a".repeat(70), [4, 228], 1, T)]);
     }
 
     fn lay(texts: HudTexts) -> Laid {

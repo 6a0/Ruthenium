@@ -2567,6 +2567,7 @@ version = "0.0.0"
 name = "ruthenium-sim"
 version = "0.0.0"
 dependencies = [
+ "rsa",
  "ruthenium-assets",
  "ruthenium-audio",
  "ruthenium-data",

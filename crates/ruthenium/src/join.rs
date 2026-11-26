@@ -600,6 +600,10 @@ pub struct Joiner {
     cache_dir: Option<PathBuf>,
     /// Where the sessions' sounds go.
     sound: ruthenium_audio::SoundHandle,
+    /// The signed-in profile's chat key pair, with the access token it is fetched with
+    /// (kept across sessions, as vanilla keeps it for the game's run).
+    #[cfg(not(feature = "dev-offline"))]
+    profile_keys: Option<(String, Arc<ProfileKeySource>)>,
 }
 
 #[derive(Debug)]
@@ -629,6 +633,8 @@ impl Joiner {
             skins: None,
             cache_dir,
             sound: ruthenium_audio::SoundHandle::off(),
+            #[cfg(not(feature = "dev-offline"))]
+            profile_keys: None,
         }
     }
 
@@ -711,6 +717,7 @@ impl Joiner {
     /// Starts a session with the server at `address` (as typed), or says why it can't.
     pub fn join(&mut self, address: &str, accounts: &Accounts) -> Result<Session, String> {
         let (identity, auth, local_only) = self.who(accounts)?;
+        let profile_keys = self.profile_keys(accounts);
         let data = self.data();
         Session::start(SessionOptions {
             connect: ConnectOptions {
@@ -727,8 +734,48 @@ impl Joiner {
                 self.sound.clone(),
                 data.block_sounds.clone(),
             ),
+            profile_keys,
         })
         .map_err(|e| format!("couldn't start the connection: {e}"))
+    }
+
+    /// Development builds sign no chat.
+    #[cfg(feature = "dev-offline")]
+    fn profile_keys(
+        &mut self,
+        _: &Accounts,
+    ) -> Option<Arc<dyn ruthenium_sim::chat::ProfileKeySource>> {
+        None
+    }
+
+    /// The signed-in account's chat key pair (`Minecraft.getProfileKeyPairManager`): the
+    /// same while the account's access token is.
+    #[cfg(not(feature = "dev-offline"))]
+    fn profile_keys(
+        &mut self,
+        accounts: &Accounts,
+    ) -> Option<Arc<dyn ruthenium_sim::chat::ProfileKeySource>> {
+        let session = accounts.session()?;
+        if !self
+            .profile_keys
+            .as_ref()
+            .is_some_and(|(token, _)| *token == session.access_token)
+        {
+            let cache = self.cache_dir.as_deref().map(|d| d.join("discovery.json"));
+            let signed_in = session.clone();
+            let fetch = Arc::new(move || {
+                let mut auth = ruthenium_auth::Auth::new();
+                if let Some(c) = &cache {
+                    auth = auth.with_discovery_cache(c);
+                }
+                auth.certificates(&signed_in)
+            });
+            let keys = ProfileKeySource(ruthenium_auth::ProfileKeys::new(fetch));
+            self.profile_keys = Some((session.access_token.clone(), Arc::new(keys)));
+        }
+        let keys: Arc<dyn ruthenium_sim::chat::ProfileKeySource> =
+            self.profile_keys.as_ref()?.1.clone();
+        Some(keys)
     }
 
     /// Development builds join as an offline player, only on this machine or the local
@@ -791,6 +838,38 @@ fn valid_name(name: &str) -> bool {
 
 #[cfg(not(feature = "dev-offline"))]
 struct Join(ruthenium_auth::ServerJoin);
+
+/// The account's key pairs, as sessions take them.
+#[cfg(not(feature = "dev-offline"))]
+#[derive(Debug)]
+struct ProfileKeySource(ruthenium_auth::ProfileKeys);
+
+#[cfg(not(feature = "dev-offline"))]
+impl ruthenium_sim::chat::ProfileKeySource for ProfileKeySource {
+    fn prepare(&self) {
+        self.0.prepare();
+    }
+
+    fn poll(&self) -> ruthenium_sim::chat::KeyPoll {
+        use ruthenium_sim::chat::{KeyPoll, ProfileKeys};
+        match self.0.poll() {
+            None => KeyPoll::Pending,
+            Some(pair) => KeyPoll::Ready(pair.map(|p| {
+                Arc::new(ProfileKeys {
+                    private_key: p.private_key.clone(),
+                    public_key: p.public_key.clone(),
+                    key_signature: p.key_signature.clone(),
+                    expires_at: p.expires_at,
+                    refresh_after: p.refresh_after,
+                })
+            })),
+        }
+    }
+
+    fn should_refresh(&self) -> bool {
+        self.0.should_refresh()
+    }
+}
 
 #[cfg(not(feature = "dev-offline"))]
 impl ruthenium_net::connection::SessionJoin for Join {

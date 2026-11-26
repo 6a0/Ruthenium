@@ -47,7 +47,9 @@ use crate::join::Joiner;
 use crate::route::RoutePlayer;
 use crate::servers::{Servers, valid_address};
 use crate::settings::{GAME, Group, RUTHENIUM, Row, Settings, SettingsFile, all_groups, rows_of};
+use chat::{ChatHistory, ChatOutcome, ChatScreen};
 
+mod chat;
 mod keys;
 
 /// The characters a form's message line holds.
@@ -296,6 +298,8 @@ enum Screen {
     Game,
     /// The Game Menu over the world.
     Paused,
+    /// The chat screen over the world.
+    Chat(Box<ChatScreen>),
 }
 
 /// Which settings the Settings screen shows, and from where.
@@ -418,6 +422,8 @@ pub struct Menu {
     route: Option<RoutePlayer>,
     /// The key bindings' rows and what the keyboard holds.
     keys: keys::KeysState,
+    /// The messages sent, for the chat screen's Up and Down.
+    chat_history: ChatHistory,
 }
 
 impl std::fmt::Debug for Menu {
@@ -540,6 +546,41 @@ impl Menu {
             hud: true,
             route: None,
             keys,
+            chat_history: ChatHistory::default(),
+        }
+    }
+
+    /// Keeps the commands sent in `path` (`command_history.txt`), and has those it keeps.
+    pub fn set_command_history(&mut self, path: Option<PathBuf>) {
+        self.chat_history = ChatHistory::load(path);
+    }
+
+    /// Opens the chat screen with `initial` typed (`openChatScreen`): keys let go, the
+    /// mouse freed.
+    fn open_chat(&mut self, initial: &str) {
+        self.game.release(self.session.as_ref());
+        self.screen = Screen::Chat(Box::new(ChatScreen::new(initial, &self.chat_history)));
+    }
+
+    /// A key on the chat screen (down or repeated).
+    fn chat_key(&mut self, scancode: u32, shift: bool, shortcut: bool, clipboard: &dyn Clipboard) {
+        let Screen::Chat(chat) = &mut self.screen else {
+            return;
+        };
+        match chat.key(scancode, shift, shortcut, &self.chat_history, clipboard) {
+            ChatOutcome::Stay => {}
+            ChatOutcome::Close => self.enter_game(),
+            ChatOutcome::Send(text) => {
+                // `handleChatInput`: kept as sent, unless nothing is left of it.
+                let message = ruthenium_sim::chat::normalize(&text);
+                if !message.is_empty() {
+                    self.chat_history.add(&message);
+                    if let Some(s) = &self.session {
+                        s.send_chat(&message);
+                    }
+                }
+                self.enter_game();
+            }
         }
     }
 
@@ -1138,6 +1179,7 @@ impl Menu {
     /// Whether a text field has focus (the client turns text input on for it).
     pub fn wants_text_input(&self) -> bool {
         matches!(&self.screen, Screen::Form(_, form, _) if form.focused_field().is_some())
+            || matches!(self.screen, Screen::Chat(_))
     }
 
     /// Lays every live screen out for the window, if its size changed.
@@ -1696,6 +1738,23 @@ impl Menu {
             }
             Screen::Game => {
                 self.game.key(scancode, down, self.session.as_ref());
+                // `handleKeybinds`: the Chat key opens the chat, the Command key with a
+                // slash typed.
+                if down && self.route.is_none() {
+                    let key = ruthenium_sim::input::Key::scancode(scancode);
+                    let actions: Vec<_> = self.binds().on(key).collect();
+                    if actions.contains(&ruthenium_sim::keybinds::Action::Chat) {
+                        self.open_chat("");
+                    } else if actions.contains(&ruthenium_sim::keybinds::Action::Command) {
+                        self.open_chat("/");
+                    }
+                }
+                return None;
+            }
+            Screen::Chat(_) => {
+                if down {
+                    self.chat_key(scancode, shift, shortcut, clipboard);
+                }
                 return None;
             }
             Screen::Paused if escape => return self.act(Action::Back, None, clipboard),
@@ -1703,7 +1762,7 @@ impl Menu {
         }
         let action = match &mut self.screen {
             // Handled above.
-            Screen::Game => None,
+            Screen::Game | Screen::Chat(_) => None,
             Screen::Paused => {
                 let screen = self.pause.as_mut()?;
                 let key = match scancode {
@@ -1885,11 +1944,22 @@ impl Menu {
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.edit(&self.fonts, |f| f.insert(text));
         }
+        if let Screen::Chat(chat) = &mut self.screen {
+            chat.type_text(text);
+        }
         self.validate_form();
     }
 
     /// The wheel turned `notches` (positive: up); `raw` is SDL's `(x, y)` as it came.
     pub fn wheel(&mut self, notches: f32, raw: (f32, f32)) {
+        // (Shift held: one line a notch.)
+        let held = self.keys.physical();
+        if let Screen::Chat(chat) = &mut self.screen {
+            let shift = [225, 229]
+                .into_iter()
+                .any(|k| held.contains(&ruthenium_sim::input::Key::scancode(k)));
+            chat.wheel(notches, shift);
+        }
         match (&self.screen, &mut self.servers, &mut self.accounts_screen) {
             (Screen::Game, ..) => self.game.wheel(raw.0, raw.1, self.session.as_ref()),
             (Screen::Servers, Some(s), _) => s.screen.wheel(notches),
@@ -1940,6 +2010,8 @@ impl Menu {
                 self.game.mouse_button(1, down, self.session.as_ref());
                 None
             }
+            // (Clicks in the edit box and on the chat's links: not yet.)
+            Screen::Chat(_) => None,
             Screen::Paused => {
                 let screen = self.pause.as_mut()?;
                 let hit = screen.hit(ux, uy);
@@ -2155,6 +2227,17 @@ impl Menu {
         self.last_frame = Some(now);
         let scale = self.layout(pixel_size);
         self.poll_session();
+        // The chat screen, as the HUD draws it.
+        let chat = match &mut self.screen {
+            Screen::Chat(chat) => {
+                if let Some(shown) = renderer.chat_shown() {
+                    chat.shown(shown);
+                }
+                Some(chat.input(now))
+            }
+            _ => None,
+        };
+        renderer.set_chat_input(chat);
         self.name_keys_once_lang_loads();
         self.sync_world(renderer);
         if matches!(self.screen, Screen::Game) && self.game.should_pause() {
@@ -2261,7 +2344,7 @@ impl Menu {
                     p.draw(&mut self.shapes, &mut self.text, atlas, logo);
                 }
             }
-            Screen::Game => {
+            Screen::Game | Screen::Chat(_) => {
                 let drawn = renderer.world_ready();
                 let debug = self.settings.settings.frame_stats;
                 // Over a drawn world the readout only shows with the statistics: its
@@ -2525,6 +2608,39 @@ mod tests {
             Screen::Form(k, f, _) => Some((*k, f.spec.message.clone())),
             _ => None,
         }
+    }
+
+    #[test]
+    fn the_chat_key_opens_the_chat_screen_and_enter_sends() {
+        let clip = FakeClipboard(RefCell::new(None));
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.screen = Screen::Game;
+        // T: empty, typed into, the world's keys let go.
+        press(&mut m, 23, false, false, &clip);
+        assert!(matches!(&m.screen, Screen::Chat(c) if c.text().is_empty()));
+        assert!(m.wants_text_input() && !m.wants_mouse_grab() && !m.in_world());
+        m.text_input("  hello   there ");
+        press(&mut m, SCANCODE_RETURN, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Game));
+        // Sent as made tidy, and kept for Up.
+        assert_eq!(m.chat_history.get(0), Some("hello there"));
+        // /: a slash typed already; Escape closes without sending.
+        press(&mut m, 56, false, false, &clip);
+        assert!(matches!(&m.screen, Screen::Chat(c) if c.text() == "/"));
+        m.text_input("say x");
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Game));
+        assert_eq!(m.chat_history.len(), 1);
+        // Nothing left once tidied: nothing kept.
+        press(&mut m, 23, false, false, &clip);
+        m.text_input("   ");
+        press(&mut m, SCANCODE_KP_ENTER, false, false, &clip);
+        assert_eq!(m.chat_history.len(), 1);
+        // Up brings back what was sent.
+        press(&mut m, 23, false, false, &clip);
+        press(&mut m, SCANCODE_UP, false, false, &clip);
+        assert!(matches!(&m.screen, Screen::Chat(c) if c.text() == "hello there"));
     }
 
     #[test]

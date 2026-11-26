@@ -1813,6 +1813,8 @@ pub mod play {
             player_id: i32,
             amount: i32,
         },
+        /// `ClientboundCommandsPacket`: the commands the player may use.
+        Commands(Box<crate::commands::CommandTree>),
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
     }
@@ -2450,6 +2452,9 @@ pub mod play {
                     };
                     Clientbound::StopSound { source, name }
                 }
+                C::Commands => {
+                    Clientbound::Commands(Box::new(crate::commands::CommandTree::read(&mut r)?))
+                }
                 C::TakeItemEntity => Clientbound::TakeItemEntity {
                     item_id: r.varint()?,
                     player_id: r.varint()?,
@@ -2508,6 +2513,93 @@ pub mod play {
     pub fn chat_ack(offset: i32) -> Vec<u8> {
         wire::packet(pl::Serverbound::ChatAck.id(), |o| {
             wire::write_varint(o, offset);
+        })
+    }
+
+    /// The messages a chat message or a signed command says its sender had seen
+    /// (`LastSeenMessages.Update`): how many were taken in since the last update, which
+    /// of the 20 last seen are acknowledged (bit `i` of byte `i / 8`, a `BitSet`), and a
+    /// checksum of their signatures (0: not checked).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct LastSeenUpdate {
+        pub offset: i32,
+        pub acknowledged: [u8; 3],
+        pub checksum: u8,
+    }
+
+    impl LastSeenUpdate {
+        fn write(&self, o: &mut Vec<u8>) {
+            wire::write_varint(o, self.offset);
+            o.extend_from_slice(&self.acknowledged);
+            o.push(self.checksum);
+        }
+    }
+
+    /// `ServerboundChatPacket`: a chat message, when it was sent (milliseconds of the
+    /// epoch), its salt and its signature, if the player has a chat session.
+    pub fn chat(
+        message: &str,
+        time: i64,
+        salt: i64,
+        signature: Option<&[u8; SIGNATURE_BYTES]>,
+        last_seen: &LastSeenUpdate,
+    ) -> Vec<u8> {
+        wire::packet(pl::Serverbound::Chat.id(), |o| {
+            wire::write_string(o, message);
+            wire::write_i64(o, time);
+            wire::write_i64(o, salt);
+            wire::write_bool(o, signature.is_some());
+            if let Some(s) = signature {
+                o.extend_from_slice(s);
+            }
+            last_seen.write(o);
+        })
+    }
+
+    /// `ServerboundChatCommandPacket`: a command (without its slash) with nothing in it
+    /// to sign.
+    pub fn chat_command(command: &str) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ChatCommand.id(), |o| {
+            wire::write_string(o, command)
+        })
+    }
+
+    /// `ServerboundChatCommandSignedPacket`: a command with arguments the server takes as
+    /// chat, each signed by name (none without a chat session).
+    pub fn chat_command_signed(
+        command: &str,
+        time: i64,
+        salt: i64,
+        arguments: &[(String, Box<[u8; SIGNATURE_BYTES]>)],
+        last_seen: &LastSeenUpdate,
+    ) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ChatCommandSigned.id(), |o| {
+            wire::write_string(o, command);
+            wire::write_i64(o, time);
+            wire::write_i64(o, salt);
+            wire::write_varint(o, arguments.len() as i32);
+            for (name, signature) in arguments {
+                wire::write_string(o, name);
+                o.extend_from_slice(&signature[..]);
+            }
+            last_seen.write(o);
+        })
+    }
+
+    /// `ServerboundChatSessionUpdatePacket`: the player's chat session, its public key
+    /// (X.509 DER), when the key expires (milliseconds of the epoch) and Mojang's
+    /// signature over it.
+    pub fn chat_session_update(
+        session_id: u128,
+        expires_at: i64,
+        public_key: &[u8],
+        key_signature: &[u8],
+    ) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ChatSessionUpdate.id(), |o| {
+            wire::write_uuid(o, session_id);
+            wire::write_i64(o, expires_at);
+            wire::write_byte_array(o, public_key);
+            wire::write_byte_array(o, key_signature);
         })
     }
 

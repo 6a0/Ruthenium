@@ -5,15 +5,16 @@
 //!
 //! Steps are separated by spaces: `<key name><+|->@<ms>` presses (+) or lets go of (-)
 //! a key or button by its name as `options.txt` has it (`key.keyboard.i+@500`,
-//! `key.mouse.5-@50`), `shot@<ms>` takes the `--screenshot` then; each waits so many
-//! milliseconds after the step before it.
+//! `key.mouse.5-@50`), `shot@<ms>` takes the `--screenshot` then, `type=<text>@<ms>`
+//! types text (`_` for a space, `%XX` for any byte); each waits so many milliseconds
+//! after the step before it.
 
 use std::time::{Duration, Instant};
 
 use ruthenium_sim::keybinds::{Key, Parsed};
 
 /// One step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// A key (SDL scancode) down or up.
     Key(u32, bool),
@@ -21,6 +22,8 @@ pub enum Step {
     Button(u8, bool),
     /// The screenshot.
     Shot,
+    /// Typed text.
+    Text(String),
 }
 
 /// See the module docs.
@@ -37,10 +40,12 @@ impl InputScript {
         let mut steps = Vec::new();
         for s in text.split_whitespace() {
             let bad = || format!("--input: can't read the step {s:?}");
-            let (what, ms) = s.split_once('@').ok_or_else(bad)?;
+            let (what, ms) = s.rsplit_once('@').ok_or_else(bad)?;
             let wait = Duration::from_millis(ms.parse().map_err(|_| bad())?);
             let step = if what == "shot" {
                 Step::Shot
+            } else if let Some(text) = what.strip_prefix("type=") {
+                Step::Text(typed(text).ok_or_else(bad)?)
             } else {
                 let down = match what.chars().last() {
                     Some('+') => true,
@@ -77,7 +82,7 @@ impl InputScript {
         let Some(mut last) = self.last.or(in_world.then_some(now)) else {
             return out;
         };
-        while let Some(&(wait, step)) = self.steps.get(self.next) {
+        while let Some((wait, step)) = self.steps.get(self.next).cloned() {
             if now < last + wait {
                 break;
             }
@@ -88,6 +93,23 @@ impl InputScript {
         self.last = Some(last);
         out
     }
+}
+
+/// A `type=` step's text: `_` a space, `%XX` a byte, the rest as it is.
+fn typed(s: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut it = s.bytes();
+    while let Some(b) = it.next() {
+        match b {
+            b'_' => bytes.push(b' '),
+            b'%' => {
+                let hex = [it.next()?, it.next()?];
+                bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+            }
+            b => bytes.push(b),
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
@@ -111,6 +133,12 @@ mod tests {
             s.due(t + Duration::from_millis(200), true),
             [Step::Key(12, false), Step::Shot]
         );
+        let mut t = InputScript::parse("type=/msg_@a_%C3%A9@0").unwrap();
+        assert_eq!(
+            t.due(Instant::now(), true),
+            [Step::Text("/msg @a é".into())]
+        );
+        assert!(InputScript::parse("type=%Z@5").is_err());
         assert!(InputScript::parse("key.keyboard.i@5").is_err());
         assert!(InputScript::parse("w+@5").is_err());
         assert!(InputScript::parse("key.keyboard.unknown+@5").is_err());

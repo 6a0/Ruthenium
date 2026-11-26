@@ -12,7 +12,9 @@ use ruthenium_gpu::{
 use ruthenium_protocol::text::{BoundKeys, WithKeys};
 use ruthenium_sim::hud::OFF_HAND;
 use ruthenium_sim::scene::Frame;
-use ruthenium_ui::hud::{HudHealth, HudLayout, HudMemory, HudOptions, HudSprites, HudView};
+use ruthenium_ui::hud::{
+    ChatInput, ChatShown, HudHealth, HudLayout, HudMemory, HudOptions, HudSprites, HudView,
+};
 use ruthenium_ui::{GuiScale, Quad, Sprites};
 
 use crate::block_entity::renderer::BlockEntityRenderer;
@@ -255,6 +257,11 @@ impl Hud {
         self.stats
     }
 
+    /// How the chat screen's chat was last drawn.
+    pub fn chat_shown(&self) -> Option<&ChatShown> {
+        self.layout.chat_shown.as_ref()
+    }
+
     /// No HUD this frame, unless [`Self::gather`] says otherwise.
     pub fn begin(&mut self) {
         self.scale = 0;
@@ -277,6 +284,7 @@ impl Hud {
         models: &mut BlockEntityRenderer,
         block_atlas: TextureId,
         textures: &TextureTable,
+        chat: Option<&ChatInput>,
     ) {
         // (Whether or not it is drawn: `Hud.tick`.)
         self.vignette.update(frame.epoch, frame.ticks, light);
@@ -292,6 +300,7 @@ impl Hud {
             millis: params.millis,
             now: params.now,
             options: params.options,
+            chat,
         };
         if !self
             .keys_seen

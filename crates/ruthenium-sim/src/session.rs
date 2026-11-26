@@ -21,6 +21,13 @@
 //! packs of the imported game ([`SessionOptions::known_packs`]), or none without it, in
 //! which case the server sends every registry entry in full.
 //!
+//! Chat (`sendChat`, `sendCommand`): messages and commands the menus hand over
+//! ([`Session::send_chat`]) go out with what the player has seen of the chat, signed by a
+//! chat session made at each login on an online-mode server once the signed-in player's
+//! key pair is had ([`SessionOptions::profile_keys`]; see [`crate::chat`]); a command
+//! is parsed against the server's commands to find its arguments to sign
+//! ([`crate::command`]).
+//!
 //! Not yet: server resource packs (every offer is declined; a server that requires its
 //! pack will refuse the player), transfers (the session ends with a message), dialogs
 //! and server links (ignored), and anything in play beyond pings, cookies and the switch
@@ -35,6 +42,7 @@ use std::time::{Duration, Instant};
 use ruthenium_net::connection::{
     Closed, ConnectOptions, Connection, Event, Local, Protocol, Reason, Stage,
 };
+use ruthenium_protocol::commands::CommandTree;
 use ruthenium_protocol::nbt::{Compound, Tag};
 use ruthenium_protocol::packets::configuration::{self as cfg, RegistryEntry, RegistryTags};
 use ruthenium_protocol::packets::{
@@ -83,6 +91,9 @@ pub struct SessionOptions {
     pub physics: Option<Physics>,
     /// Where the session's sounds go (none: silent).
     pub sound: crate::sound::GameSounds,
+    /// The signed-in player's chat key pair (none: chat goes unsigned, as without a
+    /// Microsoft account).
+    pub profile_keys: Option<Arc<dyn crate::chat::ProfileKeySource>>,
 }
 
 /// The prepared game's data movement uses.
@@ -174,6 +185,9 @@ enum Command {
     Respawn,
     /// The bed screen's Leave Bed button.
     LeaveBed,
+    /// A chat message or, with its slash, a command, made tidy
+    /// ([`crate::chat::normalize`]).
+    Chat(String),
 }
 
 /// The local camera for drawing: the latest frame, and where the player looks once
@@ -293,6 +307,7 @@ impl Session {
             options.physics,
             information,
             options.sound,
+            options.profile_keys,
         )
     }
 
@@ -303,6 +318,7 @@ impl Session {
         physics: Option<Physics>,
         information: ClientInformation,
         sound: crate::sound::GameSounds,
+        profile_keys: Option<Arc<dyn crate::chat::ProfileKeySource>>,
     ) -> std::io::Result<Session> {
         let handoff = Arc::new(Handoff::new(Limits::default()));
         let (publisher, scene) = Scene::new(DEFAULT_DIRTY_CAPACITY);
@@ -320,6 +336,7 @@ impl Session {
                     Game::new(connection, known_packs, physics, tx, publisher, information);
                 game.view = game_view;
                 game.sounds = sound;
+                game.profile_keys = profile_keys;
                 game.run(&game_handoff);
             })?;
         Ok(Session {
@@ -358,6 +375,16 @@ impl Session {
     /// [`SessionEvent::WokeUp`] follows once it does.
     pub fn leave_bed(&self) {
         self.handoff.push_control(Command::LeaveBed);
+    }
+
+    /// Sends a chat message, or a command if it begins with a slash
+    /// (`ChatScreen.handleChatInput` after the history: the text is
+    /// [`crate::chat::normalize`]d first, and nothing is sent if that leaves nothing).
+    pub fn send_chat(&self, message: &str) {
+        let message = crate::chat::normalize(message);
+        if !message.is_empty() {
+            self.handoff.push_control(Command::Chat(message));
+        }
     }
 
     /// Ends the main thread's frame: the game thread runs it (`Minecraft.runTick`) with
@@ -653,6 +680,13 @@ struct Game {
     fov: FovEase,
     fov_effects: f32,
     sounds: crate::sound::GameSounds,
+    /// The server's commands, for what of a command to sign (the play listener's).
+    commands: CommandTree,
+    /// Where the chat key pair comes from, whether it is being fetched, and the chat
+    /// session made with it (`ClientPacketListener.chatSession`).
+    profile_keys: Option<Arc<dyn crate::chat::ProfileKeySource>>,
+    keys_pending: bool,
+    chat_session: Option<crate::chat::LocalChatSession>,
 }
 
 /// The feature flag that switches minecarts to their new movement, which doesn't
@@ -828,6 +862,10 @@ impl Game {
             fov: FovEase::default(),
             fov_effects: 1.0,
             sounds: crate::sound::GameSounds::default(),
+            commands: CommandTree::default(),
+            profile_keys: None,
+            keys_pending: false,
+            chat_session: None,
         }
     }
 
@@ -897,6 +935,90 @@ impl Game {
                 }
             }
             Command::CodeOfConduct(_) => {}
+            Command::Chat(message) => self.send_chat(&message),
+        }
+    }
+
+    /// `ClientPacketListener.sendChat` and `sendCommand`, in play.
+    fn send_chat(&mut self, message: &str) {
+        if self.phase != Phase::Play || self.world.is_none() {
+            return;
+        }
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |t| t.as_millis() as i64);
+        let packet = match message.strip_prefix('/') {
+            None => {
+                let salt = crate::chat::salt();
+                let (seen, update) = self.hud_text.last_seen_update();
+                let signature = self
+                    .chat_session
+                    .as_mut()
+                    .and_then(|s| s.sign(message, time, salt, &seen));
+                play::chat(message, time, salt, signature.as_deref(), &update)
+            }
+            Some(command) => {
+                let level = self.world.as_ref().map_or(0, |w| w.player.permission_level);
+                let arguments = crate::command::signable_arguments(&self.commands, command, level);
+                if arguments.is_empty() {
+                    play::chat_command(command)
+                } else {
+                    let salt = crate::chat::salt();
+                    let (seen, update) = self.hud_text.last_seen_update();
+                    // (`ArgumentSignatures.signCommand`: none without a session.)
+                    let signed: Vec<_> = arguments
+                        .iter()
+                        .filter_map(|(name, value)| {
+                            let s = self.chat_session.as_mut()?.sign(value, time, salt, &seen)?;
+                            Some((name.clone(), s))
+                        })
+                        .collect();
+                    let names: Vec<&str> = arguments.iter().map(|(n, _)| n.as_str()).collect();
+                    eprintln!(
+                        "[session] a command with arguments to sign: {names:?} ({} signed)",
+                        signed.len()
+                    );
+                    play::chat_command_signed(command, time, salt, &signed, &update)
+                }
+            }
+        };
+        self.connection.send(packet);
+    }
+
+    /// `ClientPacketListener.tick`'s key pair: a new one fetched when it is due, and a
+    /// chat session made of each new one the server is told of (`setKeyPair`).
+    fn tick_chat_keys(&mut self) {
+        let Some(keys) = self.profile_keys.clone() else {
+            return;
+        };
+        if self.chat_session.is_some() && !self.keys_pending && keys.should_refresh() {
+            keys.prepare();
+            self.keys_pending = true;
+        }
+        if !self.keys_pending {
+            return;
+        }
+        let crate::chat::KeyPoll::Ready(pair) = keys.poll() else {
+            return;
+        };
+        self.keys_pending = false;
+        let Some(pair) = pair else { return };
+        if self.chat_session.as_ref().is_some_and(|s| s.keys == pair) {
+            return;
+        }
+        let Some(id) = crate::chat::random_uuid() else {
+            return;
+        };
+        match crate::chat::LocalChatSession::new(id, pair, self.uuid) {
+            Ok(session) => {
+                eprintln!(
+                    "[session] chat session {:032x}: messages are signed",
+                    session.id
+                );
+                self.connection.send(session.update_packet());
+                self.chat_session = Some(session);
+            }
+            Err(e) => eprintln!("[session] no chat session: {e}"),
         }
     }
 
@@ -1607,6 +1729,9 @@ impl Game {
     /// One client tick (`Minecraft.tick`), for the parts there are so far.
     fn tick(&mut self) {
         let now = self.millis();
+        if self.world.is_some() {
+            self.tick_chat_keys();
+        }
         let Some(w) = &mut self.world else {
             return;
         };
@@ -1962,6 +2087,7 @@ impl Game {
                     self.connection.send(play::chat_ack(offset));
                 }
                 self.hud_text.reconfigure();
+                self.commands = CommandTree::default();
                 self.connection
                     .switch(Protocol::Configuration, play::configuration_acknowledged());
                 self.phase = Phase::Configuration;
@@ -1995,6 +2121,15 @@ impl Game {
                 self.hardcore = login.hardcore;
                 self.online_mode = login.online_mode;
                 self.world = Some(world);
+                // A new chat session for every login, once its key pair is had.
+                self.chat_session = None;
+                self.keys_pending = false;
+                if login.online_mode
+                    && let Some(keys) = &self.profile_keys
+                {
+                    keys.prepare();
+                    self.keys_pending = true;
+                }
             }
             play::Clientbound::Respawn {
                 spawn,
@@ -2731,6 +2866,7 @@ impl Game {
                     self.connection.send(play::chat_ack(offset));
                 }
             }
+            play::Clientbound::Commands(tree) => self.commands = *tree,
             play::Clientbound::DisguisedChat { message, kind } => {
                 let ticks = self.hud.ticks();
                 self.hud_text
@@ -3576,6 +3712,144 @@ mod tests {
     }
 
     #[test]
+    fn chat_goes_out_signed_once_the_key_pair_is_had() {
+        use crate::chat::{KeyPoll, ProfileKeySource};
+        use ruthenium_data::v26_3::packets::play as pl;
+        use ruthenium_net::connection::Sent;
+        use ruthenium_protocol::wire::Reader;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        /// Ready on the second look.
+        #[derive(Debug, Default)]
+        struct Keys {
+            prepared: AtomicU32,
+            polls: AtomicU32,
+        }
+        impl ProfileKeySource for Keys {
+            fn prepare(&self) {
+                self.prepared.fetch_add(1, Ordering::SeqCst);
+            }
+            fn poll(&self) -> KeyPoll {
+                if self.polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    KeyPoll::Pending
+                } else {
+                    KeyPoll::Ready(Some(crate::chat::tests::keys()))
+                }
+            }
+            fn should_refresh(&self) -> bool {
+                false
+            }
+        }
+        // Each packet sent since the last look: its id and its body.
+        let sent = |r: &mut Rig| -> Vec<(u32, Vec<u8>)> {
+            r.remote
+                .sent()
+                .into_iter()
+                .filter_map(|s| match s {
+                    Sent::Packet(p) => {
+                        let mut rd = Reader::new(&p);
+                        let id = rd.varint().ok()? as u32;
+                        Some((id, rd.rest().to_vec()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let id = |p: pl::Serverbound| p.id();
+        let ids = |s: &[(u32, Vec<u8>)]| s.iter().map(|p| p.0).collect::<Vec<_>>();
+        let chat_ids = [
+            id(pl::Serverbound::Chat),
+            id(pl::Serverbound::ChatCommand),
+            id(pl::Serverbound::ChatCommandSigned),
+            id(pl::Serverbound::ChatSessionUpdate),
+        ];
+        let chats = |s: Vec<(u32, Vec<u8>)>| -> Vec<(u32, Vec<u8>)> {
+            s.into_iter().filter(|p| chat_ids.contains(&p.0)).collect()
+        };
+
+        // An offline server: no key pair asked for, nothing signed.
+        let keys = Arc::new(Keys::default());
+        let mut r = rig(None);
+        r.game.profile_keys = Some(keys.clone());
+        r.game.phase = Phase::Play;
+        r.packet(login());
+        r.packet(play::Clientbound::Commands(Box::new(
+            crate::chat::tests::tree(),
+        )));
+        r.frame(50);
+        r.frame(50);
+        assert_eq!(keys.prepared.load(Ordering::SeqCst), 0);
+        sent(&mut r);
+        r.game.control(Command::Chat("hello".into()));
+        r.game.control(Command::Chat("/say hi".into()));
+        r.game.control(Command::Chat("/tp 1 2 3".into()));
+        let out = chats(sent(&mut r));
+        assert_eq!(
+            ids(&out),
+            [
+                id(pl::Serverbound::Chat),
+                id(pl::Serverbound::ChatCommandSigned),
+                id(pl::Serverbound::ChatCommand)
+            ]
+        );
+        // "hello", its time and salt, then no signature.
+        assert_eq!(out[0].1[..6], [5, b'h', b'e', b'l', b'l', b'o']);
+        assert_eq!(out[0].1[6 + 16], 0);
+        // "say hi", its time and salt, and no argument signatures.
+        assert_eq!(out[1].1[7 + 16], 0);
+        assert_eq!(
+            out[2].1,
+            [8, b't', b'p', b' ', b'1', b' ', b'2', b' ', b'3']
+        );
+
+        // An online server: the key pair, once it comes, makes a chat session.
+        let keys = Arc::new(Keys::default());
+        let mut r = rig(None);
+        r.game.profile_keys = Some(keys.clone());
+        r.game.phase = Phase::Play;
+        let mut online = login();
+        if let play::Clientbound::Login(l) = &mut online {
+            l.online_mode = true;
+        }
+        r.packet(online);
+        r.packet(play::Clientbound::Commands(Box::new(
+            crate::chat::tests::tree(),
+        )));
+        r.frame(50);
+        assert_eq!(keys.prepared.load(Ordering::SeqCst), 1);
+        assert!(chats(sent(&mut r)).is_empty());
+        r.frame(50);
+        let out = chats(sent(&mut r));
+        assert_eq!(ids(&out), [id(pl::Serverbound::ChatSessionUpdate)]);
+        let session = r.game.chat_session.as_ref().unwrap().id;
+        assert_eq!(out[0].1[..16], session.to_be_bytes());
+        // The same pair again makes no new session.
+        r.game.keys_pending = true;
+        r.frame(50);
+        assert!(chats(sent(&mut r)).is_empty());
+        r.game.control(Command::Chat("hello".into()));
+        r.game.control(Command::Chat("/me waves".into()));
+        let out = chats(sent(&mut r));
+        assert_eq!(
+            ids(&out),
+            [
+                id(pl::Serverbound::Chat),
+                id(pl::Serverbound::ChatCommandSigned)
+            ]
+        );
+        assert_eq!(out[0].1[6 + 16], 1);
+        assert_eq!(out[0].1.len(), 6 + 16 + 1 + 256 + 1 + 3 + 1);
+        // One argument signature, named "action".
+        assert_eq!(
+            out[1].1[9 + 16..9 + 16 + 8],
+            [1, 6, b'a', b'c', b't', b'i', b'o', b'n']
+        );
+        // Out of play, nothing goes.
+        r.game.phase = Phase::Configuration;
+        r.game.control(Command::Chat("late".into()));
+        assert!(chats(sent(&mut r)).is_empty());
+    }
+
+    #[test]
     fn what_the_server_says_reaches_the_frame() {
         use ruthenium_protocol::packets::play::{BoundChatType, ChatTypeRef};
         let text = |s: &str| Tag::String(s.to_owned());
@@ -3794,6 +4068,7 @@ mod tests {
             None,
             ClientInformation::default(),
             crate::sound::GameSounds::default(),
+            None,
         )
         .unwrap();
         assert!(session.camera().is_none());

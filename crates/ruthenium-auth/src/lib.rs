@@ -17,6 +17,7 @@ pub mod http;
 pub mod minecraft;
 pub mod msa;
 pub mod pkce;
+pub mod profile_keys;
 pub mod skin;
 pub mod store;
 pub mod textures;
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 pub use http::{Http, UreqHttp};
 pub use minecraft::{Certificates, Endpoints, JoinError, Privileges, Profile};
 pub use msa::DeviceCode;
+pub use profile_keys::{ProfileKeyPair, ProfileKeys};
 pub use store::{Account, AccountStore};
 pub use xbox::XboxRefusal;
 

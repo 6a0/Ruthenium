@@ -759,6 +759,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     game.clouds = opts.clouds.unwrap_or(game.clouds);
     game.cloud_distance = opts.cloud_distance.unwrap_or(game.cloud_distance);
     let mut menu = Menu::new(servers_file, accounts, settings);
+    menu.set_command_history(data_dir.as_ref().map(|d| d.join("command_history.txt")));
     if let Some(n) = opts.mesh_workers {
         menu.set_mesh_workers(n);
     }
@@ -1159,6 +1160,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                     Step::Key(code, down) => keys.push((code, down, false, false, false)),
                     Step::Button(1, down) => clicks.push((down, 0.0, 0.0, false)),
                     Step::Button(b, down) => menu.other_mouse_button(b, down),
+                    Step::Text(text) => typed.push_str(&text),
                     Step::Shot => {
                         renderer.request_screenshot();
                         screenshot_requested = true;

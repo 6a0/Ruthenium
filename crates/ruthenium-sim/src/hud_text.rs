@@ -18,7 +18,7 @@ use ruthenium_protocol::nbt::{Compound, Tag};
 use ruthenium_protocol::packets::configuration::RegistryEntry;
 use ruthenium_protocol::packets::play::{
     self, BossEvent, BoundChatType, ChatDecoration, ChatParameter, ChatTypeRef, FilterMask,
-    PackedSignature, PlayerChat, SIGNATURE_BYTES,
+    PackedSignature, PlayerChat,
 };
 use ruthenium_protocol::text::StyledText;
 
@@ -70,7 +70,7 @@ impl ChatTag {
     };
 }
 
-type Signature = Box<[u8; SIGNATURE_BYTES]>;
+use crate::chat::{LastSeenTracker, Signature};
 
 /// A message in the chat.
 #[derive(Debug, Clone, PartialEq)]
@@ -341,9 +341,8 @@ fn has_font(tag: &Tag) -> bool {
 struct ChatSession {
     next_index: i32,
     signatures: Vec<Signature>,
-    last_tracked: Option<Signature>,
-    /// Signed messages taken in that the server has not been told of.
-    offset: i32,
+    /// The signed messages seen, and how many the server has not been told of.
+    seen: LastSeenTracker,
 }
 
 impl ChatSession {
@@ -580,23 +579,29 @@ impl HudTextState {
             self.add(ticks, text, None, Some(ChatTag::ERROR));
         }
         // `markMessageAsProcessed`.
-        let session = &mut self.session;
+        // (Shown: from a player on the list, not wholly filtered.)
+        let shown = known && chat.filter != FilterMask::FullyFiltered;
+        let seen = &mut self.session.seen;
         if let Some(signature) = &chat.signature
-            && session.last_tracked.as_ref() != Some(signature)
+            && seen.add_pending(signature, shown)
+            && seen.offset() > ACK_AFTER
         {
-            session.last_tracked = Some(signature.clone());
-            session.offset += 1;
-            if session.offset > ACK_AFTER {
-                return Ok(self.take_acknowledgement());
-            }
+            return Ok(self.take_acknowledgement());
         }
         Ok(None)
     }
 
     /// The signed messages the server is to be told of now, if any.
     pub fn take_acknowledgement(&mut self) -> Option<i32> {
-        let offset = std::mem::take(&mut self.session.offset);
+        let offset = self.session.seen.take_offset();
         (offset > 0).then_some(offset)
+    }
+
+    /// What a message or a signed command sent now says the player has seen
+    /// (`LastSeenMessagesTracker.generateAndApplyUpdate`): the signatures to sign with,
+    /// and the update to send.
+    pub fn last_seen_update(&mut self) -> (Vec<Signature>, play::LastSeenUpdate) {
+        self.session.seen.update()
     }
 
     /// `handleDeleteChat`.
@@ -605,6 +610,7 @@ impl HudTextState {
             .session
             .unpack(packed)
             .ok_or("the server deletes a chat message that is not known")?;
+        self.session.seen.ignore_pending(&signature);
         self.delete_message(&signature, ticks);
         Ok(())
     }
@@ -961,7 +967,7 @@ mod tests {
     }
 
     fn signature(n: u8) -> Signature {
-        Box::new([n; SIGNATURE_BYTES])
+        Box::new([n; play::SIGNATURE_BYTES])
     }
 
     fn said(index: i32, content: &str, signed: Option<u8>) -> PlayerChat {
@@ -976,6 +982,27 @@ mod tests {
             filter: FilterMask::PassThrough,
             kind: kind(0),
         }
+    }
+
+    #[test]
+    fn only_messages_shown_and_not_taken_back_are_acknowledged() {
+        use ruthenium_protocol::packets::play::{FilterMask, PackedSignature};
+        let t = types();
+        let mut s = HudTextState::default();
+        let mut hidden = said(0, "hidden", Some(1));
+        hidden.filter = FilterMask::FullyFiltered;
+        s.player_chat(0, 0, &hidden, true, &t).unwrap();
+        s.player_chat(0, 0, &said(1, "shown", Some(2)), true, &t)
+            .unwrap();
+        s.player_chat(0, 0, &said(2, "unknown", Some(3)), false, &t)
+            .unwrap();
+        s.player_chat(0, 0, &said(3, "taken back", Some(4)), true, &t)
+            .unwrap();
+        s.delete_chat(0, &PackedSignature::Full(signature(4)))
+            .unwrap();
+        let (seen, update) = s.last_seen_update();
+        assert_eq!(seen, [signature(2)]);
+        assert_eq!(update.offset, 4);
     }
 
     #[test]

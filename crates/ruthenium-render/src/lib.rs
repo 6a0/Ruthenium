@@ -497,6 +497,8 @@ pub struct Renderer {
     view_options: ViewOptions,
     /// The HUD, with the world's assets.
     hud: Option<hud::Hud>,
+    /// The chat screen, while it is open.
+    chat_input: Option<ruthenium_ui::hud::ChatInput>,
     /// The player's key bindings, for the HUD's text that names them.
     key_bindings: Arc<ruthenium_protocol::text::BoundKeys>,
     /// The terrain's part of the last frame.
@@ -625,6 +627,7 @@ impl Renderer {
             show_hand: true,
             view_options: ViewOptions::default(),
             hud: None,
+            chat_input: None,
             key_bindings: Arc::default(),
             world_times: WorldTimes::default(),
             last_frame: 0,
@@ -1072,6 +1075,16 @@ impl Renderer {
     }
 
     /// What the last frame's HUD was made of, if there is one.
+    /// The chat screen the HUD draws from now on (none: it is closed).
+    pub fn set_chat_input(&mut self, input: Option<ruthenium_ui::hud::ChatInput>) {
+        self.chat_input = input;
+    }
+
+    /// How the chat screen's chat was last drawn.
+    pub fn chat_shown(&self) -> Option<ruthenium_ui::hud::ChatShown> {
+        self.hud.as_ref()?.chat_shown().cloned()
+    }
+
     pub fn hud_stats(&self) -> Option<HudStats> {
         self.hud.as_ref().map(hud::Hud::stats)
     }
@@ -1648,6 +1661,7 @@ impl Renderer {
                     models,
                     renderer.block_atlas(),
                     &self.textures,
+                    self.chat_input.as_ref(),
                 );
             }
             self.world_times.stage_ns += started.elapsed().as_nanos() as u64;

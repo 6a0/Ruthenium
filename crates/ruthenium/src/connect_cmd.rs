@@ -6,13 +6,15 @@
 //! `+`-joined `w a s d jump sneak sprint use hit` (`use` holds the right button, `hit`
 //! the left), hotbar digits `1`-`9`, `click` (one press of the right button), `attack`
 //! (one press of the left), `swap` (the swap-hands key) and `wake` (the bed screen's
-//! Leave Bed), the last five pressed once
+//! Leave Bed), the last five pressed once, or `chat=TEXT` alone, sent to the chat as if
+//! typed and entered at the step's start (`_` for a space, `%XX` for any byte; a
+//! leading `/` makes it a command)
 //! at the step's start, or `-` for none; held for MS milliseconds while the mouse moves
 //! DX, DY counts every frame (60 a second, the rate frames run at here), turned as the window turns them with the
 //! saved mouse sensitivity. For example
 //! `w@2000 w+sprint+jump@3000 w@2000:12,0 sneak+w@1500 2@100 -@1000`.
 //!
-//! A death is printed, and Respawn pressed as soon as the death screen's buttons work;
+//! What the chat shows is printed as it comes. A death is printed, and Respawn pressed as soon as the death screen's buttons work;
 //! the script goes on (it doesn't start over) once the player is back.
 //!
 //! `--light-out` writes the light of every loaded chunk when the stay ends, and
@@ -32,9 +34,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ruthenium_prepare::discover::Env;
+use ruthenium_sim::hud_text::ChatMessage;
 use ruthenium_sim::input::{self, MouseOptions};
 use ruthenium_sim::player::{Keys, Pose};
 use ruthenium_sim::session::{PlayerView, Session, SessionEvent};
@@ -59,6 +63,8 @@ struct Step {
     swaps: u32,
     /// Leave Bed pressed at the step's start (`wake`).
     wake: bool,
+    /// Sent to the chat at the step's start.
+    chat: Option<String>,
     ms: u64,
     turn: (f32, f32),
 }
@@ -67,7 +73,7 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
     s.split_whitespace()
         .map(|step| {
             let bad = || format!("--script: can't read the step {step:?}");
-            let (keys, rest) = step.split_once('@').ok_or_else(bad)?;
+            let (keys, rest) = step.rsplit_once('@').ok_or_else(bad)?;
             let (ms, turn) = match rest.split_once(':') {
                 Some((ms, t)) => {
                     let (dx, dy) = t.split_once(',').ok_or_else(bad)?;
@@ -90,9 +96,14 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                 attacks: 0,
                 swaps: 0,
                 wake: false,
+                chat: None,
                 ms: ms.parse().map_err(|_| bad())?,
                 turn,
             };
+            if let Some(text) = keys.strip_prefix("chat=") {
+                st.chat = Some(script_text(text).ok_or_else(bad)?);
+                return Ok(st);
+            }
             for k in keys.split('+').filter(|k| *k != "-") {
                 match k {
                     "w" => st.keys.forward = true,
@@ -117,6 +128,23 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
             Ok(st)
         })
         .collect()
+}
+
+/// A `chat=` step's text: `_` a space, `%XX` a byte, the rest as it is.
+fn script_text(s: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(s.len());
+    let mut it = s.bytes();
+    while let Some(b) = it.next() {
+        match b {
+            b'_' => bytes.push(b' '),
+            b'%' => {
+                let hex = [it.next()?, it.next()?];
+                bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+            }
+            b => bytes.push(b),
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Plays a script, one frame at a time.
@@ -153,6 +181,10 @@ impl Player {
         }
         if st.wake {
             session.leave_bed();
+        }
+        if let Some(text) = &st.chat {
+            println!("          chat: {text}");
+            session.send_chat(text);
         }
         for _ in 0..st.swaps {
             session.swap_hands_key();
@@ -435,6 +467,8 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut leaving = false;
     let mut light_same = true;
     let mut next_frame = Instant::now();
+    // The newest chat message printed.
+    let mut chat_seen: Option<Arc<ChatMessage>> = None;
     loop {
         let mut closed = None;
         for e in session.poll() {
@@ -501,6 +535,18 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
             scripting = p.frame(&session);
         }
         session.frame();
+        if let Some(f) = session.scene().frame() {
+            let chat = &f.hud.texts.chat;
+            let new = chat
+                .iter()
+                .position(|m| chat_seen.as_ref().is_some_and(|s| Arc::ptr_eq(s, m)))
+                .unwrap_or(chat.len());
+            let t = started.elapsed().as_secs_f64();
+            for m in chat[..new].iter().rev() {
+                println!("{t:7.3}s  chat: {}", plain_text(&m.content, &data.lang));
+            }
+            chat_seen = chat.first().cloned();
+        }
         if let Some(v) = crate::ingame::world_view(&session, Instant::now(), 70.0) {
             audio.set_listener(&crate::sound::listener(&v.camera));
         }
@@ -690,6 +736,11 @@ mod tests {
         let s = parse_script("w+use@500 click+click+swap@50").unwrap();
         assert!(s[0].use_held && s[0].keys.forward);
         assert_eq!((s[1].clicks, s[1].swaps, s[1].use_held), (2, 1, false));
+        let s = parse_script("chat=/msg_@a_hi%5Fthere+1@200 chat=héllo@0").unwrap();
+        assert_eq!(s[0].chat.as_deref(), Some("/msg @a hi_there+1"));
+        assert_eq!((s[0].ms, s[0].keys), (200, Keys::default()));
+        assert_eq!(s[1].chat.as_deref(), Some("héllo"));
+        assert!(parse_script("chat=%G1@5").is_err());
         assert!(parse_script("w@").is_err());
         assert!(parse_script("fly@100").is_err());
     }

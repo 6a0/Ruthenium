@@ -10,6 +10,7 @@
 
 mod text;
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use ruthenium_assets::{Font, Id};
@@ -274,6 +275,33 @@ pub struct HudView<'a> {
     pub millis: i64,
     pub now: Instant,
     pub options: HudOptions,
+    /// The chat screen, while it is open over the HUD.
+    pub chat: Option<&'a ChatInput>,
+}
+
+/// The chat screen as the HUD draws it (`ChatScreen`): what is typed, the caret and
+/// the selection's other end (byte offsets), whether the caret blinks on, and how far
+/// the chat is scrolled up, in lines, as of the newest message then.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChatInput {
+    pub text: String,
+    pub caret: usize,
+    pub anchor: usize,
+    pub caret_on: bool,
+    pub scroll: i32,
+    pub newest: Option<Arc<ruthenium_sim::hud_text::ChatMessage>>,
+    /// A message came while it was scrolled up (the scroll bar is red).
+    pub new_since_scroll: bool,
+}
+
+/// How the chat screen's chat was drawn: its lines, how many of them came after the
+/// input's newest message, and the newest message then. While the chat is scrolled up,
+/// each new line scrolls it up one more (`addMessageToDisplayQueue`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChatShown {
+    pub lines: usize,
+    pub added: i32,
+    pub newest: Option<Arc<ruthenium_sim::hud_text::ChatMessage>>,
 }
 
 /// One frame's HUD.
@@ -291,6 +319,8 @@ pub struct HudLayout {
     texts_used: usize,
     /// The faces in the player list.
     pub faces: Vec<HudFace>,
+    /// The chat screen's chat, as last drawn.
+    pub chat_shown: Option<ChatShown>,
     sorted: Vec<HudEffect>,
 }
 
@@ -362,6 +392,7 @@ impl HudLayout {
         self.over.clear();
         self.texts_used = 0;
         self.faces.clear();
+        self.chat_shown = None;
     }
 
     /// The frame's lines of text, each over so many of [`Self::over`] and under the rest.
@@ -926,6 +957,7 @@ mod tests {
             millis,
             now: Instant::now(),
             options,
+            chat: None,
         };
         let mut memory = HudMemory::default();
         layout.build(&sprites, &font(), &(), &view, health, &mut memory);
