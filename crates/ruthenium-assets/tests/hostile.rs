@@ -1804,3 +1804,113 @@ fn the_metadata_check_reads_pack_mcmeta_alone() {
     let t = Temp::new("check-big.zip", &zip(&[("pack.mcmeta", META)]));
     assert!(Pack::check_untrusted(&t.0, &limits).is_err());
 }
+
+// The second review.
+
+#[test]
+fn the_filter_patterns_of_a_stack_are_bounded() {
+    let meta = |n: usize| {
+        let blocks = vec![r#"{"path": "^nothing/"}"#; n].join(",");
+        format!(r#"{{"pack": {{"description": ""}}, "filter": {{"block": [{blocks}]}}}}"#)
+    };
+    let u = Limits::untrusted();
+    // Nine patterns: more than a pack may have; eight read.
+    let (p, _t) = open(&zip(&[("pack.mcmeta", meta(9).as_bytes())]), &u).unwrap();
+    assert!(p.filter().is_none());
+    let (a, _ta) = open(&zip(&[("pack.mcmeta", meta(8).as_bytes())]), &u).unwrap();
+    let (b, _tb) = open(&zip(&[("pack.mcmeta", meta(8).as_bytes())]), &u).unwrap();
+    let (c, _tc) = open(&zip(&[("pack.mcmeta", meta(1).as_bytes())]), &u).unwrap();
+    assert_eq!(a.filter().unwrap().patterns(), 8);
+    // Sixteen in all: the third pack goes without its filter.
+    let res = Resources::new(vec![a, b, c]);
+    let kept: Vec<usize> = res
+        .packs()
+        .iter()
+        .map(|p| p.filter().map_or(0, |f| f.patterns()))
+        .collect();
+    assert_eq!(kept, [8, 8, 0]);
+}
+
+/// A pack whose load is cancelled: with the flag set every lookup finds nothing, reads
+/// fail, and every builder returns at once.
+#[test]
+fn a_cancelled_load_finds_nothing_and_builds_nothing() {
+    let (res, _t) = pack(
+        &[
+            ("assets/minecraft/atlases/blocks.json", BLOCKS_ATLAS),
+            (
+                "assets/minecraft/textures/block/x.png",
+                &png(16, 16, 0xFFFF_FFFF),
+            ),
+            ("assets/minecraft/models/block/m.json", cube_model()),
+            (
+                "assets/minecraft/blockstates/stone.json",
+                br#"{"variants": {"": {"model": "block/m"}}}"#,
+            ),
+            (
+                "assets/minecraft/items/stone.json",
+                br#"{"model": {"type": "model", "model": "block/m"}}"#,
+            ),
+            (
+                "assets/minecraft/font/default.json",
+                br#"{"providers": [{"type": "space", "advances": {"a": 1}}]}"#,
+            ),
+        ],
+        &Limits::untrusted(),
+    );
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    res.packs()[0].cancel_with(flag.clone());
+    let a = blocks(&res, 16384).unwrap();
+    assert!(a.sprite(&id("block/x")).is_some() && !res.cancelled());
+    let x = res.get(&id("textures/block/x.png")).unwrap();
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(res.cancelled());
+    assert!(res.get(&id("textures/block/x.png")).is_none());
+    assert!(res.stack(&id("textures/block/x.png")).is_empty());
+    assert!(res.list("textures", |_| true).is_empty());
+    assert!(x.read().is_err() && x.image(16384).is_err());
+    assert!(matches!(blocks(&res, 16384), Err(AtlasError::Cancelled)));
+    let models = BlockModels::bake(&res, &a);
+    assert!(
+        models.warnings.iter().any(|w| w.contains("cancelled")),
+        "{:?}",
+        models.warnings
+    );
+    let items = ItemModels::bake(&res, &a, &a, None);
+    assert_eq!(items.len(), 0);
+    assert!(!font(&res).has('a'));
+}
+
+/// A worst-case atlas (sixty pictures of a million texels) cancelled from another thread
+/// while it loads stops within a bounded time.
+#[test]
+fn a_cancelled_atlas_stops_while_it_loads() {
+    let big = png(1024, 1024, 0xFF80_8080);
+    let names: Vec<String> = (0..60)
+        .map(|i| format!("assets/minecraft/textures/block/b{i}.png"))
+        .collect();
+    let mut files: Vec<(&str, &[u8])> =
+        vec![("assets/minecraft/atlases/blocks.json", BLOCKS_ATLAS)];
+    files.extend(names.iter().map(|n| (n.as_str(), &big[..])));
+    let (res, _t) = pack(&files, &Limits::untrusted());
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    res.packs()[0].cancel_with(flag.clone());
+    let setter = {
+        let flag = flag.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            Instant::now()
+        })
+    };
+    let built = blocks(&res, 16384);
+    let ended = Instant::now();
+    let set = setter.join().unwrap();
+    assert!(
+        matches!(built, Err(AtlasError::Cancelled)),
+        "{:?}",
+        built.map(|a| a.width)
+    );
+    // At most one picture a thread after the flag.
+    assert!(ended.saturating_duration_since(set) < Duration::from_secs(5));
+}
