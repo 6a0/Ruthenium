@@ -8,7 +8,9 @@
 //! [`fetch::Limits`], the address policy in [`address`], the cache's rules in [`cache`].
 //!
 //! Deviations from vanilla, each for safety: hosts that resolve to private, loopback or
-//! other non-public addresses are refused unless the server itself is local; timeouts on
+//! other non-public addresses are refused except those the caller lists (a local server's
+//! own), judging IPv4 reached through NAT64 by the IPv4 (the network's own NAT64 prefixes
+//! are found with one `ipv4only.arpa` lookup, RFC 7050, when an IPv6 answer needs them); timeouts on
 //! every phase and on the whole download; at most five redirects; no proxy; redirects
 //! that aren't followed (308, a missing Location, another protocol) fail instead of
 //! keeping the redirect's own body as the pack; the player's name and UUID go only to the
@@ -24,6 +26,8 @@ mod fetch;
 mod java_url;
 #[cfg(test)]
 mod tests;
+
+pub use address::AddressRange;
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -58,8 +62,10 @@ pub struct DownloadConfig {
     /// Sent with every request, exactly these (vanilla's `X-Minecraft-*` and
     /// `User-Agent`); the player's name and UUID only to the host the server named.
     pub headers: Vec<(String, String)>,
-    /// whether the server we're connected to is itself on a loopback/private/link-local address (then pack hosts may be too)
-    pub allow_private_hosts: bool,
+    /// Non-public addresses pack hosts may still have (empty: public hosts only): the
+    /// server's own, when the server we play on is itself local. Unspecified, broadcast
+    /// and multicast addresses are refused even when listed.
+    pub private_allowed: Vec<AddressRange>,
 }
 
 /// Why a pack didn't download.
@@ -212,7 +218,7 @@ pub(crate) fn download_batch_with(
     limits: &fetch::Limits,
 ) -> Vec<(u128, Result<PathBuf, DownloadError>)> {
     let opened = open_cache(&config.cache_dir);
-    let client = fetch::Client::new(limits, config.allow_private_hosts);
+    let client = fetch::Client::new(limits, &config.private_allowed);
     let mut results = Vec::with_capacity(requests.len());
     for (n, request) in requests.iter().enumerate() {
         progress.request_start();

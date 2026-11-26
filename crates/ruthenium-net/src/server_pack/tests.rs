@@ -213,7 +213,7 @@ fn config(dir: &TempDir) -> DownloadConfig {
     DownloadConfig {
         cache_dir: dir.cache(),
         headers: headers(),
-        allow_private_hosts: true,
+        private_allowed: vec![AddressRange::host("127.0.0.1".parse().unwrap())],
     }
 }
 
@@ -223,6 +223,7 @@ fn limits() -> fetch::Limits {
         per_read: Duration::from_secs(5),
         headers: Duration::from_secs(5),
         whole: Duration::from_secs(20),
+        nat64: Some(Vec::new()),
         ..fetch::Limits::default()
     }
 }
@@ -619,6 +620,7 @@ fn quick(headers: u64, per_read: u64, whole: u64) -> fetch::Limits {
         headers: Duration::from_millis(headers),
         per_read: Duration::from_millis(per_read),
         whole: Duration::from_millis(whole),
+        nat64: Some(Vec::new()),
         ..fetch::Limits::default()
     }
 }
@@ -819,7 +821,7 @@ fn local_hosts_are_refused_unless_the_server_is_local() {
     let server = serve(|_| ok(b"pack"));
     let dir = TempDir::new();
     let mut cfg = config(&dir);
-    cfg.allow_private_hosts = false;
+    cfg.private_allowed = Vec::new();
     let (result, log) = one(&cfg, &server.url("/p"), None, &limits());
     assert_eq!(
         result,
@@ -838,6 +840,33 @@ fn local_hosts_are_refused_unless_the_server_is_local() {
 }
 
 #[test]
+fn a_local_server_allows_its_own_address_and_nothing_else() {
+    let server = serve(|r| match r.path.as_str() {
+        "/to-neighbour" => redirect(302, "http://127.0.0.2:9/admin"),
+        "/to-router" => redirect(302, "http://192.168.1.1/admin"),
+        _ => ok(b"pack"),
+    });
+    let dir = TempDir::new();
+    // config() allows the server's own address, 127.0.0.1.
+    assert!(
+        one(&config(&dir), &server.url("/p"), None, &limits())
+            .0
+            .is_ok()
+    );
+    for (path, ip) in [
+        ("/to-neighbour", "127.0.0.2"),
+        ("/to-router", "192.168.1.1"),
+    ] {
+        let (result, _) = one(&config(&dir), &server.url(path), None, &limits());
+        assert_eq!(
+            result,
+            Err(DownloadError::RefusedAddress(ip.parse().unwrap())),
+            "{path}"
+        );
+    }
+}
+
+#[test]
 fn a_redirect_to_a_private_address_is_refused() {
     let server = serve(|r| match r.path.as_str() {
         "/to-loopback" => redirect(302, "http://127.0.0.2:9/admin"),
@@ -845,14 +874,19 @@ fn a_redirect_to_a_private_address_is_refused() {
         "/to-metadata" => redirect(302, "http://169.254.169.254/latest/meta-data/"),
         "/to-v6" => redirect(302, "http://[::1]:9/"),
         "/to-mapped" => redirect(302, "http://[::ffff:10.0.0.1]/"),
+        "/to-nat64" => redirect(302, "http://[2a00:1234:5678:9abc::c0a8:101]:9/"),
         _ => ok(b"pack"),
     });
     let dir = TempDir::new();
     let mut cfg = config(&dir);
-    cfg.allow_private_hosts = false;
-    // The test server stands in for a public host.
+    cfg.private_allowed = Vec::new();
+    // The test server stands in for a public host, on a network whose DNS64 synthesises
+    // with an operator's prefix.
     let pretend = fetch::Limits {
         pretend_public: vec!["127.0.0.1".parse().unwrap()],
+        nat64: Some(vec![
+            address::Nat64Prefix::new("2a00:1234:5678:9abc::".parse().unwrap(), 96).unwrap(),
+        ]),
         ..limits()
     };
     assert!(one(&cfg, &server.url("/p"), None, &pretend).0.is_ok());
@@ -862,6 +896,8 @@ fn a_redirect_to_a_private_address_is_refused() {
         ("/to-metadata", "169.254.169.254"),
         ("/to-v6", "::1"),
         ("/to-mapped", "10.0.0.1"),
+        // 192.168.1.1 through the operator's NAT64.
+        ("/to-nat64", "2a00:1234:5678:9abc::c0a8:101"),
     ] {
         let (result, _) = one(&cfg, &server.url(path), None, &pretend);
         assert_eq!(

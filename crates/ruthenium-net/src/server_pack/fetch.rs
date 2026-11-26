@@ -21,7 +21,7 @@ use ureq::tls::{RootCerts, TlsConfig};
 use ureq::unversioned::transport::DefaultConnector;
 
 use super::DownloadError;
-use super::address::CheckedResolver;
+use super::address::{AddressRange, CheckedResolver, Nat64Prefix};
 use super::java_url::{self, JavaUrl, UrlError};
 
 /// Every limit a download runs under. [`Limits::default`] is what the game uses; tests
@@ -53,6 +53,9 @@ pub(crate) struct Limits {
     pub max_requests: usize,
     /// Addresses treated as public (tests: the test server is on loopback).
     pub pretend_public: Vec<IpAddr>,
+    /// The network's NAT64 prefixes, or None to find them (RFC 7050) when an IPv6 answer
+    /// needs them; tests give them.
+    pub nat64: Option<Vec<Nat64Prefix>>,
 }
 
 impl Default for Limits {
@@ -73,6 +76,7 @@ impl Default for Limits {
             // Servers send one pack, a few at most.
             max_requests: 32,
             pretend_public: Vec::new(),
+            nat64: None,
         }
     }
 }
@@ -94,7 +98,7 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    pub fn new(limits: &Limits, allow_private: bool) -> Client {
+    pub fn new(limits: &Limits, private_allowed: &[AddressRange]) -> Client {
         let tls = TlsConfig::builder()
             .root_certs(RootCerts::PlatformVerifier)
             .build();
@@ -114,7 +118,12 @@ impl Client {
             .timeout_per_read(Some(limits.per_read))
             .tls_config(tls)
             .build();
-        let resolver = CheckedResolver::new(allow_private, limits.pretend_public.clone());
+        let resolver = CheckedResolver::new(
+            private_allowed.to_vec(),
+            limits.nat64.clone(),
+            limits.resolve,
+            limits.pretend_public.clone(),
+        );
         let refused = resolver.refused.clone();
         Client {
             agent: Agent::with_parts(config, DefaultConnector::default(), resolver),

@@ -3,28 +3,209 @@
 //! Vanilla connects wherever the URL points. A pack URL comes from the server, so it could
 //! point the player's own machine at their router, a printer, a local admin page or
 //! anything else on their network; we refuse every address that isn't on the public
-//! internet unless the server we're playing on is itself local (then its packs may be too).
+//! internet, except the few the caller allows (the server's own, when it is local).
 //! The check runs on the resolved addresses inside ureq's resolver, and ureq connects only
 //! to the addresses the resolver returns, so a name can't resolve to a public address for
 //! the check and a private one for the connection (DNS rebinding).
+//!
+//! IPv4 reached through IPv6 is judged as the IPv4 it reaches: mapped addresses, NAT64's
+//! well-known prefix 64:ff9b::/96, 6to4, and the network's own NAT64 prefixes, which
+//! RFC 7050 finds by asking the system resolver for `ipv4only.arpa` (its DNS64 then
+//! answers with 192.0.0.170 and .171 inside the prefix). Without that, a name answering
+//! only `<operator prefix>::c0a8:101` (192.168.1.1 through the operator's NAT64) would pass
+//! as a public IPv6 address.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::time::Duration;
 
 use ureq::config::Config;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::NextTimeout;
 
-/// Whether a download may connect to `ip`. With `allow_private` (the server we play on is
-/// local), everything but addresses no server can have.
-pub(crate) fn allowed(ip: IpAddr, allow_private: bool) -> bool {
-    let ip = canonical(ip);
-    if never(ip) {
-        return false;
+/// A range of addresses: `addr/prefix_len`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressRange {
+    addr: IpAddr,
+    prefix_len: u8,
+}
+
+impl AddressRange {
+    /// Exactly one address (/32 or /128). IPv4-mapped IPv6 is normalised to IPv4.
+    pub fn host(ip: IpAddr) -> AddressRange {
+        let addr = unmap(ip);
+        let prefix_len = if addr.is_ipv4() { 32 } else { 128 };
+        AddressRange { addr, prefix_len }
     }
-    allow_private || is_public(ip)
+
+    /// `ip/prefix_len`; None when `prefix_len` is over 32 (IPv4) or 128 (IPv6). An
+    /// IPv4-mapped range of /96 or longer is the IPv4 range it maps.
+    pub fn new(ip: IpAddr, prefix_len: u8) -> Option<AddressRange> {
+        let (addr, prefix_len) = match ip {
+            IpAddr::V6(v6) if prefix_len >= 96 && v6.to_ipv4_mapped().is_some() => {
+                (unmap(ip), prefix_len - 96)
+            }
+            _ => (ip, prefix_len),
+        };
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        (prefix_len <= max).then_some(AddressRange { addr, prefix_len })
+    }
+
+    /// Whether `ip` (IPv4-mapped IPv6 as its IPv4) is in the range.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, unmap(ip)) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => in_v4(ip, net.octets(), self.prefix_len.into()),
+            (IpAddr::V6(net), IpAddr::V6(ip)) => in_v6(ip, net.segments(), self.prefix_len.into()),
+            _ => false,
+        }
+    }
+}
+
+fn unmap(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+/// A NAT64 prefix (RFC 6052): an IPv6 address's first `len` bits, with the IPv4 address
+/// it reaches in the bits after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Nat64Prefix {
+    bytes: [u8; 16],
+    len: u8,
+}
+
+/// The prefix lengths RFC 6052 allows.
+const NAT64_LENGTHS: [u8; 6] = [96, 64, 56, 48, 40, 32];
+
+/// The IPv4 address embedded after a prefix of `len` bits (RFC 6052 section 2.2: bits 64
+/// to 71 are zero and skipped).
+fn embedded_v4(b: [u8; 16], len: u8) -> Option<Ipv4Addr> {
+    let v4 = match len {
+        96 => [b[12], b[13], b[14], b[15]],
+        64 => [b[9], b[10], b[11], b[12]],
+        56 => [b[7], b[9], b[10], b[11]],
+        48 => [b[6], b[7], b[9], b[10]],
+        40 => [b[5], b[6], b[7], b[9]],
+        32 => [b[4], b[5], b[6], b[7]],
+        _ => return None,
+    };
+    (len == 96 || b[8] == 0).then(|| Ipv4Addr::from(v4))
+}
+
+impl Nat64Prefix {
+    /// `ip`'s first `len` bits as a prefix.
+    pub fn new(ip: Ipv6Addr, len: u8) -> Option<Nat64Prefix> {
+        if !NAT64_LENGTHS.contains(&len) {
+            return None;
+        }
+        let mut bytes = [0u8; 16];
+        let n = usize::from(len / 8);
+        bytes[..n].copy_from_slice(&ip.octets()[..n]);
+        Some(Nat64Prefix { bytes, len })
+    }
+
+    /// The IPv4 address `ip` reaches through this prefix, if it is in it.
+    fn embedded(&self, ip: Ipv6Addr) -> Option<Ipv4Addr> {
+        let b = ip.octets();
+        let n = usize::from(self.len / 8);
+        if b[..n] != self.bytes[..n] {
+            return None;
+        }
+        embedded_v4(b, self.len)
+    }
+}
+
+/// RFC 7050's well-known IPv4 addresses of `ipv4only.arpa`.
+const IPV4ONLY: [Ipv4Addr; 2] = [Ipv4Addr::new(192, 0, 0, 170), Ipv4Addr::new(192, 0, 0, 171)];
+
+/// RFC 7050 section 3: the prefixes in which `ipv4only.arpa`'s IPv6 answers carry its
+/// well-known IPv4 addresses. Every length that fits is kept (more is stricter).
+pub(crate) fn nat64_prefixes(answers: impl IntoIterator<Item = IpAddr>) -> Vec<Nat64Prefix> {
+    let mut out = Vec::new();
+    for ip in answers {
+        let IpAddr::V6(v6) = ip else { continue };
+        if v6.to_ipv4_mapped().is_some() {
+            continue;
+        }
+        for len in NAT64_LENGTHS {
+            if embedded_v4(v6.octets(), len).is_some_and(|v4| IPV4ONLY.contains(&v4))
+                && let Some(p) = Nat64Prefix::new(v6, len)
+                && !out.contains(&p)
+            {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Asks the system resolver for `ipv4only.arpa` (RFC 7050), giving up after `timeout`:
+/// no answer means no NAT64 prefix of the network's own.
+pub(crate) fn discover_nat64(timeout: Duration) -> Vec<Nat64Prefix> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("nat64-discovery".into())
+        .spawn(move || {
+            let answers: Vec<IpAddr> = ("ipv4only.arpa", 0)
+                .to_socket_addrs()
+                .map(|a| a.map(|s| s.ip()).collect())
+                .unwrap_or_default();
+            let _ = tx.send(answers);
+        });
+    if spawned.is_err() {
+        return Vec::new();
+    }
+    let prefixes = nat64_prefixes(rx.recv_timeout(timeout).unwrap_or_default());
+    if !prefixes.is_empty() {
+        eprintln!("[packs] NAT64 prefixes of this network: {prefixes:?}");
+    }
+    prefixes
+}
+
+/// What a download may connect to.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Policy {
+    /// Non-public addresses still allowed (the server's own, when it is local).
+    pub private_allowed: Vec<AddressRange>,
+    /// The network's NAT64 prefixes besides the well-known one.
+    pub nat64: Vec<Nat64Prefix>,
+}
+
+impl Policy {
+    /// Whether a download may connect to `ip`: a public address, or one the caller
+    /// allows; never an address no server can have.
+    pub fn allowed(&self, ip: IpAddr) -> bool {
+        let reached = self.canonical(ip);
+        if never(reached) || never(ip) {
+            return false;
+        }
+        is_public(reached)
+            || self
+                .private_allowed
+                .iter()
+                .any(|r| r.contains(ip) || r.contains(reached))
+    }
+
+    /// IPv4 written as IPv6 (mapped, NAT64) as the IPv4 it reaches.
+    fn canonical(&self, ip: IpAddr) -> IpAddr {
+        let c = canonical(ip);
+        if let IpAddr::V6(v6) = c
+            && let Some(v4) = self.nat64.iter().find_map(|p| p.embedded(v6))
+        {
+            return v4.into();
+        }
+        c
+    }
+
+    /// Whether the answer depends on the network's NAT64 prefixes: an IPv6 address that
+    /// would otherwise pass.
+    fn needs_nat64(&self, ip: IpAddr) -> bool {
+        matches!(canonical(ip), IpAddr::V6(_)) && self.allowed(ip)
+    }
 }
 
 /// IPv4 written as IPv6 (mapped, or NAT64's well-known prefix) as the IPv4 it reaches.
@@ -133,7 +314,10 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 /// address is refused as a whole (a public pack host never answers with a private one).
 pub(crate) struct CheckedResolver {
     inner: DefaultResolver,
-    allow_private: bool,
+    policy: Policy,
+    /// The network's NAT64 prefixes: given (tests), or found on the first IPv6 answer.
+    nat64: OnceLock<Vec<Nat64Prefix>>,
+    discovery_timeout: Duration,
     /// Addresses tests treat as public (the test server is on loopback).
     pretend_public: Vec<IpAddr>,
     /// The last address refused, for the error.
@@ -141,20 +325,51 @@ pub(crate) struct CheckedResolver {
 }
 
 impl CheckedResolver {
-    pub fn new(allow_private: bool, pretend_public: Vec<IpAddr>) -> CheckedResolver {
+    pub fn new(
+        private_allowed: Vec<AddressRange>,
+        nat64: Option<Vec<Nat64Prefix>>,
+        discovery_timeout: Duration,
+        pretend_public: Vec<IpAddr>,
+    ) -> CheckedResolver {
+        let cell = OnceLock::new();
+        if let Some(n) = nat64 {
+            let _ = cell.set(n);
+        }
         CheckedResolver {
             inner: DefaultResolver::default(),
-            allow_private,
+            policy: Policy {
+                private_allowed,
+                nat64: Vec::new(),
+            },
+            nat64: cell,
+            discovery_timeout,
             pretend_public,
             refused: Arc::default(),
         }
+    }
+
+    fn allowed(&self, ip: IpAddr) -> bool {
+        if self.pretend_public.contains(&ip) {
+            return true;
+        }
+        if !self.policy.needs_nat64(ip) {
+            return self.policy.allowed(ip);
+        }
+        let nat64 = self
+            .nat64
+            .get_or_init(|| discover_nat64(self.discovery_timeout));
+        Policy {
+            private_allowed: self.policy.private_allowed.clone(),
+            nat64: nat64.clone(),
+        }
+        .allowed(ip)
     }
 }
 
 impl fmt::Debug for CheckedResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CheckedResolver")
-            .field("allow_private", &self.allow_private)
+            .field("policy", &self.policy)
             .finish_non_exhaustive()
     }
 }
@@ -169,7 +384,7 @@ impl Resolver for CheckedResolver {
         let addrs = self.inner.resolve(uri, config, timeout)?;
         for addr in addrs.iter() {
             let ip = addr.ip();
-            if !self.pretend_public.contains(&ip) && !allowed(ip, self.allow_private) {
+            if !self.allowed(ip) {
                 if let Ok(mut r) = self.refused.lock() {
                     *r = Some(ip);
                 }
@@ -189,6 +404,181 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    /// The policy with nothing private allowed, or everything.
+    fn allowed(ip: IpAddr, private: bool) -> bool {
+        let all = || {
+            vec![
+                AddressRange::new("0.0.0.0".parse().unwrap(), 0).unwrap(),
+                AddressRange::new("::".parse().unwrap(), 0).unwrap(),
+            ]
+        };
+        Policy {
+            private_allowed: if private { all() } else { Vec::new() },
+            nat64: Vec::new(),
+        }
+        .allowed(ip)
+    }
+
+    fn only(ranges: &[AddressRange]) -> Policy {
+        Policy {
+            private_allowed: ranges.to_vec(),
+            nat64: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ranges_hold_what_they_say() {
+        let host = AddressRange::host(ip("192.168.1.20"));
+        assert!(host.contains(ip("192.168.1.20")));
+        assert!(host.contains(ip("::ffff:192.168.1.20")));
+        assert!(!host.contains(ip("192.168.1.21")));
+        assert!(!host.contains(ip("::1")));
+        assert_eq!(
+            AddressRange::host(ip("::ffff:10.0.0.1")),
+            AddressRange::host(ip("10.0.0.1"))
+        );
+        let net = AddressRange::new(ip("10.1.2.3"), 16).unwrap();
+        assert!(net.contains(ip("10.1.255.1")));
+        assert!(!net.contains(ip("10.2.0.1")));
+        let mapped = AddressRange::new(ip("::ffff:10.1.0.0"), 112).unwrap();
+        assert_eq!(mapped, AddressRange::new(ip("10.1.0.0"), 16).unwrap());
+        let v6 = AddressRange::new(ip("fd00:1::"), 64).unwrap();
+        assert!(v6.contains(ip("fd00:1::5")));
+        assert!(!v6.contains(ip("fd00:2::5")));
+        assert!(AddressRange::new(ip("10.0.0.0"), 33).is_none());
+        assert!(AddressRange::new(ip("::"), 129).is_none());
+        assert!(AddressRange::new(ip("::"), 128).is_some());
+    }
+
+    #[test]
+    fn only_the_listed_private_addresses_are_allowed() {
+        let p = only(&[
+            AddressRange::host(ip("192.168.1.20")),
+            AddressRange::host(ip("::1")),
+        ]);
+        assert!(p.allowed(ip("192.168.1.20")));
+        assert!(p.allowed(ip("::ffff:192.168.1.20")));
+        assert!(p.allowed(ip("::1")));
+        assert!(p.allowed(ip("8.8.8.8")));
+        for s in [
+            "192.168.1.21",
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "fe80::1",
+        ] {
+            assert!(!p.allowed(ip(s)), "{s}");
+        }
+        // Never an address no server has, listed or not.
+        let all = only(&[
+            AddressRange::new(ip("0.0.0.0"), 0).unwrap(),
+            AddressRange::new(ip("::"), 0).unwrap(),
+        ]);
+        for s in [
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::",
+            "ff02::1",
+            "::ffff:224.0.0.1",
+        ] {
+            assert!(!all.allowed(ip(s)), "{s}");
+        }
+    }
+
+    /// `v4` inside `prefix` (of `len` bits) as RFC 6052 writes it.
+    fn synthesize(prefix: &str, len: u8, v4: &str) -> IpAddr {
+        let mut b = prefix.parse::<Ipv6Addr>().unwrap().octets();
+        let v4: Ipv4Addr = v4.parse().unwrap();
+        let o = v4.octets();
+        let positions: &[usize] = match len {
+            96 => &[12, 13, 14, 15],
+            64 => &[9, 10, 11, 12],
+            56 => &[7, 9, 10, 11],
+            48 => &[6, 7, 9, 10],
+            40 => &[5, 6, 7, 9],
+            _ => &[4, 5, 6, 7],
+        };
+        for (&i, &x) in positions.iter().zip(&o) {
+            b[i] = x;
+        }
+        IpAddr::V6(Ipv6Addr::from(b))
+    }
+
+    #[test]
+    fn an_operators_nat64_prefix_is_found_and_judged_by_the_ipv4_it_reaches() {
+        for (prefix, len) in [
+            ("2a00:1234:5678:9abc::", 96),
+            ("2a00:1234:5678:9abc::", 64),
+            ("2a00:1234:5678:9a00::", 56),
+            ("2a00:1234:5678::", 48),
+            ("2a00:1234:5600::", 40),
+            ("2a00:1234::", 32),
+        ] {
+            // What ipv4only.arpa answers on that network: its A records and the DNS64's.
+            let answers = [
+                ip("192.0.0.170"),
+                ip("192.0.0.171"),
+                synthesize(prefix, len, "192.0.0.170"),
+                synthesize(prefix, len, "192.0.0.171"),
+            ];
+            let found = nat64_prefixes(answers);
+            assert!(
+                found.contains(&Nat64Prefix::new(prefix.parse().unwrap(), len).unwrap()),
+                "/{len}: {found:?}"
+            );
+            let policy = Policy {
+                private_allowed: Vec::new(),
+                nat64: found,
+            };
+            for private in [
+                "192.168.1.1",
+                "10.0.0.1",
+                "127.0.0.1",
+                "169.254.169.254",
+                "100.64.0.1",
+            ] {
+                let through = synthesize(prefix, len, private);
+                assert!(
+                    !policy.allowed(through),
+                    "/{len}: {through} reaches {private}"
+                );
+                // Without the prefix it would have passed for a public IPv6 address.
+                assert!(Policy::default().allowed(through), "{through}");
+            }
+            assert!(policy.allowed(synthesize(prefix, len, "8.8.8.8")), "/{len}");
+            // Outside the prefix the same bits are just an IPv6 address.
+            let elsewhere = synthesize("2a00:9999:8888:7777::", len, "192.168.1.1");
+            assert!(policy.allowed(elsewhere), "/{len}: {elsewhere}");
+            // A local server's own address through NAT64 is allowed like the address itself.
+            let lan = Policy {
+                private_allowed: vec![AddressRange::host(ip("192.168.1.20"))],
+                nat64: policy.nat64.clone(),
+            };
+            assert!(lan.allowed(synthesize(prefix, len, "192.168.1.20")));
+            assert!(!lan.allowed(synthesize(prefix, len, "192.168.1.21")));
+        }
+    }
+
+    #[test]
+    fn a_network_without_dns64_has_no_prefix() {
+        // ipv4only.arpa's own records only, or nothing at all.
+        assert_eq!(nat64_prefixes([ip("192.0.0.170"), ip("192.0.0.171")]), []);
+        assert_eq!(nat64_prefixes([]), []);
+        // An IPv6 answer that carries neither well-known address isn't a prefix.
+        assert_eq!(nat64_prefixes([ip("2a00:1234::1")]), []);
+        // RFC 6052's bits 64 to 71 are zero below /96: otherwise it isn't a /64 prefix.
+        let IpAddr::V6(v6) = synthesize("2a00:1234:5678:9abc::", 64, "192.0.0.170") else {
+            unreachable!()
+        };
+        let mut b = v6.octets();
+        b[8] = 0xff;
+        let found = nat64_prefixes([IpAddr::V6(Ipv6Addr::from(b))]);
+        assert!(found.iter().all(|p| p.len == 96), "{found:?}");
+        // Nor does a mapped address count.
+        assert_eq!(nat64_prefixes([ip("::ffff:192.0.0.170")]), []);
     }
 
     #[test]

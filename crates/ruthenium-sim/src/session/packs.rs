@@ -468,7 +468,15 @@ impl Game {
             let config = download::DownloadConfig {
                 cache_dir,
                 headers: download_headers(&self.name, self.uuid),
-                allow_private_hosts: self.packs.peer.is_some_and(is_local),
+                // #12: Agent R's `pack_hosts_allowed(peer)` (adding 127.0.0.1 and ::1 for a
+                // loopback peer) replaces this when integrated.
+                private_allowed: self
+                    .packs
+                    .peer
+                    .filter(|&p| is_local(p))
+                    .map(download::AddressRange::host)
+                    .into_iter()
+                    .collect(),
             };
             let (jobs, rx) = channel::<Batch>();
             let results = self.packs.downloads.results_tx.clone();
