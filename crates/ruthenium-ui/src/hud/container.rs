@@ -120,9 +120,11 @@ fn translated(key: &str) -> Arc<Tag> {
 
 static CRAFTING: LazyLock<Arc<Tag>> = LazyLock::new(|| translated("container.crafting"));
 static INVENTORY: LazyLock<Arc<Tag>> = LazyLock::new(|| translated("container.inventory"));
-/// The line a placeholder screen shows (Ruthenium's own, not a translation key).
-static NOT_YET: LazyLock<Arc<Tag>> =
-    LazyLock::new(|| Arc::new(Tag::String("Ruthenium can't show this screen yet".into())));
+/// The lines a placeholder screen shows (Ruthenium's own, not a translation key), each
+/// narrower than the window.
+static NOT_YET: LazyLock<[Arc<Tag>; 2]> = LazyLock::new(|| {
+    ["Ruthenium can't show", "this screen yet"].map(|s| Arc::new(Tag::String(s.into())))
+});
 
 /// A whole 256 by 256 picture (`blit` with a texture size).
 const PICTURE: SpriteInfo = SpriteInfo {
@@ -299,10 +301,13 @@ impl HudLayout {
             }
         }
         if let Kind::Placeholder(p) = v.kind {
-            let line = memory.lines(&NOT_YET, Wrap::Single, font, lang)[0].clone();
             let middle = (17 + placeholder_body_end(p.inventory, ih)) / 2;
-            let x = left + (iw - line.width) / 2;
-            self.styled(&line, [0, 0], 1, x, top + middle - 4, LABEL, false);
+            for (i, text) in NOT_YET.iter().enumerate() {
+                let line = memory.lines(text, Wrap::Single, font, lang)[0].clone();
+                let x = left + (iw - line.width) / 2;
+                let y = top + middle - 10 + 11 * i as i32;
+                self.styled(&line, [0, 0], 1, x, y, LABEL, false);
+            }
         }
         // `AbstractFurnaceScreen.extractBackground`: the fire while it burns, the arrow
         // as far as the cooking has come.
