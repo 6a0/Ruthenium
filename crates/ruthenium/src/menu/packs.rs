@@ -49,6 +49,13 @@ pub(super) struct PackState {
     pub given: Vec<(u128, PathBuf)>,
     /// Development: every server's setting is this (`--server-packs`).
     pub status_override: Option<PackStatus>,
+    /// The packs the sound engine's files are of (none: vanilla's).
+    pub sounds_of: Vec<(u128, PathBuf)>,
+    /// A session whose packs are what the renderer has ended: no world is drawn until
+    /// vanilla's assets are back.
+    pub stale: bool,
+    /// The largest texture the GPU takes, once known.
+    pub max_texture: Option<u32>,
 }
 
 /// The server's prompt as plain text, cut to size: control characters (but line breaks)
@@ -56,6 +63,7 @@ pub(super) struct PackState {
 pub fn prompt_lines(text: &str) -> Vec<String> {
     let cleaned: String = text
         .chars()
+        .filter(|&c| !is_format_char(c))
         .take(MAX_PROMPT_CHARS)
         .map(|c| if c != '\n' && c.is_control() { ' ' } else { c })
         .collect();
@@ -64,6 +72,37 @@ pub fn prompt_lines(text: &str) -> Vec<String> {
         .map(|l| l.trim_end().to_owned())
         .take(MAX_PROMPT_LINES)
         .collect()
+}
+
+/// Unicode's format characters (general category Cf): bidirectional overrides and
+/// isolates, which can make the server's text read in another order than it is
+/// (`Yes` shown where `No` is meant), zero-width ones that hide what is there, the byte
+/// order mark, interlinear annotation marks and tags. They are left out of the prompt.
+pub fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{AD}'
+            | '\u{600}'..='\u{605}'
+            | '\u{61C}'
+            | '\u{6DD}'
+            | '\u{70F}'
+            | '\u{890}'..='\u{891}'
+            | '\u{8E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
 }
 
 /// The toast's two lines (`download.pack.*` in vanilla's English).
@@ -231,10 +270,41 @@ impl Menu {
             .map_or(PackStatus::Prompt, |e| e.pack_status)
     }
 
-    /// A session was dropped before it could ask: its server's packs go
-    /// (`clearDownloadedResourcePacks`).
-    pub(super) fn packs_back_to_vanilla(&mut self) {
+    /// The session is over (it closed, or another took its place): its reloads are
+    /// given up, and its server's packs go (`clearDownloadedResourcePacks`). The
+    /// language and the sounds are vanilla's again at once; the world's assets come back
+    /// with a reload, and until then no world is drawn, so the next server's never shows
+    /// with this one's pictures, font or models.
+    pub(super) fn packs_session_over(&mut self) {
+        let number = self.packs.session_number;
+        self.packs.wanted.retain(|r| r.session != number);
+        self.packs.prompt = None;
+        self.packs.toast = None;
+        let max = self.packs.max_texture.unwrap_or(16384);
+        if let Some(reloader) = &mut self.packs.reloader {
+            reloader.cancel_session(number, max);
+        }
+        if let Some(j) = &mut self.joiner {
+            j.set_server_lang(None);
+            if !self.packs.sounds_of.is_empty() {
+                self.packs.sounds_of.clear();
+                let (sound, game) = (j.sound().clone(), j.game());
+                let spawned = std::thread::Builder::new()
+                    .name("vanilla-sounds".into())
+                    .spawn(move || {
+                        let Some(game) = game else { return };
+                        match crate::game_files::vanilla(&game) {
+                            Ok(r) => sound.replace_files(ruthenium_audio::SoundFiles::new(r)),
+                            Err(e) => eprintln!("[sound] no vanilla sounds: {e}"),
+                        }
+                    });
+                if let Err(e) = spawned {
+                    eprintln!("[sound] no thread for vanilla's sounds: {e}");
+                }
+            }
+        }
         if !self.packs.given.is_empty() {
+            self.packs.stale = true;
             self.packs.wanted.push(Request {
                 packs: Vec::new(),
                 session: 0,
@@ -254,6 +324,7 @@ impl Menu {
     /// renderer, the sound and the language; the session that asked hears how it went.
     pub(super) fn sync_reloads(&mut self, renderer: &mut Renderer) {
         let max = renderer.gpu().caps().max_image_dimension_2d;
+        self.packs.max_texture = Some(max);
         if self.packs.reloader.is_none() {
             let game = self.joiner.as_ref().and_then(|j| j.game());
             self.packs.reloader = Some(Reloader::new(game, true));
@@ -326,14 +397,14 @@ impl Menu {
                 return false;
             }
         }
-        let first = request.session == 0 && self.packs.given.is_empty();
-        if !first
-            && self.packs.given != request.packs
-            && let Some(j) = &mut self.joiner
-        {
+        if let Some(j) = &mut self.joiner {
             j.set_server_lang((r.packs > 0).then(|| r.lang.clone()));
-            j.sound().replace_files(r.sounds);
+            if self.packs.sounds_of != request.packs {
+                j.sound().replace_files(r.sounds);
+                self.packs.sounds_of = request.packs.clone();
+            }
         }
+        self.packs.stale = false;
         self.packs.given = request.packs.clone();
         eprintln!(
             "[ruthenium] resources in use: vanilla's{}",
@@ -419,6 +490,51 @@ mod tests {
         let many = "a\n".repeat(MAX_PROMPT_LINES * 5);
         assert_eq!(prompt_lines(&many).len(), MAX_PROMPT_LINES);
         assert_eq!(prompt_lines("a\u{7}b\u{1b}[2Jc\r\nd"), ["a b [2Jc", "d"]);
+        // Format characters go: a right-to-left override, isolates, zero widths, the BOM.
+        assert_eq!(
+            prompt_lines("Click \u{202E}oN\u{202C} \u{2066}x\u{2069}\u{200B}y\u{FEFF}\u{E0041}"),
+            ["Click oN xy"]
+        );
+        // They don't count against the cap.
+        let hidden = format!("{}a", "\u{200B}".repeat(MAX_PROMPT_CHARS));
+        assert_eq!(prompt_lines(&hidden), ["a"]);
+    }
+
+    /// A session that ends gives up its reloads, puts the language back to vanilla's at
+    /// once, and keeps its packs' world from being drawn until vanilla's assets are back.
+    #[test]
+    fn the_end_of_a_session_goes_back_to_vanilla_at_once() {
+        use crate::account::Accounts;
+        use crate::settings::SettingsFile;
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.set_joiner(crate::join::Joiner::new(None, None));
+        let mut lang = std::collections::HashMap::new();
+        lang.insert("death.attack.generic".to_owned(), "PACK %s".to_owned());
+        if let Some(j) = &mut m.joiner {
+            j.set_server_lang(Some(std::sync::Arc::new(lang)));
+        }
+        m.packs.session_number = 4;
+        m.packs.given = vec![(1, PathBuf::from("/p.zip"))];
+        m.packs.wanted.push(Request {
+            packs: vec![(1, PathBuf::from("/p.zip"))],
+            session: 4,
+        });
+        m.packs_session_over();
+        let lang = m.joiner.as_mut().unwrap().server_lang();
+        assert!(!lang.contains_key("death.attack.generic"));
+        assert!(m.packs.stale);
+        assert!(m.world_view().is_none());
+        assert_eq!(
+            m.packs.wanted,
+            [Request {
+                packs: Vec::new(),
+                session: 0,
+            }]
+        );
+        // Without packs in use there is nothing to go back from.
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.packs_session_over();
+        assert!(!m.packs.stale && m.packs.wanted.is_empty());
     }
 
     /// Vanilla's toast texts, and `Unit.humanReadable`.

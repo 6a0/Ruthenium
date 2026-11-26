@@ -855,6 +855,10 @@ impl Menu {
 
     /// The world to draw this frame, if the session is in one.
     pub fn world_view(&self) -> Option<crate::ingame::WorldView> {
+        // (Not with the assets of a server whose session is over.)
+        if self.packs.stale {
+            return None;
+        }
         let fov = self.settings.settings.game.fov as f32;
         crate::ingame::world_view(self.session.as_ref()?, Instant::now(), fov)
     }
@@ -999,7 +1003,7 @@ impl Menu {
         // A session still closing is dropped (and so disconnected) here; the resources
         // go back to vanilla's (its own request for that goes with it).
         if self.session.take().is_some() {
-            self.packs_back_to_vanilla();
+            self.packs_session_over();
         }
         self.forget_world = true;
         self.packs.session_number += 1;
@@ -1286,8 +1290,8 @@ impl Menu {
                     self.session = None;
                     self.bed = false;
                     self.forget_world = true;
-                    self.packs.prompt = None;
-                    self.packs.toast = None;
+                    // (Before its reason is put in words: in vanilla's language.)
+                    self.packs_session_over();
                     if self.leaving || crate::join::left_on_purpose(&c) {
                         self.leaving = false;
                         if self.game_menu_open() {

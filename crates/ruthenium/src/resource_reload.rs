@@ -16,10 +16,12 @@
 //! shaders or post effects of any pack (PLAN D5: nothing reads them).
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ruthenium_assets::{Id, Limits, Pack, Resources};
 use ruthenium_audio::SoundFiles;
@@ -88,26 +90,40 @@ pub fn is_loadable(path: &Path) -> bool {
 /// Builds the resources of `game` with `packs` (lowest first) over vanilla's.
 /// `max_texture`: the largest texture the GPU takes; `world`: whether to build the
 /// world's assets too.
+/// `cancel` is looked at between the stages: once it is set, the build gives up.
 pub fn build(
     game: &Path,
     packs: &[(u128, PathBuf)],
     max_texture: u32,
     world: bool,
+    cancel: &AtomicBool,
 ) -> Result<Reloaded, String> {
+    let go_on = || {
+        if cancel.load(Ordering::Relaxed) {
+            Err("cancelled".to_owned())
+        } else {
+            Ok(())
+        }
+    };
     let started = Instant::now();
-    let opened = packs
-        .iter()
-        .map(|(id, path)| open_server_pack(path).map_err(|e| format!("pack {id:032x}: {e}")))
-        .collect::<Result<Vec<Pack>, String>>()?;
+    let mut opened = Vec::with_capacity(packs.len());
+    for (id, path) in packs {
+        go_on()?;
+        opened.push(open_server_pack(path).map_err(|e| format!("pack {id:032x}: {e}"))?);
+    }
     let resources = crate::game_files::with_server_packs(game, opened)?;
     let max_texture = atlas_limit(max_texture, packs.len());
+    go_on()?;
     let lang = Arc::new(language(&resources, packs.len()));
+    go_on()?;
     let sounds = SoundFiles::new(resources.clone());
+    go_on()?;
     let world = if world {
         Some(crate::join::load_world_assets_from(
             game,
             &resources,
             max_texture,
+            cancel,
         )?)
     } else {
         None
@@ -190,72 +206,201 @@ pub struct Request {
     pub session: u64,
 }
 
-/// Makes one reload at a time; one asked for meanwhile waits, and a reload overtaken by
-/// a newer one is not applied.
-#[derive(Debug)]
+/// The least time between two reloads a server asks for (vanilla: none): pushes and
+/// pops can ask for one again and again, and each builds every atlas and model anew.
+/// Those asked for meanwhile wait, and only the newest is made.
+pub const MIN_RELOAD_INTERVAL: Duration = Duration::from_secs(3);
+/// A reload still building after this long is given up (as failed, which the session
+/// recovers from); its thread stops at its next stage.
+pub const RELOAD_DEADLINE: Duration = Duration::from_secs(60);
+
+/// What builds a reload ([`build`], or a stand-in in tests).
+type Build = Arc<
+    dyn Fn(&Path, &[(u128, PathBuf)], u32, bool, &AtomicBool) -> Result<Reloaded, String>
+        + Send
+        + Sync,
+>;
+
+/// The reload under way.
+struct Running {
+    request: Request,
+    handle: JoinHandle<Result<Reloaded, String>>,
+    cancel: Arc<AtomicBool>,
+    started: Instant,
+}
+
+/// Makes one reload at a time. One asked for meanwhile waits (the newest only); one a
+/// server asked for starts at least [`MIN_RELOAD_INTERVAL`] after the last such one; a
+/// reload overtaken by a newer one, cancelled with its session, or past
+/// [`RELOAD_DEADLINE`] is not applied, and its request comes back as failed, for an
+/// answer. Requests of session 0 are the client's own (a first world, the way back to
+/// vanilla's after a session): they don't wait for the interval.
 pub struct Reloader {
     game: Option<PathBuf>,
     world: bool,
-    running: Option<(Request, JoinHandle<Result<Reloaded, String>>)>,
-    queued: Option<Request>,
+    build: Build,
+    running: Option<Running>,
+    next: Option<Request>,
+    last_server_start: Option<Instant>,
+    answers: VecDeque<(Request, Result<Reloaded, String>)>,
+    min_interval: Duration,
+    deadline: Duration,
+}
+
+impl std::fmt::Debug for Reloader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reloader")
+            .field("running", &self.running.as_ref().map(|r| &r.request))
+            .field("next", &self.next)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Reloader {
+    /// A reloader that builds with `build` and these times (tests).
+    #[cfg(test)]
+    fn with_build(build: Build, min_interval: Duration, deadline: Duration) -> Reloader {
+        Reloader {
+            build,
+            min_interval,
+            deadline,
+            ..Reloader::new(Some(PathBuf::from("/nowhere")), false)
+        }
+    }
+
     /// `world`: whether reloads build the world's assets (a window draws them).
     pub fn new(game: Option<PathBuf>, world: bool) -> Reloader {
         Reloader {
             game,
             world,
+            build: Arc::new(build),
             running: None,
-            queued: None,
+            next: None,
+            last_server_start: None,
+            answers: VecDeque::new(),
+            min_interval: MIN_RELOAD_INTERVAL,
+            deadline: RELOAD_DEADLINE,
         }
     }
 
     /// Asks for the resources with `request`'s packs; `max_texture` as [`build`]'s.
     pub fn request(&mut self, request: Request, max_texture: u32) {
-        if self.running.is_some() {
-            self.queued = Some(request);
-            return;
+        if let Some(old) = self.next.replace(request) {
+            self.answers
+                .push_back((old, Err("overtaken by a newer reload".into())));
         }
-        self.start(request, max_texture);
+        self.pump(max_texture);
     }
 
-    fn start(&mut self, request: Request, max_texture: u32) {
-        let Some(game) = self.game.clone() else {
-            eprintln!("[ruthenium] no game files to reload resources from");
+    /// Starts the waiting reload, if nothing runs and the interval allows.
+    fn pump(&mut self, max_texture: u32) {
+        let Some(next) = &self.next else { return };
+        if self.running.is_some()
+            || next.session != 0
+                && self
+                    .last_server_start
+                    .is_some_and(|t| t.elapsed() < self.min_interval)
+        {
+            return;
+        }
+        let Some(request) = self.next.take() else {
             return;
         };
-        let (packs, world) = (request.packs.clone(), self.world);
+        let Some(game) = self.game.clone() else {
+            eprintln!("[ruthenium] no game files to reload resources from");
+            self.answers
+                .push_back((request, Err("no game files".into())));
+            return;
+        };
+        if request.session != 0 {
+            self.last_server_start = Some(Instant::now());
+        }
+        let (packs, world, build) = (request.packs.clone(), self.world, self.build.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
         match std::thread::Builder::new()
             .name("resource-reload".into())
-            .spawn(move || build(&game, &packs, max_texture, world))
+            .spawn(move || build(&game, &packs, max_texture, world, &flag))
         {
-            Ok(h) => self.running = Some((request, h)),
-            Err(e) => eprintln!("[ruthenium] no thread for the reload: {e}"),
+            Ok(handle) => {
+                self.running = Some(Running {
+                    request,
+                    handle,
+                    cancel,
+                    started: Instant::now(),
+                })
+            }
+            Err(e) => {
+                eprintln!("[ruthenium] no thread for the reload: {e}");
+                self.answers
+                    .push_back((request, Err(format!("no thread: {e}"))));
+            }
         }
     }
 
     /// Whether a reload is under way or waiting.
     pub fn busy(&self) -> bool {
-        self.running.is_some() || self.queued.is_some()
+        self.running.is_some() || self.next.is_some()
+    }
+
+    /// The session `session` is over: its reload under way stops at its next stage and
+    /// is not applied, and one of its waiting is dropped (both come back as failed).
+    pub fn cancel_session(&mut self, session: u64, max_texture: u32) {
+        if self.next.as_ref().is_some_and(|r| r.session == session)
+            && let Some(r) = self.next.take()
+        {
+            self.answers
+                .push_back((r, Err("its session is over".into())));
+        }
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.request.session == session)
+            && let Some(r) = self.running.take()
+        {
+            r.cancel.store(true, Ordering::Relaxed);
+            self.answers
+                .push_back((r.request, Err("its session is over".into())));
+        }
+        self.pump(max_texture);
     }
 
     /// A reload that has ended: its request and what it built (`Err`: it failed, and
-    /// nothing changes). One overtaken by a request that came meanwhile is dropped and
-    /// the newer one starts; its request still comes back, as failed, for an answer.
+    /// nothing changes).
     pub fn poll(&mut self, max_texture: u32) -> Option<(Request, Result<Reloaded, String>)> {
-        if !self.running.as_ref().is_some_and(|(_, h)| h.is_finished()) {
-            return None;
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.started.elapsed() >= self.deadline)
+            && let Some(r) = self.running.take()
+        {
+            r.cancel.store(true, Ordering::Relaxed);
+            eprintln!(
+                "[ruthenium] the resource reload took longer than {:.0?}: given up",
+                self.deadline
+            );
+            self.answers
+                .push_back((r.request, Err("it took too long".into())));
         }
-        let (request, handle) = self.running.take()?;
-        let result = handle
-            .join()
-            .unwrap_or_else(|_| Err("the reload's thread panicked".into()));
-        if let Some(next) = self.queued.take() {
-            self.start(next, max_texture);
-            return Some((request, Err("overtaken by a newer reload".into())));
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|r| r.handle.is_finished())
+            && let Some(r) = self.running.take()
+        {
+            let result = r
+                .handle
+                .join()
+                .unwrap_or_else(|_| Err("the reload's thread panicked".into()));
+            let result = if self.next.is_some() {
+                Err("overtaken by a newer reload".into())
+            } else {
+                result
+            };
+            self.answers.push_back((r.request, result));
         }
-        Some((request, result))
+        self.pump(max_texture);
+        self.answers.pop_front()
     }
 }
 
@@ -270,6 +415,122 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn request(session: u64) -> Request {
+        Request {
+            packs: Vec::new(),
+            session,
+        }
+    }
+
+    /// Waits for the next answer (at most a few seconds).
+    fn answer(r: &mut Reloader) -> (Request, Result<Reloaded, String>) {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(a) = r.poll(1024) {
+                return a;
+            }
+            assert!(Instant::now() < until, "no answer");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn err(a: (Request, Result<Reloaded, String>)) -> (u64, String) {
+        (a.0.session, a.1.expect_err("a failure"))
+    }
+
+    /// A build that runs until it is cancelled, stage by stage.
+    fn endless() -> Build {
+        Arc::new(
+            |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &AtomicBool| {
+                while !cancel.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err("cancelled".into())
+            },
+        )
+    }
+
+    /// A session's reload under way is given up when the session is over: it comes back
+    /// at once, failed, and its thread is told to stop; the next starts.
+    #[test]
+    fn a_reload_of_a_session_that_is_over_is_dropped() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let seen = flag.clone();
+        let build: Build = Arc::new(
+            move |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &AtomicBool| {
+                while !cancel.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                seen.store(true, Ordering::Relaxed);
+                Err("cancelled".into())
+            },
+        );
+        let mut r = Reloader::with_build(build, Duration::ZERO, Duration::from_secs(60));
+        r.request(request(7), 1024);
+        assert!(r.busy());
+        r.cancel_session(7, 1024);
+        assert_eq!(err(answer(&mut r)), (7, "its session is over".into()));
+        assert!(!r.busy());
+        let until = Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::Relaxed) {
+            assert!(Instant::now() < until, "the build was not told to stop");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Another session's isn't touched.
+        r.request(request(8), 1024);
+        r.cancel_session(7, 1024);
+        assert!(r.busy());
+        r.cancel_session(8, 1024);
+        assert_eq!(err(answer(&mut r)).0, 8);
+    }
+
+    /// A reload still building at its deadline is given up.
+    #[test]
+    fn a_reload_past_its_deadline_is_given_up() {
+        let mut r = Reloader::with_build(endless(), Duration::ZERO, Duration::from_millis(30));
+        r.request(request(3), 1024);
+        assert_eq!(err(answer(&mut r)), (3, "it took too long".into()));
+        assert!(!r.busy());
+    }
+
+    /// Reloads a server asks for start at least the interval apart, only the newest of
+    /// those asked for meanwhile; the client's own don't wait.
+    #[test]
+    fn reloads_a_server_asks_for_are_spaced_and_coalesced() {
+        let quick: Build =
+            Arc::new(|_: &Path, _: &[(u128, PathBuf)], _, _, _: &AtomicBool| Err("built".into()));
+        let mut r =
+            Reloader::with_build(quick, Duration::from_millis(300), Duration::from_secs(60));
+        let started = Instant::now();
+        r.request(request(1), 1024);
+        assert_eq!(err(answer(&mut r)), (1, "built".into()));
+        r.request(request(1), 1024);
+        r.request(request(1), 1024);
+        // The first of the two is overtaken; the second waits for the interval.
+        assert_eq!(
+            err(answer(&mut r)),
+            (1, "overtaken by a newer reload".into())
+        );
+        assert_eq!(err(answer(&mut r)), (1, "built".into()));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        // The client's own starts at once.
+        let at = Instant::now();
+        r.request(request(0), 1024);
+        assert_eq!(err(answer(&mut r)), (0, "built".into()));
+        assert!(at.elapsed() < Duration::from_millis(250));
+    }
+
+    /// Cancelled between stages, a real build stops (here before opening the packs).
+    #[test]
+    fn a_cancelled_build_stops() {
+        let cancel = AtomicBool::new(true);
+        let packs = [(1u128, PathBuf::from("/nowhere/p.zip"))];
+        assert_eq!(
+            build(Path::new("/nowhere"), &packs, 1024, true, &cancel).err(),
+            Some("cancelled".to_owned())
+        );
     }
 
     const MCMETA: &[u8] = br#"{"pack":{"description":"test","min_format":97,"max_format":97}}"#;

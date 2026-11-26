@@ -307,11 +307,21 @@ const UNDERWATER: &str = "textures/misc/underwater.png";
 /// with its mip levels, and every block state's baked model and drawing rules; the block
 /// tags and the exported tables are the game's own. `max_texture` is the largest
 /// texture the GPU takes.
+/// `cancel` is looked at between the stages: once it is set, the build gives up
+/// (`Err`) at the next one.
 pub fn load_world_assets_from(
     game: &Path,
     resources: &Resources,
     max_texture: u32,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<WorldAssets, String> {
+    let go_on = || {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            Err("cancelled".to_owned())
+        } else {
+            Ok(())
+        }
+    };
     let started = std::time::Instant::now();
     let version = ruthenium_prepare::supported_version();
     let imported = ruthenium_prepare::import::open(version, game)
@@ -324,7 +334,9 @@ pub fn load_world_assets_from(
     let mut atlas = ruthenium_assets::atlas::build(resources, def, &options)
         .map_err(|e| format!("the block atlas: {e}"))?;
     let stitched = started.elapsed();
+    go_on()?;
     let models = BlockModels::bake(resources, &atlas);
+    go_on()?;
     for w in &models.warnings {
         eprintln!("[ruthenium] block models: {w}");
     }
@@ -372,6 +384,7 @@ pub fn load_world_assets_from(
                 },
             }
         });
+    go_on()?;
     // The sun, the moon and the End's sky, as bytes of red, green, blue and alpha.
     let sky_image = |file: &str| {
         colour_map(file).map(|image| SkyImage {
@@ -408,6 +421,7 @@ pub fn load_world_assets_from(
         })
         .collect();
     let exports = ruthenium_prepare::exporters::exports_dir(&imported);
+    go_on()?;
     let mut block_entities = block_entity_assets(&exports, resources, &sky_image)
         .inspect_err(|e| eprintln!("[ruthenium] no block entities: {e}; run `ruthenium prepare`"))
         .ok();
@@ -434,6 +448,7 @@ pub fn load_world_assets_from(
         ruthenium_data::v26_3::blocks::STATE_COUNT,
         table.part_count(),
     );
+    go_on()?;
     // The GUI's sprites, which the HUD is made of.
     let gui = ruthenium_assets::atlas::atlas_def("gui").and_then(|def| {
         ruthenium_assets::atlas::build(resources, def, &options)
