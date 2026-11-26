@@ -11,8 +11,9 @@ pub struct Pinned {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssetIndex {
     pub id: &'static str,
-    pub sha1: &'static str,
-    pub size: u64,
+    /// [`crate::asset_index::pinned_digest`] of the index: a SHA-256 over its
+    /// entries other than translations, which Mojang republishes.
+    pub pinned_sha256: &'static str,
 }
 
 /// The Java runtime Mojang ships for the version.

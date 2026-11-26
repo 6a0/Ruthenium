@@ -41,10 +41,12 @@ tasks:
       cache/javamath/mth.bin (read by ruthenium-javamath's tests). Defaults to
       reference/26.3 and JAVA_HOME or PATH. To check what players run, pass the
       launcher's runtime, e.g. --java <launcher>/java/java-runtime-epsilon/bin/java.
-  pin-version [--json <version.json>] [--out <file>]
+  pin-version [--json <version.json>] [--asset-index <index.json>] [--out <file>]
       Regenerate crates/ruthenium-prepare/src/pins.rs (hashes, sizes and paths of
-      the client jar, asset index and class-path libraries) from Mojang's version
-      JSON. Defaults to reference/26.3/jars/26.3.json.
+      the client jar and class-path libraries, and the digest of the asset index's
+      entries other than translations) from Mojang's version JSON and the asset
+      index it names. Defaults to reference/26.3/jars/26.3.json and the index
+      beside it, <asset index id>.json.
   fetch-compile-deps [--out <folder>]
       Download the official client jar and its class-path libraries, pinned by
       SHA-1, into cache/compile-deps. Build-time input for CI only: never

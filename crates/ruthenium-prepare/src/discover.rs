@@ -11,6 +11,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::asset_index::{self, IndexError};
 use crate::hash::sha1_file;
 use crate::version::GameVersion;
 
@@ -264,9 +265,10 @@ pub enum Rejection {
     },
     /// The asset index is missing: the version was installed but not played.
     NoAssetIndex(PathBuf),
+    /// The asset index is not the pinned one, translations aside.
     AssetIndexMismatch {
         path: PathBuf,
-        sha1: String,
+        why: IndexError,
     },
     /// Class-path libraries missing or of the wrong size.
     MissingLibraries(Vec<&'static str>),
@@ -291,8 +293,12 @@ impl fmt::Display for Rejection {
                 "{} is missing; play the version once so the launcher downloads its assets",
                 p.display()
             ),
-            Rejection::AssetIndexMismatch { path, sha1 } => {
-                write!(f, "{} has the wrong SHA-1 ({sha1})", path.display())
+            Rejection::AssetIndexMismatch { path, why } => {
+                write!(
+                    f,
+                    "{} is not the official asset index: {why}",
+                    path.display()
+                )
             }
             Rejection::MissingLibraries(names) => {
                 write!(f, "{} libraries missing: {}", names.len(), names.join(", "))
@@ -355,9 +361,9 @@ pub fn check(launcher: Launcher, root: &Path, version: &GameVersion) -> Result<I
     if !index.is_file() {
         return Err(Rejection::NoAssetIndex(index));
     }
-    let sha1 = sha1_file(&index).map_err(io_err(&index))?;
-    if sha1 != version.asset_index.sha1 {
-        return Err(Rejection::AssetIndexMismatch { path: index, sha1 });
+    let bytes = std::fs::read(&index).map_err(io_err(&index))?;
+    if let Err(why) = asset_index::verify(&bytes, &version.asset_index) {
+        return Err(Rejection::AssetIndexMismatch { path: index, why });
     }
 
     let missing: Vec<&'static str> = version

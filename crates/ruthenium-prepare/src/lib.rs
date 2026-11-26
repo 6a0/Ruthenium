@@ -2,7 +2,7 @@
 //!
 //! Ruthenium ships no Mojang files and downloads none. This crate finds a
 //! 26.3 install the player already has (official launcher, Prism, MultiMC,
-//! Modrinth App, ATLauncher, GDLauncher), verifies it against pinned SHA-1s,
+//! Modrinth App, ATLauncher, GDLauncher), verifies it against pinned hashes,
 //! imports it into Ruthenium's cache, and builds per-version data from it on
 //! the player's machine.
 //!
@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod asset_index;
 pub mod datagen;
 pub mod discover;
 pub mod exporters;

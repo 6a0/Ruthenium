@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ruthenium_prepare::asset_index::{self, IndexError};
 use ruthenium_prepare::discover::{self, Launcher, Rejection};
 use ruthenium_prepare::import::{self, ImportError};
 use ruthenium_prepare::version::{AssetIndex, GameVersion, JavaRequirement, Library, Pinned};
@@ -12,6 +13,9 @@ use sha1::{Digest, Sha1};
 const JAR: &[u8] = b"not really a client jar";
 const LIB: &[u8] = b"not really a library";
 const OBJECTS: [&[u8]; 2] = [b"first object", b"second object"];
+/// A translation, and what Mojang republished it as.
+const LANG: &[u8] = b"a translation";
+const NEW_LANG: &[u8] = b"a better translation";
 const LIB_PATH: &str = "org/example/lib/1.0/lib-1.0.jar";
 
 fn sha1(bytes: &[u8]) -> String {
@@ -25,19 +29,26 @@ fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
 }
 
-fn index_json() -> String {
-    let entries: Vec<String> = OBJECTS
-        .iter()
-        .enumerate()
-        .map(|(i, o)| {
-            format!(
-                "\"obj/{i}\": {{\"hash\": \"{}\", \"size\": {}}}",
-                sha1(o),
-                o.len()
-            )
-        })
-        .collect();
+fn entry(name: &str, object: &[u8]) -> String {
+    format!(
+        "\"{name}\": {{\"hash\": \"{}\", \"size\": {}}}",
+        sha1(object),
+        object.len()
+    )
+}
+
+/// The index with `lang` as its translation and `first` as its first object.
+fn index_with(first: &[u8], lang: &[u8]) -> String {
+    let entries = [
+        entry("obj/0", first),
+        entry("obj/1", OBJECTS[1]),
+        entry("minecraft/lang/xx_yy.json", lang),
+    ];
     format!("{{\"objects\": {{{}}}}}", entries.join(", "))
+}
+
+fn index_json() -> String {
+    index_with(OBJECTS[0], LANG)
 }
 
 fn version() -> &'static GameVersion {
@@ -50,8 +61,9 @@ fn version() -> &'static GameVersion {
         },
         asset_index: AssetIndex {
             id: "99",
-            sha1: leak(sha1(index.as_bytes())),
-            size: index.len() as u64,
+            pinned_sha256: leak(asset_index::pinned_digest(
+                &asset_index::parse(index.as_bytes()).unwrap(),
+            )),
         },
         java: JavaRequirement {
             component: "java-runtime-test",
@@ -89,10 +101,15 @@ fn fake_install(root: &Path, jar: &str, libs: &str, assets: &str) {
         &root.join(assets).join("indexes/99.json"),
         index_json().as_bytes(),
     );
-    for o in OBJECTS {
-        let h = sha1(o);
-        put(&root.join(assets).join("objects").join(&h[..2]).join(&h), o);
+    for o in OBJECTS.into_iter().chain([LANG]) {
+        put(&object(&root.join(assets), o), o);
     }
+}
+
+/// Where an object is in an assets folder.
+fn object(assets: &Path, bytes: &[u8]) -> PathBuf {
+    let h = sha1(bytes);
+    assets.join("objects").join(&h[..2]).join(&h)
 }
 
 fn fake_prism(root: &Path) {
@@ -200,14 +217,114 @@ fn imports_once_and_verifies_objects() {
 
     assert!(import::open(v, &cache).is_none());
     let (imported, stats) = import::import(&install, v, &cache).unwrap();
-    assert_eq!(stats.objects, 2);
-    assert_eq!(stats.linked + stats.copied, 5); // jar, library, index, 2 objects
+    assert_eq!(stats.objects, 3);
+    assert_eq!(stats.linked + stats.copied, 6); // jar, library, index, 3 objects
     assert_eq!(std::fs::read(&imported.client_jar).unwrap(), JAR);
     assert!(import::open(v, &cache).is_some());
 
     // Re-importing keeps what is already there.
     let (_, again) = import::import(&install, v, &cache).unwrap();
-    assert_eq!(again.present, 5);
+    assert_eq!(again.present, 6);
+}
+
+#[test]
+fn accepts_an_index_with_republished_translations() {
+    let v = version();
+    let root = scratch("lang-src");
+    fake_prism(&root);
+    let cache = scratch("lang-cache");
+    let index = root.join("assets/indexes/99.json");
+    let install = discover::check(Launcher::Prism, &root, v).unwrap();
+    let (imported, _) = import::import(&install, v, &cache).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(imported.asset_index()).unwrap(),
+        index_json()
+    );
+
+    // The launcher fetches the republished index and its translation, writing
+    // the index in place. The import already made is not touched by that.
+    let republished = index_with(OBJECTS[0], NEW_LANG);
+    assert_ne!(republished, index_json());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&index)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, republished.as_bytes()))
+        .unwrap();
+    put(&object(&root.join("assets"), NEW_LANG), NEW_LANG);
+    assert_eq!(
+        std::fs::read_to_string(imported.asset_index()).unwrap(),
+        index_json()
+    );
+    assert!(import::open(v, &cache).is_some());
+
+    // The install is still verified, and importing it brings its index and
+    // its translation, checked like any object.
+    let install = discover::check(Launcher::Prism, &root, v).unwrap();
+    let (imported, stats) = import::import(&install, v, &cache).unwrap();
+    assert_eq!(stats.objects, 3);
+    assert_eq!((stats.linked + stats.copied, stats.present), (2, 4));
+    assert_eq!(
+        std::fs::read_to_string(imported.asset_index()).unwrap(),
+        republished
+    );
+    assert_eq!(
+        std::fs::read(object(&imported.assets, NEW_LANG)).unwrap(),
+        NEW_LANG
+    );
+
+    // A republished translation that is damaged does not get in.
+    let cache = scratch("lang-damaged-cache");
+    std::fs::write(object(&root.join("assets"), NEW_LANG), b"tampered").unwrap();
+    assert!(matches!(
+        import::import(&install, v, &cache),
+        Err(ImportError::Mismatch { .. })
+    ));
+    assert!(import::open(v, &cache).is_none());
+}
+
+#[test]
+fn rejects_an_index_whose_other_files_changed() {
+    let v = version();
+    let root = scratch("index-src");
+    fake_prism(&root);
+    let index = root.join("assets/indexes/99.json");
+    let install = discover::check(Launcher::Prism, &root, v).unwrap();
+
+    // Another file for obj/0, present and intact in the object store.
+    let other: &[u8] = b"another object";
+    put(&object(&root.join("assets"), other), other);
+    let changed = index_with(other, LANG);
+    // A file more, and a translation's name on something that is not one.
+    let more = index_json().replace("\"obj/1\"", "\"obj/2\"");
+    let disguised = index_json().replace("lang/xx_yy.json", "lang/../xx_yy.json");
+    for bad in [&changed, &more, &disguised] {
+        std::fs::write(&index, bad).unwrap();
+        match discover::check(Launcher::Prism, &root, v) {
+            Err(Rejection::AssetIndexMismatch {
+                why: IndexError::Mismatch { .. },
+                ..
+            }) => {}
+            other => panic!("{bad}: {other:?}"),
+        }
+        // An install verified before its index changed is not imported either.
+        let cache = scratch("index-cache");
+        match import::import(&install, v, &cache) {
+            Err(ImportError::BadAssetIndex { .. }) => {}
+            other => panic!("{bad}: {other:?}"),
+        }
+        assert!(import::open(v, &cache).is_none());
+        assert!(!cache.join("assets/indexes/99.json").exists());
+    }
+
+    std::fs::write(&index, "not an index").unwrap();
+    match discover::check(Launcher::Prism, &root, v) {
+        Err(Rejection::AssetIndexMismatch {
+            why: IndexError::Malformed(_),
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -216,8 +333,7 @@ fn import_refuses_damaged_or_missing_objects() {
     let root = scratch("damaged-src");
     fake_prism(&root);
     let install = discover::check(Launcher::Prism, &root, v).unwrap();
-    let h = sha1(OBJECTS[0]);
-    let object = root.join("assets/objects").join(&h[..2]).join(&h);
+    let object = object(&root.join("assets"), OBJECTS[0]);
 
     std::fs::write(&object, b"tampered").unwrap();
     let cache = scratch("damaged-cache");
@@ -230,7 +346,7 @@ fn import_refuses_damaged_or_missing_objects() {
     std::fs::remove_file(&object).unwrap();
     match import::import(&install, v, &cache) {
         Err(ImportError::MissingObjects { missing, total, .. }) => {
-            assert_eq!((missing, total), (1, 2));
+            assert_eq!((missing, total), (1, 3));
         }
         other => panic!("{other:?}"),
     }

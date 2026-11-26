@@ -60,7 +60,7 @@ cargo run -p ruthenium -- prepare   # import the game files and run Mojang's dat
 
 To also run Ruthenium's exporters (original Java code that reads data such as entity sizes from your installed game), build them first with `cargo xtask exporters`. This needs JDK 25 and a client jar to compile against: either the local reference copy, or the official jar fetched by `cargo xtask fetch-compile-deps` (compile-time only, kept in the git-ignored `cache/`).
 
-`prepare` accepts a client jar only if its SHA-1 matches the official 26.3 release. It checks the asset index and every library and asset file the same way. Verified files are hard-linked (or copied) into Ruthenium's data folder. Pass `--from <folder>` for a launcher folder that isn't found automatically.
+`prepare` accepts a client jar only if its SHA-1 matches the official 26.3 release. It checks every library and asset file the same way. The asset index is checked entry by entry, except for the translations: Mojang republishes those after a release, so each is checked only against the hash its own index names. Verified files are hard-linked (or copied) into Ruthenium's data folder. Pass `--from <folder>` for a launcher folder that isn't found automatically.
 
 After `prepare`, `cargo run -p ruthenium -- assets` builds the game's sprite atlases from those files, read in place (add `--pack <zip or folder>` for resource packs, `--dump <folder>` to write them out as PNGs). The atlas tests in `crates/ruthenium-assets/tests/vanilla.rs` run against your import when `RUTHENIUM_GAME_DIR` points at it.
 

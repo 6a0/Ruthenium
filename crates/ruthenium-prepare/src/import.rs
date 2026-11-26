@@ -2,7 +2,8 @@
 //!
 //! Files are hard-linked when the cache is on the same file system as the
 //! launcher (no extra disk space), otherwise copied. Every file is checked
-//! against its pinned or indexed SHA-1 on the way in, so a damaged launcher
+//! against its pinned or indexed SHA-1 on the way in, and the asset index
+//! against its pinned digest ([`crate::asset_index`]), so a damaged launcher
 //! download never reaches the cache. Layout:
 //!
 //! ```text
@@ -19,10 +20,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::asset_index;
 use crate::discover::Install;
 use crate::hash::sha1_file;
 use crate::step;
-use crate::version::GameVersion;
+use crate::version::{AssetIndex, GameVersion};
 
 const MARKER: &str = "import.ok";
 
@@ -81,7 +83,7 @@ fn import_key(version: &GameVersion) -> String {
         "import-v1",
         version.id,
         version.client_jar.sha1,
-        version.asset_index.sha1,
+        version.asset_index.pinned_sha256,
     ];
     parts.extend(version.libraries.iter().map(|l| l.sha1));
     step::key(&parts)
@@ -204,32 +206,35 @@ fn place(src: &Path, dst: &Path, sha1: &str) -> Result<Placed, ImportError> {
     Ok(placed)
 }
 
-/// `(sha1, size)` of every distinct object in an asset index.
-fn index_objects(path: &Path) -> Result<Vec<(String, u64)>, ImportError> {
-    let bad = |reason: String| ImportError::BadAssetIndex {
-        path: path.to_owned(),
-        reason,
+/// Puts the launcher's asset index at `dst` and returns the `(sha1, size)` of
+/// every distinct object in it. The bytes written are the bytes checked
+/// against the pin. Always a copy: a launcher replaces its index when Mojang
+/// republishes it, and one that wrote in place would change a hard link too.
+fn place_index(
+    src: &Path,
+    dst: &Path,
+    pin: &AssetIndex,
+) -> Result<(Placed, Vec<(String, u64)>), ImportError> {
+    let bytes = std::fs::read(src).map_err(io_err(src))?;
+    let entries = asset_index::verify(&bytes, pin).map_err(|e| ImportError::BadAssetIndex {
+        path: src.to_owned(),
+        reason: e.to_string(),
+    })?;
+    let placed = if std::fs::read(dst).is_ok_and(|have| have == bytes) {
+        Placed::Present
+    } else {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(io_err(parent))?;
+        }
+        let tmp = dst.with_extension("partial");
+        std::fs::write(&tmp, &bytes).map_err(io_err(&tmp))?;
+        std::fs::rename(&tmp, dst).map_err(io_err(dst))?;
+        Placed::Copied
     };
-    let text = std::fs::read_to_string(path).map_err(io_err(path))?;
-    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| bad(e.to_string()))?;
-    let objects = json["objects"]
-        .as_object()
-        .ok_or_else(|| bad("no \"objects\" map".into()))?;
-    let mut out = Vec::with_capacity(objects.len());
-    for (name, obj) in objects {
-        let hash = obj["hash"].as_str().filter(|h| {
-            h.len() == 40
-                && h.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        });
-        let (Some(hash), Some(size)) = (hash, obj["size"].as_u64()) else {
-            return Err(bad(format!("bad entry {name:?}")));
-        };
-        out.push((hash.to_owned(), size));
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
+    let mut objects: Vec<(String, u64)> = entries.into_iter().map(|e| (e.hash, e.size)).collect();
+    objects.sort();
+    objects.dedup();
+    Ok((placed, objects))
 }
 
 /// `objects/<first two hex digits>/<sha1>`.
@@ -266,13 +271,13 @@ pub fn import(
             lib.sha1,
         )?);
     }
-    count(place(
+    let (placed, objects) = place_index(
         &install.asset_index(version),
         &imported.asset_index(),
-        version.asset_index.sha1,
-    )?);
+        &version.asset_index,
+    )?;
+    count(placed);
 
-    let objects = index_objects(&imported.asset_index())?;
     let next = AtomicUsize::new(0);
     let placed: Mutex<[usize; 3]> = Mutex::new([0; 3]);
     let missing: Mutex<Vec<String>> = Mutex::new(Vec::new());
