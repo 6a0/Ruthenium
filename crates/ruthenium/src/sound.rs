@@ -2,9 +2,8 @@
 //! files, the volumes from the settings, the listener every frame, the menus' click and
 //! the sliders' preview (`SoundPreviewHandler`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use ruthenium_assets::{Pack, Resources};
 use ruthenium_audio::{
     Audio, InstanceId, Listener, Output, SoundFiles, SoundHandle, SoundInstance, SoundSource,
     Volumes,
@@ -35,22 +34,9 @@ pub fn start(mode: &SoundMode, game: Option<PathBuf>, volumes: Volumes) -> Audio
     };
     Audio::start(output, volumes, move || {
         let game = game.ok_or("no data folder")?;
-        files(&game)
+        // The vanilla pack of the imported game, which the menus and the world share.
+        crate::game_files::vanilla(&game).map(SoundFiles::new)
     })
-}
-
-/// The vanilla pack of the imported game: the jar and the asset index's objects.
-fn files(game: &Path) -> Result<SoundFiles, String> {
-    let version = ruthenium_prepare::supported_version();
-    let imported = ruthenium_prepare::import::open(version, game)
-        .ok_or("the game files are not imported; run `ruthenium prepare`")?;
-    let pack = Pack::vanilla(
-        &imported.client_jar,
-        &imported.asset_index(),
-        &imported.assets.join("objects"),
-    )
-    .map_err(|e| format!("cannot open the game files: {e}"))?;
-    Ok(SoundFiles::new(Resources::new(vec![pack])))
 }
 
 /// The listener at the frame's camera (`SoundEngine.updateSource`).

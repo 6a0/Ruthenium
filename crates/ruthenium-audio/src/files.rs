@@ -3,6 +3,7 @@
 //! objects, not in the client jar.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use ruthenium_assets::{Id, Resources};
 
@@ -11,13 +12,16 @@ use crate::events::{SoundEvents, SoundsJson, id_key};
 /// See the module docs.
 #[derive(Debug)]
 pub struct SoundFiles {
-    resources: Resources,
+    resources: Arc<Resources>,
     /// Every `.ogg` under `sounds/`, as `namespace:path`.
     ogg: HashSet<String>,
 }
 
 impl SoundFiles {
-    pub fn new(resources: Resources) -> SoundFiles {
+    /// The sound files of `resources` (shared with others that read the same packs, or
+    /// its own).
+    pub fn new(resources: impl Into<Arc<Resources>>) -> SoundFiles {
+        let resources = resources.into();
         let ogg = resources
             .list("sounds", |p| p.ends_with(".ogg"))
             .keys()

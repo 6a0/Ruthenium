@@ -10,6 +10,7 @@ mod auth_cmd;
 mod client;
 mod connect_cmd;
 mod controls;
+mod game_files;
 mod ingame;
 mod input_script;
 mod join;

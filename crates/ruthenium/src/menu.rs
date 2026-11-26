@@ -506,7 +506,7 @@ pub fn load_unifont(game: Option<PathBuf>) {
         .name("menu-unifont".into())
         .spawn(move || {
             let started = Instant::now();
-            let Some(resources) = crate::skins::open(&game) else {
+            let Ok(resources) = crate::game_files::vanilla(&game) else {
                 return;
             };
             let id = ruthenium_assets::Id::minecraft("include/unifont").expect("a valid id");

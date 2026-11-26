@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use ruthenium_assets::{Id, Image, Pack, Resources};
+use ruthenium_assets::{Id, Image, Resources};
 use ruthenium_auth::http::{Http, UreqHttp};
 use ruthenium_auth::skin;
 use ruthenium_auth::textures::{PropertyKeys, Textures, profile_by_id, profile_by_name};
@@ -47,7 +47,7 @@ struct Shared {
     changed: Condvar,
     game: Option<PathBuf>,
     cache: Option<PathBuf>,
-    resources: OnceLock<Option<Resources>>,
+    resources: OnceLock<Option<Arc<Resources>>>,
     keys: Mutex<Option<PropertyKeys>>,
 }
 
@@ -294,24 +294,12 @@ fn decode(png: &[u8], most: u32) -> Option<Image> {
 fn picture(shared: &Shared, id: &str) -> Option<SkyImage> {
     let resources = shared
         .resources
-        .get_or_init(|| open(shared.game.as_deref()?))
+        .get_or_init(|| crate::game_files::vanilla(shared.game.as_deref()?).ok())
         .as_ref()?;
     let id = Id::parse(id)?;
     let file = id.wrap("textures/", ".png");
     let png = resources.get(&file)?.read().ok()?;
     decode(&png, MAX_SIDE).as_ref().map(sky_image)
-}
-
-/// The vanilla pack of the game imported in `game`.
-pub(crate) fn open(game: &Path) -> Option<Resources> {
-    let imported = ruthenium_prepare::import::open(ruthenium_prepare::supported_version(), game)?;
-    let pack = Pack::vanilla(
-        &imported.client_jar,
-        &imported.asset_index(),
-        &imported.assets.join("objects"),
-    )
-    .ok()?;
-    Some(Resources::new(vec![pack]))
 }
 
 fn sky_image(i: &Image) -> SkyImage {

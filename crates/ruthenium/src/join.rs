@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use ruthenium_assets::atlas::AtlasOptions;
 use ruthenium_assets::item::ItemModels;
 use ruthenium_assets::zip::Zip;
-use ruthenium_assets::{AtlasAnimations, BlockModels, Font, Id, Image, Pack, Resources};
+use ruthenium_assets::{AtlasAnimations, BlockModels, Font, Id, Image, Resources};
 use ruthenium_net::connection::{Auth, Closed, ConnectOptions, Identity, Local, Reason, Stage};
 use ruthenium_protocol::packets::{ClientInformation, KnownPack};
 use ruthenium_protocol::text::StyledText;
@@ -307,13 +307,8 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
     let version = ruthenium_prepare::supported_version();
     let imported = ruthenium_prepare::import::open(version, game)
         .ok_or("the game files are not imported; run `ruthenium prepare`")?;
-    let pack = Pack::vanilla(
-        &imported.client_jar,
-        &imported.asset_index(),
-        &imported.assets.join("objects"),
-    )
-    .map_err(|e| format!("cannot open the game files: {e}"))?;
-    let resources = Resources::new(vec![pack]);
+    // The vanilla pack the sound files and the menus read too.
+    let resources = crate::game_files::vanilla(game)?;
     let def = ruthenium_assets::atlas::atlas_def("blocks").expect("a known atlas");
     let options = AtlasOptions {
         max_size: max_texture,
@@ -322,7 +317,7 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
     let mut atlas = ruthenium_assets::atlas::build(&resources, def, &options)
         .map_err(|e| format!("the block atlas: {e}"))?;
     let stitched = started.elapsed();
-    let models = BlockModels::bake(&resources, &atlas);
+    let models = BlockModels::bake(&*resources, &atlas);
     for w in &models.warnings {
         eprintln!("[ruthenium] block models: {w}");
     }
