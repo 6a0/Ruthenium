@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use rayon::prelude::*;
@@ -17,6 +18,7 @@ use serde_json::Value;
 
 use crate::id::Id;
 use crate::image::{Image, Transparency, alpha};
+use crate::limits::Limits;
 use crate::meta::{GuiScaling, Metadata, MipmapStrategy};
 use crate::mipmap;
 use crate::resources::{Resource, Resources};
@@ -129,10 +131,40 @@ struct Shared<'a> {
 }
 
 impl Shared<'_> {
-    fn get(&self) -> Option<&Image> {
+    fn get(&self, max_side: u32) -> Option<&Image> {
         self.image
-            .get_or_init(|| Image::decode_png(&self.resource.read().ok()?).ok())
+            .get_or_init(|| self.resource.image(max_side).ok())
             .as_ref()
+    }
+}
+
+/// What loading an atlas's sprites is held to.
+struct Load<'l> {
+    limits: &'l Limits,
+    /// The largest side a sprite's picture may have: the atlas's.
+    max_side: u32,
+    /// Texels of every sprite loaded so far, frames and all, against the atlas's area.
+    texels: AtomicU64,
+    /// Some sprite did not fit in what the atlas may hold.
+    full: AtomicBool,
+}
+
+impl Load<'_> {
+    /// Counts a sprite's picture; false (and the atlas is full) if the sprites so far
+    /// would cover more than the whole atlas, which then could never be stitched.
+    fn take(&self, image: &Image) -> bool {
+        let n = u64::from(image.width) * u64::from(image.height);
+        let area = u64::from(self.max_side) * u64::from(self.max_side);
+        let fits = self
+            .texels
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(n).filter(|&t| t <= area)
+            })
+            .is_ok();
+        if !fits {
+            self.full.store(true, Ordering::Relaxed);
+        }
+        fits
     }
 }
 
@@ -310,15 +342,26 @@ fn collect<'a>(
     res: &'a Resources,
     def: &AtlasDef,
     warnings: &mut Vec<String>,
-) -> HashMap<Id, Loader<'a>> {
-    let file = Id::minecraft(&format!("atlases/{}.json", def.name)).unwrap();
+) -> Result<HashMap<Id, Loader<'a>>, AtlasError> {
+    let Some(file) = Id::minecraft(&format!("atlases/{}.json", def.name)) else {
+        return Ok(HashMap::new());
+    };
+    let limits = res.limits();
     let mut sprites: HashMap<Id, Loader<'a>> = HashMap::new();
     for r in res.stack(&file) {
-        let sources = r
-            .read()
-            .map_err(|e| e.to_string())
-            .and_then(|b| crate::meta::parse_json(&b))
-            .and_then(|j| parse_sources(&j));
+        let sources = r.json().and_then(|j| {
+            let n = j
+                .get("sources")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            if n > r.limits().atlas_sources {
+                return Err(format!(
+                    "{n} sources is more than an atlas definition may have ({})",
+                    r.limits().atlas_sources
+                ));
+            }
+            parse_sources(&j)
+        });
         let sources = match sources {
             Ok(s) => s,
             Err(e) => {
@@ -328,9 +371,17 @@ fn collect<'a>(
         };
         for source in sources {
             run_source(res, source, &mut sprites, warnings);
+            if sprites.len() > limits.atlas_sprites {
+                return Err(AtlasError::TooManySprites {
+                    atlas: def.name,
+                    max: limits.atlas_sprites,
+                });
+            }
         }
     }
-    sprites
+    // The missing sprite is the atlas's own (vanilla puts it in after every source).
+    sprites.remove(&missing_id());
+    Ok(sprites)
 }
 
 fn run_source<'a>(
@@ -399,7 +450,12 @@ fn run_source<'a>(
                         )
                     })
                     .collect();
+            let max = res.limits().atlas_sprites;
             for texture in textures {
+                if sprites.len() > max {
+                    // The atlas fails as soon as this source is done.
+                    return;
+                }
                 let Some(r) = res.get(&texture_file(&texture)) else {
                     warnings.push(format!("unable to find texture {}", texture_file(&texture)));
                     continue;
@@ -424,14 +480,20 @@ fn run_source<'a>(
     }
 }
 
-fn load_palette(r: Option<&Resource<'_>>) -> Result<Vec<u32>, String> {
+fn load_palette(r: Option<&Resource<'_>>, max_side: u32) -> Result<Vec<u32>, String> {
     let r = r.ok_or("palette image not found")?;
-    let bytes = r.read().map_err(|e| e.to_string())?;
-    Ok(Image::decode_png(&bytes).map_err(|e| e.to_string())?.pixels)
+    Ok(r.image(max_side)?.pixels)
 }
 
-fn build_palette(key: Option<&Resource<'_>>, target: Option<&Resource<'_>>) -> PaletteMap {
-    let (key, target) = (load_palette(key)?, load_palette(target)?);
+fn build_palette(
+    key: Option<&Resource<'_>>,
+    target: Option<&Resource<'_>>,
+    max_side: u32,
+) -> PaletteMap {
+    let (key, target) = (
+        load_palette(key, max_side)?,
+        load_palette(target, max_side)?,
+    );
     if key.len() != target.len() {
         return Err(format!(
             "palette sizes differ: {} != {}",
@@ -509,17 +571,31 @@ impl Contents {
     }
 }
 
-fn load_file(id: Id, r: &Resource<'_>, gui: bool) -> Result<Contents, String> {
+fn load_file(id: Id, r: &Resource<'_>, gui: bool, load: &Load<'_>) -> Result<Contents, String> {
     let meta: Metadata = r.metadata()?;
     let animation = meta.animation()?;
+    let max_frames = load
+        .limits
+        .animation_frames
+        .min(r.limits().animation_frames);
+    if let Some(list) = animation.as_ref().and_then(|a| a.frames.as_ref())
+        && list.len() > max_frames
+    {
+        return Err(format!(
+            "{} frames is more than an animation may have ({max_frames})",
+            list.len()
+        ));
+    }
     let texture = meta.texture()?.unwrap_or_default();
     let gui = if gui {
         Some(meta.gui()?.unwrap_or_default())
     } else {
         None
     };
-    let bytes = r.read().map_err(|e| e.to_string())?;
-    let image = Image::decode_png(&bytes).map_err(|e| e.to_string())?;
+    let image = r.image(load.max_side)?;
+    if !load.take(&image) {
+        return Err("the atlas's sprites cover more than it may hold".into());
+    }
     let (w, h) = match &animation {
         Some(a) => a.frame_size(image.width, image.height),
         None => (image.width, image.height),
@@ -528,6 +604,16 @@ fn load_file(id: Id, r: &Resource<'_>, gui: bool) -> Result<Contents, String> {
         return Err(format!(
             "image size {}x{} is not a multiple of frame size {w}x{h}",
             image.width, image.height
+        ));
+    }
+    if let Some(a) = &animation
+        && a.frames.is_none()
+        && u64::from(image.width / w) * u64::from(image.height / h) > max_frames as u64
+    {
+        return Err(format!(
+            "{}x{} frames of {w}x{h} is more than an animation may have ({max_frames})",
+            image.width / w,
+            image.height / h
         ));
     }
     let animation = animation.and_then(|a| {
@@ -567,16 +653,16 @@ fn floor_i(v: f64) -> i64 {
     v.floor() as i64
 }
 
-fn load(id: Id, loader: Loader<'_>, gui: bool) -> Result<Contents, String> {
+fn load(id: Id, loader: Loader<'_>, gui: bool, load: &Load<'_>) -> Result<Contents, String> {
     match loader {
         Loader::Missing => Ok(Contents::plain(id, Image::missing(16, 16))),
-        Loader::File(r) => load_file(id, &r, gui),
+        Loader::File(r) => load_file(id, &r, gui, load),
         Loader::Region {
             image,
             region,
             divisor,
         } => {
-            let img = image.get().ok_or("unreadable image")?;
+            let img = image.get(load.max_side).ok_or("unreadable image")?;
             let (sx, sy) = (
                 f64::from(img.width) / divisor[0],
                 f64::from(img.height) / divisor[1],
@@ -592,6 +678,9 @@ fn load(id: Id, loader: Loader<'_>, gui: bool) -> Result<Contents, String> {
             let sizes = |v: i64| u32::try_from(v).ok().filter(|&v| v > 0);
             let sub = (|| img.sub_image(fits(x)?, fits(y)?, sizes(w)?, sizes(h)?))()
                 .ok_or("region is empty or outside the image")?;
+            if !load.take(&sub) {
+                return Err("the atlas's sprites cover more than it may hold".into());
+            }
             Ok(Contents::plain(id, sub))
         }
         Loader::Paletted {
@@ -600,10 +689,15 @@ fn load(id: Id, loader: Loader<'_>, gui: bool) -> Result<Contents, String> {
             key,
             target,
         } => {
-            let img = image.get().ok_or("unreadable image")?;
+            let img = image.get(load.max_side).ok_or("unreadable image")?;
             let map = palette
-                .get_or_init(|| build_palette(key.as_ref().as_ref(), target.as_ref()))
+                .get_or_init(|| {
+                    build_palette(key.as_ref().as_ref(), target.as_ref(), load.max_side)
+                })
                 .as_ref()?;
+            if !load.take(img) {
+                return Err("the atlas's sprites cover more than it may hold".into());
+            }
             let mut out = img.clone();
             for p in &mut out.pixels {
                 *p = apply_palette(map, *p);
@@ -701,12 +795,17 @@ impl Atlas {
 
 #[derive(Debug)]
 pub enum AtlasError {
-    /// A sprite cannot fit in the device's largest texture.
+    /// A sprite cannot fit in the device's largest texture (or the largest atlas a pack
+    /// may make).
     TooLarge {
         atlas: &'static str,
         sprite: Id,
         max: u32,
     },
+    /// The sprites together cover more than the largest atlas.
+    TooManyTexels { atlas: &'static str, max: u32 },
+    /// The definitions list more sprites than an atlas may have.
+    TooManySprites { atlas: &'static str, max: usize },
 }
 
 impl fmt::Display for AtlasError {
@@ -714,6 +813,12 @@ impl fmt::Display for AtlasError {
         match self {
             AtlasError::TooLarge { atlas, sprite, max } => {
                 write!(f, "atlas {atlas}: {sprite} does not fit in {max}x{max}")
+            }
+            AtlasError::TooManyTexels { atlas, max } => {
+                write!(f, "atlas {atlas}: its sprites cover more than {max}x{max}")
+            }
+            AtlasError::TooManySprites { atlas, max } => {
+                write!(f, "atlas {atlas}: more than {max} sprites")
             }
         }
     }
@@ -745,13 +850,26 @@ fn blit(
 /// Loads, stitches and composes one atlas from the resource stack.
 pub fn build(res: &Resources, def: &AtlasDef, opts: &AtlasOptions) -> Result<Atlas, AtlasError> {
     let mut warnings = Vec::new();
-    let loaders = collect(res, def, &mut warnings);
+    let loaders = collect(res, def, &mut warnings)?;
     let mut jobs: Vec<(Id, Loader<'_>)> = vec![(missing_id(), Loader::Missing)];
     jobs.extend(loaders);
+    let max_side = opts.max_size.min(res.limits().atlas_side);
+    let load_state = Load {
+        limits: res.limits(),
+        max_side,
+        texels: AtomicU64::new(0),
+        full: AtomicBool::new(false),
+    };
     let results: Vec<Result<Contents, (Id, String)>> = jobs
         .into_par_iter()
-        .map(|(id, loader)| load(id.clone(), loader, def.gui).map_err(|e| (id, e)))
+        .map(|(id, loader)| load(id.clone(), loader, def.gui, &load_state).map_err(|e| (id, e)))
         .collect();
+    if load_state.full.load(Ordering::Relaxed) {
+        return Err(AtlasError::TooManyTexels {
+            atlas: def.name,
+            max: max_side,
+        });
+    }
     let mut sprites = Vec::with_capacity(results.len());
     for r in results {
         match r {
@@ -775,13 +893,13 @@ pub fn build(res: &Resources, def: &AtlasDef, opts: &AtlasOptions) -> Result<Atl
         |a, b| sprites[a].id.cmp(&sprites[b].id),
         levels,
         padding,
-        opts.max_size,
-        opts.max_size,
+        max_side,
+        max_side,
     )
     .map_err(|stitch::DoesNotFit(i)| AtlasError::TooLarge {
         atlas: def.name,
-        sprite: sprites[i].id.clone(),
-        max: opts.max_size,
+        sprite: sprites.get(i).map_or_else(missing_id, |s| s.id.clone()),
+        max: max_side,
     })?;
 
     // Mip levels per sprite, over the whole image (every frame).

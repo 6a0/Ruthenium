@@ -97,8 +97,10 @@ impl Region {
     }
 }
 
-/// `Mth.smallestEncompassingPowerOfTwo` (0 stays 0).
-fn pow2_ceil(v: u32) -> u32 {
+/// `Mth.smallestEncompassingPowerOfTwo` (0 stays 0), in 64 bits so that it cannot
+/// overflow.
+fn pow2_ceil(v: impl Into<u64>) -> u64 {
+    let v = v.into();
     if v == 0 { 0 } else { v.next_power_of_two() }
 }
 
@@ -125,11 +127,22 @@ pub fn stitch(
     max_width: u32,
     max_height: u32,
 ) -> Result<Layout, DoesNotFit> {
-    let round = |v: u32| v.div_ceil(1 << mip_levels) << mip_levels;
-    let slots: Vec<(u32, u32)> = sizes
+    // In 64 bits: a slot of a sprite as large as a pack may claim cannot overflow, and
+    // one larger than the atlas does not fit.
+    let round = |v: u64| v.div_ceil(1 << mip_levels.min(31)) << mip_levels.min(31);
+    let pad = 2 * u64::from(padding);
+    let slots: Vec<(u64, u64)> = sizes
         .iter()
-        .map(|&(w, h)| (round(w + 2 * padding), round(h + 2 * padding)))
+        .map(|&(w, h)| (round(u64::from(w) + pad), round(u64::from(h) + pad)))
         .collect();
+    if let Some(i) = slots
+        .iter()
+        .position(|&(w, h)| w > u64::from(max_width) || h > u64::from(max_height))
+    {
+        return Err(DoesNotFit(i));
+    }
+    // Both now fit in 32 bits.
+    let slots: Vec<(u32, u32)> = slots.iter().map(|&(w, h)| (w as u32, h as u32)).collect();
     let mut items: Vec<usize> = (0..sizes.len()).collect();
     items.sort_by(|&a, &b| {
         slots[b]
@@ -147,11 +160,21 @@ pub fn stitch(
             continue;
         }
         let (cur_x, cur_y) = (pow2_ceil(width), pow2_ceil(height));
-        let (new_x, new_y) = (pow2_ceil(width + w), pow2_ceil(height + h));
-        let (can_x, can_y) = (new_x <= max_width, new_y <= max_height);
+        let grown = |at: u32, by: u32| pow2_ceil(u64::from(at) + u64::from(by));
+        let (new_x, new_y) = (grown(width, w), grown(height, h));
+        let (can_x, can_y) = (
+            new_x <= u64::from(max_width),
+            new_y <= u64::from(max_height),
+        );
         if !can_x && !can_y {
             return Err(DoesNotFit(i));
         }
+        // What can grow is within the maximum, so in 32 bits.
+        let (new_x, new_y) = (
+            new_x.min(u64::from(u32::MAX)) as u32,
+            new_y.min(u64::from(u32::MAX)) as u32,
+        );
+        let (cur_x, cur_y) = (cur_x as u32, cur_y as u32);
         let (will_x, will_y) = (can_x && cur_x != new_x, can_y && cur_y != new_y);
         let grow_x = if will_x ^ will_y {
             will_x
@@ -234,6 +257,22 @@ mod tests {
                 assert!(apart, "{a:?} overlaps {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn sizes_a_pack_may_claim_do_not_overflow() {
+        let order = |a: usize, b: usize| a.cmp(&b);
+        for sizes in [
+            vec![(u32::MAX, 1)],
+            vec![(1, u32::MAX)],
+            vec![(u32::MAX - 1, u32::MAX - 1); 3],
+        ] {
+            assert!(stitch(&sizes, order, 4, 1 << 8, 16384, 16384).is_err());
+            assert!(stitch(&sizes, order, 4, 1 << 8, u32::MAX, u32::MAX).is_err());
+        }
+        // Many that each fit and together do not.
+        let many = vec![(4096, 4096); 64];
+        assert!(stitch(&many, order, 0, 1, 16384, 16384).is_err());
     }
 
     #[test]
