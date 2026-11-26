@@ -507,6 +507,7 @@ From runs with one part left out, and the GPU's pipeline statistics (a temporary
 - **The cutout layer's quads in nearest-first order shade no fewer fragments** (8.05 against 8.06 million; tried by sorting each section's cutout quads from the camera at meshing time). With `discard` in the shader this GPU gets no fine early depth test inside the pass, only the coarse one against what the solid layer wrote: without the solid layer the cutout fragments rose to 7.55 million.
 - **Triangles cost about 0.15 ns each** whether drawn or culled: leaving out 190 thousand back-facing ones saved 0.028 ms. The 516 thousand left (in 258 thousand quads) are about 0.075 ms.
 - The vignette runs at about the GPU's blending rate for a screen of pixels, and only 10% of its texture is exactly black (where it would change nothing), so it was left as it is.
+- **Taking the divisions and square roots out of the fragment shaders bought little.** The terrain's nearest and RGSS sampling lost every division and most square roots in the SPIR-V, and the fog in every world shader became one clamped multiply-add; the GPU's frame went from 0.295 to 0.289 ms in idle and by 0.003 to 0.006 ms on the other routes (one 20 s run each of `a30db04` and the build after it, 1% lows within 1%). The driver had evidently done most of it already. What is left to cut is the cutout layer's shading, not its arithmetic.
 
 ## Where a frame's time goes
 
