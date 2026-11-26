@@ -490,10 +490,13 @@ mod tests {
             // The status ping: refused by closing.
             let (s, _) = listener.accept().await.unwrap();
             drop(s);
+            // The legacy ping, read whole before the answer: a socket closed with bytes
+            // unread is reset, and on Windows a reset throws away what the other side
+            // had received and not yet read, the answer with it.
             let (mut s, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 3];
+            let mut buf = vec![0u8; legacy_request("127.0.0.1", port).len()];
             s.read_exact(&mut buf).await.unwrap();
-            assert_eq!(buf, [0xFE, 0x01, 0xFA]);
+            assert_eq!(buf, legacy_request("127.0.0.1", port));
             s.write_all(&legacy_bytes(
                 "§1\x0074\x001.6.4\x00Old §cserver\x003\x0020",
             ))
@@ -508,6 +511,7 @@ mod tests {
             rt.block_on(async { tokio::time::sleep(Duration::from_millis(5)).await });
             got.extend(pinger.poll());
         }
+        assert_eq!(got.len(), 2, "{got:?}");
         assert!(matches!(got[0], (3, PingEvent::Failed(_))), "{got:?}");
         assert_eq!(
             got[1],

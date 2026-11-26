@@ -1350,6 +1350,31 @@ mod tests {
                 lang.insert(key.to_string(), format!("<{key}>"));
             }
         }
+        // The golden file was written on Linux. The game names a few keys by the system
+        // it runs on (InputQuirks.keyboardTranslationKey): Linux's names there, for the
+        // keys it calls Windows keys, are the Command keys on a Mac and the Windows keys on
+        // Windows, and a Mac's Alt keys are its Option keys.
+        let here = |linux: &'static str| -> &'static str {
+            let names: &[(&str, &str)] = if cfg!(target_os = "macos") {
+                &[
+                    ("key.keyboard.left.alt", "key.keyboard.left.option"),
+                    ("key.keyboard.right.alt", "key.keyboard.right.option"),
+                    ("key.keyboard.left.meta", "key.keyboard.left.command"),
+                    ("key.keyboard.right.meta", "key.keyboard.right.command"),
+                ]
+            } else if cfg!(windows) {
+                &[
+                    ("key.keyboard.left.meta", "key.keyboard.left.windows"),
+                    ("key.keyboard.right.meta", "key.keyboard.right.windows"),
+                ]
+            } else {
+                &[]
+            };
+            names
+                .iter()
+                .find(|(from, _)| *from == linux)
+                .map_or(linux, |(_, to)| to)
+        };
         for &(name, system, ref shown) in DISPLAYED {
             let key = match Key::parse(name) {
                 Parsed::Key(k) => k,
@@ -1360,7 +1385,7 @@ mod tests {
             let want = match shown {
                 Shown::Literal(s) => KeyText::Literal(s.to_string()),
                 Shown::Translate("key.mouse", [n]) => KeyText::Button(n.parse().unwrap()),
-                Shown::Translate(k, []) => KeyText::Translate(k.to_string()),
+                Shown::Translate(k, []) => KeyText::Translate(here(k).to_string()),
                 other => panic!("{other:?}"),
             };
             assert_eq!(got, want, "{name}");

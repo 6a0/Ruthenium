@@ -153,10 +153,11 @@ jobs:
             libegl1-mesa-dev libdrm-dev libgbm-dev libdecor-0-dev libdbus-1-dev libibus-1.0-dev \
             libasound2-dev
       - run: cargo clippy --workspace --all-targets $FEATURES
-      - run: cargo test --workspace $FEATURES
+      # --no-fail-fast: one crate's failure would otherwise hide the rest's.
+      - run: cargo test --workspace --no-fail-fast $FEATURES
       # The development-only offline login (PLAN D3) compiles and passes its tests...
       - run: cargo clippy -p ruthenium --all-targets $FEATURES --features ruthenium/dev-offline
-      - run: cargo test -p ruthenium $FEATURES --features ruthenium/dev-offline
+      - run: cargo test -p ruthenium --no-fail-fast $FEATURES --features ruthenium/dev-offline
 
   fixtures:
     # The renderer's own checks (cargo xtask fixtures) on Mesa's software Vulkan driver,

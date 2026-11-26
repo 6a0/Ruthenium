@@ -61,15 +61,25 @@ mod tests {
 
     #[test]
     fn a_mapped_file_reads_as_its_bytes() {
-        let path = std::env::temp_dir().join(format!("ruthenium-map-{}", std::process::id()));
-        std::fs::write(&path, b"mapped bytes").unwrap();
-        let map = MappedFile::open(&path).unwrap();
+        let path = |name: &str| {
+            std::env::temp_dir().join(format!("ruthenium-map-{}-{name}", std::process::id()))
+        };
+        let (bytes, kept, empty) = (path("bytes"), path("kept"), path("empty"));
+        std::fs::write(&bytes, b"mapped bytes").unwrap();
+        let map = MappedFile::open(&bytes).unwrap();
         assert_eq!(&*map, b"mapped bytes");
-        assert_eq!(MappedFile::open_for_good(&path).unwrap(), b"mapped bytes");
+        // Windows neither truncates nor deletes a file while a map of it is open
+        // (error 1224, "a user-mapped section open"): unmapped first.
+        drop(map);
+        std::fs::remove_file(&bytes).unwrap();
+        assert!(MappedFile::open(&bytes).is_err());
+        // A map for good stays until the process ends, and so on Windows does its file.
+        std::fs::write(&kept, b"kept bytes").unwrap();
+        assert_eq!(MappedFile::open_for_good(&kept).unwrap(), b"kept bytes");
+        let _ = std::fs::remove_file(&kept);
         // An empty file maps to nothing.
-        std::fs::write(&path, b"").unwrap();
-        assert!(MappedFile::open(&path).unwrap().is_empty());
-        std::fs::remove_file(&path).unwrap();
-        assert!(MappedFile::open(&path).is_err());
+        std::fs::write(&empty, b"").unwrap();
+        assert!(MappedFile::open(&empty).unwrap().is_empty());
+        std::fs::remove_file(&empty).unwrap();
     }
 }

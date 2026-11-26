@@ -1,0 +1,8 @@
+# Text files keep LF line endings on every checkout, Windows included: tests compare
+# generated files with the committed ones byte for byte (include_str!), and the
+# committed SPIR-V and tables are what the generators write.
+* text=auto eol=lf
+
+*.spv binary
+*.ttf binary
+*.png binary
