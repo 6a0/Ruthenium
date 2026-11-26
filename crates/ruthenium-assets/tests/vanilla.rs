@@ -102,6 +102,85 @@ fn atlas_sizes_match_vanilla() {
     }
 }
 
+/// The game's own assets fit the limits a server's pack brings to the whole stack: with an
+/// (empty) untrusted pack on top, every atlas, model, item and the default font are as
+/// they are alone, with no warning more.
+#[test]
+fn the_games_assets_fit_a_server_packs_limits() {
+    let (Some(alone), Some(dir)) = (vanilla(), std::env::var_os("RUTHENIUM_GAME_DIR")) else {
+        eprintln!("RUTHENIUM_GAME_DIR not set; skipped");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    // A stored zip of one pack.mcmeta.
+    let meta = br#"{"pack": {"description": "server"}}"#;
+    let mut z = Vec::new();
+    let head = |v: &mut Vec<u8>| {
+        v.extend_from_slice(&[0; 10]);
+        v.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        v.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        v.extend_from_slice(&11u16.to_le_bytes());
+    };
+    z.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+    z.extend_from_slice(&[20, 0, 0, 0]);
+    head(&mut z);
+    z.extend_from_slice(&[0; 2]);
+    z.extend_from_slice(b"pack.mcmeta");
+    z.extend_from_slice(meta);
+    let cd = z.len() as u32;
+    z.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+    z.extend_from_slice(&[20, 0, 20, 0, 0, 0]);
+    head(&mut z);
+    z.extend_from_slice(&[0; 16]);
+    z.extend_from_slice(b"pack.mcmeta");
+    let cd_len = z.len() as u32 - cd;
+    z.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    z.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+    z.extend_from_slice(&cd_len.to_le_bytes());
+    z.extend_from_slice(&cd.to_le_bytes());
+    z.extend_from_slice(&[0; 2]);
+    let path = std::env::temp_dir().join(format!(
+        "ruthenium-empty-server-pack-{}.zip",
+        std::process::id()
+    ));
+    std::fs::write(&path, z).unwrap();
+    let server = Pack::open_untrusted(&path, &ruthenium_assets::Limits::untrusted()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let version = dir.join("versions/26.3");
+    let game = Pack::vanilla(
+        &version.join("client.jar"),
+        &dir.join("assets/indexes/34.json"),
+        &dir.join("assets/objects"),
+    )
+    .unwrap();
+    let stacked = Resources::new(vec![game, server]);
+    assert_eq!(stacked.limits(), &ruthenium_assets::Limits::untrusted());
+    let opts = AtlasOptions::default();
+    let shape = |res: &Resources| {
+        let atlases: Vec<_> = atlas::build_all(res, &opts)
+            .into_iter()
+            .map(|a| a.expect("atlas builds"))
+            .collect();
+        let sizes: Vec<_> = atlases
+            .iter()
+            .map(|a| (a.width, a.height, a.sprites.len(), a.warnings.len()))
+            .collect();
+        let models = ruthenium_assets::BlockModels::bake(res, &atlases[1]);
+        let items = ruthenium_assets::item::ItemModels::bake(res, &atlases[1], &atlases[2], None);
+        let font = ruthenium_assets::Font::load(res, &Id::minecraft("default").unwrap());
+        (
+            sizes,
+            models.part_count(),
+            models.warnings.len(),
+            items.counts(),
+            items.warnings.len(),
+            font.warnings.len(),
+            font.unihex_bytes() > 0,
+        )
+    };
+    assert_eq!(shape(&stacked), shape(&alone));
+}
+
 struct Reader(Vec<u8>, usize);
 
 impl Reader {
