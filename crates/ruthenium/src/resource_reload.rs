@@ -89,16 +89,37 @@ pub fn is_loadable(path: &Path) -> bool {
     }
 }
 
+/// Opens a reload's server packs, each told of `cancel` (never vanilla's shared pack:
+/// a flag left on it would cancel every later reload; `with_server_packs` opens vanilla's
+/// anew beside them).
+fn open_server_packs(
+    packs: &[(u128, PathBuf)],
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<Pack>, String> {
+    let mut opened = Vec::with_capacity(packs.len());
+    for (id, path) in packs {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".to_owned());
+        }
+        let pack = open_server_pack(path).map_err(|e| format!("pack {id:032x}: {e}"))?;
+        pack.cancel_with(cancel.clone());
+        opened.push(pack);
+    }
+    Ok(opened)
+}
+
 /// Builds the resources of `game` with `packs` (lowest first) over vanilla's.
 /// `max_texture`: the largest texture the GPU takes; `world`: whether to build the
 /// world's assets too.
-/// `cancel` is looked at between the stages: once it is set, the build gives up.
+/// `cancel` is looked at between the stages, and given to every server pack, whose
+/// builders look at it inside their loops (Agent U's `Pack::cancel_with`): once it is
+/// set, the build gives up, and what a stopped stage returned (partly built) is dropped.
 pub fn build(
     game: &Path,
     packs: &[(u128, PathBuf)],
     max_texture: u32,
     world: bool,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<Reloaded, String> {
     let go_on = || {
         if cancel.load(Ordering::Relaxed) {
@@ -108,11 +129,7 @@ pub fn build(
         }
     };
     let started = Instant::now();
-    let mut opened = Vec::with_capacity(packs.len());
-    for (id, path) in packs {
-        go_on()?;
-        opened.push(open_server_pack(path).map_err(|e| format!("pack {id:032x}: {e}"))?);
-    }
+    let opened = open_server_packs(packs, cancel)?;
     let resources = crate::game_files::with_server_packs(game, opened)?;
     let max_texture = atlas_limit(max_texture, packs.len());
     go_on()?;
@@ -218,7 +235,7 @@ pub const RELOAD_DEADLINE: Duration = Duration::from_secs(60);
 
 /// What builds a reload ([`build`], or a stand-in in tests).
 type Build = Arc<
-    dyn Fn(&Path, &[(u128, PathBuf)], u32, bool, &AtomicBool) -> Result<Reloaded, String>
+    dyn Fn(&Path, &[(u128, PathBuf)], u32, bool, &Arc<AtomicBool>) -> Result<Reloaded, String>
         + Send
         + Sync,
 >;
@@ -460,7 +477,7 @@ mod tests {
     /// A build that runs until it is cancelled, stage by stage.
     fn endless() -> Build {
         Arc::new(
-            |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &AtomicBool| {
+            |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &Arc<AtomicBool>| {
                 while !cancel.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -476,7 +493,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let seen = flag.clone();
         let build: Build = Arc::new(
-            move |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &AtomicBool| {
+            move |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &Arc<AtomicBool>| {
                 while !cancel.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -513,7 +530,7 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let (s, rel) = (starts.clone(), release.clone());
         let build: Build = Arc::new(
-            move |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &AtomicBool| {
+            move |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &Arc<AtomicBool>| {
                 s.fetch_add(1, Ordering::SeqCst);
                 // A stage that takes its time to see the flag.
                 while !(cancel.load(Ordering::Relaxed) && rel.load(Ordering::Relaxed)) {
@@ -563,7 +580,7 @@ mod tests {
     /// Runs until cancelled and let go.
     fn endless_until(release: Arc<AtomicBool>) -> Build {
         Arc::new(
-            move |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &AtomicBool| {
+            move |_: &Path, _: &[(u128, PathBuf)], _, _, cancel: &Arc<AtomicBool>| {
                 while !(cancel.load(Ordering::Relaxed) && release.load(Ordering::Relaxed)) {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -585,8 +602,9 @@ mod tests {
     /// those asked for meanwhile; the client's own don't wait.
     #[test]
     fn reloads_a_server_asks_for_are_spaced_and_coalesced() {
-        let quick: Build =
-            Arc::new(|_: &Path, _: &[(u128, PathBuf)], _, _, _: &AtomicBool| Err("built".into()));
+        let quick: Build = Arc::new(
+            |_: &Path, _: &[(u128, PathBuf)], _, _, _: &Arc<AtomicBool>| Err("built".into()),
+        );
         let mut r =
             Reloader::with_build(quick, Duration::from_millis(300), Duration::from_secs(60));
         let started = Instant::now();
@@ -611,12 +629,36 @@ mod tests {
     /// Cancelled between stages, a real build stops (here before opening the packs).
     #[test]
     fn a_cancelled_build_stops() {
-        let cancel = AtomicBool::new(true);
+        let cancel = Arc::new(AtomicBool::new(true));
         let packs = [(1u128, PathBuf::from("/nowhere/p.zip"))];
         assert_eq!(
             build(Path::new("/nowhere"), &packs, 1024, true, &cancel).err(),
             Some("cancelled".to_owned())
         );
+    }
+
+    /// The server packs carry the reload's flag: once it is set, a stack of them is
+    /// cancelled, and their builders stop inside their loops.
+    #[test]
+    fn server_packs_carry_the_reloads_flag() {
+        let dir = temp("flag");
+        let p = dir.join("p.zip");
+        std::fs::write(
+            &p,
+            zip_bytes(&[
+                ("pack.mcmeta", MCMETA),
+                ("assets/minecraft/lang/en_us.json", br#"{"a":"b"}"#),
+            ]),
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let opened = open_server_packs(&[(1, p)], &cancel).unwrap();
+        let r = Resources::new(opened);
+        assert!(!r.cancelled());
+        assert_eq!(language(&r, 1).len(), 1);
+        cancel.store(true, Ordering::Relaxed);
+        assert!(r.cancelled());
+        assert!(language(&r, 1).is_empty());
     }
 
     const MCMETA: &[u8] = br#"{"pack":{"description":"test","min_format":97,"max_format":97}}"#;
