@@ -369,7 +369,6 @@ mod tests {
         assert_eq!([needed(30), needed(31), needed(100)], [112, 121, 742]);
     }
 
-    #[test]
     /// The count goes on from the last HUD's, 20 a second since, so a blink the
     /// renderer kept from the last session (its end tick) is long past.
     #[test]
@@ -387,6 +386,7 @@ mod tests {
         assert!(count_from(*client_count(), Instant::now()) >= 1);
     }
 
+    #[test]
     fn a_stack_that_came_or_grew_bulges_for_five_ticks() {
         let mut hud = HudState::default();
         let one = Stack {
