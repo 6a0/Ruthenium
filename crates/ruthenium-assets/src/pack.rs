@@ -18,6 +18,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::id::{valid_namespace, valid_path};
+use crate::limits::{Budget, Limits};
 use crate::zip::Zip;
 
 /// The resource pack format of 26.3: 97.1 (`SharedConstants.java:27-29`).
@@ -109,6 +110,20 @@ pub struct Pack {
     filter: Option<Filter>,
     /// The whole `pack.mcmeta` (built-in metadata for the vanilla pack).
     metadata: Value,
+    /// What its files are read under, and what they have cost this load.
+    limits: Limits,
+    budget: Arc<Budget>,
+    /// A server's pack: what it could run is hidden ([`HIDDEN`]).
+    untrusted: bool,
+}
+
+/// Folders of a namespace an untrusted pack never shows: shaders (core shaders, their
+/// includes and post-processing programs) and post-effect chains. The client compiles its
+/// own and runs no code a pack brings; vanilla's core-shader overrides are unsupported.
+pub const HIDDEN: [&str; 2] = ["shaders/", "post_effect/"];
+
+fn hidden(path: &str) -> bool {
+    HIDDEN.iter().any(|h| path.starts_with(h))
 }
 
 impl fmt::Debug for Pack {
@@ -262,6 +277,9 @@ impl Pack {
                     "max_format": [PACK_FORMAT.major, i32::MAX],
                 }
             }),
+            limits: Limits::trusted(),
+            budget: Arc::default(),
+            untrusted: false,
         })
     }
 
@@ -342,7 +360,116 @@ impl Pack {
             namespaces,
             filter,
             metadata,
+            limits: Limits::trusted(),
+            budget: Arc::default(),
+            untrusted: false,
         })
+    }
+
+    /// A pack whose every byte is hostile: a zip file only, read under `limits`. Fails as
+    /// vanilla's `Pack.readPackMetadata` does when `pack.mcmeta` is missing or invalid (no
+    /// `pack` section, or one without a `description`), and when the archive itself is
+    /// broken or over a limit (vanilla's `ZipFile` refuses a broken one; the pack then has
+    /// no metadata). Its shader and post-effect folders are hidden ([`HIDDEN`]).
+    pub fn open_untrusted(path: &Path, limits: &Limits) -> Result<Pack, PackError> {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        if !path.is_file() {
+            return Err(PackError::Io(
+                path.to_owned(),
+                io::Error::new(io::ErrorKind::InvalidInput, "not a zip file"),
+            ));
+        }
+        let budget = Arc::new(Budget::default());
+        let zip =
+            Arc::new(Zip::open_untrusted(path, limits, budget.clone()).map_err(io_err(path))?);
+        let i = zip
+            .find("pack.mcmeta")
+            .ok_or_else(|| PackError::NoMetadata(path.to_owned()))?;
+        let bad = |why: String| PackError::BadMetadata(path.to_owned(), why);
+        if zip.size(i) > limits.json_bytes {
+            return Err(bad(format!("{} bytes is too large", zip.size(i))));
+        }
+        let meta_bytes = zip.read(i).map_err(io_err(path))?;
+        let metadata: Value = crate::meta::parse_json(&meta_bytes).map_err(bad)?;
+        let pack = metadata.get("pack").filter(|p| p.is_object());
+        if pack.is_none_or(|p| p.get("description").is_none()) {
+            return Err(PackError::NoMetadata(path.to_owned()));
+        }
+        let count = |section: &str, list: &str| {
+            metadata
+                .get(section)
+                .and_then(|s| s.get(list))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+        };
+        if count("overlays", "entries") > limits.pack_overlays {
+            return Err(bad(format!("more than {} overlays", limits.pack_overlays)));
+        }
+        if count("filter", "block") > limits.pack_filters {
+            return Err(bad(format!(
+                "more than {} filter patterns",
+                limits.pack_filters
+            )));
+        }
+        let filter = filter(&metadata).map_err(bad)?;
+        let overlays = overlays(&metadata).map_err(bad)?;
+        let mut layers = Vec::new();
+        for dir in overlays
+            .iter()
+            .rev()
+            .map(|d| format!("{d}/"))
+            .chain([String::new()])
+        {
+            layers.push(Layer::Zip {
+                zip: zip.clone(),
+                prefix: format!("{dir}assets/"),
+            });
+        }
+        let mut namespaces = BTreeSet::new();
+        for layer in &layers {
+            if let Layer::Zip { zip, prefix } = layer {
+                for i in zip.with_prefix(prefix) {
+                    if let Some((ns, _)) = zip.name(i)[prefix.len()..].split_once('/')
+                        && valid_namespace(ns)
+                    {
+                        namespaces.insert(ns.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(Pack {
+            name,
+            layers,
+            namespaces,
+            filter,
+            metadata,
+            limits: *limits,
+            budget,
+            untrusted: true,
+        })
+    }
+
+    /// What the pack's files are read under.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    /// What the pack has cost the current load.
+    pub fn budget(&self) -> &Arc<Budget> {
+        &self.budget
+    }
+
+    /// A new load of the same pack begins: what it costs is counted from nothing again.
+    pub fn reset_budget(&self) {
+        self.budget.reset();
+    }
+
+    /// A server's pack, opened by [`Pack::open_untrusted`].
+    pub fn is_untrusted(&self) -> bool {
+        self.untrusted
     }
 
     pub fn name(&self) -> &str {
@@ -363,6 +490,9 @@ impl Pack {
     }
 
     pub(crate) fn find(&self, namespace: &str, path: &str) -> Option<Loc> {
+        if self.untrusted && hidden(path) {
+            return None;
+        }
         for (i, layer) in self.layers.iter().enumerate() {
             match layer {
                 Layer::Zip { zip, prefix } => {
@@ -393,6 +523,9 @@ impl Pack {
     /// Every file under `<namespace>/<dir>/`, with paths relative to the
     /// namespace. The highest layer wins per path; the order is unspecified.
     pub(crate) fn list(&self, namespace: &str, dir: &str, out: &mut dyn FnMut(String, Loc)) {
+        if self.untrusted && hidden(&format!("{dir}/")) {
+            return;
+        }
         let mut found: HashMap<String, Loc> = HashMap::new();
         for (i, layer) in self.layers.iter().enumerate() {
             match layer {
@@ -439,13 +572,35 @@ impl Pack {
         }
     }
 
+    /// A file's contents, taken from the load's budget.
     pub(crate) fn read(&self, loc: &Loc) -> io::Result<Cow<'_, [u8]>> {
+        self.read_inner(loc, true)
+    }
+
+    /// A file's contents, not taken from the load's budget: for files read while playing.
+    pub(crate) fn read_on_demand(&self, loc: &Loc) -> io::Result<Cow<'_, [u8]>> {
+        self.read_inner(loc, false)
+    }
+
+    fn read_inner(&self, loc: &Loc, budgeted: bool) -> io::Result<Cow<'_, [u8]>> {
         match loc {
-            Loc::Zip(layer, e) => match &self.layers[*layer] {
-                Layer::Zip { zip, .. } => zip.read(*e),
-                _ => unreachable!("zip location in a non-zip layer"),
+            Loc::Zip(layer, e) => match self.layers.get(*layer) {
+                Some(Layer::Zip { zip, .. }) if budgeted => zip.read(*e),
+                Some(Layer::Zip { zip, .. }) => zip.read_on_demand(*e),
+                _ => Err(io::Error::other("zip location in a non-zip layer")),
             },
             Loc::File(p) => std::fs::read(p).map(Cow::Owned),
+        }
+    }
+
+    /// The size a file says it has, if it says one (zip entries).
+    pub(crate) fn declared_size(&self, loc: &Loc) -> Option<u64> {
+        match loc {
+            Loc::Zip(layer, e) => match self.layers.get(*layer) {
+                Some(Layer::Zip { zip, .. }) => Some(zip.size(*e)),
+                _ => None,
+            },
+            Loc::File(p) => std::fs::metadata(p).ok().map(|m| m.len()),
         }
     }
 }

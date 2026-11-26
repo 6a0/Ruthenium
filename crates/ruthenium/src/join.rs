@@ -323,11 +323,11 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
     }
     // The pixel the game reads for a temperature of 0.5 and a downfall of 1
     // (`GrassColor.getDefaultColor`); its own stand-in where the map is missing.
+    // Each picture as large as the GPU takes at most (and as its pack's limits allow).
     let colour_map = |file: &str| {
         resources
             .get(&Id::minecraft(file).expect("a valid id"))
-            .and_then(|r| r.read().ok())
-            .and_then(|bytes| Image::decode_png(&bytes).ok())
+            .and_then(|r| r.image(max_texture).ok())
     };
     let grass_map = colour_map(GRASS_MAP);
     let grass_default = grass_map
@@ -513,9 +513,7 @@ fn block_entity_assets(
             })
             .collect()
     };
-    let json = |id: &Id| -> Option<serde_json::Value> {
-        serde_json::from_slice(&resources.get(id)?.read().ok()?).ok()
-    };
+    let json = |id: &Id| -> Option<serde_json::Value> { resources.get(id)?.json().ok() };
     let equipment_files: Vec<(String, serde_json::Value)> = listed("equipment", ".json")
         .into_iter()
         .filter_map(|(id, name)| Some((name, json(&id)?)))
@@ -561,8 +559,7 @@ fn block_entity_assets(
     }
     let lang = resources
         .get(&Id::minecraft(LANG_PATH).expect("a valid id"))
-        .and_then(|r| r.read().ok())
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|r| ruthenium_assets::lang::read(&r).ok())
         .unwrap_or_default();
     Ok(BlockEntityAssets {
         models,

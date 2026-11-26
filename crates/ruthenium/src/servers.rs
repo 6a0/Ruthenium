@@ -103,7 +103,14 @@ struct Lan {
 
 /// A favicon as premultiplied RGBA, if it is a 64 x 64 PNG.
 fn decode_icon(png: &[u8]) -> Option<Vec<u8>> {
-    let img = Image::decode_png(png).ok()?;
+    // The server's own bytes: nothing larger than an icon is decoded.
+    let img = Image::decode_png_with(
+        png,
+        ICON_SIZE,
+        u64::from(ICON_SIZE) * u64::from(ICON_SIZE),
+        &mut |_| true,
+    )
+    .ok()?;
     if (img.width, img.height) != (ICON_SIZE, ICON_SIZE) {
         return None;
     }

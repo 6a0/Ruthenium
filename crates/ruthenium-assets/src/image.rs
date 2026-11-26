@@ -60,6 +60,12 @@ impl fmt::Display for ImageError {
 
 impl std::error::Error for ImageError {}
 
+/// The largest picture [`Image::decode_png`] takes on a side: twice the largest texture
+/// any desktop GPU takes.
+pub const DEFAULT_SIDE: u32 = 1 << 15;
+/// The most texels [`Image::decode_png`] takes: 1 GiB decoded.
+pub const DEFAULT_TEXELS: u64 = 1 << 28;
+
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'];
 
 impl Image {
@@ -76,7 +82,23 @@ impl Image {
     /// palette and grey images are expanded, `tRNS` becomes alpha, 16-bit
     /// channels keep their high byte, and gamma chunks are ignored. Only PNG
     /// is accepted.
+    ///
+    /// A picture larger than [`DEFAULT_SIDE`] on a side or [`DEFAULT_TEXELS`] in all is
+    /// refused before anything is allocated for it: a PNG's header may claim any size.
+    /// [`Self::decode_png_with`] takes other limits.
     pub fn decode_png(bytes: &[u8]) -> Result<Image, ImageError> {
+        Image::decode_png_with(bytes, DEFAULT_SIDE, DEFAULT_TEXELS, &mut |_| true)
+    }
+
+    /// [`Self::decode_png`] for a picture no wider or taller than `max_side` and of no more
+    /// than `max_texels`; `take` is asked for its texels before they are allocated (a
+    /// load's budget) and refuses it by returning false.
+    pub fn decode_png_with(
+        bytes: &[u8],
+        max_side: u32,
+        max_texels: u64,
+        take: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<Image, ImageError> {
         if !bytes.starts_with(&PNG_SIGNATURE) {
             return Err(ImageError("not a PNG file".into()));
         }
@@ -84,6 +106,18 @@ impl Image {
         let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = decoder.read_info().map_err(err)?;
+        let (w, h) = reader.info().size();
+        let texels = u64::from(w) * u64::from(h);
+        if w > max_side || h > max_side || texels > max_texels {
+            return Err(ImageError(format!(
+                "{w}x{h} is larger than a picture may be ({max_side} on a side, {max_texels} texels)"
+            )));
+        }
+        if !take(texels) {
+            return Err(ImageError(format!(
+                "{w}x{h}: the pack's pictures have decoded to more than a load may"
+            )));
+        }
         let size = reader
             .output_buffer_size()
             .ok_or_else(|| ImageError("image too large".into()))?;
@@ -103,6 +137,9 @@ impl Image {
         if info.bit_depth != png::BitDepth::Eight {
             return Err(ImageError("unexpected bit depth after expansion".into()));
         }
+        if stride == 0 || buf.len() < stride * h as usize {
+            return Err(ImageError("a frame smaller than its rows".into()));
+        }
         for row in buf.chunks(stride).take(h as usize) {
             for p in row[..w as usize * channels].chunks_exact(channels) {
                 let [r, g, b, a] = match *p {
@@ -110,10 +147,13 @@ impl Image {
                     [v, a] => [v, v, v, a],
                     [r, g, b] => [r, g, b, 255],
                     [r, g, b, a] => [r, g, b, a],
-                    _ => unreachable!(),
+                    _ => [0, 0, 0, 0],
                 };
                 pixels.push(argb(a.into(), r.into(), g.into(), b.into()));
             }
+        }
+        if pixels.len() != n {
+            return Err(ImageError("a frame smaller than its rows".into()));
         }
         Ok(Image {
             width: w,

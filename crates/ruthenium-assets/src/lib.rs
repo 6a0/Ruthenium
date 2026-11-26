@@ -9,6 +9,8 @@
 //!   and mip-mapped exactly as 26.3 does, composed on the CPU.
 //! - [`font`]: the characters' pictures and the room they take.
 //! - [`model`]: every block state's model, baked into quads as 26.3 bakes them.
+//! - [`limits`]: how much a pack may make us read and build; a server's pack is hostile
+//!   ([`Pack::open_untrusted`]).
 
 pub mod animation;
 pub mod atlas;
@@ -16,6 +18,8 @@ pub mod font;
 pub mod id;
 pub mod image;
 pub mod item;
+pub mod lang;
+pub mod limits;
 pub mod map;
 pub mod meta;
 pub mod mipmap;
@@ -31,6 +35,7 @@ pub use atlas::{ATLASES, Atlas, AtlasDef, AtlasOptions};
 pub use font::Font;
 pub use id::Id;
 pub use image::Image;
+pub use limits::{Budget, Limits};
 pub use model::{BakedQuad, BlockModels, Layer, ModelPart};
 pub use pack::Pack;
 pub use resources::{Resource, Resources};

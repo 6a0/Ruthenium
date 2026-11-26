@@ -9,7 +9,11 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 
+use serde_json::Value;
+
 use crate::id::Id;
+use crate::image::Image;
+use crate::limits::Limits;
 use crate::meta::Metadata;
 use crate::pack::{Loc, Pack};
 
@@ -28,6 +32,8 @@ struct Slot {
 pub struct Resources {
     packs: Vec<Pack>,
     namespaces: HashMap<String, Vec<Slot>>,
+    /// The strictest of the packs' limits.
+    limits: Limits,
 }
 
 /// A file found in the stack.
@@ -45,8 +51,62 @@ impl<'a> Resource<'a> {
         &self.res.packs[self.pack]
     }
 
+    /// The file's bytes, taken from its pack's budget for the load.
     pub fn read(&self) -> io::Result<Cow<'a, [u8]>> {
         self.res.packs[self.pack].read(&self.loc)
+    }
+
+    /// The file's bytes, not taken from the load's budget: for what is read while the game
+    /// plays (sounds), after the load. Each read is still no larger than a file may be.
+    pub fn read_on_demand(&self) -> io::Result<Cow<'a, [u8]>> {
+        self.res.packs[self.pack].read_on_demand(&self.loc)
+    }
+
+    /// The limits of the file's pack.
+    pub fn limits(&self) -> &'a Limits {
+        self.res.packs[self.pack].limits()
+    }
+
+    /// The file as text for a JSON reader: no larger than a JSON file may be
+    /// ([`Limits::json_bytes`]), UTF-8.
+    pub fn text(&self) -> Result<String, String> {
+        let bytes = self.json_bytes()?;
+        String::from_utf8(bytes.into_owned()).map_err(|e| e.to_string())
+    }
+
+    fn json_bytes(&self) -> Result<Cow<'a, [u8]>, String> {
+        let pack = &self.res.packs[self.pack];
+        let max = pack.limits().json_bytes;
+        if pack.declared_size(&self.loc).is_some_and(|n| n > max) {
+            return Err(format!("larger than a JSON file may be ({max} bytes)"));
+        }
+        let bytes = self.read().map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > max {
+            return Err(format!("larger than a JSON file may be ({max} bytes)"));
+        }
+        Ok(bytes)
+    }
+
+    /// The file parsed as JSON ([`crate::meta::parse_json`]), no larger than a JSON file
+    /// may be. Nesting deeper than 128 levels is an error (`serde_json`'s recursion limit).
+    pub fn json(&self) -> Result<Value, String> {
+        crate::meta::parse_json(&self.json_bytes()?)
+    }
+
+    /// The file decoded as a PNG, no larger than its pack's limits and `max_side` (the
+    /// device's largest texture, for a picture uploaded as it is), its texels taken from
+    /// the pack's budget for the load.
+    pub fn image(&self, max_side: u32) -> Result<Image, String> {
+        let pack = &self.res.packs[self.pack];
+        let limits = pack.limits();
+        let bytes = self.read().map_err(|e| e.to_string())?;
+        Image::decode_png_with(
+            &bytes,
+            limits.image_side.min(max_side),
+            limits.image_texels,
+            &mut |texels| pack.budget().take_texels(texels, limits),
+        )
+        .map_err(|e| e.to_string())
     }
 
     /// The file's `.mcmeta`, or empty metadata if it has none.
@@ -54,7 +114,17 @@ impl<'a> Resource<'a> {
         match &self.meta {
             None => Ok(Metadata::default()),
             Some((pack, loc)) => {
-                let bytes = self.res.packs[*pack].read(loc).map_err(|e| e.to_string())?;
+                let pack = &self.res.packs[*pack];
+                let max = pack.limits().mcmeta_bytes;
+                let too_large =
+                    || format!("metadata larger than a .mcmeta file may be ({max} bytes)");
+                if pack.declared_size(loc).is_some_and(|n| n > max) {
+                    return Err(too_large());
+                }
+                let bytes = pack.read(loc).map_err(|e| e.to_string())?;
+                if bytes.len() as u64 > max {
+                    return Err(too_large());
+                }
                 Metadata::parse(&bytes)
             }
         }
@@ -88,11 +158,31 @@ impl Resources {
                 }
             }
         }
-        Resources { packs, namespaces }
+        let limits = packs
+            .iter()
+            .fold(Limits::trusted(), |l, p| l.min(p.limits()));
+        Resources {
+            packs,
+            namespaces,
+            limits,
+        }
     }
 
     pub fn packs(&self) -> &[Pack] {
         &self.packs
+    }
+
+    /// The strictest of the packs' limits: what anything built from every pack (an atlas,
+    /// the baked models, a font) is held to.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    /// A new load begins: every pack's budget is counted from nothing again.
+    pub fn reset_budgets(&self) {
+        for p in &self.packs {
+            p.reset_budget();
+        }
     }
 
     fn slots(&self, namespace: &str) -> &[Slot] {
