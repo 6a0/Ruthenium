@@ -751,7 +751,9 @@ fn bilinear(texels: &[Rgba], at: [f32; 2]) -> [f32; 4] {
     })
 }
 
-/// The atlas's colour at `at` (in texels) as `terrain_frag.glsl` samples it. `du` and
+/// The atlas's colour at `at` (in texels) as vanilla's sampleNearest and sampleRGSS
+/// work it out, square roots and divisions and all (`terrain_frag.glsl` keeps that
+/// arithmetic for rgss-reference; its other shaders multiply instead). `du` and
 /// `dv` are how far the place moves, in texels, from one pixel to the next across and
 /// down the screen. `rgss`: with far texels averaged.
 fn sampled(texels: &[Rgba], at: [f32; 2], du: [f32; 2], dv: [f32; 2], rgss: bool) -> [f32; 4] {
@@ -795,7 +797,8 @@ fn sampled(texels: &[Rgba], at: [f32; 2], du: [f32; 2], dv: [f32; 2], rgss: bool
     std::array::from_fn(|i| nearest[i] * (1.0 - blend) + far[i] * 0.25 * blend)
 }
 
-/// How much fog there is at a distance, as `terrain_frag.glsl` works it out.
+/// How much fog there is at a distance, as vanilla's linear fog works it out: the
+/// shaders take it as a line (`fog_line`), which this checks them against.
 fn fog_amount(distance: f32, range: [f32; 2]) -> f32 {
     if distance <= range[0] {
         0.0

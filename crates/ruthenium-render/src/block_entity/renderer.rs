@@ -69,7 +69,8 @@ pub const MODEL_VERTEX: VertexInput = VertexInput {
 };
 
 /// Where the models' push constants are, in bytes: four words the vertex stage reads, then
-/// the fog as the terrain's fragments read it. `model_frag.glsl` declares the same block.
+/// the fog as the terrain's fragments read it (its colour and its lines).
+/// `model_frag.glsl` declares the same block.
 pub(crate) const PUSH_FOG_COLOUR: usize = 16;
 pub(crate) const PUSH_FOG_ENVIRONMENTAL: usize = 32;
 pub(crate) const PUSH_FOG_RENDER_DISTANCE: usize = 40;
@@ -3241,14 +3242,15 @@ pub(crate) fn model_push(words: [u32; 4], fog: &Fog) -> [u8; MODEL_PUSH_BYTES] {
     for (i, c) in fog.colour.iter().enumerate() {
         put(PUSH_FOG_COLOUR + i * 4, c.to_ne_bytes());
     }
+    let [environmental, render_distance] = fog.lines();
     for i in 0..2 {
         put(
             PUSH_FOG_ENVIRONMENTAL + i * 4,
-            fog.environmental[i].to_ne_bytes(),
+            environmental[i].to_ne_bytes(),
         );
         put(
             PUSH_FOG_RENDER_DISTANCE + i * 4,
-            fog.render_distance[i].to_ne_bytes(),
+            render_distance[i].to_ne_bytes(),
         );
     }
     push

@@ -512,10 +512,11 @@ fn weather_push(
     for (i, c) in fog.colour.iter().enumerate() {
         put(16 + i * 4, c.to_ne_bytes());
     }
-    put(32, fog.environmental[0].to_ne_bytes());
-    put(36, fog.environmental[1].to_ne_bytes());
-    put(40, fog.render_distance[0].to_ne_bytes());
-    put(44, fog.render_distance[1].to_ne_bytes());
+    let [environmental, render_distance] = fog.lines();
+    put(32, environmental[0].to_ne_bytes());
+    put(36, environmental[1].to_ne_bytes());
+    put(40, render_distance[0].to_ne_bytes());
+    put(44, render_distance[1].to_ne_bytes());
     put(48, texture.index().to_ne_bytes());
     push
 }

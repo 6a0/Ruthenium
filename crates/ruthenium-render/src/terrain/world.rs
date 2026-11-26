@@ -137,11 +137,12 @@ impl TerrainDraws {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TerrainShader {
     /// Far texels averaged as vanilla's Texture Filtering "RGSS" averages them (the
-    /// Fancy preset's), taking only the samples that count for something.
+    /// Fancy preset's), taking only the samples that count for something, with its
+    /// square roots and divisions turned into multiplications where they can be.
     #[default]
     Rgss,
-    /// The same picture with all nine samples taken for every pixel, as vanilla's
-    /// shader is written: what `Rgss` is measured against.
+    /// The same picture with all nine samples taken for every pixel and vanilla's
+    /// arithmetic, as its shader is written: what `Rgss` is measured against.
     RgssReference,
     /// Every texel with hard edges, as with Texture Filtering off (the Fast preset's).
     Nearest,
@@ -871,16 +872,21 @@ fn put(bytes: &mut [u8], at: usize, word: [u8; 4]) {
 /// Where the terrain's push constants are, in bytes: four words the vertex stage reads
 /// (the word offsets of the frame's world record, its matrix and its first section
 /// record, and that the draw is a real one), then what every fragment reads: the fog's
-/// colour and its two ranges, one texel of the atlas in its coordinates, and the
-/// atlas's index in the texture table. `terrain_frag.glsl` declares the same block.
+/// colour and its two lines ([`Fog::lines`]), one texel of the atlas in its coordinates
+/// and the atlas's size in texels, the atlas's index in the texture table, and one over
+/// the shorter side of a texel, squared and as its base-2 logarithm.
+/// `terrain_frag.glsl` declares the same block.
 pub(crate) const PUSH_ENABLED: usize = 12;
 pub(crate) const PUSH_FOG_COLOUR: usize = 16;
 pub(crate) const PUSH_FOG_ENVIRONMENTAL: usize = 32;
 pub(crate) const PUSH_FOG_RENDER_DISTANCE: usize = 40;
 pub(crate) const PUSH_ATLAS_TEXEL: usize = 48;
-pub(crate) const PUSH_ATLAS: usize = 56;
+pub(crate) const PUSH_ATLAS_SIZE: usize = 56;
+pub(crate) const PUSH_ATLAS: usize = 64;
+pub(crate) const PUSH_TEXEL_SCALE_SQUARED: usize = 68;
+pub(crate) const PUSH_TEXEL_SCALE_LOG2: usize = 72;
 /// Bytes of the terrain's push constants.
-pub(crate) const TERRAIN_PUSH_BYTES: usize = 60;
+pub(crate) const TERRAIN_PUSH_BYTES: usize = 76;
 
 /// The terrain's push constants for a frame's draws.
 pub(crate) fn terrain_push(
@@ -899,24 +905,38 @@ pub(crate) fn terrain_push(
     for (i, c) in fog.colour.iter().enumerate() {
         put(&mut push, PUSH_FOG_COLOUR + i * 4, c.to_ne_bytes());
     }
+    let [environmental, render_distance] = fog.lines();
     for i in 0..2 {
         put(
             &mut push,
             PUSH_FOG_ENVIRONMENTAL + i * 4,
-            fog.environmental[i].to_ne_bytes(),
+            environmental[i].to_ne_bytes(),
         );
         put(
             &mut push,
             PUSH_FOG_RENDER_DISTANCE + i * 4,
-            fog.render_distance[i].to_ne_bytes(),
+            render_distance[i].to_ne_bytes(),
         );
         put(
             &mut push,
             PUSH_ATLAS_TEXEL + i * 4,
             (1.0 / atlas_size[i]).to_ne_bytes(),
         );
+        put(
+            &mut push,
+            PUSH_ATLAS_SIZE + i * 4,
+            atlas_size[i].to_ne_bytes(),
+        );
     }
     put(&mut push, PUSH_ATLAS, atlas.index().to_ne_bytes());
+    // One over the shorter side of a texel: the atlas's longer side.
+    let scale = atlas_size[0].max(atlas_size[1]);
+    put(
+        &mut push,
+        PUSH_TEXEL_SCALE_SQUARED,
+        (scale * scale).to_ne_bytes(),
+    );
+    put(&mut push, PUSH_TEXEL_SCALE_LOG2, scale.log2().to_ne_bytes());
     push
 }
 
@@ -2388,8 +2408,9 @@ mod tests {
         assert_eq!(word(1), 64);
         assert_eq!(word(2), 1_000_000);
         assert_eq!(f32::from_bits(word(3)), 0.25);
-        // The push constants: four words for the vertex stage, then the fog, a texel
-        // of the atlas and the atlas, where terrain_frag.glsl's block has them.
+        // The push constants: four words for the vertex stage, then the fog's colour
+        // and lines, a texel of the atlas, its size, the atlas and the texel's scale,
+        // where terrain_frag.glsl's block has them.
         let fog = Fog {
             colour: [0.1, 0.2, 0.3, 1.0],
             environmental: [4.0, 5.0],
@@ -2397,17 +2418,24 @@ mod tests {
             sky_end: 8.0,
         };
         let push = terrain_push(7, 14, 30, &fog, TextureId::MISSING, [1024.0, 512.0]);
-        assert_eq!(push.len(), 60);
+        assert_eq!(push.len(), 76);
         assert_eq!(push[0..4], 7u32.to_ne_bytes());
         assert_eq!(push[4..8], 14u32.to_ne_bytes());
         assert_eq!(push[8..12], 30u32.to_ne_bytes());
         assert_eq!(push[12..16], 1u32.to_ne_bytes());
         let pushed = |at: usize| f32::from_ne_bytes(push[at..at + 4].try_into().unwrap());
         assert_eq!([pushed(16), pushed(20), pushed(24), pushed(28)], fog.colour);
-        assert_eq!([pushed(32), pushed(36)], fog.environmental);
-        assert_eq!([pushed(40), pushed(44)], fog.render_distance);
+        // Fog from 4 to 5 blocks, and from 6 to 7: a block wide each.
+        assert_eq!([pushed(32), pushed(36)], [1.0, -4.0]);
+        assert_eq!([pushed(40), pushed(44)], [1.0, -6.0]);
         assert_eq!([pushed(48), pushed(52)], [1.0 / 1024.0, 1.0 / 512.0]);
-        assert_eq!(push[56..60], TextureId::MISSING.index().to_ne_bytes());
+        assert_eq!([pushed(56), pushed(60)], [1024.0, 512.0]);
+        assert_eq!(push[64..68], TextureId::MISSING.index().to_ne_bytes());
+        assert_eq!([pushed(68), pushed(72)], [1024.0 * 1024.0, 10.0]);
+        // The shorter side of a texel is the one of the longer side of the atlas.
+        let tall = terrain_push(7, 14, 30, &fog, TextureId::MISSING, [256.0, 2048.0]);
+        let pushed = |at: usize| f32::from_ne_bytes(tall[at..at + 4].try_into().unwrap());
+        assert_eq!([pushed(68), pushed(72)], [2048.0 * 2048.0, 11.0]);
         // The world record: the camera's offset, the atlas's size and the light map.
         let mut world = [0u8; WORLD.bytes() as usize];
         write_world_record(

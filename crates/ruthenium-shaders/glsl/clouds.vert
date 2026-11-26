@@ -15,8 +15,8 @@ layout(push_constant) uniform Push {
     vec4 color;
     // Where the camera's cell starts, in blocks from the camera: the layer's bottom in y.
     vec3 offset;
-    // Where the clouds have faded out, in blocks from the camera (the fragment stage's).
-    float fog_end;
+    // The fragment stage's fade with distance.
+    float fog_scale;
 } pc;
 
 layout(location = 0) in uint a_face;

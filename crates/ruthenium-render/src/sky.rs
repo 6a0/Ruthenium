@@ -18,6 +18,7 @@ use ruthenium_gpu::{
 use ruthenium_javamath::mth;
 use ruthenium_shaders::interface::SKY;
 
+use crate::atmosphere::fog_line;
 use crate::pipelines::PipelineId;
 use crate::terrain::View;
 
@@ -553,17 +554,19 @@ pub(crate) struct SkyRenderer {
 }
 
 /// Bytes of the sky's push constants.
-pub(crate) const SKY_PUSH_BYTES: usize = 56;
+pub(crate) const SKY_PUSH_BYTES: usize = 60;
 /// Where they are, in bytes: two words the vertex stage reads (the word offset of the
 /// draw's record, and that the draw is a real one), then what every fragment reads:
 /// the kind of draw, its texture, its colour, the fog's colour and where the sky's fog
-/// is complete, and the sampler. `sky.frag` declares the same block.
+/// is complete, the sampler, and one over that end as the scale of a fog line
+/// ([`fog_line`]). `sky.frag` declares the same block.
 pub(crate) const PUSH_KIND: usize = 8;
 pub(crate) const PUSH_TEXTURE: usize = 12;
 pub(crate) const PUSH_COLOUR: usize = 16;
 pub(crate) const PUSH_FOG_COLOUR: usize = 32;
 pub(crate) const PUSH_FOG_END: usize = 48;
 pub(crate) const PUSH_SAMPLER: usize = 52;
+pub(crate) const PUSH_FOG_SCALE: usize = 56;
 
 /// The sky's push constants for one draw whose record is at `record`.
 fn sky_push_of(record: u32, draw: &Draw, fog: [f32; 4], fog_end: f32) -> [u8; SKY_PUSH_BYTES] {
@@ -599,6 +602,8 @@ pub(crate) fn sky_push(
     }
     put(PUSH_FOG_END, fog_end.to_ne_bytes());
     put(PUSH_SAMPLER, sampler.index().to_ne_bytes());
+    // The fog towards the dome's rim: from none at the camera to all at its end.
+    put(PUSH_FOG_SCALE, fog_line([0.0, fog_end])[0].to_ne_bytes());
     push
 }
 
@@ -1144,7 +1149,7 @@ mod tests {
             [0.5, 0.6, 0.7, 0.8],
             192.0,
         );
-        assert_eq!(push.len(), 56);
+        assert_eq!(push.len(), 60);
         assert_eq!(push[..8], [7, 0, 0, 0, 1, 0, 0, 0]);
         assert_eq!(push[8..12], TEXTURED.to_ne_bytes());
         assert_eq!(push[12..16], TextureId::MISSING.index().to_ne_bytes());
@@ -1159,5 +1164,6 @@ mod tests {
         );
         assert_eq!(float(48), 192.0);
         assert_eq!(push[52..56], SamplerId::NearestRepeat.index().to_ne_bytes());
+        assert_eq!(float(56), 1.0 / 192.0);
     }
 }

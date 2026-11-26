@@ -27,6 +27,8 @@ layout(push_constant) uniform Push {
     float fog_end;
     // The sampler the texture is read with.
     uint sampler_id;
+    // One over fog_end, as fog.glsl's scale (atmosphere.rs, fog_line).
+    float fog_scale;
 } pc;
 
 layout(location = 0) in vec4 v_color;
@@ -42,9 +44,8 @@ void main() {
         // The sky's dome fades into the fog's colour towards its rim, and is all fog
         // beyond where the sky's fog ends, sideways or in height.
         vec4 fog = pc.fog_color;
-        float end = pc.fog_end;
-        float towards = v_spherical <= 0.0 ? 0.0 : (v_spherical >= end ? 1.0 : v_spherical / end);
-        float beyond = v_cylindrical <= end ? 0.0 : 1.0;
+        float towards = clamp(v_spherical * pc.fog_scale, 0.0, 1.0);
+        float beyond = v_cylindrical <= pc.fog_end ? 0.0 : 1.0;
         o_color = vec4(mix(color.rgb, fog.rgb, max(towards, beyond) * fog.a), color.a);
         return;
     }

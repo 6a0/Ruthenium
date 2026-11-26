@@ -379,7 +379,10 @@ mod tests {
             (vec(2), w::PUSH_FOG_ENVIRONMENTAL as u32),
             (vec(2), w::PUSH_FOG_RENDER_DISTANCE as u32),
             (vec(2), w::PUSH_ATLAS_TEXEL as u32),
+            (vec(2), w::PUSH_ATLAS_SIZE as u32),
             (Type::Uint, w::PUSH_ATLAS as u32),
+            (Type::Float, w::PUSH_TEXEL_SCALE_SQUARED as u32),
+            (Type::Float, w::PUSH_TEXEL_SCALE_LOG2 as u32),
         ]);
         assert_eq!(terrain[3].1 as usize, w::PUSH_ENABLED);
         assert_eq!(
@@ -403,6 +406,7 @@ mod tests {
             (vec(4), s::PUSH_FOG_COLOUR as u32),
             (Type::Float, s::PUSH_FOG_END as u32),
             (Type::Uint, s::PUSH_SAMPLER as u32),
+            (Type::Float, s::PUSH_FOG_SCALE as u32),
         ]);
         assert_eq!(sky.last().unwrap().1 as usize + 4, s::SKY_PUSH_BYTES);
         assert_eq!(pushed(&shaders::SKY_VERT), words(2));

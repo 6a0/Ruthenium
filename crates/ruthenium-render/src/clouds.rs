@@ -21,6 +21,7 @@ use ruthenium_gpu::{
 };
 use ruthenium_shaders::interface::WORLD_MATRIX;
 
+use crate::atmosphere::fog_line;
 use crate::pipelines::PipelineId;
 use crate::terrain::View;
 
@@ -674,13 +675,26 @@ fn cloud_push(
     for (i, c) in offset.iter().enumerate() {
         put(32 + i * 4, c.to_ne_bytes());
     }
-    put(44, fog_end.to_ne_bytes());
+    // The fade from the camera to the end as a fog line, whose bias is 0.
+    put(44, fog_line([0.0, fog_end])[0].to_ne_bytes());
     push
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_clouds_fade_by_one_over_their_end() {
+        let push = cloud_push(3, [1.0; 4], [0.5, -2.0, 0.25], 192.0);
+        let float = |at: usize| f32::from_ne_bytes(push[at..at + 4].try_into().unwrap());
+        assert_eq!(float(44), 1.0 / 192.0);
+        assert_eq!([float(32), float(36), float(40)], [0.5, -2.0, 0.25]);
+        // A fade from the camera needs no bias: clouds.frag has none.
+        for end in [0.0, 1.0, 192.0, 2048.0, f32::INFINITY] {
+            assert_eq!(fog_line([0.0, end])[1], 0.0, "{end}");
+        }
+    }
 
     /// The clouds golden's generator (a 64-bit LCG, as the tool's).
     struct Lcg(u64);

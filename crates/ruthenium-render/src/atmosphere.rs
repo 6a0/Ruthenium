@@ -53,6 +53,37 @@ impl Fog {
         render_distance: [f32::MAX; 2],
         sky_end: f32::MAX,
     };
+
+    /// The fog of the place and the fog at the edge of the view as the shaders take
+    /// them: each [`fog_line`] of its range.
+    pub fn lines(&self) -> [[f32; 2]; 2] {
+        [fog_line(self.environmental), fog_line(self.render_distance)]
+    }
+}
+
+/// A fog that is none up to `start`, all from `end` and in a straight line between
+/// (vanilla's linear fog), as the scale and bias with which the shaders work it out in
+/// one multiply-add: the amount at a distance `d` is `clamp(d * scale + bias, 0, 1)`
+/// (`fog.glsl`). Worked out in double precision, so that each is the nearest single.
+///
+/// A start at `f32::MAX` or beyond is no fog at all ([`Fog::NONE`]): nothing. An end at
+/// or before the start is vanilla's fog that is all there just past the start: a line
+/// so steep that it is all there 2^-64 of a block past it. An end that is infinitely
+/// far off never brings any fog.
+pub fn fog_line([start, end]: [f32; 2]) -> [f32; 2] {
+    // A power of two, so that its product with a start is exact.
+    const STEEP: f64 = 18_446_744_073_709_551_616.0;
+    if start.is_nan() || start >= f32::MAX {
+        return [0.0, 0.0];
+    }
+    let start = f64::from(start.max(f32::MIN));
+    let end = f64::from(end);
+    if end > start {
+        let scale = 1.0 / (end - start);
+        [scale as f32, (-start * scale) as f32]
+    } else {
+        [STEEP as f32, (-start * STEEP) as f32]
+    }
 }
 
 /// What the camera is in (`FogType`).
@@ -626,6 +657,82 @@ mod tests {
             fire_resistance: false,
             water_vision: 1.0,
         }
+    }
+
+    /// Vanilla's linear fog as its shader writes it.
+    fn linear(d: f32, [start, end]: [f32; 2]) -> f32 {
+        if d <= start {
+            0.0
+        } else if d >= end {
+            1.0
+        } else {
+            (d - start) / (end - start)
+        }
+    }
+
+    /// The shaders' fog of a line (`fog.glsl`).
+    fn along(d: f32, [scale, bias]: [f32; 2]) -> f32 {
+        d.mul_add(scale, bias).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn a_fog_s_line_is_vanilla_s_linear_fog() {
+        // The ranges the game makes: the edge of the view at 2 and 32 chunks, the air,
+        // rain, water, lava, powder snow, blindness, and the fixture's.
+        let ranges = [
+            [28.0, 32.0],
+            [512.0 - 51.2, 512.0],
+            [0.0, 1024.0],
+            [-80.0, 896.0],
+            [-8.0, 96.0],
+            [0.25, 1.0],
+            [-8.0, 96.0],
+            [0.0, 2.0],
+            [1.25, 5.0],
+            [3.0, 19.0],
+            [6.0, 12.5],
+        ];
+        for range in ranges {
+            let line = fog_line(range);
+            // Within a few steps of a single-precision float near 1, everywhere: far
+            // less than one step of a colour's byte.
+            for i in 0..=4000 {
+                let d = range[0] - 2.0 + (range[1] - range[0] + 4.0) * i as f32 / 4000.0;
+                let (want, got) = (linear(d, range), along(d, line));
+                assert!((want - got).abs() < 2e-5, "{range:?} at {d}: {want} {got}");
+            }
+            // Nothing at the start and before it, all at the end and after it.
+            assert!(along(range[0], line) < 1e-6, "{range:?}");
+            assert_eq!(along(range[0] - 1.0, line), 0.0);
+            assert!(along(range[1], line) > 1.0 - 1e-6, "{range:?}");
+            assert_eq!(along(range[1] + 1.0, line), 1.0);
+        }
+        // No fog: nothing, however far.
+        assert_eq!(fog_line([f32::MAX; 2]), [0.0, 0.0]);
+        assert_eq!(fog_line([f32::INFINITY; 2]), [0.0, 0.0]);
+        assert_eq!(Fog::NONE.lines(), [[0.0, 0.0]; 2]);
+        for d in [0.0, 1.0, 1e30, f32::MAX] {
+            assert_eq!(along(d, fog_line([f32::MAX; 2])), 0.0);
+        }
+        // An end infinitely far off: never any.
+        assert_eq!(along(1e30, fog_line([10.0, f32::INFINITY])), 0.0);
+        // An end at or before the start: all of it just past the start, as vanilla's.
+        for range in [[16.0, 16.0], [16.0, 4.0], [0.0, 0.0], [-8.0, -8.0]] {
+            let line = fog_line(range);
+            assert_eq!(along(range[0] - 0.001, line), 0.0, "{range:?}");
+            assert_eq!(along(range[0], line), 0.0, "{range:?}");
+            let past = f32::from_bits(range[0].to_bits() + 1).max(range[0] + 1e-6);
+            assert_eq!(along(past, line), 1.0, "{range:?}");
+            assert_eq!(along(1000.0, line), 1.0, "{range:?}");
+        }
+        let fog = Fog {
+            colour: [0.0; 4],
+            environmental: [3.0, 19.0],
+            render_distance: [6.0, 12.5],
+            sky_end: 0.0,
+        };
+        assert_eq!(fog.lines(), [fog_line([3.0, 19.0]), fog_line([6.0, 12.5])]);
+        assert_eq!(fog_line([3.0, 19.0]), [1.0 / 16.0, -3.0 / 16.0]);
     }
 
     #[test]
