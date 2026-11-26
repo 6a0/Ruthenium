@@ -1,6 +1,7 @@
 //! The game's GNU Unifont, the menus' last fallback (as it is vanilla's): glyphs are
 //! pictures 16 pixels high, so each is drawn from an outline around its set pixels, and
-//! set without shaping, at the advance vanilla gives it.
+//! set without shaping, at the advance vanilla gives it. Bold text is drawn as vanilla
+//! draws it, twice, the second copy a pixel to the right: one outline around both.
 //!
 //! Sizes: Unifont is a 16-pixel font, its rows one em, 14 of them above the baseline
 //! (the ascent its own outline builds have, and vanilla's: 7 of the 8 units the rows
@@ -29,9 +30,16 @@ pub(crate) fn char_of(plane: u8, id: u16) -> Option<char> {
     char::from_u32(u32::from(plane) << 16 | u32::from(id))
 }
 
-/// `c`'s advance in ems: vanilla's, in its units of two rows.
-pub(crate) fn advance(font: &Font, c: char) -> f32 {
-    font.glyph(c).advance * 2.0 / ROWS_PER_EM as f32
+/// `c`'s advance in ems: vanilla's, in its units of two rows (bold: its bold offset,
+/// half a unit, more).
+pub(crate) fn advance(font: &Font, c: char, bold: bool) -> f32 {
+    font.glyph(c).advance(bold) * 2.0 / ROWS_PER_EM as f32
+}
+
+/// How many pixels to the right vanilla draws a bold glyph's second copy: its bold offset
+/// (half a unit, so one).
+fn bold_shift(font: &Font, c: char) -> u32 {
+    (font.glyph(c).bold_offset * 2.0).round().max(0.0) as u32
 }
 
 /// Characters left out of a Unifont run: those that only join or select (Unifont draws
@@ -44,14 +52,17 @@ pub(crate) fn invisible(c: char) -> bool {
 }
 
 /// The outline of `c`'s set pixels in rows from its pen position, y up from the baseline,
-/// and its box (`x_min, y_min, x_max, y_max`); none for a glyph without ink.
-pub(crate) fn outline(font: &Font, c: char) -> Option<(Shape<Contour>, [f64; 4])> {
+/// and its box (`x_min, y_min, x_max, y_max`); none for a glyph without ink. `bold`: of
+/// its pixels and the same shifted right by the bold offset, as one.
+pub(crate) fn outline(font: &Font, c: char, bold: bool) -> Option<(Shape<Contour>, [f64; 4])> {
     if !font.has(c) {
         return None;
     }
     let picture = font.texels(c)?;
-    let loops = polygons(picture.width, picture.height, |x, y| {
-        picture.get(x, y) >> 24 != 0
+    let shift = if bold { bold_shift(font, c) } else { 0 };
+    let ink = |x: u32, y: u32| x < picture.width && picture.get(x, y) >> 24 != 0;
+    let loops = polygons(picture.width + shift, picture.height, |x, y| {
+        ink(x, y) || (x >= shift && ink(x - shift, y))
     });
     let mut bbox = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
     let mut shape = Shape::default();

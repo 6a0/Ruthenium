@@ -6,8 +6,10 @@
 //! that; see `fonts/README.md`); each has its own atlas entries.
 //!
 //! Characters Nunito lacks come from fonts already on the system ([`fallback`]), and
-//! after them from the game's own GNU Unifont ([`unifont`]). A word that needs one is set
-//! wholly in it where it can be, so a word in small capitals does not mix two typefaces. The atlas starts with what the menus' own text needs and takes in
+//! after them from the game's own GNU Unifont ([`unifont`]). A word that needs a system
+//! font is set wholly in it where it can be, so a word in small capitals does not mix two
+//! typefaces; Unifont only ever takes the characters no other font has. The atlas starts
+//! with what the menus' own text needs and takes in
 //! the glyphs of other text (server names and messages, typed text) as it is drawn:
 //! [`TextList`] notes the glyphs it had to leave out, and they are rendered and added.
 
@@ -76,8 +78,9 @@ pub enum FaceId {
     Nunito(Weight),
     /// A system font, by its file's place in the fallback list.
     System(u16),
-    /// The game's Unifont: the plane of the character, whose place in it is the glyph id.
-    Unifont(u8),
+    /// The game's Unifont: the plane of the character, whose place in it is the glyph id,
+    /// and whether it is drawn bold (vanilla's second copy a pixel to the right).
+    Unifont { plane: u8, bold: bool },
 }
 
 /// One glyph of a shaped line: its font, its id there, and its pen position.
@@ -213,7 +216,7 @@ impl Fonts {
         match id {
             FaceId::Nunito(w) => Some(self.face(w)),
             FaceId::System(file) => self.fallback()?.system?.face(file),
-            FaceId::Unifont(_) => None,
+            FaceId::Unifont { .. } => None,
         }
     }
 
@@ -223,9 +226,9 @@ impl Fonts {
         &self,
         (id, glyph): (FaceId, u16),
     ) -> Option<(fdsm::shape::Shape<Contour>, [f64; 4], f64)> {
-        if let FaceId::Unifont(plane) = id {
+        if let FaceId::Unifont { plane, bold } = id {
             let c = unifont::char_of(plane, glyph)?;
-            let (shape, bbox) = unifont::outline(self.fallback()?.unifont?, c)?;
+            let (shape, bbox) = unifont::outline(self.fallback()?.unifont?, c, bold)?;
             return Some((shape, bbox, unifont::ROWS_PER_EM));
         }
         let face = self.face_of(id)?;
@@ -260,7 +263,7 @@ impl Fonts {
         let mut glyphs = Vec::with_capacity(text.len());
         let mut x = 0.0f32;
         for (range, id) in self.runs(text, style.weight) {
-            if let FaceId::Unifont(_) = id {
+            if let FaceId::Unifont { bold, .. } = id {
                 let Some(font) = self.fallback().and_then(|c| c.unifont) else {
                     continue;
                 };
@@ -274,12 +277,12 @@ impl Fonts {
                     }
                     let (plane, id) = unifont::key(c);
                     glyphs.push(Glyph {
-                        face: FaceId::Unifont(plane),
+                        face: FaceId::Unifont { plane, bold },
                         id,
                         x,
                         y: 0.0,
                     });
-                    x += unifont::advance(font, c) * style.size;
+                    x += unifont::advance(font, c, bold) * style.size;
                 }
                 continue;
             }
@@ -316,10 +319,8 @@ impl Fonts {
         }
     }
 
-    /// `text` in runs of one font each: Nunito wherever it has the characters; a word it
-    /// can't set in the first fallback font that has all of the word, else character by
-    /// character in the first that has each (Nunito's missing glyph when none has it).
-    /// Unifont's runs are `FaceId::Unifont(0)`; [`Fonts::shape`] gives each glyph its plane.
+    /// `text` in runs of one font each (see [`itemize`]). Unifont's runs are in plane 0;
+    /// [`Fonts::shape`] gives each glyph its own.
     fn runs(&self, text: &str, weight: Weight) -> Vec<(std::ops::Range<usize>, FaceId)> {
         let nunito = FaceId::Nunito(weight);
         let primary = self.face(weight);
@@ -342,7 +343,7 @@ impl Fonts {
             .into_iter()
             .map(|(range, font)| {
                 let id = match (font, fallback.system) {
-                    (Some(f), _) if fallback.is_unifont(f) => FaceId::Unifont(0),
+                    (Some(f), _) if fallback.is_unifont(f) => FaceId::Unifont { plane: 0, bold },
                     (Some(f), Some(system)) => FaceId::System(system.file(f, bold)),
                     _ => nunito,
                 };
@@ -360,13 +361,21 @@ pub(crate) trait Coverage {
     fn covering(&self, c: char) -> Option<u16>;
     /// Whether `family` has `c`.
     fn family_has(&self, family: u16, c: char) -> bool;
+    /// The family looked in last, which only takes the characters no other font has
+    /// (Unifont), if there is one.
+    fn last_resort(&self) -> Option<u16> {
+        None
+    }
 }
 
-/// `text` in runs of one font each (`None`: Nunito, which has `primary(c)`): Nunito for a
-/// word it has every character of; else the first fallback that has the whole word
+/// `text` in runs of one font each (`None`: Nunito, which has `primary(c)`). A word
+/// Nunito has every character of is Nunito's. In another, the characters that only the
+/// last resort has (or no font) are left aside: each goes to the last resort, or is
+/// Nunito's missing glyph. The rest of the word is set as if they were not there: in
+/// Nunito if it has all of it; else in the first other fallback that has all of it
 /// (looking first at the one with the first character Nunito lacks); else character by
-/// character, each in Nunito if it has it, or the first fallback that does (Nunito's
-/// missing glyph when none has it). Joiners and marks go with what they follow.
+/// character, each in Nunito if it has it, or the first fallback that does. Joiners and
+/// marks go with what they follow.
 fn itemize(
     text: &str,
     primary: impl Fn(char) -> bool,
@@ -377,30 +386,37 @@ fn itemize(
         Some((r, last)) if *last == id && r.end == range.start => r.end = range.end,
         _ => runs.push((range, id)),
     };
+    let last = fallback.last_resort();
+    // Set by Nunito or a fallback before the last resort.
+    let settable = |c: char| primary(c) || fallback.covering(c).is_some_and(|f| Some(f) != last);
     for word in words(text) {
         let chars = || text[word.clone()].chars().filter(|&c| !ignorable(c));
         if chars().all(&primary) {
             push(word, None);
             continue;
         }
-        let has_all = |f: u16| chars().all(|c| fallback.family_has(f, c));
-        let first = chars()
+        let rest = || chars().filter(|&c| settable(c));
+        let has_all = |f: u16| rest().all(|c| fallback.family_has(f, c));
+        // The fallback for all of the rest, if one has it all (none if it is Nunito's).
+        let whole = match rest()
             .find(|&c| !primary(c))
-            .and_then(|c| fallback.covering(c));
-        let whole = match first {
+            .and_then(|c| fallback.covering(c))
+        {
             Some(f) if has_all(f) => Some(f),
-            Some(_) => (0..fallback.families()).find(|&f| has_all(f)),
+            Some(_) => (0..fallback.families())
+                .filter(|&f| Some(f) != last)
+                .find(|&f| has_all(f)),
             None => None,
         };
-        if let Some(f) = whole {
-            push(word, Some(f));
-            continue;
-        }
         let mut current = None;
         for (i, c) in text[word.clone()].char_indices() {
             let at = word.start + i;
             let id = if ignorable(c) {
                 current
+            } else if !settable(c) {
+                fallback.covering(c)
+            } else if whole.is_some() {
+                whole
             } else if primary(c) {
                 None
             } else {
@@ -1037,6 +1053,114 @@ mod tests {
         assert_eq!(words(" ab  c "), [0..1, 1..3, 3..5, 5..6, 6..7]);
     }
 
+    /// `Fake`, and a fourth family looked in last (Unifont): it has ASCII, the small
+    /// capitals, CJK, Ol Onal (U+1E5D0 on) and an emoji, which no other font has.
+    struct WithLast;
+
+    impl Coverage for WithLast {
+        fn families(&self) -> u16 {
+            4
+        }
+
+        fn covering(&self, c: char) -> Option<u16> {
+            (0..4).find(|&f| self.family_has(f, c))
+        }
+
+        fn family_has(&self, family: u16, c: char) -> bool {
+            match family {
+                3 => {
+                    c.is_ascii()
+                        || Fake.family_has(1, c)
+                        || Fake.family_has(2, c)
+                        || ('\u{1E5D0}'..='\u{1E5FF}').contains(&c)
+                        || c == '😀'
+                        || c == '\u{301}'
+                }
+                f => Fake.family_has(f, c),
+            }
+        }
+
+        fn last_resort(&self) -> Option<u16> {
+            Some(3)
+        }
+    }
+
+    fn itemized_last(text: &str) -> Vec<(&str, Option<u16>)> {
+        let primary = |c: char| c.is_ascii() || ('\u{400}'..='\u{4FF}').contains(&c);
+        itemize(text, primary, &WithLast)
+            .into_iter()
+            .map(|(r, f)| (&text[r], f))
+            .collect()
+    }
+
+    /// The last resort takes only the characters no other font has; the rest of the word
+    /// is set as it would be without them.
+    #[test]
+    fn the_last_resort_takes_only_what_no_other_font_has() {
+        // Latin round a character only it has, and an emoji no system font has.
+        assert_eq!(
+            itemized_last("a\u{1E5D0}b"),
+            [("a", None), ("\u{1E5D0}", Some(3)), ("b", None)]
+        );
+        assert_eq!(
+            itemized_last("Hello😀 there"),
+            [("Hello", None), ("😀", Some(3)), (" there", None)]
+        );
+        // Small capitals keep the whole-word rule among the system's fonts.
+        assert_eq!(
+            itemized_last("ѕɪᴇɢᴇ\u{1E5D0}"),
+            [("ѕɪᴇɢᴇ", Some(1)), ("\u{1E5D0}", Some(3))]
+        );
+        assert_eq!(
+            itemized_last("\u{1E5D0}ᴛᴇ\u{1E5D1}ᴛ"),
+            [
+                ("\u{1E5D0}", Some(3)),
+                ("ᴛᴇ", Some(0)),
+                ("\u{1E5D1}", Some(3)),
+                ("ᴛ", Some(0))
+            ]
+        );
+        // No system font has the rest whole: character by character, as without it.
+        assert_eq!(
+            itemized_last("ᴀ日\u{1E5D0}b"),
+            [
+                ("ᴀ", Some(0)),
+                ("日", Some(2)),
+                ("\u{1E5D0}", Some(3)),
+                ("b", None)
+            ]
+        );
+        // A word of its characters alone is all its.
+        assert_eq!(
+            itemized_last("x \u{1E5D0}\u{1E5D1}"),
+            [("x ", None), ("\u{1E5D0}\u{1E5D1}", Some(3))]
+        );
+        // Joiners and marks go with what they follow, whichever font that is.
+        assert_eq!(
+            itemized_last("a\u{1E5D0}\u{301}\u{200D}b\u{301}"),
+            [
+                ("a", None),
+                ("\u{1E5D0}\u{301}\u{200D}", Some(3)),
+                ("b\u{301}", None)
+            ]
+        );
+        assert_eq!(
+            itemized_last("ᴀ\u{301}\u{1E5D0}\u{FE0F}"),
+            [("ᴀ\u{301}", Some(0)), ("\u{1E5D0}\u{FE0F}", Some(3))]
+        );
+        // A character no font has is Nunito's missing glyph, and doesn't split the rest.
+        assert_eq!(
+            itemized_last("ѕɪᴇɢᴇ\u{E000}"),
+            [("ѕɪᴇɢᴇ", Some(1)), ("\u{E000}", None)]
+        );
+        assert_eq!(
+            itemized("ѕɪᴇɢᴇ\u{E000}"),
+            [("ѕɪᴇɢᴇ", Some(1)), ("\u{E000}", None)]
+        );
+        // What Nunito has stays Nunito's.
+        assert_eq!(itemized_last("Hello"), [("Hello", None)]);
+    }
+
     #[test]
     fn the_atlas_grows_and_keeps_what_it_had() {
         let fonts = Fonts::nunito(&[Weight::REGULAR]);
@@ -1210,7 +1334,13 @@ E000:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
                 .collect()
         };
         let line = fonts.shape("x \u{1E5D0}\u{1E5D0}", style);
-        let unifont_glyph = (FaceId::Unifont(1), 0xE5D0);
+        let unifont_glyph = (
+            FaceId::Unifont {
+                plane: 1,
+                bold: false,
+            },
+            0xE5D0,
+        );
         assert_eq!(line.glyphs.len(), 4);
         assert_eq!(line.glyphs[0].face, FaceId::Nunito(Weight::REGULAR));
         assert_eq!(line.glyphs[2].key(), unifont_glyph);
@@ -1219,12 +1349,10 @@ E000:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
         assert_eq!(line.glyphs[3].x - start, 18.0);
         assert_eq!(line.width - start, 36.0);
         assert_eq!(line.glyphs[2].y, 0.0);
-        // The whole word in Unifont, which has its 'a' too; joiners are left out.
-        assert_eq!(
-            faces("a\u{1E5D0}\u{200D}\u{FE0F}"),
-            [(FaceId::Unifont(0), 0x61), unifont_glyph]
-        );
-        // A word Unifont can't set whole: each character where it is.
+        // Unifont has the 'a' too, but Nunito keeps it; joiners are left out.
+        let a = faces("a")[0];
+        assert_eq!(a.0, FaceId::Nunito(Weight::REGULAR));
+        assert_eq!(faces("a\u{1E5D0}\u{200D}\u{FE0F}"), [a, unifont_glyph]);
         assert_eq!(
             faces("b\u{1E5D0}"),
             [
@@ -1246,6 +1374,99 @@ E000:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
             },
         );
         assert_eq!(tracked.width, 36.0 + 8.0);
+        // Unifont alone (`--font-fallback unifont`) takes only what Nunito lacks.
+        let alone = Fonts::with_chain(
+            &[Weight::REGULAR],
+            Chain {
+                system: None,
+                unifont: Some(unifont()),
+            },
+        );
+        let keys: Vec<FaceId> = alone
+            .shape("a\u{1D00}a", style)
+            .glyphs
+            .iter()
+            .map(|g| g.face)
+            .collect();
+        let regular = FaceId::Unifont {
+            plane: 0,
+            bold: false,
+        };
+        assert_eq!(keys, [FaceId::Nunito(Weight::REGULAR), regular, a.0]);
+    }
+
+    /// Bold text (600 and up, as the system fonts' bold files) draws Unifont's glyphs as
+    /// vanilla draws bold: a pixel wider, and that much further on.
+    #[test]
+    fn bold_unifont_is_a_pixel_wider_and_further_on() {
+        let weights = [
+            Weight::REGULAR,
+            Weight::MEDIUM,
+            Weight::SEMIBOLD,
+            Weight::EXTRABOLD,
+        ];
+        let fonts = Fonts::with_chain(
+            &weights,
+            Chain {
+                system: None,
+                unifont: Some(unifont()),
+            },
+        );
+        let shaped = |weight| {
+            fonts.shape(
+                "\u{1E5D0}\u{1E5D0}",
+                TextStyle {
+                    size: 16.0,
+                    weight,
+                    tracking: 0.0,
+                },
+            )
+        };
+        for (weight, bold) in [
+            (Weight::REGULAR, false),
+            (Weight::MEDIUM, false),
+            (Weight(599), false),
+            (Weight::SEMIBOLD, true),
+            (Weight::EXTRABOLD, true),
+        ] {
+            let line = shaped(weight);
+            let face = FaceId::Unifont { plane: 1, bold };
+            assert!(line.glyphs.iter().all(|g| g.face == face), "{weight:?}");
+            let advance = if bold { 19.0 } else { 18.0 };
+            assert_eq!(line.glyphs[1].x, advance, "{weight:?}");
+            assert_eq!(line.width, 2.0 * advance, "{weight:?}");
+        }
+        // Its own atlas entry: the ring's six columns and the same one to the right.
+        let mut atlas = GlyphAtlas::new(256);
+        let ring = |bold| (FaceId::Unifont { plane: 0, bold }, u16::from(b'A'));
+        assert!(atlas.add_many(&fonts, &[ring(false), ring(true)]));
+        let (thin, thick) = (
+            atlas.get(ring(false)).unwrap(),
+            atlas.get(ring(true)).unwrap(),
+        );
+        let width = |s: GlyphSlot| s.plane[2] - s.plane[0];
+        assert!((width(thick) - width(thin) - 1.0 / 16.0).abs() < 1e-3);
+        assert_eq!(
+            (thick.plane[0], thick.plane[1]),
+            (thin.plane[0], thin.plane[1])
+        );
+        let texel = |s: GlyphSlot, x: f32, y: f32| {
+            let [u0, v0, ..] = s.uv.map(|v| v * 256.0);
+            let i = (((v0 + y) as usize) * 256 + (u0 + x) as usize) * 4;
+            let mut c = [atlas.pixels[i], atlas.pixels[i + 1], atlas.pixels[i + 2]];
+            c.sort();
+            c[1]
+        };
+        // 3 texels a pixel, 4 of padding: the ring's second column (the hole's first in
+        // regular) is ink in bold, its third is the hole in both; its right side has two
+        // columns of ink.
+        let row = 4.0 + 3.0 * 5.5;
+        let column = |i: f32| 4.0 + 3.0 * i + 1.5;
+        assert!(texel(thin, column(1.0), row) < 100);
+        assert!(texel(thick, column(1.0), row) > 160);
+        assert!(texel(thin, column(2.0), row) < 100 && texel(thick, column(2.0), row) < 100);
+        assert!(texel(thick, column(5.0), row) > 160 && texel(thick, column(6.0), row) > 160);
+        assert!(texel(thin, column(5.0), row) > 160);
     }
 
     #[test]
@@ -1258,8 +1479,12 @@ E000:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
             },
         );
         let mut atlas = GlyphAtlas::new(256);
-        let ring = (FaceId::Unifont(0), u16::from(b'A'));
-        assert!(atlas.add_many(&fonts, &[ring, (FaceId::Unifont(0), 0x20)]));
+        let regular = FaceId::Unifont {
+            plane: 0,
+            bold: false,
+        };
+        let ring = (regular, u16::from(b'A'));
+        assert!(atlas.add_many(&fonts, &[ring, (regular, 0x20)]));
         let slot = atlas.get(ring).expect("the ring has a field");
         // Columns 1 to 6 from the pen (the picture starts at its ink), rows 2 to 11 of
         // 16 with 14 above the baseline: 3 texels a row, 4 of padding around.
@@ -1290,7 +1515,7 @@ E000:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
         assert!(texel(4.5, 4.5) > 128, "{}", texel(4.5, 4.5));
         assert!(texel(3.5, 3.5) < 128, "{}", texel(3.5, 3.5));
         // A character without ink (not in this font) has nothing to draw.
-        assert_eq!(atlas.known((FaceId::Unifont(0), 0x20)), Known::Blank);
+        assert_eq!(atlas.known((regular, 0x20)), Known::Blank);
     }
 
     /// With the system's fonts (where there are any), small capitals are drawn from one.

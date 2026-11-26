@@ -240,6 +240,10 @@ impl super::Coverage for Chain {
             _ => self.unifont_has(c),
         }
     }
+
+    fn last_resort(&self) -> Option<u16> {
+        self.unifont.is_some().then(|| self.system_families())
+    }
 }
 
 impl Chain {
