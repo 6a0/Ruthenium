@@ -7,7 +7,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use ruthenium_assets::{Id, Limits};
-use ruthenium_audio::decode::{Decoder, decode, decode_limited};
+use ruthenium_audio::decode::{DecodeError, Decoder, decode, decode_limited};
 use ruthenium_audio::events::{Choice, SoundEvents, SoundsJson};
 use ruthenium_javamath::random::JavaRandom;
 
@@ -185,8 +185,27 @@ fn a_sound_decoded_whole_is_no_longer_than_the_limit() {
         sound_samples: 1000,
         ..Limits::untrusted()
     };
-    assert!(decode_limited(ogg.clone(), &limits, usize::MAX).is_err());
-    assert!(decode_limited(ogg.clone(), &Limits::untrusted(), 1000).is_err());
+    // Longer than a sound may be: the file's own, however much room there is.
+    assert!(matches!(
+        decode_limited(ogg.clone(), &limits, usize::MAX),
+        Err(DecodeError::Broken(_))
+    ));
+    assert!(matches!(
+        decode_limited(ogg.clone(), &limits, 10),
+        Err(DecodeError::Broken(_))
+    ));
+    // It would fit, but not in the room left: for now.
+    assert_eq!(
+        decode_limited(ogg.clone(), &Limits::untrusted(), 1000),
+        Err(DecodeError::HeldBack)
+    );
+    // Broken in its data with little room: still broken.
+    let mut broken = ogg.clone();
+    let (start, len, _) = pages(&broken)[2];
+    broken[start + len - 40..start + len].fill(0xFF);
+    broken.truncate(start + len);
+    let little = decode_limited(broken, &Limits::untrusted(), 1000);
+    assert!(little != Err(DecodeError::HeldBack), "{little:?}");
     assert_eq!(
         decode_limited(ogg, &Limits::untrusted(), usize::MAX).unwrap(),
         whole

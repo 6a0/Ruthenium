@@ -49,6 +49,8 @@ pub struct Decoder {
     track: u32,
     pub channels: u8,
     pub rate: u32,
+    /// The frames the file says it has (its last page's granule position), if it says.
+    pub frames: Option<u64>,
     floats: Vec<f32>,
 }
 
@@ -107,12 +109,14 @@ impl Decoder {
         // Checked before the decoder reads the headers: they are the pack's numbers.
         let decoder =
             VorbisDecoder::try_new(params, &AudioDecoderOptions::default()).map_err(err)?;
+        let frames = track.num_frames;
         Ok(Decoder {
             track: track.id,
             reader,
             decoder,
             channels,
             rate,
+            frames,
             floats: Vec::new(),
         })
     }
@@ -153,21 +157,56 @@ fn err(e: Error) -> String {
 
 /// A whole file (`SoundBufferLibrary.getCompleteBuffer`).
 pub fn decode(bytes: Vec<u8>) -> Result<Pcm, String> {
-    decode_limited(bytes, &Limits::trusted(), usize::MAX)
+    decode_limited(bytes, &Limits::trusted(), usize::MAX).map_err(|e| e.to_string())
 }
 
-/// [`decode`] for a file of a pack read under `limits`, of at most `max_samples` samples
-/// and [`Limits::sound_samples`]: a longer one is refused (vanilla would decode it all;
-/// one not streamed is held whole while it plays).
-pub fn decode_limited(bytes: Vec<u8>, limits: &Limits, max_samples: usize) -> Result<Pcm, String> {
-    let max = max_samples.min(limits.sound_samples);
-    let mut d = Decoder::with_limits(bytes, limits)?;
+/// Why a whole sound was not decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeError {
+    /// It would fit a sound's limit, but not the room the sounds alive now leave: a later
+    /// play may have it.
+    HeldBack,
+    /// The file itself: broken, or longer than a sound may be. It never will decode.
+    Broken(String),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::HeldBack => f.write_str("too much sound is decoded at once"),
+            DecodeError::Broken(e) => f.write_str(e),
+        }
+    }
+}
+
+/// [`decode`] for a file of a pack read under `limits`, of at most
+/// [`Limits::sound_samples`] (a longer one is refused: vanilla would decode it all; one
+/// not streamed is held whole while it plays) and at most `room`, what the sounds alive
+/// now leave. Only a sound refused for the room alone is [`DecodeError::HeldBack`]; a
+/// file that says it is longer than a sound may be is refused before it is decoded.
+pub fn decode_limited(bytes: Vec<u8>, limits: &Limits, room: usize) -> Result<Pcm, DecodeError> {
+    let broken = DecodeError::Broken;
+    let too_long = || {
+        broken(format!(
+            "longer than a sound decoded whole may be ({} samples)",
+            limits.sound_samples
+        ))
+    };
+    let mut d = Decoder::with_limits(bytes, limits).map_err(broken)?;
+    let declared = d.frames.map(|f| f.saturating_mul(u64::from(d.channels)));
+    if declared.is_some_and(|n| n > limits.sound_samples as u64) {
+        return Err(too_long());
+    }
+    if declared.is_some_and(|n| n > room as u64) {
+        return Err(DecodeError::HeldBack);
+    }
     let mut samples = Vec::new();
-    while d.next_into(&mut samples)? {
-        if samples.len() > max {
-            return Err(format!(
-                "longer than a sound decoded whole may be ({max} samples)"
-            ));
+    while d.next_into(&mut samples).map_err(broken)? {
+        if samples.len() > limits.sound_samples {
+            return Err(too_long());
+        }
+        if samples.len() > room {
+            return Err(DecodeError::HeldBack);
         }
     }
     Ok(Pcm {
