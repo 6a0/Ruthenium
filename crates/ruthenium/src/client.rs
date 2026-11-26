@@ -743,6 +743,7 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
             f.import_mouse(crate::controls::vanilla_mouse);
             f.import_keys(crate::controls::vanilla_keys);
             f.import_sound(crate::sound::vanilla_volumes);
+            f.import_chat_drafts(crate::controls::vanilla_chat_drafts);
             f
         }
         _ => SettingsFile::transient(),

@@ -41,6 +41,12 @@ fn java_whitespace(c: char) -> bool {
         | '\u{3000}')
 }
 
+/// `StringUtils.isBlank` (the chat screen's test for a draft worth keeping): nothing but
+/// Java's whitespace, or nothing at all.
+pub fn is_blank(text: &str) -> bool {
+    text.chars().all(java_whitespace)
+}
+
 /// `ChatScreen.normalizeChatMessage`: trimmed (`String.trim`), every run of whitespace
 /// one space and non-breaking spaces plain ones (`StringUtils.normalizeSpace`), then
 /// cut to [`MAX_MESSAGE`] UTF-16 units (half a surrogate pair cut off becomes `?`, as
@@ -397,6 +403,25 @@ pub(crate) mod tests {
         let mut r = Reader::new(p);
         r.varint().unwrap();
         r.rest().to_vec()
+    }
+
+    #[test]
+    fn blank_is_javas_whitespace_alone() {
+        // The characters `StringUtils.isBlank` finds blank on their own, from vanilla's
+        // classes (every UTF-16 unit tried).
+        const BLANK: [u32; 25] = [
+            0x9, 0xA, 0xB, 0xC, 0xD, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x1680, 0x2000, 0x2001, 0x2002,
+            0x2003, 0x2004, 0x2005, 0x2006, 0x2008, 0x2009, 0x200A, 0x2028, 0x2029, 0x205F, 0x3000,
+        ];
+        let found: Vec<u32> = (0..=0xFFFF)
+            .filter_map(char::from_u32)
+            .filter(|c| is_blank(&c.to_string()))
+            .map(u32::from)
+            .collect();
+        assert_eq!(found, BLANK);
+        assert!(is_blank("") && is_blank(" \u{3000}\t"));
+        // Non-breaking spaces and a character past the first plane are not.
+        assert!(!is_blank("\u{A0}") && !is_blank(" \u{1F600}") && !is_blank(" a "));
     }
 
     #[test]

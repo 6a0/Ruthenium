@@ -42,6 +42,8 @@ const CHAT_FOCUSED_LINES: i32 = 20;
 const CHAT_INPUT_GROUND: u32 = 0x8000_0000;
 const CHAT_INPUT_TEXT: u32 = 0xFFE0_E0E0;
 const CHAT_INPUT_SELECTION: u32 = 0x8000_00FF;
+/// A draft's text (`ChatFormatting.GRAY`), slanted.
+const CHAT_DRAFT: u32 = 0xAA_AAAA;
 const CHAT_INPUT_MAX: usize = 256;
 /// The room a changed message's icon takes.
 const CHAT_ICON: i32 = 9 + 4 + 2;
@@ -940,13 +942,7 @@ impl HudLayout {
                 shown
             };
             if !half.is_empty() {
-                self.text(
-                    format_args!("{half}"),
-                    draw_x,
-                    text_y,
-                    CHAT_INPUT_TEXT,
-                    true,
-                );
+                self.edit_text(half, input.draft, draw_x, text_y, font);
             }
             draw_x += text_width(font, half) + 1;
         }
@@ -964,13 +960,7 @@ impl HudLayout {
         }
         if !shown.is_empty() && on_screen && input.caret < shown_end {
             let rest = &value[input.caret..shown_end];
-            self.text(
-                format_args!("{rest}"),
-                draw_x,
-                text_y,
-                CHAT_INPUT_TEXT,
-                true,
-            );
+            self.edit_text(rest, input.draft, draw_x, text_y, font);
         }
         let anchor = input.anchor.clamp(display, shown_end);
         if anchor != input.caret {
@@ -986,6 +976,7 @@ impl HudLayout {
             );
         }
         if input.caret_on && on_screen {
+            // (The caret is not a draft's: it keeps the box's colour, upright.)
             if insert {
                 self.over.fill(
                     cursor_x,
@@ -997,6 +988,22 @@ impl HudLayout {
             } else {
                 self.text(format_args!("_"), cursor_x, text_y, CHAT_INPUT_TEXT, true);
             }
+        }
+    }
+
+    /// Part of the edit box's text: a draft's grey and slanted (`formatChat`'s style over
+    /// the box's colour), else as it is.
+    fn edit_text(&mut self, s: &str, draft: bool, x: i32, y: i32, font: &Font) {
+        if draft {
+            let style = Style {
+                color: Some(CHAT_DRAFT),
+                italic: true,
+                ..Style::default()
+            };
+            let line = TextLine::new(s.chars().map(|c| (c, style)).collect(), font);
+            self.plain(&Arc::new(line), x, y, CHAT_INPUT_TEXT, true);
+        } else {
+            self.text(format_args!("{s}"), x, y, CHAT_INPUT_TEXT, true);
         }
     }
 }
@@ -1370,6 +1377,60 @@ mod tests {
             .rfind(|t| t.0.starts_with('m'))
             .unwrap();
         assert_eq!(last.0, "m24");
+    }
+
+    #[test]
+    fn a_draft_shows_grey_and_slanted_but_its_caret_does_not() {
+        let hud = HudRecord::default();
+        let input = ChatInput {
+            text: "hello".into(),
+            caret: 2,
+            anchor: 2,
+            caret_on: true,
+            draft: true,
+            ..ChatInput::default()
+        };
+        let l = lay_typing(&hud, &input, &mut HudMemory::default());
+        // In the same places as plain text, each half grey and slanted over the box's
+        // colour (the style's colour wins, with the box's alpha).
+        let texts = l.layout.texts();
+        assert_eq!(
+            l.texts(),
+            [
+                ("he".into(), [4, 228], 1, CHAT_INPUT_TEXT),
+                ("llo".into(), [16, 228], 1, CHAT_INPUT_TEXT)
+            ]
+        );
+        for t in texts {
+            let line = t.line.as_ref().unwrap();
+            assert!(t.shadow);
+            assert!(
+                line.chars
+                    .iter()
+                    .all(|(_, s)| s.italic && s.color == Some(0xAA_AAAA) && !s.bold)
+            );
+        }
+        // The bar between stays the box's colour.
+        assert!(
+            l.over()
+                .contains(&(String::new(), [16, 227, 1, 10], CHAT_INPUT_TEXT))
+        );
+        // At the end, the `_` is upright and plain.
+        let input = ChatInput {
+            caret: 5,
+            anchor: 5,
+            ..input
+        };
+        let l = lay_typing(&hud, &input, &mut HudMemory::default());
+        let caret = &l.layout.texts()[1];
+        assert_eq!((caret.text.as_str(), caret.line.is_none()), ("_", true));
+        // Not a draft: plain text, as before.
+        let input = ChatInput {
+            draft: false,
+            ..input
+        };
+        let l = lay_typing(&hud, &input, &mut HudMemory::default());
+        assert!(l.layout.texts().iter().all(|t| t.line.is_none()));
     }
 
     #[test]

@@ -165,6 +165,10 @@ pub struct Settings {
     pub toggle_sprint: bool,
     /// The volume sliders. Imported from vanilla's `options.txt` when the file has none.
     pub sound: SoundSettings,
+    /// Escape keeps what is typed in the chat as a draft (vanilla's Save Unsent Chats,
+    /// `saveChatDrafts`). Imported from vanilla's `options.txt` when the file doesn't set
+    /// it.
+    pub save_chat_drafts: bool,
 }
 
 /// Vanilla's volume sliders (`soundCategory_*`): any value from 0 to 1, kept exactly.
@@ -250,6 +254,7 @@ impl Default for Settings {
             toggle_sneak: false,
             toggle_sprint: false,
             sound: SoundSettings::default(),
+            save_chat_drafts: false,
         }
     }
 }
@@ -287,6 +292,7 @@ pub enum Row {
     ResetKeys,
     /// A category's volume.
     Volume(SoundSource),
+    SaveChatDrafts,
 }
 
 /// The Controls page: the mouse, Sneak and Sprint (hold or toggle), Reset Keys, then
@@ -408,7 +414,7 @@ pub const GAME: [Group; 9] = [
             Row::Volume(SoundSource::Ui),
         ],
     ),
-    ("Chat", &[]),
+    ("Chat", &[Row::SaveChatDrafts]),
     ("Skin", &[]),
     ("Language", &[]),
 ];
@@ -444,6 +450,7 @@ impl Settings {
             section("controls"),
             section("game"),
         );
+        let chat = section("chat");
         fn get<'a>(t: Option<&'a toml::Table>, key: &str) -> Option<&'a toml::Value> {
             t.and_then(|t| t.get(key))
         }
@@ -543,6 +550,7 @@ impl Settings {
             last_server,
             mouse,
             sound,
+            save_chat_drafts: flag(chat, "save_drafts", d.save_chat_drafts),
         })
     }
 
@@ -558,6 +566,15 @@ impl Settings {
             t.get("controls")
                 .and_then(toml::Value::as_table)
                 .is_some_and(|c| c.contains_key("mouse_sensitivity"))
+        })
+    }
+
+    /// Whether `text` sets Save Unsent Chats (else it's imported from vanilla).
+    pub fn has_chat_drafts(text: &str) -> bool {
+        text.parse::<toml::Table>().is_ok_and(|t| {
+            t.get("chat")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|c| c.contains_key("save_drafts"))
         })
     }
 
@@ -752,6 +769,12 @@ impl Settings {
                 "How far speed and fluids change the view",
                 Slider(percents(100)),
             ),
+            // (Vanilla's words and tooltip.)
+            Row::SaveChatDrafts => (
+                "Save Unsent Chats",
+                "Unsent messages will be saved and can be sent the next time chat is opened.",
+                Switch,
+            ),
             // Above.
             Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys => ("", "", Switch),
             Row::Volume(s) => {
@@ -818,6 +841,7 @@ impl Settings {
             Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys => 0,
             // (Vanilla's own may lie between two steps: the nearest shows.)
             Row::Volume(s) => (self.sound.volumes[s.index()] * 100.0).round() as usize,
+            Row::SaveChatDrafts => self.save_chat_drafts.into(),
         }
     }
 
@@ -871,6 +895,7 @@ impl Settings {
             }
             Row::Key(_) | Row::KeyHeading(_) | Row::ResetKeys => {}
             Row::Volume(s) => self.sound.volumes[s.index()] = f64::from(percent) / 100.0,
+            Row::SaveChatDrafts => self.save_chat_drafts = value != 0,
         }
     }
 
@@ -928,6 +953,10 @@ impl Settings {
              # {} to {} blocks.\n\
              weather_radius = {}\n\
              \n\
+             [chat]\n\
+             # Escape keeps what is typed as a draft, as vanilla's Save Unsent Chats.\n\
+             save_drafts = {}\n\
+             \n\
              [keys]\n\
              # Each of vanilla's key bindings by its name, and its key as options.txt names\n\
              # them (\"key.keyboard.w\", \"key.mouse.left\", \"key.mouse.4\", \"key.keyboard.unknown\"\n\
@@ -958,6 +987,7 @@ impl Settings {
             weather::MIN_RADIUS,
             weather::MAX_RADIUS,
             self.game.weather_radius,
+            self.save_chat_drafts,
             self.keys_toml(),
         ) + &self.sound.toml_section()
     }
@@ -1012,6 +1042,8 @@ pub struct SettingsFile {
     has_keys: bool,
     /// Whether the file had the volumes.
     has_sound: bool,
+    /// Whether the file set Save Unsent Chats.
+    has_chat_drafts: bool,
 }
 
 impl SettingsFile {
@@ -1029,6 +1061,7 @@ impl SettingsFile {
             has_mouse: true,
             has_keys: true,
             has_sound: true,
+            has_chat_drafts: true,
         }
     }
 
@@ -1055,6 +1088,7 @@ impl SettingsFile {
         let has_mouse = text.as_ref().is_ok_and(|t| Settings::has_mouse(t));
         let has_keys = text.as_ref().is_ok_and(|t| Settings::has_keys(t));
         let has_sound = text.as_ref().is_ok_and(|t| Settings::has_sound(t));
+        let has_chat_drafts = text.as_ref().is_ok_and(|t| Settings::has_chat_drafts(t));
         SettingsFile {
             saved: settings.clone(),
             settings,
@@ -1062,6 +1096,7 @@ impl SettingsFile {
             has_mouse,
             has_keys,
             has_sound,
+            has_chat_drafts,
         }
     }
 
@@ -1139,6 +1174,25 @@ impl SettingsFile {
         }
         // Written even when it's the default, so the import happens once.
         self.saved.sound.volumes[0] = f64::NAN;
+    }
+
+    /// Takes Save Unsent Chats from `import` (vanilla's) if the file didn't set it; it
+    /// is saved with the next change, or on quitting.
+    pub fn import_chat_drafts(&mut self, import: impl FnOnce() -> Option<(bool, PathBuf)>) {
+        if self.has_chat_drafts {
+            return;
+        }
+        self.has_chat_drafts = true;
+        if let Some((on, from)) = import() {
+            eprintln!(
+                "[ruthenium] Save Unsent Chats {} from {}",
+                if on { "on" } else { "off" },
+                from.display()
+            );
+            self.settings.save_chat_drafts = on;
+        }
+        // Written even when it's the default, so the import happens once.
+        self.saved.save_chat_drafts = !self.settings.save_chat_drafts;
     }
 
     /// Writes the settings if they changed since they were read or last saved.
@@ -1238,8 +1292,12 @@ mod tests {
                     0.6,
                 ],
             },
+            save_chat_drafts: true,
         };
         assert_eq!(Settings::parse(&s.to_toml()), Ok(s.clone()));
+        assert!(Settings::has_chat_drafts(&s.to_toml()));
+        assert!(!Settings::has_chat_drafts("[chat]\n"));
+        assert!(!Settings::has_chat_drafts("save_drafts = true\n"));
         assert!(Settings::has_mouse(&s.to_toml()));
         assert!(!Settings::has_mouse(
             "[display]
@@ -1561,6 +1619,52 @@ vsync = true
         assert!(std::fs::read_to_string(&path).unwrap().contains("[keys]"));
         let _ = std::fs::remove_dir_all(&dir);
         drop(f);
+    }
+
+    #[test]
+    fn save_unsent_chats_is_imported_once_and_is_the_chat_pages() {
+        let chat = GAME.iter().find(|g| g.0 == "Chat").unwrap();
+        assert_eq!(chat.1, [Row::SaveChatDrafts]);
+        let spec = Settings::default().spec(Row::SaveChatDrafts);
+        assert_eq!(
+            (spec.label.as_str(), spec.control, spec.value),
+            ("Save Unsent Chats", ControlSpec::Switch, 0)
+        );
+        assert!(
+            !Settings::parse("[chat]\nsave_drafts = 1\n")
+                .unwrap()
+                .save_chat_drafts
+        );
+        let dir = std::env::temp_dir().join(format!("ruthenium-drafts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = SettingsFile::path_in(&dir);
+        // Vanilla's on: taken, and written at once.
+        let mut f = SettingsFile::load(path.clone());
+        f.import_chat_drafts(|| Some((true, PathBuf::from("options.txt"))));
+        assert!(f.settings.save_chat_drafts);
+        f.save();
+        let mut again = SettingsFile::load(path.clone());
+        assert!(again.settings.save_chat_drafts);
+        again.import_chat_drafts(|| panic!("imported twice"));
+        // Vanilla's off (the default) is written too, so it is asked once.
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut f = SettingsFile::load(path.clone());
+        f.import_chat_drafts(|| Some((false, PathBuf::from("options.txt"))));
+        f.save();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("save_drafts = false")
+        );
+        // No options.txt: the default, written.
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut f = SettingsFile::load(path.clone());
+        f.import_chat_drafts(|| None);
+        f.save();
+        assert!(Settings::has_chat_drafts(
+            &std::fs::read_to_string(&path).unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -108,6 +108,12 @@ impl InGame {
         &self.binds
     }
 
+    /// Whether `key` is held in the world.
+    #[cfg(test)]
+    pub fn holds(&self, key: Key) -> bool {
+        self.held.is_down(key)
+    }
+
     /// The screen closed and the mouse is grabbed again (`grabMouse`): the bindings on
     /// keyboard keys held now (`physical`) are held from now on (`KeyMapping.setAll`,
     /// not on macOS; buttons are not read again).

@@ -9,8 +9,17 @@
 //! The messages sent are kept for the session's run (`recentChat`, the last 100);
 //! commands are kept in `command_history.txt` too (the last 50), and come back from it.
 //!
+//! Drafts ([`Drafts`], `ChatComponent.latestDraft`): what is typed is kept when the screen
+//! is closed by something else (another screen, the death screen, the level loading,
+//! leaving the server), and on Escape only with Save Unsent Chats on; Enter, or nothing
+//! but whitespace typed, drops it. The Chat key brings any draft back, the Command key
+//! only a command's; it shows grey and slanted until it is edited, and Backspace then
+//! clears it all. It is kept in memory for the client's run, from server to server, as
+//! vanilla's chat keeps it. A chat screen open when a level starts loading (a respawn into
+//! another dimension) comes back as it was once the level has loaded.
+//!
 //! Not yet: tab completion and the command's suggestions, clicking in the edit box or on
-//! the chat's links and hovering its text, drafts, and the chat restrictions.
+//! the chat's links and hovering its text, and the chat restrictions.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -108,6 +117,112 @@ impl ChatHistory {
     }
 }
 
+/// Which key opened the chat screen (`ChatComponent.ChatMethod`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatMethod {
+    /// The Chat key: empty, or any draft.
+    Message,
+    /// The Command key: a slash, or a command's draft.
+    Command,
+}
+
+impl ChatMethod {
+    fn prefix(self) -> &'static str {
+        match self {
+            ChatMethod::Message => "",
+            ChatMethod::Command => "/",
+        }
+    }
+
+    /// `isDraftRestorable`.
+    fn restores(self, draft: &Draft) -> bool {
+        self == ChatMethod::Message || draft.method == self
+    }
+}
+
+/// What was typed when the chat screen last closed (`ChatComponent.Draft`): a command's
+/// if it starts with a slash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub text: String,
+    pub method: ChatMethod,
+}
+
+/// Why the chat screen closed (`ChatScreen.ExitReason`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// Escape.
+    Intentional,
+    /// Something else took its place.
+    Interrupted,
+    /// Enter: it was sent.
+    Done,
+}
+
+/// The draft, and a chat screen put away while a level loads (`ChatComponent`'s
+/// `latestDraft` and `preservedScreen`).
+#[derive(Debug, Default)]
+pub struct Drafts {
+    latest: Option<Draft>,
+    preserved: Option<Box<ChatScreen>>,
+}
+
+impl Drafts {
+    /// `createScreen`: the draft if `method` brings it back, shown as one; else empty
+    /// or a slash.
+    pub fn open(&self, method: ChatMethod, history: &ChatHistory) -> ChatScreen {
+        match &self.latest {
+            Some(d) if method.restores(d) => ChatScreen::with(&d.text, true, history),
+            _ => ChatScreen::new(method.prefix(), history),
+        }
+    }
+
+    /// `ChatScreen.removed`: the chat scrolls back down, and the draft goes if the screen
+    /// was closed on purpose (Enter, or Escape without `save_drafts`) or nothing but
+    /// whitespace is typed; else what is typed becomes the draft, unless it is the draft
+    /// still as it was brought back.
+    pub fn removed(&mut self, screen: &mut ChatScreen, reason: ExitReason, save_drafts: bool) {
+        screen.reset_scroll();
+        let text = screen.field.value();
+        let discard = match reason {
+            ExitReason::Interrupted => false,
+            ExitReason::Intentional => !save_drafts,
+            ExitReason::Done => true,
+        };
+        if discard || ruthenium_sim::chat::is_blank(text) {
+            self.latest = None;
+        } else if !screen.draft {
+            let method = if text.starts_with('/') {
+                ChatMethod::Command
+            } else {
+                ChatMethod::Message
+            };
+            self.latest = Some(Draft {
+                text: text.to_owned(),
+                method,
+            });
+        }
+    }
+
+    /// `preserveCurrentChatScreen`: `screen` (already removed) comes back after the
+    /// level's loading.
+    pub fn preserve(&mut self, screen: Box<ChatScreen>) {
+        self.preserved = Some(screen);
+    }
+
+    /// `restoreChatScreen`: the screen put away, if there is one, opened again (`init`).
+    pub fn restore(&mut self, history: &ChatHistory) -> Option<Box<ChatScreen>> {
+        let mut screen = self.preserved.take()?;
+        screen.init(history);
+        Some(screen)
+    }
+
+    #[cfg(test)]
+    pub fn latest(&self) -> Option<&Draft> {
+        self.latest.as_ref()
+    }
+}
+
 /// What a key did on the chat screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatOutcome {
@@ -134,10 +249,16 @@ pub struct ChatScreen {
     new_since_scroll: bool,
     /// The chat's lines when it was last drawn.
     lines: usize,
+    /// It shows the draft brought back, not yet edited (`isDraft`).
+    draft: bool,
 }
 
 impl ChatScreen {
     pub fn new(initial: &str, history: &ChatHistory) -> ChatScreen {
+        ChatScreen::with(initial, false, history)
+    }
+
+    fn with(initial: &str, draft: bool, history: &ChatHistory) -> ChatScreen {
         ChatScreen {
             field: TextField::new(initial, MAX_LENGTH),
             history_pos: history.len(),
@@ -147,7 +268,22 @@ impl ChatScreen {
             newest: None,
             new_since_scroll: false,
             lines: 0,
+            draft,
         }
+    }
+
+    /// `init` again, when it comes back: at the end of the history, the caret at the
+    /// end of the text.
+    fn init(&mut self, history: &ChatHistory) {
+        self.history_pos = history.len();
+        self.field = TextField::new(self.field.value(), MAX_LENGTH);
+        self.focused = Instant::now();
+    }
+
+    /// `resetChatScroll`.
+    fn reset_scroll(&mut self) {
+        self.scroll = 0;
+        self.new_since_scroll = false;
     }
 
     #[cfg(test)]
@@ -155,8 +291,23 @@ impl ChatScreen {
         self.field.value()
     }
 
+    #[cfg(test)]
+    pub fn is_draft(&self) -> bool {
+        self.draft
+    }
+
+    /// Whether inserting into the edit box now tells its responder (`insertText`: when
+    /// there is room, even for nothing), which ends a draft (`onEdited`).
+    fn insert_edits(&self) -> bool {
+        let selected = self.field.selected_text().encode_utf16().count();
+        self.field.value().encode_utf16().count() - selected < MAX_LENGTH
+    }
+
     /// Typed text (`charTyped`): what the chat allows of it.
     pub fn type_text(&mut self, text: &str) {
+        if self.insert_edits() && text.chars().any(ruthenium_sim::chat::allowed_character) {
+            self.draft = false;
+        }
         self.field.insert(text);
     }
 
@@ -169,34 +320,79 @@ impl ChatScreen {
         history: &ChatHistory,
         clipboard: &dyn Clipboard,
     ) -> ChatOutcome {
+        // Backspace on a draft as it was brought back clears it all.
+        if self.draft && scancode == SCANCODE_BACKSPACE {
+            self.field = TextField::new("", MAX_LENGTH);
+            self.draft = false;
+            self.focused = Instant::now();
+            return ChatOutcome::Stay;
+        }
+        let before = self.field.value().len();
+        let inserts = self.insert_edits();
         let f = &mut self.field;
-        match scancode {
+        let edited = match scancode {
             SCANCODE_ESCAPE => return ChatOutcome::Close,
-            SCANCODE_BACKSPACE => f.backspace(shortcut),
-            SCANCODE_DELETE => f.delete(shortcut),
-            SCANCODE_HOME => f.home(shift),
-            SCANCODE_END => f.end(shift),
-            SCANCODE_RIGHT => f.step(true, shortcut, shift),
-            SCANCODE_LEFT => f.step(false, shortcut, shift),
-            SCANCODE_A if shortcut => f.select_all(),
-            SCANCODE_C if shortcut => clipboard.set(f.selected_text()),
+            // (Deleting tells the responder only when something went.)
+            SCANCODE_BACKSPACE => {
+                f.backspace(shortcut);
+                f.value().len() != before
+            }
+            SCANCODE_DELETE => {
+                f.delete(shortcut);
+                f.value().len() != before
+            }
+            SCANCODE_HOME => {
+                f.home(shift);
+                false
+            }
+            SCANCODE_END => {
+                f.end(shift);
+                false
+            }
+            SCANCODE_RIGHT => {
+                f.step(true, shortcut, shift);
+                false
+            }
+            SCANCODE_LEFT => {
+                f.step(false, shortcut, shift);
+                false
+            }
+            SCANCODE_A if shortcut => {
+                f.select_all();
+                false
+            }
+            SCANCODE_C if shortcut => {
+                clipboard.set(f.selected_text());
+                false
+            }
             SCANCODE_X if shortcut => {
                 clipboard.set(f.selected_text());
                 f.insert("");
+                inserts
             }
             SCANCODE_V if shortcut => {
                 if let Some(text) = clipboard.get() {
                     f.insert(&text);
                 }
+                inserts
             }
             SCANCODE_RETURN | SCANCODE_KP_ENTER => {
                 return ChatOutcome::Send(self.field.value().to_owned());
             }
-            SCANCODE_PAGE_UP => self.scroll_chat(LINES_PER_PAGE - 1),
-            SCANCODE_PAGE_DOWN => self.scroll_chat(-LINES_PER_PAGE + 1),
+            SCANCODE_PAGE_UP => {
+                self.scroll_chat(LINES_PER_PAGE - 1);
+                false
+            }
+            SCANCODE_PAGE_DOWN => {
+                self.scroll_chat(-LINES_PER_PAGE + 1);
+                false
+            }
             SCANCODE_UP => self.move_in_history(-1, history),
             SCANCODE_DOWN => self.move_in_history(1, history),
             _ => return ChatOutcome::Stay,
+        };
+        if edited {
+            self.draft = false;
         }
         // (Anything that edits or moves the caret shows it at once.)
         if !matches!(scancode, SCANCODE_PAGE_UP | SCANCODE_PAGE_DOWN) {
@@ -206,12 +402,12 @@ impl ChatScreen {
     }
 
     /// `moveInHistory`: back (-1) or on (1) through the messages sent; past the last,
-    /// the text that was being typed.
-    fn move_in_history(&mut self, dir: i32, history: &ChatHistory) {
+    /// the text that was being typed. Whether it moved (and so set the text).
+    fn move_in_history(&mut self, dir: i32, history: &ChatHistory) -> bool {
         let max = history.len();
         let pos = (self.history_pos as i64 + i64::from(dir)).clamp(0, max as i64) as usize;
         if pos == self.history_pos {
-            return;
+            return false;
         }
         if pos == max {
             self.history_pos = max;
@@ -223,6 +419,7 @@ impl ChatScreen {
             self.field = TextField::new(history.get(pos).unwrap_or(""), MAX_LENGTH);
             self.history_pos = pos;
         }
+        true
     }
 
     /// `ChatComponent.scrollChat`, in range of the lines last drawn.
@@ -281,6 +478,7 @@ impl ChatScreen {
             scroll: self.scroll,
             newest: self.newest.clone(),
             new_since_scroll: self.new_since_scroll,
+            draft: self.draft,
         }
     }
 }
@@ -353,6 +551,238 @@ mod tests {
             key(&mut s, SCANCODE_KP_ENTER, false, false),
             ChatOutcome::Send("hi".into())
         );
+    }
+
+    /// A screen opened by `method`, typed into, then closed for `reason`.
+    fn close(d: &mut Drafts, method: ChatMethod, typed: &str, reason: ExitReason, save: bool) {
+        let h = ChatHistory::default();
+        let mut s = d.open(method, &h);
+        s.type_text(typed);
+        d.removed(&mut s, reason, save);
+    }
+
+    fn draft(text: &str, method: ChatMethod) -> Option<Draft> {
+        Some(Draft {
+            text: text.into(),
+            method,
+        })
+    }
+
+    #[test]
+    fn a_draft_is_kept_unless_closed_on_purpose_or_blank() {
+        use ChatMethod::{Command, Message};
+        use ExitReason::{Done, Intentional, Interrupted};
+        let mut d = Drafts::default();
+        // Interrupted: kept, whatever the option.
+        close(&mut d, Message, "hello", Interrupted, false);
+        assert_eq!(d.latest().cloned(), draft("hello", Message));
+        // Escape: kept only with the option on.
+        close(&mut d, Message, " again", Intentional, true);
+        assert_eq!(d.latest().cloned(), draft("hello again", Message));
+        close(&mut d, Message, "!", Intentional, false);
+        assert_eq!(d.latest(), None);
+        // Sent: dropped, whatever the option.
+        close(&mut d, Message, "x", Interrupted, false);
+        close(&mut d, Message, "y", Done, true);
+        assert_eq!(d.latest(), None);
+        // Nothing but Java's whitespace: dropped, even when interrupted.
+        let h = ChatHistory::default();
+        close(&mut d, Message, "x", Interrupted, false);
+        d.removed(&mut ChatScreen::new("", &h), Interrupted, false);
+        assert_eq!(d.latest(), None);
+        let mut s = ChatScreen::new("", &h);
+        s.type_text("  \u{3000}");
+        d.removed(&mut s, Interrupted, true);
+        assert_eq!(d.latest(), None);
+        // A non-breaking space is not whitespace to Java.
+        let mut s = ChatScreen::new("\u{A0}", &h);
+        d.removed(&mut s, Interrupted, true);
+        assert_eq!(d.latest().cloned(), draft("\u{A0}", Message));
+        // A slash first makes it a command's, whichever key opened it.
+        close(&mut d, Command, "say hi", Interrupted, false);
+        assert_eq!(d.latest().cloned(), draft("/say hi", Command));
+        d.latest = None;
+        close(&mut d, Message, "/me waves", Interrupted, false);
+        assert_eq!(d.latest().cloned(), draft("/me waves", Command));
+    }
+
+    #[test]
+    fn the_chat_key_brings_any_draft_back_and_the_command_key_a_commands() {
+        use ChatMethod::{Command, Message};
+        use ExitReason::{Intentional, Interrupted};
+        let h = ChatHistory::default();
+        let mut d = Drafts::default();
+        assert_eq!(d.open(Message, &h).text(), "");
+        assert_eq!(d.open(Command, &h).text(), "/");
+        close(&mut d, Message, "a message", Interrupted, false);
+        let s = d.open(Message, &h);
+        assert!(s.is_draft() && s.text() == "a message");
+        assert!(s.input(Instant::now()).draft);
+        // The Command key opens with a slash, not as a draft; the message's draft is
+        // still there until this screen closes.
+        let mut s = d.open(Command, &h);
+        assert!(!s.is_draft() && s.text() == "/");
+        assert!(!s.input(Instant::now()).draft);
+        assert_eq!(d.latest().cloned(), draft("a message", Message));
+        // Closed by Escape without the option: the message's draft goes too.
+        d.removed(&mut s, Intentional, false);
+        assert_eq!(d.latest(), None);
+        // A command's draft comes back with either key.
+        close(&mut d, Command, "tp ~ ~1 ~", Interrupted, false);
+        assert!(d.open(Command, &h).is_draft());
+        assert_eq!(d.open(Message, &h).text(), "/tp ~ ~1 ~");
+        // Brought back and closed untouched, it stays; with none, a slash alone is a
+        // command's draft too.
+        close(&mut d, Command, "", Interrupted, false);
+        assert_eq!(d.latest().cloned(), draft("/tp ~ ~1 ~", Command));
+        d.latest = None;
+        close(&mut d, Command, "", Interrupted, false);
+        assert_eq!(d.latest().cloned(), draft("/", Command));
+    }
+
+    #[test]
+    fn a_draft_closed_unedited_stays_as_it_was() {
+        use ChatMethod::Message;
+        use ExitReason::Interrupted;
+        let h = ChatHistory::default();
+        let clip = Clip::default();
+        let mut d = Drafts::default();
+        close(&mut d, Message, "first", Interrupted, false);
+        // Brought back and closed again untouched (the caret moved): the same draft.
+        let mut s = d.open(Message, &h);
+        s.key(SCANCODE_LEFT, false, false, &h, &clip);
+        s.key(SCANCODE_HOME, true, false, &h, &clip);
+        assert!(s.is_draft());
+        d.latest = draft("changed meanwhile", Message);
+        d.removed(&mut s, Interrupted, false);
+        assert_eq!(d.latest().cloned(), draft("changed meanwhile", Message));
+        // Edited: it is a draft no more, and what it says now is kept.
+        let mut s = d.open(Message, &h);
+        s.key(SCANCODE_END, false, false, &h, &clip);
+        s.type_text("!");
+        assert!(!s.is_draft());
+        d.removed(&mut s, Interrupted, false);
+        assert_eq!(d.latest().cloned(), draft("changed meanwhile!", Message));
+    }
+
+    #[test]
+    fn backspace_clears_a_draft_and_editing_ends_it() {
+        let clip = Clip::default();
+        let h = history(&["sent"]);
+        let draft_of = |text: &str| ChatScreen::with(text, true, &h);
+        let key = |s: &mut ChatScreen, code, shortcut| s.key(code, false, shortcut, &h, &clip);
+        // Backspace, with or without the shortcut, wherever the caret: all of it.
+        for shortcut in [false, true] {
+            let mut s = draft_of("one two");
+            key(&mut s, SCANCODE_LEFT, false);
+            key(&mut s, SCANCODE_BACKSPACE, shortcut);
+            assert_eq!((s.text(), s.is_draft()), ("", false));
+            // Once it is not a draft, Backspace takes a character again.
+            s.type_text("ab");
+            key(&mut s, SCANCODE_BACKSPACE, false);
+            assert_eq!(s.text(), "a");
+        }
+        // What leaves the text as it is keeps the draft: moving, selecting, copying,
+        // scrolling, Delete at the end, Down past the end of the history.
+        let mut s = draft_of("one two");
+        for (code, shortcut) in [
+            (SCANCODE_LEFT, false),
+            (SCANCODE_RIGHT, true),
+            (SCANCODE_HOME, false),
+            (SCANCODE_END, false),
+            (SCANCODE_A, true),
+            (SCANCODE_C, true),
+            (SCANCODE_PAGE_UP, false),
+            (SCANCODE_DOWN, false),
+            (SCANCODE_END, false),
+            (SCANCODE_DELETE, false),
+            (SCANCODE_A, false),
+        ] {
+            key(&mut s, code, shortcut);
+            assert!(s.is_draft(), "{code} {shortcut}");
+        }
+        // What edits ends it: Delete inside, typing, pasting (even nothing), cutting
+        // (even nothing), Up into the history.
+        let edits: [&dyn Fn(&mut ChatScreen); 6] = [
+            &|s| {
+                key(s, SCANCODE_HOME, false);
+                key(s, SCANCODE_DELETE, false);
+            },
+            &|s| s.type_text("x"),
+            &|s| {
+                key(s, SCANCODE_V, true);
+            },
+            &|s| {
+                key(s, SCANCODE_X, true);
+            },
+            &|s| {
+                key(s, SCANCODE_UP, false);
+            },
+            &|s| {
+                key(s, SCANCODE_A, true);
+                key(s, SCANCODE_X, true);
+            },
+        ];
+        for (i, edit) in edits.iter().enumerate() {
+            let mut s = draft_of("one two");
+            edit(&mut s);
+            assert!(!s.is_draft(), "edit {i}");
+        }
+        // Characters the chat leaves out are not typed, so they edit nothing.
+        let mut s = draft_of("one two");
+        s.type_text("§\t");
+        assert!(s.is_draft() && s.text() == "one two");
+        // A full box takes nothing, so it is not edited either; a selection makes room.
+        let full = "x".repeat(MAX_LENGTH);
+        let mut s = draft_of(&full);
+        s.type_text("y");
+        key(&mut s, SCANCODE_V, true);
+        key(&mut s, SCANCODE_X, true);
+        assert!(s.is_draft() && s.text() == full);
+        key(&mut s, SCANCODE_LEFT, false);
+        s.field.step(true, false, true);
+        s.type_text("y");
+        assert!(!s.is_draft() && s.text() == "x".repeat(MAX_LENGTH - 1) + "y");
+    }
+
+    #[test]
+    fn a_screen_put_away_comes_back_as_it_was() {
+        let h = history(&["a", "b"]);
+        let clip = Clip::default();
+        let mut d = Drafts::default();
+        assert!(d.restore(&h).is_none());
+        let mut s = ChatScreen::new("", &h);
+        s.type_text("half typed");
+        s.key(SCANCODE_LEFT, true, false, &h, &clip);
+        s.key(SCANCODE_UP, false, false, &h, &clip);
+        s.key(SCANCODE_DOWN, false, false, &h, &clip);
+        s.shown(ChatShown {
+            lines: 60,
+            ..ChatShown::default()
+        });
+        s.key(SCANCODE_PAGE_UP, false, false, &h, &clip);
+        s.new_since_scroll = true;
+        d.removed(&mut s, ExitReason::Interrupted, false);
+        assert_eq!(
+            d.latest().cloned(),
+            draft("half typed", ChatMethod::Message)
+        );
+        d.preserve(Box::new(s));
+        let more = history(&["a", "b", "c"]);
+        let mut s = d.restore(&more).unwrap();
+        assert!(d.restore(&more).is_none(), "once");
+        // The same text, not a draft, the caret at its end, scrolled down, and at the
+        // end of the history.
+        let i = s.input(Instant::now());
+        assert_eq!((i.text.as_str(), i.caret, i.anchor), ("half typed", 10, 10));
+        assert_eq!((i.scroll, i.new_since_scroll, i.draft), (0, false, false));
+        s.key(SCANCODE_UP, false, false, &more, &clip);
+        assert_eq!(s.text(), "c");
+        // A draft put away comes back a draft.
+        let mut s = ChatScreen::with("old", true, &h);
+        d.removed(&mut s, ExitReason::Interrupted, false);
+        d.preserve(Box::new(s));
+        assert!(d.restore(&h).unwrap().is_draft());
     }
 
     #[test]

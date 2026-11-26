@@ -49,7 +49,7 @@ use crate::join::Joiner;
 use crate::route::RoutePlayer;
 use crate::servers::{Selected, Servers, valid_address};
 use crate::settings::{GAME, Group, RUTHENIUM, Row, Settings, SettingsFile, all_groups, rows_of};
-use chat::{ChatHistory, ChatOutcome, ChatScreen};
+use chat::{ChatHistory, ChatMethod, ChatOutcome, ChatScreen, Drafts, ExitReason};
 
 mod chat;
 mod keys;
@@ -439,6 +439,8 @@ pub struct Menu {
     keys: keys::KeysState,
     /// The messages sent, for the chat screen's Up and Down.
     chat_history: ChatHistory,
+    /// The chat's draft, and a chat screen put away while a level loads.
+    chat_drafts: Drafts,
 }
 
 impl std::fmt::Debug for Menu {
@@ -573,6 +575,7 @@ impl Menu {
             route: None,
             keys,
             chat_history: ChatHistory::default(),
+            chat_drafts: Drafts::default(),
         }
     }
 
@@ -581,11 +584,45 @@ impl Menu {
         self.chat_history = ChatHistory::load(path);
     }
 
-    /// Opens the chat screen with `initial` typed (`openChatScreen`): keys let go, the
-    /// mouse freed.
-    fn open_chat(&mut self, initial: &str) {
+    /// Opens the chat screen (`openChatScreen`), with the draft if `method` brings it
+    /// back: keys let go, the mouse freed.
+    fn open_chat(&mut self, method: ChatMethod) {
         self.game.release(self.session.as_ref());
-        self.screen = Screen::Chat(Box::new(ChatScreen::new(initial, &self.chat_history)));
+        let chat = self.chat_drafts.open(method, &self.chat_history);
+        self.screen = Screen::Chat(Box::new(chat));
+    }
+
+    /// The chat screen, if it is open, is closing for `reason` (`removed`): the draft
+    /// is kept or dropped.
+    fn chat_removed(&mut self, reason: ExitReason) {
+        if let Screen::Chat(chat) = &mut self.screen {
+            let save = self.settings.settings.save_chat_drafts;
+            self.chat_drafts.removed(chat, reason, save);
+        }
+    }
+
+    /// The level loading screen, until the player is in the world
+    /// (`startWaitingForNewLevel`); an open chat screen is put away meanwhile.
+    fn level_loading(&mut self) {
+        self.preserve_chat();
+        let title = self.server_name.clone();
+        self.session_form(
+            FormKind::Playing,
+            &title,
+            &["Loading the world..."],
+            vec![button("Disconnect", Action::Cancel)],
+        );
+    }
+
+    /// A level starts loading (`startWaitingForNewLevel`): an open chat screen is put
+    /// away, to come back once the player is in the world again.
+    fn preserve_chat(&mut self) {
+        self.chat_removed(ExitReason::Interrupted);
+        if let Screen::Chat(_) = self.screen
+            && let Screen::Chat(chat) = std::mem::replace(&mut self.screen, Screen::Game)
+        {
+            self.chat_drafts.preserve(chat);
+        }
     }
 
     /// A key on the chat screen (down or repeated).
@@ -595,8 +632,12 @@ impl Menu {
         };
         match chat.key(scancode, shift, shortcut, &self.chat_history, clipboard) {
             ChatOutcome::Stay => {}
-            ChatOutcome::Close => self.enter_game(),
+            ChatOutcome::Close => {
+                self.chat_removed(ExitReason::Intentional);
+                self.enter_game();
+            }
             ChatOutcome::Send(text) => {
+                self.chat_removed(ExitReason::Done);
                 // `handleChatInput`: kept as sent, unless nothing is left of it.
                 let message = ruthenium_sim::chat::normalize(&text);
                 if !message.is_empty() {
@@ -729,6 +770,8 @@ impl Menu {
         buttons: Vec<FormButton>,
     ) {
         let Some(scale) = self.scale else { return };
+        // (A chat screen is interrupted: its draft is kept.)
+        self.chat_removed(ExitReason::Interrupted);
         // (Options that were open over the world.)
         if matches!(self.screen, Screen::Settings) {
             self.settings_screen = None;
@@ -850,10 +893,21 @@ impl Menu {
         }
     }
 
-    /// Into the world, no screen open (`setScreen(null)`, which grabs the mouse).
+    /// Into the world, no screen open (`setScreen(null)`, which grabs the mouse); or the
+    /// chat screen put away while a level loaded, back (`restoreChatScreen`), unless the
+    /// player is dead.
     fn enter_game(&mut self) {
-        self.game
-            .enter(self.session.as_ref(), self.keys.physical().into_iter());
+        let chat = if self.death.is_none() {
+            self.chat_drafts.restore(&self.chat_history)
+        } else {
+            None
+        };
+        if chat.is_some() {
+            self.game.release(self.session.as_ref());
+        } else {
+            self.game
+                .enter(self.session.as_ref(), self.keys.physical().into_iter());
+        }
         if matches!(self.screen, Screen::Settings) {
             self.settings_screen = None;
             self.save_settings();
@@ -867,7 +921,7 @@ impl Menu {
             }
             _ => self.pause = None,
         }
-        self.screen = Screen::Game;
+        self.screen = chat.map_or(Screen::Game, Screen::Chat);
     }
 
     /// Whether the Game Menu or its options are open.
@@ -996,15 +1050,7 @@ impl Menu {
                 SessionEvent::CodeOfConduct(text) if !self.leaving => {
                     self.code_of_conduct_arrived(&text);
                 }
-                SessionEvent::Playing if !self.leaving => {
-                    let title = self.server_name.clone();
-                    self.session_form(
-                        FormKind::Playing,
-                        &title,
-                        &["Loading the world..."],
-                        vec![button("Disconnect", Action::Cancel)],
-                    );
-                }
+                SessionEvent::Playing if !self.leaving => self.level_loading(),
                 SessionEvent::Loaded if !self.leaving => self.enter_game(),
                 SessionEvent::Died {
                     cause,
@@ -1059,13 +1105,7 @@ impl Menu {
                     self.game.respawned(self.session.as_ref());
                     // The level loading screen, until the player is back in the world.
                     self.death = None;
-                    let title = self.server_name.clone();
-                    self.session_form(
-                        FormKind::Playing,
-                        &title,
-                        &["Loading the world..."],
-                        vec![button("Disconnect", Action::Cancel)],
-                    );
+                    self.level_loading();
                 }
                 SessionEvent::Reconfiguring if !self.leaving => {
                     self.connecting_form(NetStage::Joining);
@@ -1837,9 +1877,9 @@ impl Menu {
                     let key = ruthenium_sim::input::Key::scancode(scancode);
                     let actions: Vec<_> = self.binds().on(key).collect();
                     if actions.contains(&ruthenium_sim::keybinds::Action::Chat) {
-                        self.open_chat("");
+                        self.open_chat(ChatMethod::Message);
                     } else if actions.contains(&ruthenium_sim::keybinds::Action::Command) {
-                        self.open_chat("/");
+                        self.open_chat(ChatMethod::Command);
                     }
                 }
                 return None;
@@ -2799,6 +2839,116 @@ mod tests {
         press(&mut m, 23, false, false, &clip);
         press(&mut m, SCANCODE_UP, false, false, &clip);
         assert!(matches!(&m.screen, Screen::Chat(c) if c.text() == "hello there"));
+    }
+
+    /// What the chat screen shows, and whether as a draft.
+    fn chat_shows(m: &Menu) -> Option<(String, bool)> {
+        match &m.screen {
+            Screen::Chat(c) => Some((c.text().to_owned(), c.is_draft())),
+            _ => None,
+        }
+    }
+
+    fn dead() -> DeathForm {
+        DeathForm {
+            title: "You Died!",
+            lines: Vec::new(),
+            hardcore: false,
+            ready: false,
+            respawn_pressed: false,
+        }
+    }
+
+    #[test]
+    fn chat_drafts_outlive_other_screens_and_escape_only_with_the_option() {
+        let clip = FakeClipboard(RefCell::new(None));
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.screen = Screen::Game;
+        let some = |s: &str, draft| Some((s.to_owned(), draft));
+        // Typed, then the death screen took its place: the Chat key brings it back.
+        press(&mut m, 23, false, false, &clip);
+        m.text_input("before dying");
+        m.death = Some(dead());
+        m.death_form();
+        assert!(matches!(m.screen, Screen::Form(FormKind::Died, ..)));
+        m.death = None;
+        m.enter_game();
+        press(&mut m, 23, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("before dying", true));
+        // Escape with Save Unsent Chats off (the default): gone.
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        press(&mut m, 23, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("", false));
+        // With it on: kept.
+        m.set_setting(Row::SaveChatDrafts, 1);
+        m.text_input("kept");
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        press(&mut m, 23, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("kept", true));
+        // Backspace clears it; what is sent is no draft.
+        press(&mut m, SCANCODE_BACKSPACE, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("", false));
+        m.text_input("x");
+        press(&mut m, SCANCODE_RETURN, false, false, &clip);
+        press(&mut m, 23, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("", false));
+        // A message's draft, and the Command key: a slash, and the slash is the draft
+        // once Escape closes it.
+        m.text_input("a message");
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        press(&mut m, 56, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("/", false));
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        press(&mut m, 23, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("/", true));
+        // Leaving the server (its screen in the chat's place) keeps it for the next.
+        press(&mut m, SCANCODE_BACKSPACE, false, false, &clip);
+        m.text_input("/say on the next server");
+        m.session_form(FormKind::Disconnected, "Disconnected", &[], Vec::new());
+        m.screen = Screen::Game;
+        press(&mut m, 56, false, false, &clip);
+        assert_eq!(chat_shows(&m), some("/say on the next server", true));
+    }
+
+    #[test]
+    fn a_chat_screen_open_when_a_level_loads_comes_back_after() {
+        let clip = FakeClipboard(RefCell::new(None));
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.screen = Screen::Game;
+        press(&mut m, 23, false, false, &clip);
+        m.text_input("through the portal");
+        m.level_loading();
+        assert!(matches!(m.screen, Screen::Form(FormKind::Playing, ..)));
+        // W held while it loads: not walked on while the chat is back.
+        m.key(26, true, false, false, false, &clip);
+        m.enter_game();
+        assert_eq!(
+            chat_shows(&m),
+            Some(("through the portal".to_owned(), false))
+        );
+        assert!(m.wants_text_input() && !m.wants_mouse_grab());
+        assert!(!m.game.holds(ruthenium_sim::input::Key::Keyboard(26)));
+        m.key(26, false, false, false, false, &clip);
+        // Once: closed, the world.
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        assert!(matches!(m.screen, Screen::Game));
+        // While the player is dead it waits (the death screen comes first).
+        press(&mut m, 23, false, false, &clip);
+        m.text_input("later");
+        m.level_loading();
+        m.death = Some(dead());
+        m.enter_game();
+        assert!(matches!(m.screen, Screen::Game));
+        m.death = None;
+        m.enter_game();
+        assert_eq!(chat_shows(&m), Some(("later".to_owned(), false)));
+        // Another screen in the loading's place leaves no chat to come back.
+        press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
+        m.session_form(FormKind::Playing, "Server", &[], Vec::new());
+        m.enter_game();
+        assert!(matches!(m.screen, Screen::Game));
     }
 
     #[test]

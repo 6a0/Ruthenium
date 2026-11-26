@@ -292,6 +292,9 @@ pub struct ChatInput {
     pub newest: Option<Arc<ruthenium_sim::hud_text::ChatMessage>>,
     /// A message came while it was scrolled up (the scroll bar is red).
     pub new_since_scroll: bool,
+    /// The text is a draft brought back and not yet edited: grey and slanted
+    /// (`ChatScreen.formatChat`).
+    pub draft: bool,
 }
 
 /// How the chat screen's chat was drawn: its lines, how many of them came after the
