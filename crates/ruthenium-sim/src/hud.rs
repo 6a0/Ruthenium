@@ -3,6 +3,9 @@
 //! record of the player's bars, effects and hotbar. Laying the record out and drawing it is
 //! done elsewhere, on what a frame carries.
 
+use std::sync::Mutex;
+use std::time::Instant;
+
 use ruthenium_data::v26_3::registries::DataComponentType as Kind;
 use ruthenium_protocol::item::Component;
 
@@ -54,11 +57,41 @@ pub struct HudState {
     pop: [i32; SLOTS],
 }
 
+/// `Hud.tickCount` is the client's, not a connection's: `Minecraft.gui` outlives
+/// connections and `Gui.tick` runs every client tick, in the menus too. Where the last
+/// session's count stood, and when.
+static CLIENT_COUNT: Mutex<Option<(Instant, i32)>> = Mutex::new(None);
+
+fn client_count() -> std::sync::MutexGuard<'static, Option<(Instant, i32)>> {
+    CLIENT_COUNT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The count a new HUD starts at, `now`, after the last stood at `last`.
+fn count_from(last: Option<(Instant, i32)>, now: Instant) -> i32 {
+    last.map_or(0, |(when, ticks)| {
+        let since = now.saturating_duration_since(when).as_millis() / 50;
+        ticks.wrapping_add(i32::try_from(since).unwrap_or(i32::MAX))
+    })
+}
+
 impl HudState {
+    /// A new session's HUD: its count goes on from the last session's as if the client
+    /// had ticked 20 times a second since (0 for the first). Starting each session at
+    /// 0 left the hearts' blinking, which the renderer keeps across sessions with the
+    /// tick it ends at, far ahead of the new count: they blinked on for minutes.
+    pub fn continuing() -> HudState {
+        let ticks = count_from(*client_count(), Instant::now());
+        HudState {
+            ticks,
+            ..HudState::default()
+        }
+    }
+
     /// `Hud.tick`, and the hotbar's part of `Inventory.tick`. Returns whether the
     /// selected stack is another, or has changed ([`Self::selected`]).
     pub fn tick(&mut self, player: &LocalPlayer) -> bool {
         self.ticks = self.ticks.wrapping_add(1);
+        *client_count() = Some((Instant::now(), self.ticks));
         let selected = player.inventory.hand(crate::inventory::Hand::Main);
         if selected.is_empty() {
             self.highlight_timer = 0;
@@ -337,6 +370,23 @@ mod tests {
     }
 
     #[test]
+    /// The count goes on from the last HUD's, 20 a second since, so a blink the
+    /// renderer kept from the last session (its end tick) is long past.
+    #[test]
+    fn a_new_hud_counts_on_from_the_last() {
+        let then = Instant::now();
+        assert_eq!(count_from(None, then), 0);
+        assert_eq!(count_from(Some((then, 5000)), then), 5000);
+        let later = then + std::time::Duration::from_millis(3020);
+        assert_eq!(count_from(Some((then, 5000)), later), 5060);
+        // A clock that went back counts nothing.
+        assert_eq!(count_from(Some((later, 7)), then), 7);
+        let mut hud = HudState::continuing();
+        let p = LocalPlayer::default();
+        hud.tick(&p);
+        assert!(count_from(*client_count(), Instant::now()) >= 1);
+    }
+
     fn a_stack_that_came_or_grew_bulges_for_five_ticks() {
         let mut hud = HudState::default();
         let one = Stack {

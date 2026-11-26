@@ -896,7 +896,7 @@ impl Game {
             bed_screen: false,
             held_keys: Keys::default(),
             hardcore: false,
-            hud: crate::hud::HudState::default(),
+            hud: crate::hud::HudState::continuing(),
             hud_text: HudTextState::default(),
             chat_types: ChatTypes::default(),
             player_list: false,
