@@ -256,6 +256,12 @@ pub struct FormScreen {
     fields: Vec<FieldView>,
     labels: Vec<Text>,
     blink: f32,
+    /// At most this many message lines show at once, the rest scrolled to
+    /// ([`FormScreen::set_message_window`]); the first line shown.
+    window: Option<usize>,
+    scroll: usize,
+    /// Where the shown lines are, while they are windowed.
+    message_view: Option<Rect>,
 }
 
 /// The message lines' size.
@@ -397,6 +403,9 @@ impl FormScreen {
             fields,
             labels: Vec::new(),
             blink: 0.0,
+            window: None,
+            scroll: 0,
+            message_view: None,
             spec,
         };
         if !form.fields.is_empty() {
@@ -423,7 +432,9 @@ impl FormScreen {
             .iter()
             .flat_map(|m| wrap_to(fonts, m, MESSAGE_STYLE.with_px(scale.px), WIDTH * scale.px))
             .collect();
-        let msg_h = lines.len() as f32 * 26.0;
+        let shown = self.window.map_or(lines.len(), |w| lines.len().min(w));
+        self.scroll = self.scroll.min(lines.len() - shown);
+        let msg_h = shown as f32 * 26.0;
         let code_h = if self.spec.code.is_some() {
             CODE_H
         } else {
@@ -456,6 +467,13 @@ impl FormScreen {
         if msg_h > 0.0 {
             y += 18.0;
         }
+        self.message_view = (shown < lines.len()).then_some(Rect {
+            x,
+            y,
+            w: WIDTH,
+            h: msg_h,
+        });
+        let message_end = y + msg_h;
         self.message = lines
             .iter()
             .map(|m| {
@@ -470,6 +488,7 @@ impl FormScreen {
                 (t, r)
             })
             .collect();
+        y = message_end;
         self.code = self.spec.code.as_ref().map(|c| {
             let t = Text::new(fonts, c, &scale, CODE_SIZE, Weight::EXTRABOLD, 0.14);
             let r = Rect {
@@ -532,6 +551,27 @@ impl FormScreen {
 
     pub fn field(&self, i: usize) -> &TextField {
         &self.fields[i].field
+    }
+
+    /// Shows at most `lines` lines of the message at once; the wheel scrolls the rest
+    /// ([`FormScreen::wheel`]).
+    pub fn set_message_window(&mut self, lines: usize, fonts: &Fonts) {
+        self.window = Some(lines.max(1));
+        self.layout(self.scale, fonts);
+    }
+
+    /// The wheel turned `notches` (positive: up) over the form: a windowed message
+    /// scrolls a line a notch.
+    pub fn wheel(&mut self, notches: f32) {
+        let Some(shown) = self.window else { return };
+        let most = self.message.len().saturating_sub(shown);
+        let by = notches.round() as i64;
+        self.scroll = (self.scroll as i64 - by).clamp(0, most as i64) as usize;
+    }
+
+    /// The first message line shown, and how many there are.
+    pub fn message_scroll(&self) -> (usize, usize) {
+        (self.scroll, self.message.len())
     }
 
     pub fn field_count(&self) -> usize {
@@ -639,12 +679,40 @@ impl FormScreen {
         if let Some(atlas) = atlas {
             self.title
                 .centred(text, atlas, s, self.title_rect, WHITE_TEXT);
-            for (t, r) in &self.message {
-                t.centred(text, atlas, s, *r, SOFT);
+            match self.message_view {
+                None => {
+                    for (t, r) in &self.message {
+                        t.centred(text, atlas, s, *r, SOFT);
+                    }
+                }
+                Some(view) => {
+                    // The lines scrolled to, in the message's place.
+                    text.set_clip(Clip::rect(super::px_rect(s, view)));
+                    let up = self.scroll as f32 * 26.0;
+                    for (t, r) in &self.message {
+                        let r = Rect { y: r.y - up, ..*r };
+                        if r.y + r.h > view.y && r.y < view.y + view.h {
+                            t.centred(text, atlas, s, r, SOFT);
+                        }
+                    }
+                    text.set_clip(Clip::NONE);
+                }
             }
             if let Some((t, r)) = &self.code {
                 t.centred(text, atlas, s, *r, WHITE_TEXT);
             }
+        }
+        // Where a scrolled message is: a thin bar beside it.
+        if let Some(view) = self.message_view {
+            let total = self.message.len().max(1) as f32;
+            let shown = view.h / 26.0;
+            let bar = Rect {
+                x: view.x + view.w + 8.0,
+                y: view.y + view.h * self.scroll as f32 / total,
+                w: 3.0,
+                h: (view.h * shown / total).max(8.0),
+            };
+            shapes.rounded(s, bar, 1.5, [0.85, 0.87, 1.0, 0.35]);
         }
         for (i, f) in self.fields.iter().enumerate() {
             let focused = self.states.focused() == Some(i);
@@ -879,5 +947,38 @@ mod tests {
         );
         let lines = wrap_to(&fonts, "一二三四五。六", style, w("一二三四五"));
         assert_eq!(lines, ["一二三四五。", "六"]);
+    }
+
+    /// A long message shows a window of its lines, scrolled by the wheel, within its
+    /// ends; the form's height follows the window, not the message.
+    #[test]
+    fn a_windowed_message_scrolls_within_its_lines() {
+        let fonts = Fonts::new(&WEIGHTS);
+        let spec = |lines: usize| FormSpec {
+            title: "Prompt".into(),
+            message: (0..lines).map(|i| format!("line {i}")).collect(),
+            code: None,
+            fields: Vec::new(),
+            buttons: vec![FormButton {
+                label: "Yes".into(),
+                action: Action::Confirm,
+            }],
+        };
+        let scale = UiScale::new(1600, 900);
+        let mut long = FormScreen::new(scale, &fonts, spec(40));
+        long.set_message_window(5, &fonts);
+        let mut short = FormScreen::new(scale, &fonts, spec(5));
+        short.set_message_window(5, &fonts);
+        assert_eq!(long.buttons[0].rect.y, short.buttons[0].rect.y);
+        assert_eq!(long.message_scroll(), (0, 40));
+        long.wheel(-3.0);
+        assert_eq!(long.message_scroll(), (3, 40));
+        long.wheel(-100.0);
+        assert_eq!(long.message_scroll(), (35, 40));
+        long.wheel(1000.0);
+        assert_eq!(long.message_scroll(), (0, 40));
+        // A message that fits doesn't scroll.
+        short.wheel(-3.0);
+        assert_eq!(short.message_scroll(), (0, 5));
     }
 }
