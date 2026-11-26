@@ -535,14 +535,14 @@ impl Menu {
     // --- Slot rules ---------------------------------------------------------------
 
     /// `Slot.mayPlace`.
-    pub fn may_place(&self, i: usize, stack: &Stack, who: &Who) -> bool {
+    pub fn may_place(&self, i: usize, stack: &Stack, _who: &Who) -> bool {
         match self.slots[i].rule {
             Rule::Plain | Rule::Offhand => true,
             // `isEquippableInSlot`: an item without `equippable` goes only in the main
             // hand.
             Rule::Armor(eq) => stack.c.equippable.is_some_and(|e| e.slot == eq),
             Rule::CraftResult | Rule::FurnaceResult => false,
-            Rule::FurnaceFuel => stack.c.cooking_fuel || is_bucket(stack, who.items),
+            Rule::FurnaceFuel => stack.c.cooking_fuel || is_bucket(stack),
             // `canFitInsideContainerItems`: not a shulker box.
             Rule::ShulkerBox => !is_shulker_box(stack),
         }
@@ -559,20 +559,9 @@ impl Menu {
         }
     }
 
-    /// `Slot.getMaxStackSize()`.
-    fn slot_max(&self, i: usize) -> i32 {
-        match self.slots[i].rule {
-            Rule::Armor(_) => 1,
-            _ => CONTAINER_MAX,
-        }
-    }
-
     /// `Slot.getMaxStackSize(stack)`.
-    pub fn max_stack_size(&self, i: usize, stack: &Stack, who: &Who) -> i32 {
-        if self.slots[i].rule == Rule::FurnaceFuel && is_bucket(stack, who.items) {
-            return 1;
-        }
-        self.slot_max(i).min(stack.max_stack_size())
+    pub fn max_stack_size(&self, i: usize, stack: &Stack, _who: &Who) -> i32 {
+        rule_max_stack_size(self.slots[i].rule, stack)
     }
 
     /// `Slot.allowModification`.
@@ -1347,7 +1336,18 @@ fn humanoid_armor_slot(eq: EquipmentSlot) -> Option<usize> {
     }
 }
 
-fn is_bucket(stack: &Stack, _items: &Items) -> bool {
+/// `Slot.getMaxStackSize(stack)` of a slot of `rule`: an armour slot holds one, a
+/// fuel slot one bucket, any other as many as the stack allows up to 99.
+pub fn rule_max_stack_size(rule: Rule, stack: &Stack) -> i32 {
+    let slot = match rule {
+        Rule::Armor(_) => 1,
+        Rule::FurnaceFuel if is_bucket(stack) => return 1,
+        _ => CONTAINER_MAX,
+    };
+    slot.min(stack.max_stack_size())
+}
+
+fn is_bucket(stack: &Stack) -> bool {
     !stack.is_empty() && stack.c.name == "minecraft:bucket"
 }
 
@@ -1460,7 +1460,7 @@ mod tests {
             count,
             patch: ComponentPatch {
                 added: vec![(ComponentKind::Damage.id() as i32, Component::Damage(damage))],
-                removed: Vec::new(),
+                ..ComponentPatch::default()
             },
         })
     }

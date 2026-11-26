@@ -1059,6 +1059,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut input = opts.input.clone();
     let mut typed = String::new();
     let mut shift_held = false;
+    // Where `--input`'s pointer is (its `move=` steps), in window coordinates.
+    let mut script_pointer = (0.0f32, 0.0f32);
+    let mut script_moved = false;
     let mut text_input = false;
     let mut mouse_grabbed = false;
     let mut screenshot_requested = false;
@@ -1155,6 +1158,8 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 keys.push((scancode, down, repeat, shift, shortcut));
             }
             Event::TextInput { .. } => typed.push_str(e.text()),
+            // (Once `--input` has moved the pointer, the real one is not followed.)
+            Event::MouseMotion { .. } | Event::MouseLeft if script_moved => {}
             Event::MouseMotion { x, y, dx, dy } => menu.mouse_moved(x, y, dx, dy),
             Event::MouseLeft => menu.mouse_left(),
             Event::MouseWheel { y, raw_x, raw_y } => menu.wheel(y, (raw_x, raw_y)),
@@ -1178,7 +1183,15 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
                 eprintln!("[ruthenium] --input: {step:?}");
                 match step {
                     Step::Key(code, down) => keys.push((code, down, false, false, false)),
-                    Step::Button(1, down) => clicks.push((down, 0.0, 0.0, false)),
+                    Step::Button(1, down) => {
+                        clicks.push((down, script_pointer.0, script_pointer.1, false));
+                    }
+                    Step::Move(x, y) => {
+                        let (dx, dy) = (x - script_pointer.0, y - script_pointer.1);
+                        script_pointer = (x, y);
+                        script_moved = true;
+                        menu.mouse_moved(x, y, dx, dy);
+                    }
                     Step::Button(b, down) => menu.other_mouse_button(b, down),
                     Step::Text(text) => typed.push_str(&text),
                     Step::Shot => {

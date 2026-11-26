@@ -15,9 +15,9 @@
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use ruthenium_protocol::hashed::SyncedRegistries;
 use ruthenium_protocol::nbt::Tag;
 use ruthenium_protocol::packets::play;
+use std::collections::HashMap;
 
 use super::{Configured, Game, SessionEvent, lock};
 use crate::inventory::{Hand, Inventory};
@@ -28,10 +28,13 @@ use crate::menu::{Input, Kind, Menu, Menus, Rule, Who};
 /// `MouseHandler.DOUBLE_CLICK_THRESHOLD_MS`.
 const DOUBLE_CLICK: Duration = Duration::from_millis(250);
 
-impl SyncedRegistries for Configured {
-    fn key(&self, registry: &str, id: i32) -> Option<&str> {
-        let (_, entries) = self.registries.iter().find(|(r, _)| r == registry)?;
-        Some(entries.get(usize::try_from(id).ok()?)?.id.as_str())
+impl Configured {
+    /// The synced registries' keys by network id, as hashing stacks reads them.
+    pub(super) fn keys(&self) -> HashMap<String, Vec<String>> {
+        self.registries
+            .iter()
+            .map(|(r, entries)| (r.clone(), entries.iter().map(|e| e.id.clone()).collect()))
+            .collect()
     }
 }
 
@@ -92,7 +95,7 @@ pub struct ContainerView {
     pub serial: u64,
     pub kind: Kind,
     /// The server's title (`None`: the inventory's, "Crafting").
-    pub title: Option<Tag>,
+    pub title: Option<Arc<Tag>>,
     pub image_width: i32,
     pub image_height: i32,
     /// Each slot: where, its rule, and its stack.
@@ -110,12 +113,14 @@ pub struct ContainerView {
 #[derive(Debug, Default)]
 pub(super) struct Containers {
     pub(super) screen: Option<Screen>,
-    title: Option<Tag>,
+    title: Option<Arc<Tag>>,
     serial: u64,
     pointer: Pointer,
     last_click: Option<(Instant, u64, u8)>,
     /// Inventory key presses not yet read (`keyInventory.clickCount`).
     pub(super) inventory_clicks: u32,
+    /// The synced registries' keys, for hashing stacks (set as play begins).
+    pub(super) registries: HashMap<String, Vec<String>>,
 }
 
 static NO_ITEMS: LazyLock<Items> = LazyLock::new(Items::default);
@@ -125,7 +130,7 @@ struct Ctx<'a> {
     menus: &'a mut Menus,
     inv: &'a mut Inventory,
     who: Who<'a>,
-    registries: &'a Configured,
+    registries: &'a HashMap<String, Vec<String>>,
     sent: Vec<Vec<u8>>,
     dropped: usize,
 }
@@ -203,7 +208,7 @@ impl Game {
                 recipes: &self.recipe_sets,
                 creative,
             },
-            registries: &self.configured,
+            registries: &self.containers.registries,
             sent: Vec::new(),
             dropped: 0,
         };
@@ -281,6 +286,9 @@ impl Game {
             }
             ScreenInput::Drag { at } => {
                 let (x, y) = self.place(at);
+                if crate::menu::log_enabled() {
+                    eprintln!("[menu] drag at {x}, {y}");
+                }
                 self.with_screen(|s, c| s.mouse_dragged(c, x, y));
             }
             ScreenInput::Key { binds, ctrl, at } => {
@@ -310,6 +318,12 @@ impl Game {
         self.containers.pointer = p;
         if resized && let Some(s) = &mut self.containers.screen {
             s.resize(p.width, p.height);
+            if crate::menu::log_enabled() {
+                eprintln!(
+                    "[menu] screen at {}, {} on a GUI of {} by {}",
+                    s.left, s.top, p.width, p.height
+                );
+            }
         }
     }
 
@@ -318,6 +332,9 @@ impl Game {
     pub(super) fn container_frame(&mut self, drag: bool) {
         let Pointer { x, y, .. } = self.containers.pointer;
         if drag {
+            if crate::menu::log_enabled() {
+                eprintln!("[menu] drag at {x}, {y}");
+            }
             self.with_screen(|s, c| s.mouse_dragged(c, x, y));
         }
         self.with_screen(|s, c| s.frame(c, x, y));
@@ -370,7 +387,7 @@ impl Game {
         self.replace_screen();
         let Pointer { width, height, .. } = self.containers.pointer;
         self.containers.screen = Some(Screen::new(kind, width, height));
-        self.containers.title = title;
+        self.containers.title = title.map(Arc::new);
         self.containers.serial += 1;
         // It takes the place of the death screen or the bed screen.
         self.death_screen = None;

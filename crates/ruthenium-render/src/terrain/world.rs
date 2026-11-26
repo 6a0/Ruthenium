@@ -325,6 +325,8 @@ pub struct WorldAssets {
     /// The picture that darkens the frame's corners in the dark
     /// (`textures/misc/vignette.png`).
     pub vignette: Option<crate::sky::SkyImage>,
+    /// The container screens' pictures by name (`textures/gui/container/<name>.png`).
+    pub containers: Vec<(String, crate::sky::SkyImage)>,
 }
 
 /// The indices of quads as two triangles each, sharing the diagonal from a quad's first

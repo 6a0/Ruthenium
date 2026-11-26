@@ -501,6 +501,8 @@ pub struct Renderer {
     hud: Option<hud::Hud>,
     /// The chat screen, while it is open.
     chat_input: Option<ruthenium_ui::hud::ChatInput>,
+    /// The container screen drawn over the HUD, and the pointer in GUI units.
+    container_screen: Option<(Arc<ruthenium_sim::session::ContainerView>, (f64, f64))>,
     /// The player's key bindings, for the HUD's text that names them.
     key_bindings: Arc<ruthenium_protocol::text::BoundKeys>,
     /// The terrain's part of the last frame.
@@ -632,6 +634,7 @@ impl Renderer {
             view_options: ViewOptions::default(),
             hud: None,
             chat_input: None,
+            container_screen: None,
             key_bindings: Arc::default(),
             world_times: WorldTimes::default(),
             last_frame: 0,
@@ -708,10 +711,11 @@ impl Renderer {
             }
             // Without the GUI's sprites there is no HUD.
             let vignette = assets.vignette.take();
+            let containers = std::mem::take(&mut assets.containers);
             self.hud = assets
                 .gui
                 .take()
-                .map(|atlas| hud::Hud::new(atlas, vignette));
+                .map(|atlas| hud::Hud::new(atlas, vignette, containers));
             let mut marks = BlockMarks::new(&mut self.textures, &mut self.uploads, &assets.cracks);
             marks.set_outline(self.block_outline);
             self.marks = Some(marks);
@@ -1081,6 +1085,14 @@ impl Renderer {
 
     /// What the last frame's HUD was made of, if there is one.
     /// The chat screen the HUD draws from now on (none: it is closed).
+    /// The container screen over the HUD from now on, with the pointer in GUI units.
+    pub fn set_container_screen(
+        &mut self,
+        screen: Option<(Arc<ruthenium_sim::session::ContainerView>, (f64, f64))>,
+    ) {
+        self.container_screen = screen;
+    }
+
     pub fn set_chat_input(&mut self, input: Option<ruthenium_ui::hud::ChatInput>) {
         self.chat_input = input;
     }
@@ -1687,6 +1699,9 @@ impl Renderer {
                     renderer.block_atlas(),
                     &self.textures,
                     self.chat_input.as_ref(),
+                    self.container_screen
+                        .as_ref()
+                        .map(|(v, pointer)| (&**v, *pointer)),
                 );
             }
             self.world_times.stage_ns += started.elapsed().as_nanos() as u64;

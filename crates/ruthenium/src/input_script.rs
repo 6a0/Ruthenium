@@ -6,15 +6,16 @@
 //! Steps are separated by spaces: `<key name><+|->@<ms>` presses (+) or lets go of (-)
 //! a key or button by its name as `options.txt` has it (`key.keyboard.i+@500`,
 //! `key.mouse.5-@50`), `shot@<ms>` takes the `--screenshot` then, `type=<text>@<ms>`
-//! types text (`_` for a space, `%XX` for any byte); each waits so many milliseconds
-//! after the step before it.
+//! types text (`_` for a space, `%XX` for any byte), `move=<x>,<y>@<ms>` moves the
+//! pointer there (window coordinates; the left button presses where it is); each waits
+//! so many milliseconds after the step before it.
 
 use std::time::{Duration, Instant};
 
 use ruthenium_sim::keybinds::{Key, Parsed};
 
 /// One step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     /// A key (SDL scancode) down or up.
     Key(u32, bool),
@@ -24,6 +25,8 @@ pub enum Step {
     Shot,
     /// Typed text.
     Text(String),
+    /// The pointer moves to a place in the window.
+    Move(f32, f32),
 }
 
 /// See the module docs.
@@ -46,6 +49,9 @@ impl InputScript {
                 Step::Shot
             } else if let Some(text) = what.strip_prefix("type=") {
                 Step::Text(typed(text).ok_or_else(bad)?)
+            } else if let Some(at) = what.strip_prefix("move=") {
+                let (x, y) = at.split_once(',').ok_or_else(bad)?;
+                Step::Move(x.parse().map_err(|_| bad())?, y.parse().map_err(|_| bad())?)
             } else {
                 let down = match what.chars().last() {
                     Some('+') => true,

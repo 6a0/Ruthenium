@@ -221,6 +221,7 @@ impl InGame {
                         s.set_use(true);
                     }
                     Click::SwapHands => s.swap_hands_key(),
+                    Click::Inventory => s.inventory_key(),
                     Click::Hotbar(slot) => s.hotbar_key(slot),
                 }
             }
@@ -287,6 +288,7 @@ enum Click {
     Attack,
     Use,
     SwapHands,
+    Inventory,
     Hotbar(u8),
 }
 
@@ -296,6 +298,7 @@ fn clicks(binds: &KeyBinds, key: Key) -> impl Iterator<Item = Click> + '_ {
         Action::Attack => Some(Click::Attack),
         Action::Use => Some(Click::Use),
         Action::SwapOffhand => Some(Click::SwapHands),
+        Action::Inventory => Some(Click::Inventory),
         a => a.hotbar_slot().map(Click::Hotbar),
     })
 }

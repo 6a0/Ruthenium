@@ -2132,6 +2132,7 @@ impl Game {
                     c.tags = std::mem::take(&mut self.configured.tags);
                 }
                 self.configured = c;
+                self.containers.registries = self.configured.keys();
                 self.transformers = self.configured_transformers();
                 self.chat_types = self.configured_chat_types();
                 self.configure_enchantments();
@@ -2775,6 +2776,9 @@ impl Game {
                 id,
                 value,
             } => {
+                if crate::menu::log_enabled() {
+                    eprintln!("[menu] got set_data container {container_id} {id} = {value}");
+                }
                 if let Some(w) = &mut self.world
                     && w.player.menus.container().id == container_id
                 {

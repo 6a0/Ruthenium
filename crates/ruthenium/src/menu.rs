@@ -53,6 +53,7 @@ use crate::settings::{GAME, Group, RUTHENIUM, Row, Settings, SettingsFile, all_g
 use chat::{ChatHistory, ChatMethod, ChatOutcome, ChatScreen, Drafts, ExitReason};
 
 mod chat;
+mod container;
 mod keys;
 
 /// Side of the logo texture's top level.
@@ -309,6 +310,8 @@ enum Screen {
     Paused,
     /// The chat screen over the world.
     Chat(Box<ChatScreen>),
+    /// A container screen over the world (the session runs it).
+    Container,
 }
 
 /// Which settings the Settings screen shows, and from where.
@@ -429,6 +432,8 @@ pub struct Menu {
     bed_button: Option<BedScreen>,
     /// Input in the world.
     game: InGame,
+    /// A container screen's input.
+    container: container::ContainerInput,
     /// The session the terrain's meshes are of ended or was replaced: the renderer
     /// forgets them in the next frame.
     forget_world: bool,
@@ -631,6 +636,7 @@ impl Menu {
             bed: false,
             bed_button: None,
             game,
+            container: container::ContainerInput::default(),
             forget_world: false,
             mesh_workers: default_mesh_workers(),
             crosshair: true,
@@ -1115,6 +1121,7 @@ impl Menu {
             self.game
                 .frame(&self.settings.settings.mouse, self.session.as_ref());
         }
+        self.container_game_frame();
         if let Some(s) = &self.session {
             if let Some(r) = &mut self.route {
                 if r.running() && !in_world {
@@ -1206,6 +1213,8 @@ impl Menu {
                     });
                     self.death_form();
                 }
+                SessionEvent::ContainerOpened if !self.leaving => self.container_opened(),
+                SessionEvent::ContainerClosed => self.container_closed(),
                 SessionEvent::InBed if !self.leaving => self.in_bed(),
                 SessionEvent::WokeUp => self.woke_up(),
                 SessionEvent::RespawnReady => {
@@ -1267,6 +1276,9 @@ impl Menu {
         self.mouse = Some((x, y));
         if matches!(self.screen, Screen::Game) {
             self.game.mouse_moved(dx, dy);
+        }
+        if matches!(self.screen, Screen::Container) {
+            self.container_moved();
         }
     }
 
@@ -2015,12 +2027,16 @@ impl Menu {
                 }
                 return None;
             }
+            Screen::Container => {
+                self.container_key(scancode, down);
+                return None;
+            }
             Screen::Paused if escape => return self.act(Action::Back, None, clipboard),
             _ => {}
         }
         let action = match &mut self.screen {
             // Handled above.
-            Screen::Game | Screen::Chat(_) => None,
+            Screen::Game | Screen::Chat(_) | Screen::Container => None,
             Screen::Paused => {
                 let screen = self.pause.as_mut()?;
                 let key = match scancode {
@@ -2240,6 +2256,9 @@ impl Menu {
         if matches!(self.screen, Screen::Game) {
             self.game.mouse_button(button, down, self.session.as_ref());
         }
+        if matches!(self.screen, Screen::Container) {
+            self.container_button(button, down);
+        }
     }
 
     /// The left mouse button went down or up at `(x, y)` (window coordinates): the action
@@ -2281,6 +2300,10 @@ impl Menu {
                 }
             }
             Screen::Chat(_) => None,
+            Screen::Container => {
+                self.container_button(1, down);
+                None
+            }
             Screen::Paused => {
                 let screen = self.pause.as_mut()?;
                 let hit = screen.hit(ux, uy);
@@ -2563,6 +2586,7 @@ impl Menu {
             _ => None,
         };
         renderer.set_chat_input(chat);
+        self.container_frame(renderer, pixel_size, window_size);
         self.name_keys_once_lang_loads();
         self.sync_world(renderer);
         if matches!(self.screen, Screen::Game) && self.game.should_pause() {
@@ -2681,7 +2705,7 @@ impl Menu {
                     p.draw(&mut self.shapes, &mut self.text, atlas, logo);
                 }
             }
-            Screen::Game | Screen::Chat(_) => {
+            Screen::Game | Screen::Chat(_) | Screen::Container => {
                 let drawn = renderer.world_ready();
                 let debug = self.settings.settings.frame_stats;
                 // Over a drawn world the readout only shows with the statistics: its

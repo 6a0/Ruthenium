@@ -459,6 +459,13 @@ pub fn load_world_assets(game: &Path, max_texture: u32) -> Result<WorldAssets, S
         cracks,
         gui,
         vignette: sky_image(VIGNETTE),
+        containers: ruthenium_ui::hud::BACKGROUNDS
+            .iter()
+            .filter_map(|n| {
+                let image = sky_image(&format!("textures/gui/container/{n}.png"))?;
+                Some(((*n).to_owned(), image))
+            })
+            .collect(),
     })
 }
 

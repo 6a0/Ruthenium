@@ -155,7 +155,7 @@ fn split(chars: &[(char, Style)], width: i32, font: &Font) -> Vec<(Vec<(char, St
 
 /// How a text is made into lines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Wrap {
+pub(super) enum Wrap {
     /// It is one.
     Single,
     /// As wide as this at most (`Font.split`).
@@ -269,7 +269,7 @@ impl HudMemory {
         self.edit.0
     }
 
-    fn lines(
+    pub(super) fn lines(
         &mut self,
         text: &Arc<Tag>,
         wrap: Wrap,
@@ -419,7 +419,7 @@ impl HudLayout {
     /// A styled line, `scale` times as large about `origin` (`GuiGraphics.text` under a
     /// translated and scaled pose).
     #[allow(clippy::too_many_arguments)]
-    fn styled(
+    pub(super) fn styled(
         &mut self,
         line: &Arc<TextLine>,
         origin: [i32; 2],

@@ -223,7 +223,8 @@ impl Screen {
     /// The frame's drawing (`extractContents`, `extractSlot`): the slot under the
     /// pointer, and a drag's slots that no longer take the stack leave it.
     pub fn frame(&mut self, c: &dyn Clicker, mx: f64, my: f64) {
-        self.hovered = self.slot_at(c.menu(), mx, my);
+        // (Drawing takes the pointer in whole units.)
+        self.hovered = self.slot_at(c.menu(), mx.floor(), my.floor());
         let (menu, inv) = (c.menu(), c.inventory());
         if self.is_quick_crafting && !menu.carried.is_empty() && self.quick_craft_slots.len() > 1 {
             let gone: Vec<usize> = self
@@ -473,7 +474,8 @@ impl Screen {
         if binds.escape || binds.inventory {
             return true;
         }
-        self.hovered = self.slot_at(c.menu(), mx, my);
+        // (The slot the last frame drew as hovered: the pointer in whole units.)
+        self.hovered = self.slot_at(c.menu(), mx.floor(), my.floor());
         // `checkHotbarKeyPressed` (its answer is not looked at).
         if let Some(h) = self.hovered.filter(|_| c.menu().carried.is_empty()) {
             if binds.swap_offhand {

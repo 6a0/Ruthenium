@@ -392,6 +392,16 @@ pub struct BlockEntityStats {
     pub overflowed: u64,
 }
 
+/// A GUI layer's items, as [`BlockEntityRenderer::take_gui_items`] took them.
+#[derive(Default)]
+pub(crate) struct GuiItems([Vec<Instance>; 2]);
+
+impl std::fmt::Debug for GuiItems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GuiItems({} + {})", self.0[0].len(), self.0[1].len())
+    }
+}
+
 /// One part to draw: its record, and what it is sorted into draws by.
 struct Instance {
     /// The layer; its place in it, where that matters; then the part's first quad.
@@ -2559,7 +2569,7 @@ impl BlockEntityRenderer {
                 .translate([
                     (item.x + 8) as f32 * scale,
                     (item.y + 8) as f32 * scale,
-                    0.0,
+                    item.z * scale,
                 ])
                 .scale([side, -side, side]);
             let used = using.filter(|u| u.0 == item.slot);
@@ -2581,6 +2591,17 @@ impl BlockEntityRenderer {
         }
         std::mem::swap(&mut self.instances, &mut gathered);
         self.sorted = sorted;
+    }
+
+    /// The items a GUI shows gathered so far, taken out to be drawn as a layer of their
+    /// own (with [`Self::put_gui_items`] before [`Self::draw_gui_items`]).
+    pub(crate) fn take_gui_items(&mut self) -> GuiItems {
+        GuiItems(std::mem::take(&mut self.gui))
+    }
+
+    /// The items a layer gathered, to be drawn next.
+    pub(crate) fn put_gui_items(&mut self, items: GuiItems) {
+        self.gui = items.0;
     }
 
     /// Draws the items a GUI shows, as [`Self::gather_gui_items`] left them, into

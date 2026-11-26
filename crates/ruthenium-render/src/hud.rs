@@ -11,13 +11,16 @@ use ruthenium_gpu::{
 };
 use ruthenium_protocol::text::{BoundKeys, WithKeys};
 use ruthenium_sim::hud::OFF_HAND;
+use ruthenium_sim::item::Stack;
 use ruthenium_sim::scene::Frame;
+use ruthenium_sim::session::ContainerView;
 use ruthenium_ui::hud::{
-    ChatInput, ChatShown, HudHealth, HudLayout, HudMemory, HudOptions, HudSprites, HudView,
+    ChatInput, ChatShown, ContainerDraw, HudHealth, HudLayout, HudMemory, HudOptions, HudSprites,
+    HudView,
 };
 use ruthenium_ui::{GuiScale, Quad, Sprites};
 
-use crate::block_entity::renderer::BlockEntityRenderer;
+use crate::block_entity::renderer::{BlockEntityRenderer, GuiItems};
 use crate::gui;
 use crate::pipelines::PipelineId;
 use crate::sky::SkyImage;
@@ -185,11 +188,35 @@ pub(crate) struct Hud {
     /// The GUI scale the frame is laid out for; 0 while there is nothing to draw.
     scale: u32,
     stats: HudStats,
+    /// The HUD's items, drawn under a container screen.
+    items: GuiItems,
+    /// The container screens' pictures, until staged, then their textures by name.
+    containers_waiting: Vec<(String, SkyImage)>,
+    containers: Vec<(String, TextureId)>,
+    /// The container screen over the HUD this frame: its layout, its stacks, its items,
+    /// and the quads over them with how many are glyphs'.
+    screen: Option<Box<Screen>>,
+}
+
+/// A container screen as laid out for a frame.
+#[derive(Debug, Default)]
+struct Screen {
+    layout: HudLayout,
+    memory: HudMemory,
+    stacks: Vec<Stack>,
+    items: GuiItems,
+    over: Vec<Quad>,
+    glyphs: u32,
+    shown: bool,
 }
 
 impl Hud {
     /// A HUD of the sprites of the GUI's atlas, which [`Self::stage`] sends to the GPU.
-    pub fn new(atlas: Atlas, vignette: Option<SkyImage>) -> Hud {
+    pub fn new(
+        atlas: Atlas,
+        vignette: Option<SkyImage>,
+        containers: Vec<(String, SkyImage)>,
+    ) -> Hud {
         Hud {
             waiting: Some(atlas),
             atlas: None,
@@ -209,6 +236,10 @@ impl Hud {
             glyphs: 0,
             scale: 0,
             stats: HudStats::default(),
+            items: GuiItems::default(),
+            containers_waiting: containers,
+            containers: Vec::new(),
+            screen: None,
         }
     }
 
@@ -216,6 +247,25 @@ impl Hud {
     /// for it (it is too large to stage at once), and looks the HUD's sprites up in it:
     /// before the frame's `UploadRing::record`.
     pub fn stage(&mut self, textures: &mut TextureTable, uploads: &mut UploadRing) {
+        while let Some((name, image)) = self.containers_waiting.pop() {
+            let whole = image.rgba.len() == image.width as usize * image.height as usize * 4;
+            match textures.create_with(
+                uploads,
+                TextureDesc::rgba8(image.width, image.height),
+                &[&image.rgba],
+                Arrival::NextFrame,
+            ) {
+                Ok(id) if whole => self.containers.push((name, id)),
+                Ok(id) => textures.destroy(id),
+                // The ring is full for now.
+                Err(_) => {
+                    if whole {
+                        self.containers_waiting.push((name, image));
+                    }
+                    break;
+                }
+            }
+        }
         if let Some(image) = self.vignette_waiting.take() {
             let whole = image.rgba.len() == image.width as usize * image.height as usize * 4;
             match textures.create_with(
@@ -285,7 +335,11 @@ impl Hud {
         block_atlas: TextureId,
         textures: &TextureTable,
         chat: Option<&ChatInput>,
+        container: Option<(&ContainerView, (f64, f64))>,
     ) {
+        if let Some(s) = &mut self.screen {
+            s.shown = false;
+        }
         // (Whether or not it is drawn: `Hud.tick`.)
         self.vignette.update(frame.epoch, frame.ticks, light);
         let Some((_, sprites)) = self.atlas.as_ref().filter(|a| textures.is_ready(a.0)) else {
@@ -341,8 +395,51 @@ impl Hud {
             block_atlas,
             textures,
         );
+        self.items = models.take_gui_items();
         self.over.clear();
         self.glyphs = models.gui_over(&self.layout, textures, &mut self.over);
+        if let Some((view, (mx, my))) = container {
+            let background = self
+                .containers
+                .iter()
+                .find(|(n, _)| n == ruthenium_ui::hud::background_name(view.kind))
+                .map(|(_, t)| *t)
+                .filter(|t| textures.is_ready(*t))
+                .map(TextureId::index);
+            let s = self.screen.get_or_insert_with(Default::default);
+            let draw = ContainerDraw {
+                view,
+                width: scale.width as i32,
+                height: scale.height as i32,
+                mouse: (mx.floor() as i32, my.floor() as i32),
+                background,
+                partial,
+            };
+            let lang = WithKeys {
+                lang: models.lang(),
+                keys,
+            };
+            s.layout.container(
+                sprites,
+                models.font(),
+                &lang,
+                &mut s.memory,
+                &draw,
+                &mut s.stacks,
+            );
+            models.gather_gui_items(
+                &s.layout.items,
+                &s.stacks,
+                scale.scale as f32,
+                None,
+                block_atlas,
+                textures,
+            );
+            s.items = models.take_gui_items();
+            s.over.clear();
+            s.glyphs = models.gui_over(&s.layout, textures, &mut s.over);
+            s.shown = true;
+        }
         self.vignette_quad = self
             .vignette_picture
             // (Fully faded, it would darken nothing.)
@@ -434,14 +531,33 @@ impl Hud {
             // Among themselves the items' faces hide each other; nothing of the world
             // hides them.
             pass.clear_depth();
+            models.put_gui_items(std::mem::take(&mut self.items));
             // SAFETY: the caller's.
             unsafe { models.draw_gui_items(pass, frame_data, size, lightmap, indices) };
         }
         quads(pass, frame_data, PipelineId::WorldGui, &self.over);
+        // A container screen over all of the HUD, its items over its own quads.
+        let mut screen_glyphs = 0;
+        if let Some(s) = self.screen.as_mut().filter(|s| s.shown) {
+            quads(
+                pass,
+                frame_data,
+                PipelineId::WorldGui,
+                s.layout.under.quads(),
+            );
+            if let Some((lightmap, indices)) = shared.filter(|_| !s.layout.items.is_empty()) {
+                pass.clear_depth();
+                models.put_gui_items(std::mem::take(&mut s.items));
+                // SAFETY: the caller's.
+                unsafe { models.draw_gui_items(pass, frame_data, size, lightmap, indices) };
+            }
+            quads(pass, frame_data, PipelineId::WorldGui, &s.over);
+            screen_glyphs = s.glyphs;
+        }
         self.stats = HudStats {
-            quads: drawn.saturating_sub(self.glyphs),
+            quads: drawn.saturating_sub(self.glyphs + screen_glyphs),
             items: self.layout.items.len() as u32,
-            glyphs: self.glyphs,
+            glyphs: self.glyphs + screen_glyphs,
         };
     }
 }

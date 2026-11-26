@@ -8,6 +8,7 @@
 //! (which inverts what is behind it), the quads under the hotbar's items, the items, and
 //! the quads over them, with the texts and the faces each between two of those quads.
 
+mod container;
 mod text;
 
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use ruthenium_javamath::random::JavaRandom;
 use ruthenium_protocol::text::Lang;
 use ruthenium_sim::hud::{HudEffect, HudRecord, OFF_HAND};
 
+pub use self::container::{BACKGROUNDS, ContainerDraw, background_name};
 use self::text::Words;
 pub use self::text::{HudFace, HudMemory, HudText, TextLine};
 use crate::draw::{DrawList, SpriteInfo, Sprites};
@@ -184,6 +186,7 @@ pub struct HudSprites {
     /// Unknown, then one to five bars.
     ping: [SpriteInfo; 6],
     missing: SpriteInfo,
+    container: self::container::ContainerSprites,
 }
 
 impl HudSprites {
@@ -229,6 +232,7 @@ impl HudSprites {
             }),
             ping: ["unknown", "1", "2", "3", "4", "5"].map(|n| s(&format!("icon/ping_{n}"))),
             missing: s("missingno"),
+            container: self::container::ContainerSprites::with(&s),
         }
     }
 
@@ -260,6 +264,9 @@ pub struct HudItem {
     /// A stack that just grew is squeezed sideways and stretched upwards about the
     /// middle of its lower part, `(x + 8, y + 12)`: the two factors.
     pub squeeze: Option<[f32; 2]>,
+    /// How much nearer than the others it is drawn, in GUI units (a stack on the
+    /// cursor over the slots').
+    pub z: f32,
 }
 
 /// What a frame's HUD is laid out from.
@@ -577,6 +584,7 @@ impl HudLayout {
             x,
             y,
             squeeze,
+            z: 0.0,
         });
         let c = &stack.c;
         let damage = c.damage.unwrap_or(0);
