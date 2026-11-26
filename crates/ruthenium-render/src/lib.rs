@@ -455,6 +455,8 @@ pub struct Renderer {
     chunk_fade_ms: u32,
     /// Whether the terrain's translucent layer is drawn.
     translucent: bool,
+    /// Whether the terrain's groups of quads facing away from the camera are left out.
+    face_culling: bool,
     /// Whether animated textures play.
     animate: bool,
     /// The FOV Effects option, 0 to 1.
@@ -599,6 +601,7 @@ impl Renderer {
             terrain_shader: TerrainShader::default(),
             chunk_fade_ms: terrain::DEFAULT_FADE_MS,
             translucent: true,
+            face_culling: true,
             animate: true,
             fov_effects: 1.0,
             underwater: None,
@@ -730,6 +733,7 @@ impl Renderer {
                 w.set_shader(self.terrain_shader);
                 w.set_fade_ms(self.chunk_fade_ms);
                 w.set_translucent(self.translucent);
+                w.set_face_culling(self.face_culling);
                 w.set_animate(self.animate);
             }
         }
@@ -803,6 +807,16 @@ impl Renderer {
         self.translucent = on;
         if let Some(w) = &mut self.world {
             w.set_translucent(on);
+        }
+    }
+
+    /// Whether a section's groups of solid and cutout quads that all face away from
+    /// the camera are left out of the frame (on, the default): the picture is the same,
+    /// what the GPU is given is less.
+    pub fn set_face_culling(&mut self, on: bool) {
+        self.face_culling = on;
+        if let Some(w) = &mut self.world {
+            w.set_face_culling(on);
         }
     }
 

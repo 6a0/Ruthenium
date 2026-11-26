@@ -126,6 +126,9 @@ pub struct Options {
     pub swapchain_maintenance: Option<SwapchainMaintenance>,
     /// How long a frame waits for a swapchain image.
     pub acquire_wait: AcquireWait,
+    /// How long before the GPU is expected to be done the wait for it polls instead of
+    /// sleeping (zero: it sleeps).
+    pub gpu_spin: Option<Duration>,
     /// Development: pretend the window's surface offers only sRGB formats.
     pub pretend_srgb: PretendSrgb,
     /// Development: with `--screenshot`, resize the window to this size in points once
@@ -183,6 +186,9 @@ pub struct Options {
     pub light_flicker: Option<bool>,
     /// Whether the terrain's translucent layer is drawn (the default) or left out.
     pub translucent: Option<bool>,
+    /// Whether the terrain's groups of quads facing away from the camera are left out
+    /// (the default) or drawn for the GPU to cull.
+    pub face_culling: Option<bool>,
     /// Whether block entities (chests, skulls, banners, the text of signs) are drawn (the default).
     pub block_entities: Option<bool>,
     pub players: Option<bool>,
@@ -255,6 +261,7 @@ impl Options {
             exercise_minimize: false,
             swapchain_maintenance: None,
             acquire_wait: AcquireWait::Pace,
+            gpu_spin: None,
             pretend_srgb: PretendSrgb::Never,
             screenshot_resize: None,
             texture_slots: None,
@@ -278,6 +285,7 @@ impl Options {
             sky: None,
             light_flicker: None,
             translucent: None,
+            face_culling: None,
             block_entities: None,
             players: None,
             entity_shadows: None,
@@ -386,6 +394,13 @@ impl Options {
                             ));
                         }
                     };
+                }
+                "--gpu-spin" => {
+                    let v = value("microseconds")?;
+                    let us: u64 = v
+                        .parse()
+                        .map_err(|_| format!("--gpu-spin: not microseconds: {v}"))?;
+                    o.gpu_spin = Some(Duration::from_micros(us));
                 }
                 "--acquire-wait" => {
                     let v = value("milliseconds, or pace")?;
@@ -501,7 +516,7 @@ impl Options {
                 "--fog" | "--light-flicker" | "--translucent" | "--animations"
                 | "--fov-effects" | "--block-entities" | "--players" | "--entity-shadows"
                 | "--hand" | "--block-outline" | "--view-bobbing" | "--crosshair" | "--hud"
-                | "--vignette" | "--player-list" | "--weather" => {
+                | "--vignette" | "--player-list" | "--weather" | "--face-culling" => {
                     let on = match value("on or off")?.as_str() {
                         "on" => true,
                         "off" => false,
@@ -523,6 +538,7 @@ impl Options {
                         "--vignette" => o.vignette = Some(on),
                         "--player-list" => o.player_list = Some(on),
                         "--weather" => o.weather = Some(on),
+                        "--face-culling" => o.face_culling = Some(on),
                         _ => o.translucent = Some(on),
                     }
                 }
@@ -925,6 +941,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     if let Some(on) = opts.translucent {
         renderer.set_translucent(on);
     }
+    if let Some(on) = opts.face_culling {
+        renderer.set_face_culling(on);
+    }
     if let Some(on) = opts.block_entities {
         renderer.set_block_entities(on);
     }
@@ -973,6 +992,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     };
     if let AcquireWait::Fixed(d) = opts.acquire_wait {
         renderer.frames_mut().set_acquire_limit(d, None);
+    }
+    if let Some(d) = opts.gpu_spin {
+        renderer.frames_mut().set_gpu_spin(d);
     }
 
     let mut sleeper = Sleeper::new();

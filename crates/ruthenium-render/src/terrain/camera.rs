@@ -52,6 +52,10 @@ pub struct View {
     /// Minus the eye's place inside that block: what the shader adds to positions
     /// given relative to `block`.
     pub offset: [f32; 3],
+    /// Where the projection's centre is, in blocks from `block`: the eye, moved by how
+    /// the view sways ([`Self::moved`]). Which faces are seen from in front is judged
+    /// from here.
+    pub eye: [f32; 3],
     /// From blocks relative to the eye to clip space, columns first.
     pub view_projection: [f32; 16],
     /// The frustum's left, right, bottom, top and near planes: a point `p` (relative to
@@ -68,6 +72,26 @@ const UNMOVED: [[f32; 4]; 3] = [
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// `x` with `m x = b` (rows of `m`), by Cramer's rule; `None` if `m` has no inverse.
+fn solve(m: [[f32; 3]; 3], b: [f32; 3]) -> Option<[f32; 3]> {
+    let det = |m: [[f32; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let d = det(m);
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    Some(std::array::from_fn(|c| {
+        let mut mc = m;
+        for r in 0..3 {
+            mc[r][c] = b[r];
+        }
+        det(mc) / d
+    }))
 }
 
 impl View {
@@ -106,6 +130,10 @@ impl View {
             moved[2].map(|c| -c),
         ];
         let view_projection = std::array::from_fn(|i| rows[i % 4][i / 4]);
+        // The point the moved view's space has at its origin: `moved` takes it to 0.
+        let linear: [[f32; 3]; 3] = std::array::from_fn(|r| std::array::from_fn(|c| moved[r][c]));
+        let centre = solve(linear, std::array::from_fn(|r| -moved[r][3])).unwrap_or([0.0; 3]);
+        let eye = std::array::from_fn(|i| centre[i] - offset[i]);
         let side = |sign: f32, axis: [f32; 3], scale: f32| {
             [
                 forward[0] + sign * scale * axis[0],
@@ -117,6 +145,7 @@ impl View {
         View {
             block,
             offset,
+            eye,
             view_projection,
             planes: [
                 side(1.0, right, gx),
@@ -142,6 +171,7 @@ impl View {
         View {
             block: [0; 3],
             offset: [0.0; 3],
+            eye: [0.0; 3],
             view_projection: std::array::from_fn(|i| rows[i % 4][i / 4]),
             planes: [[0.0, 0.0, 0.0, 1.0]; 5],
         }
@@ -190,6 +220,40 @@ mod tests {
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn the_eye_is_where_the_projection_has_its_centre_however_the_view_sways() {
+        // Unmoved, the eye is the pose's own place in its block.
+        let mut p = pose(30.0, 20.0);
+        p.position = [10.25, 64.5, -3.75];
+        let v = View::new(&p, 16.0 / 9.0);
+        assert_eq!(v.block, [10, 64, -4]);
+        assert_eq!(v.eye, [0.25, 0.5, 0.25]);
+        // Swayed and tilted (as `bobView` and `bobHurt` move the view): the eye, given as
+        // the shader gives positions (from the block, then `offset` added), is the one
+        // point every ray through the screen starts from: its x, y and w are 0.
+        for (angle, t) in [
+            (0.0f32, [0.05f32, -0.03, 0.0]),
+            (0.2, [0.01, 0.07, 0.02]),
+            (-0.4, [-0.06, 0.0, 0.03]),
+        ] {
+            let (s, c) = angle.sin_cos();
+            let bob = [[c, -s, 0.0, t[0]], [s, c, 0.0, t[1]], [0.0, 0.0, 1.0, t[2]]];
+            let v = View::moved(&p, 16.0 / 9.0, &bob);
+            let at: [f32; 3] = std::array::from_fn(|i| v.eye[i] + v.offset[i]);
+            let m = v.view_projection;
+            let row = |r: usize| m[r] * at[0] + m[4 + r] * at[1] + m[8 + r] * at[2] + m[12 + r];
+            for r in [0, 1, 3] {
+                assert!(
+                    row(r).abs() < 1e-5,
+                    "row {r} is {} for {angle} {t:?}",
+                    row(r)
+                );
+            }
+            // And it is not the unmoved eye.
+            assert!(v.eye != [0.25, 0.5, 0.25]);
+        }
     }
 
     #[test]

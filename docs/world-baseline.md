@@ -2,7 +2,7 @@
 
 What Ruthenium's world renderer costs on the routes the vanilla client was measured on, and where its frame time, memory and latency go. It measures an unfinished renderer: read [what the scene leaves out](#what-ruthenium-draws-and-what-it-does-not) before any ratio. The vanilla numbers are the dedicated-server runs of [baseline.md](baseline.md); the menus' own cost is in [menu-baseline.md](menu-baseline.md).
 
-The release measurements here were taken on 2026-11-24. The first, from the working tree on top of `d447d22`, is of a renderer that meshed every loaded section and drew every one inside the view: everything from [Against vanilla](#against-vanilla) on, where nothing else is said. The second, on top of `50564e0`, is of [cave culling](#cave-culling), which is the default since. A third, on top of `92e7bb6`, is of the terrain drawn as vanilla's shader draws it, with fog and sky: [the picture against vanilla's](#the-picture-against-vanillas), which also holds the two clients' pictures against each other for the first time. A fourth, on top of `63b6734`, adds [water, lava and translucent blocks](#water-lava-and-translucent-blocks). On 2026-11-25 short runs on the same working tree followed for [animated textures and the camera inside fluids](#animated-textures-and-the-camera-inside-fluids).
+The release measurements here were taken on 2026-11-24. The first, from the working tree on top of `d447d22`, is of a renderer that meshed every loaded section and drew every one inside the view: everything from [Against vanilla](#against-vanilla) on, where nothing else is said. The second, on top of `50564e0`, is of [cave culling](#cave-culling), which is the default since. A third, on top of `92e7bb6`, is of the terrain drawn as vanilla's shader draws it, with fog and sky: [the picture against vanilla's](#the-picture-against-vanillas), which also holds the two clients' pictures against each other for the first time. A fourth, on top of `63b6734`, adds [water, lava and translucent blocks](#water-lava-and-translucent-blocks). On 2026-11-25 short runs on the same working tree followed for [animated textures and the camera inside fluids](#animated-textures-and-the-camera-inside-fluids). Short runs on 2026-11-26 are of [the 1% lows](#the-1-lows).
 
 ## Machine and conditions
 
@@ -466,6 +466,47 @@ Every streak and flake is where vanilla's is; the pixels one step apart are wher
 - **Checked by rule:** which columns fall and how, against the game's own `WeatherEffectRenderer` run headless (its `extractRenderState` over a made-up level, then `prepareInstances`): 2000 cases of camera places, radii 3 to 10, rain levels, game times past the wrap of 131072 ticks, partial ticks, heights, rain, snow or nothing, and light: the number of rain and snow columns and a hash of every vertex (place, picture coordinates, colour, light) agree.
 - **When columns are gathered:** only when the camera enters another block, the level changes or the radius does; each frame only scrolls and places them (at most 440 records of 12 words).
 - **Not there:** rain's splashes and smoke on lava (no particles yet), its sound, lightning and the sky's flash; a block's own light at a column's foot (the light engine's is used: the same wherever the light is in place); the Improved Transparency path.
+
+## The 1% lows
+
+From the working tree on top of `9af0127`, 2026-11-26, same machine, profile `performance`, no viewer on the stream (no video encoding session in any run). Every number in this section is one short run of 20 s per route and variant (`--reps 1 --warmup 5 --duration 20`, no `--baseline`); no full campaign was run. The ratios are against the vanilla column of [Against vanilla](#against-vanilla). `9af0127` is the same build drawing as before, run from its own binary in the same sitting.
+
+| Route | `9af0127`: avg / 1% low / 0.1% low | Now | × vanilla |
+|---|---:|---:|---:|
+| idle | 1946 / 1310 / 1047 | 2337 / 1534 / 1259 | 1.61 / 1.71 / 1.97 |
+| spin | 1864 / 1222 / 1022 | 2249 / 1491 / 1236 | 1.47 / 1.65 / 1.95 |
+| walk | 1845 / 1173 / 979 | 2224 / 1396 / 1062 | 1.58 / 1.73 / 2.07 |
+| fly | 1899 / 1244 / 1015 | 2203 / 1457 / 1123 | 1.40 / 1.82 / 2.78 |
+
+The 1% lows rose 17 to 22% and the averages 16 to 21%. The target of twice vanilla's 1% low is still missed everywhere (1.65 to 1.82).
+
+- **The wait for the GPU no longer sleeps to the end.** Before a frame samples its input, the main thread waits for the GPU to finish the frame before. That wait was one `vkWaitSemaphores`: the core went idle, and woke late and slow. It now sleeps only until 250 µs before the GPU should be done (the frame's submission plus the last frame's GPU time), then polls the timeline; a GPU later than that by 2 ms is slept for after all (`--gpu-spin <µs>`, 0 for the old wait). In idle the median frame fell from 0.50 to 0.41 ms and the main thread's own work from 0.107 to 0.075 ms (it ran slower after a sleep), with the same GPU time; the 1% low rose from 1280 to 1521 in one pair of runs. Margins of 100, 250 and 1000 µs gave the same frames here, where every wait is short.
+- **Faces that look away from the camera are left out before the GPU sees them.** The mesher puts each section's solid and cutout quads in seven groups: one for each of the six directions a quad lying across an axis can face, taken from its packed corners, and one for the rest (crossed plants, rotated elements, sloping fluids). For each direction it keeps the plane its quads lie furthest back in. A frame skips a direction's group when the eye is behind that plane by more than 1/256 of a block: every one of those triangles faces away, and the pipelines cull back faces, so no pixel changes. The eye is the projection's own centre, with the view's sway and tilt in it. Groups next to each other are one draw, as are two drawn groups with up to 64 hidden quads between them. In idle 346 thousand quads became 258 thousand, the GPU's frame 0.323 ms became 0.295, and draws went from 930 to 1192 (main thread +8 µs). `--face-culling off` draws them all. The end-of-route frames of all four routes are the same bytes with it on and off, and as `9af0127`'s (animations, clouds and light flicker held still; the HUD's vignette off for idle and fly, where it eases in over ticks).
+
+### What holds the lows down: the compositor's turn on the GPU
+
+About 231 times a second, once per refresh of the 240 Hz display, one frame takes 175 to 225 µs longer than the median (10.7% of frames in idle, a tight cluster). The GPU's own time for that frame is unchanged: the frame waits for KWin to composite the window. With nothing of Ruthenium's queued, the compositor's work runs between two frames, and the next frame starts after it. So the slow frame is about K + G, the compositor's turn K and Ruthenium's GPU frame G, and the 1% low is set by it:
+
+- **Only G moves the 1% low.** Main-thread work hides inside K. At G = 0.295 ms the P99 frame is 0.65 ms, so K plus what follows is about 0.36 ms. Twice vanilla's 1% low in idle (P99 at most 0.558 ms) needs G of about 0.2 ms; walk and fly (0.62 ms) about 0.26.
+- **K grows with the window.** At a quarter of the pixels (`--any-drawable --width 480 --height 270`) the slow frames were 0.16 ms slower instead of 0.25.
+- **What did not help:** one frame ahead (the GPU always busy: the compositor's work then lands in full on one frame; 1% lows 1450 to 1573 against 1521 to 1545), four swapchain images, MAILBOX instead of IMMEDIATE, a swapchain of colour attachment usage only (all within 2%), and a high-priority queue (`VK_KHR_global_priority`: `ERROR_NOT_PERMITTED` without privileges).
+
+### Where the GPU's 0.295 ms go now (idle)
+
+From runs with one part left out, and the GPU's pipeline statistics (a temporary query around each frame, not in the tree):
+
+| Part | GPU time | Fragment shader invocations a frame |
+|---|---:|---:|
+| Cutout layer (leaves, grass, vines) | about 0.14 ms | about 5.2 million |
+| RGSS against nearest sampling | 0.044 | |
+| Translucent layer | 0.024 | |
+| The HUD's vignette (one blended quad over the screen) | 0.022 | 2.1 million |
+| Clouds, hand, sky, fog | 0.003 to 0.006 each | |
+
+- The frame shades about 8 million fragments for 2.07 million pixels. Without the cutout layer it shades 2.8 million and the GPU's frame is 0.156 ms.
+- **The cutout layer's quads in nearest-first order shade no fewer fragments** (8.05 against 8.06 million; tried by sorting each section's cutout quads from the camera at meshing time). With `discard` in the shader this GPU gets no fine early depth test inside the pass, only the coarse one against what the solid layer wrote: without the solid layer the cutout fragments rose to 7.55 million.
+- **Triangles cost about 0.15 ns each** whether drawn or culled: leaving out 190 thousand back-facing ones saved 0.028 ms. The 516 thousand left (in 258 thousand quads) are about 0.075 ms.
+- The vignette runs at about the GPU's blending rate for a screen of pixels, and only 10% of its texture is exactly black (where it would change nothing), so it was left as it is.
 
 ## Where a frame's time goes
 

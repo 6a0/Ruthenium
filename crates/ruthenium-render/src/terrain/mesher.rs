@@ -1,5 +1,7 @@
 //! The reference mesher: one 16 x 16 x 16 section's block models as packed vertices,
-//! block by block and quad by quad, with nothing merged or reordered.
+//! block by block and quad by quad, with nothing merged. The solid and the cutout
+//! layer's quads are then grouped by the way they face ([`super::facing`]), each group's
+//! in the order they were made.
 //!
 //! It does what 26.3's section compiler does for blocks drawn from models. A face whose
 //! neighbour hides it is left out (`Block.shouldRenderFace`). With Smooth Lighting on,
@@ -22,6 +24,7 @@ use ruthenium_sim::blocks::{offset as block_offset, seed};
 use ruthenium_sim::fluid::FluidState;
 use ruthenium_sim::scene::{HALO_SIDE, Neighbourhood};
 
+use super::facing::{self, Facings};
 use super::fluid::{self, FluidQuad};
 use super::smooth::{self, Cell, Face, Lit};
 use super::sort;
@@ -82,6 +85,8 @@ pub struct SectionMesh {
     pub connectivity: Connectivity,
     /// The blocks drawn as block entities: where in the section, and their states.
     pub block_entities: Vec<([u8; 3], u16)>,
+    /// How the solid and the cutout quads are grouped by the way they face.
+    pub facings: Facings,
 }
 
 impl SectionMesh {
@@ -99,6 +104,8 @@ pub struct Mesher {
     pairs: HashMap<(u16, u16), bool>,
     cutout: Vec<u8>,
     translucent: Vec<u8>,
+    /// For grouping a layer's quads by the way they face.
+    grouping: Vec<u8>,
     /// What smooth lighting has read of each block of the scratch so far, packed
     /// ([`pack_cell`]); 0: not read yet.
     cells: Vec<u16>,
@@ -238,6 +245,7 @@ impl Mesher {
             pairs: HashMap::new(),
             cutout: Vec::new(),
             translucent: Vec::new(),
+            grouping: Vec::new(),
             cells: Vec::new(),
             tints: TintScratch::default(),
         }
@@ -559,6 +567,20 @@ impl Mesher {
         }
         out.solid_quads = (out.vertices.len() / (4 * crate::terrain_vertex::VERTEX_BYTES)) as u32;
         out.cutout_quads = (cutout.len() / (4 * crate::terrain_vertex::VERTEX_BYTES)) as u32;
+        let mut planes = facing::no_planes();
+        facing::group(
+            &mut out.vertices,
+            &mut self.grouping,
+            &mut out.facings.solid,
+            &mut planes,
+        );
+        facing::group(
+            &mut cutout,
+            &mut self.grouping,
+            &mut out.facings.cutout,
+            &mut planes,
+        );
+        out.facings.planes = facing::planes_in_blocks(&planes);
         out.translucent_quads = out.centres.len() as u32;
         out.vertices.extend_from_slice(&cutout);
         out.vertices.extend_from_slice(&translucent);
@@ -1336,12 +1358,15 @@ mod tests {
         let all = quads(&m);
         // The stone's top is hidden by nothing (lava covers no face) and lit by the
         // lava's own light; the lava itself is lit by it too.
-        for q in &all[6..] {
-            assert!(q.iter().all(|v| (v.block_light, v.sky_light) == (240, 0)));
-            assert_eq!(q[0].colour[3], 255);
-        }
+        // (The quads are grouped by the way they face, so the lava's are not all last.)
+        let lit: Vec<_> = all
+            .iter()
+            .filter(|q| q.iter().all(|v| (v.block_light, v.sky_light) == (240, 0)))
+            .collect();
+        assert_eq!(lit.len(), 10);
+        assert!(lit.iter().all(|q| q[0].colour[3] == 255));
         // Lava's sprites: still at 112, flowing at 128.
-        assert_eq!(all[6][0].uv, [112 * 8, 0]);
+        assert!(all.iter().any(|q| q[0].uv == [112 * 8, 0]));
     }
 
     #[test]

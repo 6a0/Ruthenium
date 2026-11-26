@@ -50,6 +50,9 @@ With no command, opens the game window. Options:
                          and its GPU time
   --frames-ahead <0|1>   frames the GPU may still be working on when the next one
                          samples input (default: 0 without VSync, 1 with it)
+  --gpu-spin <µs>        how long before the GPU is expected to finish a frame the
+                         wait for it stops sleeping and polls (default 250; 0: it
+                         sleeps until the GPU is done)
   --empty-window         draw only the background, no menus (benchmarks)
   --quit-after <s>       close after <s> seconds (for benchmarks and tests)
   --acquire-wait <ms|pace>
@@ -130,6 +133,10 @@ With no command, opens the game window. Options:
                          the world as vanilla does it (first), or not at all
   --translucent <on|off> whether the world's translucent layer (water, stained glass,
                          ice) is drawn (on, the default); off, to measure it against
+  --face-culling <on|off>
+                         whether a section's faces that all look away from the camera
+                         are left out before the GPU culls them (on, the default; the
+                         picture is the same); off, to measure it against
   --block-entities <on|off>
                          whether chests, shulker boxes, skulls and banners are drawn
                          (on, the default); off, to measure it against

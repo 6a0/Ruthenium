@@ -23,6 +23,16 @@ const DROP_PRESENT_WAIT: Duration = Duration::from_millis(250);
 /// Semaphore waits a frame can carry besides its acquire (see [`FrameCtx::wait_timeline`]).
 pub const MAX_FRAME_WAITS: usize = 4;
 
+/// How long before the GPU is expected to finish a frame the wait for it stops sleeping
+/// and polls ([`FrameLoop::wait_for_gpu`]). On a GPU-bound laptop (RTX 4060, 2026-11-26)
+/// a sleep to the end added 0.08 ms to the median frame and 0.11 ms to the 1% slowest:
+/// the time to wake the core, and its work running slower after.
+pub const DEFAULT_GPU_SPIN: Duration = Duration::from_micros(250);
+
+/// The longest the wait for the GPU polls before it sleeps after all (the GPU is far
+/// later than its last frame said it would be).
+const MAX_GPU_POLL: Duration = Duration::from_millis(2);
+
 /// Named GPU zones one frame can record (see [`FrameLoop::zone_begin`]); more are ignored.
 pub const MAX_GPU_ZONES: usize = 16;
 /// Timestamp queries per frame slot: the frame's start and end, then two per zone.
@@ -36,6 +46,8 @@ struct Slot {
     acquire: vk::Semaphore,
     /// Timeline value of the last frame recorded in this slot (0: never used).
     frame: u64,
+    /// When that frame was submitted.
+    submitted: Option<Instant>,
     timed: bool,
     /// Zones recorded in the slot's frame.
     #[cfg(feature = "tracy")]
@@ -274,6 +286,11 @@ pub struct FrameLoop {
     completed_generation: u32,
     acquire_timeout: Duration,
     acquire_deadline: Option<Instant>,
+    /// How long before the GPU is expected to finish [`Self::wait_for_gpu`] polls instead
+    /// of sleeping (zero: it sleeps until woken), and the GPU time of the last frame
+    /// measured, which it expects the next to take too.
+    gpu_spin: Duration,
+    last_gpu: Duration,
     policy: PresentPolicy,
     pixel_size: (u32, u32),
     stale: bool,
@@ -323,6 +340,7 @@ impl FrameLoop {
                 cmd: vk::CommandBuffer::null(),
                 acquire: vk::Semaphore::null(),
                 frame: 0,
+                submitted: None,
                 timed: false,
                 #[cfg(feature = "tracy")]
                 zones: 0,
@@ -345,6 +363,8 @@ impl FrameLoop {
             completed_generation: 0,
             acquire_timeout: ACQUIRE_TIMEOUT,
             acquire_deadline: None,
+            gpu_spin: DEFAULT_GPU_SPIN,
+            last_gpu: Duration::ZERO,
             policy,
             pixel_size,
             stale: true,
@@ -473,7 +493,59 @@ impl FrameLoop {
     pub fn wait_for_gpu(&self, frames_ahead: u64) -> Result<(), Error> {
         profiling::scope!("wait_for_gpu");
         let target = self.frame.saturating_sub(frames_ahead);
-        self.wait_timeline(target)
+        if target == 0 || self.gpu_spin.is_zero() {
+            return self.wait_timeline(target);
+        }
+        if self.completed()? >= target {
+            return Ok(());
+        }
+        // Sleep through what the GPU should still take, but for the margin: waking from
+        // a sleep takes the core out of its idle state, and the time that takes would be
+        // added to the frame.
+        let slot = &self.slots[(target % MAX_FRAMES_IN_FLIGHT as u64) as usize];
+        if slot.frame == target
+            && let Some(submitted) = slot.submitted
+            && let Some(sleep) = (submitted + self.last_gpu)
+                .checked_duration_since(Instant::now())
+                .and_then(|left| left.checked_sub(self.gpu_spin))
+            && self.wait_timeline_for(target, sleep)?
+        {
+            return Ok(());
+        }
+        // Then poll, the core kept awake, until the frame is done; a GPU much later than
+        // its last frame is slept for after all.
+        let polling = Instant::now();
+        loop {
+            if self.completed()? >= target {
+                return Ok(());
+            }
+            if polling.elapsed() >= MAX_GPU_POLL {
+                return self.wait_timeline(target);
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// How long before the GPU is expected to finish [`Self::wait_for_gpu`] stops sleeping
+    /// and polls instead ([`DEFAULT_GPU_SPIN`] unless set); zero: it sleeps until woken.
+    pub fn set_gpu_spin(&mut self, margin: Duration) {
+        self.gpu_spin = margin;
+    }
+
+    /// Waits at most `timeout` for the timeline to reach `value`; whether it did.
+    fn wait_timeline_for(&self, value: u64, timeout: Duration) -> Result<bool, Error> {
+        let semaphores = [self.timeline];
+        let values = [value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        let nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        // SAFETY: live timeline semaphore; every waited value has been submitted.
+        match unsafe { self.gpu.device.wait_semaphores(&info, nanos) } {
+            Ok(()) => Ok(true),
+            Err(vk::Result::TIMEOUT) => Ok(false),
+            Err(e) => Err(e).ctx("vkWaitSemaphores"),
+        }
     }
 
     fn wait_timeline(&self, value: u64) -> Result<(), Error> {
@@ -506,6 +578,9 @@ impl FrameLoop {
             ..FrameTimings::default()
         };
         let gpu_time = self.read_timestamps(slot_index);
+        if let Some(t) = gpu_time {
+            self.last_gpu = Duration::from_nanos(t.nanos);
+        }
         #[cfg(feature = "tracy")]
         self.upload_zones(slot_index);
         self.reap()?;
@@ -771,6 +846,7 @@ impl FrameLoop {
         // signalled by this frame's acquire.
         unsafe { gpu.queue_submit2(std::slice::from_ref(&submit))? };
         self.timings.submit_ns = started.elapsed().as_nanos() as u64;
+        self.slots[ctx.slot].submitted = Some(started);
 
         let (Some(t), Some(sem), Some(sc)) = (target, render_done, &self.swapchain) else {
             return Ok(Presented::Skipped);

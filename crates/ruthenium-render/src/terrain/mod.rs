@@ -2,6 +2,7 @@
 //! mesher that turns a section of the level into vertices ([`Mesher`]).
 
 mod camera;
+pub(crate) mod facing;
 mod fluid;
 mod lightmap;
 pub(crate) mod medium;

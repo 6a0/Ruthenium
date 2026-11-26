@@ -43,6 +43,7 @@ use ruthenium_sim::environment::Environment;
 use ruthenium_sim::scene::{Frame, Scene, SectionKey, Stamp};
 
 use super::camera::{CameraPose, View};
+use super::facing::{self, Facings};
 use super::lightmap::{self, LightmapInputs};
 use super::medium;
 use super::mesher::{MeshOptions, Mesher, SectionMesh};
@@ -347,6 +348,8 @@ struct MeshRange {
     first_vertex: u32,
     solid_quads: u32,
     cutout_quads: u32,
+    /// How the solid and the cutout quads are grouped by the way they face.
+    facings: Facings,
     /// In blocks from the section's corner.
     bounds: [[f32; 3]; 2],
     translucent: Option<Translucent>,
@@ -622,6 +625,7 @@ struct Pending {
     vertex_bytes: u64,
     solid_quads: u32,
     cutout_quads: u32,
+    facings: Facings,
     translucent_quads: u32,
     centres: Arc<[[f32; 3]]>,
     sorted_at: [i32; 3],
@@ -651,6 +655,11 @@ struct Visible {
     first_vertex: u32,
     solid_quads: u32,
     cutout_quads: u32,
+    /// Its solid and cutout groups ([`facing::SLOTS`]), and the directions whose
+    /// groups can be seen from the camera.
+    solid: [u32; 7],
+    cutout: [u32; 7],
+    shown: u8,
     /// Its translucent quads and where their indices are.
     translucent: Option<(u32, IndexRange)>,
 }
@@ -797,6 +806,9 @@ pub(crate) struct WorldRenderer {
     fade_ms: u32,
     /// Whether the translucent layer is drawn (and sorted again as the camera moves).
     translucent: bool,
+    /// Whether a section's groups of quads the camera is behind are left out
+    /// ([`facing`]).
+    face_culling: bool,
     /// Scratch of [`Self::draw`]: each page's nearest section and then its place in the
     /// order of pages; a layer's draw commands; and the calls that read them (a vertex
     /// buffer, its first command and how many).
@@ -1039,6 +1051,7 @@ impl WorldRenderer {
             shader: TerrainShader::default(),
             fade_ms: DEFAULT_FADE_MS,
             translucent: true,
+            face_culling: true,
             page_order: Vec::new(),
             commands: Vec::new(),
             calls: Vec::new(),
@@ -1184,6 +1197,13 @@ impl WorldRenderer {
     /// Whether the translucent layer is drawn. It applies from the next frame.
     pub fn set_translucent(&mut self, on: bool) {
         self.translucent = on;
+    }
+
+    /// Whether the groups of a section's solid and cutout quads that face away from the
+    /// camera are left out of the frame (on unless said otherwise). The picture is the
+    /// same either way. It applies from the next frame.
+    pub fn set_face_culling(&mut self, on: bool) {
+        self.face_culling = on;
     }
 
     /// How the terrain's texels are filtered. It applies from the next frame.
@@ -1373,6 +1393,7 @@ impl WorldRenderer {
                 vertex_bytes,
                 solid_quads: done.mesh.solid_quads,
                 cutout_quads: done.mesh.cutout_quads,
+                facings: done.mesh.facings,
                 translucent_quads: done.mesh.translucent_quads,
                 centres: done.mesh.centres.into(),
                 sorted_at: done.sorted_at,
@@ -1631,6 +1652,7 @@ impl WorldRenderer {
                 first_vertex: (range.offset / VERTEX_BYTES as u64) as u32,
                 solid_quads: p.solid_quads,
                 cutout_quads: p.cutout_quads,
+                facings: p.facings,
                 bounds: p.bounds,
                 translucent: (p.translucent_quads > 0).then(|| Translucent {
                     quads: p.translucent_quads,
@@ -1987,6 +2009,13 @@ impl WorldRenderer {
                 .iter()
                 .map(|c| i64::from(c + 8) * i64::from(c + 8))
                 .sum();
+            // The camera from the section's corner, in blocks.
+            let eye = std::array::from_fn(|i| view.eye[i] - origin[i] as f32);
+            let shown = if self.face_culling {
+                facing::shown(&mesh.facings.planes, eye)
+            } else {
+                0b11_1111
+            };
             if let Some(t) = &mesh.translucent
                 && self.translucent
                 && !t.sorting
@@ -2003,6 +2032,9 @@ impl WorldRenderer {
                 first_vertex: mesh.first_vertex,
                 solid_quads: mesh.solid_quads,
                 cutout_quads: mesh.cutout_quads,
+                solid: mesh.facings.solid,
+                cutout: mesh.facings.cutout,
+                shown,
                 translucent: mesh.translucent.as_ref().map(|t| (t.quads, t.indices)),
             });
         }
@@ -2107,53 +2139,54 @@ impl WorldRenderer {
                 self.commands.clear();
                 self.calls.clear();
                 for (instance, v) in self.visible[..count].iter().enumerate() {
-                    let (mut quads, mut first_vertex) = if cutout {
-                        (v.cutout_quads, v.first_vertex + v.solid_quads * 4)
+                    let (groups, layer_first) = if cutout {
+                        (&v.cutout, v.first_vertex + v.solid_quads * 4)
                     } else {
-                        (v.solid_quads, v.first_vertex)
+                        (&v.solid, v.first_vertex)
                     };
-                    if quads == 0 {
-                        continue;
-                    }
-                    if bound != Some(v.page) {
-                        bound = Some(v.page);
-                        self.stats.binds += 1;
-                        if indirect {
-                            let next = self.commands.len() as u32 / DRAW_COMMAND_BYTES;
-                            self.calls.push((v.buffer, next, 0));
-                        } else {
-                            pass.bind_vertex_buffer(v.buffer, 0);
-                        }
-                    }
-                    self.stats.quads += u64::from(quads);
-                    // More quads than 16-bit indices reach: in several draws.
-                    while quads > 0 {
-                        let n = quads.min(QUADS_PER_DRAW);
-                        if indirect {
-                            self.commands.extend_from_slice(&draw_command(
-                                n * 6,
-                                0,
-                                first_vertex as i32,
-                                instance as u32,
-                            ));
-                            if let Some(call) = self.calls.last_mut() {
-                                call.2 += 1;
+                    for (start, quads) in facing::runs(groups, v.shown) {
+                        let mut quads = quads;
+                        let mut first_vertex = layer_first + start * 4;
+                        if bound != Some(v.page) {
+                            bound = Some(v.page);
+                            self.stats.binds += 1;
+                            if indirect {
+                                let next = self.commands.len() as u32 / DRAW_COMMAND_BYTES;
+                                self.calls.push((v.buffer, next, 0));
+                            } else {
+                                pass.bind_vertex_buffer(v.buffer, 0);
                             }
-                        } else {
-                            pass.draw_indexed(
-                                pipeline.index(),
-                                if pushed { &[] } else { &push },
-                                n * 6,
-                                0,
-                                first_vertex as i32,
-                                instance as u32,
-                            );
-                            pushed = true;
-                            self.stats.calls += 1;
                         }
-                        self.stats.draws += 1;
-                        quads -= n;
-                        first_vertex += n * 4;
+                        self.stats.quads += u64::from(quads);
+                        // More quads than 16-bit indices reach: in several draws.
+                        while quads > 0 {
+                            let n = quads.min(QUADS_PER_DRAW);
+                            if indirect {
+                                self.commands.extend_from_slice(&draw_command(
+                                    n * 6,
+                                    0,
+                                    first_vertex as i32,
+                                    instance as u32,
+                                ));
+                                if let Some(call) = self.calls.last_mut() {
+                                    call.2 += 1;
+                                }
+                            } else {
+                                pass.draw_indexed(
+                                    pipeline.index(),
+                                    if pushed { &[] } else { &push },
+                                    n * 6,
+                                    0,
+                                    first_vertex as i32,
+                                    instance as u32,
+                                );
+                                pushed = true;
+                                self.stats.calls += 1;
+                            }
+                            self.stats.draws += 1;
+                            quads -= n;
+                            first_vertex += n * 4;
+                        }
                     }
                 }
                 if !indirect || self.commands.is_empty() {
