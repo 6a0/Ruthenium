@@ -281,6 +281,11 @@ fn open(bytes: &[u8], dir: &std::path::Path, case: u64) -> Option<Resources> {
     let path = dir.join(format!("{case}.zip"));
     std::fs::write(&path, bytes).unwrap();
     let pack = Pack::open_untrusted(&path, &Limits::untrusted());
+    // The cheap check before a reload passes whatever the full opening takes.
+    let checked = Pack::check_untrusted(&path, &Limits::untrusted());
+    if pack.is_ok() {
+        assert!(checked.is_ok(), "case {case}: {checked:?}");
+    }
     let _ = std::fs::remove_file(&path);
     Some(Resources::new(vec![pack.ok()?]))
 }

@@ -23,6 +23,8 @@ struct Entry {
     compressed: Option<u32>,
     /// Overrides the local header offset the directory gives.
     offset: Option<u32>,
+    /// The directory entry's extra field.
+    extra: Vec<u8>,
 }
 
 fn entry(name: &str, data: &[u8]) -> Entry {
@@ -33,6 +35,7 @@ fn entry(name: &str, data: &[u8]) -> Entry {
         size: None,
         compressed: None,
         offset: None,
+        extra: Vec::new(),
     }
 }
 
@@ -69,9 +72,11 @@ fn zip_with(entries: &[Entry], count: Option<u16>) -> Vec<u8> {
         central.extend_from_slice(&compressed.to_le_bytes());
         central.extend_from_slice(&size.to_le_bytes());
         central.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
-        central.extend_from_slice(&[0; 12]);
+        central.extend_from_slice(&(e.extra.len() as u16).to_le_bytes());
+        central.extend_from_slice(&[0; 10]);
         central.extend_from_slice(&e.offset.unwrap_or(offset).to_le_bytes());
         central.extend_from_slice(&e.name);
+        central.extend_from_slice(&e.extra);
     }
     let cd_offset = out.len() as u32;
     out.extend_from_slice(&central);
@@ -499,7 +504,10 @@ fn overlays_filters_and_metadata_are_bounded() {
         r#"{{"pack": {{"description": ""}}, "filter": {{"block": [{}]}}}}"#,
         [r#"{"path": "a"}"#; 3].join(",")
     );
-    assert!(open(&zip(&[("pack.mcmeta", filters.as_bytes())]), &limits).is_err());
+    // Too many filter patterns: the filter does not read, and vanilla ignores one that
+    // does not.
+    let (p, _t) = open(&zip(&[("pack.mcmeta", filters.as_bytes())]), &limits).unwrap();
+    assert!(p.filter().is_none());
     let long = format!(r#"{{"animation": {{"frametime": 1{}}}}}"#, " ".repeat(64));
     let (res, _t) = pack(
         &[
@@ -1502,4 +1510,297 @@ fn a_budget_is_shared_by_every_reader_of_a_pack() {
     assert!(z.read(0).is_ok());
     assert!(z.read(0).is_err());
     assert_eq!(budget.used().0, 600 << 10);
+}
+
+// Found by the review of the merged branch.
+
+#[test]
+fn a_zip64_offset_near_the_end_of_memory_is_an_error_not_a_panic() {
+    // The directory's offset is 0xFFFFFFFF: the zip64 extra field gives the real one.
+    for at in [u64::MAX, u64::MAX - 3, u64::MAX - 40, 1 << 62] {
+        let mut e = entry("assets/minecraft/a.txt", b"x");
+        e.offset = Some(0xFFFF_FFFF);
+        e.extra = [
+            1u16.to_le_bytes().to_vec(),
+            8u16.to_le_bytes().to_vec(),
+            at.to_le_bytes().to_vec(),
+        ]
+        .concat();
+        let z = zip_with(&[entry("pack.mcmeta", META), e], None);
+        assert!(
+            Zip::from_vec_untrusted(z.clone(), &Limits::untrusted(), Default::default()).is_err()
+        );
+        // A trusted reader opens it lazily, and its read fails.
+        let trusted = Zip::from_vec(z).unwrap();
+        let i = trusted.find("assets/minecraft/a.txt").unwrap();
+        assert!(trusted.read(i).is_err());
+    }
+}
+
+#[test]
+fn advances_are_clamped_so_that_a_line_stays_finite() {
+    let (res, _t) = pack(
+        &[
+            (
+                "assets/minecraft/font/default.json",
+                br#"{"providers": [
+                    {"type": "space", "advances": {"a": 3.0e38, "b": -3.0e38, "c": 4}},
+                    {"type": "bitmap", "file": "minecraft:font/x.png", "ascent": -2147483648, "height": 2147483647, "chars": ["d"]}
+                ]}"#,
+            ),
+            ("assets/minecraft/textures/font/x.png", &png(8, 8, 0xFFFF_FFFF)),
+        ],
+        &Limits::untrusted(),
+    );
+    let f = font(&res);
+    assert!(f.warnings.is_empty(), "{:?}", f.warnings);
+    assert_eq!(f.glyph('c').advance, 4.0);
+    for c in ['a', 'b', 'd'] {
+        assert!(f.glyph(c).advance.abs() <= 16384.0, "{c}: {:?}", f.glyph(c));
+    }
+    let line: f32 = "a".repeat(10_000).chars().map(|c| f.glyph(c).advance).sum();
+    assert!(line.is_finite());
+    let p = f.glyph('d').picture.unwrap();
+    assert!(
+        [p.right, p.top, p.bottom]
+            .iter()
+            .all(|v| v.abs() <= 3.0 * 16384.0),
+        "{p:?}"
+    );
+}
+
+#[test]
+fn a_font_of_thousands_of_providers_looks_characters_up() {
+    // 16 000 providers, the character in the last: asked of every provider in turn,
+    // 100 000 glyphs would be 1.6 billion lookups.
+    let providers: Vec<String> = (0..16_000)
+        .map(|i| {
+            let c = char::from_u32(0x4E00 + i).unwrap();
+            format!(r#"{{"type": "space", "advances": {{"{c}": 1}}}}"#)
+        })
+        .collect();
+    let json = format!(
+        r#"{{"providers": [{}, {{"type": "space", "advances": {{"z": 7, "{}": 2}}}}]}}"#,
+        providers.join(","),
+        char::from_u32(0x4E00).unwrap()
+    );
+    let (res, _t) = pack(
+        &[("assets/minecraft/font/default.json", json.as_bytes())],
+        &Limits::untrusted(),
+    );
+    let f = font(&res);
+    // The first provider that has a character gives its glyph.
+    assert_eq!(f.glyph('\u{4E00}').advance, 1.0);
+    assert_eq!(f.glyph('z').advance, 7.0);
+    assert!(f.has('z') && !f.has('y'));
+    assert_eq!(f.glyph('y'), ruthenium_assets::font::Glyph::MISSING);
+    let started = Instant::now();
+    let mut sum = 0.0;
+    for _ in 0..100_000 {
+        sum += f.glyph('z').advance + f.glyph('y').advance;
+    }
+    assert!(sum > 0.0);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn texture_slots_are_bounded_and_followed_once() {
+    // 300 slots: more than a model may have.
+    let many: Vec<String> = (0..300).map(|i| format!(r#""s{i}": "block/x""#)).collect();
+    let many = format!(
+        r##"{{"textures": {{{}}}, "elements": [{{"from": [0, 0, 0], "to": [16, 16, 16], "faces": {{"north": {{"texture": "#s0"}}}}}}]}}"##,
+        many.join(",")
+    );
+    let (res, _t) = pack(
+        &[
+            ("assets/minecraft/atlases/blocks.json", BLOCKS_ATLAS),
+            (
+                "assets/minecraft/textures/block/x.png",
+                &png(16, 16, 0xFFFF_FFFF),
+            ),
+            (
+                "assets/minecraft/blockstates/stone.json",
+                br#"{"variants": {"": {"model": "block/many"}}}"#,
+            ),
+            ("assets/minecraft/models/block/many.json", many.as_bytes()),
+        ],
+        &Limits::untrusted(),
+    );
+    let a = blocks(&res, 16384).unwrap();
+    let models = BlockModels::bake(&res, &a);
+    assert!(
+        models.warnings.iter().any(|w| w.contains("texture slots")),
+        "{:?}",
+        models.warnings
+    );
+}
+
+#[test]
+fn a_filter_that_does_not_read_is_ignored_as_vanilla_ignores_it() {
+    let long = "a".repeat(2000);
+    for path in [long.as_str(), "a{1000}{1000}", "a{50000}", "(unclosed"] {
+        let meta = format!(
+            r#"{{"pack": {{"description": ""}}, "filter": {{"block": [{{"path": "{path}"}}]}}}}"#
+        );
+        let (p, _t) = open(
+            &zip(&[("pack.mcmeta", meta.as_bytes())]),
+            &Limits::untrusted(),
+        )
+        .unwrap();
+        assert!(p.filter().is_none(), "{path}");
+    }
+    let many = format!(
+        r#"{{"pack": {{"description": ""}}, "filter": {{"block": [{}]}}}}"#,
+        [r#"{"path": "a"}"#; 3].join(",")
+    );
+    let limits = Limits {
+        pack_filters: 2,
+        ..Limits::untrusted()
+    };
+    let (p, _t) = open(&zip(&[("pack.mcmeta", many.as_bytes())]), &limits).unwrap();
+    assert!(p.filter().is_none());
+    // One that reads filters, every pattern at once.
+    let fine = r#"{"pack": {"description": ""}, "filter": {"block": [{"path": "^a/"}, {"namespace": "x", "path": "b$"}]}}"#;
+    let (p, _t) = open(&zip(&[("pack.mcmeta", fine.as_bytes())]), &limits).unwrap();
+    let f = p.filter().unwrap();
+    assert!(f.filters_path("a/x") && f.filters_path("q/b") && !f.filters_path("q/c"));
+    // An atlas's filter source with too long a pattern: that definition is skipped.
+    let source = format!(
+        r#"{{"sources": [{{"type": "directory", "source": "block", "prefix": "block/"}}, {{"type": "filter", "pattern": {{"path": "{long}"}}}}]}}"#
+    );
+    let (res, _t) = pack(
+        &[
+            ("assets/minecraft/atlases/blocks.json", source.as_bytes()),
+            (
+                "assets/minecraft/textures/block/x.png",
+                &png(16, 16, 0xFFFF_FFFF),
+            ),
+        ],
+        &Limits::untrusted(),
+    );
+    let a = blocks(&res, 16384).unwrap();
+    assert!(a.sprite(&id("block/x")).is_none());
+    assert!(
+        a.warnings.iter().any(|w| w.contains("longer than")),
+        "{:?}",
+        a.warnings
+    );
+}
+
+#[test]
+fn missing_models_share_one_part_and_parts_and_variants_are_bounded() {
+    // Three thousand names of models that are not there, under four rotations.
+    let variants: Vec<String> = (0..3000)
+        .map(|i| format!(r#"{{"model": "block/absent{i}", "y": {}}}"#, 90 * (i % 4)))
+        .collect();
+    let def = format!(r#"{{"variants": {{"": [{}]}}}}"#, variants.join(","));
+    let (res, _t) = pack(
+        &[
+            ("assets/minecraft/atlases/blocks.json", BLOCKS_ATLAS),
+            ("assets/minecraft/blockstates/stone.json", def.as_bytes()),
+        ],
+        &Limits::untrusted(),
+    );
+    let a = blocks(&res, 16384).unwrap();
+    let models = BlockModels::bake(&res, &a);
+    assert!(models.part_count() <= 5, "{}", models.part_count());
+    // Real models, more of them than may be baked.
+    let names: Vec<String> = (0..20)
+        .map(|i| format!("assets/minecraft/models/block/m{i}.json"))
+        .collect();
+    let list: Vec<String> = (0..20)
+        .map(|i| format!(r#"{{"model": "block/m{i}"}}"#))
+        .collect();
+    let def = format!(r#"{{"variants": {{"": [{}]}}}}"#, list.join(","));
+    let mut files: Vec<(&str, &[u8])> = vec![
+        ("assets/minecraft/atlases/blocks.json", BLOCKS_ATLAS),
+        ("assets/minecraft/blockstates/stone.json", def.as_bytes()),
+    ];
+    files.extend(names.iter().map(|n| (n.as_str(), cube_model())));
+    let (res, _t) = pack(
+        &files,
+        &Limits {
+            baked_parts: 10,
+            ..Limits::untrusted()
+        },
+    );
+    let a = blocks(&res, 16384).unwrap();
+    let models = BlockModels::bake(&res, &a);
+    assert!(models.part_count() <= 12, "{}", models.part_count());
+    assert!(
+        models.warnings.iter().any(|w| w.contains("more parts")),
+        "{:?}",
+        models.warnings
+    );
+    // Variants over all the files of a bake.
+    let (res, _t) = pack(
+        &files,
+        &Limits {
+            baked_variants: 10,
+            ..Limits::untrusted()
+        },
+    );
+    let models = BlockModels::bake(&res, &a);
+    assert!(
+        models
+            .warnings
+            .iter()
+            .any(|w| w.contains("more variants than may be baked")),
+        "{:?}",
+        models.warnings
+    );
+}
+
+#[test]
+fn the_metadata_check_reads_pack_mcmeta_alone() {
+    let u = Limits::untrusted();
+    let check = |bytes: &[u8]| {
+        let t = Temp::new("check.zip", bytes);
+        Pack::check_untrusted(&t.0, &u)
+    };
+    assert!(check(&zip(&[("pack.mcmeta", META)])).is_ok());
+    assert!(matches!(
+        check(&zip(&[("x", b"x")])),
+        Err(PackError::NoMetadata(_))
+    ));
+    assert!(matches!(
+        check(&zip(&[("pack.mcmeta", br#"{"pack": {}}"#)])),
+        Err(PackError::NoMetadata(_))
+    ));
+    assert!(matches!(
+        check(&zip(&[("pack.mcmeta", b"{")])),
+        Err(PackError::BadMetadata(..))
+    ));
+    // The last of two copies, as the archive's lookup gives.
+    let two = zip(&[("pack.mcmeta", b"{"), ("pack.mcmeta", META)]);
+    assert!(check(&two).is_ok());
+    // A pack.mcmeta that claims to inflate to more than a JSON file may be.
+    let mut big = entry("pack.mcmeta", META);
+    big.size = Some(5 << 20);
+    let e = check(&zip_with(&[big], None)).unwrap_err().to_string();
+    assert!(e.contains("larger than a file may be"), "{e}");
+    // Entries that overlap, or a broken filter, are not looked at: the full opening
+    // refuses the first (the reload then fails) and ignores the second.
+    let mut entries = vec![
+        entry("pack.mcmeta", META),
+        entry("assets/minecraft/a.txt", &[0; 100]),
+    ];
+    let mut again = entry("assets/minecraft/b.txt", &[0; 100]);
+    again.offset = Some(0);
+    entries.push(again);
+    let overlapping = zip_with(&entries, None);
+    assert!(check(&overlapping).is_ok());
+    assert!(open(&overlapping, &u).is_err());
+    // Over its limits, the check fails as the opening does.
+    assert!(check(&[0xFF; 100]).is_err());
+    let limits = Limits {
+        pack_bytes: 10,
+        ..u
+    };
+    let t = Temp::new("check-big.zip", &zip(&[("pack.mcmeta", META)]));
+    assert!(Pack::check_untrusted(&t.0, &limits).is_err());
 }
