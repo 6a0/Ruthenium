@@ -61,14 +61,34 @@ struct Sprite {
     padding: u32,
     size: (u32, u32),
     head: Playhead,
-    /// The atlas does not show what it should yet.
+    /// The atlas does not show what it should, and the sprite is to be written.
     stale: bool,
+    /// It should be written, and waits for room in a tick's budget ([`MAX_STALE_TEXELS`]).
+    owed: bool,
 }
 
+/// The most texels the sprites to be written may take at once: 8 MiB of RGBA. The game's
+/// 56 animated sprites take 187 000 if all are written at once, padding and levels too; a pack's 65 536 interpolated sprites would
+/// be every texel of the atlas, every tick, composed on the frame's thread. Past it
+/// sprites wait their turn (round the list, so that each gets one): they move on less
+/// smoothly, and the work stays bounded.
+pub const MAX_STALE_TEXELS: usize = 1 << 21;
+
 impl Sprite {
+    /// A tick goes by: the sprite is owed a write if it shows another frame, or blends.
     fn tick(&mut self) {
         let changed = self.head.tick(&self.animation.frames);
-        self.stale |= changed || self.animation.interpolate;
+        self.owed |= changed || self.animation.interpolate;
+    }
+
+    /// Texels a write of it takes: every level's slot, padding and all.
+    fn texels(&self) -> usize {
+        (0..self.levels.len() as u32)
+            .map(|l| {
+                let pad = 2 * (self.padding >> l) as usize;
+                ((self.size.0 >> l) as usize + pad) * ((self.size.1 >> l) as usize + pad)
+            })
+            .sum()
     }
 
     /// Appends the slot's texels at one level.
@@ -130,6 +150,10 @@ impl Sprite {
 #[derive(Debug, Default)]
 pub struct AtlasAnimations {
     sprites: Vec<Sprite>,
+    /// Where the next tick starts handing out writes.
+    cursor: usize,
+    /// What the sprites to be written may take ([`MAX_STALE_TEXELS`]).
+    budget: usize,
 }
 
 impl AtlasAnimations {
@@ -156,10 +180,15 @@ impl AtlasAnimations {
                     size: (width, height),
                     head: Playhead::default(),
                     stale: false,
+                    owed: false,
                 })
             })
             .collect();
-        AtlasAnimations { sprites }
+        AtlasAnimations {
+            sprites,
+            cursor: 0,
+            budget: MAX_STALE_TEXELS,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -170,11 +199,47 @@ impl AtlasAnimations {
         self.sprites.is_empty()
     }
 
-    /// A tick goes by.
+    /// A tick goes by. The sprites owed a write are to be written, as many as the budget
+    /// holds with those still waiting to be, from where the last tick stopped.
     pub fn tick(&mut self) {
         for s in &mut self.sprites {
             s.tick();
         }
+        let mut taken: usize = self.stale_texels();
+        let n = self.sprites.len();
+        for k in 0..n {
+            let i = (self.cursor + k) % n;
+            let s = &mut self.sprites[i];
+            if !s.owed {
+                continue;
+            }
+            if s.stale {
+                s.owed = false;
+                continue;
+            }
+            let texels = s.texels();
+            if taken > 0 && taken.saturating_add(texels) > self.budget {
+                self.cursor = i;
+                return;
+            }
+            s.stale = true;
+            s.owed = false;
+            taken = taken.saturating_add(texels);
+        }
+    }
+
+    /// Texels a write of the sprite takes, all its levels.
+    pub fn texels(&self, sprite: usize) -> usize {
+        self.sprites.get(sprite).map_or(0, Sprite::texels)
+    }
+
+    /// Texels of every sprite to be written.
+    pub fn stale_texels(&self) -> usize {
+        self.sprites
+            .iter()
+            .filter(|s| s.stale)
+            .map(Sprite::texels)
+            .sum()
     }
 
     /// How many sprites the atlas does not show as it should.
@@ -225,6 +290,7 @@ mod tests {
             size: (2, 2),
             head: Playhead::default(),
             stale: false,
+            owed: false,
         }
     }
 
@@ -237,9 +303,9 @@ mod tests {
         let mut s = sprite(&[(0, 2), (3, 1), (3, 2), (1, 1)], false);
         let mut seen = Vec::new();
         for _ in 0..7 {
-            s.stale = false;
+            s.owed = false;
             s.tick();
-            seen.push((s.head.frame, s.head.ticks, s.stale));
+            seen.push((s.head.frame, s.head.ticks, s.owed));
         }
         // The second and the third show the same frame: nothing to write between them.
         assert_eq!(
@@ -254,12 +320,12 @@ mod tests {
                 (0, 1, false),
             ]
         );
-        // Not written yet, it stays to be written.
-        s.stale = true;
+        // Not written yet, it stays owed.
+        s.owed = true;
         s.tick();
-        assert!(s.stale);
+        assert!(s.owed);
         s.tick();
-        assert!(s.stale);
+        assert!(s.owed);
     }
 
     #[test]
@@ -303,7 +369,7 @@ mod tests {
         assert_eq!(first(&s), [0, 10]);
         // Every tick is written; a third of the way is 0.333.
         s.tick();
-        assert!(s.stale);
+        assert!(s.owed);
         assert_eq!(s.head.blend(&s.animation.frames), (0, 1, 0.333));
         assert_eq!(first(&s), [7, 17]);
         s.tick();
@@ -324,6 +390,8 @@ mod tests {
                 sprite(&[(0, 1), (1, 1)], false),
                 sprite(&[(0, 5), (1, 5)], true),
             ],
+            cursor: 0,
+            budget: MAX_STALE_TEXELS,
         };
         assert_eq!(a.next_stale(0), None);
         a.tick();
@@ -336,6 +404,47 @@ mod tests {
         a.written(1);
         a.written(2);
         assert_eq!(a.next_stale(0), None);
+    }
+
+    /// A pack's thousand interpolated sprites, each written every tick: the sprites to be
+    /// written never take more than the budget, and every one gets its turn.
+    #[test]
+    fn a_ticks_writes_are_bounded_and_each_sprite_gets_its_turn() {
+        let one = sprite(&[(0, 1), (1, 1)], true).texels();
+        assert_eq!(one, 36 + 9);
+        let mut a = AtlasAnimations {
+            sprites: (0..1000).map(|_| sprite(&[(0, 1), (1, 1)], true)).collect(),
+            cursor: 0,
+            budget: 100 * one,
+        };
+        let mut written = vec![0u32; 1000];
+        for _ in 0..30 {
+            a.tick();
+            assert!(a.stale_texels() <= 100 * one, "{}", a.stale_texels());
+            // The frame writes them all.
+            let mut at = 0;
+            while let Some(s) = a.next_stale(at) {
+                at = s + 1;
+                a.written(s);
+                written[s] += 1;
+            }
+        }
+        // A hundred a tick: each of the thousand three times in thirty ticks.
+        assert!(written.iter().all(|&w| w == 3), "{written:?}");
+        // While none can be written (no room to upload), no more are handed out.
+        for _ in 0..5 {
+            a.tick();
+            assert!(a.stale_texels() <= 100 * one);
+        }
+        // A sprite larger than the whole budget is still written, alone.
+        let mut a = AtlasAnimations {
+            sprites: (0..3).map(|_| sprite(&[(0, 1), (1, 1)], true)).collect(),
+            cursor: 0,
+            budget: 10,
+        };
+        a.tick();
+        assert_eq!(a.stale_count(), 1);
+        assert_eq!(a.stale_texels(), one);
     }
 
     /// Where the game's own animation states stand after each of 64 ticks, as hashes of
@@ -368,9 +477,9 @@ mod tests {
                 let frames: Vec<(u32, u32)> = (0..frames).map(|_| (next(4), 1 + next(7))).collect();
                 let mut s = sprite(&frames, interpolate);
                 for _ in 0..64 {
-                    s.stale = false;
+                    s.owed = false;
                     s.tick();
-                    for word in [s.head.frame as u32, s.head.ticks, u32::from(s.stale)] {
+                    for word in [s.head.frame as u32, s.head.ticks, u32::from(s.owed)] {
                         for byte in word.to_le_bytes() {
                             hash = (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
                         }
