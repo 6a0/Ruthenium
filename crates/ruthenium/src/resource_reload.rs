@@ -78,7 +78,9 @@ pub fn open_server_pack(path: &Path) -> Result<Pack, String> {
 /// Whether a downloaded file is a pack that can be loaded (`readPackMetadata`), for the
 /// session's check when a reload starts.
 pub fn is_loadable(path: &Path) -> bool {
-    match open_server_pack(path) {
+    // Only pack.mcmeta is read here (no directory walk, no filter compiled); a pack that
+    // passes and is still refused when the reload opens it fails as the reload.
+    match Pack::check_untrusted(path, &Limits::untrusted()).map_err(|e| e.to_string()) {
         Ok(_) => true,
         Err(e) => {
             eprintln!("[server packs] {e}");
@@ -542,6 +544,27 @@ mod tests {
         assert_eq!(atlas_limit(32768, 0), 32768);
         assert_eq!(atlas_limit(32768, 1), MAX_SERVER_ATLAS);
         assert_eq!(atlas_limit(4096, 3), 4096);
+    }
+
+    /// The session's check reads only the metadata: a zip with a valid pack.mcmeta is
+    /// loadable, one without it (or with a broken one) is not.
+    #[test]
+    fn the_check_reads_the_packs_metadata() {
+        let dir = temp("check");
+        let good = dir.join("good.zip");
+        std::fs::write(&good, zip_bytes(&[("pack.mcmeta", MCMETA)])).unwrap();
+        let none = dir.join("none.zip");
+        std::fs::write(
+            &none,
+            zip_bytes(&[("assets/minecraft/lang/en_us.json", b"{}")]),
+        )
+        .unwrap();
+        let broken = dir.join("broken.zip");
+        std::fs::write(&broken, zip_bytes(&[("pack.mcmeta", b"{\"pack\":")])).unwrap();
+        assert!(is_loadable(&good));
+        assert!(!is_loadable(&none));
+        assert!(!is_loadable(&broken));
+        assert!(!is_loadable(&dir.join("missing.zip")));
     }
 
     /// A server pack's language goes over vanilla's, the newest pack over older ones.
