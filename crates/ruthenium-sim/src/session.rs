@@ -77,6 +77,9 @@ use crate::scene::{
 use crate::scoreboard::Scoreboard;
 use crate::weather::Weather;
 use crate::world::{BiomeInfo, ChunkPacket, Level, global_bits};
+
+mod containers;
+pub use containers::{At, ContainerView, Pointer, ScreenInput};
 use ruthenium_audio::SoundSource;
 use ruthenium_protocol::profile::ResolvableProfile;
 
@@ -173,6 +176,11 @@ pub enum SessionEvent {
     /// The server brought the player back (`handleRespawn`): the death screen closes and
     /// the level loads; [`SessionEvent::Loaded`] follows.
     Respawned,
+    /// A container screen opened (the inventory, a chest...): its events go to
+    /// [`Session::screen_input`] and it is drawn from [`Session::container_view`].
+    ContainerOpened,
+    /// The container screen closed.
+    ContainerClosed,
     /// The last event.
     Closed(Closed),
 }
@@ -227,6 +235,14 @@ struct FrameInput {
     turns: Vec<(f64, f64)>,
     /// The FOV Effects option, when it was set this frame.
     fov_effects: Option<f32>,
+    /// Presses of the inventory key in the world.
+    inventory_clicks: u32,
+    /// A container screen's events, in order.
+    screen_inputs: Vec<ScreenInput>,
+    /// The pointer over a screen as the frame ends, and whether it moved with a button
+    /// held (a drag).
+    pointer: Option<Pointer>,
+    drag: bool,
 }
 
 /// The local player as of the last tick, for the screen.
@@ -276,6 +292,7 @@ pub struct Session {
     /// The input of the frame under way, sent with [`Session::frame`].
     input: Mutex<FrameInput>,
     view: Arc<Mutex<Option<PlayerView>>>,
+    container_view: Arc<Mutex<Option<Arc<ContainerView>>>>,
     /// What the game thread publishes for drawing.
     scene: Scene,
     /// The turns handed over, each with its frame's number, until a published frame
@@ -328,6 +345,8 @@ impl Session {
         }
         let view = Arc::new(Mutex::new(None));
         let game_view = view.clone();
+        let container_view = Arc::new(Mutex::new(None));
+        let game_container_view = container_view.clone();
         let game_handoff = handoff.clone();
         let thread = std::thread::Builder::new()
             .name("game".into())
@@ -335,6 +354,7 @@ impl Session {
                 let mut game =
                     Game::new(connection, known_packs, physics, tx, publisher, information);
                 game.view = game_view;
+                game.container_view = game_container_view;
                 game.sounds = sound;
                 game.profile_keys = profile_keys;
                 game.run(&game_handoff);
@@ -344,6 +364,7 @@ impl Session {
             events,
             input: Mutex::default(),
             view,
+            container_view,
             scene,
             turns: Mutex::default(),
             thread: Some(thread),
@@ -551,6 +572,30 @@ impl Session {
     pub fn view(&self) -> Option<PlayerView> {
         lock(&self.view).clone()
     }
+
+    /// A press of the inventory key in the world, read by the next tick.
+    pub fn inventory_key(&self) {
+        lock(&self.input).inventory_clicks += 1;
+    }
+
+    /// An event of the open container screen (a mouse button, a key, a drag, or a
+    /// script's click), run with the frame's other events.
+    pub fn screen_input(&self, e: ScreenInput) {
+        lock(&self.input).screen_inputs.push(e);
+    }
+
+    /// Where the pointer is over a screen as the frame ends, in GUI units, on a GUI of
+    /// that size; `drag`: it moved this frame with a button held.
+    pub fn set_pointer(&self, pointer: Pointer, drag: bool) {
+        let mut input = lock(&self.input);
+        input.pointer = Some(pointer);
+        input.drag |= drag;
+    }
+
+    /// The open container screen as of the last frame (`None` without one).
+    pub fn container_view(&self) -> Option<Arc<ContainerView>> {
+        lock(&self.container_view).clone()
+    }
 }
 
 impl Drop for Session {
@@ -622,6 +667,9 @@ struct Game {
     /// Tests set the millisecond clock by hand.
     manual_ms: Option<i64>,
     view: Arc<Mutex<Option<PlayerView>>>,
+    /// The container screen, its menus' packets, and what is drawn of it.
+    containers: containers::Containers,
+    container_view: Arc<Mutex<Option<Arc<ContainerView>>>>,
     /// Where the level and each frame are published for drawing.
     publisher: ScenePublisher,
     /// The number of the last frame input taken in, and when it was handed over.
@@ -833,6 +881,8 @@ impl Game {
             started: Instant::now(),
             manual_ms: None,
             view: Arc::default(),
+            containers: containers::Containers::default(),
+            container_view: Arc::default(),
             publisher,
             input_sequence: 0,
             input_at: None,
@@ -1055,9 +1105,15 @@ impl Game {
         self.ticks += u64::from(ticks);
         // `handleAccumulatedMovement`, without a player nothing turns.
         if let Some(w) = &mut self.world {
-            for &(xo, yo) in &input.turns {
-                w.player.turn(xo, yo);
+            // (No camera turns under a container screen: the mouse isn't grabbed.)
+            if !self.containers.screen.is_some() {
+                for &(xo, yo) in &input.turns {
+                    w.player.turn(xo, yo);
+                }
             }
+        }
+        if self.container_screen_open() {
+            self.container_frame(input.drag);
         }
         self.publish();
         self.update_view();
@@ -1309,6 +1365,14 @@ impl Game {
     /// The frame's events (`runAllTasks`, after the packets): keys and scrolls apply
     /// now, hotbar presses wait for the ticks.
     fn take_input(&mut self, input: &FrameInput) {
+        // A container screen's events first: Escape there gives the keys back.
+        if let Some(p) = input.pointer {
+            self.set_pointer(p);
+        }
+        for e in &input.screen_inputs {
+            self.screen_input(e);
+        }
+        self.containers.inventory_clicks += input.inventory_clicks;
         self.keys = input.keys;
         self.held_keys = input.keys;
         self.use_keys.use_down = input.use_down;
@@ -1323,7 +1387,7 @@ impl Game {
         }
         // The death screen or the bed screen took the keys (`KeyMapping.releaseAll`)
         // and keeps them.
-        if self.death_screen.is_some() || self.bed_screen {
+        if self.death_screen.is_some() || self.bed_screen || self.container_screen_open() {
             self.release_keys();
         }
         // Without a player (`minecraft.player == null`) the input goes nowhere.
@@ -1772,7 +1836,10 @@ impl Game {
         // screen ticks, its buttons working from its 20th tick.
         // With the bed screen open, it closes once the player is out of bed; with no
         // screen open, a sleeping player gets it.
-        let no_screen = !self.screen_open && self.death_screen.is_none() && !self.bed_screen;
+        let no_screen = !self.screen_open
+            && self.death_screen.is_none()
+            && !self.bed_screen
+            && self.containers.screen.is_none();
         let found_dead = no_screen && w.player.is_dead_or_dying();
         let show_death_screen = w.player.show_death_screen;
         if self.bed_screen && !w.player.is_sleeping() {
@@ -1804,6 +1871,38 @@ impl Game {
                 let _ = self.events.send(SessionEvent::RespawnReady);
             }
         }
+        self.container_tick();
+        // `pick`, then `handleKeybinds` unless a screen is open (the level-loading screen
+        // or another): one press per hotbar key per tick (spectators' hotbar keys open
+        // the spectator menu instead, which isn't there yet), then the inventory key
+        // (whose screen lets go of the keys the rest of it reads), then the hands. A
+        // screen makes attacks wait for the attack key to be let go.
+        let keybinds = self.physics.is_some()
+            && self.world.as_ref().is_some_and(|w| w.loaded)
+            && !(self.screen_open
+                || self.death_screen.is_some()
+                || self.bed_screen
+                || self.containers.screen.is_some());
+        let mut hit = None;
+        if keybinds && let (Some(w), Some(physics)) = (&mut self.world, &self.physics) {
+            let env = Env {
+                level: &w.level,
+                blocks: &physics.blocks,
+                tags: &self.tags,
+                colliders: &[],
+                others: None,
+            };
+            hit = Some(pick_target(&env, &w.entities, &self.players, &w.player));
+            for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
+                if *pending > 0 {
+                    *pending -= 1;
+                    if !w.player.spectator {
+                        w.player.inventory.selected = slot as i32;
+                    }
+                }
+            }
+            self.inventory_key();
+        }
         let Some(w) = &mut self.world else {
             return;
         };
@@ -1817,29 +1916,7 @@ impl Game {
             self.connection.send(play::client_tick_end());
             return;
         };
-        // `pick`, then `handleKeybinds` unless a screen is open (the level-loading screen
-        // or another): one press per hotbar key per tick (spectators' hotbar keys open
-        // the spectator menu instead, which isn't there yet), then the hands. A screen
-        // makes attacks wait for the attack key to be let go.
-        if !w.loaded || self.screen_open || self.death_screen.is_some() || self.bed_screen {
-            w.game_mode.screen_open();
-        } else {
-            let env = Env {
-                level: &w.level,
-                blocks: &physics.blocks,
-                tags: &self.tags,
-                colliders: &[],
-                others: None,
-            };
-            let hit = pick_target(&env, &w.entities, &self.players, &w.player);
-            for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
-                if *pending > 0 {
-                    *pending -= 1;
-                    if !w.player.spectator {
-                        w.player.inventory.selected = slot as i32;
-                    }
-                }
-            }
+        if let (true, Some(hit)) = (keybinds, hit) {
             let mut world = interact::World::new(
                 &mut w.level,
                 &mut w.predictions,
@@ -2092,6 +2169,7 @@ impl Game {
                     .switch(Protocol::Configuration, play::configuration_acknowledged());
                 self.phase = Phase::Configuration;
                 self.collecting = Configured::default();
+                self.drop_screen(false);
                 self.world = None;
                 self.publisher.end_level();
                 self.death_screen = None;
@@ -2109,6 +2187,7 @@ impl Game {
                     login.simulation_distance,
                     login.spawn.game_type
                 );
+                self.drop_screen(false);
                 let (level, biome_bits) = self.new_level(&login.spawn);
                 self.simulation_distance = login.simulation_distance;
                 let entities = self.new_entities(login.player_id);
@@ -2135,6 +2214,8 @@ impl Game {
                 spawn,
                 data_to_keep,
             } => {
+                // `handleRespawn`: another menu open is closed first.
+                self.drop_screen(true);
                 let (level, biome_bits) = self.new_level(&spawn);
                 let id = self
                     .world
@@ -2579,17 +2660,32 @@ impl Game {
                 items,
                 carried,
             } => {
-                // Container 0 is the inventory; other menus aren't tracked yet.
+                if crate::menu::log_enabled() {
+                    let n = items.iter().filter(|s| !s.is_empty()).count();
+                    eprintln!(
+                        "[menu] got set_content container {container_id} state {state_id}: {} slots ({n} filled), carried {}*{}",
+                        items.len(),
+                        carried.item,
+                        carried.count
+                    );
+                }
+                // Container 0 is the inventory's menu, whatever is open; another goes to
+                // the open menu if it is that one.
                 if let Some(w) = &mut self.world
                     && let Some(physics) = &self.physics
-                    && container_id == 0
                 {
                     let it = &physics.items;
                     let stacks = items.iter().map(|s| it.stack(s)).collect();
-                    w.player
-                        .inventory
-                        .initialize(state_id, stacks, it.stack(&carried));
-                    self.hud.slots_replaced();
+                    let p = &mut w.player;
+                    let menu = if container_id == 0 {
+                        Some(&mut p.menus.inventory)
+                    } else {
+                        p.menus.open.as_mut().filter(|m| m.id == container_id)
+                    };
+                    if let Some(menu) = menu {
+                        menu.initialize(&mut p.inventory, state_id, stacks, it.stack(&carried));
+                        self.hud.slots_replaced();
+                    }
                 }
             }
             play::Clientbound::ContainerSetSlot {
@@ -2598,28 +2694,49 @@ impl Game {
                 slot,
                 item,
             } => {
+                if crate::menu::log_enabled() {
+                    eprintln!(
+                        "[menu] got set_slot container {container_id} state {state_id} slot {slot}: {}*{}{}",
+                        item.item,
+                        item.count,
+                        if item.patch.is_empty() { "" } else { "+patch" }
+                    );
+                }
                 if let Some(w) = &mut self.world
                     && let Some(physics) = &self.physics
-                    && container_id == 0
                 {
                     let s = physics.items.stack(&item);
-                    // `InventoryMenu.isHotbarSlot`: the hotbar, then the off hand.
-                    if let Some(shown @ 0..crate::hud::SLOTS) =
-                        usize::try_from(slot).ok().and_then(|i| i.checked_sub(36))
+                    let p = &mut w.player;
+                    if container_id == 0 {
+                        // `InventoryMenu.isHotbarSlot`: the hotbar, then the off hand.
+                        if let Some(shown @ 0..crate::hud::SLOTS) =
+                            usize::try_from(slot).ok().and_then(|i| i.checked_sub(36))
+                        {
+                            let at = if shown == crate::hud::OFF_HAND {
+                                crate::inventory::SLOT_OFFHAND
+                            } else {
+                                shown
+                            };
+                            self.hud.slot_set(shown, p.inventory.get(at), &s);
+                        }
+                        p.menus
+                            .inventory
+                            .set_item(&mut p.inventory, i32::from(slot), state_id, s);
+                    } else if let Some(menu) =
+                        p.menus.open.as_mut().filter(|m| m.id == container_id)
                     {
-                        let at = if shown == crate::hud::OFF_HAND {
-                            crate::inventory::SLOT_OFFHAND
-                        } else {
-                            shown
-                        };
-                        self.hud.slot_set(shown, w.player.inventory.get(at), &s);
+                        menu.set_item(&mut p.inventory, i32::from(slot), state_id, s);
+                        self.hud.slots_replaced();
                     }
-                    w.player
-                        .inventory
-                        .set_menu_slot(i32::from(slot), state_id, s);
                 }
             }
             play::Clientbound::SetPlayerInventory { slot, item } => {
+                if crate::menu::log_enabled() {
+                    eprintln!(
+                        "[menu] got set_player_inventory slot {slot}: {}*{}",
+                        item.item, item.count
+                    );
+                }
                 if let Some(w) = &mut self.world
                     && let Some(physics) = &self.physics
                     && let Ok(slot) = usize::try_from(slot)
@@ -2635,12 +2752,43 @@ impl Game {
                 }
             }
             play::Clientbound::SetCursorItem { item } => {
+                if crate::menu::log_enabled() {
+                    eprintln!("[menu] got set_cursor_item {}*{}", item.item, item.count);
+                }
                 if let Some(w) = &mut self.world
                     && let Some(physics) = &self.physics
                 {
-                    w.player.inventory.carried = physics.items.stack(&item);
+                    w.player.menus.container_mut().carried = physics.items.stack(&item);
                 }
             }
+            play::Clientbound::OpenScreen {
+                container_id,
+                menu_type,
+                title,
+            } => self.open_screen(container_id, menu_type, title),
+            play::Clientbound::ContainerClose { container_id } => {
+                eprintln!("[menu] the server closed container {container_id}");
+                self.client_side_close_container();
+            }
+            play::Clientbound::ContainerSetData {
+                container_id,
+                id,
+                value,
+            } => {
+                if let Some(w) = &mut self.world
+                    && w.player.menus.container().id == container_id
+                {
+                    w.player
+                        .menus
+                        .container_mut()
+                        .set_data(i32::from(id), i32::from(value));
+                }
+            }
+            play::Clientbound::MountScreenOpen {
+                container_id,
+                inventory_columns,
+                entity_id,
+            } => self.mount_screen_open(container_id, inventory_columns, entity_id),
             play::Clientbound::Cooldown { group, duration } => {
                 if let Some(w) = &mut self.world {
                     if duration == 0 {

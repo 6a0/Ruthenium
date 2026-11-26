@@ -757,6 +757,9 @@ pub struct LocalPlayer {
     pub old_rot: (f32, f32),
     /// The inventory and the hands.
     pub inventory: Inventory,
+    /// The inventory's menu and any other open over it (`inventoryMenu`,
+    /// `containerMenu`).
+    pub menus: crate::menu::Menus,
     /// `ItemCooldowns`.
     pub cooldowns: Cooldowns,
     /// `FoodData.saturationLevel` (`set_health`, and eating).
@@ -971,6 +974,7 @@ impl LocalPlayer {
             old_position: [0.0; 3],
             old_rot: (-180.0, 0.0),
             inventory: Inventory::default(),
+            menus: crate::menu::Menus::default(),
             cooldowns: Cooldowns::default(),
             saturation: 5.0,
             experience_progress: 0.0,

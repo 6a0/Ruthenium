@@ -57,6 +57,7 @@ pub mod item_name;
 pub mod keybinds;
 pub mod level_load;
 pub mod light;
+pub mod menu;
 pub mod mining;
 pub mod pick;
 pub mod piston;

@@ -555,6 +555,10 @@ pub struct Components {
     pub potion_name: Option<Arc<str>>,
     /// `written_book_content`'s title.
     pub book_title: Option<Arc<str>>,
+    /// `cooking_fuel`: a furnace burns it.
+    pub cooking_fuel: bool,
+    /// One of its enchantments has `prevent_armor_change` (curse of binding).
+    pub prevent_armor_change: bool,
 }
 
 /// What the registered potion `id` is called in names (`Potion.name`): longer and
@@ -734,6 +738,7 @@ impl Components {
                 Some(Kind::BaseColor) => self.base_color = None,
                 Some(Kind::BannerPatterns) => self.banner_patterns = None,
                 Some(Kind::Profile) => self.profile = None,
+                Some(Kind::CookingFuel) => self.cooking_fuel = false,
                 _ => {}
             }
         }
@@ -929,6 +934,7 @@ impl Components {
             };
             match kind {
                 Some(Kind::Compostable) => self.compostable = true,
+                Some(Kind::CookingFuel) => self.cooking_fuel = true,
                 Some(Kind::JukeboxPlayable) => self.jukebox_playable = true,
                 Some(Kind::LodestoneTracker) => self.lodestone = true,
                 Some(Kind::CustomName) => self.custom_name = text(c),
@@ -1074,6 +1080,44 @@ impl Stack {
     /// `shrink`.
     pub fn shrink(&mut self, n: i32) {
         self.count -= n;
+    }
+
+    /// `grow`.
+    pub fn grow(&mut self, n: i32) {
+        self.count += n;
+    }
+
+    /// `copyWithCount`: a new object (the empty stack stays the empty one).
+    pub fn copy_with_count(&self, count: i32) -> Stack {
+        if self.is_empty() {
+            return Stack::empty();
+        }
+        let mut s = self.copy();
+        s.count = count;
+        s
+    }
+
+    /// `split`: up to `n` of this stack as a new one, the rest staying here.
+    pub fn split(&mut self, n: i32) -> Stack {
+        let n = n.min(self.count);
+        let taken = self.copy_with_count(n);
+        self.shrink(n);
+        taken
+    }
+
+    /// `getMaxStackSize` (1 without the component, as the empty stack).
+    pub fn max_stack_size(&self) -> i32 {
+        self.c.max_stack_size()
+    }
+
+    /// `isDamaged`: damageable, with damage above 0.
+    pub fn is_damaged(&self) -> bool {
+        self.c.damageable() && self.c.damage.unwrap_or(0) > 0
+    }
+
+    /// `isStackable`: more than one fits, and it is not a damaged tool.
+    pub fn is_stackable(&self) -> bool {
+        self.max_stack_size() > 1 && !self.is_damaged()
     }
 
     /// `ItemStack.consume`: used up unless the player has infinite materials.
@@ -1267,6 +1311,7 @@ impl Items {
             c.crossbow_charge_ticks = self.enchantments.crossbow_charge_ticks(&c.enchantments);
         }
         c.spin_attack_strength = self.enchantments.spin_attack_strength(&c.enchantments);
+        c.prevent_armor_change = self.enchantments.prevents_armor_change(&c.enchantments);
         c.remainder = c
             .use_remainder
             .as_ref()
@@ -1333,6 +1378,7 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
     c.compostable = has("minecraft:compostable");
     c.jukebox_playable = has("minecraft:jukebox_playable");
     c.glider = has("minecraft:glider");
+    c.cooking_fuel = has("minecraft:cooking_fuel");
     if let Some(o) = v.get("minecraft:block_state").and_then(|o| o.as_object()) {
         let props = o
             .iter()

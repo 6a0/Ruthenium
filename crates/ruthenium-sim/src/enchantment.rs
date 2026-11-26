@@ -188,6 +188,8 @@ pub struct Enchantment {
     /// `minecraft:trident_spin_attack_strength`.
     pub spin_attack_strength: Option<ValueEffect>,
     pub crossbow_charge_time: Option<ValueEffect>,
+    /// `minecraft:prevent_armor_change` (curse of binding).
+    pub prevent_armor_change: bool,
 }
 
 impl Enchantment {
@@ -198,6 +200,9 @@ impl Enchantment {
         Enchantment {
             spin_attack_strength: effect("minecraft:trident_spin_attack_strength"),
             crossbow_charge_time: effect("minecraft:crossbow_charge_time"),
+            prevent_armor_change: effects
+                .and_then(|e| e.get("minecraft:prevent_armor_change"))
+                .is_some(),
         }
     }
 }
@@ -294,6 +299,14 @@ impl Enchantments {
     /// the value, from 0, in the stack's order.
     pub fn spin_attack_strength(&self, enchantments: &[(i32, i32)]) -> f32 {
         self.modify(enchantments, 0.0, |e| e.spin_attack_strength.as_ref())
+    }
+
+    /// `EnchantmentHelper.has(stack, PREVENT_ARMOR_CHANGE)`: one of the stack's
+    /// enchantments has the effect.
+    pub fn prevents_armor_change(&self, enchantments: &[(i32, i32)]) -> bool {
+        enchantments
+            .iter()
+            .any(|&(id, _)| self.get(id).is_some_and(|e| e.prevent_armor_change))
     }
 
     /// Loading takes 1.25 seconds before the stack's charge-time effects are applied.

@@ -1634,6 +1634,30 @@ pub mod play {
         SetCursorItem {
             item: ItemStack,
         },
+        /// `ClientboundOpenScreenPacket`: a menu opens; its type is a `minecraft:menu`
+        /// registry id, its title a text component.
+        OpenScreen {
+            container_id: i32,
+            menu_type: i32,
+            title: Tag,
+        },
+        /// `ClientboundContainerClosePacket`.
+        ContainerClose {
+            container_id: i32,
+        },
+        /// `ClientboundContainerSetDataPacket`: one of a menu's data slots (a furnace's
+        /// fire and arrow).
+        ContainerSetData {
+            container_id: i32,
+            id: i16,
+            value: i16,
+        },
+        /// `ClientboundMountScreenOpenPacket`: a horse's (or nautilus's) inventory.
+        MountScreenOpen {
+            container_id: i32,
+            inventory_columns: i32,
+            entity_id: i32,
+        },
         /// `ClientboundCooldownPacket`: a cooldown group (an item id, or a
         /// `use_cooldown` group) and its length in ticks; 0 ends it.
         Cooldown {
@@ -2278,6 +2302,24 @@ pub mod play {
                 C::SetCursorItem => Clientbound::SetCursorItem {
                     item: ItemStack::read_optional(&mut r)?,
                 },
+                C::OpenScreen => Clientbound::OpenScreen {
+                    container_id: r.varint()?,
+                    menu_type: r.varint()?,
+                    title: text(&mut r)?,
+                },
+                C::ContainerClose => Clientbound::ContainerClose {
+                    container_id: r.varint()?,
+                },
+                C::ContainerSetData => Clientbound::ContainerSetData {
+                    container_id: r.varint()?,
+                    id: r.u16()? as i16,
+                    value: r.u16()? as i16,
+                },
+                C::MountScreenOpen => Clientbound::MountScreenOpen {
+                    container_id: r.varint()?,
+                    inventory_columns: r.varint()?,
+                    entity_id: r.i32()?,
+                },
                 C::Cooldown => Clientbound::Cooldown {
                     group: r.identifier()?,
                     duration: r.varint()?,
@@ -2631,6 +2673,99 @@ pub mod play {
 
     pub fn configuration_acknowledged() -> Vec<u8> {
         wire::packet(pl::Serverbound::ConfigurationAcknowledged.id(), |_| {})
+    }
+
+    /// `ServerboundContainerClosePacket`.
+    pub fn container_close(container_id: i32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ContainerClose.id(), |o| {
+            wire::write_varint(o, container_id)
+        })
+    }
+
+    /// `ServerboundContainerClickPacket`: the menu, its state id, the slot (a short),
+    /// the button (a byte), the `ContainerInput` id, the slots the click changed with
+    /// their new stacks hashed, and the stack on the cursor hashed. `changed` is in slot
+    /// order, as `handleContainerInput` puts them into its `Int2ObjectOpenHashMap`; they
+    /// are written in the order that map iterates them ([`int_map_order`]).
+    pub fn container_click(
+        container_id: i32,
+        state_id: i32,
+        slot: i16,
+        button: i8,
+        input: i32,
+        changed: &[(i16, Option<crate::hashed::HashedStack>)],
+        carried: Option<&crate::hashed::HashedStack>,
+    ) -> Vec<u8> {
+        use crate::hashed::HashedStack;
+        wire::packet(pl::Serverbound::ContainerClick.id(), |o| {
+            wire::write_varint(o, container_id);
+            wire::write_varint(o, state_id);
+            o.extend_from_slice(&slot.to_be_bytes());
+            o.push(button as u8);
+            wire::write_varint(o, input);
+            let keys: Vec<i32> = changed.iter().map(|(k, _)| i32::from(*k)).collect();
+            wire::write_varint(o, changed.len() as i32);
+            for i in int_map_order(&keys) {
+                let (k, stack) = &changed[i];
+                o.extend_from_slice(&k.to_be_bytes());
+                HashedStack::write(stack.as_ref(), o);
+            }
+            HashedStack::write(carried, o);
+        })
+    }
+
+    /// The order fastutil's `Int2ObjectOpenHashMap` (default size 16, load factor 0.75)
+    /// iterates distinct keys put into it in the given order: the key 0 first (kept
+    /// apart), then the table from its last position down. A key's place is
+    /// `HashCommon.mix(key) & mask`, probing upwards; the table doubles (`rehash`,
+    /// which moves the keys from the top down) once it holds more than three quarters.
+    /// Returns indices into `keys`.
+    pub fn int_map_order(keys: &[i32]) -> Vec<usize> {
+        fn mix(x: i32) -> u32 {
+            let h = (x as u32).wrapping_mul(0x9E37_79B9);
+            h ^ (h >> 16)
+        }
+        fn array_size(expected: usize) -> usize {
+            // `HashCommon.arraySize(expected, 0.75f)`: the next power of two of
+            // ceil(expected / 0.75), at least 2.
+            let s = (expected as f64 / 0.75).ceil() as usize;
+            s.next_power_of_two().max(2)
+        }
+        fn max_fill(n: usize) -> usize {
+            ((n as f64 * 0.75).ceil() as usize).min(n - 1)
+        }
+        fn place(table: &mut [Option<usize>], mask: usize, key: i32, index: usize) {
+            let mut pos = mix(key) as usize & mask;
+            while table[pos].is_some() {
+                pos = (pos + 1) & mask;
+            }
+            table[pos] = Some(index);
+        }
+        let mut n = array_size(16);
+        let mut table: Vec<Option<usize>> = vec![None; n];
+        let mut null_key = None;
+        // (Each key is new: the map holds as many as went in before.)
+        for (index, &key) in keys.iter().enumerate() {
+            let size = index;
+            if key == 0 {
+                null_key = Some(index);
+            } else {
+                place(&mut table, n - 1, key, index);
+            }
+            if size >= max_fill(n) {
+                let new_n = array_size(size + 2);
+                let mut new_table = vec![None; new_n];
+                for &i in table.iter().rev().flatten() {
+                    place(&mut new_table, new_n - 1, keys[i], i);
+                }
+                n = new_n;
+                table = new_table;
+            }
+        }
+        null_key
+            .into_iter()
+            .chain(table.iter().rev().flatten().copied())
+            .collect()
     }
 
     /// `InteractionHand` ids.
@@ -4037,5 +4172,125 @@ mod tests {
         assert!((v[1] - 1.5).abs() < 1e-3 && (v[2] + 0.25).abs() < 1e-3);
         assert!(!r.bool().unwrap());
         r.finish().unwrap();
+    }
+
+    #[test]
+    fn changed_slots_go_in_fastutils_order() {
+        // `Int2ObjectOpenHashMap`'s iteration of keys put in in order, from vanilla's
+        // own fastutil (the 26.3 libraries), across its first two rehashes.
+        let cases: [(Vec<i32>, &[i32]); 7] = [
+            (vec![0, 1, 2, 3], &[0, 2, 1, 3]),
+            (
+                (0..46).collect(),
+                &[
+                    0, 33, 29, 25, 37, 4, 12, 13, 8, 9, 30, 28, 24, 26, 18, 16, 17, 19, 23, 20, 22,
+                    21, 35, 39, 2, 27, 6, 15, 14, 31, 11, 10, 32, 1, 3, 34, 7, 38, 36, 5, 45, 44,
+                    42, 41, 40, 43,
+                ],
+            ),
+            (
+                (5..63).collect(),
+                &[
+                    33, 58, 25, 49, 50, 8, 9, 57, 24, 59, 26, 16, 17, 23, 18, 35, 60, 39, 56, 27,
+                    47, 48, 51, 55, 31, 52, 32, 34, 36, 38, 46, 40, 41, 45, 44, 42, 43, 29, 37, 54,
+                    12, 13, 53, 61, 30, 28, 19, 62, 21, 22, 20, 6, 15, 14, 11, 10, 7, 5,
+                ],
+            ),
+            (vec![44, 3, 17, 0, 9], &[0, 9, 3, 17, 44]),
+            (
+                (1..25).collect(),
+                &[
+                    2, 6, 4, 15, 14, 12, 13, 8, 9, 11, 10, 1, 3, 24, 7, 23, 5, 16, 17, 19, 18, 22,
+                    21, 20,
+                ],
+            ),
+            (
+                (0..24).collect(),
+                &[
+                    0, 2, 6, 4, 15, 14, 12, 13, 8, 9, 11, 10, 1, 3, 7, 23, 5, 16, 17, 19, 18, 22,
+                    21, 20,
+                ],
+            ),
+            (
+                (0..25).collect(),
+                &[
+                    0, 4, 12, 13, 8, 9, 24, 18, 16, 17, 19, 23, 20, 22, 21, 2, 6, 15, 14, 11, 10,
+                    1, 3, 7, 5,
+                ],
+            ),
+        ];
+        for (keys, want) in cases {
+            let got: Vec<i32> = play::int_map_order(&keys)
+                .into_iter()
+                .map(|i| keys[i])
+                .collect();
+            assert_eq!(got, want, "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn reads_the_menus_packets() {
+        let decode =
+            |kind: pl::Clientbound, b: &[u8]| play::Clientbound::decode(kind.id(), b).unwrap();
+        // open_screen: container 3, generic_9x3 (2), the title "Chest" as a string tag.
+        let mut b = vec![3, 2, 8, 0, 5];
+        b.extend_from_slice(b"Chest");
+        let play::Clientbound::OpenScreen {
+            container_id,
+            menu_type,
+            title,
+        } = decode(pl::Clientbound::OpenScreen, &b)
+        else {
+            panic!()
+        };
+        assert_eq!((container_id, menu_type), (3, 2));
+        assert_eq!(title, Tag::String("Chest".into()));
+        assert_eq!(
+            decode(pl::Clientbound::ContainerClose, &[7]),
+            play::Clientbound::ContainerClose { container_id: 7 }
+        );
+        // set_data: shorts, which may be negative.
+        assert_eq!(
+            decode(pl::Clientbound::ContainerSetData, &[1, 0, 2, 0xFF, 0xFE]),
+            play::Clientbound::ContainerSetData {
+                container_id: 1,
+                id: 2,
+                value: -2
+            }
+        );
+        assert_eq!(
+            decode(pl::Clientbound::MountScreenOpen, &[4, 3, 0, 0, 1, 0]),
+            play::Clientbound::MountScreenOpen {
+                container_id: 4,
+                inventory_columns: 3,
+                entity_id: 256
+            }
+        );
+        // container_close and container_click as vanilla writes them.
+        assert_eq!(
+            play::container_close(5),
+            [pl::Serverbound::ContainerClose.id() as u8, 5]
+        );
+        let stone = crate::hashed::HashedStack {
+            item: 1,
+            count: 3,
+            added: Vec::new(),
+            removed: Vec::new(),
+        };
+        let click = play::container_click(
+            1,
+            41,
+            -999,
+            1,
+            0,
+            &[(0, None), (36, Some(stone.clone()))],
+            Some(&stone),
+        );
+        assert_eq!(
+            click[1..],
+            [
+                1, 41, 0xFC, 0x19, 1, 0, 2, 0, 0, 0, 0, 36, 1, 1, 3, 0, 0, 1, 1, 3, 0, 0
+            ]
+        );
     }
 }

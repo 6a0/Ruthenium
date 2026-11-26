@@ -716,23 +716,27 @@ fn handle(
             carried,
         } => {
             let stacks = stacks.iter().map(|s| items.stack(s)).collect();
-            p.inventory
-                .initialize(state_id, stacks, items.stack(&carried));
+            p.menus
+                .inventory
+                .initialize(&mut p.inventory, state_id, stacks, items.stack(&carried));
         }
         Clientbound::ContainerSetSlot {
             container_id: 0,
             state_id,
             slot,
             item,
-        } => p
-            .inventory
-            .set_menu_slot(i32::from(slot), state_id, items.stack(&item)),
+        } => p.menus.inventory.set_item(
+            &mut p.inventory,
+            i32::from(slot),
+            state_id,
+            items.stack(&item),
+        ),
         Clientbound::SetPlayerInventory { slot, item } => {
             if let Ok(slot) = usize::try_from(slot) {
                 p.inventory.set(slot, items.stack(&item));
             }
         }
-        Clientbound::SetCursorItem { item } => p.inventory.carried = items.stack(&item),
+        Clientbound::SetCursorItem { item } => p.menus.inventory.carried = items.stack(&item),
         Clientbound::Cooldown { group, duration } => {
             if duration == 0 {
                 p.cooldowns.remove(&group);

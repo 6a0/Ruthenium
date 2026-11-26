@@ -29,18 +29,13 @@ impl Hand {
 
 /// The 36 main slots (the hotbar is 0 to 8), then the equipment at 36 to 42
 /// (`Inventory.EQUIPMENT_SLOT_MAPPING`: feet, legs, chest, head, off hand, body,
-/// saddle); the crafting grid and result of the inventory menu; the stack the cursor
-/// carries.
+/// saddle). The menus over it are [`crate::menu`]'s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Inventory {
     pub items: Vec<Stack>,
     pub equipment: [Stack; 7],
     /// The selected hotbar slot.
     pub selected: i32,
-    /// Menu slots 0 (result) to 4 (the 2x2 grid).
-    pub crafting: [Stack; 5],
-    pub carried: Stack,
-    pub state_id: i32,
 }
 
 impl Default for Inventory {
@@ -49,9 +44,6 @@ impl Default for Inventory {
             items: vec![Stack::empty(); 36],
             equipment: Default::default(),
             selected: 0,
-            crafting: Default::default(),
-            carried: Stack::empty(),
-            state_id: 0,
         }
     }
 }
@@ -86,7 +78,7 @@ impl Inventory {
         }
     }
 
-    fn selected_index(&self) -> usize {
+    pub(crate) fn selected_index(&self) -> usize {
         usize::try_from(self.selected).unwrap_or(0).min(8)
     }
 
@@ -127,39 +119,6 @@ impl Inventory {
         *self.hand_mut(hand) = stack;
     }
 
-    /// `InventoryMenu`'s slot `slot` (container 0): where it keeps its stack.
-    fn menu_slot(&mut self, slot: i32) -> Option<&mut Stack> {
-        let i = usize::try_from(slot).ok()?;
-        match i {
-            0..=4 => self.crafting.get_mut(i),
-            // Head first: the armor slots go 39 down to 36.
-            5..=8 => self.get_mut(39 - (i - 5)),
-            9..=35 => self.get_mut(i),
-            36..=44 => self.get_mut(i - 36),
-            45 => self.get_mut(SLOT_OFFHAND),
-            _ => None,
-        }
-    }
-
-    /// `InventoryMenu.setItem` (`ClientboundContainerSetSlotPacket` for container 0).
-    pub fn set_menu_slot(&mut self, slot: i32, state_id: i32, stack: Stack) {
-        if let Some(s) = self.menu_slot(slot) {
-            *s = stack;
-        }
-        self.state_id = state_id;
-    }
-
-    /// `initializeContents` (`ClientboundContainerSetContentPacket` for container 0).
-    pub fn initialize(&mut self, state_id: i32, items: Vec<Stack>, carried: Stack) {
-        for (i, s) in items.into_iter().enumerate() {
-            if let Some(slot) = self.menu_slot(i as i32) {
-                *slot = s;
-            }
-        }
-        self.carried = carried;
-        self.state_id = state_id;
-    }
-
     /// `Inventory.add` for one stack that doesn't stack with others (the off-hand and
     /// armour swaps): the first free main slot, the selected one first. Whether it
     /// fitted.
@@ -180,6 +139,91 @@ impl Inventory {
             }
             None => false,
         }
+    }
+}
+
+impl Inventory {
+    /// `hasRemainingSpaceForItem`.
+    fn has_room_for(&self, slot: usize, stack: &Stack) -> bool {
+        let here = self.get(slot);
+        !here.is_empty()
+            && here.same_item_same_components(stack)
+            && here.is_stackable()
+            && here.count < here.max_stack_size().min(99)
+    }
+
+    /// `getSlotWithRemainingSpace`: the selected slot, the off hand, then the main
+    /// slots in order.
+    fn slot_with_room(&self, stack: &Stack) -> Option<usize> {
+        let selected = self.selected_index();
+        if self.has_room_for(selected, stack) {
+            return Some(selected);
+        }
+        if self.has_room_for(SLOT_OFFHAND, stack) {
+            return Some(SLOT_OFFHAND);
+        }
+        (0..36).find(|&i| self.has_room_for(i, stack))
+    }
+
+    /// `addResource(slot, stack)`: what of `stack` doesn't fit in `slot`.
+    fn add_resource_at(&mut self, slot: usize, stack: &Stack) -> i32 {
+        let mut count = stack.count;
+        let mut here = self.get(slot).clone();
+        if here.is_empty() {
+            here = stack.copy_with_count(0);
+        }
+        let max_to_add = here.max_stack_size().min(99) - here.count;
+        let to_add = count.min(max_to_add);
+        if to_add == 0 {
+            self.set(slot, here);
+            return count;
+        }
+        count -= to_add;
+        here.grow(to_add);
+        self.set(slot, here);
+        count
+    }
+
+    /// `Inventory.add(stack)` (any slot): a damaged tool goes whole into the first
+    /// free slot; anything else joins like stacks and fills free slots. `stack` is
+    /// left with what didn't fit (none with infinite materials). Whether any went in.
+    pub fn add_stack(&mut self, stack: &mut Stack, infinite: bool) -> bool {
+        if stack.is_empty() {
+            return false;
+        }
+        if stack.is_damaged() {
+            if let Some(free) = self.items.iter().position(Stack::is_empty) {
+                // `copyAndClear`.
+                let moved = stack.copy();
+                stack.count = 0;
+                self.items[free] = moved;
+                return true;
+            }
+            if infinite {
+                stack.count = 0;
+                return true;
+            }
+            return false;
+        }
+        let mut last;
+        loop {
+            last = stack.count;
+            let slot = self
+                .slot_with_room(stack)
+                .or_else(|| self.items.iter().position(Stack::is_empty));
+            stack.count = match slot {
+                Some(s) => self.add_resource_at(s, stack),
+                None => stack.count,
+            };
+            if stack.is_empty() || stack.count >= last {
+                break;
+            }
+        }
+        if stack.count == last && infinite {
+            stack.count = 0;
+            return true;
+        }
+        stack.count < last
     }
 }
 
@@ -252,23 +296,6 @@ impl Cooldowns {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn menu_slots_map_to_the_inventory() {
-        let mut inv = Inventory::default();
-        let mut a = Stack::empty();
-        a.item = 5;
-        a.count = 1;
-        inv.set_menu_slot(36, 3, a.clone());
-        assert_eq!(inv.items[0].item, 5);
-        inv.set_menu_slot(45, 4, a.clone());
-        assert_eq!(inv.hand(Hand::Off).item, 5);
-        inv.set_menu_slot(5, 5, a.clone());
-        assert_eq!(inv.get(39).item, 5);
-        assert_eq!(inv.state_id, 5);
-        inv.selected = 0;
-        assert_eq!(inv.hand(Hand::Main).item, 5);
-    }
 
     #[test]
     fn cooldowns_count_down() {

@@ -6,13 +6,25 @@
 //! `+`-joined `w a s d jump sneak sprint use hit` (`use` holds the right button, `hit`
 //! the left), hotbar digits `1`-`9`, `click` (one press of the right button), `attack`
 //! (one press of the left), `swap` (the swap-hands key) and `wake` (the bed screen's
-//! Leave Bed), the last five pressed once, or `chat=TEXT` alone, sent to the chat as if
+//! Leave Bed), the last five pressed once, `inv` (the inventory key), or `chat=TEXT` alone, sent to the chat as if
 //! typed and entered at the step's start (`_` for a space, `%XX` for any byte; a
 //! leading `/` makes it a command)
 //! at the step's start, or `-` for none; held for MS milliseconds while the mouse moves
 //! DX, DY counts every frame (60 a second, the rate frames run at here), turned as the window turns them with the
 //! saved mouse sensitivity. For example
 //! `w@2000 w+sprint+jump@3000 w@2000:12,0 sneak+w@1500 2@100 -@1000`.
+//!
+//! An open container screen takes these, each its events at the step's start, at a
+//! slot's middle (slots are the menu's numbers): `lclick.N`, `rclick.N`, `mclick.N`
+//! (a press and a release of the left, right, middle button), `sclick.N` and
+//! `srclick.N` (with shift), `dbl.N` and `sdbl.N` (a double click, with shift: the
+//! second press 0 ms after the first), `drag.N.M...` and `rdrag.N.M...` (pressed
+//! over the first, dragged over each, let go over the last), `out.l` and `out.r` (a
+//! click outside the window), `hot.K.N` (the hotbar key K, 1 to 9, over slot N),
+//! `off.N` (the swap-hands key), `drop.N` and `cdrop.N` (the drop key, with ctrl),
+//! `esc` (Escape), and `raw.SLOT.BUTTON.INPUT` (a click as the screen's
+//! `slotClicked` makes it: INPUT is `pickup`, `quick_move`, `swap`, `clone`,
+//! `throw`, `quick_craft` or `pickup_all`; `raw.-999.0.pickup` outside).
 //!
 //! What the chat shows is printed as it comes. A death is printed, and Respawn pressed as soon as the death screen's buttons work;
 //! the script goes on (it doesn't start over) once the player is back.
@@ -40,8 +52,10 @@ use std::time::{Duration, Instant};
 use ruthenium_prepare::discover::Env;
 use ruthenium_sim::hud_text::ChatMessage;
 use ruthenium_sim::input::{self, MouseOptions};
+use ruthenium_sim::menu::Input;
+use ruthenium_sim::menu::screen::Binds;
 use ruthenium_sim::player::{Keys, Pose};
-use ruthenium_sim::session::{PlayerView, Session, SessionEvent};
+use ruthenium_sim::session::{At, PlayerView, ScreenInput, Session, SessionEvent};
 
 use crate::account::{AccountStatus, Accounts};
 use crate::join::{Joiner, closed_text, plain_text, stage_text};
@@ -65,6 +79,9 @@ struct Step {
     wake: bool,
     /// Sent to the chat at the step's start.
     chat: Option<String>,
+    /// Inventory key presses, and container screen events, at the step's start.
+    inventory: u32,
+    screen: Vec<ScreenEvent>,
     ms: u64,
     turn: (f32, f32),
 }
@@ -97,6 +114,8 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                 swaps: 0,
                 wake: false,
                 chat: None,
+                inventory: 0,
+                screen: Vec::new(),
                 ms: ms.parse().map_err(|_| bad())?,
                 turn,
             };
@@ -119,6 +138,10 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                     "attack" => st.attacks += 1,
                     "swap" => st.swaps += 1,
                     "wake" => st.wake = true,
+                    "inv" => st.inventory += 1,
+                    k if screen_events(k).is_some() => {
+                        st.screen.extend(screen_events(k).unwrap_or_default());
+                    }
                     d if d.len() == 1 && ("1"..="9").contains(&d) => {
                         st.hotbar.push(d.parse::<u8>().map_err(|_| bad())? - 1);
                     }
@@ -128,6 +151,85 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
             Ok(st)
         })
         .collect()
+}
+
+/// A script's container screen event, made when its step begins.
+#[derive(Debug, Clone, PartialEq)]
+enum ScreenEvent {
+    Press(u8, At, bool),
+    Release(u8, At, bool),
+    Drag(At),
+    Key(Binds, bool, At),
+    Click(i32, i32, Input),
+}
+
+/// The screen events of a script token (see the module docs), if it is one.
+fn screen_events(k: &str) -> Option<Vec<ScreenEvent>> {
+    use ScreenEvent::{Click, Drag, Key, Press, Release};
+    let parts: Vec<&str> = k.split('.').collect();
+    let slot = |s: &str| s.parse::<usize>().ok().map(At::Slot);
+    let click = |button: u8, at: At, shift: bool| {
+        vec![Press(button, at, shift), Release(button, at, shift)]
+    };
+    let key = |binds: Binds, ctrl: bool, at: &str| Some(vec![Key(binds, ctrl, slot(at)?)]);
+    Some(match parts.as_slice() {
+        ["lclick", n] => click(1, slot(n)?, false),
+        ["rclick", n] => click(3, slot(n)?, false),
+        ["mclick", n] => click(2, slot(n)?, false),
+        ["sclick", n] => click(1, slot(n)?, true),
+        ["srclick", n] => click(3, slot(n)?, true),
+        ["dbl", n] | ["sdbl", n] => {
+            let shift = parts[0] == "sdbl";
+            let at = slot(n)?;
+            [click(1, at, shift), click(1, at, shift)].concat()
+        }
+        ["drag" | "rdrag", rest @ ..] if !rest.is_empty() => {
+            let button = if parts[0] == "drag" { 1 } else { 3 };
+            let at: Vec<At> = rest.iter().map(|s| slot(s)).collect::<Option<_>>()?;
+            let mut out = vec![Press(button, at[0], false)];
+            out.extend(at.iter().map(|a| Drag(*a)));
+            out.push(Release(button, *at.last()?, false));
+            out
+        }
+        ["out", "l"] => click(1, At::Outside, false),
+        ["out", "r"] => click(3, At::Outside, false),
+        ["hot", k, n] => {
+            let k: usize = k.parse().ok().filter(|k| (1..=9).contains(k))?;
+            let mut b = Binds::default();
+            b.hotbar[k - 1] = true;
+            key(b, false, n)?
+        }
+        ["off", n] => key(
+            Binds {
+                swap_offhand: true,
+                ..Binds::default()
+            },
+            false,
+            n,
+        )?,
+        ["drop", n] | ["cdrop", n] => key(
+            Binds {
+                drop: true,
+                ..Binds::default()
+            },
+            parts[0] == "cdrop",
+            n,
+        )?,
+        ["esc"] => vec![Key(
+            Binds {
+                escape: true,
+                ..Binds::default()
+            },
+            false,
+            At::Outside,
+        )],
+        ["raw", slot, button, input] => {
+            // (A negative slot reads as "raw.-999...": its minus was kept.)
+            let input = Input::from_name(input).or_else(|| Input::from_id(input.parse().ok()?))?;
+            vec![Click(slot.parse().ok()?, button.parse().ok()?, input)]
+        }
+        _ => return None,
+    })
 }
 
 /// A `chat=` step's text: `_` a space, `%XX` a byte, the rest as it is.
@@ -185,6 +287,40 @@ impl Player {
         if let Some(text) = &st.chat {
             println!("          chat: {text}");
             session.send_chat(text);
+        }
+        for _ in 0..st.inventory {
+            session.inventory_key();
+        }
+        let now = Instant::now();
+        let mouse = |button: u8| Binds {
+            // The default bindings: the middle button picks.
+            pick: button == 2,
+            ..Binds::default()
+        };
+        for e in &st.screen {
+            println!("          screen: {e:?}");
+            session.screen_input(match *e {
+                ScreenEvent::Press(button, at, shift) => ScreenInput::Press {
+                    button,
+                    at,
+                    shift,
+                    binds: mouse(button),
+                    when: now,
+                },
+                ScreenEvent::Release(button, at, shift) => ScreenInput::Release {
+                    button,
+                    at,
+                    shift,
+                    binds: mouse(button),
+                },
+                ScreenEvent::Drag(at) => ScreenInput::Drag { at },
+                ScreenEvent::Key(binds, ctrl, at) => ScreenInput::Key { binds, ctrl, at },
+                ScreenEvent::Click(slot, button, input) => ScreenInput::Click {
+                    slot,
+                    button,
+                    input,
+                },
+            });
         }
         for _ in 0..st.swaps {
             session.swap_hands_key();
@@ -515,6 +651,8 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                 SessionEvent::Respawned => println!("{t:7.3}s  respawned"),
                 SessionEvent::InBed => println!("{t:7.3}s  in bed"),
                 SessionEvent::WokeUp => println!("{t:7.3}s  woke up"),
+                SessionEvent::ContainerOpened => println!("{t:7.3}s  container screen open"),
+                SessionEvent::ContainerClosed => println!("{t:7.3}s  container screen closed"),
                 SessionEvent::Closed(c) => {
                     let (title, reason) = closed_text(c, &data.lang);
                     println!("{t:7.3}s  closed: {title}: {reason}");
