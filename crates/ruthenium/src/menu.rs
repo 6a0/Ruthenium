@@ -2465,7 +2465,7 @@ mod tests {
     use ruthenium_net::server_list::ServerList;
 
     use super::*;
-    use crate::account::tests::accounts_in;
+    use crate::account::tests::{accounts_held_in, accounts_in};
 
     #[derive(Default)]
     struct FakeClipboard(RefCell<Option<String>>);
@@ -2588,7 +2588,7 @@ mod tests {
     #[test]
     fn accounts_sign_in_switch_and_sign_out() {
         let dir = temp("accounts");
-        let (accounts, pages) = accounts_in(&dir, &["Alex"], Some(Ok("Notch")));
+        let (accounts, pages, answer) = accounts_held_in(&dir, &["Alex"], Some(Ok("Notch")));
         let clip = FakeClipboard::default();
         let mut m = Menu::new(None, accounts, SettingsFile::transient());
         m.layout((1600, 900));
@@ -2601,14 +2601,22 @@ mod tests {
         press(&mut m, SCANCODE_RETURN, false, false, &clip);
         assert!(matches!(m.screen, Screen::Accounts));
 
-        // Add Account signs in in the browser, then comes back to the list.
+        // Add Account shows the sign-in form and opens the browser's page. Once the
+        // player has signed in there (the answer was held back until now: it can come
+        // before the menu first looks, and then the form never shows), it comes back to
+        // the list.
         m.act(Action::AddAccount, None, &clip);
         assert!(matches!(m.screen, Screen::Form(FormKind::SignIn, ..)));
-        until(&mut m, |m| matches!(m.screen, Screen::Accounts));
+        until(&mut m, |m| {
+            matches!(m.stage_shown, Some(Stage::Browser { .. }))
+        });
+        assert!(matches!(m.screen, Screen::Form(FormKind::SignIn, ..)));
         assert_eq!(
             pages.lock().unwrap().as_slice(),
             ["https://login.example/authorize"]
         );
+        answer.store(true, std::sync::atomic::Ordering::Relaxed);
+        until(&mut m, |m| matches!(m.screen, Screen::Accounts));
         assert_eq!(names(&m), ["Notch", "Alex"]);
 
         // Down twice selects Alex; Enter switches to it, and the selection follows.

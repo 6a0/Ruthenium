@@ -771,9 +771,11 @@ pub(crate) mod tests {
     }
 
     /// Signs in whoever the refresh token names ("token-<name>"); a new sign-in gives
-    /// `next`'s account, or waits to be cancelled when there is none.
+    /// `next`'s account once `answer` is set, or waits to be cancelled when there is
+    /// none.
     pub(crate) struct FakeBackend {
         pub next: Option<Result<&'static str, AuthError>>,
+        pub answer: Arc<AtomicBool>,
     }
 
     /// "Child" may not play online.
@@ -798,15 +800,14 @@ pub(crate) mod tests {
 
     impl FakeBackend {
         fn new_sign_in(&mut self, cancel: &AtomicBool) -> Result<SignedIn, AuthError> {
-            match self.next.take() {
-                Some(r) => r.map(signed),
-                None => {
-                    while !cancel.load(Ordering::Relaxed) {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(AuthError::Cancelled)
+            let answered = || self.next.is_some() && self.answer.load(Ordering::Relaxed);
+            while !answered() {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(AuthError::Cancelled);
                 }
+                std::thread::sleep(Duration::from_millis(1));
             }
+            self.next.take().expect("answered").map(signed)
         }
     }
 
@@ -849,6 +850,19 @@ pub(crate) mod tests {
         names: &[&str],
         next: Option<Result<&'static str, AuthError>>,
     ) -> (Accounts, Arc<Mutex<Vec<String>>>) {
+        let (accounts, pages, answer) = accounts_held_in(dir, names, next);
+        answer.store(true, Ordering::Relaxed);
+        (accounts, pages)
+    }
+
+    /// As [`accounts_in`], but a new sign-in gets its answer only once the flag given
+    /// back is set. The worker answers at once otherwise, sometimes before the menu has
+    /// looked: a test of what shows while signing in holds the answer back.
+    pub(crate) fn accounts_held_in(
+        dir: &Path,
+        names: &[&str],
+        next: Option<Result<&'static str, AuthError>>,
+    ) -> (Accounts, Arc<Mutex<Vec<String>>>, Arc<AtomicBool>) {
         let _ = std::fs::remove_dir_all(dir);
         let secrets = MemorySecrets::default();
         let mut store = AccountStore::with_secrets(dir, Box::new(secrets.clone()));
@@ -862,16 +876,18 @@ pub(crate) mod tests {
         let dir = dir.to_owned();
         let pages = Arc::new(Mutex::new(Vec::new()));
         let seen = pages.clone();
+        let answer = Arc::new(AtomicBool::new(false));
+        let held = answer.clone();
         let open: Open = Box::new(move || {
             let store = AccountStore::with_secrets(&dir, Box::new(secrets));
-            (store, Box::new(FakeBackend { next }))
+            (store, Box::new(FakeBackend { next, answer: held }))
         });
         let accounts = Accounts::with_worker(
             list,
             open,
             Box::new(move |url| seen.lock().unwrap().push(url.to_owned())),
         );
-        (accounts, pages)
+        (accounts, pages, answer)
     }
 
     /// Polls until `done` holds (or fails after a few seconds).
