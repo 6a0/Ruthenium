@@ -385,6 +385,7 @@ mod tests {
             patch: Arc::new(ComponentPatch {
                 added,
                 removed: Vec::new(),
+                ..Default::default()
             }),
             ..Stack::empty()
         };

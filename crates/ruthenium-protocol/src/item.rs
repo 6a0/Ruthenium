@@ -9,7 +9,8 @@
 //!
 //! Every component type has a reader here. The ones the client simulation uses are
 //! [`Component`]'s typed variants; the rest are kept as their raw bytes
-//! ([`Component::Other`]). Types without a network codec of their own (custom data,
+//! ([`Component::Other`]). A typed value's bytes are kept too ([`RawValues`]), for
+//! what it leaves out. Types without a network codec of their own (custom data,
 //! locks, recipes...) go over the wire as one network NBT tag, as vanilla's fallback
 //! (`ByteBufCodecs.fromCodecWithRegistries`) sends them.
 //!
@@ -114,12 +115,39 @@ fn read_template(r: &mut Reader<'_>, depth: u32) -> Result<ItemStack, WireError>
 pub struct ComponentPatch {
     pub added: Vec<(i32, Component)>,
     pub removed: Vec<i32>,
+    /// The bytes each typed component was read from (see [`RawValues`]).
+    pub raw: RawValues,
+}
+
+/// The bytes the typed components of a patch were read from, for what their typed value
+/// leaves out. Patches compare equal whatever their bytes.
+#[derive(Clone, Default)]
+pub struct RawValues(Vec<(i32, Box<[u8]>)>);
+
+impl RawValues {
+    /// The bytes the component of type `kind` was read from, if it was read.
+    pub fn get(&self, kind: i32) -> Option<&[u8]> {
+        self.0.iter().find(|(k, _)| *k == kind).map(|(_, b)| &b[..])
+    }
+}
+
+impl PartialEq for RawValues {
+    fn eq(&self, _: &RawValues) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for RawValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RawValues({})", self.0.len())
+    }
 }
 
 impl ComponentPatch {
     pub const EMPTY: ComponentPatch = ComponentPatch {
         added: Vec::new(),
         removed: Vec::new(),
+        raw: RawValues(Vec::new()),
     };
 
     pub fn is_empty(&self) -> bool {
@@ -141,9 +169,16 @@ impl ComponentPatch {
         let added_count = r.count(usize::MAX)?;
         let removed_count = r.count(usize::MAX)?;
         let mut added = Vec::with_capacity(added_count.min(64));
+        let mut raw = Vec::new();
         for _ in 0..added_count {
             let kind = r.varint()?;
-            added.push((kind, read_component(r, kind, depth)?));
+            let mut start = r.clone();
+            let c = read_component(r, kind, depth)?;
+            if !matches!(c, Component::Other { .. }) {
+                let used = start.remaining() - r.remaining();
+                raw.push((kind, start.bytes(used)?.into()));
+            }
+            added.push((kind, c));
         }
         let mut removed = Vec::with_capacity(removed_count.min(64));
         for _ in 0..removed_count {
@@ -151,7 +186,11 @@ impl ComponentPatch {
             component_kind(kind)?;
             removed.push(kind);
         }
-        Ok(ComponentPatch { added, removed })
+        Ok(ComponentPatch {
+            added,
+            removed,
+            raw: RawValues(raw),
+        })
     }
 }
 
@@ -1801,6 +1840,28 @@ mod tests {
             panic!()
         };
         assert_eq!(data[..3], [0, 2, 1]);
+    }
+
+    #[test]
+    fn typed_components_keep_the_bytes_they_were_read_from() {
+        let s = stack(with(
+            2,
+            W::default()
+                .kind(Kind::Food)
+                .v(4)
+                .f(2.4)
+                .b(true)
+                .kind(Kind::CustomName)
+                .text("x"),
+        ));
+        let food = W::default().v(4).f(2.4).b(true);
+        assert_eq!(s.patch.raw.get(Kind::Food.id() as i32), Some(&food.0[..]));
+        // An untyped one is its bytes already.
+        assert_eq!(s.patch.raw.get(Kind::CustomName.id() as i32), None);
+        // Patches compare by their values alone.
+        let mut bare = s.patch.clone();
+        bare.raw = RawValues::default();
+        assert_eq!(bare, s.patch);
     }
 
     #[test]

@@ -830,6 +830,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
                 patch: ruthenium_protocol::item::ComponentPatch {
                     added,
                     removed: Vec::new(),
+                    ..Default::default()
                 },
             });
             if let Some(slot) = inventory_slot(w[4], p.inventory.selected) {

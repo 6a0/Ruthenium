@@ -1201,6 +1201,7 @@ mod tests {
                 },
             )],
             removed: Vec::new(),
+            ..Default::default()
         });
         f.player.inventory.set_hand(Hand::Main, water.clone());
         assert_eq!(

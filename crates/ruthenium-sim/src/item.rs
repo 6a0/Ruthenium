@@ -1635,6 +1635,7 @@ mod tests {
                     ),
                 ],
                 removed: vec![Kind::Food.id() as i32],
+                ..Default::default()
             },
         });
         assert_eq!(items.use_duration(&patched), 10);
@@ -1787,6 +1788,7 @@ mod tests {
             patch: ComponentPatch {
                 added: Vec::new(),
                 removed: vec![Kind::ItemName.id() as i32, Kind::Rarity.id() as i32],
+                ..Default::default()
             },
         });
         assert_eq!(hover_name(&bare), Tag::String(String::new()));
@@ -1797,6 +1799,7 @@ mod tests {
             patch: ComponentPatch {
                 added: Vec::new(),
                 removed: vec![Kind::PotionContents.id() as i32],
+                ..Default::default()
             },
         });
         assert_eq!(key(&hover_name(&bare)), "item.minecraft.potion");
@@ -1830,6 +1833,7 @@ mod tests {
             patch: ComponentPatch {
                 added: added.into_iter().map(|(k, c)| (k.id() as i32, c)).collect(),
                 removed: Vec::new(),
+                ..Default::default()
             },
         })
     }

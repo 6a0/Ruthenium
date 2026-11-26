@@ -4400,6 +4400,7 @@ mod tests {
                     ),
                 ],
                 removed: Vec::new(),
+                ..Default::default()
             },
         })
     }
