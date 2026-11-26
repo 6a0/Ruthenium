@@ -9,7 +9,7 @@
 //! TrueType providers are left out: no font of the game's own has one, and a pack's is
 //! skipped with a warning (no font file of a pack is ever parsed).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -25,6 +25,18 @@ use crate::zip::Zip;
 const BASELINE: f32 = 7.0;
 /// Rows of a unihex glyph.
 const UNIHEX_ROWS: u32 = 16;
+/// Fonts of up to this many providers ask each in turn for a character (the game's have
+/// at most six); larger ones (plugin-made packs have thousands) look it up.
+const LINEAR_PROVIDERS: usize = 16;
+/// The largest advance, height or ascent a provider may give, either way: the text of a
+/// line adds advances up, and a pack's `f32::MAX` would make its width infinite. Plugin
+/// packs' "negative space" characters go to a few thousand.
+const MAX_ADVANCE: f32 = 16384.0;
+
+/// A pack's length clamped to [`MAX_ADVANCE`].
+fn clamp_advance(v: f32) -> f32 {
+    v.clamp(-MAX_ADVANCE, MAX_ADVANCE)
+}
 /// Size overrides of a unihex provider: every glyph read is looked up in them, so a pack
 /// with a million could make reading Unifont take hours. The game's have 2 and 9.
 const MAX_SIZE_OVERRIDES: usize = 1024;
@@ -215,6 +227,10 @@ pub struct Font {
     glyphs: usize,
     /// The characters by their advance rounded up, for obfuscated text.
     by_advance: HashMap<i32, Vec<u32>>,
+    /// For a font of more than [`LINEAR_PROVIDERS`] providers, the provider of each
+    /// character (`FontSet`'s glyph cache, made at load): asking thousands of providers
+    /// for every character of every frame's text would be the frame's whole time.
+    first: Option<HashMap<u32, u32>>,
     /// What could not be read.
     pub warnings: Vec<String>,
 }
@@ -235,6 +251,7 @@ impl Font {
             limits: *res.limits(),
             glyphs: 0,
             by_advance: HashMap::new(),
+            first: None,
             warnings: Vec::new(),
         };
         font.add(res, id, &mut Vec::new(), &mut HashMap::new());
@@ -243,17 +260,24 @@ impl Font {
     }
 
     /// Lists the characters by their advance.
+    /// With more than [`LINEAR_PROVIDERS`] providers, also which provider has each
+    /// character.
     fn index(&mut self) {
-        let mut seen = HashSet::new();
-        for p in &self.providers {
+        let mut seen: HashMap<u32, u32> = HashMap::new();
+        for (i, p) in self.providers.iter().enumerate() {
             for c in p.characters() {
-                if seen.insert(c)
+                if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(c)
                     && let Some(g) = p.glyph(c)
                 {
+                    e.insert(i as u32);
                     let width = g.advance.ceil() as i32;
                     self.by_advance.entry(width).or_default().push(c);
                 }
             }
+        }
+        if self.providers.len() > LINEAR_PROVIDERS {
+            seen.shrink_to_fit();
+            self.first = Some(seen);
         }
         // In an order that does not change from run to run.
         for list in self.by_advance.values_mut() {
@@ -271,6 +295,7 @@ impl Font {
             limits: Limits::trusted(),
             glyphs: 0,
             by_advance: HashMap::new(),
+            first: None,
             warnings: Vec::new(),
         };
         font.index();
@@ -374,7 +399,7 @@ impl Font {
                             };
                             // A number past `f32::MAX` would be an infinite advance.
                             let a = a.as_f64()? as f32;
-                            a.is_finite().then_some((u32::from(c), a))
+                            a.is_finite().then_some((u32::from(c), clamp_advance(a)))
                         })
                         .collect(),
                 )));
@@ -393,8 +418,8 @@ impl Font {
                     .map(|row| row.as_str().map(|r| r.chars().map(u32::from).collect()))
                     .collect::<Option<_>>()
                     .ok_or("chars that are not text")?;
-                let height = p["height"].as_i64().unwrap_or(8) as f32;
-                let ascent = p["ascent"].as_i64().ok_or("no ascent")? as f32;
+                let height = clamp_advance(p["height"].as_i64().unwrap_or(8) as f32);
+                let ascent = clamp_advance(p["ascent"].as_i64().ok_or("no ascent")? as f32);
                 self.take_glyphs(grid.iter().map(Vec::len).sum())?;
                 let image = Image::decode_png_with(
                     &bytes,
@@ -443,10 +468,17 @@ impl Font {
     }
 
     fn provider(&self, c: u32) -> Option<&Provider> {
-        self.providers
-            .iter()
-            .find(|p| p.glyph(c).is_some())
-            .map(|p| &**p)
+        match &self.first {
+            Some(first) => first
+                .get(&c)
+                .and_then(|&i| self.providers.get(i as usize))
+                .map(|p| &**p),
+            None => self
+                .providers
+                .iter()
+                .find(|p| p.glyph(c).is_some())
+                .map(|p| &**p),
+        }
     }
 
     /// Whether some provider has a glyph for `c`.
@@ -484,6 +516,7 @@ impl Font {
             limits: Limits::trusted(),
             glyphs: 0,
             by_advance: HashMap::new(),
+            first: None,
             warnings: Vec::new(),
         };
         font.index();
@@ -492,9 +525,8 @@ impl Font {
 
     /// The glyph of a character: [`Glyph::MISSING`'s if the font has none.
     pub fn glyph(&self, c: char) -> Glyph {
-        self.providers
-            .iter()
-            .find_map(|p| p.glyph(u32::from(c)))
+        self.provider(u32::from(c))
+            .and_then(|p| p.glyph(u32::from(c)))
             .unwrap_or(Glyph::MISSING)
     }
 
@@ -567,7 +599,7 @@ fn bitmap(
             });
             let width = ink.map_or(0, |column| column + 1);
             let advance = ((0.5 + f64::from(width as f32 * scale)) as i32).saturating_add(1);
-            cells.insert(c, ([x, y], advance as f32));
+            cells.insert(c, ([x, y], clamp_advance(advance as f32)));
         }
     }
     Ok(Bitmap {
