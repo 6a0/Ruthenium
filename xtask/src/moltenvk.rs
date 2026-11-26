@@ -27,7 +27,8 @@ const LICENSE_MEMBER: &str = "MoltenVK/LICENSE";
 
 /// The bundle's identifier: the one the client gives SDL (`ruthenium-platform`).
 const BUNDLE_ID: &str = "dev.ruthenium.Ruthenium";
-/// The oldest macOS the bundle claims to run on: the first with Apple Silicon.
+/// The oldest macOS the bundle claims to run on: the first with Apple Silicon. Every
+/// build is made for it (`.cargo/config.toml`'s `MACOSX_DEPLOYMENT_TARGET`).
 const MINIMUM_MACOS: &str = "11.0";
 
 pub fn run_fetch(root: &Path, args: &[String]) -> ExitCode {
@@ -274,6 +275,12 @@ mod tests {
             p.matches("<key>").count(),
             p.matches("<string>").count() + p.matches("<true/>").count()
         );
+    }
+
+    #[test]
+    fn the_build_is_made_for_the_oldest_macos_the_bundle_claims() {
+        let config = include_str!("../../.cargo/config.toml");
+        assert!(config.contains(&format!("MACOSX_DEPLOYMENT_TARGET = \"{MINIMUM_MACOS}\"")));
     }
 
     #[test]

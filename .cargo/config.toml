@@ -1,2 +1,9 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+[env]
+# The oldest macOS the client runs on (the bundle's LSMinimumSystemVersion, in
+# xtask/src/moltenvk.rs). rustc links for it, and the C and Objective-C that cc and
+# CMake build (SDL, ring) must be built for it too: left to themselves they take the
+# SDK's own version, which the linker warns about object by object.
+MACOSX_DEPLOYMENT_TARGET = "11.0"
