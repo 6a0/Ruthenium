@@ -963,6 +963,10 @@ pub trait ModelFiles {
     fn limits(&self) -> Limits {
         Limits::trusted()
     }
+    /// Whether the load is given up: the bake then returns what it has.
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 impl ModelFiles for Resources {
@@ -980,6 +984,10 @@ impl ModelFiles for Resources {
 
     fn limits(&self) -> Limits {
         *Resources::limits(self)
+    }
+
+    fn cancelled(&self) -> bool {
+        Resources::cancelled(self)
     }
 }
 
@@ -1385,6 +1393,9 @@ impl Baker<'_> {
 
     /// Fails past [`Limits::baked_variants`] over the whole bake.
     fn choice(&mut self, variants: &[Variant], weighted: bool) -> Result<Choice, String> {
+        if self.files.cancelled() {
+            return Err("the load was cancelled".into());
+        }
         self.variants = self.variants.saturating_add(variants.len());
         if self.variants > self.limits.baked_variants {
             return Err(format!(
@@ -1435,6 +1446,10 @@ impl BlockModels {
         let mut states = vec![StateModel::Simple(0); STATE_COUNT];
         let mut first = 0;
         while let Some(state) = BlockState::from_id(first) {
+            if files.cancelled() {
+                baker.warn("the load was cancelled".into());
+                break;
+            }
             let block = state.block();
             let info = block.info();
             first = info.states().end;

@@ -371,6 +371,9 @@ fn collect<'a>(
             }
         };
         for source in sources {
+            if res.cancelled() {
+                return Err(AtlasError::Cancelled);
+            }
             run_source(res, source, &mut sprites, warnings);
             if sprites.len() > limits.atlas_sprites {
                 return Err(AtlasError::TooManySprites {
@@ -807,6 +810,8 @@ pub enum AtlasError {
     TooManyTexels { atlas: &'static str, max: u32 },
     /// The definitions list more sprites than an atlas may have.
     TooManySprites { atlas: &'static str, max: usize },
+    /// The load was cancelled ([`crate::Budget::cancel_with`]).
+    Cancelled,
 }
 
 impl fmt::Display for AtlasError {
@@ -821,6 +826,7 @@ impl fmt::Display for AtlasError {
             AtlasError::TooManySprites { atlas, max } => {
                 write!(f, "atlas {atlas}: more than {max} sprites")
             }
+            AtlasError::Cancelled => f.write_str("cancelled"),
         }
     }
 }
@@ -863,8 +869,16 @@ pub fn build(res: &Resources, def: &AtlasDef, opts: &AtlasOptions) -> Result<Atl
     };
     let results: Vec<Result<Contents, (Id, String)>> = jobs
         .into_par_iter()
-        .map(|(id, loader)| load(id.clone(), loader, def.gui, &load_state).map_err(|e| (id, e)))
+        .map(|(id, loader)| {
+            if res.cancelled() {
+                return Err((id, "the load was cancelled".to_owned()));
+            }
+            load(id.clone(), loader, def.gui, &load_state).map_err(|e| (id, e))
+        })
         .collect();
+    if res.cancelled() {
+        return Err(AtlasError::Cancelled);
+    }
     if load_state.full.load(Ordering::Relaxed) {
         return Err(AtlasError::TooManyTexels {
             atlas: def.name,
@@ -903,10 +917,16 @@ pub fn build(res: &Resources, def: &AtlasDef, opts: &AtlasOptions) -> Result<Atl
         max: max_side,
     })?;
 
+    if res.cancelled() {
+        return Err(AtlasError::Cancelled);
+    }
     // Mip levels per sprite, over the whole image (every frame).
     let mips: Vec<Vec<Image>> = sprites
         .par_iter_mut()
         .map(|s| {
+            if res.cancelled() {
+                return Vec::new();
+            }
             let image = std::mem::replace(&mut s.image, Image::new(0, 0));
             mipmap::generate(
                 s.id.path(),
@@ -919,6 +939,9 @@ pub fn build(res: &Resources, def: &AtlasDef, opts: &AtlasOptions) -> Result<Atl
         })
         .collect();
 
+    if res.cancelled() {
+        return Err(AtlasError::Cancelled);
+    }
     let mut out_levels: Vec<Image> = (0..=levels)
         .map(|l| Image::new(layout.width >> l, layout.height >> l))
         .collect();

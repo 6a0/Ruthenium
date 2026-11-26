@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
+use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
 use crate::id::{valid_namespace, valid_path};
@@ -87,10 +87,15 @@ pub struct Filter {
     every_path: bool,
     /// The path regexes, tried in one pass: a path is asked about on every lookup below
     /// the pack.
-    paths: RegexSet,
+    paths: regex::bytes::RegexSet,
 }
 
 impl Filter {
+    /// How many patterns it has.
+    pub fn patterns(&self) -> usize {
+        self.namespaces.len()
+    }
+
     /// Whether any block pattern's namespace regex matches. A pattern without
     /// one matches every namespace.
     pub fn filters_namespace(&self, namespace: &str) -> bool {
@@ -102,7 +107,7 @@ impl Filter {
     /// Whether any block pattern's path regex matches. Vanilla does not pair
     /// a pattern's namespace with its path.
     pub fn filters_path(&self, path: &str) -> bool {
-        self.every_path || self.paths.is_match(path)
+        self.every_path || self.paths.is_match(path.as_bytes())
     }
 }
 
@@ -113,15 +118,38 @@ pub const MAX_PATTERN_BYTES: usize = 1024;
 /// `a{1000}{1000}` compiles to gigabytes otherwise (the regex crate's defaults are 10 and
 /// 2 MiB).
 const REGEX_BYTES: usize = 1 << 20;
+/// What one filter path pattern may compile to. Filters are asked on every lookup below
+/// their pack, so they are held much smaller: 16 KiB of ASCII program takes any real
+/// pattern (`^textures/block/[a-z_]+\.png$` is under 1 KiB), and the worst one that
+/// fits costs under a microsecond a path.
+const FILTER_REGEX_BYTES: usize = 1 << 14;
 
 /// A pack's regular expression, no longer than [`MAX_PATTERN_BYTES`] and compiled into at
 /// most [`REGEX_BYTES`]. (The regex crate matches in time linear in the text.)
 pub(crate) fn pack_regex(pattern: &str) -> Result<Regex, String> {
+    pack_regex_within(pattern, REGEX_BYTES)
+}
+
+fn pack_regex_within(pattern: &str, bytes: usize) -> Result<Regex, String> {
     if pattern.len() > MAX_PATTERN_BYTES {
         return Err(format!("a pattern longer than {MAX_PATTERN_BYTES} bytes"));
     }
     RegexBuilder::new(pattern)
-        .size_limit(REGEX_BYTES)
+        .size_limit(bytes)
+        .dfa_size_limit(REGEX_BYTES)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// A path pattern as Java reads it on paths, which are ASCII: classes such as `\w` are
+/// ASCII ones (Java's default), so that a pattern compiles small.
+fn ascii_pattern(pattern: &str, bytes: usize) -> Result<regex::bytes::Regex, String> {
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(format!("a pattern longer than {MAX_PATTERN_BYTES} bytes"));
+    }
+    regex::bytes::RegexBuilder::new(pattern)
+        .unicode(false)
+        .size_limit(bytes)
         .dfa_size_limit(REGEX_BYTES)
         .build()
         .map_err(|e| e.to_string())
@@ -269,14 +297,15 @@ fn filter(meta: &Value, max: usize) -> Result<Option<Filter>, String> {
         match text(b, "path")? {
             // Each within its own limit, before the set of them is built.
             Some(p) => {
-                pack_regex(&p).map_err(|e| format!("filter: {e}"))?;
+                ascii_pattern(&p, FILTER_REGEX_BYTES).map_err(|e| format!("filter: {e}"))?;
                 paths.push(p);
             }
             None => every_path = true,
         }
     }
-    let paths = RegexSetBuilder::new(&paths)
-        .size_limit(REGEX_BYTES * max.clamp(1, 64))
+    let paths = regex::bytes::RegexSetBuilder::new(&paths)
+        .unicode(false)
+        .size_limit(FILTER_REGEX_BYTES * paths.len().max(1))
         .dfa_size_limit(REGEX_BYTES)
         .build()
         .map_err(|e| format!("filter: {e}"))?;
@@ -556,6 +585,11 @@ impl Pack {
         &self.budget
     }
 
+    /// Gives the pack's load a cancel flag ([`Budget::cancel_with`]).
+    pub fn cancel_with(&self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.budget.cancel_with(flag);
+    }
+
     /// A new load of the same pack begins: what it costs is counted from nothing again.
     pub fn reset_budget(&self) {
         self.budget.reset();
@@ -576,6 +610,11 @@ impl Pack {
 
     pub fn filter(&self) -> Option<&Filter> {
         self.filter.as_ref()
+    }
+
+    /// Loads the pack without its filter (over the stack's limit of patterns).
+    pub(crate) fn drop_filter(&mut self) {
+        self.filter = None;
     }
 
     /// The pack's `pack.mcmeta`.
@@ -757,6 +796,122 @@ mod tests {
         assert!(pack_regex("a{50000}").is_err());
         assert!(pack_regex("^textures/block/(stone|dirt)$").is_ok());
         assert!(pack_regex(&"a".repeat(MAX_PATTERN_BYTES + 1)).is_err());
+    }
+
+    /// The worst filter a pack may bring (eight of the costliest patterns found) answers
+    /// a path in microseconds: with Unicode classes and 1 MiB a pattern, eight of
+    /// `(\w|\d|\s){20}x` took 5 ms a path.
+    #[test]
+    fn a_filter_answers_quickly() {
+        let blocks = [r#"{"path": "(\\w|\\d|\\s){90}x"}"#; 8].join(",");
+        let meta: Value =
+            serde_json::from_str(&format!(r#"{{"filter": {{"block": [{blocks}]}}}}"#)).unwrap();
+        let f = filter(&meta, 8).unwrap().unwrap();
+        assert_eq!(f.patterns(), 8);
+        let path = "textures/block/a_banana_and_a_papaya_on_a_tea_tray_at_a_bazaar/a.png";
+        let started = std::time::Instant::now();
+        for _ in 0..2000 {
+            assert!(!f.filters_path(path));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // Classes are Java's ASCII ones: \w is [A-Za-z0-9_].
+        let meta: Value =
+            serde_json::from_str(r#"{"filter": {"block": [{"path": "^\\w+$"}]}}"#).unwrap();
+        let f = filter(&meta, 8).unwrap().unwrap();
+        assert!(f.filters_path("stone_2") && !f.filters_path("a/b"));
+        assert!(
+            filter(
+                &serde_json::json!({"filter": {"block": [{"path": "a"}, {"path": "b"}]}}),
+                1
+            )
+            .is_err()
+        );
+        // A pattern of more than 16 KiB of program, though under the 1 MiB of others.
+        assert!(pack_regex("(.|..){100}x").is_ok());
+        let long = serde_json::json!({"filter": {"block": [{"path": "(.|..){100}x"}]}});
+        assert!(filter(&long, 8).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn filter_lookup_cost() {
+        // Run with `--ignored --nocapture` in release: the worst patterns found, as many
+        // as a pack may have (BENCH_PATTERNS), each repeated N times (BENCH_N).
+        // The largest repetition of each template that compiles under the limit.
+        let templates = [
+            ".*a.{N}",
+            ".*[aeiou_].{N}$",
+            "(.*_.{N})|(.*e.{N})|(.*o.{N})",
+            "(.|..){N}x",
+            "(\\w*a){N}b",
+            "([^/]*/){N}x",
+            "(\\w|\\d|\\s){N}x",
+            "(.*a.{5}){N}",
+            "([a-z]+/)*[a-z]{N}\\.png",
+            "(a|b|c|d|e|f|g|h)*a(a|b|c|d|e|f|g|h){N}",
+            "\\pL{N}",
+        ];
+        let paths: Vec<String> = (0..2000).map(|i| format!("textures/block/a_banana_and_a_papaya_{i}_on_a_tea_tray_at_a_bazaar_in_alabama/a_{i}.png")).collect();
+        for t in templates {
+            let fits = |n: usize| {
+                ascii_pattern(&t.replace('N', &n.to_string()), FILTER_REGEX_BYTES).is_ok()
+            };
+            let (mut lo, mut hi) = (1usize, 1 << 20);
+            if !fits(lo) {
+                eprintln!("BENCH {t}: nothing fits");
+                continue;
+            }
+            while lo + 1 < hi {
+                let m = (lo + hi) / 2;
+                if fits(m) { lo = m } else { hi = m }
+            }
+            if let Some(n) = std::env::var("BENCH_N")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                lo = lo.min(n);
+            }
+            let pat = t.replace('N', &lo.to_string());
+            let n = std::env::var("BENCH_PATTERNS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64);
+            let blocks: Vec<String> = (0..n)
+                .map(|i| {
+                    format!(
+                        r#"{{"path": "{}{}"}}"#,
+                        pat.replace('\\', "\\\\"),
+                        if std::env::var("BENCH_SAME").is_ok() {
+                            String::new()
+                        } else {
+                            format!("(?:){i}")
+                        }
+                    )
+                })
+                .collect();
+            let meta: Value = serde_json::from_str(&format!(
+                r#"{{"filter": {{"block": [{}]}}}}"#,
+                blocks.join(",")
+            ))
+            .unwrap();
+            let f = match filter(&meta, usize::MAX) {
+                Ok(Some(f)) => f,
+                e => {
+                    eprintln!("BENCH {t}: {:?}", e.err());
+                    continue;
+                }
+            };
+            let started = std::time::Instant::now();
+            let hits = paths.iter().filter(|p| f.filters_path(p)).count();
+            eprintln!(
+                "BENCH {t} N={lo}: {n} patterns, {:?} for 2000 paths ({hits} hits)",
+                started.elapsed()
+            );
+        }
     }
 
     #[test]

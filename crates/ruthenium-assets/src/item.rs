@@ -788,6 +788,9 @@ impl<'a> Baker<'a> {
     /// A definition's node, no deeper than [`Limits::item_model_depth`] and no more of them
     /// than [`Limits::item_model_nodes`]: past either, nothing is drawn.
     fn node(&mut self, v: &Value, parent: &Transformation) -> Node {
+        if self.files.cancelled() {
+            return Node::Empty;
+        }
         if self.depth >= self.limits.item_model_depth {
             self.warn(format!(
                 "an item definition nests deeper than {}",
@@ -1162,6 +1165,10 @@ impl ItemModels {
         let mut out = HashMap::new();
         let mut swap_scales = HashMap::new();
         for (id, text) in definitions {
+            if files.cancelled() {
+                baker.warn("the load was cancelled".into());
+                break;
+            }
             let file = serde_json::from_str::<Value>(text).ok();
             if let Some(scale) = file
                 .as_ref()

@@ -53,6 +53,12 @@ impl<'a> Resource<'a> {
 
     /// The file's bytes, taken from its pack's budget for the load.
     pub fn read(&self) -> io::Result<Cow<'a, [u8]>> {
+        if self.res.cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the load was cancelled",
+            ));
+        }
         self.res.packs[self.pack].read(&self.loc)
     }
 
@@ -137,7 +143,26 @@ fn mcmeta(path: &str) -> String {
 
 impl Resources {
     /// `packs` from lowest to highest priority; the vanilla pack first.
-    pub fn new(packs: Vec<Pack>) -> Resources {
+    pub fn new(mut packs: Vec<Pack>) -> Resources {
+        let limits = packs
+            .iter()
+            .fold(Limits::trusted(), |l, p| l.min(p.limits()));
+        // Every filter pattern of the stack is tried on lookups below its pack: past
+        // `Limits::stack_filters` in all, the packs that bring more go without.
+        let mut patterns = 0usize;
+        for pack in &mut packs {
+            let n = pack.filter().map_or(0, crate::pack::Filter::patterns);
+            if patterns.saturating_add(n) > limits.stack_filters {
+                eprintln!(
+                    "[assets] {}: the packs' filters have more than {} patterns; loaded without its filter",
+                    pack.name(),
+                    limits.stack_filters
+                );
+                pack.drop_filter();
+            } else {
+                patterns += n;
+            }
+        }
         let mut all: Vec<&str> = packs
             .iter()
             .flat_map(|p| p.namespaces().iter().map(String::as_str))
@@ -158,9 +183,6 @@ impl Resources {
                 }
             }
         }
-        let limits = packs
-            .iter()
-            .fold(Limits::trusted(), |l, p| l.min(p.limits()));
         Resources {
             packs,
             namespaces,
@@ -176,6 +198,12 @@ impl Resources {
     /// the baked models, a font) is held to.
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// Whether the load is given up: some pack's budget has a cancel flag that is set
+    /// ([`crate::Budget::cancel_with`]). Lookups then find nothing and reads fail.
+    pub fn cancelled(&self) -> bool {
+        self.packs.iter().any(|p| p.budget().cancelled())
     }
 
     /// A new load begins: every pack's budget is counted from nothing again.
@@ -205,6 +233,9 @@ impl Resources {
     /// The highest pack's copy of `id`. A filter above every copy hides it.
     /// Its metadata is the highest `.mcmeta` at or above that pack.
     pub fn get(&self, id: &Id) -> Option<Resource<'_>> {
+        if self.cancelled() {
+            return None;
+        }
         let (ns, path) = (id.namespace(), id.path());
         let slots = self.slots(ns);
         for (i, slot) in slots.iter().enumerate().rev() {
@@ -237,6 +268,9 @@ impl Resources {
     /// Every copy of `id`, lowest pack first, down to the highest filter
     /// that hides it. Each copy's metadata comes from its own pack.
     pub fn stack(&self, id: &Id) -> Vec<Resource<'_>> {
+        if self.cancelled() {
+            return Vec::new();
+        }
         let (ns, path) = (id.namespace(), id.path());
         let meta_path = mcmeta(path);
         let mut out = Vec::new();
@@ -272,6 +306,9 @@ impl Resources {
     pub fn list(&self, dir: &str, select: impl Fn(&str) -> bool) -> BTreeMap<Id, Resource<'_>> {
         let mut out = BTreeMap::new();
         for (ns, slots) in &self.namespaces {
+            if self.cancelled() {
+                return BTreeMap::new();
+            }
             let mut files: HashMap<String, (usize, usize, Loc)> = HashMap::new();
             let mut metas: HashMap<String, (usize, usize, Loc)> = HashMap::new();
             for (i, slot) in slots.iter().enumerate() {

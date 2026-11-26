@@ -15,7 +15,8 @@
 //!
 //! [`Resources::limits`]: crate::Resources::limits
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// See the module docs. Every number says why it is what it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,8 +45,11 @@ pub struct Limits {
     /// have one per range of versions they support.
     pub pack_overlays: usize,
     /// `filter.block` patterns in `pack.mcmeta`: regular expressions tried on every
-    /// lookup below the pack. The game's packs have none.
+    /// lookup below the pack. The game's packs have none, packs that use them one or two.
     pub pack_filters: usize,
+    /// Filter patterns of every pack of a stack together (up to 16 server packs): the
+    /// packs above the limit are loaded without their filters.
+    pub stack_filters: usize,
 
     // Files of the pack.
     /// One JSON file (models, block states, item definitions, atlases, fonts, language
@@ -145,6 +149,7 @@ impl Limits {
             load_bytes: u64::MAX,
             pack_overlays: usize::MAX,
             pack_filters: usize::MAX,
+            stack_filters: usize::MAX,
             json_bytes: u64::MAX,
             mcmeta_bytes: u64::MAX,
             // stb_image's own limit (`STBI_MAX_DIMENSIONS`).
@@ -186,7 +191,8 @@ impl Limits {
             entry_bytes: 64 << 20,
             load_bytes: 1 << 30,
             pack_overlays: 64,
-            pack_filters: 64,
+            pack_filters: 8,
+            stack_filters: 16,
             json_bytes: 4 << 20,
             mcmeta_bytes: 256 << 10,
             image_side: 16384,
@@ -228,6 +234,7 @@ impl Limits {
             load_bytes: self.load_bytes.min(o.load_bytes),
             pack_overlays: self.pack_overlays.min(o.pack_overlays),
             pack_filters: self.pack_filters.min(o.pack_filters),
+            stack_filters: self.stack_filters.min(o.stack_filters),
             json_bytes: self.json_bytes.min(o.json_bytes),
             mcmeta_bytes: self.mcmeta_bytes.min(o.mcmeta_bytes),
             image_side: self.image_side.min(o.image_side),
@@ -272,9 +279,24 @@ impl Default for Limits {
 pub struct Budget {
     bytes: AtomicU64,
     texels: AtomicU64,
+    /// Set by whoever runs the load: once it is true, the load is given up.
+    cancel: OnceLock<Arc<AtomicBool>>,
 }
 
 impl Budget {
+    /// Makes `flag` the load's cancel flag: once it is set, every lookup in a stack with
+    /// this pack finds nothing, every read fails, and the builders (atlases, models,
+    /// items, fonts) return early with what they have. The first flag given stays: a pack
+    /// is opened for one load.
+    pub fn cancel_with(&self, flag: Arc<AtomicBool>) {
+        let _ = self.cancel.set(flag);
+    }
+
+    /// Whether the load is given up.
+    pub fn cancelled(&self) -> bool {
+        self.cancel.get().is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
     /// Takes `n` from what `limit` leaves, or fails and takes nothing.
     fn take(counter: &AtomicU64, n: u64, limit: u64) -> bool {
         counter
