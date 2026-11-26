@@ -7,6 +7,7 @@
 //! - [`ping`]: the server list's status ping (and the legacy one), on a background thread.
 //! - [`lan`]: games open to the local network, heard on their multicast group.
 //! - [`server_list`]: the saved list, `servers.dat`.
+//! - [`server_pack`]: downloading the resource packs a server pushes, safely.
 //! - [`connection`]: a connection for playing, from the handshake into play, on its own
 //!   thread.
 //! - [`crypt`], [`transport`]: the login's cryptography; framing, compression and
@@ -21,6 +22,7 @@ pub mod lan;
 pub mod ping;
 pub mod resolve;
 pub mod server_list;
+pub mod server_pack;
 pub mod transport;
 
 pub use address::ServerAddress;

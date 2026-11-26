@@ -1,6 +1,6 @@
 [package]
 name = "ruthenium-net"
-description = "Networking: server addresses, SRV lookup, the server list's status ping, servers.dat"
+description = "Networking: server addresses, SRV lookup, the server list's status ping, servers.dat, server resource pack downloads"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
