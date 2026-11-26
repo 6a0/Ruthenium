@@ -735,6 +735,17 @@ mod tests {
     }
 
     #[test]
+    fn a_double_click_is_on_the_same_slot() {
+        let (mut s, mut f) = chest();
+        let (p0, p1) = (at(&s, &f, 0), at(&s, &f, 1));
+        click(&mut s, &mut f, 1, p0, false, false);
+        // Within the time, but on another slot: a plain click there.
+        s.mouse_clicked(&mut f, mouse(1, p1, false), true);
+        s.mouse_released(&mut f, mouse(1, p1, false));
+        assert_eq!(f.clicks, [(0, 0, Input::Pickup), (1, 0, Input::Pickup)]);
+    }
+
+    #[test]
     fn keys_swap_throw_and_close() {
         let (mut s, mut f) = chest();
         let p0 = at(&s, &f, 0);
@@ -800,9 +811,11 @@ mod tests {
         for i in [5, 1, 3] {
             set.insert(i);
         }
-        // Buckets of 16: the hashes' low bits after the spread.
+        // Buckets of 16: the hashes' low bits after the spread (`h ^ h >>> 16`).
         let hashes = [0, 0x21, 0, 0x10_0002, 0, 0x7];
         assert_eq!(set.ordered(&hashes), [1, 3, 5]);
+        let hashes = [0, 0x3, 0, 0x2_0000, 0, 0x1];
+        assert_eq!(set.ordered(&hashes), [5, 3, 1]);
         // The table grows past 12 and never shrinks.
         for i in 0..13 {
             set.insert(10 + i);

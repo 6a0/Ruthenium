@@ -1658,4 +1658,149 @@ mod tests {
             &wrong[..wrong.len().min(20)]
         );
     }
+    #[test]
+    fn slots_keep_their_rules() {
+        let (items, recipes) = (items(), recipes());
+        let who = Who {
+            items: &items,
+            recipes: &recipes,
+            creative: false,
+        };
+        let mut inv = Inventory::default();
+        // A shulker box doesn't go into a shulker box; a bucket is a furnace's fuel, one
+        // at a time.
+        let shulker = Menu::new(Kind::ShulkerBox, 1);
+        let boxed = items.new_stack(id("minecraft:shulker_box"), 1);
+        assert!(!shulker.may_place(0, &boxed, &who));
+        assert!(shulker.may_place(0, &items.new_stack(id("minecraft:stone"), 1), &who));
+        let furnace = Menu::new(Kind::Furnace, 1);
+        let buckets = items.new_stack(id("minecraft:bucket"), 16);
+        assert!(furnace.may_place(1, &buckets, &who));
+        assert_eq!(furnace.max_stack_size(1, &buckets, &who), 1);
+        assert!(!furnace.may_place(1, &items.new_stack(id("minecraft:stone"), 1), &who));
+        assert!(furnace.may_place(1, &items.new_stack(id("minecraft:coal"), 1), &who));
+        assert!(!furnace.may_place(2, &items.new_stack(id("minecraft:coal"), 1), &who));
+        // Armour: only its own slot, one at a time; bound armour stays on but in creative.
+        let mut m = Menu::inventory();
+        let helmet = items.new_stack(id("minecraft:diamond_helmet"), 1);
+        assert!(m.may_place(5, &helmet, &who));
+        assert!(!m.may_place(6, &helmet, &who));
+        assert_eq!(
+            m.max_stack_size(5, &items.new_stack(id("minecraft:stone"), 64), &who),
+            1
+        );
+        let mut bound = helmet.clone();
+        std::sync::Arc::make_mut(&mut bound.c).prevent_armor_change = true;
+        m.set(&mut inv, 5, bound);
+        assert!(!m.may_pickup(&inv, 5, &who));
+        let creative = Who {
+            creative: true,
+            ..who
+        };
+        assert!(m.may_pickup(&inv, 5, &creative));
+        m.clicked(&mut inv, &who, 5, 0, Input::Pickup);
+        assert!(m.carried.is_empty());
+        // Shift-clicking armour puts it on, and the off hand takes a shield.
+        let mut m = Menu::inventory();
+        let mut inv = Inventory::default();
+        m.set(
+            &mut inv,
+            36,
+            items.new_stack(id("minecraft:diamond_boots"), 1),
+        );
+        m.set(&mut inv, 37, items.new_stack(id("minecraft:shield"), 1));
+        m.clicked(&mut inv, &who, 36, 0, Input::QuickMove);
+        m.clicked(&mut inv, &who, 37, 0, Input::QuickMove);
+        assert_eq!(inv.get(36).c.name, "minecraft:diamond_boots");
+        assert_eq!(inv.get(40).c.name, "minecraft:shield");
+        // Shift-clicking stone in a 3-row chest's inventory part fills the chest; out
+        // of it, the hotbar's last slot first (backwards).
+        let mut chest = Menu::new(Kind::Chest(3), 2);
+        let mut inv = Inventory::default();
+        chest.set(&mut inv, 0, items.new_stack(id("minecraft:stone"), 10));
+        chest.clicked(&mut inv, &who, 0, 0, Input::QuickMove);
+        assert_eq!(inv.items[8].count, 10);
+        chest.clicked(&mut inv, &who, 62, 0, Input::QuickMove);
+        assert_eq!(chest.own[0].count, 10);
+    }
+
+    #[test]
+    fn taking_a_crafting_result_uses_the_grid() {
+        let (items, recipes) = (items(), recipes());
+        let who = Who {
+            items: &items,
+            recipes: &recipes,
+            creative: false,
+        };
+        let mut inv = Inventory::default();
+        let mut m = Menu::new(Kind::Crafting, 3);
+        m.grid[4] = items.new_stack(id("minecraft:milk_bucket"), 1);
+        m.grid[5] = items.new_stack(id("minecraft:stone"), 3);
+        m.own[0] = items.new_stack(id("minecraft:snowball"), 4);
+        m.clicked(&mut inv, &who, 0, 0, Input::Pickup);
+        assert_eq!(m.carried.count, 4);
+        // The milk leaves its bucket; the stone one less.
+        assert_eq!(m.grid[4].c.name, "minecraft:bucket");
+        assert_eq!(m.grid[5].count, 2);
+        assert!(m.own[0].is_empty());
+        // Dragging copies needs infinite materials.
+        let mut m = Menu::new(Kind::Chest(1), 1);
+        m.carried = items.new_stack(id("minecraft:stone"), 2);
+        for (slot, mask) in [
+            (-999, quickcraft_mask(0, 2)),
+            (0, quickcraft_mask(1, 2)),
+            (1, quickcraft_mask(1, 2)),
+            (-999, quickcraft_mask(2, 2)),
+        ] {
+            m.clicked(&mut inv, &who, slot, mask, Input::QuickCraft);
+        }
+        assert!(m.own[0].is_empty());
+        let creative = Who {
+            creative: true,
+            ..who
+        };
+        for (slot, mask) in [
+            (-999, quickcraft_mask(0, 2)),
+            (0, quickcraft_mask(1, 2)),
+            (1, quickcraft_mask(1, 2)),
+            (-999, quickcraft_mask(2, 2)),
+        ] {
+            m.clicked(&mut inv, &creative, slot, mask, Input::QuickCraft);
+        }
+        // (What is left goes below nothing: the cursor is empty.)
+        assert_eq!((m.own[0].count, m.own[1].count), (64, 64));
+        assert!(m.carried.is_empty());
+    }
+
+    #[test]
+    fn swaps_and_gathers_mind_their_slots() {
+        let (items, recipes) = (items(), recipes());
+        let who = Who {
+            items: &items,
+            recipes: &recipes,
+            creative: false,
+        };
+        // A gather leaves a crafting result alone.
+        let mut inv = Inventory::default();
+        let mut m = Menu::inventory();
+        m.own[0] = items.new_stack(id("minecraft:stone"), 5);
+        m.set(&mut inv, 9, items.new_stack(id("minecraft:stone"), 4));
+        m.carried = items.new_stack(id("minecraft:stone"), 3);
+        m.clicked(&mut inv, &who, 10, 0, Input::PickupAll);
+        assert_eq!((m.carried.count, m.own[0].count), (7, 5));
+        // Swapping sixteen pumpkins with a helmet on: one goes on, the helmet into the
+        // inventory.
+        let mut inv = Inventory::default();
+        let mut m = Menu::inventory();
+        m.set(
+            &mut inv,
+            5,
+            items.new_stack(id("minecraft:diamond_helmet"), 1),
+        );
+        inv.items[0] = items.new_stack(id("minecraft:carved_pumpkin"), 16);
+        m.clicked(&mut inv, &who, 5, 0, Input::Swap);
+        assert_eq!(inv.get(39).c.name, "minecraft:carved_pumpkin");
+        assert_eq!(inv.items[0].count, 15);
+        assert_eq!(inv.items[1].c.name, "minecraft:diamond_helmet");
+    }
 }

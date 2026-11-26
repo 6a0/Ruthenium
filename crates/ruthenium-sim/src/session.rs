@@ -1372,14 +1372,19 @@ impl Game {
         for e in &input.screen_inputs {
             self.screen_input(e);
         }
-        self.containers.inventory_clicks += input.inventory_clicks;
+        // Under a container screen keys and buttons press no binding (`KeyMapping.click`
+        // is only called with no screen open) and the wheel goes to the screen.
+        let under_screen = self.containers.screen.is_some();
+        if !under_screen {
+            self.containers.inventory_clicks += input.inventory_clicks;
+            self.use_keys.use_clicks += input.use_clicks;
+            self.use_keys.swap_clicks += input.swap_clicks;
+            self.use_keys.attack_clicks += input.attack_clicks;
+        }
         self.keys = input.keys;
         self.held_keys = input.keys;
         self.use_keys.use_down = input.use_down;
-        self.use_keys.use_clicks += input.use_clicks;
-        self.use_keys.swap_clicks += input.swap_clicks;
         self.use_keys.attack_down = input.attack_down;
-        self.use_keys.attack_clicks += input.attack_clicks;
         self.screen_open = input.screen_open;
         self.player_list = input.player_list;
         if let Some(scale) = input.fov_effects {
@@ -1401,11 +1406,14 @@ impl Game {
                 self.connection.send(p);
             }
         }
-        if !w.player.spectator {
+        if !w.player.spectator && !under_screen {
             for &wheel in &input.scrolls {
                 let inv = &mut w.player.inventory;
                 inv.selected = next_scroll_selection(f64::from(wheel), inv.selected, 9);
             }
+        }
+        if under_screen {
+            return;
         }
         for (pending, new) in self.hotbar_clicks.iter_mut().zip(input.hotbar_clicks) {
             *pending += new;
@@ -4307,5 +4315,115 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(closed);
+    }
+    /// Container screens: a menu the server opens takes the frame's events (and its
+    /// clicks go out), the wheel and the keys' presses reach nothing under it, Escape
+    /// closes it with the menu's id, the server may close it, and a menu the client
+    /// doesn't run is closed at once.
+    #[test]
+    fn container_screens_take_the_input_while_open() {
+        use crate::menu::screen::Binds;
+        use ruthenium_data::v26_3::packets::play as pl;
+        let mut r = start(None);
+        let sent = |r: &mut Rig| -> Vec<Vec<u8>> {
+            r.remote
+                .sent()
+                .into_iter()
+                .filter_map(|s| match s {
+                    Sent::Packet(p) if p[0] != pl::Serverbound::ClientTickEnd.id() as u8 => Some(p),
+                    _ => None,
+                })
+                .collect()
+        };
+        r.packet(play::Clientbound::OpenScreen {
+            container_id: 3,
+            menu_type: 2,
+            title: Tag::String("Chest".into()),
+        });
+        r.frame(1);
+        assert!(r.game.container_screen_open());
+        assert_eq!(
+            r.game.world.as_ref().unwrap().player.menus.container().id,
+            3
+        );
+        let before = r.game.world.as_ref().unwrap().player.inventory.selected;
+        r.frame_with(
+            1,
+            FrameInput {
+                scrolls: vec![1],
+                hotbar_clicks: [0, 0, 0, 1, 0, 0, 0, 0, 0],
+                inventory_clicks: 1,
+                screen_inputs: vec![ScreenInput::Click {
+                    slot: 0,
+                    button: 0,
+                    input: crate::menu::Input::Pickup,
+                }],
+                ..FrameInput::default()
+            },
+        );
+        r.frame(100);
+        assert_eq!(
+            r.game.world.as_ref().unwrap().player.inventory.selected,
+            before
+        );
+        assert_eq!(r.game.hotbar_clicks, [0; 9]);
+        assert_eq!(r.game.containers.inventory_clicks, 0);
+        let clicks: Vec<Vec<u8>> = sent(&mut r)
+            .into_iter()
+            .filter(|p| p[0] == pl::Serverbound::ContainerClick.id() as u8)
+            .collect();
+        assert_eq!(clicks.len(), 1);
+        assert_eq!(
+            clicks[0][..3],
+            [pl::Serverbound::ContainerClick.id() as u8, 3, 0]
+        );
+        r.frame_with(
+            1,
+            FrameInput {
+                screen_inputs: vec![ScreenInput::Key {
+                    binds: Binds {
+                        escape: true,
+                        ..Binds::default()
+                    },
+                    ctrl: false,
+                    at: At::Outside,
+                }],
+                ..FrameInput::default()
+            },
+        );
+        assert!(!r.game.container_screen_open());
+        assert_eq!(sent(&mut r), [play::container_close(3)]);
+        // The wheel turns the hotbar again.
+        r.frame_with(
+            1,
+            FrameInput {
+                scrolls: vec![1],
+                ..FrameInput::default()
+            },
+        );
+        assert_ne!(
+            r.game.world.as_ref().unwrap().player.inventory.selected,
+            before
+        );
+        // The server closes a chest without a word back.
+        r.packet(play::Clientbound::OpenScreen {
+            container_id: 4,
+            menu_type: 2,
+            title: Tag::String("Chest".into()),
+        });
+        r.frame(1);
+        r.packet(play::Clientbound::ContainerClose { container_id: 4 });
+        r.frame(1);
+        assert!(!r.game.container_screen_open());
+        assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
+        // An anvil (8) isn't run: it is closed at once.
+        r.packet(play::Clientbound::OpenScreen {
+            container_id: 5,
+            menu_type: 8,
+            title: Tag::String("Repair".into()),
+        });
+        r.frame(1);
+        assert!(!r.game.container_screen_open());
+        assert_eq!(sent(&mut r), [play::container_close(5)]);
     }
 }
