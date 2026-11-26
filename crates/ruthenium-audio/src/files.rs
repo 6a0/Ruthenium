@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use ruthenium_assets::{Id, Resources};
+use ruthenium_assets::{Id, Limits, Resources};
 
 use crate::events::{SoundEvents, SoundsJson, id_key};
 
@@ -43,12 +43,20 @@ impl SoundFiles {
         self.ogg.iter().map(String::as_str)
     }
 
+    /// A sound file's bytes, read while the game plays: not counted against its pack's
+    /// budget for a load, but no larger than a file of it may be.
     pub fn read(&self, file: &Id) -> std::io::Result<Vec<u8>> {
-        self.resources
+        self.open(file).map(|(bytes, _)| bytes)
+    }
+
+    /// [`Self::read`], with the limits of the pack the file is in (what decoding it is
+    /// held to).
+    pub fn open(&self, file: &Id) -> std::io::Result<(Vec<u8>, Limits)> {
+        let r = self
+            .resources
             .get(file)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, id_key(file)))?
-            .read()
-            .map(|b| b.into_owned())
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, id_key(file)))?;
+        Ok((r.read_on_demand()?.into_owned(), *r.limits()))
     }
 
     /// The events of every pack's `sounds.json`, lowest pack first, with the warnings.
@@ -61,26 +69,33 @@ impl SoundFiles {
             .collect();
         namespaces.sort_unstable();
         namespaces.dedup();
-        let mut files: Vec<(String, String, Vec<u8>)> = Vec::new();
+        let mut files: Vec<(String, String, Vec<u8>, Limits)> = Vec::new();
         for ns in namespaces {
             let Some(id) = Id::new(ns, "sounds.json") else {
                 continue;
             };
             for r in self.resources.stack(&id) {
-                match r.read() {
-                    Ok(b) => {
-                        files.push((ns.to_owned(), r.pack().name().to_owned(), b.into_owned()))
-                    }
+                // `text` keeps a file over the JSON limit from being read at all.
+                match r.text() {
+                    Ok(b) => files.push((
+                        ns.to_owned(),
+                        r.pack().name().to_owned(),
+                        b.into_bytes(),
+                        *r.limits(),
+                    )),
                     Err(e) => eprintln!("[sound] {}: {ns}:sounds.json: {e}", r.pack().name()),
                 }
             }
         }
         SoundEvents::load(
-            files.iter().map(|(namespace, pack, bytes)| SoundsJson {
-                namespace,
-                pack,
-                bytes,
-            }),
+            files
+                .iter()
+                .map(|(namespace, pack, bytes, limits)| SoundsJson {
+                    namespace,
+                    pack,
+                    bytes,
+                    limits: *limits,
+                }),
             |f| self.has(f),
         )
     }

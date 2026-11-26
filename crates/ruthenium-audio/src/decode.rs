@@ -7,6 +7,7 @@
 
 use std::io::Cursor;
 
+use ruthenium_assets::Limits;
 use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error;
@@ -62,6 +63,12 @@ impl std::fmt::Debug for Decoder {
 
 impl Decoder {
     pub fn new(bytes: Vec<u8>) -> Result<Decoder, String> {
+        Decoder::with_limits(bytes, &Limits::trusted())
+    }
+
+    /// A decoder for a file of a pack read under `limits`: a sample rate above
+    /// [`Limits::sample_rate`] is refused (the stream buffers are seconds of it).
+    pub fn with_limits(bytes: Vec<u8>, limits: &Limits) -> Result<Decoder, String> {
         let source = MediaSourceStream::new(
             Box::new(Cursor::new(bytes)),
             MediaSourceStreamOptions::default(),
@@ -73,8 +80,6 @@ impl Decoder {
         let Some(CodecParameters::Audio(params)) = &track.codec_params else {
             return Err("no audio codec parameters".into());
         };
-        let decoder =
-            VorbisDecoder::try_new(params, &AudioDecoderOptions::default()).map_err(err)?;
         let channels = params
             .channels
             .as_ref()
@@ -88,6 +93,15 @@ impl Decoder {
             .sample_rate
             .filter(|&r| r > 0)
             .ok_or("no sample rate")?;
+        if rate > limits.sample_rate {
+            return Err(format!(
+                "{rate} Hz is above what a sound may have ({} Hz)",
+                limits.sample_rate
+            ));
+        }
+        // Checked before the decoder reads the headers: they are the pack's numbers.
+        let decoder =
+            VorbisDecoder::try_new(params, &AudioDecoderOptions::default()).map_err(err)?;
         Ok(Decoder {
             track: track.id,
             reader,
@@ -134,9 +148,23 @@ fn err(e: Error) -> String {
 
 /// A whole file (`SoundBufferLibrary.getCompleteBuffer`).
 pub fn decode(bytes: Vec<u8>) -> Result<Pcm, String> {
-    let mut d = Decoder::new(bytes)?;
+    decode_limited(bytes, &Limits::trusted(), usize::MAX)
+}
+
+/// [`decode`] for a file of a pack read under `limits`, of at most `max_samples` samples
+/// and [`Limits::sound_samples`]: a longer one is refused (vanilla would decode it all;
+/// one not streamed is held whole while it plays).
+pub fn decode_limited(bytes: Vec<u8>, limits: &Limits, max_samples: usize) -> Result<Pcm, String> {
+    let max = max_samples.min(limits.sound_samples);
+    let mut d = Decoder::with_limits(bytes, limits)?;
     let mut samples = Vec::new();
-    while d.next_into(&mut samples)? {}
+    while d.next_into(&mut samples)? {
+        if samples.len() > max {
+            return Err(format!(
+                "longer than a sound decoded whole may be ({max} samples)"
+            ));
+        }
+    }
     Ok(Pcm {
         channels: d.channels,
         rate: d.rate,

@@ -73,6 +73,7 @@ fn made_up_packs_choose_what_vanilla_chooses() {
             namespace: "minecraft",
             pack: "test",
             bytes: json.as_bytes(),
+            limits: ruthenium_assets::Limits::trusted(),
         }),
         |f| id_key(f) != "minecraft:sounds/f/gone.ogg",
     );

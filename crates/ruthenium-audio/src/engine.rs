@@ -818,6 +818,7 @@ mod tests {
                 namespace: "minecraft",
                 pack: "test",
                 bytes: SOUNDS.as_bytes(),
+                limits: ruthenium_assets::Limits::trusted(),
             }],
             |_| true,
         );

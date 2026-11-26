@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use ruthenium_assets::Id;
+use ruthenium_assets::{Id, Limits};
 use ruthenium_javamath::random::JavaRandom;
 use serde_json::Value;
 
@@ -116,6 +116,10 @@ pub enum Choice {
 #[derive(Debug, Default, Clone)]
 pub struct SoundEvents {
     events: HashMap<String, EventDef>,
+    /// Each event's weight at every depth of references, worked out once: summed afresh
+    /// for every play, an event that names another a thousand times, which names a third
+    /// a thousand times, and so on 32 deep, would take forever.
+    weights: HashMap<String, Box<[i32]>>,
 }
 
 /// One pack's `sounds.json` for one namespace.
@@ -125,6 +129,8 @@ pub struct SoundsJson<'a> {
     /// For warnings.
     pub pack: &'a str,
     pub bytes: &'a [u8],
+    /// The limits of the pack it is in.
+    pub limits: Limits,
 }
 
 /// A registration as vanilla's deserializer reads it.
@@ -144,7 +150,7 @@ impl SoundEvents {
         let mut events = SoundEvents::default();
         let mut warnings = Vec::new();
         for f in files {
-            let entries = match parse_file(f.bytes) {
+            let entries = match parse_file(f.bytes, &f.limits) {
                 Ok(e) => e,
                 Err(e) => {
                     warnings.push(format!("invalid sounds.json in {}: {e}", f.pack));
@@ -162,7 +168,39 @@ impl SoundEvents {
                 events.register(id, reg, &has_file, &mut warnings);
             }
         }
+        events.weigh();
         (events, warnings)
+    }
+
+    /// Works out every event's weight at every depth (`weights`), deepest first.
+    fn weigh(&mut self) {
+        let depths = MAX_DEPTH as usize + 1;
+        let mut weights: HashMap<String, Box<[i32]>> = self
+            .events
+            .keys()
+            .map(|k| (k.clone(), vec![0; depths].into_boxed_slice()))
+            .collect();
+        for depth in (0..depths).rev() {
+            let mut layer = Vec::with_capacity(self.events.len());
+            for (key, event) in &self.events {
+                let w = event.sounds.iter().fold(0i32, |sum, s| {
+                    sum.wrapping_add(match s.kind {
+                        SoundKind::File => s.weight,
+                        SoundKind::Event if depth >= MAX_DEPTH as usize => 0,
+                        SoundKind::Event => {
+                            weights.get(&id_key(&s.name)).map_or(0, |w| w[depth + 1])
+                        }
+                    })
+                });
+                layer.push((key, w));
+            }
+            for (key, w) in layer {
+                if let Some(ws) = weights.get_mut(key) {
+                    ws[depth] = w;
+                }
+            }
+        }
+        self.weights = weights;
     }
 
     /// `Preparations.handleRegistration`.
@@ -216,22 +254,20 @@ impl SoundEvents {
         self.events.keys().map(String::as_str)
     }
 
-    /// `WeighedSoundEvents.getWeight`.
-    fn weight(&self, event: &EventDef, depth: u32) -> i32 {
-        event
-            .sounds
-            .iter()
-            .fold(0i32, |sum, s| sum.wrapping_add(self.sound_weight(s, depth)))
+    /// `WeighedSoundEvents.getWeight` of the event `key` at `depth`.
+    fn weight(&self, key: &str, depth: u32) -> i32 {
+        self.weights
+            .get(key)
+            .and_then(|w| w.get(depth as usize))
+            .copied()
+            .unwrap_or(0)
     }
 
     fn sound_weight(&self, sound: &SoundDef, depth: u32) -> i32 {
         match sound.kind {
             SoundKind::File => sound.weight,
             SoundKind::Event if depth >= MAX_DEPTH => 0,
-            SoundKind::Event => self
-                .events
-                .get(&id_key(&sound.name))
-                .map_or(0, |e| self.weight(e, depth + 1)),
+            SoundKind::Event => self.weight(&id_key(&sound.name), depth + 1),
         }
     }
 
@@ -241,19 +277,26 @@ impl SoundEvents {
         match self.events.get(event) {
             None => Choice::Unknown,
             Some(e) => self
-                .choose_in(e, random, 0)
+                .choose_in(event, e, random, 0)
                 .map_or(Choice::Empty, Choice::Sound),
         }
     }
 
-    fn choose_in(&self, event: &EventDef, random: &mut JavaRandom, depth: u32) -> Option<Chosen> {
-        let weight = self.weight(event, depth);
+    fn choose_in(
+        &self,
+        key: &str,
+        event: &EventDef,
+        random: &mut JavaRandom,
+        depth: u32,
+    ) -> Option<Chosen> {
+        let weight = self.weight(key, depth);
         if event.sounds.is_empty() || weight <= 0 {
             return None;
         }
         let mut index = random.next_int(weight);
         for sound in &event.sounds {
-            index -= self.sound_weight(sound, depth);
+            // Java's int arithmetic: a pack's weights may add up past an int.
+            index = index.wrapping_sub(self.sound_weight(sound, depth));
             if index < 0 {
                 return match sound.kind {
                     SoundKind::File => Some(Chosen {
@@ -265,8 +308,9 @@ impl SoundEvents {
                         attenuation_distance: sound.attenuation_distance,
                     }),
                     SoundKind::Event => {
-                        let inner = self.events.get(&id_key(&sound.name))?;
-                        let wrapped = self.choose_in(inner, random, depth + 1)?;
+                        let inner_key = id_key(&sound.name);
+                        let inner = self.events.get(&inner_key)?;
+                        let wrapped = self.choose_in(&inner_key, inner, random, depth + 1)?;
                         Some(Chosen {
                             volume: wrapped.volume * sound.volume,
                             pitch: wrapped.pitch * sound.pitch,
@@ -288,8 +332,33 @@ pub fn id_key(id: &Id) -> String {
 
 /// A file's entries in file order, each read as vanilla's deserializer reads it; any
 /// entry it refuses fails the whole file.
-fn parse_file(bytes: &[u8]) -> Result<Vec<(String, Registration)>, String> {
+/// Over [`Limits::json_bytes`], [`Limits::sound_events`] or [`Limits::sounds_per_event`],
+/// the whole file is refused too.
+fn parse_file(bytes: &[u8], limits: &Limits) -> Result<Vec<(String, Registration)>, String> {
+    if bytes.len() as u64 > limits.json_bytes {
+        return Err(format!(
+            "larger than a JSON file may be ({})",
+            limits.json_bytes
+        ));
+    }
     let entries: Ordered = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if entries.0.len() > limits.sound_events {
+        return Err(format!(
+            "{} events is more than a sounds.json may have ({})",
+            entries.0.len(),
+            limits.sound_events
+        ));
+    }
+    if let Some((k, _)) = entries.0.iter().find(|(_, v)| {
+        v.get("sounds")
+            .and_then(Value::as_array)
+            .is_some_and(|s| s.len() > limits.sounds_per_event)
+    }) {
+        return Err(format!(
+            "{k}: more sounds than an event may have ({})",
+            limits.sounds_per_event
+        ));
+    }
     entries
         .0
         .into_iter()
@@ -469,6 +538,7 @@ mod tests {
                 namespace: ns,
                 pack: "test",
                 bytes: json.as_bytes(),
+                limits: Limits::trusted(),
             }),
             |id| !missing.contains(&id_key(id).as_str()),
         )
