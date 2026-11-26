@@ -96,6 +96,10 @@ impl Sprites {
     }
 }
 
+/// The most tiles one tiled blit draws. The game's smallest tiled part, the 2 x 2 centre
+/// of the bundle's bar, only ever fills a few dozen texels.
+const MAX_TILES: i64 = 16384;
+
 /// Quads for one frame of GUI.
 #[derive(Debug, Default)]
 pub struct DrawList {
@@ -255,6 +259,18 @@ impl DrawList {
             return;
         }
         let [u0, v0, u1, v1] = s.sub_uv(sw, sh, tx, ty, tw, th);
+        // A pack's sprite may tile by one texel: over a 4K screen that is millions of
+        // quads a frame. Past MAX_TILES the tiles are drawn larger, stretched.
+        let (mut tw, mut th) = (tw, th);
+        let tiles = |tw: i32, th: i32| {
+            (i64::from(w) + i64::from(tw) - 1) / i64::from(tw)
+                * ((i64::from(h) + i64::from(th) - 1) / i64::from(th))
+        };
+        if tiles(tw, th) > MAX_TILES {
+            let grow = (tiles(tw, th) as f64 / MAX_TILES as f64).sqrt().ceil() as i32 + 1;
+            tw = tw.saturating_mul(grow);
+            th = th.saturating_mul(grow);
+        }
         let lerp = |f: f32, a: f32, b: f32| a + f * (b - a);
         let mut ox = 0;
         while ox < w {
@@ -533,6 +549,48 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(dl.quads()[5].uv, [0.0, 0.0, 0.5, 0.25]);
+    }
+
+    /// A pack's sprite that tiles by one texel over a 4K screen: millions of quads a frame,
+    /// unless the tiles grow.
+    #[test]
+    fn tiny_tiles_over_a_large_area_are_bounded() {
+        let s = sheet(
+            GuiScaling::Tile {
+                width: 1,
+                height: 1,
+            },
+            1,
+            1,
+        );
+        let mut dl = DrawList::new();
+        dl.blit_sprite(&s, &Id::minecraft("s").unwrap(), 0, 0, 3840, 2160, !0);
+        let n = dl.quads().len() as i64;
+        assert!(n <= MAX_TILES && n > MAX_TILES / 8, "{n}");
+        // Still covering all of it.
+        let r = rects(&dl);
+        assert_eq!(r.iter().map(|q| q[2]).max(), Some(3840));
+        assert_eq!(r.iter().map(|q| q[3]).max(), Some(2160));
+        // A nine-slice's tiled centre too.
+        let b = Border {
+            left: 1,
+            top: 1,
+            right: 1,
+            bottom: 1,
+        };
+        let s = sheet(
+            GuiScaling::NineSlice {
+                width: 3,
+                height: 3,
+                border: b,
+                stretch_inner: false,
+            },
+            3,
+            3,
+        );
+        let mut dl = DrawList::new();
+        dl.blit_sprite(&s, &Id::minecraft("s").unwrap(), 0, 0, 3840, 2160, !0);
+        assert!((dl.quads().len() as i64) < 6 * MAX_TILES);
     }
 
     #[test]
