@@ -169,6 +169,8 @@ pub(crate) struct Tracker<M> {
     sorted_for: Option<SectionKey>,
     unsorted: usize,
     keys: Vec<(SectionKey, u8)>,
+    /// The next sync compares everything with the level ([`Tracker::rescan_next`]).
+    rescan_next: bool,
     stats: TrackerStats,
     /// The moment changes taken in now are known from.
     now: Since,
@@ -211,6 +213,7 @@ impl<M> Tracker<M> {
             sorted_for: None,
             unsorted: 0,
             keys: Vec::new(),
+            rescan_next: false,
             stats: TrackerStats::default(),
             now: Since {
                 at: Instant::now(),
@@ -405,6 +408,12 @@ impl<M> Tracker<M> {
         }
     }
 
+    /// Has the next [`Self::sync`] compare every loaded section with the level, as
+    /// when a level begins: after a resource reload, every section is meshed again.
+    pub fn rescan_next(&mut self) {
+        self.rescan_next = true;
+    }
+
     /// Forgets everything; the meshes go to `removed`.
     pub fn clear(&mut self, removed: &mut Vec<M>) {
         self.sections.clear();
@@ -541,7 +550,8 @@ impl<M> Tracker<M> {
             self.epoch = drained.epoch;
             self.stats.epochs += 1;
         }
-        if drained.rescan.is_some() || !keys.is_empty() {
+        let rescan = drained.rescan.is_some() || std::mem::take(&mut self.rescan_next);
+        if rescan || !keys.is_empty() {
             let dims = scene.with_terrain(|t| t.dims());
             self.range = (dims.min_section, dims.sections);
             let level = Some((self.epoch, self.range));
@@ -553,7 +563,7 @@ impl<M> Tracker<M> {
                 });
             }
         }
-        if drained.rescan.is_some() {
+        if rescan {
             self.stats.rescans += 1;
             let columns =
                 scene.with_terrain(|t| t.columns().map(|(k, _)| k).collect::<Vec<(i32, i32)>>());
@@ -1152,6 +1162,29 @@ mod tests {
             }
         };
         assert_eq!((later.since.frame, later.first), (20, false));
+    }
+
+    /// A resource reload: a fresh tracker over the same level finds nothing to mesh
+    /// unless it is told to compare everything, and then meshes every loaded section.
+    #[test]
+    fn a_rescan_asked_for_meshes_the_same_level_again() {
+        let mut world = World::new(&surrounded());
+        world.publish();
+        let mut t: Tracker<SectionKey> = Tracker::new();
+        let mut removed = Vec::new();
+        t.sync(&world.scene, &mut removed);
+        assert_eq!(mesh_all(&mut t, &world).len(), 4);
+        // What a reload does: everything forgotten, the same level kept.
+        let mut fresh: Tracker<SectionKey> = Tracker::new();
+        fresh.sync(&world.scene, &mut removed);
+        assert!(mesh_all(&mut fresh, &world).is_empty());
+        let mut fresh: Tracker<SectionKey> = Tracker::new();
+        fresh.rescan_next();
+        fresh.sync(&world.scene, &mut removed);
+        assert_eq!(mesh_all(&mut fresh, &world).len(), 4);
+        // Once: the next sync takes in changes only.
+        fresh.sync(&world.scene, &mut removed);
+        assert!(mesh_all(&mut fresh, &world).is_empty());
     }
 
     #[test]

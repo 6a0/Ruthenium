@@ -607,6 +607,26 @@ pub(crate) fn sky_push(
     push
 }
 
+/// A picture's texture, for a whole picture (one whose bytes are its size's).
+fn picture(
+    textures: &mut TextureTable,
+    uploads: &mut UploadRing,
+    image: &Option<SkyImage>,
+) -> Option<TextureId> {
+    let i = image.as_ref()?;
+    if i.rgba.len() != i.width as usize * i.height as usize * 4 || i.rgba.is_empty() {
+        return None;
+    }
+    textures
+        .create_with(
+            uploads,
+            TextureDesc::rgba8(i.width, i.height),
+            &[&i.rgba],
+            Arrival::NextFrame,
+        )
+        .ok()
+}
+
 impl SkyRenderer {
     /// Builds the meshes and creates the pictures' textures. Not on a frame's path.
     pub fn new(
@@ -633,20 +653,7 @@ impl SkyRenderer {
         let range = pool
             .alloc(bytes.len() as u64, 8)
             .map_err(|e| Error::Unsupported(format!("no room for the sky's meshes: {e:?}")))?;
-        let mut texture = |image: &Option<SkyImage>| {
-            let i = image.as_ref()?;
-            if i.rgba.len() != i.width as usize * i.height as usize * 4 || i.rgba.is_empty() {
-                return None;
-            }
-            textures
-                .create_with(
-                    uploads,
-                    TextureDesc::rgba8(i.width, i.height),
-                    &[&i.rgba],
-                    Arrival::NextFrame,
-                )
-                .ok()
-        };
+        let mut texture = |image: &Option<SkyImage>| picture(textures, uploads, image);
         let sun = texture(&images.sun);
         let moon = std::array::from_fn(|i| texture(&images.moon[i]));
         let end_sky = texture(&images.end_sky);
@@ -662,6 +669,25 @@ impl SkyRenderer {
             end_sky,
             draws: Vec::new(),
         })
+    }
+
+    /// Takes a resource reload's pictures of the sun, the moon and the End's sky in place
+    /// of the ones it has (destroyed); the meshes stay.
+    pub fn replace_pictures(
+        &mut self,
+        textures: &mut TextureTable,
+        uploads: &mut UploadRing,
+        images: &SkyImages,
+    ) {
+        let old = [self.sun.take(), self.end_sky.take()]
+            .into_iter()
+            .chain(self.moon.iter_mut().map(Option::take));
+        for id in old.flatten() {
+            textures.destroy(id);
+        }
+        self.sun = picture(textures, uploads, &images.sun);
+        self.moon = std::array::from_fn(|i| picture(textures, uploads, &images.moon[i]));
+        self.end_sky = picture(textures, uploads, &images.end_sky);
     }
 
     /// Stages the meshes, until that has worked once: before the frame's

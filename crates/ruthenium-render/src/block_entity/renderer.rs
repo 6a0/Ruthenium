@@ -877,6 +877,80 @@ fn pattern_texture(id: &str) -> String {
     format!("{BANNER_DIR}/{path}")
 }
 
+/// The pictures of a set of assets, on the GPU.
+struct Pictures {
+    ids: HashMap<String, TextureId>,
+    chests: HashMap<(Chest, bool, usize), TextureId>,
+    shulkers: Vec<Option<TextureId>>,
+    skulls: Vec<Option<TextureId>>,
+    shadow: Option<TextureId>,
+    glints: [Option<TextureId>; 2],
+}
+
+/// Creates the textures of the pictures below `textures/entity` (and the shadow's and
+/// the glints'), and finds the chests', shulker boxes' and skulls' among them.
+fn make_pictures(
+    textures: &mut TextureTable,
+    uploads: &mut UploadRing,
+    list: &[(String, SkyImage)],
+    shadow: Option<SkyImage>,
+    glint: [Option<SkyImage>; 2],
+) -> Pictures {
+    let mut ids = HashMap::new();
+    for (path, i) in list {
+        if i.rgba.is_empty() || i.rgba.len() != i.width as usize * i.height as usize * 4 {
+            continue;
+        }
+        if let Ok(id) = textures.create_with(
+            uploads,
+            TextureDesc::rgba8(i.width, i.height),
+            &[&i.rgba],
+            Arrival::NextFrame,
+        ) {
+            ids.insert(path.clone(), id);
+        }
+    }
+    let mut chests = HashMap::new();
+    for chest in CHESTS {
+        for christmas in [false, true] {
+            for (i, half) in HALVES.into_iter().enumerate() {
+                let name = place::chest_texture(chest, christmas);
+                if let Some(id) = ids.get(&format!("chest/{name}{half}")) {
+                    chests.insert((chest, christmas, i), *id);
+                }
+            }
+        }
+    }
+    let shulkers = std::iter::once("shulker/shulker".to_owned())
+        .chain(DYES.map(|d| format!("shulker/shulker_{d}")))
+        .map(|p| ids.get(&p).copied())
+        .collect();
+    let skulls = SKULLS.map(|s| ids.get(skull_texture(s)).copied()).to_vec();
+    let mut picture = |i: Option<SkyImage>| {
+        i.filter(|i| !i.rgba.is_empty() && i.rgba.len() == i.width as usize * i.height as usize * 4)
+            .and_then(|i| {
+                textures
+                    .create_with(
+                        uploads,
+                        TextureDesc::rgba8(i.width, i.height),
+                        &[&i.rgba],
+                        Arrival::NextFrame,
+                    )
+                    .ok()
+            })
+    };
+    let shadow = picture(shadow);
+    let glints = glint.map(&mut picture);
+    Pictures {
+        ids,
+        chests,
+        shulkers,
+        skulls,
+        shadow,
+        glints,
+    }
+}
+
 impl BlockEntityRenderer {
     /// Creates the models' buffer and the pictures' textures. Not on a frame's path.
     pub fn new(
@@ -903,53 +977,15 @@ impl BlockEntityRenderer {
         let range = pool
             .alloc(bytes.len() as u64, 8)
             .map_err(|e| Error::Unsupported(format!("no room for the models: {e:?}")))?;
-        let mut ids = HashMap::new();
-        for (path, i) in &assets.textures {
-            if i.rgba.is_empty() || i.rgba.len() != i.width as usize * i.height as usize * 4 {
-                continue;
-            }
-            if let Ok(id) = textures.create_with(
-                uploads,
-                TextureDesc::rgba8(i.width, i.height),
-                &[&i.rgba],
-                Arrival::NextFrame,
-            ) {
-                ids.insert(path.clone(), id);
-            }
-        }
-        let mut chests = HashMap::new();
-        for chest in CHESTS {
-            for christmas in [false, true] {
-                for (i, half) in HALVES.into_iter().enumerate() {
-                    let name = place::chest_texture(chest, christmas);
-                    if let Some(id) = ids.get(&format!("chest/{name}{half}")) {
-                        chests.insert((chest, christmas, i), *id);
-                    }
-                }
-            }
-        }
-        let shulkers = std::iter::once("shulker/shulker".to_owned())
-            .chain(DYES.map(|d| format!("shulker/shulker_{d}")))
-            .map(|p| ids.get(&p).copied())
-            .collect();
-        let skulls = SKULLS.map(|s| ids.get(skull_texture(s)).copied()).to_vec();
-        let mut picture = |i: Option<SkyImage>| {
-            i.filter(|i| {
-                !i.rgba.is_empty() && i.rgba.len() == i.width as usize * i.height as usize * 4
-            })
-            .and_then(|i| {
-                textures
-                    .create_with(
-                        uploads,
-                        TextureDesc::rgba8(i.width, i.height),
-                        &[&i.rgba],
-                        Arrival::NextFrame,
-                    )
-                    .ok()
-            })
-        };
-        let shadow_picture = picture(assets.shadow);
-        let glint_pictures = assets.glint.map(&mut picture);
+        let p = make_pictures(
+            textures,
+            uploads,
+            &assets.textures,
+            assets.shadow,
+            assets.glint,
+        );
+        let (ids, chests, shulkers, skulls, shadow_picture, glint_pictures) =
+            (p.ids, p.chests, p.shulkers, p.skulls, p.shadow, p.glints);
         // (Their atlas is too large to stage at once: it is streamed, from `stage` on.)
         let (items, item_atlas_waiting) = match assets.items {
             Some(i) => (Some(i.models), Some(i.atlas)),
@@ -1040,6 +1076,93 @@ impl BlockEntityRenderer {
     /// Whether entities cast shadows (the game's Entity Shadows option).
     pub fn set_shadows(&mut self, on: bool) {
         self.show_shadows = on;
+    }
+
+    /// Takes a resource reload's assets (other packs) in place of the ones it has:
+    /// every picture made from the packs is destroyed and made anew, the items' models
+    /// and their atlas replaced (their vertices are made again as items are held), and
+    /// what was laid out with the old font, language or pictures (signs, names, banner
+    /// patterns, trims, worn layers) is laid out again. The models' vertices stay: the
+    /// models come from the game's exported layers, not from a pack. The players' skins
+    /// stay too.
+    pub fn replace_assets(
+        &mut self,
+        textures: &mut TextureTable,
+        uploads: &mut UploadRing,
+        assets: BlockEntityAssets,
+        frame: u64,
+    ) -> Result<(), Error> {
+        let mut gone: std::collections::HashSet<TextureId> = std::collections::HashSet::new();
+        gone.extend(self.textures.drain().map(|(_, id)| id));
+        gone.extend(self.shadow_picture.take());
+        gone.extend(self.glint_pictures.iter_mut().filter_map(Option::take));
+        gone.extend(self.item_atlas.take());
+        gone.extend(self.trim_textures.drain().filter_map(|(_, id)| id));
+        for worn in &mut self.worn_pictures {
+            gone.extend(worn.drain().flat_map(|(_, layers)| layers).flatten());
+        }
+        for id in gone {
+            textures.destroy(id);
+        }
+        self.pages.destroy(textures);
+        let users = ruthenium_gpu::Users::until_frame(frame);
+        for (_, r) in self.item_ranges.drain() {
+            match r {
+                ItemRange::Placed(h) | ItemRange::Ready(h) => {
+                    self.item_pool.retire(h, users);
+                }
+                ItemRange::Copied(h, t) => {
+                    self.item_pool.retire(h, users.and(uploads.users_of(t)));
+                }
+                ItemRange::Wanted | ItemRange::Failed => {}
+            }
+        }
+        self.items_wanted.clear();
+        let p = make_pictures(
+            textures,
+            uploads,
+            &assets.textures,
+            assets.shadow,
+            assets.glint,
+        );
+        self.skins.set_defaults(std::array::from_fn(|i| {
+            p.ids.get(&default_path(i)).copied()
+        }));
+        self.textures = p.ids;
+        self.chests = p.chests;
+        self.shulkers = p.shulkers;
+        self.skulls = p.skulls;
+        self.shadow_picture = p.shadow;
+        self.glint_pictures = p.glints;
+        (self.items, self.item_atlas_waiting) = match assets.items {
+            Some(i) => (Some(i.models), Some(i.atlas)),
+            None => (None, None),
+        };
+        if self.items.is_some() && self.item_pool.stats().pages == 0 {
+            self.item_pool.grow_now()?;
+        }
+        self.font = assets.font;
+        self.lang = assets.lang;
+        self.equipment = assets.equipment;
+        self.trim_bases = assets
+            .trims
+            .into_iter()
+            .map(|(path, image, palette)| (path, (image, palette)))
+            .collect();
+        self.palettes = assets
+            .palettes
+            .into_iter()
+            .map(|(path, image)| (path, image.rgba))
+            .collect();
+        self.trims_wanted.clear();
+        self.trim_keys.clear();
+        self.worn.clear();
+        self.patterns.clear();
+        self.signs.clear();
+        self.names.clear();
+        self.name_runs.clear();
+        self.runs.clear();
+        Ok(())
     }
 
     /// Stages the models, until that has worked once, and the glyphs that wait for it:

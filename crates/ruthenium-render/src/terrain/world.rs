@@ -778,6 +778,8 @@ pub(crate) struct WorldRenderer {
     /// a session that is over, whose stamps mean nothing in this one.
     session: u64,
     workers: Workers,
+    /// How many meshing threads there are.
+    worker_count: usize,
     jobs_out: usize,
     pending: Vec<Pending>,
     /// Sorts with a worker, and their results on the way to the GPU.
@@ -1052,6 +1054,7 @@ impl WorldRenderer {
             cell: None,
             session: 0,
             workers: Workers::start(&assets.table, workers),
+            worker_count: workers,
             table: assets.table,
             jobs_out: 0,
             pending: Vec::new(),
@@ -1095,6 +1098,48 @@ impl WorldRenderer {
             warned_dropped: false,
             warned_envelope: false,
         })
+    }
+
+    /// Takes a resource reload's assets (other packs): the block table and models, the
+    /// atlas (a new texture streamed, the old one destroyed), its animations and the
+    /// colour maps. Every section's mesh is forgotten, as on a new level, and every
+    /// loaded section is meshed again from the new table (vanilla's `allChanged`); the
+    /// meshing threads start again with it.
+    pub fn replace_assets(
+        &mut self,
+        textures: &mut TextureTable,
+        uploads: &mut UploadRing,
+        assets: WorldAssets,
+        frame: u64,
+    ) -> Result<(), Error> {
+        let desc = TextureDesc {
+            width: assets.atlas_width,
+            height: assets.atlas_height,
+            mip_levels: assets.atlas_levels.len() as u32,
+            format: vk::Format::R8G8B8A8_UNORM,
+        };
+        let atlas = textures.create(desc)?;
+        if let Err(e) = textures.stream(uploads, atlas, assets.atlas_levels) {
+            textures.destroy(atlas);
+            return Err(Error::Upload(e));
+        }
+        // The old threads mesh with the old table: their results are of a session
+        // that is over once `clear` has counted on.
+        self.workers.stop();
+        textures.destroy(std::mem::replace(&mut self.atlas, atlas));
+        self.atlas_size = [assets.atlas_width as f32, assets.atlas_height as f32];
+        self.animations = assets.animations;
+        self.animated_at = None;
+        self.animated_stale = 0;
+        self.animated_frame = None;
+        self.table = assets.table;
+        self.colour_maps = assets.colour_maps;
+        // The biomes' colours are worked out again from the new maps.
+        self.environment = None;
+        self.clear(uploads, frame);
+        self.tracker.rescan_next();
+        self.workers = Workers::start(&self.table, self.worker_count);
+        Ok(())
     }
 
     /// Ends the worker threads. They write into the upload ring's staging memory, so

@@ -590,6 +590,13 @@ impl CloudRenderer {
         }
     }
 
+    /// Takes a resource reload's clouds picture: the layer is made again from its cells
+    /// (the one drawn stays until the new one is ready).
+    pub fn set_cells(&mut self, cells: CloudCells) {
+        self.cells = Arc::new(cells);
+        self.requested = None;
+    }
+
     /// Once a frame: takes back the lists no frame reads any more.
     pub fn maintain(&mut self, completed: &Completed) {
         self.pool.maintain(completed);

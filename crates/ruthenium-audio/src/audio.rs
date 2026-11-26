@@ -103,6 +103,42 @@ impl SoundHandle {
     pub fn listener_position(&self) -> Option<[f32; 3]> {
         self.lock().map(|e| e.listener_position())
     }
+
+    /// Takes the sounds of `files` in place of the ones loaded (a resource reload with
+    /// other packs): their events are read here, on the caller's thread, a new loader
+    /// fetches their samples, and every sound playing stops, as vanilla's sound engine
+    /// does on a reload. Nothing changes without sound.
+    pub fn replace_files(&self, files: SoundFiles) {
+        let Some(engine) = &self.engine else { return };
+        load_sounds(Arc::new(files), &Arc::downgrade(engine), Instant::now());
+    }
+}
+
+/// Reads the events of `files` and hands them to the engine with a loader for them.
+fn load_sounds(files: Arc<SoundFiles>, engine: &std::sync::Weak<Mutex<Engine>>, started: Instant) {
+    let (events, warnings) = files.events();
+    for w in warnings.iter().take(20) {
+        eprintln!("[sound] {w}");
+    }
+    if warnings.len() > 20 {
+        eprintln!("[sound] ... and {} more warnings", warnings.len() - 20);
+    }
+    eprintln!(
+        "[sound] {} events, {} files in {:.0} ms",
+        events.len(),
+        files.files(),
+        started.elapsed().as_secs_f64() * 1e3
+    );
+    let Ok(loader) = crate::loader::spawn(files, engine.clone()) else {
+        eprintln!("[sound] couldn't start the loader: no sounds");
+        return;
+    };
+    if let Some(engine) = engine.upgrade() {
+        engine
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_sounds(Arc::new(events), Box::new(loader));
+    }
 }
 
 /// Sound for the client: see the module docs. Dropping it closes the output.
@@ -155,29 +191,7 @@ impl Audio {
                         return;
                     }
                 };
-                let (events, warnings) = files.events();
-                for w in warnings.iter().take(20) {
-                    eprintln!("[sound] {w}");
-                }
-                if warnings.len() > 20 {
-                    eprintln!("[sound] ... and {} more warnings", warnings.len() - 20);
-                }
-                eprintln!(
-                    "[sound] {} events, {} files in {:.0} ms",
-                    events.len(),
-                    files.files(),
-                    started.elapsed().as_secs_f64() * 1e3
-                );
-                let Ok(loader) = crate::loader::spawn(files, weak.clone()) else {
-                    eprintln!("[sound] couldn't start the loader: no sounds");
-                    return;
-                };
-                if let Some(engine) = weak.upgrade() {
-                    engine
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .set_sounds(Arc::new(events), Box::new(loader));
-                }
+                load_sounds(files, &weak, started);
             });
         if let Err(e) = loading {
             eprintln!("[sound] couldn't start loading sounds: {e}");

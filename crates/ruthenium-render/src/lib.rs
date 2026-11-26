@@ -752,6 +752,97 @@ impl Renderer {
         Ok(())
     }
 
+    /// Takes a resource reload's assets (a server's packs over vanilla's, or vanilla's
+    /// again) in place of the loaded world's: every picture is made anew from them (the
+    /// old textures are destroyed once the frames that read them are done), the sky's,
+    /// clouds' and weather's pictures, block entities and items, the HUD and the cracks
+    /// are replaced in place, and every loaded section is meshed again with the new block
+    /// table and atlas. Until the new atlas has arrived the world is not drawn, and the
+    /// sections come back as their meshes are made, as when a level loads. Without a
+    /// world loaded yet it is [`Self::load_world`].
+    pub fn replace_world(
+        &mut self,
+        mut assets: WorldAssets,
+        workers: usize,
+    ) -> Result<(), ruthenium_gpu::Error> {
+        if self.world.is_none() {
+            return self.load_world(assets, workers);
+        }
+        let frame = self.last_frame;
+        if let Some(sky) = &mut self.sky {
+            sky.replace_pictures(&mut self.textures, &mut self.uploads, &assets.sky);
+        }
+        // Without a clouds picture the clouds stay as they were.
+        if let (Some(clouds), Some(cells)) = (
+            &mut self.clouds,
+            assets
+                .clouds
+                .as_ref()
+                .and_then(|i| CloudCells::from_rgba(i.width, i.height, &i.rgba)),
+        ) {
+            clouds.set_cells(cells);
+        }
+        if let Some(weather) = self.weather.take() {
+            for id in weather.textures().into_iter().flatten() {
+                self.textures.destroy(id);
+            }
+        }
+        let mut picture = |image: &Option<SkyImage>| {
+            let i = image.as_ref()?;
+            self.textures
+                .create_with(
+                    &mut self.uploads,
+                    TextureDesc::rgba8(i.width, i.height),
+                    &[&i.rgba],
+                    Arrival::NextFrame,
+                )
+                .ok()
+        };
+        let (rain, snow) = (picture(&assets.rain), picture(&assets.snow));
+        let underwater = picture(&assets.underwater);
+        self.weather = Some(WeatherRenderer::new(rain, snow));
+        if let Some(old) = std::mem::replace(&mut self.underwater, underwater) {
+            self.textures.destroy(old);
+        }
+        match (&mut self.block_entities, assets.block_entities.take()) {
+            (Some(b), Some(models)) => {
+                b.replace_assets(&mut self.textures, &mut self.uploads, models, frame)?;
+            }
+            (None, Some(models)) => {
+                let gpu = self.frames.gpu().clone();
+                self.block_entities =
+                    BlockEntityRenderer::new(&gpu, &mut self.textures, &mut self.uploads, models)
+                        .inspect_err(|e| eprintln!("[render] no block entities: {e}"))
+                        .ok();
+                if let Some(b) = &mut self.block_entities {
+                    b.set_shadows(self.entity_shadows);
+                }
+            }
+            // (The block entities' models come from the game's exports, not a pack.)
+            (_, None) => {}
+        }
+        let vignette = assets.vignette.take();
+        let containers = std::mem::take(&mut assets.containers);
+        let old = self.hud.take();
+        self.hud = assets.gui.take().map(|atlas| {
+            let mut hud = hud::Hud::new(atlas, vignette, containers);
+            if let Some(old) = &old {
+                hud.continue_from(old);
+            }
+            hud
+        });
+        if let Some(old) = old {
+            old.destroy(&mut self.textures);
+        }
+        if let Some(marks) = &mut self.marks {
+            marks.replace_pictures(&mut self.textures, &mut self.uploads, &assets.cracks);
+        }
+        if let Some(w) = &mut self.world {
+            w.replace_assets(&mut self.textures, &mut self.uploads, assets, frame)?;
+        }
+        Ok(())
+    }
+
     /// Whether the block atlas's animated textures play (they do unless said otherwise).
     /// Stopped, two frames of one place and time are the same picture.
     pub fn set_animate(&mut self, on: bool) {

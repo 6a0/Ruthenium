@@ -307,6 +307,26 @@ impl Hud {
         self.stats
     }
 
+    /// Carries what the HUD counts over time (how dark the vignette is, the hearts'
+    /// state) over from the HUD it replaces.
+    pub fn continue_from(&mut self, old: &Hud) {
+        self.vignette = old.vignette;
+        self.health = old.health;
+    }
+
+    /// Destroys its textures (a resource reload makes a new HUD).
+    pub fn destroy(self, textures: &mut TextureTable) {
+        let ids = self
+            .atlas
+            .map(|(id, _)| id)
+            .into_iter()
+            .chain(self.vignette_picture)
+            .chain(self.containers.into_iter().map(|(_, id)| id));
+        for id in ids {
+            textures.destroy(id);
+        }
+    }
+
     /// How the chat screen's chat was last drawn.
     pub fn chat_shown(&self) -> Option<&ChatShown> {
         self.layout.chat_shown.as_ref()

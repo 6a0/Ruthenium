@@ -369,6 +369,11 @@ pub(crate) struct WeatherRenderer {
 }
 
 impl WeatherRenderer {
+    /// The pictures of rain and snow it draws with (for a resource reload to destroy).
+    pub fn textures(&self) -> [Option<TextureId>; 2] {
+        [self.rain_texture, self.snow_texture]
+    }
+
     pub fn new(
         rain_texture: Option<TextureId>,
         snow_texture: Option<TextureId>,

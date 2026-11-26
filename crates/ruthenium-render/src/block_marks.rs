@@ -135,6 +135,21 @@ impl BlockMarks {
         self.show_outline = on;
     }
 
+    /// Takes a resource reload's pictures of the stages in place of the ones it has
+    /// (destroyed).
+    pub fn replace_pictures(
+        &mut self,
+        textures: &mut TextureTable,
+        uploads: &mut UploadRing,
+        pictures: &[SkyImage],
+    ) {
+        for id in self.stages.iter_mut().filter_map(Option::take) {
+            textures.destroy(id);
+        }
+        let fresh = BlockMarks::new(textures, uploads, pictures);
+        self.stages = fresh.stages;
+    }
+
     pub fn stats(&self) -> MarkStats {
         self.stats
     }

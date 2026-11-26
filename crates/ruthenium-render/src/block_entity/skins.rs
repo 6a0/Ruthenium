@@ -106,6 +106,12 @@ impl Skins {
         self.frame += 1;
     }
 
+    /// The default skins' pictures after a resource reload (the old ones are destroyed
+    /// by their owner).
+    pub fn set_defaults(&mut self, defaults: [Option<TextureId>; DEFAULT_SKINS]) {
+        self.defaults = defaults;
+    }
+
     /// The skins wanted since the last call that nobody has been asked for.
     pub fn take_requests(&mut self) -> Vec<Arc<SkinSource>> {
         std::mem::take(&mut self.requests)

@@ -362,6 +362,15 @@ pub(crate) struct GlyphPages {
 }
 
 impl GlyphPages {
+    /// Destroys the pages' textures and forgets every glyph (a resource reload brings
+    /// another font).
+    pub fn destroy(&mut self, textures: &mut TextureTable) {
+        for id in self.pages.iter_mut().filter_map(|p| p.texture.take()) {
+            textures.destroy(id);
+        }
+        *self = GlyphPages::default();
+    }
+
     /// Room for a picture, with a free texel after it.
     fn room(&mut self, width: u32, height: u32) -> Option<(usize, u32, u32)> {
         let (w, h) = (width + 1, height + 1);
