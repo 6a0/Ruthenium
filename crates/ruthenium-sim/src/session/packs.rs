@@ -13,6 +13,7 @@
 //! vanilla, the number of packs a server can have tracked, collected in one prompt, and
 //! loaded at once is capped (see the constants).
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -149,6 +150,50 @@ impl Drop for Downloads {
     }
 }
 
+/// A downloaded file, as its check knows it: its path, length and modification time.
+type FileKey = (PathBuf, u64, Option<std::time::SystemTime>);
+
+/// How many checks [`Checks`] keeps: two for every pack that can be tracked.
+const CHECKS_KEPT: usize = 2 * MAX_TRACKED;
+
+/// The checks of downloaded packs (`readPackMetadata`), by file: made on the download
+/// thread as each download ends, so that the check when a reload starts, on the game
+/// thread, only looks its files up (vanilla reads every pack's metadata on its main
+/// thread then). A file that changed since is checked again; one that is gone fails.
+#[derive(Clone, Default)]
+pub(super) struct Checks(Arc<std::sync::Mutex<VecDeque<(FileKey, bool)>>>);
+
+impl Checks {
+    fn key(path: &Path) -> Option<FileKey> {
+        let m = std::fs::metadata(path).ok()?;
+        Some((path.to_owned(), m.len(), m.modified().ok()))
+    }
+
+    /// Whether `path` passes `check`: the kept answer for the file as it is now, else
+    /// `check`'s, kept.
+    fn check(&self, check: &(dyn Fn(&Path) -> bool + Send + Sync), path: &Path) -> bool {
+        let Some(key) = Checks::key(path) else {
+            return false;
+        };
+        let kept = || {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some(&(_, ok)) = kept().iter().find(|(k, _)| *k == key) {
+            return ok;
+        }
+        let ok = check(path);
+        let mut kept = kept();
+        kept.retain(|(k, _)| k.0 != key.0);
+        kept.push_back((key, ok));
+        while kept.len() > CHECKS_KEPT {
+            kept.pop_front();
+        }
+        ok
+    }
+}
+
 /// The pack state of a game thread.
 pub(super) struct Packs {
     pub(super) manager: ServerPacks<(u128, PathBuf)>,
@@ -160,6 +205,8 @@ pub(super) struct Packs {
     cleaned: bool,
     /// The server's address, for whether pack hosts may be on the local network.
     pub(super) peer: Option<IpAddr>,
+    /// The checks of the packs downloaded.
+    checks: Checks,
 }
 
 impl Default for Packs {
@@ -215,8 +262,11 @@ fn open_checked(
 impl Packs {
     pub(super) fn new(setup: ServerPackSetup) -> Packs {
         let check = setup.check.clone();
-        let mut manager =
-            ServerPacks::new(move |list: &[(u128, PathBuf)]| open_checked(&*check, list));
+        let checks = Checks::default();
+        let kept = checks.clone();
+        let mut manager = ServerPacks::new(move |list: &[(u128, PathBuf)]| {
+            open_checked(&|p: &Path| kept.check(&*check, p), list)
+        });
         manager.configure_for_server_control(prompt_status(setup.status));
         Packs {
             manager,
@@ -226,8 +276,38 @@ impl Packs {
             quiet: false,
             cleaned: false,
             peer: None,
+            checks,
         }
     }
+}
+
+/// The private addresses a server's pack hosts may have: none unless the server itself
+/// is on this machine or the local network, and then only the server's own address (and
+/// for a server on this machine, this machine's under either family), not the whole
+/// private range: a server on the local network can't send the client to the router or
+/// another machine there.
+pub fn pack_hosts_allowed(peer: Option<IpAddr>) -> Vec<IpAddr> {
+    let Some(peer) = peer.map(|p| match p {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(p, IpAddr::V4),
+        v4 => v4,
+    }) else {
+        return Vec::new();
+    };
+    if !is_local(peer) {
+        return Vec::new();
+    }
+    let mut out = vec![peer];
+    if peer.is_loopback() {
+        for ip in [
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out
 }
 
 /// A text component that translates `key`.
@@ -468,25 +548,27 @@ impl Game {
             let config = download::DownloadConfig {
                 cache_dir,
                 headers: download_headers(&self.name, self.uuid),
-                // #12: Agent R's `pack_hosts_allowed(peer)` (adding 127.0.0.1 and ::1 for a
-                // loopback peer) replaces this when integrated.
-                private_allowed: self
-                    .packs
-                    .peer
-                    .filter(|&p| is_local(p))
-                    .map(download::AddressRange::host)
+                // Only the server's own address (and, for a server on this machine, the
+                // loopback addresses) may serve its packs when it isn't public.
+                private_allowed: pack_hosts_allowed(self.packs.peer)
                     .into_iter()
+                    .map(download::AddressRange::host)
                     .collect(),
             };
             let (jobs, rx) = channel::<Batch>();
             let results = self.packs.downloads.results_tx.clone();
             let events = self.events.clone();
             let cancel = self.packs.downloads.cancel.clone();
+            let (checks, check) = (self.packs.checks.clone(), self.packs.setup.check.clone());
             let spawned = std::thread::Builder::new()
                 .name("pack-download".into())
                 .spawn(move || {
                     for batch in rx {
                         let r = run_batch(&config, &batch, &events, &cancel);
+                        // Checked here, while the session goes on.
+                        for path in r.1.iter().filter_map(|(_, p)| p.as_ref().ok()) {
+                            checks.check(&*check, path);
+                        }
                         if results.send(r).is_err() {
                             return;
                         }
@@ -839,6 +921,65 @@ mod tests {
         r.game
             .handle_pack_push(push("http://127.0.0.1/p.zip", true));
         assert_eq!(r.sent(), [status(ID, PackAction::Accepted)]);
+    }
+
+    /// A pack is checked once for the file it is: again once it changed; a file that is
+    /// gone fails without a check; at most [`CHECKS_KEPT`] are kept.
+    #[test]
+    fn pack_checks_are_kept_by_file() {
+        use std::sync::atomic::AtomicUsize;
+        let dir = std::env::temp_dir().join(format!("ruthenium-checks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("p.zip");
+        std::fs::write(&file, b"one").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let check = move |_: &Path| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            true
+        };
+        let checks = Checks::default();
+        assert!(checks.check(&check, &file));
+        assert!(checks.check(&check, &file));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        std::fs::write(&file, b"longer").unwrap();
+        assert!(checks.check(&check, &file));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert!(!checks.check(&check, &dir.join("gone.zip")));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        for i in 0..CHECKS_KEPT + 5 {
+            let f = dir.join(format!("{i}.zip"));
+            std::fs::write(&f, b"x").unwrap();
+            checks.check(&check, &f);
+        }
+        assert_eq!(checks.0.lock().unwrap().len(), CHECKS_KEPT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the server's own address is allowed for pack hosts, and only when it is
+    /// local; a server on this machine allows this machine under either family.
+    #[test]
+    fn pack_hosts_may_be_the_local_server_only() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(pack_hosts_allowed(None).is_empty());
+        assert!(pack_hosts_allowed(Some(ip("203.0.113.9"))).is_empty());
+        assert_eq!(
+            pack_hosts_allowed(Some(ip("192.168.1.20"))),
+            [ip("192.168.1.20")]
+        );
+        assert_eq!(
+            pack_hosts_allowed(Some(ip("::ffff:10.0.0.7"))),
+            [ip("10.0.0.7")]
+        );
+        assert_eq!(
+            pack_hosts_allowed(Some(ip("127.0.0.1"))),
+            [ip("127.0.0.1"), ip("::1")]
+        );
+        assert_eq!(
+            pack_hosts_allowed(Some(ip("::1"))),
+            [ip("::1"), ip("127.0.0.1")]
+        );
     }
 
     /// Past [`MAX_TRACKED`] packs, a push is discarded.
