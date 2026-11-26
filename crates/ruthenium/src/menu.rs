@@ -312,6 +312,10 @@ enum Screen {
     Chat(Box<ChatScreen>),
     /// A container screen over the world (the session runs it).
     Container,
+    /// Respawn was pressed and the server answered: the level loads again under the
+    /// death screen's veil as it goes, with nothing to click, until the player is in
+    /// the world (vanilla's level loading screen, a split second).
+    Respawning,
 }
 
 /// Which settings the Settings screen shows, and from where.
@@ -712,6 +716,7 @@ impl Menu {
     /// The level loading screen, until the player is in the world
     /// (`startWaitingForNewLevel`); an open chat screen is put away meanwhile.
     fn level_loading(&mut self) {
+        eprintln!("[menu] the level loading form");
         self.preserve_chat();
         let title = self.server_name.clone();
         self.session_form(
@@ -1064,6 +1069,16 @@ impl Menu {
         }
     }
 
+    /// Whether the death screen (or its quit confirmation) is over the world: the world
+    /// behind it is veiled as behind the Game Menu.
+    fn death_veiled(&self) -> bool {
+        self.death.is_some()
+            && matches!(
+                self.screen,
+                Screen::Form(FormKind::Died | FormKind::QuitConfirm, ..)
+            )
+    }
+
     /// The Game Menu (`pauseGame`): keys let go, the mouse freed.
     fn pause(&mut self) {
         self.game.release(self.session.as_ref());
@@ -1097,6 +1112,25 @@ impl Menu {
         if let Screen::Form(_, form, _) = &mut self.screen {
             form.set_button_enabled(0, d.ready && !d.respawn_pressed);
             form.set_button_enabled(1, d.ready);
+        }
+    }
+
+    /// The server respawned the player (`handleRespawn`): the level loading screen until
+    /// the player is back in the world. After the death screen that is the world under
+    /// the veil as it goes, with nothing to click (the connecting form, titled with the
+    /// server's name, flashed for a split second there); else (another dimension) the
+    /// form.
+    fn respawned(&mut self) {
+        // (`LocalPlayer.respawn` ends toggled keys, before the screen.)
+        self.game.respawned(self.session.as_ref());
+        let died = self.death.take().is_some();
+        self.bed = false;
+        if died {
+            self.preserve_chat();
+            self.screen = Screen::Respawning;
+            eprintln!("[menu] respawned: the world under the veil until it loads");
+        } else {
+            self.level_loading();
         }
     }
 
@@ -1225,14 +1259,7 @@ impl Menu {
                         self.death_form();
                     }
                 }
-                SessionEvent::Respawned if !self.leaving => {
-                    // (`LocalPlayer.respawn` ends toggled keys, before the screen.)
-                    self.game.respawned(self.session.as_ref());
-                    // The level loading screen, until the player is back in the world.
-                    self.death = None;
-                    self.bed = false;
-                    self.level_loading();
-                }
+                SessionEvent::Respawned if !self.leaving => self.respawned(),
                 SessionEvent::Reconfiguring if !self.leaving => {
                     self.connecting_form(NetStage::Joining);
                 }
@@ -2035,8 +2062,8 @@ impl Menu {
             _ => {}
         }
         let action = match &mut self.screen {
-            // Handled above.
-            Screen::Game | Screen::Chat(_) | Screen::Container => None,
+            // Handled above; nothing to press while respawning.
+            Screen::Game | Screen::Chat(_) | Screen::Container | Screen::Respawning => None,
             Screen::Paused => {
                 let screen = self.pause.as_mut()?;
                 let key = match scancode {
@@ -2299,7 +2326,7 @@ impl Menu {
                     b.states.mouse_up(hit).map(|_| b.button.action)
                 }
             }
-            Screen::Chat(_) => None,
+            Screen::Chat(_) | Screen::Respawning => None,
             Screen::Container => {
                 self.container_button(1, down);
                 None
@@ -2669,7 +2696,8 @@ impl Menu {
             self.transition.end();
         }
         let options = matches!(self.screen, Screen::Settings);
-        self.transition.step(self.game_menu_open(), options, dt);
+        self.transition
+            .step(self.game_menu_open() || self.death_veiled(), options, dt);
         if let Some(ShownMenu::Coming(share)) = self.shown_menu {
             self.transition = MenuTransition::at(share);
         }
@@ -2697,6 +2725,8 @@ impl Menu {
                     p.draw(&mut self.shapes, &mut self.text, atlas, logo);
                 }
             }
+            // Only the veil, going.
+            Screen::Respawning => {}
             Screen::Paused => {
                 if let Some(p) = &mut self.pause {
                     let hit = pointer.and_then(|(x, y)| p.hit(x, y));
@@ -2793,9 +2823,12 @@ impl Menu {
             let look = self
                 .transition
                 .look(scale.px, self.settings.settings.reduce_motion);
-            // Only the Game Menu and its options come and go.
+            // Only the Game Menu and its options come and go (the death screen's buttons
+            // are a form's, which comes on its own).
             let menu = self.game_menu_open()
-                || matches!(self.screen, Screen::Game) && self.transition.menu_shows();
+                || matches!(self.screen, Screen::Game)
+                    && self.transition.menu_shows()
+                    && self.pause.is_some();
             ruthenium_render::Veil {
                 saturation: look.saturation,
                 brightness: look.brightness,
@@ -3665,6 +3698,34 @@ mod tests {
         m.act(Action::Cancel, None, &clip);
         m.act(Action::Confirm, None, &clip);
         assert!(matches!(m.screen, Screen::Servers) && m.death.is_none());
+    }
+
+    /// The world behind the death screen is veiled as behind the Game Menu; once the
+    /// server respawns the player, no form shows until the world is back.
+    #[test]
+    fn the_death_screen_veils_the_world_and_respawns_without_a_form() {
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        assert!(!m.death_veiled());
+        m.death = Some(DeathForm {
+            title: "You Died!",
+            lines: vec!["Score: 0".into()],
+            hardcore: false,
+            ready: true,
+            respawn_pressed: true,
+        });
+        m.death_form();
+        assert!(m.death_veiled());
+        m.act(Action::Cancel, None, &FakeClipboard::default());
+        assert!(matches!(m.screen, Screen::Form(FormKind::QuitConfirm, ..)));
+        assert!(m.death_veiled());
+        m.death_form();
+        m.respawned();
+        assert!(matches!(m.screen, Screen::Respawning));
+        assert!(m.death.is_none() && !m.death_veiled());
+        // A respawn into another dimension, alive: the level loading form.
+        m.respawned();
+        assert!(matches!(m.screen, Screen::Form(FormKind::Playing, ..)));
     }
 
     #[test]

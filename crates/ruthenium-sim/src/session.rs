@@ -795,9 +795,19 @@ struct World {
     placements: u64,
     /// The blocks being broken, by the player and by others.
     destruction: Destruction,
+    /// Chunks the server forgot while the player was dead, kept for drawing until it
+    /// lives again (or the server sends them anew).
+    forgotten_while_dead: Vec<(i32, i32)>,
 }
 
 impl World {
+    /// The chunks kept for drawing while the player was dead go (it lives again).
+    fn forget_kept_chunks(&mut self) {
+        for (x, z) in std::mem::take(&mut self.forgotten_while_dead) {
+            self.level.forget_chunk(x, z);
+        }
+    }
+
     /// The end of a client tick: unless the server froze the game, the border moves
     /// and the game time and the world clocks go on by one (`tickTime`).
     fn tick_time(&mut self) {
@@ -842,6 +852,7 @@ impl World {
             ticks: 0,
             placements: 0,
             destruction: Destruction::default(),
+            forgotten_while_dead: Vec::new(),
         }
     }
 }
@@ -1812,6 +1823,11 @@ impl Game {
         let Some(w) = &mut self.world else {
             return;
         };
+        // A player alive again (without a respawn: the server set its health) lets the
+        // chunks kept since it died go.
+        if !w.player.is_dead_or_dying() && !w.forgotten_while_dead.is_empty() {
+            w.forget_kept_chunks();
+        }
         // `gui.tick`, before anything of the level ticks.
         if self.hud.tick(&w.player) {
             self.hud_text.select(self.hud.selected());
@@ -2254,8 +2270,10 @@ impl Game {
                     w.dimension_name = Arc::from(spawn.dimension.as_str());
                     w.environment = environment;
                     w.ticks = 0;
+                    w.forgotten_while_dead.clear();
                 } else {
                     w.entities.local_respawned();
+                    w.forget_kept_chunks();
                 }
                 w.placements += 1;
                 // `handleRespawn`: a new player, with what the server says to keep, in
@@ -2332,6 +2350,7 @@ impl Game {
                     if let Err(e) = w.level.load_chunk_packet(x, z, packet, w.biome_bits) {
                         return Err(format!("chunk {x} {z}: {e}"));
                     }
+                    w.forgotten_while_dead.retain(|&c| c != (x, z));
                     w.entities.chunk_loaded(x, z);
                 }
             }
@@ -2358,8 +2377,19 @@ impl Game {
             }
             play::Clientbound::ForgetLevelChunk { x, z } => {
                 if let Some(w) = &mut self.world {
-                    w.level.forget_chunk(x, z);
                     w.entities.chunk_unloaded(x, z);
+                    // The server forgets every chunk around a player it takes out of the
+                    // level (`ChunkMap.removeEntity`, 20 ticks after dying). Vanilla's
+                    // client drops their data but keeps drawing what it had built of them
+                    // while nothing changes there, so the world stays behind the death
+                    // screen: the chunks stay until the player lives again.
+                    if w.player.is_dead_or_dying() {
+                        if !w.forgotten_while_dead.contains(&(x, z)) {
+                            w.forgotten_while_dead.push((x, z));
+                        }
+                    } else {
+                        w.level.forget_chunk(x, z);
+                    }
                 }
             }
             // `setServerVerifiedBlockState`: a predicted block keeps the server's state
@@ -3577,6 +3607,31 @@ mod tests {
         });
         r.frame(10);
         assert!(r.dirty().is_empty());
+
+        // The server forgets every chunk of a player it takes out of the level, 20
+        // ticks after the death: they stay drawn while the player is dead, as
+        // vanilla's built sections do, and go once it lives again.
+        r.packet(chunk(1, 0));
+        let dead = |health| play::Clientbound::SetHealth {
+            health,
+            food: 20,
+            saturation: 5.0,
+        };
+        r.packet(dead(0.0));
+        r.packet(play::Clientbound::ForgetLevelChunk { x: 1, z: 0 });
+        r.frame(10);
+        assert!(r.scene.with_terrain(|t| t.column(1, 0).is_some()));
+        r.packet(dead(20.0));
+        r.frame(60);
+        assert!(r.scene.with_terrain(|t| t.column(1, 0).is_none()));
+        // Sent again while dead, a forgotten chunk is simply the new one.
+        r.packet(dead(0.0));
+        r.packet(play::Clientbound::ForgetLevelChunk { x: 0, z: 0 });
+        r.packet(chunk(0, 0));
+        r.packet(dead(20.0));
+        r.frame(60);
+        assert!(r.scene.with_terrain(|t| t.column(0, 0).is_some()));
+        r.dirty();
 
         // Another dimension: a new epoch, its own environment, nothing of the old
         // level left; the clocks stay, as vanilla's listener keeps them.
