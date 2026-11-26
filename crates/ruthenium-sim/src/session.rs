@@ -4319,7 +4319,7 @@ mod tests {
     /// Container screens: a menu the server opens takes the frame's events (and its
     /// clicks go out), the wheel and the keys' presses reach nothing under it, Escape
     /// closes it with the menu's id, the server may close it, and a menu the client
-    /// doesn't run is closed at once.
+    /// doesn't run opens a placeholder that clicks nothing.
     #[test]
     fn container_screens_take_the_input_while_open() {
         use crate::menu::screen::Binds;
@@ -4416,14 +4416,74 @@ mod tests {
         r.frame(1);
         assert!(!r.game.container_screen_open());
         assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
-        // An anvil (8) isn't run: it is closed at once.
+        // An anvil (8) isn't run: it opens a placeholder as a chest opens its screen:
+        // the keys let go, the menu's id and slots kept, nothing sent.
+        r.game.use_keys.use_clicks = 2;
         r.packet(play::Clientbound::OpenScreen {
             container_id: 5,
             menu_type: 8,
             title: Tag::String("Repair".into()),
         });
         r.frame(1);
+        assert!(r.game.container_screen_open());
+        assert_eq!(r.game.use_keys.use_clicks, 0);
+        let menu = r.game.world.as_ref().unwrap().player.menus.container();
+        assert_eq!((menu.id, menu.slots.len()), (5, 3 + 36));
+        assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
+        // It clicks nothing, the number keys swap nothing, and E closes it.
+        r.frame_with(
+            1,
+            FrameInput {
+                screen_inputs: vec![
+                    ScreenInput::Click {
+                        slot: 3,
+                        button: 0,
+                        input: crate::menu::Input::Pickup,
+                    },
+                    ScreenInput::Key {
+                        binds: Binds {
+                            hotbar: [true, false, false, false, false, false, false, false, false],
+                            ..Binds::default()
+                        },
+                        ctrl: false,
+                        at: At::Slot(3),
+                    },
+                ],
+                ..FrameInput::default()
+            },
+        );
+        assert!(r.game.container_screen_open());
+        assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
+        r.frame_with(
+            1,
+            FrameInput {
+                screen_inputs: vec![ScreenInput::Key {
+                    binds: Binds {
+                        inventory: true,
+                        ..Binds::default()
+                    },
+                    ctrl: false,
+                    at: At::Outside,
+                }],
+                ..FrameInput::default()
+            },
+        );
         assert!(!r.game.container_screen_open());
         assert_eq!(sent(&mut r), [play::container_close(5)]);
+        // A lectern (17) has one slot and no inventory; a crafter (7) its result last.
+        let layout = |name| crate::menu::Placeholder::for_menu(name);
+        assert!(!layout("minecraft:lectern").inventory);
+        let crafter = crate::menu::Menu::new(
+            crate::menu::Kind::Placeholder(layout("minecraft:crafter_3x3")),
+            6,
+        );
+        assert_eq!(crafter.slots.len(), 46);
+        assert_eq!(crafter.slots[45].index, 9);
+        assert_eq!(
+            crafter.slots[9].container,
+            crate::menu::Container::Inventory
+        );
+        assert_eq!(crate::menu::Placeholder::mount(5).before, 17);
+        assert_eq!(crate::menu::Placeholder::mount(0).before, 2);
     }
 }

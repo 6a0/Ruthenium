@@ -88,7 +88,15 @@ pub fn background_name(kind: Kind) -> &'static str {
         Kind::BlastFurnace => "blast_furnace",
         Kind::Smoker => "smoker",
         Kind::Hopper => "hopper",
+        // Pieces of the chest's window.
+        Kind::Placeholder(_) => "generic_54",
     }
+}
+
+/// Where a placeholder window's plain band ends: at its inventory part (96 units
+/// tall), or at its bottom edge (7).
+fn placeholder_body_end(inventory: bool, image_height: i32) -> i32 {
+    image_height - if inventory { 96 } else { 7 }
 }
 
 /// Every picture a container screen may need.
@@ -112,6 +120,9 @@ fn translated(key: &str) -> Arc<Tag> {
 
 static CRAFTING: LazyLock<Arc<Tag>> = LazyLock::new(|| translated("container.crafting"));
 static INVENTORY: LazyLock<Arc<Tag>> = LazyLock::new(|| translated("container.inventory"));
+/// The line a placeholder screen shows (Ruthenium's own, not a translation key).
+static NOT_YET: LazyLock<Arc<Tag>> =
+    LazyLock::new(|| Arc::new(Tag::String("Ruthenium can't show this screen yet".into())));
 
 /// A whole 256 by 256 picture (`blit` with a texture size).
 const PICTURE: SpriteInfo = SpriteInfo {
@@ -250,11 +261,48 @@ impl HudLayout {
                         WHITE,
                     );
                 }
+                Kind::Placeholder(p) => {
+                    // The chest window's top edge and title band, its plain band (rows 4
+                    // to 16) as often as it takes, then its inventory part or its bottom
+                    // edge.
+                    let mut piece = |uv: [i32; 2], y: i32, h: i32| {
+                        self.under.blit_part(
+                            &PICTURE,
+                            t,
+                            [256, 256],
+                            uv,
+                            left,
+                            top + y,
+                            iw,
+                            h,
+                            WHITE,
+                        );
+                    };
+                    piece([0, 0], 0, 17);
+                    let end = placeholder_body_end(p.inventory, ih);
+                    let mut y = 17;
+                    while y < end {
+                        let h = (end - y).min(13);
+                        piece([0, 4], y, h);
+                        y += h;
+                    }
+                    if p.inventory {
+                        piece([0, 126], end, 96);
+                    } else {
+                        piece([0, 215], end, 7);
+                    }
+                }
                 _ => {
                     self.under
                         .blit_part(&PICTURE, t, [256, 256], [0, 0], left, top, iw, ih, WHITE)
                 }
             }
+        }
+        if let Kind::Placeholder(p) = v.kind {
+            let line = memory.lines(&NOT_YET, Wrap::Single, font, lang)[0].clone();
+            let middle = (17 + placeholder_body_end(p.inventory, ih)) / 2;
+            let x = left + (iw - line.width) / 2;
+            self.styled(&line, [0, 0], 1, x, top + middle - 4, LABEL, false);
         }
         // `AbstractFurnaceScreen.extractBackground`: the fire while it burns, the arrow
         // as far as the cooking has come.
@@ -315,7 +363,12 @@ impl HudLayout {
             _ => 8,
         };
         self.styled(&title, [0, 0], 1, left + title_x, top + 6, LABEL, false);
-        if v.kind != Kind::Inventory {
+        let shows_inventory = match v.kind {
+            Kind::Inventory => false,
+            Kind::Placeholder(p) => p.inventory,
+            _ => true,
+        };
+        if shows_inventory {
             let inventory = memory.lines(&INVENTORY, Wrap::Single, font, lang)[0].clone();
             self.styled(&inventory, [0, 0], 1, left + 8, top + ih - 94, LABEL, false);
         }
@@ -344,6 +397,10 @@ impl HudLayout {
             .as_ref()
             .filter(|_| !carried.is_empty());
         for (i, &(x, y, rule)) in v.slots.iter().enumerate() {
+            // A placeholder's own slots aren't drawn.
+            if x == menu::HIDDEN {
+                continue;
+            }
             let (x, y) = (left + x, top + y);
             let mut stack = v.stacks[i].clone();
             let mut count = None;

@@ -88,7 +88,58 @@ pub enum Kind {
     BlastFurnace,
     Smoker,
     Hopper,
+    /// A menu the client doesn't run (an anvil, an enchanting table, a horse's
+    /// inventory...): it stays open with its container id, so the server's packets for
+    /// it land, and its screen is a placeholder that clicks nothing.
+    Placeholder(Placeholder),
 }
+
+/// The layout of a menu the client doesn't run, as far as the slots' numbering goes:
+/// its own slots before the player's inventory and after it (a crafter's result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placeholder {
+    pub before: u8,
+    pub after: u8,
+    /// Whether the menu shows the player's inventory (a lectern's doesn't).
+    pub inventory: bool,
+}
+
+impl Placeholder {
+    /// The layout of a `minecraft:menu` the client doesn't run, by its slots
+    /// (`addSlot` and `addStandardInventorySlots` in each menu's constructor).
+    pub fn for_menu(name: &str) -> Placeholder {
+        let (before, after, inventory) = match name.trim_start_matches("minecraft:") {
+            "crafter_3x3" => (9, 1, true),
+            "anvil" | "grindstone" | "merchant" | "cartography_table" => (3, 0, true),
+            "beacon" => (1, 0, true),
+            "brewing_stand" => (5, 0, true),
+            "enchantment" | "stonecutter" => (2, 0, true),
+            "loom" | "smithing" => (4, 0, true),
+            "lectern" => (1, 0, false),
+            // A menu this table doesn't know: no slots, every packet for it ignored.
+            _ => (0, 0, false),
+        };
+        Placeholder {
+            before,
+            after,
+            inventory,
+        }
+    }
+
+    /// `HorseInventoryMenu` and `NautilusInventoryMenu`: the saddle and the body slots,
+    /// then three rows of `columns` (none for a mount without a chest).
+    pub fn mount(columns: i32) -> Placeholder {
+        let chest = columns.clamp(0, 5) as u8 * 3;
+        Placeholder {
+            before: 2 + chest,
+            after: 0,
+            inventory: true,
+        }
+    }
+}
+
+/// Where a placeholder's own slots are: off the screen, never under the pointer.
+pub const HIDDEN: i32 = -10_000;
 
 impl Kind {
     /// The kind of a `minecraft:menu` registry id, if the client runs it.
@@ -412,6 +463,25 @@ impl Menu {
                 slots.push(slot(Container::Own, 2, 116, 35, Rule::FurnaceResult));
                 standard_inventory(&mut slots, 8, 84);
                 (3, 0, 4)
+            }
+            Kind::Placeholder(p) => {
+                let hidden = |slots: &mut Vec<Slot>, from: u8, n: u8| {
+                    for i in from..from + n {
+                        slots.push(slot(
+                            Container::Own,
+                            usize::from(i),
+                            HIDDEN,
+                            HIDDEN,
+                            Rule::Plain,
+                        ));
+                    }
+                };
+                hidden(&mut slots, 0, p.before);
+                if p.inventory {
+                    standard_inventory(&mut slots, 8, 84);
+                }
+                hidden(&mut slots, p.before, p.after);
+                (usize::from(p.before + p.after), 0, 0)
             }
             Kind::Hopper => {
                 for x in 0..5 {
@@ -1083,6 +1153,8 @@ impl Menu {
         let n = self.slots.len();
         // (Each branch: where to, and whether failing to move ends it.)
         let moved = match self.kind {
+            // Its screen clicks nothing.
+            Kind::Placeholder(_) => false,
             Kind::Inventory => {
                 let eq = equipment_slot_for_item(&clicked);
                 if i == 0 {

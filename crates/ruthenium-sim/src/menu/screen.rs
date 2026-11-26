@@ -16,6 +16,7 @@ pub fn image_size(kind: Kind) -> (i32, i32) {
         Kind::Chest(rows) => (176, 114 + i32::from(rows) * 18),
         Kind::ShulkerBox => (176, 167),
         Kind::Hopper => (176, 133),
+        Kind::Placeholder(p) if !p.inventory => (176, 80),
         _ => (176, 166),
     }
 }

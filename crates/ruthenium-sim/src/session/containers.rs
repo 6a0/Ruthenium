@@ -8,9 +8,13 @@
 //! ticks, with the frame's pointer (`handleAccumulatedMovement`). Each click is sent
 //! as it is made (`MultiPlayerGameMode.handleContainerInput`).
 //!
-//! A menu type the client doesn't run (an anvil, a horse's inventory...) is closed at
-//! once with `container_close`, as a player pressing Escape before anything showed
-//! would: the server then knows no menu is open, as the client does.
+//! A menu type the client doesn't run (an anvil, an enchanting table, a horse's
+//! inventory...) opens as any other does (`Gui.setScreen`: the keys and the mouse let
+//! go), with a placeholder screen ([`Kind::Placeholder`]) that keeps the menu's
+//! container id and slots, so the server's packets for it land, clicks nothing, and
+//! closes on Escape or the inventory key as a container screen does. Closing such a
+//! menu at once instead left a held use key using the block again a few ticks later,
+//! open after open, which anticheats see.
 
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -23,7 +27,7 @@ use super::{Configured, Game, SessionEvent, lock};
 use crate::inventory::{Hand, Inventory};
 use crate::item::{Items, Stack};
 use crate::menu::screen::{self, Binds, Clicker, Mouse, Screen};
-use crate::menu::{Input, Kind, Menu, Menus, Rule, Who};
+use crate::menu::{Input, Kind, Menu, Menus, Placeholder, Rule, Who};
 
 /// `MouseHandler.DOUBLE_CLICK_THRESHOLD_MS`.
 const DOUBLE_CLICK: Duration = Duration::from_millis(250);
@@ -191,6 +195,31 @@ fn has_custom_inventory(entity_type: i32) -> bool {
         || name.ends_with("chest_raft")
 }
 
+/// The title of a mount's inventory screen, if `entity_type` is an `AbstractHorse` or an
+/// `AbstractNautilus` (`getDisplayName`: its type's name; custom names aren't kept).
+fn mount_title(entity_type: i32) -> Option<Tag> {
+    use ruthenium_data::v26_3::registries::EntityType;
+    let t = EntityType::from_id(u32::try_from(entity_type).ok()?)?;
+    let name = t.name().trim_start_matches("minecraft:");
+    let mount = matches!(
+        name,
+        "horse"
+            | "donkey"
+            | "mule"
+            | "skeleton_horse"
+            | "zombie_horse"
+            | "llama"
+            | "trader_llama"
+            | "camel"
+            | "camel_husk"
+    ) || name.ends_with("nautilus");
+    mount.then(|| {
+        let mut c = ruthenium_protocol::nbt::Compound::new();
+        c.put("translate", Tag::String(format!("entity.minecraft.{name}")));
+        Tag::Compound(c)
+    })
+}
+
 impl Game {
     /// Runs `f` on the open screen with what it clicks through, then sends what it
     /// clicked and swings the hand for what it dropped.
@@ -242,7 +271,16 @@ impl Game {
 
     /// One of the frame's screen events (`MouseHandler.onButton`, `KeyboardHandler`).
     pub(super) fn screen_input(&mut self, e: &ScreenInput) {
-        if self.containers.screen.is_none() {
+        let Some(s) = &self.containers.screen else {
+            return;
+        };
+        // A placeholder clicks nothing; Escape and the inventory key close it.
+        if matches!(s.kind, Kind::Placeholder(_)) {
+            if let ScreenInput::Key { binds, .. } = e
+                && (binds.escape || binds.inventory)
+            {
+                self.close_container();
+            }
             return;
         }
         let serial = self.containers.serial;
@@ -429,21 +467,39 @@ impl Game {
                     .and_then(ruthenium_data::v26_3::registries::Menu::from_id)
                     .map_or("?", |m| m.name());
                 eprintln!(
-                    "[menu] no screen for {name} (container {container_id}): closed at once, as Escape would"
+                    "[menu] no screen of its own for {name} (container {container_id}): a placeholder"
                 );
-                self.client_side_close_container();
-                self.connection.send(play::container_close(container_id));
+                self.open_placeholder(container_id, Placeholder::for_menu(name), title);
             }
         }
     }
 
-    /// `handleMountScreenOpen`: a mount's inventory isn't run; it is closed at once.
+    /// A menu the client doesn't run opens as one it runs would, with a placeholder
+    /// screen.
+    fn open_placeholder(&mut self, container_id: i32, p: Placeholder, title: Tag) {
+        let kind = Kind::Placeholder(p);
+        if let Some(w) = &mut self.world {
+            w.player.menus.open = Some(Menu::new(kind, container_id));
+        }
+        self.show_screen(kind, Some(title));
+    }
+
+    /// `handleMountScreenOpen`: a horse's or a nautilus's inventory, which the client
+    /// doesn't run, opens with a placeholder screen; for anything else (or an entity
+    /// the client doesn't know) nothing happens.
     pub(super) fn mount_screen_open(&mut self, container_id: i32, columns: i32, entity_id: i32) {
+        let Some(e) = self.world.as_ref().and_then(|w| w.entities.get(entity_id)) else {
+            eprintln!("[menu] mount screen for unknown entity {entity_id}: nothing opens");
+            return;
+        };
+        let Some(title) = mount_title(e.entity_type) else {
+            eprintln!("[menu] mount screen for entity {entity_id}, not a mount: nothing opens");
+            return;
+        };
         eprintln!(
-            "[menu] no screen for entity {entity_id}'s inventory ({columns} columns, container {container_id}): closed at once"
+            "[menu] entity {entity_id}'s inventory ({columns} columns, container {container_id}): a placeholder"
         );
-        self.client_side_close_container();
-        self.connection.send(play::container_close(container_id));
+        self.open_placeholder(container_id, Placeholder::mount(columns), title);
     }
 
     /// `LocalPlayer.closeContainer`: the server is told, then the client closes it.
