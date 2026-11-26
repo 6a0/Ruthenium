@@ -3,6 +3,8 @@
 //! - [`session`]: one session with a server, from connecting into play: the
 //!   configuration phase (registries, tags, known packs, features, cookies, resource-pack
 //!   answers, the code of conduct), the switch into play and back, and the ticks.
+//! - [`server_pack`]: the server's resource packs: vanilla's `ServerPackManager`, what it
+//!   asks to be downloaded and loaded, and what the server is told.
 //! - [`clock`]: when ticks run (vanilla's millisecond tick clock).
 //! - [`level_load`]: when the player counts as loaded into a level.
 //! - [`player`]: the local player: movement, collisions, flight, the server's view of
@@ -67,6 +69,7 @@ mod potion_colours;
 pub mod predict;
 pub mod scene;
 pub mod scoreboard;
+pub mod server_pack;
 pub mod session;
 pub mod shape;
 pub mod sound;
