@@ -2460,6 +2460,20 @@ impl Game {
                     self.connection.send(p);
                 }
             }
+            // `handleRotatePlayer`: turned by the server (`/rotate`), the player says where
+            // it looks at once (`ClientPacketListener.java:836`).
+            play::Clientbound::PlayerRotation {
+                y_rot,
+                relative_y,
+                x_rot,
+                relative_x,
+            } => {
+                let w = self.world.as_mut().ok_or("a rotation before the login")?;
+                w.player.rotate(y_rot, relative_y, x_rot, relative_x);
+                let (y, x) = (w.player.y_rot, w.player.x_rot);
+                self.connection
+                    .send(play::move_player_rot(y, x, false, false));
+            }
             play::Clientbound::GameEvent { event, param } => {
                 if let Some(w) = &mut self.world {
                     match event {
@@ -3596,6 +3610,45 @@ mod tests {
             self.scene.drain_dirty(&mut out);
             out.into_iter().collect()
         }
+    }
+
+    /// `handleRotatePlayer`: the server's rotation (`/rotate`), outright or relative,
+    /// is taken without interpolation and answered at once with the player's rotation
+    /// and no ground or collision flags.
+    #[test]
+    fn the_servers_rotation_is_taken_and_answered_at_once() {
+        let mut r = rig(None);
+        r.packet(login());
+        r.frame(10);
+        r.remote.sent();
+        r.packet(play::Clientbound::PlayerRotation {
+            y_rot: 45.0,
+            relative_y: false,
+            x_rot: 120.0,
+            relative_x: false,
+        });
+        let f = r.frame(0);
+        assert_eq!(
+            r.remote.sent(),
+            [Sent::Packet(play::move_player_rot(
+                45.0, 90.0, false, false
+            ))]
+        );
+        assert_eq!((f.player.y_rot, f.player.x_rot), (45.0, 90.0));
+        assert_eq!(f.player.old_rot, (45.0, 90.0));
+        r.packet(play::Clientbound::PlayerRotation {
+            y_rot: 10.0,
+            relative_y: true,
+            x_rot: -100.0,
+            relative_x: true,
+        });
+        r.frame(0);
+        assert_eq!(
+            r.remote.sent(),
+            [Sent::Packet(play::move_player_rot(
+                55.0, -10.0, false, false
+            ))]
+        );
     }
 
     #[test]

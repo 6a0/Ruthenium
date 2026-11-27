@@ -1391,6 +1391,14 @@ pub mod play {
             data_to_keep: u8,
         },
         PlayerPosition(PlayerPosition),
+        /// `ClientboundPlayerRotationPacket` (`/rotate`): the player's new rotation, each
+        /// part added to the current one when it is relative.
+        PlayerRotation {
+            y_rot: f32,
+            relative_y: bool,
+            x_rot: f32,
+            relative_x: bool,
+        },
         /// `ClientboundGameEventPacket`: the event id and its parameter.
         GameEvent {
             event: u8,
@@ -1903,6 +1911,12 @@ pub mod play {
                     x_rot: r.f32()?,
                     relatives: r.i32()? as u32,
                 }),
+                C::PlayerRotation => Clientbound::PlayerRotation {
+                    y_rot: r.f32()?,
+                    relative_y: r.bool()?,
+                    x_rot: r.f32()?,
+                    relative_x: r.bool()?,
+                },
                 C::GameEvent => Clientbound::GameEvent {
                     event: r.u8()?,
                     param: r.f32()?,
@@ -2892,6 +2906,21 @@ pub mod play {
             o.extend(y_rot.to_be_bytes());
             o.extend(x_rot.to_be_bytes());
             wire::write_bool(o, on_ground);
+        })
+    }
+
+    /// `ServerboundMovePlayerPacket.Rot`: the player's rotation, with its ground and
+    /// horizontal collision flags.
+    pub fn move_player_rot(
+        y_rot: f32,
+        x_rot: f32,
+        on_ground: bool,
+        horizontal_collision: bool,
+    ) -> Vec<u8> {
+        wire::packet(pl::Serverbound::MovePlayerRot.id(), |o| {
+            wire::write_f32(o, y_rot);
+            wire::write_f32(o, x_rot);
+            o.push(u8::from(on_ground) | u8::from(horizontal_collision) << 1);
         })
     }
 
@@ -4297,5 +4326,27 @@ mod tests {
                 1, 41, 0xFC, 0x19, 1, 0, 2, 0, 0, 0, 0, 36, 1, 1, 3, 0, 0, 1, 1, 3, 0, 0
             ]
         );
+    }
+    #[test]
+    fn the_servers_rotation_and_the_rotation_packet() {
+        let mut b = Vec::new();
+        wire::write_f32(&mut b, 45.0);
+        wire::write_bool(&mut b, false);
+        wire::write_f32(&mut b, -10.0);
+        wire::write_bool(&mut b, true);
+        assert_eq!(
+            play::Clientbound::decode(pl::Clientbound::PlayerRotation.id(), &b).unwrap(),
+            play::Clientbound::PlayerRotation {
+                y_rot: 45.0,
+                relative_y: false,
+                x_rot: -10.0,
+                relative_x: true,
+            }
+        );
+        let mut want = vec![pl::Serverbound::MovePlayerRot.id() as u8];
+        want.extend(45.0f32.to_be_bytes());
+        want.extend((-10.0f32).to_be_bytes());
+        want.push(0b10);
+        assert_eq!(play::move_player_rot(45.0, -10.0, false, true), want);
     }
 }

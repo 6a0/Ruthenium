@@ -1647,6 +1647,32 @@ impl LocalPlayer {
         self.movement_this_tick.clear();
     }
 
+    /// `handleRotatePlayer` (`ClientPacketListener.java:825`): the server turns the
+    /// player, riding or not (`calculateAbsolute` with the rotation's relatives, the
+    /// pitch clamped), and the old rotation goes with it (`setOldRot`).
+    pub fn rotate(&mut self, y_rot: f32, relative_y: bool, x_rot: f32, relative_x: bool) {
+        let relatives = u32::from(relative_y) << 3 | u32::from(relative_x) << 4;
+        let (_, _, y, x) = calculate_absolute(
+            self.position,
+            self.delta,
+            self.y_rot,
+            self.x_rot,
+            self.position,
+            self.delta,
+            y_rot,
+            x_rot,
+            relatives,
+        );
+        // `setYRot` and `setXRot` leave a rotation that isn't finite alone.
+        if y.is_finite() {
+            self.y_rot = y;
+        }
+        if x.is_finite() {
+            self.x_rot = x;
+        }
+        self.old_rot = (self.y_rot, self.x_rot);
+    }
+
     /// `handleUpdateAttributes`: each attribute's base, and its modifiers replaced by
     /// the server's.
     pub fn apply_attributes(

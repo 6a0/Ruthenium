@@ -183,8 +183,11 @@ enum Expect {
         x_rot: Option<f32>,
     },
     /// `handleRotatePlayer`'s `Rot(yRot, xRot, false, false)`
-    /// (`ClientPacketListener.java:836`).
-    Rot,
+    /// (`ClientPacketListener.java:836`), with the rotation where it was set outright.
+    Rot {
+        y_rot: Option<f32>,
+        x_rot: Option<f32>,
+    },
     /// `handlePing`'s pong (`ClientCommonPacketListenerImpl.java:153`).
     Pong(i32),
 }
@@ -193,7 +196,7 @@ impl Expect {
     fn invariant(&self) -> &'static str {
         match self {
             Expect::Accept { .. } => "INV-C9",
-            Expect::Rot => "INV-T2",
+            Expect::Rot { .. } => "INV-T2",
             Expect::Pong(_) => "INV-R1",
         }
     }
@@ -201,7 +204,7 @@ impl Expect {
     fn answering(&self) -> &'static str {
         match self {
             Expect::Accept { .. } => C::PlayerPosition.name(),
-            Expect::Rot => C::PlayerRotation.name(),
+            Expect::Rot { .. } => C::PlayerRotation.name(),
             Expect::Pong(_) => C::Ping.name(),
         }
     }
@@ -518,7 +521,17 @@ impl PacketChecker {
                     x_rot: outright(1 << 4).then_some(t.x_rot.clamp(-90.0, 90.0)),
                 });
             }
-            play::Clientbound::Other(C::PlayerRotation) => self.expect = Some(Expect::Rot),
+            play::Clientbound::PlayerRotation {
+                y_rot,
+                relative_y,
+                x_rot,
+                relative_x,
+            } => {
+                self.expect = Some(Expect::Rot {
+                    y_rot: (!relative_y).then_some(0.0 + y_rot),
+                    x_rot: (!relative_x).then_some(x_rot.clamp(-90.0, 90.0)),
+                });
+            }
             play::Clientbound::SetHeldSlot { slot } => {
                 if (0..9).contains(slot) {
                     self.server_slot = Some(*slot);
@@ -795,8 +808,14 @@ impl PacketChecker {
                     self.flag("INV-R1", name, format!("pong {got}, the ping was {want}"));
                 }
             }
-            (Expect::Rot, S::MovePlayerRot) => {
+            (Expect::Rot { y_rot, x_rot }, S::MovePlayerRot) => {
                 let (y, x) = (r.f32()?, r.f32()?);
+                if y_rot.is_some_and(|w| !same_f32(w, y)) || x_rot.is_some_and(|w| !same_f32(w, x))
+                {
+                    let detail =
+                        format!("rotation ({y}, {x}), the server set ({y_rot:?}, {x_rot:?})");
+                    self.flag("INV-T2", name, detail);
+                }
                 let flags = r.u8()?;
                 if flags != 0 {
                     let detail = format!("flags {flags} (vanilla answers with false, false)");
@@ -1393,6 +1412,16 @@ mod tests {
         })
     }
 
+    /// The server's rotation, set outright.
+    fn turn(y_rot: f32, x_rot: f32) -> play::Clientbound {
+        play::Clientbound::PlayerRotation {
+            y_rot,
+            relative_y: false,
+            x_rot,
+            relative_x: false,
+        }
+    }
+
     fn pos(p: [f64; 3]) -> Vec<u8> {
         wire::packet(S::MovePlayerPos.id(), |o| {
             p.iter().for_each(|v| wire::write_f64(o, *v));
@@ -1556,15 +1585,31 @@ mod tests {
         c.sent(&rot(1.0, 2.0, 0));
         assert_eq!(broken(&c), ["INV-T2"]);
         let mut c = joined();
-        c.handled(&play::Clientbound::Other(C::PlayerRotation));
+        c.handled(&turn(1.0, 2.0));
         c.sent(&rot(1.0, 2.0, 0));
         assert_eq!(broken(&c), Vec::<&str>::new());
-        c.handled(&play::Clientbound::Other(C::PlayerRotation));
+        c.handled(&turn(1.0, 2.0));
         c.sent(&rot(1.0, 2.0, 1));
         assert_eq!(broken(&c), ["INV-T2"]);
         let mut c = joined();
-        c.handled(&play::Clientbound::Other(C::PlayerRotation));
+        c.handled(&turn(1.0, 2.0));
         tick(&mut c, 1, &[]);
+        assert_eq!(broken(&c), ["INV-T2"]);
+        // The answer is where the server turned the player (the pitch clamped), or
+        // anywhere when it turned it by an amount.
+        let mut c = joined();
+        c.handled(&turn(1.0, 100.0));
+        c.sent(&rot(1.0, 90.0, 0));
+        c.handled(&turn(1.0, 2.0));
+        c.sent(&rot(1.5, 2.0, 0));
+        assert_eq!(broken(&c), ["INV-T2"]);
+        c.handled(&play::Clientbound::PlayerRotation {
+            y_rot: 1.0,
+            relative_y: true,
+            x_rot: 2.0,
+            relative_x: true,
+        });
+        c.sent(&rot(7.0, 8.0, 0));
         assert_eq!(broken(&c), ["INV-T2"]);
     }
 
