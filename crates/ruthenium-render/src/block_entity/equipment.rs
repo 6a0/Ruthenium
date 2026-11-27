@@ -178,12 +178,26 @@ impl EquipmentSet {
 /// `base` becomes the colour at the same place in `target`, in every texel that is not
 /// clear; a texel keeps its own opacity, lessened by its new colour's. All three are RGBA.
 /// Palettes of different lengths change nothing.
+#[cfg(test)]
 pub fn map_palette(picture: &[u8], base: &[u8], target: &[u8]) -> Vec<u8> {
     let mut out = picture.to_vec();
-    if base.len() != target.len() {
-        return out;
+    if let Some(mapping) = palette_mapping(base, target) {
+        apply_palette(&mut out, &mapping);
     }
-    let mut mapping: HashMap<[u8; 3], [u8; 4]> = HashMap::new();
+    out
+}
+
+/// What [`map_palette`] turns each colour of `base` into: nothing for palettes of
+/// different lengths.
+pub type PaletteMapping = HashMap<[u8; 3], [u8; 4]>;
+
+/// The mapping of `base`'s colours to `target`'s, for [`apply_palette`]; none when
+/// they differ in length (nothing changes).
+pub fn palette_mapping(base: &[u8], target: &[u8]) -> Option<PaletteMapping> {
+    if base.len() != target.len() {
+        return None;
+    }
+    let mut mapping = PaletteMapping::new();
     for (from, to) in base
         .as_chunks::<4>()
         .0
@@ -194,7 +208,12 @@ pub fn map_palette(picture: &[u8], base: &[u8], target: &[u8]) -> Vec<u8> {
             mapping.insert([from[0], from[1], from[2]], *to);
         }
     }
-    for texel in out.as_chunks_mut::<4>().0 {
+    Some(mapping)
+}
+
+/// [`map_palette`] on `texels` (RGBA) in place: any run of a picture's texels.
+pub fn apply_palette(texels: &mut [u8], mapping: &PaletteMapping) {
+    for texel in texels.as_chunks_mut::<4>().0 {
         if texel[3] == 0 {
             continue;
         }
@@ -203,7 +222,6 @@ pub fn map_palette(picture: &[u8], base: &[u8], target: &[u8]) -> Vec<u8> {
             *texel = [to[0], to[1], to[2], alpha as u8];
         }
     }
-    out
 }
 
 /// The path of a trim's picture below `textures` without its suffix, for a pattern's

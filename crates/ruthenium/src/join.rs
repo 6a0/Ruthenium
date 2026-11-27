@@ -476,7 +476,10 @@ pub fn load_world_assets_from(
         underwater,
         colour_maps,
         sky,
-        clouds: sky_image(CLOUDS),
+        // Its cells here, on the reload's thread: a pack's picture may be large.
+        clouds: sky_image(CLOUDS).and_then(|i| {
+            ruthenium_render::clouds::CloudCells::from_rgba(i.width, i.height, &i.rgba)
+        }),
         rain: sky_image(RAIN),
         snow: sky_image(SNOW),
         block_entities,
@@ -506,8 +509,11 @@ fn block_entity_assets(
     // Cap extra entity/equipment/trim/palette texture counts so an untrusted pack cannot
     // exhaust TextureTable slots or Vulkan allocations during reload.
     const MAX_EXTRA_TEXTURES_PER_DIR: usize = 256;
-    const MAX_TRIM_TEXELS: u64 = 256 * 256;
     const MAX_PALETTE_COLOURS: u64 = 256;
+    // The trims' pictures together are held to an atlas's worth (`Limits::trim_texels`:
+    // vanilla stitches them all into one), each to the pack's limits on pictures: a pack
+    // may draw a few of them finely, as vanilla allows.
+    let mut trim_texels_left = resources.limits().trim_texels;
 
     let mut paths = block_entity::texture_paths();
     for folder in [block_entity::BANNER_DIR, block_entity::SHIELD_DIR] {
@@ -583,7 +589,12 @@ fn block_entity_assets(
             let Some(picture) = image(id.path()) else {
                 continue;
             };
-            if u64::from(picture.width) * u64::from(picture.height) > MAX_TRIM_TEXELS {
+            if !take_trim_texels(&mut trim_texels_left, picture.width, picture.height) {
+                eprintln!(
+                    "[ruthenium] {}: past the trims' {} texels; not drawn",
+                    id.path(),
+                    resources.limits().trim_texels
+                );
                 continue;
             }
             // The palette its colours are of, from its metadata (bounded by mcmeta_bytes).
@@ -637,6 +648,18 @@ fn block_entity_assets(
         ],
         items: None,
     })
+}
+
+/// Takes a trim picture of `width` by `height` from what the trims' pictures have left
+/// (`Limits::trim_texels`), or says it doesn't fit and takes nothing.
+fn take_trim_texels(left: &mut u64, width: u32, height: u32) -> bool {
+    match left.checked_sub(u64::from(width) * u64::from(height)) {
+        Some(rest) => {
+            *left = rest;
+            true
+        }
+        None => false,
+    }
 }
 
 /// Starts joining servers: loads the game data on a thread meanwhile.
@@ -1006,6 +1029,35 @@ pub fn left_on_purpose(c: &Closed) -> bool {
 mod tests {
     use super::*;
     use ruthenium_protocol::nbt::Tag;
+
+    /// A server's trims may be as large as its pictures may be (vanilla puts them in an
+    /// atlas, of any size it takes), and together no more than the trims' room: of a pack
+    /// listing as many 4096 x 4096 trims as it may, four are drawn, and small ones still
+    /// fit beside them until the room is used up.
+    #[test]
+    fn trims_take_an_atlas_worth_of_texels() {
+        let limits = ruthenium_assets::Limits::untrusted();
+        let mut left = limits.trim_texels;
+        assert!(take_trim_texels(&mut left, 64, 32), "vanilla's");
+        assert!(
+            take_trim_texels(&mut left, 1024, 512),
+            "past the old 256 x 256"
+        );
+        let side = (limits.image_texels as f64).sqrt() as u32;
+        let big = (0..512)
+            .filter(|_| take_trim_texels(&mut left, side, side))
+            .count();
+        assert_eq!(big, 3, "four would pass the room with the two before");
+        assert!(left < u64::from(side) * u64::from(side));
+        let fit = left / (64 * 32);
+        let small = (0..1_000_000)
+            .filter(|_| take_trim_texels(&mut left, 64, 32))
+            .count() as u64;
+        assert_eq!(small, fit);
+        assert!(left < 64 * 32);
+        let mut trusted = ruthenium_assets::Limits::trusted().trim_texels;
+        assert!(take_trim_texels(&mut trusted, u32::MAX, u32::MAX));
+    }
 
     #[test]
     fn reasons_read_as_text() {

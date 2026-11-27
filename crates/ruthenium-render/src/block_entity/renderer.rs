@@ -38,7 +38,7 @@ use super::place::{self, Chest, DYE_COLOURS, DYES, Kind};
 use super::shadow::{self, Ground, Piece};
 use super::sign::{self, GLYPH_WORDS, GlyphPages, SignText};
 use super::skins::{LoadedSkin, Look, Skins, default_path};
-use super::trims::{TrimCache, trim_allowed};
+use super::trims::{Colouring, TRIM_TEXELS_PER_FRAME, TrimCache, trim_allowed};
 use crate::atmosphere::Fog;
 use crate::pipelines::PipelineId;
 use crate::sky::SkyImage;
@@ -797,6 +797,8 @@ pub(crate) struct BlockEntityRenderer {
     /// The trims' pictures in their palettes, as far as they were asked for: nothing for
     /// one that is asked for and not made yet, or cannot be.
     trims: TrimCache<TrimKey, TextureId>,
+    /// A trim too large to colour in one frame, being coloured a share a frame.
+    trim_colouring: Option<Colouring<TrimKey>>,
     /// The pictures of each equipment asset's layers, on the body and on the legs, once
     /// it has been worn.
     worn_pictures: [HashMap<String, Vec<Option<TextureId>>>; 2],
@@ -1039,6 +1041,7 @@ impl BlockEntityRenderer {
                 .map(|(path, image)| (path, image.rgba))
                 .collect(),
             trims: TrimCache::default(),
+            trim_colouring: None,
             worn_pictures: [HashMap::new(), HashMap::new()],
             trim_keys: HashMap::new(),
             worn: Vec::new(),
@@ -1097,6 +1100,7 @@ impl BlockEntityRenderer {
         gone.extend(self.glint_pictures.iter_mut().filter_map(Option::take));
         gone.extend(self.item_atlas.take());
         gone.extend(self.trims.clear());
+        self.trim_colouring = None;
         for worn in &mut self.worn_pictures {
             gone.extend(worn.drain().flat_map(|(_, layers)| layers).flatten());
         }
@@ -1171,27 +1175,7 @@ impl BlockEntityRenderer {
         for id in self.trims.take_gone() {
             textures.destroy(id);
         }
-        let bases = &self.trim_bases;
-        let texels = |key: &TrimKey| {
-            bases
-                .get(&key.0)
-                .map_or(0, |(i, _)| i.width as usize * i.height as usize)
-        };
-        for key in self.trims.take_wanted(texels) {
-            let made = self.trim_picture(&key).and_then(|(width, height, rgba)| {
-                textures
-                    .create_with(
-                        uploads,
-                        TextureDesc::rgba8(width, height),
-                        &[&rgba],
-                        Arrival::NextFrame,
-                    )
-                    .ok()
-            });
-            if let Some(id) = self.trims.made(&key, made) {
-                textures.destroy(id);
-            }
-        }
+        self.stage_trims(textures, uploads);
         // The items' atlas, once the ring has a stream to spare for it.
         if let Some(atlas) = self.item_atlas_waiting.take() {
             let whole = atlas.rgba.len() == atlas.width as usize * atlas.height as usize * 4;
@@ -2175,7 +2159,12 @@ impl BlockEntityRenderer {
                 self.trim_keys.insert(at, (Arc::clone(trim), key));
             }
             if let Some(key) = &self.trim_keys[&at].1
-                && let Some(texture) = self.trims.get(key)
+                && let Some(texture) = self.trims.get(
+                    key,
+                    self.trim_bases
+                        .get(&key.0)
+                        .map_or(0, |(i, _)| i.width as usize * i.height as usize),
+                )
                 && textures.is_ready(texture)
             {
                 drawn.push((texture, WHITE));
@@ -2519,10 +2508,112 @@ impl BlockEntityRenderer {
         }
     }
 
-    /// A trim's picture in its palette: its size and texels. Nothing for a picture
-    /// larger than [`MAX_TRIM_TEXELS`], or a palette of more than
+    /// Colours the trims asked for, at most [`TRIM_TEXELS_PER_FRAME`] texels a frame (a
+    /// larger one over several frames, the others waiting), and stages their textures.
+    fn stage_trims(&mut self, textures: &mut TextureTable, uploads: &mut UploadRing) {
+        // A large one under way goes on, and takes the frame's share.
+        if let Some(c) = &mut self.trim_colouring {
+            let done = match self.trim_bases.get(&c.key.0) {
+                _ if !self.trims.is_kept(&c.key) => Some(Vec::new()),
+                Some((image, _)) => c.step(&image.rgba, TRIM_TEXELS_PER_FRAME),
+                None => Some(Vec::new()),
+            };
+            if let Some(rgba) = done
+                && let Some(c) = self.trim_colouring.take()
+            {
+                self.trim_made(textures, uploads, &c.key, c.width, c.height, rgba);
+            }
+            return;
+        }
+        let bases = &self.trim_bases;
+        let texels = |key: &TrimKey| {
+            bases
+                .get(&key.0)
+                .map_or(0, |(i, _)| i.width as usize * i.height as usize)
+        };
+        let mut keys = self.trims.take_wanted(texels).into_iter();
+        while let Some(key) = keys.next() {
+            let Some((width, height, mapping)) = self.trim_source(&key) else {
+                if let Some(id) = self.trims.made(&key, None) {
+                    textures.destroy(id);
+                }
+                continue;
+            };
+            let mut c = Colouring::new(key, width, height, mapping);
+            let Some((image, _)) = self.trim_bases.get(&c.key.0) else {
+                continue;
+            };
+            match c.step(&image.rgba, TRIM_TEXELS_PER_FRAME) {
+                Some(rgba) => self.trim_made(textures, uploads, &c.key, width, height, rgba),
+                // Larger than a frame's share (so the first, and only one, of the frame's).
+                None => {
+                    self.trim_colouring = Some(c);
+                    for rest in keys {
+                        self.trims.again(&rest);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A trim's picture is coloured: its texture is made (a large one streamed), and
+    /// kept; one that can't be staged now is asked for again.
+    fn trim_made(
+        &mut self,
+        textures: &mut TextureTable,
+        uploads: &mut UploadRing,
+        key: &TrimKey,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) {
+        let desc = TextureDesc::rgba8(width, height);
+        let made = if rgba.is_empty() {
+            Ok(None)
+        } else if rgba.len() <= TRIM_TEXELS_PER_FRAME * 4 {
+            textures
+                .create_with(uploads, desc, &[&rgba], Arrival::NextFrame)
+                .map(Some)
+                .map_err(|e| matches!(e, Error::Upload(u) if u.try_again()))
+        } else {
+            // In tiles, from the coloured picture itself (no copy of it).
+            match textures.create(desc) {
+                Ok(id) => match textures.stream(uploads, id, vec![rgba]) {
+                    Ok(()) => Ok(Some(id)),
+                    Err(e) => {
+                        textures.destroy(id);
+                        Err(e.try_again())
+                    }
+                },
+                Err(e) => Err(matches!(e, Error::Upload(u) if u.try_again())),
+            }
+        };
+        match made {
+            Ok(texture) => {
+                if let Some(id) = self.trims.made(key, texture) {
+                    textures.destroy(id);
+                }
+            }
+            Err(true) => self.trims.again(key),
+            Err(false) => {
+                if let Some(id) = self.trims.made(key, None) {
+                    textures.destroy(id);
+                }
+            }
+        }
+    }
+
+    /// What a trim's picture is coloured from: its size and the mapping of its palette.
+    /// Nothing for a picture larger than [`KEPT_TRIM_TEXELS`], or a palette of more than
     /// [`MAX_PALETTE_COLOURS`].
-    fn trim_picture(&self, key: &(String, Option<String>)) -> Option<(u32, u32, Vec<u8>)> {
+    ///
+    /// [`KEPT_TRIM_TEXELS`]: super::trims::KEPT_TRIM_TEXELS
+    /// [`MAX_PALETTE_COLOURS`]: super::trims::MAX_PALETTE_COLOURS
+    fn trim_source(
+        &self,
+        key: &(String, Option<String>),
+    ) -> Option<(u32, u32, Option<equipment::PaletteMapping>)> {
         let (image, base) = self.trim_bases.get(&key.0)?;
         let palettes: Vec<&[u8]> = [
             base.as_deref(),
@@ -2535,21 +2626,17 @@ impl BlockEntityRenderer {
         if !trim_allowed(image.width as usize * image.height as usize, &palettes) {
             return None;
         }
-        let mapped = key
+        let mapping = key
             .1
             .as_deref()
             .and_then(equipment::palette_path)
             .and_then(|target| {
-                Some((
+                equipment::palette_mapping(
                     self.palettes.get(base.as_deref()?)?,
                     self.palettes.get(target)?,
-                ))
-            })
-            .map_or_else(
-                || image.rgba.clone(),
-                |(base, target)| equipment::map_palette(&image.rgba, base, target),
-            );
-        Some((image.width, image.height, mapped))
+                )
+            });
+        Some((image.width, image.height, mapping))
     }
 
     /// Draws what was gathered, into `pass`, which has a depth attachment. `indices` are

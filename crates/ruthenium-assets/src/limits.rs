@@ -69,6 +69,9 @@ pub struct Limits {
     pub image_side: u32,
     /// A picture's texels: 4096 x 4096, 64 MiB decoded. Larger pictures are never in packs
     /// for a reason; a PNG header may claim any size, and decoding allocates for it.
+    /// The clouds' picture is held to this (and [`Self::image_side`]) alone, as vanilla
+    /// loads one of any size: its cells, a byte a texel (16 MiB at most), are made on the
+    /// reload's thread, and a frame only reads those within the cloud distance.
     pub image_texels: u64,
     /// Texels a pack's pictures may decode to in one load: 1 GiB of RGBA. With the
     /// decoder's own buffer of each picture, a load's pictures peak at about twice that.
@@ -139,6 +142,15 @@ pub struct Limits {
     /// Total RGBA texels decoded for bitmap providers of one font (even when referencing
     /// vanilla textures): 16M texels = 64 MiB.
     pub font_bitmap_texels: u64,
+    /// Texels of the armour trims' pictures together, and of the trims coloured from them
+    /// and kept at once. Vanilla stitches every trim pattern in every material into one
+    /// atlas (`armor_trims`), so what its trims take is bounded by an atlas, not by the
+    /// size of one picture: a pack may draw a few patterns very finely. This is the
+    /// largest atlas a server pack may make, [`Self::atlas_side`] squared: 8192 x 8192,
+    /// 64M texels, 256 MiB of RGBA (each picture is also held to [`Self::image_texels`]).
+    /// Pictures past it are not drawn; coloured trims past it make room by letting the
+    /// least lately drawn go.
+    pub trim_texels: u64,
     /// Entries of a language file; `en_us.json` has 8559.
     pub lang_entries: usize,
     /// Events in one `sounds.json`; the game's has 1991.
@@ -197,6 +209,7 @@ impl Limits {
             font_references: usize::MAX,
             font_glyphs: usize::MAX,
             font_bitmap_texels: u64::MAX,
+            trim_texels: u64::MAX,
             lang_entries: usize::MAX,
             sound_events: usize::MAX,
             sounds_per_event: usize::MAX,
@@ -246,6 +259,7 @@ impl Limits {
             font_references: 16,
             font_glyphs: 1 << 18,
             font_bitmap_texels: 1 << 24,
+            trim_texels: 1 << 26,
             lang_entries: 1 << 16,
             sound_events: 1 << 16,
             sounds_per_event: 4096,
@@ -295,6 +309,7 @@ impl Limits {
             font_references: self.font_references.min(o.font_references),
             font_glyphs: self.font_glyphs.min(o.font_glyphs),
             font_bitmap_texels: self.font_bitmap_texels.min(o.font_bitmap_texels),
+            trim_texels: self.trim_texels.min(o.trim_texels),
             lang_entries: self.lang_entries.min(o.lang_entries),
             sound_events: self.sound_events.min(o.sound_events),
             sounds_per_event: self.sounds_per_event.min(o.sounds_per_event),
@@ -389,6 +404,14 @@ mod tests {
         assert_eq!(b.used(), (10, 5));
         b.reset();
         assert!(b.take_bytes(10, &limits));
+    }
+
+    /// The trims' room is the largest atlas a server pack may make.
+    #[test]
+    fn trims_take_at_most_an_atlas() {
+        let l = Limits::untrusted();
+        assert_eq!(l.trim_texels, u64::from(l.atlas_side).pow(2));
+        assert!(l.trim_texels >= l.image_texels);
     }
 
     #[test]

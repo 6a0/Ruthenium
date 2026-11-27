@@ -86,17 +86,13 @@ impl CloudCells {
     /// Vanilla finds the east and west neighbours modulo the picture's height, not its
     /// width (the same for its square picture); a neighbour that falls outside a picture
     /// wider than it is high counts as empty here, where the game's would fail to load.
+    ///
+    /// Any size, as vanilla's (its clouds.png is 256 x 256): a pack's picture is bounded
+    /// by its pack's limits on pictures (`Limits::image_texels`), and this runs on the
+    /// reload's thread (`WorldAssets::clouds`), so a large one costs no frame.
     pub fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<CloudCells> {
-        // Vanilla's clouds.png is 256x256; cap so a 4096x4096 untrusted PNG cannot stall
-        // the render thread with tens of millions of cell iterations.
-        const MAX_CLOUD_SIDE: u32 = 1024;
-        let (w, h) = (width as i64, height as i64);
-        if w == 0
-            || h == 0
-            || width > MAX_CLOUD_SIDE
-            || height > MAX_CLOUD_SIDE
-            || rgba.len() != (w * h * 4) as usize
-        {
+        let (w, h) = (i64::from(width), i64::from(height));
+        if w == 0 || h == 0 || rgba.len() as u64 != (w * h * 4) as u64 {
             return None;
         }
         let empty = |x: i64, y: i64| {
@@ -892,5 +888,34 @@ mod tests {
         assert_ne!(cells.at(0, 0), 0);
         assert_eq!(cells.at(1, 0), 0);
         assert!(CloudCells::from_rgba(2, 2, &rgba(&[255])).is_none());
+    }
+
+    /// A pack's clouds picture of any size is taken, as vanilla takes it (it was
+    /// refused past 1024 a side): a server's is bounded by its pictures' limits, and its
+    /// cells are made with the rest of the assets, off the render thread. A frame's list
+    /// only reads the cells within the cloud distance.
+    #[test]
+    fn a_large_clouds_picture_is_taken() {
+        let (w, h) = (2048u32, 1536u32);
+        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        // One cloud cell at the far corner.
+        let last = rgba.len() - 1;
+        rgba[last] = 255;
+        let cells = CloudCells::from_rgba(w, h, &rgba).expect("taken");
+        assert_eq!((cells.width(), cells.height()), (w, h));
+        assert_ne!(cells.at(w as i32 - 1, h as i32 - 1), 0);
+        assert_eq!(cells.at(0, 0), 0);
+        let mut faces = Vec::new();
+        build_mesh(
+            &cells,
+            RelativePos::Below,
+            [0, 0],
+            true,
+            radius_cells(128),
+            &mut faces,
+        );
+        let radius = radius_cells(128) as usize;
+        assert!(faces.len() <= (2 * radius + 1).pow(2) * 6);
+        assert!(CloudCells::from_rgba(w, h, &rgba[4..]).is_none());
     }
 }

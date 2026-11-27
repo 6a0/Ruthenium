@@ -679,15 +679,11 @@ impl Renderer {
                     }
                 };
             // Without the clouds picture there are no clouds.
-            self.clouds = assets
-                .clouds
-                .as_ref()
-                .and_then(|i| CloudCells::from_rgba(i.width, i.height, &i.rgba))
-                .and_then(|cells| {
-                    CloudRenderer::new(&gpu, cells)
-                        .inspect_err(|e| eprintln!("[render] no clouds: {e}"))
-                        .ok()
-                });
+            self.clouds = assets.clouds.take().and_then(|cells| {
+                CloudRenderer::new(&gpu, cells)
+                    .inspect_err(|e| eprintln!("[render] no clouds: {e}"))
+                    .ok()
+            });
             let mut picture = |image: &Option<SkyImage>| {
                 let i = image.as_ref()?;
                 self.textures
@@ -777,8 +773,7 @@ impl Renderer {
         if let Some(clouds) = &mut self.clouds {
             let cells = assets
                 .clouds
-                .as_ref()
-                .and_then(|i| CloudCells::from_rgba(i.width, i.height, &i.rgba))
+                .take()
                 .or_else(|| CloudCells::from_rgba(1, 1, &[0, 0, 0, 0]));
             if let Some(cells) = cells {
                 clouds.set_cells(cells);

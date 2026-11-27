@@ -310,8 +310,9 @@ pub struct WorldAssets {
     pub colour_maps: ColourMaps,
     /// The sun, the moon's phases and the End's sky.
     pub sky: crate::sky::SkyImages,
-    /// The clouds picture (`textures/environment/clouds.png`): one cell a texel.
-    pub clouds: Option<crate::sky::SkyImage>,
+    /// The cells of the clouds picture (`textures/environment/clouds.png`): one cell a
+    /// texel, made with the rest of the assets (off the render thread).
+    pub clouds: Option<crate::clouds::CloudCells>,
     /// Rain's and snow's pictures (`textures/environment/rain.png`, `snow.png`).
     pub rain: Option<crate::sky::SkyImage>,
     pub snow: Option<crate::sky::SkyImage>,
