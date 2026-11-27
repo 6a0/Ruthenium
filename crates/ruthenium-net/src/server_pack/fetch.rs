@@ -20,6 +20,7 @@ use ureq::Agent;
 use ureq::config::AutoHeaderValue;
 use ureq::http::{Response, header};
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::unversioned::transport::time::Duration as TimeoutDuration;
 use ureq::unversioned::transport::{
     Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport,
 };
@@ -247,23 +248,54 @@ impl Transport for GuardedTransport {
     }
 
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
-        if self.guard.is_cancelled() {
-            return Err(ureq::Error::Io(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "cancelled",
-            )));
+        // With a cancel token, a wait is made in slices with the token looked at between
+        // them: shutting the socket down from another thread wakes a blocked read on
+        // Unix, but not on Windows, where cancelling would otherwise wait out the read's
+        // whole timeout.
+        let sliced = self.guard.cancel.is_some();
+        let full = timeout.for_read();
+        let limit = match full.after {
+            TimeoutDuration::Exact(d) => Some(d),
+            TimeoutDuration::NotHappening => None,
+        };
+        let started = Instant::now();
+        loop {
+            if self.guard.is_cancelled() {
+                return Err(ureq::Error::Io(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "cancelled",
+                )));
+            }
+            if self.guard.is_exceeded() {
+                return Err(ureq::Error::Io(io::Error::other("wire limit exceeded")));
+            }
+            let left = limit.map(|l| l.saturating_sub(started.elapsed()));
+            let wait = if sliced {
+                NextTimeout {
+                    after: TimeoutDuration::Exact(
+                        left.map_or(CANCEL_SLICE, |l| l.min(CANCEL_SLICE)),
+                    ),
+                    reason: full.reason,
+                    per_read: None,
+                    per_write: timeout.per_write,
+                }
+            } else {
+                timeout
+            };
+            let before = self.inner.buffers().input().len();
+            let result = self.inner.await_input(wait);
+            let after = self.inner.buffers().input().len();
+            let added = after.saturating_sub(before) as u64;
+            if added > 0 && !self.guard.add(added) {
+                return Err(ureq::Error::Io(io::Error::other("wire limit exceeded")));
+            }
+            match result {
+                // Only a slice is over, not the wait.
+                Err(e)
+                    if sliced && timed_out(&e) && limit.is_none_or(|l| started.elapsed() < l) => {}
+                r => return r,
+            }
         }
-        if self.guard.is_exceeded() {
-            return Err(ureq::Error::Io(io::Error::other("wire limit exceeded")));
-        }
-        let before = self.inner.buffers().input().len();
-        let progress = self.inner.await_input(timeout)?;
-        let after = self.inner.buffers().input().len();
-        let added = after.saturating_sub(before) as u64;
-        if added > 0 && !self.guard.add(added) {
-            return Err(ureq::Error::Io(io::Error::other("wire limit exceeded")));
-        }
-        Ok(progress)
     }
 
     fn is_open(&mut self) -> bool {
@@ -272,6 +304,22 @@ impl Transport for GuardedTransport {
 
     fn is_tls(&self) -> bool {
         self.inner.is_tls()
+    }
+}
+
+/// How long a wait for input blocks, with a cancel token, before it is looked at again.
+const CANCEL_SLICE: Duration = Duration::from_millis(100);
+
+/// A transport's read ran out of time (the TCP transport says so as a timeout, a TLS
+/// one may pass on the socket's error).
+fn timed_out(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Timeout(_) => true,
+        ureq::Error::Io(e) => matches!(
+            e.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ),
+        _ => false,
     }
 }
 
