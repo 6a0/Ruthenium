@@ -22,7 +22,13 @@
 //! called [`Connection::switch`] with its acknowledgement: that packet goes out in the
 //! old protocol, then both directions use the new one and decoding resumes with the bytes
 //! already received.
+//!
+//! A transfer (`ClientboundTransferPacket`) is the game thread's to follow: it opens a
+//! new connection with [`ConnectOptions::transfer`], whose handshake says TRANSFER and
+//! whose login answers cookie requests from the cookies the last server stored
+//! (`ClientHandshakePacketListenerImpl`, `TransferState`).
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
@@ -98,8 +104,9 @@ impl std::fmt::Debug for Auth {
 
 #[derive(Debug)]
 pub struct ConnectOptions {
-    /// The server address as typed.
-    pub address: String,
+    /// The server's address: as typed ([`ServerAddress::parse`]), or where a transfer
+    /// sends the client ([`ServerAddress::from_parts`]).
+    pub address: ServerAddress,
     pub identity: Identity,
     pub auth: Auth,
     /// Sent in `minecraft:brand` once the login is done.
@@ -107,12 +114,33 @@ pub struct ConnectOptions {
     pub information: ClientInformation,
     /// Refuse servers that aren't on this machine or the local network.
     pub local_only: bool,
+    /// What a transfer carries here (`TransferState`); `None` for a join.
+    pub transfer: Option<TransferState>,
+}
+
+/// What a transfer carries from one server to the next (`TransferState`): the cookies
+/// the servers before stored, by key (`ClientCommonPacketListenerImpl.serverCookies`).
+/// They live only as long as the session and the transfers that follow from it; nothing
+/// keeps them on disk. With one, the handshake's intent is TRANSFER
+/// (`Connection.initiateServerboundPlayConnection`, `ConnectScreen.java:141`) and the
+/// login answers cookie requests from it (`ClientHandshakePacketListenerImpl.java:242`).
+///
+/// Vanilla's also holds the players seen (for the Social Interactions screen, which
+/// Ruthenium doesn't have) and whether the insecure-chat warning was shown, which
+/// vanilla's own login drops (`ClientHandshakePacketListenerImpl.java:194` passes
+/// `false` on).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferState {
+    pub cookies: HashMap<String, Vec<u8>>,
 }
 
 /// Where the login is, for the connecting screen (vanilla's `connect.*` messages).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Connecting,
+    /// Connecting after a transfer (`connect.transferring`, `ConnectScreen.java:77`):
+    /// the first stage instead of [`Stage::Connecting`].
+    Transferring,
     Authorizing,
     Encrypting,
     Negotiating,
@@ -582,9 +610,10 @@ impl Net<'_> {
                 self.event(Event::Stage(Stage::Negotiating));
                 self.send(&login::custom_query_answer(transaction_id)).await
             }
-            // No cookies yet: they come with transfers.
+            // Only a transfer brings cookies to the login; it can't store any.
             login::Clientbound::CookieRequest { key } => {
-                self.send(&login::cookie_response(&key, None)).await
+                let payload = o.cookies.get(&key).map(Vec::as_slice);
+                self.send(&login::cookie_response(&key, payload)).await
             }
         }
     }
@@ -596,6 +625,8 @@ struct Opened {
     information: ClientInformation,
     /// `None`: an offline login.
     join: Option<std::sync::Arc<dyn SessionJoin>>,
+    /// A transfer's cookies (none for a join).
+    cookies: HashMap<String, Vec<u8>>,
 }
 
 async fn run(
@@ -611,7 +642,9 @@ async fn run(
         brand,
         information,
         local_only,
+        transfer,
     } = options;
+    let transferring = transfer.is_some();
     let opened = Opened {
         brand,
         information,
@@ -620,9 +653,13 @@ async fn run(
             Auth::Offline => None,
             Auth::Online(j) => Some(j),
         },
+        cookies: transfer.map(|t| t.cookies).unwrap_or_default(),
     };
-    let _ = events.send(Event::Stage(Stage::Connecting));
-    let address = ServerAddress::parse(&address);
+    let _ = events.send(Event::Stage(if transferring {
+        Stage::Transferring
+    } else {
+        Stage::Connecting
+    }));
     let resolver = Resolver::new();
     let connect = async {
         let Some((host, socket)) = resolver.resolve_named(&address).await else {
@@ -665,7 +702,16 @@ async fn run(
     }
     // The intention and the hello go out together, without waiting (`ConnectScreen`).
     let opening = [
-        login::intention(PROTOCOL_VERSION, &host, socket.port(), Intent::Login),
+        login::intention(
+            PROTOCOL_VERSION,
+            &host,
+            socket.port(),
+            if transferring {
+                Intent::Transfer
+            } else {
+                Intent::Login
+            },
+        ),
         login::hello(&identity.name, identity.id),
     ];
     for p in &opening {

@@ -46,6 +46,19 @@ impl ServerAddress {
         }
     }
 
+    /// A transfer's address (`new ServerAddress(host, port)`, Guava's
+    /// `HostAndPort.fromParts`): the host is parsed as typed addresses are and must not
+    /// name a port of its own (`[::1]` loses its brackets, `host:` its colon), and the
+    /// port must be 0 to 65535. `None` where vanilla throws. An empty host is kept (it
+    /// doesn't resolve).
+    pub fn from_parts(host: &str, port: i32) -> Option<ServerAddress> {
+        let port = u16::try_from(port).ok()?;
+        match split(host) {
+            Ok((host, None)) => Some(ServerAddress::new(host, port)),
+            _ => None,
+        }
+    }
+
     /// Whether `input` parses with a non-empty host that converts to ASCII (what the
     /// Done and Join buttons check).
     pub fn is_valid(input: &str) -> bool {
@@ -233,6 +246,55 @@ mod tests {
             ("a。b", Some("a.b")),
         ] {
             assert_eq!(to_ascii(host).as_deref(), java, "{host:?}");
+        }
+    }
+
+    /// What vanilla's `new ServerAddress(host, port)` makes of these (host, port, and the
+    /// host as `getHost` gives it), or where it throws (`TransferAddressGolden.java`).
+    #[test]
+    fn transfer_addresses_are_vanillas() {
+        for (host, port, want) in [
+            ("127.0.0.1", 25622, Some(("127.0.0.1", "127.0.0.1"))),
+            ("example.com:", 1, Some(("example.com", "example.com"))),
+            ("example.com:25", 1, None),
+            ("[::1]", 5, Some(("::1", "::1"))),
+            ("::1", 5, Some(("::1", "::1"))),
+            ("[::1]:5", 5, None),
+            ("", 5, Some(("", ""))),
+            ("a", -1, None),
+            ("a", 65536, None),
+            ("a", 65535, Some(("a", "a"))),
+            ("a", 0, Some(("a", "a"))),
+            ("[::1", 5, None),
+            ("[a]", 5, None),
+            ("[a:b]x", 5, None),
+            ("x]:5", 5, None),
+            ("a b", 5, Some(("a b", "a b"))),
+            (
+                "bücher.example",
+                5,
+                Some(("bücher.example", "xn--bcher-kva.example")),
+            ),
+            ("a..b", 5, Some(("a..b", ""))),
+            ("host:+5", 5, None),
+            ("host:\u{663}", 5, None),
+            ("[1:2]:", 5, Some(("1:2", "1:2"))),
+            ("[:]", 5, Some((":", ":"))),
+            ("[::1]:", 5, Some(("::1", "::1"))),
+            ("a:b:c", 7, Some(("a:b:c", "a:b:c"))),
+            ("[a:b]:12", 7, None),
+            ("localhost", 25565, Some(("localhost", "localhost"))),
+            ("Mixed.Case.", 25565, Some(("Mixed.Case.", "Mixed.Case."))),
+            (":", 5, Some(("", ""))),
+            (":5", 5, None),
+        ] {
+            let got = ServerAddress::from_parts(host, port);
+            let got = got.as_ref().map(|a| (a.host(), a.host_ascii()));
+            let want = want.map(|(h, a)| (h, a.to_owned()));
+            assert_eq!(got, want, "{host:?} {port}");
+            if let Some(a) = ServerAddress::from_parts(host, port) {
+                assert_eq!(i32::from(a.port()), port);
+            }
         }
     }
 

@@ -765,12 +765,13 @@ impl Joiner {
         let data = self.data();
         Session::start(SessionOptions {
             connect: ConnectOptions {
-                address: address.to_owned(),
+                address: ruthenium_net::ServerAddress::parse(address),
                 identity,
                 auth,
                 brand: BRAND.into(),
                 information: ClientInformation::default(),
                 local_only,
+                transfer: None,
             },
             known_packs: data.known_packs.clone(),
             physics: data.physics.clone(),
@@ -931,6 +932,7 @@ impl ruthenium_net::connection::SessionJoin for Join {
 pub fn stage_text(stage: Stage) -> &'static str {
     match stage {
         Stage::Connecting => "Connecting to the server...",
+        Stage::Transferring => "Transferring to new server...",
         Stage::Authorizing => "Logging in...",
         Stage::Encrypting => "Encrypting...",
         Stage::Negotiating => "Negotiating...",

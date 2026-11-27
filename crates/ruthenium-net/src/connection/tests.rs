@@ -120,7 +120,7 @@ impl Server {
 
 fn options(port: u16, auth: Auth) -> ConnectOptions {
     ConnectOptions {
-        address: format!("127.0.0.1:{port}"),
+        address: ServerAddress::parse(&format!("127.0.0.1:{port}")),
         identity: Identity {
             name: "Dev".into(),
             id: crypt::offline_uuid("Dev"),
@@ -129,12 +129,24 @@ fn options(port: u16, auth: Auth) -> ConnectOptions {
         brand: "ruthenium".into(),
         information: ClientInformation::default(),
         local_only: true,
+        transfer: None,
     }
 }
 
 /// Runs `server` on a fresh local port and connects to it; returns the client's events
 /// up to and including `Closed`, answering terminal packets as a game thread would.
 fn session<F>(auth: Auth, server: impl FnOnce(TcpListener, u16) -> F) -> Vec<Event>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    session_with(|port| options(port, auth), server)
+}
+
+/// [`session`] with the options `make` gives for the server's port.
+fn session_with<F>(
+    make: impl FnOnce(u16) -> ConnectOptions,
+    server: impl FnOnce(TcpListener, u16) -> F,
+) -> Vec<Event>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -146,7 +158,7 @@ where
     let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
     let port = listener.local_addr().unwrap().port();
     let done = rt.spawn(server(listener, port));
-    let c = Connection::open(options(port, auth)).unwrap();
+    let c = Connection::open(make(port)).unwrap();
     let mut got = Vec::new();
     loop {
         let e = c
@@ -521,7 +533,7 @@ fn login_disconnects_and_local_only() {
     assert_eq!(c.reason, Reason::Json(r#"{"text":"Whitelist"}"#.into()));
 
     let mut o = options(1, Auth::Offline);
-    o.address = "8.8.8.8:1".into();
+    o.address = ServerAddress::parse("8.8.8.8:1");
     let c = Connection::open(o).unwrap();
     let last = c
         .events()
@@ -539,4 +551,76 @@ fn login_disconnects_and_local_only() {
     assert!(is_local("::ffff:10.0.0.1".parse().unwrap()));
     assert!(is_local("fd12::1".parse().unwrap()));
     assert!(!is_local("2001:db8::1".parse().unwrap()));
+}
+
+/// The server's side of a login cookie request: asks for `key` and returns what the
+/// client answered.
+async fn login_cookie(s: &mut Server, key: &str) -> Option<Vec<u8>> {
+    s.send(5, |o| wire::write_string(o, key)).await;
+    let (id, body) = s.recv().await;
+    assert_eq!(id, 4, "cookie_response");
+    let mut r = Reader::new(&body);
+    assert_eq!(r.identifier().unwrap(), key);
+    let payload = if r.bool().unwrap() {
+        Some(r.byte_array(5120).unwrap().to_vec())
+    } else {
+        None
+    };
+    r.finish().unwrap();
+    payload
+}
+
+#[test]
+fn a_transfer_says_so_and_answers_the_login_from_its_cookies() {
+    let mut cookies = HashMap::new();
+    cookies.insert("test:kept".to_owned(), vec![1, 2, 3]);
+    cookies.insert("test:empty".to_owned(), Vec::new());
+    let events = session_with(
+        |port| ConnectOptions {
+            transfer: Some(TransferState { cookies }),
+            ..options(port, Auth::Offline)
+        },
+        |listener, port| async move {
+            let mut s = Server::accept(&listener).await;
+            let (id, body) = s.recv().await;
+            assert_eq!(id, 0);
+            let mut r = Reader::new(&body);
+            assert_eq!(r.varint().unwrap(), PROTOCOL_VERSION);
+            assert_eq!(r.string(255).unwrap(), "127.0.0.1");
+            assert_eq!(r.u16().unwrap(), port);
+            // `ClientIntent.TRANSFER`.
+            assert_eq!(r.varint().unwrap(), 3);
+            let (id, body) = s.recv().await;
+            assert_eq!(id, 0, "hello");
+            let name = Reader::new(&body).string(16).unwrap().to_owned();
+            assert_eq!(login_cookie(&mut s, "test:kept").await, Some(vec![1, 2, 3]));
+            assert_eq!(login_cookie(&mut s, "test:empty").await, Some(Vec::new()));
+            assert_eq!(login_cookie(&mut s, "test:other").await, None);
+            s.finish_login(&name).await;
+            s.send(2, |o| {
+                ruthenium_protocol::nbt::write_network(o, &Tag::String("Bye".into())).unwrap()
+            })
+            .await;
+        },
+    );
+    // Vanilla's `connect.transferring` first, then the login's own stages.
+    assert_eq!(events[0], Event::Stage(Stage::Transferring));
+    assert!(!events.contains(&Event::Stage(Stage::Connecting)));
+    assert!(events.contains(&Event::Stage(Stage::Joining)));
+    assert_eq!(
+        closed(&events).reason,
+        Reason::Text(Tag::String("Bye".into()))
+    );
+}
+
+#[test]
+fn a_join_answers_the_logins_cookie_requests_empty() {
+    let events = session(Auth::Offline, |listener, port| async move {
+        let mut s = Server::accept(&listener).await;
+        // `opening` checks the intent is LOGIN.
+        let name = s.opening(port).await;
+        assert_eq!(login_cookie(&mut s, "test:kept").await, None);
+        s.finish_login(&name).await;
+    });
+    assert_eq!(events[0], Event::Stage(Stage::Connecting));
 }
