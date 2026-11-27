@@ -148,6 +148,10 @@ impl Provider {
         match self {
             Provider::Fixed(glyphs) => glyphs.get(&c).copied(),
             Provider::Space(advances) => advances.get(&c).map(|a| plain(*a)),
+            // Height 0: drawn 0 by 0 in vanilla, so nothing to draw (see `bitmap`).
+            Provider::Bitmap(b) if b.height == 0.0 => {
+                b.cells.get(&c).map(|&(_, advance)| plain(advance))
+            }
             Provider::Bitmap(b) => b.cells.get(&c).map(|&(_, advance)| {
                 let [width, height] = b.cell;
                 // Texels per unit.
@@ -452,8 +456,10 @@ impl Font {
                     .ok_or("chars that are not text")?;
                 let height = clamp_advance(p["height"].as_i64().unwrap_or(8) as f32);
                 let ascent = clamp_advance(p["ascent"].as_i64().ok_or("no ascent")? as f32);
-                if height <= 0.0 {
-                    return Err("height must be positive".into());
+                // Vanilla takes a height of 0 (BitmapProvider.java's `Definition` checks
+                // only the ascent): see `bitmap`.
+                if height < 0.0 {
+                    return Err("height must not be negative".into());
                 }
                 if ascent > height {
                     return Err(format!("ascent {ascent} is greater than height {height}"));
@@ -625,8 +631,13 @@ fn bitmap(
     if columns == 0 || grid.iter().any(|r| r.len() != columns) {
         return Err("chars are not a grid".into());
     }
-    if !height.is_finite() || height <= 0.0 {
-        return Err("height must be positive".into());
+    // A height of 0 is vanilla's too: its glyphs' scale is 0 (BitmapProvider.java:150),
+    // so each advances 1 (`(int)(0.5 + width * 0) + 1`) and is drawn 0 wide and 0 high
+    // (oversample 1 / 0): nothing shows. Here such a glyph has no picture, and no
+    // division by its height is made. A negative height (vanilla draws its glyphs
+    // mirrored, with negative advances) is still refused.
+    if !height.is_finite() || height < 0.0 {
+        return Err("height must not be negative".into());
     }
     if ascent > height {
         return Err("the ascent is above the height".into());
@@ -975,6 +986,35 @@ mod tests {
         // Three columns at half size are a column and a half, and half of one more.
         assert_eq!(g.advance, 3.0);
         assert_eq!((p.right, p.top, p.bottom), (4.0, 4.0, 8.0));
+    }
+
+    /// Vanilla takes a height of 0: each glyph advances 1 and shows nothing
+    /// (BitmapProvider.java's scale of 0). A negative height is refused.
+    #[test]
+    fn a_height_of_0_advances_one_and_draws_nothing() {
+        let png = sheet();
+        let (res, _dir) = pack(
+            "height0",
+            &[
+                (
+                    "assets/minecraft/font/default.json",
+                    br#"{"providers":[{"type":"bitmap","file":"minecraft:font/x.png","height":0,"ascent":-3,"chars":["AB"]},
+                        {"type":"bitmap","file":"minecraft:font/x.png","height":-1,"ascent":-2,"chars":["CD"]}]}"#,
+                ),
+                ("assets/minecraft/textures/font/x.png", &png),
+            ],
+        );
+        let font = Font::load(&res, &default());
+        for c in ['A', 'B'] {
+            let g = font.glyph(c);
+            assert_eq!((g.advance, g.picture), (1.0, None), "{c}");
+        }
+        assert_eq!(font.glyph('C'), Glyph::MISSING);
+        assert!(
+            font.warnings.iter().any(|w| w.contains("negative")),
+            "{:?}",
+            font.warnings
+        );
     }
 
     #[test]

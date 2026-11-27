@@ -1366,6 +1366,40 @@ fn a_font_of_a_giant_picture_loses_that_provider() {
     quick(started);
 }
 
+/// A height of 0 (vanilla's scale of 0) on a large sheet of many characters: every
+/// glyph advances 1 and has no picture, so a line of them stays finite and nothing is
+/// divided by the height; the picture still counts against the font's texels.
+#[test]
+fn a_bitmap_font_of_height_0_is_bounded_and_draws_nothing() {
+    let started = Instant::now();
+    let row: String = (0..64)
+        .map(|i| char::from_u32(0x4E00 + i).unwrap())
+        .collect();
+    let rows = vec![format!("\"{row}\""); 64].join(",");
+    let json = format!(
+        r#"{{"providers": [{{"type": "bitmap", "file": "minecraft:font/zero.png", "height": 0, "ascent": -2147483648, "chars": [{rows}]}},
+            {{"type": "bitmap", "file": "minecraft:font/zero.png", "height": 0, "ascent": 1, "chars": ["A"]}}]}}"#
+    );
+    let (res, _t) = pack(
+        &[
+            ("assets/minecraft/font/default.json", json.as_bytes()),
+            (
+                "assets/minecraft/textures/font/zero.png",
+                &png(1024, 1024, 0xFFFF_FFFF),
+            ),
+        ],
+        &Limits::untrusted(),
+    );
+    let f = font(&res);
+    let g = f.glyph('\u{4E00}');
+    assert_eq!((g.advance, g.picture), (1.0, None));
+    assert!(!f.has('A'), "an ascent above a height of 0 is refused");
+    let line: f32 = row.repeat(1000).chars().map(|c| f.glyph(c).advance).sum();
+    assert_eq!(line, 64_000.0);
+    assert_eq!(res.packs()[0].budget().used().1, 1 << 20);
+    quick(started);
+}
+
 #[test]
 fn font_references_are_read_once_and_bounded() {
     let started = Instant::now();
@@ -2092,7 +2126,9 @@ fn namespaces_and_dot_overlays_and_hidden_dot_paths_are_rejected() {
     assert!(res.list("shaders", |_| true).is_empty());
 }
 
-/// Bitmap font height <= 0 is rejected and total bitmap texels across providers are capped.
+/// A bitmap font of height 0 loads as vanilla's (advance 1, nothing drawn) and its
+/// picture counts like any other; a negative height is rejected; total bitmap texels
+/// across providers are capped.
 #[test]
 fn font_bitmap_height_and_texel_budget_are_bounded() {
     let big = png(512, 512, 0xFFFF_FFFF);
@@ -2104,20 +2140,23 @@ fn font_bitmap_height_and_texel_budget_are_bounded() {
                 "assets/minecraft/font/default.json",
                 br#"{"providers": [
                     {"type": "bitmap", "file": "minecraft:font/a.png", "height": 0, "ascent": 0, "chars": ["X"]},
+                    {"type": "bitmap", "file": "minecraft:font/a.png", "height": -1, "ascent": -1, "chars": ["N"]},
                     {"type": "bitmap", "file": "minecraft:font/a.png", "ascent": 7, "chars": ["A"]},
                     {"type": "bitmap", "file": "minecraft:font/b.png", "ascent": 7, "chars": ["B"]}
                 ]}"#,
             ),
         ],
         &Limits {
-            font_bitmap_texels: 300_000,
+            font_bitmap_texels: 600_000,
             ..Limits::untrusted()
         },
     );
     let f = font(&res);
-    assert!(!f.has('X'), "zero-height bitmap provider must be rejected");
+    assert!(f.has('X'), "a height of 0 is vanilla's");
+    assert_eq!((f.glyph('X').advance, f.glyph('X').picture), (1.0, None));
+    assert!(!f.has('N'), "a negative height is rejected");
     assert!(f.has('A'));
-    assert!(!f.has('B'), "second bitmap exceeds font_bitmap_texels");
+    assert!(!f.has('B'), "the third picture exceeds font_bitmap_texels");
 }
 
 /// Multipart blockstate cases and composite item resolved models are bounded.
