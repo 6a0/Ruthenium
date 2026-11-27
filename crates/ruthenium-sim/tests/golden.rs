@@ -18,6 +18,7 @@ use ruthenium_sim::fov::{self, FovEase, FovInputs};
 use ruthenium_sim::interact::{self, GameMode, UseKeys};
 use ruthenium_sim::inventory::{Hand, SLOT_OFFHAND};
 use ruthenium_sim::item::Items;
+use ruthenium_sim::packet_check::{OnViolation, PacketChecker};
 use ruthenium_sim::pick::HitResult;
 use ruthenium_sim::player::{Env, Keys, LocalPlayer, Others, Pose};
 use ruthenium_sim::predict::Predictions;
@@ -383,6 +384,33 @@ fn sent_outside(
         ));
     }
     Ok(())
+}
+
+/// Shows the packet-order checker a record outside the replay's ticks: a frame, a handled
+/// packet, or one vanilla sent outside a tick (the replay's own are compared with those).
+fn check_record(c: &mut PacketChecker, r: &ruthenium_trace::Record) {
+    match r.kind.as_str() {
+        "frame" => c.frame(),
+        "handle" if r.str("proto") == Some("play") => {
+            let decoded = r.bytes().and_then(|b| {
+                let mut rd = Reader::new(&b);
+                let id = rd.varint().ok()? as u32;
+                Clientbound::decode(id, rd.rest()).ok()
+            });
+            match decoded {
+                Some(p) => c.handled(&p),
+                None => c.handled_unread(r.str("name").unwrap_or("")),
+            }
+        }
+        "out"
+            if r.str("thread") == Some("game")
+                && r.str("proto") == Some("play")
+                && r.bool("inTick") == Some(false) =>
+        {
+            c.sent(&r.bytes().unwrap());
+        }
+        _ => {}
+    }
 }
 
 /// Whether an `out` record is one the replay compares that was sent outside a tick: a
@@ -921,10 +949,14 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
     // Packets handled after a tick began, applied before the next one (packets are
     // handled at the start of a frame, never during a tick).
     let mut pending: Vec<Pending> = Vec::new();
+    // The packet-order checker over the replay's tick packets; outside the ticks it takes
+    // vanilla's, which the replay's own answers are compared with byte for byte.
+    let mut check = PacketChecker::in_play(OnViolation::Collect);
     let mut i = 0;
     while i < records.len() {
         let r = &records[i];
         i += 1;
+        check_record(&mut check, r);
         if r.kind == "handle" {
             if let Some(b) = r.bytes() {
                 handle(&b, &mut client, &mut p, &mut cl, &mut game_mode, d);
@@ -1137,8 +1169,12 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         let mut sets_want = Vec::new();
         let mut after_state = Vec::new();
         let mut seen_state = false;
+        let mut outside = Vec::new();
         while i < records.len() && records[i].kind != "tick" {
             let q = &records[i];
+            if seen_state {
+                outside.push(i);
+            }
             if let Some(s) = unpredicted_set(q) {
                 if seen_state {
                     after_state.push(s);
@@ -1180,6 +1216,18 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
             i += 1;
         }
         let s = state.ok_or((n, format!("tick {n}: no state")))?;
+        check.begin_tick(n as u64, true);
+        check.set_selected(p.inventory.selected);
+        check.set_screen(screen_open);
+        check.set_riding(p.riding.is_some());
+        for packet in &sent {
+            check.sent(packet);
+        }
+        check.sent(&play::client_tick_end());
+        check.end_tick();
+        for &j in &outside {
+            check_record(&mut check, &records[j]);
+        }
         let want_packets = want.clone();
         // Every block set outside a prediction so far.
         if let Some(got) = &cl.level.set_log
@@ -1560,6 +1608,15 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
         return Err((
             ticks as i64,
             format!("the replay sent {ours:02x?}, vanilla didn't"),
+        ));
+    }
+    if let Some(v) = check.violations().first() {
+        return Err((
+            ticks as i64,
+            format!(
+                "the packet-order checker: {v} ({} in all)",
+                check.violations().len()
+            ),
         ));
     }
     Ok(ticks)

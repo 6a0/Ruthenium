@@ -70,6 +70,7 @@ use crate::item::Items;
 use crate::item_name::translation;
 use crate::level_load::LevelLoad;
 use crate::light::LightTable;
+use crate::packet_check::PacketChecker;
 use crate::pick;
 use crate::player::{Env, Keys, LocalPlayer, Others, Pose};
 use crate::predict::Predictions;
@@ -689,7 +690,9 @@ enum Phase {
 
 struct Game {
     information: ClientInformation,
-    connection: Connection,
+    /// The connection, with the packet-order checker on what is sent
+    /// ([`crate::packet_check`]).
+    connection: crate::packet_check::Outbound,
     known_packs: Vec<KnownPack>,
     events: Sender<SessionEvent>,
     phase: Phase,
@@ -944,7 +947,7 @@ impl Game {
             .map(|p| Arc::new(LightTable::of(&p.blocks)));
         Game {
             information,
-            connection,
+            connection: crate::packet_check::Outbound::new(connection),
             known_packs,
             events,
             phase: Phase::Login,
@@ -1021,6 +1024,7 @@ impl Game {
 
     fn run(&mut self, handoff: &Handoff<FrameInput, Command>) {
         while self.step(handoff.take()) {}
+        self.connection.check(|c| c.finish());
         // The server's packs go with the session (`clearDownloadedResourcePacks`).
         self.pack_cleanup();
         // Leaving stops every sound (`Minecraft.disconnect`).
@@ -1187,6 +1191,7 @@ impl Game {
                 self.held_ticks
             }
             None => {
+                self.connection.check(PacketChecker::frame);
                 self.pack_frame_start();
                 self.clock.advance(self.millis(), self.ms_per_tick())
             }
@@ -1224,8 +1229,11 @@ impl Game {
         // `runAllTasks`.
         self.pack_tasks();
         self.take_input(&input);
-        for _ in 0..ticks {
+        for i in 0..u64::from(ticks) {
+            let (n, level) = (self.ticks + i, self.world.is_some());
+            self.connection.check(|c| c.begin_tick(n, level));
             self.tick();
+            self.connection.check(PacketChecker::end_tick);
             if let Some(w) = &self.world {
                 self.sounds.tick(&w.player, &w.entities);
             }
@@ -2052,6 +2060,11 @@ impl Game {
                 || self.death_screen.is_some()
                 || self.bed_screen
                 || self.containers.screen.is_some());
+        let screen = self.screen_open
+            || self.death_screen.is_some()
+            || self.bed_screen
+            || self.containers.screen.is_some();
+        self.connection.check(|c| c.set_screen(screen));
         let mut hit = None;
         if keybinds && let (Some(w), Some(physics)) = (&mut self.world, &self.physics) {
             let env = Env {
@@ -2109,6 +2122,8 @@ impl Game {
             for s in world.sounds.drain(..) {
                 self.sounds.block(s, &physics.blocks);
             }
+            let selected = w.player.inventory.selected;
+            self.connection.check(|c| c.set_selected(selected));
             for p in out.drain(..) {
                 self.connection.send(p);
             }
@@ -2196,6 +2211,8 @@ impl Game {
         }
         if loaded && w.player.is_alive() {
             w.entities.sync_riding(&mut w.player);
+            let riding = w.player.riding.is_some();
+            self.connection.check(|c| c.set_riding(riding));
             let vehicle = w.entities.vehicle_move();
             for p in w.player.send_changes_riding(vehicle) {
                 self.connection.send(p);
@@ -2307,6 +2324,7 @@ impl Game {
     }
 
     fn play(&mut self, p: play::Clientbound) -> Result<(), String> {
+        self.connection.check(|c| c.handled(&p));
         let now = self.millis();
         match p {
             play::Clientbound::Common(c) => self.common(c, play::cookie_response, play::pong),

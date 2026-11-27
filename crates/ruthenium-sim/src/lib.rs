@@ -26,6 +26,7 @@
 //! - [`blocks`], [`shape`], [`world`], [`fluid`]: the level the player moves in;
 //!   [`inside`]: the blocks a movement passes through; [`border`]: the world border.
 //! - [`pick`]: what the crosshair points at (block and entity raycasts).
+//! - [`packet_check`]: the packet-order checker over what the game thread sends.
 
 #![forbid(unsafe_code)]
 
@@ -61,6 +62,7 @@ pub mod level_load;
 pub mod light;
 pub mod menu;
 pub mod mining;
+pub mod packet_check;
 pub mod pick;
 pub mod piston;
 pub mod place;
