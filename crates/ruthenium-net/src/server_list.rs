@@ -201,13 +201,16 @@ impl ServerList {
     }
 
     /// Adds a server from the Add Server screen: an address already hidden is shown again
-    /// with the new name, icon and pack status.
+    /// with the new name and icon (`JoinMultiplayerScreen.addServerCallback`, which
+    /// takes `ServerData.copyNameIconFrom`, ServerData.java:104: address, name and icon).
+    /// Everything else stays the hidden entry's, as in vanilla: its pack status (set when
+    /// it was joined from Direct Connect, ServerList.java's `saveSingleServer`) and its
+    /// accepted code of conduct; the form's own pack status is dropped.
     pub fn add_shown(&mut self, server: ServerEntry) {
         match self.unhide(&server.ip) {
             Some(existing) => {
                 existing.name = server.name;
                 existing.icon = server.icon;
-                existing.pack_status = server.pack_status;
             }
             None => self.add(server, false),
         }
@@ -268,17 +271,34 @@ mod tests {
         assert_eq!(ServerList::load(&path), ServerList::default());
     }
 
+    /// Vanilla's `addServerCallback`: an address already hidden is unhidden with the
+    /// form's name and icon (`copyNameIconFrom`), and keeps its own pack status and
+    /// accepted code of conduct.
     #[test]
-    fn add_shown_updates_pack_status_of_existing_entry() {
+    fn add_shown_keeps_the_hidden_entrys_pack_status() {
         let mut list = ServerList::default();
         let mut hidden = ServerEntry::new("Direct", "play.example.com");
         hidden.pack_status = PackStatus::Enabled;
+        hidden.accepted_code_of_conduct = 7;
+        hidden.icon = Some(vec![1, 2, 3]);
         list.add(hidden, true);
         let mut explicit = ServerEntry::new("My Server", "play.example.com");
         explicit.pack_status = PackStatus::Disabled;
         list.add_shown(explicit);
         assert_eq!(list.servers.len(), 1);
-        assert_eq!(list.servers[0].pack_status, PackStatus::Disabled);
+        let s = &list.servers[0];
+        assert_eq!(s.name, "My Server");
+        assert_eq!(
+            s.icon, None,
+            "the form's icon (none) replaces the hidden one's"
+        );
+        assert_eq!(s.pack_status, PackStatus::Enabled);
+        assert_eq!(s.accepted_code_of_conduct, 7);
         assert!(list.hidden.is_empty());
+        // A new address takes the form's pack status.
+        let mut new = ServerEntry::new("Other", "other.example");
+        new.pack_status = PackStatus::Disabled;
+        list.add_shown(new);
+        assert_eq!(list.servers[1].pack_status, PackStatus::Disabled);
     }
 }
