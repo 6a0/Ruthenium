@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn a_transfer_in_play_goes_even_if_the_server_hangs_up_first() {
-        let (mut game, remote, events, _scene) = game();
+        let (mut game, mut remote, events, _scene) = game();
         game.phase = super::super::Phase::Play;
         let p = |p: Common| Event::Play(play::Clientbound::Common(p));
         remote.event(p(store("test:a", b"one")));
@@ -212,6 +212,9 @@ mod tests {
             play::Clientbound::Common(store("test:b", b"two")),
             play::Clientbound::Common(Common::Ping { id: 1 }),
         ]));
+        assert!(game.frame(Default::default()));
+        // The ping behind the transfer isn't answered.
+        assert_eq!(remote.sent(), vec![Sent::Close]);
         let got = end(&mut game, &remote, &events, Local::EndOfStream);
         assert_eq!(
             got,
@@ -228,6 +231,67 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn no_ticks_run_once_a_transfer_has_begun() {
+        let (mut game, mut remote, _events, _scene) = game();
+        let mut overworld = Compound::new();
+        overworld.put("min_y", Tag::Int(0));
+        overworld.put("height", Tag::Int(64));
+        overworld.put("has_skylight", Tag::Byte(1));
+        overworld.put("has_ceiling", Tag::Byte(0));
+        game.configured.registries = vec![(
+            crate::environment::DIMENSION_TYPE.into(),
+            vec![ruthenium_protocol::packets::configuration::RegistryEntry {
+                id: "minecraft:overworld".into(),
+                data: Some(Tag::Compound(overworld)),
+            }],
+        )];
+        game.phase = super::super::Phase::Play;
+        remote.event(Event::Play(play::Clientbound::Login(Box::new(
+            play::Login {
+                player_id: 7,
+                hardcore: false,
+                levels: vec!["minecraft:overworld".into()],
+                max_players: 20,
+                chunk_radius: 2,
+                simulation_distance: 2,
+                reduced_debug_info: false,
+                show_death_screen: true,
+                limited_crafting: false,
+                spawn: play::SpawnInfo {
+                    dimension_type: 0,
+                    dimension: "minecraft:overworld".into(),
+                    seed: 0,
+                    game_type: play::CREATIVE,
+                    previous_game_type: None,
+                    is_debug: false,
+                    is_flat: true,
+                    last_death: None,
+                    portal_cooldown: 0,
+                    sea_level: 0,
+                },
+                online_mode: false,
+                enforces_secure_chat: false,
+            },
+        ))));
+        assert!(game.frame(Default::default()));
+        // A level: two ticks' worth of time, two ticks' ends.
+        game.manual_ms = Some(100);
+        assert!(game.frame(Default::default()));
+        let tick_end = Sent::Packet(play::client_tick_end());
+        let ends = |sent: &[Sent]| sent.iter().filter(|s| **s == tick_end).count();
+        assert_eq!(ends(&remote.sent()), 2);
+        remote.event(Event::Play(play::Clientbound::Common(transfer(
+            "127.0.0.1",
+            25622,
+        ))));
+        game.manual_ms = Some(200);
+        assert!(game.frame(Default::default()));
+        game.manual_ms = Some(300);
+        assert!(game.frame(Default::default()));
+        assert_eq!(remote.sent(), vec![Sent::Close]);
     }
 
     #[test]

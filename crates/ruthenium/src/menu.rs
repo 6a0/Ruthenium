@@ -1041,7 +1041,9 @@ impl Menu {
         };
         match started {
             Ok(s) => {
-                eprintln!("[ruthenium] joining {name} ({address})");
+                if !transferred {
+                    eprintln!("[ruthenium] joining {name} ({address})");
+                }
                 self.session = Some(s);
                 self.connecting_form(if transferred {
                     NetStage::Transferring
@@ -3626,9 +3628,18 @@ mod tests {
             form.spec.message
         );
         servers.join().unwrap();
+        // The form says so from the start.
+        m.start_transfer(Transfer {
+            to: ruthenium_net::ServerAddress::new("127.0.0.1", 1),
+            state: Default::default(),
+        });
+        let (kind, message) = form_kind(&m).unwrap();
+        assert_eq!(kind, FormKind::Connecting);
+        assert_eq!(message, ["Transferring to new server..."]);
         // A join after it is a join again.
         m.start_join("Nowhere", "127.0.0.1:1");
         assert!(!m.transferred);
+        assert_eq!(form_kind(&m).unwrap().1, ["Connecting to the server..."]);
     }
 
     #[test]

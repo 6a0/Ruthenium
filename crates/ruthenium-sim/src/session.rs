@@ -715,6 +715,9 @@ struct Game {
     configured: Configured,
     /// Collected during a configuration, then frozen into `configured` at its end.
     collecting: Configured,
+    /// The cookies servers stored (`serverCookies`), by full identifier, each at most
+    /// 5 KiB (`ClientboundStoreCookiePacket`) and as many as servers store (vanilla has no
+    /// cap); this session's, carried on by a transfer, never kept on disk.
     cookies: HashMap<String, Vec<u8>>,
     server_brand: Option<String>,
     report_details: Vec<(String, String)>,
