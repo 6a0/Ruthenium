@@ -127,6 +127,12 @@ fn load_sounds(
     initial: bool,
 ) {
     let (events, warnings) = files.events();
+    if files.cancelled() {
+        // A reload given up: its events (none, or not all of them) never replace the
+        // sounds in use.
+        eprintln!("[sound] the load was cancelled: the sounds in use stay");
+        return;
+    }
     for w in warnings.iter().take(20) {
         eprintln!("[sound] {w}");
     }

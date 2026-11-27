@@ -59,9 +59,22 @@ impl SoundFiles {
         Ok((r.read_on_demand()?.into_owned(), *r.limits()))
     }
 
+    /// Whether the load of these files was given up (a reload cancelled: its packs then
+    /// find nothing).
+    pub fn cancelled(&self) -> bool {
+        self.resources.cancelled()
+    }
+
     /// The events of every pack's `sounds.json`, lowest pack first, with the warnings.
-    /// Streams one `sounds.json` at a time and respects cancellation.
+    /// Streams one `sounds.json` at a time and respects cancellation: a load given up
+    /// part way hands on no events at all (those read so far were never weighed, so
+    /// every one of them would play nothing, and only some of the packs were read).
     pub fn events(&self) -> (SoundEvents, Vec<String>) {
+        self.events_unless(&|| self.resources.cancelled())
+    }
+
+    /// [`Self::events`], given up once `cancelled` says so.
+    fn events_unless(&self, cancelled: &dyn Fn() -> bool) -> (SoundEvents, Vec<String>) {
         let mut namespaces: Vec<&str> = self
             .resources
             .packs()
@@ -74,14 +87,14 @@ impl SoundFiles {
         let mut events = SoundEvents::default();
         let mut warnings = Vec::new();
         for ns in namespaces {
-            if self.resources.cancelled() {
+            if cancelled() {
                 break;
             }
             let Some(id) = Id::new(ns, "sounds.json") else {
                 continue;
             };
             for r in self.resources.stack(&id) {
-                if self.resources.cancelled() {
+                if cancelled() {
                     break;
                 }
                 // `text` keeps a file over the JSON limit from being read at all.
@@ -99,9 +112,67 @@ impl SoundFiles {
                 }
             }
         }
-        if !self.resources.cancelled() {
-            events.finish_loading();
+        if cancelled() {
+            warnings.push("the sounds' load was cancelled: no events".into());
+            return (SoundEvents::default(), warnings);
         }
+        events.finish_loading();
         (events, warnings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A folder pack with a `sounds.json` in two namespaces.
+    fn two_namespaces() -> (tempfile::TempDir, SoundFiles) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("pack");
+        let write = |p: &str, b: &[u8]| {
+            let path = root.join(p);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b).unwrap();
+        };
+        write("pack.mcmeta", br#"{"pack": {"description": ""}}"#);
+        for ns in ["a", "b"] {
+            write(&format!("assets/{ns}/sounds/x.ogg"), b"OggS");
+            write(
+                &format!("assets/{ns}/sounds.json"),
+                format!(r#"{{"e": {{"sounds": ["{ns}:x"]}}}}"#).as_bytes(),
+            );
+        }
+        let pack = ruthenium_assets::Pack::open(&root).unwrap();
+        (tmp, SoundFiles::new(Resources::new(vec![pack])))
+    }
+
+    /// A load cancelled after its first `sounds.json` hands on no events: those read
+    /// so far were never weighed (each would play nothing), and the rest weren't read.
+    #[test]
+    fn a_cancelled_load_hands_on_no_events() {
+        let (_tmp, files) = two_namespaces();
+        let (events, w) = files.events();
+        assert_eq!(events.len(), 2, "{w:?}");
+        let mut random = ruthenium_javamath::random::JavaRandom::new(1);
+        let choice = events.choose("a:e", &mut random);
+        assert!(
+            matches!(choice, crate::events::Choice::Sound(_)),
+            "{choice:?} of {:?}",
+            events.names().collect::<Vec<_>>()
+        );
+        // Cancelled once the first namespace's file has been read.
+        let asked = Cell::new(0);
+        let (events, w) = files.events_unless(&|| {
+            asked.set(asked.get() + 1);
+            asked.get() > 2
+        });
+        assert!(asked.get() > 2, "the cancel was looked at");
+        assert!(
+            events.is_empty(),
+            "{:?}",
+            events.names().collect::<Vec<_>>()
+        );
+        assert!(w.iter().any(|w| w.contains("cancelled")), "{w:?}");
     }
 }
