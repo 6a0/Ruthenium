@@ -182,6 +182,10 @@ With no command, opens the game window. Options:
                          CJK, symbols) from the system's fonts and then the game's
                          Unifont (on, the default), from Unifont alone (unifont), or
                          leave it out (off), to measure the fonts' loading against
+  --check-packets <on|off>
+                         whether every packet sent is checked against vanilla's order
+                         and the violations printed (on in development builds, off in
+                         release builds)
   --fov-effects <on|off> whether the field of view widens and narrows with speed,
                          flight, bows and fluids (on, the default), as vanilla's FOV
                          Effects at 100% or at 0%
@@ -241,6 +245,7 @@ commands:
           [--light-out <file>] [--light-against <file>]
           [--route <file> [--route-out <file>] [--expect-positions <checksum>]
            [--expect-footprint <checksum>]] [--sound <on|off>] [--sound-wav <file>]
+          [--check-packets <on|off>]
       Join a server without a window, print each step, and disconnect after
       <s> seconds (default 10). Joins as the signed-in account; development
       builds with the dev-offline feature join offline-mode servers on this
@@ -250,7 +255,8 @@ commands:
       loaded chunk's light before leaving, and
       --light-against compares it with such a file and fails if a level differs. --route plays a tick-keyed route file from cargo xtask bench
       dedicated instead, leaves when it ends, and fails unless the start, every
-      tick and the loaded chunks are what the route and the checksums say.";
+      tick and the loaded chunks are what the route and the checksums say.
+      --check-packets as for the window.";
 
 fn main() -> ExitCode {
     let started = Instant::now();

@@ -551,6 +551,12 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                     _ => return Err("--pack-answer needs yes or no".into()),
                 };
             }
+            // A process-wide switch (`ruthenium_sim::packet_check`), set as it is read.
+            "--check-packets" => match it.next().map(String::as_str) {
+                Some("on") => ruthenium_sim::packet_check::set_enabled(true),
+                Some("off") => ruthenium_sim::packet_check::set_enabled(false),
+                _ => return Err("--check-packets needs on or off".into()),
+            },
             "--sound-wav" => {
                 sound = crate::sound::SoundMode::Wav(PathBuf::from(
                     it.next().ok_or("--sound-wav needs a file")?,

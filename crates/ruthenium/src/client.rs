@@ -416,6 +416,12 @@ impl Options {
                         v => return Err(format!("--font-fallback: not on, unifont or off: {v}")),
                     }
                 }
+                // A process-wide switch (`ruthenium_sim::packet_check`), set as it is read.
+                "--check-packets" => match value("on or off")?.as_str() {
+                    "on" => ruthenium_sim::packet_check::set_enabled(true),
+                    "off" => ruthenium_sim::packet_check::set_enabled(false),
+                    v => return Err(format!("--check-packets: not on or off: {v}")),
+                },
                 "--gpu-spin" => {
                     let v = value("microseconds")?;
                     let us: u64 = v
