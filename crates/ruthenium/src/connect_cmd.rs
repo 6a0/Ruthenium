@@ -427,8 +427,12 @@ fn play_route(
             let t = started.elapsed().as_secs_f64();
             match &e {
                 SessionEvent::Closed(c) => {
-                    let (title, reason) = closed_text(c, lang);
+                    let (title, reason) = closed_text(c, lang, false);
                     return Err(format!("{title}: {reason}"));
+                }
+                // A route is played on one server.
+                SessionEvent::Transfer(to) => {
+                    return Err(format!("the server transferred the player to {}", to.to));
                 }
                 SessionEvent::Died { .. } => return Err("the player died".into()),
                 SessionEvent::CodeOfConduct(_) => {
@@ -621,7 +625,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut joiner = Joiner::new(Some(data_dir.join("game")), cache_dir);
     joiner.set_sound(audio.handle());
     let data = joiner.data();
-    let session = joiner.join(&address, &accounts, server_packs)?;
+    let mut session = joiner.join(&address, &accounts, server_packs)?;
     let mut reloader = crate::resource_reload::Reloader::new(Some(data_dir.join("game")), true);
     if let Some(route) = route {
         return run_route(&session, route, expected, route_out.as_deref(), &data.lang);
@@ -634,6 +638,11 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut next_frame = Instant::now();
     // The newest chat message printed.
     let mut chat_seen: Option<Arc<ChatMessage>> = None;
+    // Transfers are followed as in the window: the session numbers tell the reloads of
+    // one from the next's.
+    let mut transfer = None;
+    let mut transferred = false;
+    let mut session_number = 1;
     loop {
         let mut closed = None;
         for e in session.poll() {
@@ -715,19 +724,39 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                     reloader.request(
                         crate::resource_reload::Request {
                             packs: r.packs.clone(),
-                            session: 1,
+                            session: session_number,
                         },
                         HEADLESS_MAX_TEXTURE,
                     );
                 }
                 SessionEvent::ContainerOpened => println!("{t:7.3}s  container screen open"),
                 SessionEvent::ContainerClosed => println!("{t:7.3}s  container screen closed"),
+                SessionEvent::Transfer(to) => {
+                    println!("{t:7.3}s  transferred to {}", to.to);
+                    transfer = Some(to.clone());
+                }
                 SessionEvent::Closed(c) => {
-                    let (title, reason) = closed_text(c, &data.lang);
+                    let (title, reason) = closed_text(c, &data.lang, transferred);
                     println!("{t:7.3}s  closed: {title}: {reason}");
                     closed = Some(c.clone());
                 }
             }
+        }
+        // The session ended for a transfer: the next one, at once (`handleTransfer`).
+        if closed.is_some()
+            && let Some(to) = transfer.take()
+        {
+            session = match joiner.join_transfer(to, &accounts, server_packs) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("closed: Connection failed while transferring to the server: {e}");
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+            session_number += 1;
+            transferred = true;
+            playing = false;
+            continue;
         }
         if let Some(c) = closed {
             let ok = playing && light_same && (leaving || crate::join::left_on_purpose(&c));
@@ -739,7 +768,9 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
         }
         // A reload that ended: how it went goes to the session (the world's assets are
         // built and checked, not drawn).
-        if let Some((request, result)) = reloader.poll(HEADLESS_MAX_TEXTURE) {
+        if let Some((request, result)) = reloader.poll(HEADLESS_MAX_TEXTURE)
+            && request.session == session_number
+        {
             let t = started.elapsed().as_secs_f64();
             match result {
                 Ok(r) => {

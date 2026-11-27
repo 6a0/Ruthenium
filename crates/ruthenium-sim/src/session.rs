@@ -32,9 +32,10 @@
 //! [`crate::server_pack`] (vanilla's manager); the client reloads its resources when
 //! asked ([`SessionEvent::ReloadResources`]).
 //!
-//! Not yet: transfers (the session ends with a message), dialogs
-//! and server links (ignored), and anything in play beyond pings, cookies and the switch
-//! back to configuration.
+//! Transfers: see [`transfer`] (the session ends, and says where to go next with the
+//! cookies; the client follows).
+//!
+//! Not yet: dialogs and server links (ignored).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -84,6 +85,7 @@ use crate::world::{BiomeInfo, ChunkPacket, Level, global_bits};
 
 mod containers;
 mod packs;
+mod transfer;
 pub use containers::{At, ContainerView, Pointer, ScreenInput};
 pub use packs::{
     DownloadProgress, MAX_ACTIVE, MAX_PROMPTED, MAX_TRACKED, PackPrompt, PackToast, ResourceReload,
@@ -91,6 +93,7 @@ pub use packs::{
 };
 use ruthenium_audio::SoundSource;
 use ruthenium_protocol::profile::ResolvableProfile;
+pub use transfer::Transfer;
 
 #[derive(Debug)]
 pub struct SessionOptions {
@@ -204,6 +207,9 @@ pub enum SessionEvent {
     /// Load the game's resources again with these server packs over vanilla's
     /// (`reloadResourcePacks`); say how it went with [`Session::resources_reloaded`].
     ReloadResources(ResourceReload),
+    /// The server transferred the player: the session's [`SessionEvent::Closed`] comes
+    /// next, and the client connects there with the cookies (`handleTransfer`).
+    Transfer(Transfer),
     /// The last event.
     Closed(Closed),
 }
@@ -348,6 +354,13 @@ impl Session {
             options.connect.identity.name.clone(),
             options.connect.identity.id,
         );
+        // A transfer's cookies answer this session's requests too, and grow with it.
+        let cookies = options
+            .connect
+            .transfer
+            .as_ref()
+            .map(|t| t.cookies.clone())
+            .unwrap_or_default();
         let connection = Connection::open(options.connect)?;
         Session::with_connection(
             connection,
@@ -358,6 +371,7 @@ impl Session {
             options.sound,
             options.profile_keys,
             options.server_packs,
+            cookies,
         )
     }
 
@@ -372,6 +386,7 @@ impl Session {
         sound: crate::sound::GameSounds,
         profile_keys: Option<Arc<dyn crate::chat::ProfileKeySource>>,
         server_packs: ServerPackSetup,
+        cookies: HashMap<String, Vec<u8>>,
     ) -> std::io::Result<Session> {
         let handoff = Arc::new(Handoff::new(Limits::default()));
         let (publisher, scene) = Scene::new(DEFAULT_DIRTY_CAPACITY);
@@ -396,6 +411,7 @@ impl Session {
                 game.sounds = sound;
                 game.profile_keys = profile_keys;
                 game.packs = packs::Packs::new(server_packs);
+                game.cookies = cookies;
                 game.run(&game_handoff);
             })?;
         Ok(Session {
@@ -811,6 +827,8 @@ struct Game {
     packs: packs::Packs,
     /// What the session's end is put down to when the client closes it itself.
     close_reason: Option<Reason>,
+    /// The session is leaving for a transfer.
+    transfer: Option<transfer::Leaving>,
 }
 
 /// The feature flag that switches minecarts to their new movement, which doesn't
@@ -1015,6 +1033,7 @@ impl Game {
             chat_session: None,
             packs: packs::Packs::default(),
             close_reason: None,
+            transfer: None,
         }
     }
 
@@ -1225,6 +1244,10 @@ impl Game {
                     return false;
                 }
             }
+        }
+        // Leaving for a transfer: no level, no player, no ticks (`Minecraft.disconnect`).
+        if self.transferring() {
+            return true;
         }
         // `runAllTasks`.
         self.pack_tasks();
@@ -1669,8 +1692,12 @@ impl Game {
                 {
                     c.reason = r;
                 }
+                let transfer = self.transfer_closed(&mut c);
                 log_closed(&c);
                 self.pack_cleanup();
+                if let Some(t) = transfer {
+                    self.report(SessionEvent::Transfer(t));
+                }
                 self.report(SessionEvent::Closed(c));
                 return false;
             }
@@ -2250,13 +2277,7 @@ impl Game {
             }
             Common::ResourcePackPush(push) => self.handle_pack_push(push),
             Common::ResourcePackPop { id } => self.handle_pack_pop(id),
-            Common::Transfer { host, port } => {
-                eprintln!("[session] the server transfers to {host:?}:{port}: not supported yet");
-                self.close_reason = Some(Reason::Text(Tag::String(
-                    "Server transfers are not supported yet".into(),
-                )));
-                self.connection.close();
-            }
+            Common::Transfer { host, port } => self.handle_transfer(&host, port),
             Common::CustomReportDetails { details } => self.report_details = details,
             // The connection thread handles these itself.
             Common::KeepAlive { .. } | Common::Disconnect { .. } => {}
@@ -2264,6 +2285,11 @@ impl Game {
     }
 
     fn configuration(&mut self, p: cfg::Clientbound) -> Result<(), String> {
+        if self.transferring()
+            && !matches!(&p, cfg::Clientbound::Common(c) if transfer::handled_while_transferring(c))
+        {
+            return Ok(());
+        }
         match p {
             cfg::Clientbound::Common(c) => self.common(c, cfg::cookie_response, cfg::pong),
             cfg::Clientbound::SelectKnownPacks(asked) => {
@@ -2324,6 +2350,13 @@ impl Game {
     }
 
     fn play(&mut self, p: play::Clientbound) -> Result<(), String> {
+        if self.transferring()
+            && !matches!(&p, play::Clientbound::Common(c) if transfer::handled_while_transferring(c))
+        {
+            return Ok(());
+        }
+        // Only packets that are handled reach the checker: one dropped while
+        // transferring asks for no answer.
         self.connection.check(|c| c.handled(&p));
         let now = self.millis();
         match p {
@@ -4590,6 +4623,7 @@ mod tests {
             crate::sound::GameSounds::default(),
             None,
             ServerPackSetup::default(),
+            HashMap::new(),
         )
         .unwrap();
         assert!(session.camera().is_none());

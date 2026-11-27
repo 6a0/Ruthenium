@@ -42,7 +42,7 @@ use ruthenium_ui::text::{
 use ruthenium_ui::face::Face;
 
 use ruthenium_net::connection::Stage as NetStage;
-use ruthenium_sim::session::{Session, SessionEvent};
+use ruthenium_sim::session::{Session, SessionEvent, Transfer};
 
 use crate::account::{AccountStatus, Accounts, Stage, failure_lines};
 use crate::ingame::InGame;
@@ -431,6 +431,8 @@ pub struct Menu {
     conduct: Option<(i32, bool)>,
     /// The player left the session (Cancel, Disconnect): its end needs no screen.
     leaving: bool,
+    /// The session followed a transfer (its failed login says so).
+    transferred: bool,
     /// The death screen while the player is dead: its texts and buttons as shown.
     death: Option<DeathForm>,
     /// The session's bed screen is up (from [`SessionEvent::InBed`] until the player is
@@ -642,6 +644,7 @@ impl Menu {
             server_address: String::new(),
             conduct: None,
             leaving: false,
+            transferred: false,
             death: None,
             bed: false,
             bed_button: None,
@@ -997,9 +1000,30 @@ impl Menu {
 
     /// Starts joining `name` at `address`.
     fn start_join(&mut self, name: &str, address: &str) {
+        self.begin_session(name, address, None);
+    }
+
+    /// The server transferred the player (`handleTransfer`): the session ended, and the
+    /// next one goes where the server said, from the same server list entry (vanilla's
+    /// `ServerData` goes on, so its name, Server Resource Packs setting and accepted code
+    /// of conduct stay the entry's), under "Transferring to new server...".
+    fn start_transfer(&mut self, t: Transfer) {
+        eprintln!("[ruthenium] {} transfers to {}", self.server_name, t.to);
+        // As the end of a session (`Minecraft.disconnect`).
+        self.bed = false;
+        self.death = None;
+        self.pause = None;
+        let (name, address) = (self.server_name.clone(), self.server_address.clone());
+        self.begin_session(&name, &address, Some(t));
+    }
+
+    /// Starts a session for the server list entry `name` at `address`: a join, or a
+    /// transfer's.
+    fn begin_session(&mut self, name: &str, address: &str, transfer: Option<Transfer>) {
         self.server_name = name.to_owned();
         self.server_address = address.to_owned();
         self.leaving = false;
+        self.transferred = transfer.is_some();
         // A session still closing is dropped (and so disconnected) here; the resources
         // go back to vanilla's (its own request for that goes with it).
         if self.session.take().is_some() {
@@ -1009,21 +1033,31 @@ impl Menu {
         self.packs.session_number += 1;
         self.packs.prompt = None;
         let pack_status = self.entry_pack_status(name, address);
-        let started = match &mut self.joiner {
-            Some(j) => j.join(address, &self.accounts, pack_status),
-            None => Err("Joining servers isn't possible here".into()),
+        let transferred = self.transferred;
+        let started = match (&mut self.joiner, transfer) {
+            (Some(j), None) => j.join(address, &self.accounts, pack_status),
+            (Some(j), Some(t)) => j.join_transfer(t, &self.accounts, pack_status),
+            (None, _) => Err("Joining servers isn't possible here".into()),
         };
         match started {
             Ok(s) => {
                 eprintln!("[ruthenium] joining {name} ({address})");
                 self.session = Some(s);
-                self.connecting_form(NetStage::Connecting);
+                self.connecting_form(if transferred {
+                    NetStage::Transferring
+                } else {
+                    NetStage::Connecting
+                });
             }
             Err(e) => {
                 eprintln!("[ruthenium] can't join {name}: {e}");
                 self.session_form(
                     FormKind::Disconnected,
-                    "Couldn't connect to the server",
+                    if transferred {
+                        "Connection failed while transferring to the server"
+                    } else {
+                        "Couldn't connect to the server"
+                    },
                     &[&e],
                     vec![button("Back to Server List", Action::Confirm)],
                 );
@@ -1298,6 +1332,11 @@ impl Menu {
                 SessionEvent::Reconfiguring if !self.leaving => {
                     self.connecting_form(NetStage::Joining);
                 }
+                // (The session's Closed follows: the next session replaces it.)
+                SessionEvent::Transfer(t) if !self.leaving => {
+                    self.start_transfer(t);
+                    return;
+                }
                 SessionEvent::Closed(c) => {
                     self.session = None;
                     self.bed = false;
@@ -1336,8 +1375,11 @@ impl Menu {
                     } else {
                         let lang = self.joiner.as_mut().map(|j| j.server_lang());
                         let empty = std::collections::HashMap::new();
-                        let (title, reason) =
-                            crate::join::closed_text(&c, lang.as_deref().unwrap_or(&empty));
+                        let (title, reason) = crate::join::closed_text(
+                            &c,
+                            lang.as_deref().unwrap_or(&empty),
+                            self.transferred,
+                        );
                         if let Some(r) = &mut self.route {
                             r.fail(format!("{title}: {reason}"));
                         }
@@ -3464,6 +3506,129 @@ mod tests {
             assert_eq!(kind, FormKind::Disconnected);
             assert!(message.join(" ").contains("Sign in"), "{message:?}");
         }
+    }
+
+    /// A server transfers the player in configuration, to a server that doesn't accept
+    /// transfers: the next session goes from the same entry, says it is transferring, and
+    /// its failed login says it was a transfer's.
+    #[cfg(feature = "dev-offline")]
+    #[test]
+    fn a_transfer_is_followed_from_the_same_entry() {
+        use ruthenium_data::v26_3::packets::{configuration as cfg_ids, login as login_ids};
+        use ruthenium_net::transport::Transport;
+        use ruthenium_protocol::wire::{self, Reader};
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        struct Peer(TcpStream, Transport);
+        impl Peer {
+            fn accept(l: &TcpListener) -> Peer {
+                let (s, _) = l.accept().unwrap();
+                s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                Peer(s, Transport::new())
+            }
+            fn recv(&mut self) -> Option<(u32, Vec<u8>)> {
+                loop {
+                    if let Some(p) = self.1.next_packet().unwrap() {
+                        let mut r = Reader::new(&p);
+                        return Some((r.varint().unwrap() as u32, r.rest().to_vec()));
+                    }
+                    let mut buf = [0u8; 4096];
+                    match self.0.read(&mut buf).unwrap_or(0) {
+                        0 => return None,
+                        n => self.1.receive(&buf[..n]),
+                    }
+                }
+            }
+            fn send(&mut self, id: u32, body: impl FnOnce(&mut Vec<u8>)) {
+                let bytes = self.1.encode(&wire::packet(id, body)).unwrap();
+                self.0.write_all(&bytes).unwrap();
+            }
+            /// The handshake's intent, after the hello.
+            fn opening(&mut self) -> i32 {
+                let (_, body) = self.recv().unwrap();
+                let mut r = Reader::new(&body);
+                r.varint().unwrap();
+                r.string(255).unwrap();
+                r.u16().unwrap();
+                let intent = r.varint().unwrap();
+                assert_eq!(self.recv().unwrap().0, login_ids::Serverbound::Hello.id());
+                intent
+            }
+            fn until_closed(&mut self) {
+                while self.recv().is_some() {}
+            }
+        }
+
+        let a = TcpListener::bind("127.0.0.1:0").unwrap();
+        let b = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (port_a, port_b) = (
+            a.local_addr().unwrap().port(),
+            b.local_addr().unwrap().port(),
+        );
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let servers = std::thread::spawn(move || {
+            let mut s = Peer::accept(&a);
+            assert_eq!(s.opening(), 2, "LOGIN");
+            s.send(login_ids::Clientbound::LoginFinished.id(), |o| {
+                wire::write_uuid(o, 1);
+                wire::write_string(o, "Developer");
+                wire::write_varint(o, 0);
+                wire::write_uuid(o, 2);
+            });
+            for _ in 0..3 {
+                s.recv().unwrap();
+            }
+            s.send(cfg_ids::Clientbound::Transfer.id(), |o| {
+                wire::write_string(o, "127.0.0.1");
+                wire::write_varint(o, i32::from(port_b));
+            });
+            s.until_closed();
+            let mut s = Peer::accept(&b);
+            assert_eq!(s.opening(), 3, "TRANSFER");
+            wait.recv().unwrap();
+            // What a vanilla server with accepts-transfers=false answers.
+            s.send(login_ids::Clientbound::LoginDisconnect.id(), |o| {
+                wire::write_string(
+                    o,
+                    r#"{"translate":"multiplayer.disconnect.transfers_disabled"}"#,
+                );
+            });
+            s.until_closed();
+        });
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.layout((1600, 900));
+        m.set_joiner(Joiner::new(None, None));
+        m.start_join("Lobby", &format!("127.0.0.1:{port_a}"));
+        until(&mut m, |m| {
+            form_kind(m).is_some_and(|(k, message)| {
+                k == FormKind::Connecting && message.join(" ").contains("Transferring")
+            })
+        });
+        // Still the entry joined.
+        assert_eq!(
+            (m.server_name.as_str(), m.server_address.clone()),
+            ("Lobby", format!("127.0.0.1:{port_a}"))
+        );
+        go.send(()).unwrap();
+        until(&mut m, |m| m.session.is_none());
+        let Screen::Form(FormKind::Disconnected, form, _) = &m.screen else {
+            panic!("{:?}", form_kind(&m));
+        };
+        assert_eq!(
+            form.spec.title,
+            "Connection failed while transferring to the server"
+        );
+        assert!(
+            form.spec.message.join(" ").contains("transfers_disabled"),
+            "{:?}",
+            form.spec.message
+        );
+        servers.join().unwrap();
+        // A join after it is a join again.
+        m.start_join("Nowhere", "127.0.0.1:1");
+        assert!(!m.transferred);
     }
 
     #[test]

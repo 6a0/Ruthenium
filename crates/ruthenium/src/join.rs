@@ -23,7 +23,9 @@ use ruthenium_sim::blocks::Blocks;
 use ruthenium_sim::enchantment::Enchantments;
 use ruthenium_sim::entity::EntityTypes;
 use ruthenium_sim::item::Items;
-use ruthenium_sim::session::{DimensionType, Physics, ServerPackSetup, Session, SessionOptions};
+use ruthenium_sim::session::{
+    DimensionType, Physics, ServerPackSetup, Session, SessionOptions, Transfer,
+};
 use ruthenium_sim::use_on::Transformers;
 
 use crate::account::Accounts;
@@ -760,18 +762,42 @@ impl Joiner {
         accounts: &Accounts,
         packs: ruthenium_net::server_list::PackStatus,
     ) -> Result<Session, String> {
+        let address = ruthenium_net::ServerAddress::parse(address);
+        self.start(address, None, accounts, packs)
+    }
+
+    /// Follows a transfer: a session with the server it names, carrying its state, as
+    /// the same player; `packs` is still the setting of the server list entry joined
+    /// first (vanilla hands the same `ServerData` on,
+    /// `ClientCommonPacketListenerImpl.java:326`).
+    pub fn join_transfer(
+        &mut self,
+        transfer: Transfer,
+        accounts: &Accounts,
+        packs: ruthenium_net::server_list::PackStatus,
+    ) -> Result<Session, String> {
+        self.start(transfer.to, Some(transfer.state), accounts, packs)
+    }
+
+    fn start(
+        &mut self,
+        address: ruthenium_net::ServerAddress,
+        transfer: Option<ruthenium_net::connection::TransferState>,
+        accounts: &Accounts,
+        packs: ruthenium_net::server_list::PackStatus,
+    ) -> Result<Session, String> {
         let (identity, auth, local_only) = self.who(accounts)?;
         let profile_keys = self.profile_keys(accounts);
         let data = self.data();
         Session::start(SessionOptions {
             connect: ConnectOptions {
-                address: ruthenium_net::ServerAddress::parse(address),
+                address,
                 identity,
                 auth,
                 brand: BRAND.into(),
                 information: ClientInformation::default(),
                 local_only,
-                transfer: None,
+                transfer,
             },
             known_packs: data.known_packs.clone(),
             physics: data.physics.clone(),
@@ -940,12 +966,18 @@ pub fn stage_text(stage: Stage) -> &'static str {
     }
 }
 
-/// The disconnected screen's title and reason.
-pub fn closed_text(c: &Closed, lang: &HashMap<String, String>) -> (String, String) {
-    let title = if c.during_login {
-        "Couldn't connect to the server"
-    } else {
-        "Connection lost"
+/// The disconnected screen's title and reason; `transferred`: the session followed a
+/// transfer (vanilla's `connect.failed.transfer` when its login fails,
+/// `ConnectScreen.java:68`, `ClientHandshakePacketListenerImpl.java:206`).
+pub fn closed_text(
+    c: &Closed,
+    lang: &HashMap<String, String>,
+    transferred: bool,
+) -> (String, String) {
+    let title = match (c.during_login, transferred) {
+        (true, false) => "Couldn't connect to the server",
+        (true, true) => "Connection failed while transferring to the server",
+        (false, _) => "Connection lost",
     };
     let reason = match &c.reason {
         // Vanilla reads it leniently; what doesn't parse shows as it is.
@@ -989,17 +1021,22 @@ mod tests {
             ),
         };
         assert_eq!(
-            closed_text(&c, &lang),
+            closed_text(&c, &lang, false),
             (
                 "Couldn't connect to the server".into(),
                 "You are not white-listed on this server!".into()
             )
         );
+        assert_eq!(
+            closed_text(&c, &lang, true).0,
+            "Connection failed while transferring to the server"
+        );
         let c = Closed {
             during_login: false,
             reason: Reason::Text(Tag::String("Server closed".into())),
         };
-        assert_eq!(closed_text(&c, &lang).1, "Server closed");
+        assert_eq!(closed_text(&c, &lang, false).1, "Server closed");
+        assert_eq!(closed_text(&c, &lang, true).0, "Connection lost");
         assert!(left_on_purpose(&Closed {
             during_login: false,
             reason: Reason::Local(Local::Closed)
