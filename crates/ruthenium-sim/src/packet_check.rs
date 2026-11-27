@@ -1809,6 +1809,9 @@ mod tests {
         tick(&mut c, 1, &[sprint(true)]);
         tick(&mut c, 2, &[sprint(true)]);
         assert_eq!(broken(&c), ["INV-C2"]);
+        let mut c = joined();
+        tick(&mut c, 1, &[sprint(true), sprint(false)]);
+        assert_eq!(broken(&c), ["INV-C2"]);
         // A respawn keeping the entity data keeps what was sent unknown; without, the
         // new player starts not sprinting.
         let mut c = joined();
