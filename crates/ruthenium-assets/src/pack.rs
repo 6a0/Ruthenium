@@ -14,6 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
@@ -81,8 +82,12 @@ pub(crate) enum Loc {
 /// `filter.block` of a pack's metadata (`server/packs/resources/ResourceFilterSection.java`).
 #[derive(Debug)]
 pub struct Filter {
-    /// Each pattern's namespace regex (none: every namespace).
-    namespaces: Vec<Option<Regex>>,
+    /// How many patterns it has.
+    count: usize,
+    /// Some pattern has no namespace regex: it filters every namespace.
+    every_namespace: bool,
+    /// The namespace regexes, compiled as small ASCII patterns (namespaces are ASCII).
+    namespaces: regex::bytes::RegexSet,
     /// Some pattern has no path regex: it filters every path.
     every_path: bool,
     /// The path regexes, tried in one pass: a path is asked about on every lookup below
@@ -93,15 +98,13 @@ pub struct Filter {
 impl Filter {
     /// How many patterns it has.
     pub fn patterns(&self) -> usize {
-        self.namespaces.len()
+        self.count
     }
 
     /// Whether any block pattern's namespace regex matches. A pattern without
     /// one matches every namespace.
     pub fn filters_namespace(&self, namespace: &str) -> bool {
-        self.namespaces
-            .iter()
-            .any(|ns| ns.as_ref().is_none_or(|r| r.is_match(namespace)))
+        self.every_namespace || self.namespaces.is_match(namespace.as_bytes())
     }
 
     /// Whether any block pattern's path regex matches. Vanilla does not pair
@@ -118,30 +121,43 @@ pub const MAX_PATTERN_BYTES: usize = 1024;
 /// `a{1000}{1000}` compiles to gigabytes otherwise (the regex crate's defaults are 10 and
 /// 2 MiB).
 const REGEX_BYTES: usize = 1 << 20;
-/// What one filter path pattern may compile to. Filters are asked on every lookup below
-/// their pack, so they are held much smaller: 16 KiB of ASCII program takes any real
-/// pattern (`^textures/block/[a-z_]+\.png$` is under 1 KiB), and the worst one that
-/// fits costs under a microsecond a path.
+/// What one filter pattern (namespace, path, or atlas filter) may compile to: 16 KiB of
+/// ASCII program takes any real pattern (`^textures/block/[a-z_]+\.png$` is under 1 KiB),
+/// and the worst one that fits costs under a microsecond per string.
 const FILTER_REGEX_BYTES: usize = 1 << 14;
 
 /// A pack's regular expression, no longer than [`MAX_PATTERN_BYTES`] and compiled into at
-/// most [`REGEX_BYTES`]. (The regex crate matches in time linear in the text.)
+/// most [`REGEX_BYTES`].
+#[cfg(test)]
 pub(crate) fn pack_regex(pattern: &str) -> Result<Regex, String> {
-    pack_regex_within(pattern, REGEX_BYTES)
-}
-
-fn pack_regex_within(pattern: &str, bytes: usize) -> Result<Regex, String> {
     if pattern.len() > MAX_PATTERN_BYTES {
         return Err(format!("a pattern longer than {MAX_PATTERN_BYTES} bytes"));
     }
     RegexBuilder::new(pattern)
-        .size_limit(bytes)
+        .size_limit(REGEX_BYTES)
         .dfa_size_limit(REGEX_BYTES)
         .build()
         .map_err(|e| e.to_string())
 }
 
-/// A path pattern as Java reads it on paths, which are ASCII: classes such as `\w` are
+/// A pack's regular expression for ASCII resource ids (atlas `filter` sources), no longer
+/// than [`MAX_PATTERN_BYTES`] and compiled into at most [`FILTER_REGEX_BYTES`] with ASCII
+/// character classes.
+pub(crate) fn filter_regex(pattern: &str) -> Result<regex::bytes::Regex, String> {
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(format!("a pattern longer than {MAX_PATTERN_BYTES} bytes"));
+    }
+    // Over bytes: without Unicode, the str regex refuses `.` and negated classes (they
+    // could match inside a UTF-8 sequence), and ids are ASCII anyway.
+    regex::bytes::RegexBuilder::new(pattern)
+        .unicode(false)
+        .size_limit(FILTER_REGEX_BYTES)
+        .dfa_size_limit(FILTER_REGEX_BYTES * 4)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// A path/namespace pattern as Java reads it on ASCII identifiers: classes such as `\w` are
 /// ASCII ones (Java's default), so that a pattern compiles small.
 fn ascii_pattern(pattern: &str, bytes: usize) -> Result<regex::bytes::Regex, String> {
     if pattern.len() > MAX_PATTERN_BYTES {
@@ -150,7 +166,7 @@ fn ascii_pattern(pattern: &str, bytes: usize) -> Result<regex::bytes::Regex, Str
     regex::bytes::RegexBuilder::new(pattern)
         .unicode(false)
         .size_limit(bytes)
-        .dfa_size_limit(REGEX_BYTES)
+        .dfa_size_limit(FILTER_REGEX_BYTES * 4)
         .build()
         .map_err(|e| e.to_string())
 }
@@ -230,6 +246,8 @@ fn overlays(meta: &Value) -> Result<Vec<String>, String> {
             .and_then(Value::as_str)
             .filter(|d| {
                 !d.is_empty()
+                    && *d != "."
+                    && *d != ".."
                     && d.bytes()
                         .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
             })
@@ -246,6 +264,8 @@ fn overlays(meta: &Value) -> Result<Vec<String>, String> {
                     ));
                 }
                 if (min..=max).contains(&PACK_FORMAT) {
+                    // Deduplicate keeping the last (highest-priority) occurrence.
+                    out.retain(|existing| existing != dir);
                     out.push(dir.to_owned());
                 }
             }
@@ -285,15 +305,18 @@ fn filter(meta: &Value, max: usize) -> Result<Option<Filter>, String> {
             Some(_) => Err(format!("filter: \"{key}\" is not a string")),
         }
     };
-    let mut namespaces = Vec::with_capacity(blocks.len());
+    let mut namespaces = Vec::new();
+    let mut every_namespace = false;
     let mut paths = Vec::new();
     let mut every_path = false;
     for b in blocks {
-        namespaces.push(
-            text(b, "namespace")?
-                .map(|s| pack_regex(&s).map_err(|e| format!("filter: {e}")))
-                .transpose()?,
-        );
+        match text(b, "namespace")? {
+            Some(ns) => {
+                ascii_pattern(&ns, FILTER_REGEX_BYTES).map_err(|e| format!("filter: {e}"))?;
+                namespaces.push(ns);
+            }
+            None => every_namespace = true,
+        }
         match text(b, "path")? {
             // Each within its own limit, before the set of them is built.
             Some(p) => {
@@ -303,6 +326,12 @@ fn filter(meta: &Value, max: usize) -> Result<Option<Filter>, String> {
             None => every_path = true,
         }
     }
+    let namespaces = regex::bytes::RegexSetBuilder::new(&namespaces)
+        .unicode(false)
+        .size_limit(FILTER_REGEX_BYTES * namespaces.len().max(1))
+        .dfa_size_limit(REGEX_BYTES)
+        .build()
+        .map_err(|e| format!("filter: {e}"))?;
     let paths = regex::bytes::RegexSetBuilder::new(&paths)
         .unicode(false)
         .size_limit(FILTER_REGEX_BYTES * paths.len().max(1))
@@ -310,6 +339,8 @@ fn filter(meta: &Value, max: usize) -> Result<Option<Filter>, String> {
         .build()
         .map_err(|e| format!("filter: {e}"))?;
     Ok(Some(Filter {
+        count: blocks.len(),
+        every_namespace,
         namespaces,
         every_path,
         paths,
@@ -493,6 +524,16 @@ impl Pack {
     /// broken or over a limit (vanilla's `ZipFile` refuses a broken one; the pack then has
     /// no metadata). Its shader and post-effect folders are hidden ([`HIDDEN`]).
     pub fn open_untrusted(path: &Path, limits: &Limits) -> Result<Pack, PackError> {
+        Pack::open_untrusted_with(path, limits, Arc::new(Budget::default()))
+    }
+
+    /// Like [`Self::open_untrusted`], sharing `budget` (bytes, texels, and cancel flag)
+    /// across every untrusted pack in one load.
+    pub fn open_untrusted_with(
+        path: &Path,
+        limits: &Limits,
+        budget: Arc<Budget>,
+    ) -> Result<Pack, PackError> {
         let name = path.file_name().map_or_else(
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
@@ -503,7 +544,6 @@ impl Pack {
                 io::Error::new(io::ErrorKind::InvalidInput, "not a zip file"),
             ));
         }
-        let budget = Arc::new(Budget::default());
         let zip =
             Arc::new(Zip::open_untrusted(path, limits, budget.clone()).map_err(io_err(path))?);
         let i = zip
@@ -530,22 +570,47 @@ impl Pack {
         }
         let mut namespaces = BTreeSet::new();
         for layer in &layers {
+            if budget.cancelled() {
+                return Err(PackError::Io(
+                    path.to_owned(),
+                    io::Error::new(io::ErrorKind::Interrupted, "the load was cancelled"),
+                ));
+            }
             if let Layer::Zip { zip, prefix } = layer {
-                for i in zip.with_prefix(prefix) {
+                for (step, i) in zip.with_prefix(prefix).enumerate() {
+                    if step & 255 == 0 && budget.cancelled() {
+                        return Err(PackError::Io(
+                            path.to_owned(),
+                            io::Error::new(io::ErrorKind::Interrupted, "the load was cancelled"),
+                        ));
+                    }
                     if let Some((ns, _)) = zip.name(i)[prefix.len()..].split_once('/')
                         && valid_namespace(ns)
+                        && ns != "."
+                        && ns != ".."
+                        && !namespaces.contains(ns)
                     {
+                        if namespaces.len() >= limits.pack_namespaces {
+                            return Err(PackError::BadMetadata(
+                                path.to_owned(),
+                                format!(
+                                    "more than {} namespaces in one pack",
+                                    limits.pack_namespaces
+                                ),
+                            ));
+                        }
                         namespaces.insert(ns.to_owned());
                     }
                 }
             }
         }
+        // Don't permanently retain arbitrary unused JSON sections from untrusted pack.mcmeta.
         Ok(Pack {
             name,
             layers,
             namespaces,
             filter,
-            metadata,
+            metadata: Value::Null,
             limits: *limits,
             budget,
             untrusted: true,
@@ -566,7 +631,10 @@ impl Pack {
             ));
         }
         let limits = Limits {
-            entry_bytes: limits.entry_bytes.min(limits.json_bytes),
+            entry_bytes: limits
+                .entry_bytes
+                .min(limits.mcmeta_bytes)
+                .min(limits.json_bytes),
             ..*limits
         };
         let bytes = Zip::read_one_untrusted(path, "pack.mcmeta", &limits)
@@ -623,6 +691,9 @@ impl Pack {
     }
 
     pub(crate) fn find(&self, namespace: &str, path: &str) -> Option<Loc> {
+        if !plain_relative(namespace) || !plain_relative(path) {
+            return None;
+        }
         if self.untrusted && hidden(path) {
             return None;
         }
@@ -634,9 +705,6 @@ impl Pack {
                     }
                 }
                 Layer::Dir(root) => {
-                    if !plain_relative(path) {
-                        continue;
-                    }
                     let p = root.join(namespace).join(path);
                     if p.is_file() {
                         return Some(Loc::File(p));
@@ -656,6 +724,9 @@ impl Pack {
     /// Every file under `<namespace>/<dir>/`, with paths relative to the
     /// namespace. The highest layer wins per path; the order is unspecified.
     pub(crate) fn list(&self, namespace: &str, dir: &str, out: &mut dyn FnMut(String, Loc)) {
+        if !plain_relative(namespace) || (!dir.is_empty() && !plain_relative(dir)) {
+            return;
+        }
         if self.untrusted && hidden(&format!("{dir}/")) {
             return;
         }

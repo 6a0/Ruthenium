@@ -772,15 +772,17 @@ impl Renderer {
         if let Some(sky) = &mut self.sky {
             sky.replace_pictures(&mut self.textures, &mut self.uploads, &assets.sky);
         }
-        // Without a clouds picture the clouds stay as they were.
-        if let (Some(clouds), Some(cells)) = (
-            &mut self.clouds,
-            assets
+        // Replace clouds even if the new pack's clouds.png failed to decode, so a previous
+        // server's clouds never persist across sessions.
+        if let Some(clouds) = &mut self.clouds {
+            let cells = assets
                 .clouds
                 .as_ref()
-                .and_then(|i| CloudCells::from_rgba(i.width, i.height, &i.rgba)),
-        ) {
-            clouds.set_cells(cells);
+                .and_then(|i| CloudCells::from_rgba(i.width, i.height, &i.rgba))
+                .or_else(|| CloudCells::from_rgba(1, 1, &[0, 0, 0, 0]));
+            if let Some(cells) = cells {
+                clouds.set_cells(cells);
+            }
         }
         if let Some(weather) = self.weather.take() {
             for id in weather.textures().into_iter().flatten() {

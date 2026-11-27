@@ -126,14 +126,19 @@ impl Zip {
                 limits.pack_bytes
             )));
         }
+        let map = crate::map::MappedFile::open(path)?;
+        if map.len() as u64 > limits.pack_bytes {
+            return Err(bad(format!(
+                "{} bytes is larger than a pack may be ({})",
+                map.len(),
+                limits.pack_bytes
+            )));
+        }
         let guard = Guard {
             limits: *limits,
             budget,
         };
-        Zip::parse(
-            Bytes::Mapped(crate::map::MappedFile::open(path)?),
-            Some(guard),
-        )
+        Zip::parse(Bytes::Mapped(map), Some(guard))
     }
 
     /// One file of an untrusted archive, read under `limits` without opening the whole
@@ -155,6 +160,13 @@ impl Zip {
             )));
         }
         let map = crate::map::MappedFile::open(path)?;
+        if map.len() as u64 > limits.pack_bytes {
+            return Err(bad(format!(
+                "{} bytes is larger than a pack may be ({})",
+                map.len(),
+                limits.pack_bytes
+            )));
+        }
         let b: &[u8] = &map;
         let (start, end, _, _) = locate(b, Some(limits))?;
         let (mut at, mut seen, mut found) = (start, 0usize, None);
@@ -216,10 +228,16 @@ impl Zip {
                 return Err(bad("bad central directory entry"));
             }
             seen += 1;
-            if let Some(g) = &guard
-                && seen > g.limits.zip_entries
-            {
-                return Err(bad("more entries than a pack may have"));
+            if let Some(g) = &guard {
+                if seen & 255 == 0 && g.budget.cancelled() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "the load was cancelled",
+                    ));
+                }
+                if seen > g.limits.zip_entries {
+                    return Err(bad("more entries than a pack may have"));
+                }
             }
             let (next, name, mut entry) = central(b, at)?;
             at = next;
@@ -334,8 +352,15 @@ impl Zip {
             return Err(bad(format!("{name} is encrypted")));
         }
         if let Some(g) = &self.guard {
+            if budgeted && g.budget.cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "the load was cancelled",
+                ));
+            }
             check_size(&e, name, &g.limits)?;
-            if budgeted && !g.budget.take_bytes(e.size, &g.limits) {
+            let cost = e.size.max(e.compressed);
+            if budgeted && !g.budget.take_bytes(cost, &g.limits) {
                 return Err(bad(format!(
                     "{name}: the pack has inflated more than a load may ({} bytes)",
                     g.limits.load_bytes
@@ -346,8 +371,9 @@ impl Zip {
     }
 }
 
-/// An untrusted entry's sizes: no larger than a file may be, and no more than deflate
-/// can give of its compressed bytes.
+/// An untrusted entry's sizes: no larger than a file may be (compressed or inflated),
+/// no more than deflate can give of its compressed bytes, and no absurd deflate bloat
+/// (e.g., megabytes of empty deflate blocks inflating to a few bytes).
 fn check_size(e: &Entry, name: &str, limits: &Limits) -> io::Result<()> {
     if e.size > limits.entry_bytes {
         return Err(bad(format!(
@@ -355,16 +381,36 @@ fn check_size(e: &Entry, name: &str, limits: &Limits) -> io::Result<()> {
             e.size, limits.entry_bytes
         )));
     }
-    if e.method == 8
-        && e.size
+    if e.compressed > limits.entry_bytes {
+        return Err(bad(format!(
+            "{name}: {} compressed bytes is larger than a file may be ({})",
+            e.compressed, limits.entry_bytes
+        )));
+    }
+    if e.method == 8 {
+        if e.size
             > e.compressed
                 .saturating_mul(DEFLATE_RATIO)
                 .saturating_add(1024)
-    {
-        return Err(bad(format!(
-            "{name}: {} bytes cannot inflate to {}",
-            e.compressed, e.size
-        )));
+        {
+            return Err(bad(format!(
+                "{name}: {} bytes cannot inflate to {}",
+                e.compressed, e.size
+            )));
+        }
+        // Raw DEFLATE worst-case expansion is ~0.03% (5 bytes per 64 KiB block) plus header
+        // overhead. Allowing size + size/1000 + 64 KiB permits all real deflate streams
+        // while rejecting empty-block decompression bombs.
+        let max_compressed = e
+            .size
+            .saturating_add(e.size / 1000)
+            .saturating_add(64 * 1024);
+        if e.compressed > max_compressed {
+            return Err(bad(format!(
+                "{name}: {} compressed bytes is bloated for a {}-byte entry",
+                e.compressed, e.size
+            )));
+        }
     }
     Ok(())
 }
@@ -419,16 +465,22 @@ fn central(b: &[u8], at: usize) -> io::Result<(usize, &[u8], Entry)> {
     while x + 4 <= extra.len() {
         let id = u16_at(extra, x)?;
         let len = usize::from(u16_at(extra, x + 2)?);
+        let Some(field_end) = x.checked_add(4).and_then(|s| s.checked_add(len)) else {
+            return Err(bad("truncated zip64 extra"));
+        };
         if id == 1 {
-            let mut p = x + 4;
+            let z64 = extra
+                .get(x + 4..field_end)
+                .ok_or_else(|| bad("truncated zip64 extra"))?;
+            let mut p = 0;
             for field in [&mut size, &mut compressed, &mut local_header] {
                 if *field == 0xFFFF_FFFF {
-                    *field = u64_at(extra, p)?;
+                    *field = u64_at(z64, p)?;
                     p += 8;
                 }
             }
         }
-        x += 4 + len;
+        x = field_end;
     }
     let entry = Entry {
         method,
@@ -504,10 +556,17 @@ fn locate(b: &[u8], limits: Option<&Limits>) -> io::Result<(usize, usize, u64, u
     Ok((start, end, count, cd_size))
 }
 
-/// A name that means a place inside the archive only: no `..` segment, no leading `/`,
-/// no backslash or NUL.
+/// A name that means a place inside the archive only: no `.` or `..` segment, no empty
+/// segment (`//`), no leading `/`, no backslash or NUL.
 fn plain_name(name: &str) -> bool {
-    !name.starts_with('/') && !name.contains(['\\', '\0']) && name.split('/').all(|s| s != "..")
+    if name.starts_with('/') || name.contains(['\\', '\0']) {
+        return false;
+    }
+    let trimmed = name.strip_suffix('/').unwrap_or(name);
+    !trimmed.is_empty()
+        && trimmed
+            .split('/')
+            .all(|s| !s.is_empty() && s != "." && s != "..")
 }
 
 /// Inflates raw deflate `data` that must produce exactly `size` bytes.

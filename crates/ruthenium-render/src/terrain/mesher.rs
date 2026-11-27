@@ -444,6 +444,15 @@ impl Mesher {
                         light: [[light.0 << 4, light.1 << 4]; 4],
                     };
                     let mut emit = |q: &BakedQuad, lit: Lit| {
+                        // Never allocate past one 4 MiB vertex pool page inside one section:
+                        // a malicious pack with dense block models would otherwise OOM workers
+                        // before `world.rs` drops the oversized section.
+                        const MAX_SECTION_BYTES: usize = 4 << 20;
+                        if out.vertices.len() + cutout.len() + translucent.len()
+                            >= MAX_SECTION_BYTES
+                        {
+                            return;
+                        }
                         let layer = match q.layer {
                             Layer::Solid => &mut out.vertices,
                             Layer::Cutout | Layer::Translucent if opaque_leaves => {

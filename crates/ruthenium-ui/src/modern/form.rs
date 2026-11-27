@@ -286,14 +286,23 @@ impl TextStyle {
 /// between characters where a word is wider than a line (text without spaces, as Chinese
 /// and Japanese are written).
 fn wrap_to(fonts: &Fonts, text: &str, style: TextStyle, max: f32) -> Vec<String> {
-    let width = |s: &str| fonts.shape(s, style).width;
+    wrap_by(text, max, |s| fonts.shape(s, style).width)
+}
+
+/// [`wrap_to`] with `width` measuring a string. A word wider than a line is cut where a
+/// search from the line's start finds the longest piece that fits: doubling its length
+/// until a piece doesn't, then halving between the two, so each line costs a few
+/// measurements no longer than about twice the line, however long the word (hostile text
+/// can't make it quadratic), and at most one closing punctuation mark hangs over.
+fn wrap_by(text: &str, max: f32, width: impl Fn(&str) -> f32) -> Vec<String> {
     if width(text) <= max {
         return vec![text.to_owned()];
     }
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in text.split_inclusive(' ') {
-        if width(format!("{line}{word}").trim_end()) <= max {
+        let combined = format!("{line}{word}");
+        if width(combined.trim_end()) <= max {
             line.push_str(word);
             continue;
         }
@@ -301,14 +310,49 @@ fn wrap_to(fonts: &Fonts, text: &str, style: TextStyle, max: f32) -> Vec<String>
             lines.push(line.trim_end().to_owned());
             line.clear();
         }
-        for c in word.chars() {
-            line.push(c);
-            // Closing punctuation never starts a line; it may overhang this one.
-            if width(line.trim_end()) > max && line.chars().count() > 1 && !closing(c) {
-                line.pop();
-                lines.push(std::mem::take(&mut line));
-                line.push(c);
+        let stops: Vec<usize> = word
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(word.len()))
+            .collect();
+        let last = stops.len() - 1;
+        let mut start = 0;
+        while start < last {
+            let from = stops[start];
+            let fits = |k: usize| width(word[from..stops[k]].trim_end()) <= max;
+            // At least one character goes on a line.
+            let (mut lo, mut lo_fits, mut hi) = (start + 1, false, last);
+            let mut step = 2;
+            while start + step < last {
+                if fits(start + step) {
+                    (lo, lo_fits) = (start + step, true);
+                    step *= 2;
+                } else {
+                    hi = start + step - 1;
+                    break;
+                }
             }
+            while lo < hi {
+                let mid = (lo + hi).div_ceil(2);
+                if fits(mid) {
+                    (lo, lo_fits) = (mid, true);
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if lo == last && (lo_fits || fits(last)) {
+                // The rest fits: the next words may join it.
+                line.push_str(&word[from..]);
+                break;
+            }
+            if lo < last
+                && let Some(next_char) = word[stops[lo]..].chars().next()
+                && closing(next_char)
+            {
+                lo += 1;
+            }
+            lines.push(word[from..stops[lo]].trim_end().to_owned());
+            start = lo;
         }
     }
     if !line.trim_end().is_empty() {
@@ -413,6 +457,47 @@ impl FormScreen {
         }
         form.layout(scale, fonts);
         form
+    }
+
+    /// Updates a prompt form's title, message lines, buttons and scroll window in-place,
+    /// laying out once and preserving `ButtonStates` when the button count is unchanged.
+    pub fn update_prompt(
+        &mut self,
+        title: String,
+        message: Vec<String>,
+        buttons: Vec<FormButton>,
+        window: usize,
+        fonts: &Fonts,
+    ) {
+        let same_buttons = self.spec.buttons.len() == buttons.len() && self.fields.is_empty();
+        self.spec.title = title;
+        self.spec.message = message;
+        self.spec.buttons = buttons;
+        if same_buttons {
+            for (b, s) in self.buttons.iter_mut().zip(&self.spec.buttons) {
+                b.action = s.action;
+            }
+        } else {
+            let n = self.fields.len() + self.spec.buttons.len();
+            self.buttons = self
+                .spec
+                .buttons
+                .iter()
+                .map(|b| Button {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 0.0,
+                        h: 0.0,
+                    },
+                    label: "",
+                    action: b.action,
+                })
+                .collect();
+            self.states = ButtonStates::new(n);
+        }
+        self.window = Some(window.max(1));
+        self.layout(self.scale, fonts);
     }
 
     /// Lays the form out for `scale`, keeping what was typed.
@@ -681,8 +766,22 @@ impl FormScreen {
                 .centred(text, atlas, s, self.title_rect, WHITE_TEXT);
             match self.message_view {
                 None => {
-                    for (t, r) in &self.message {
-                        t.centred(text, atlas, s, *r, SOFT);
+                    // Always clip the message area so tall combining marks or overhanging
+                    // glyphs cannot paint over the title or buttons.
+                    if let (Some((_, first)), Some((_, last))) =
+                        (self.message.first(), self.message.last())
+                    {
+                        let box_rect = Rect {
+                            x: first.x,
+                            y: first.y,
+                            w: first.w,
+                            h: (last.y + last.h - first.y).max(0.0),
+                        };
+                        text.set_clip(Clip::rect(super::px_rect(s, box_rect)));
+                        for (t, r) in &self.message {
+                            t.centred(text, atlas, s, *r, SOFT);
+                        }
+                        text.set_clip(Clip::NONE);
                     }
                 }
                 Some(view) => {
@@ -980,5 +1079,48 @@ mod tests {
         // A message that fits doesn't scroll.
         short.wheel(-3.0);
         assert_eq!(short.message_scroll(), (0, 5));
+    }
+
+    #[test]
+    fn wrap_to_breaks_long_closing_punctuation_runs_fast() {
+        let fonts = Fonts::new(&WEIGHTS);
+        let style = MESSAGE_STYLE.with_px(1.0);
+        let run = "。".repeat(2000);
+        let lines = wrap_to(&fonts, &run, style, 200.0);
+        assert!(
+            lines.len() > 20,
+            "expected wrapped lines, got {}",
+            lines.len()
+        );
+        assert_eq!(lines.concat(), run);
+    }
+
+    /// A long word costs a few short measurements a line, not the whole rest each time:
+    /// counted in characters measured, with every character one unit wide.
+    #[test]
+    fn wrapping_a_long_word_measures_little_of_it() {
+        let measured = std::cell::Cell::new(0usize);
+        let width = |s: &str| {
+            let n = s.chars().count();
+            measured.set(measured.get() + n);
+            n as f32
+        };
+        for text in ["字".repeat(2000), "。".repeat(2000), "a".repeat(2000)] {
+            measured.set(0);
+            let lines = wrap_by(&text, 25.0, width);
+            assert_eq!(lines.concat(), text);
+            assert!(lines.iter().all(|l| l.chars().count() <= 26), "{lines:?}");
+            assert!(lines.len() >= 2000 / 26);
+            // About 2000 for the whole text at first, then under 20 measurements of
+            // under 50 characters for each of 80 lines.
+            assert!(
+                measured.get() < 2000 * 2 + 80 * 20 * 50,
+                "{}",
+                measured.get()
+            );
+        }
+        // Spaces still break first, and a fitting rest takes the next word.
+        let measured_words = wrap_by("aaaaaaaaaa bb cc", 5.0, |s: &str| s.chars().count() as f32);
+        assert_eq!(measured_words, ["aaaaa", "aaaaa", "bb cc"]);
     }
 }

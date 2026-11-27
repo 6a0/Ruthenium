@@ -733,6 +733,49 @@ fn an_animation_of_a_million_frames_drops_its_sprite() {
     quick(started);
 }
 
+/// An animation that never changes frame, and one too large to animate from a server's
+/// pack, are drawn still as the frame they show first, not the image's top one.
+#[test]
+fn a_still_animation_shows_its_first_frame() {
+    // Two frames of 16x16: red on top, blue below.
+    let mut two = Image::new(16, 32);
+    two.pixels[..256].fill(0xFFFF_0000);
+    two.pixels[256..].fill(0xFF00_00FF);
+    let two = two.encode_png();
+    let mut big = Image::new(1024, 2048);
+    big.pixels[..1024 * 1024].fill(0xFFFF_0000);
+    big.pixels[1024 * 1024..].fill(0xFF00_00FF);
+    let big = big.encode_png();
+    let (res, _t) = pack(
+        &[
+            ("assets/minecraft/atlases/blocks.json", BLOCKS_ATLAS),
+            ("assets/minecraft/textures/block/same.png", &two),
+            (
+                "assets/minecraft/textures/block/same.png.mcmeta",
+                br#"{"animation": {"frames": [1, 1]}}"#,
+            ),
+            ("assets/minecraft/textures/block/big.png", &big),
+            (
+                "assets/minecraft/textures/block/big.png.mcmeta",
+                br#"{"animation": {"frames": [1, 0]}}"#,
+            ),
+        ],
+        &Limits::untrusted(),
+    );
+    let a = blocks(&res, 16384).unwrap();
+    for name in ["block/same", "block/big"] {
+        let s = a.sprite(&id(name)).unwrap();
+        assert!(s.animated.is_none(), "{name} is animated");
+        let (x, y) = (s.x + s.padding, s.y + s.padding);
+        assert_eq!(a.levels[0].get(x, y), 0xFF00_00FF, "{name}");
+        assert_eq!(
+            a.levels[0].get(x + s.width - 1, y + s.height - 1),
+            0xFF00_00FF,
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn gui_scaling_of_nothing_or_too_much_drops_its_sprite() {
     let gui = br#"{"sources": [{"type": "directory", "source": "gui/sprites", "prefix": ""}]}"#;
@@ -1924,4 +1967,213 @@ fn a_cancelled_atlas_stops_while_it_loads() {
     );
     // At most one picture a thread after the flag.
     assert!(ended.saturating_duration_since(set) < Duration::from_secs(5));
+}
+
+/// A deflated entry whose compressed stream is vastly larger than its uncompressed size
+/// (e.g. empty stored deflate blocks) is refused before decompression.
+#[test]
+fn deflate_empty_block_bloat_is_refused() {
+    // Valid raw deflate stream: 20,000 empty stored blocks (100 KiB) + 1-byte final block.
+    let mut raw_deflate = Vec::with_capacity(20_000 * 5 + 6);
+    for _ in 0..20_000 {
+        raw_deflate.extend_from_slice(&[0x00, 0x00, 0x00, 0xFF, 0xFF]);
+    }
+    raw_deflate.extend_from_slice(&[0x01, 0x01, 0x00, 0xFE, 0xFF, b'x']);
+    // Build a valid 2-entry zip with `pack.mcmeta` (stored) and the bloated deflate entry.
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    let mut push_entry = |name: &[u8], method: u16, data: &[u8], uncompressed: u32| {
+        let offset = out.len() as u32;
+        let compressed = data.len() as u32;
+        out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[20, 0, 0, 0]);
+        out.extend_from_slice(&method.to_le_bytes());
+        out.extend_from_slice(&[0; 8]);
+        out.extend_from_slice(&compressed.to_le_bytes());
+        out.extend_from_slice(&uncompressed.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(name);
+        out.extend_from_slice(data);
+
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&[20, 0, 20, 0, 0, 0]);
+        central.extend_from_slice(&method.to_le_bytes());
+        central.extend_from_slice(&[0; 8]);
+        central.extend_from_slice(&compressed.to_le_bytes());
+        central.extend_from_slice(&uncompressed.to_le_bytes());
+        central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        central.extend_from_slice(&[0; 12]);
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(name);
+    };
+    push_entry(b"pack.mcmeta", 0, META, META.len() as u32);
+    push_entry(b"assets/minecraft/texts/bloat.txt", 8, &raw_deflate, 1);
+    let cd_offset = out.len() as u32;
+    let cd_len = central.len() as u32;
+    out.extend_from_slice(&central);
+    out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&cd_len.to_le_bytes());
+    out.extend_from_slice(&cd_offset.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+
+    let t = Temp::new("bloat.zip", &out);
+    let z = Zip::open_untrusted(&t.0, &Limits::untrusted(), std::sync::Arc::default()).unwrap();
+    let idx = z.find("assets/minecraft/texts/bloat.txt").unwrap();
+    assert!(z.read(idx).is_err());
+}
+
+/// Multiple untrusted packs sharing one `Budget` cannot exceed `load_bytes` combined.
+#[test]
+fn shared_budget_caps_total_across_multiple_packs() {
+    let payload = vec![b'a'; 8 * 1024];
+    let z1 = zip(&[
+        ("pack.mcmeta", META),
+        ("assets/minecraft/texts/a.txt", &payload),
+    ]);
+    let z2 = zip(&[
+        ("pack.mcmeta", META),
+        ("assets/minecraft/texts/b.txt", &payload),
+    ]);
+    let t1 = Temp::new("b1.zip", &z1);
+    let t2 = Temp::new("b2.zip", &z2);
+    let limits = Limits {
+        load_bytes: 12 * 1024,
+        ..Limits::untrusted()
+    };
+    let budget = std::sync::Arc::new(Budget::default());
+    let p1 = Pack::open_untrusted_with(&t1.0, &limits, budget.clone()).unwrap();
+    let p2 = Pack::open_untrusted_with(&t2.0, &limits, budget).unwrap();
+    let res = Resources::new(vec![p1, p2]);
+    assert!(res.get(&id("texts/a.txt")).unwrap().read().is_ok());
+    assert!(res.get(&id("texts/b.txt")).unwrap().read().is_err());
+}
+
+/// Excessive namespaces, `.`/`..` overlay directories, and `./` hidden shader paths are
+/// rejected or hidden.
+#[test]
+fn namespaces_and_dot_overlays_and_hidden_dot_paths_are_rejected() {
+    let limits = Limits {
+        pack_namespaces: 4,
+        ..Limits::untrusted()
+    };
+    let ns_files: Vec<String> = (0..6)
+        .map(|i| format!("assets/ns{i}/texts/x.txt"))
+        .collect();
+    let mut entries: Vec<(&str, &[u8])> = vec![("pack.mcmeta", META)];
+    entries.extend(ns_files.iter().map(|s| (s.as_str(), &b"x"[..])));
+    assert!(open(&zip(&entries), &limits).is_err());
+
+    for bad_dir in [".", ".."] {
+        let meta = format!(
+            r#"{{"pack": {{"description": ""}}, "overlays": {{"entries": [{{"directory": "{bad_dir}", "min_format": 1, "max_format": 200}}]}}}}"#
+        );
+        assert!(
+            open(
+                &zip(&[("pack.mcmeta", meta.as_bytes())]),
+                &Limits::untrusted()
+            )
+            .is_err(),
+            "overlay {bad_dir:?} should be rejected"
+        );
+    }
+
+    let (res, _t) = pack(
+        &[(
+            "assets/minecraft/./shaders/core/terrain.vsh",
+            b"void main(){}",
+        )],
+        &Limits::untrusted(),
+    );
+    assert!(res.get(&id("shaders/core/terrain.vsh")).is_none());
+    assert!(res.list("shaders", |_| true).is_empty());
+}
+
+/// Bitmap font height <= 0 is rejected and total bitmap texels across providers are capped.
+#[test]
+fn font_bitmap_height_and_texel_budget_are_bounded() {
+    let big = png(512, 512, 0xFFFF_FFFF);
+    let (res, _t) = pack(
+        &[
+            ("assets/minecraft/textures/font/a.png", &big),
+            ("assets/minecraft/textures/font/b.png", &big),
+            (
+                "assets/minecraft/font/default.json",
+                br#"{"providers": [
+                    {"type": "bitmap", "file": "minecraft:font/a.png", "height": 0, "ascent": 0, "chars": ["X"]},
+                    {"type": "bitmap", "file": "minecraft:font/a.png", "ascent": 7, "chars": ["A"]},
+                    {"type": "bitmap", "file": "minecraft:font/b.png", "ascent": 7, "chars": ["B"]}
+                ]}"#,
+            ),
+        ],
+        &Limits {
+            font_bitmap_texels: 300_000,
+            ..Limits::untrusted()
+        },
+    );
+    let f = font(&res);
+    assert!(!f.has('X'), "zero-height bitmap provider must be rejected");
+    assert!(f.has('A'));
+    assert!(!f.has('B'), "second bitmap exceeds font_bitmap_texels");
+}
+
+/// Multipart blockstate cases and composite item resolved models are bounded.
+#[test]
+fn block_multipart_and_item_resolved_models_are_bounded() {
+    let limits = Limits {
+        state_multipart_parts: 4,
+        item_resolved_models: 4,
+        ..Limits::untrusted()
+    };
+    let parts = [r#"{"apply": {"model": "block/cube"}}"#; 10].join(",");
+    let blockstate = format!(r#"{{"multipart": [{parts}]}}"#);
+    let leaves = [r#"{"type": "model", "model": "block/cube"}"#; 10].join(",");
+    let item_def = format!(r#"{{"model": {{"type": "composite", "models": [{leaves}]}}}}"#);
+    let (res, _t) = pack(
+        &[
+            ("assets/minecraft/atlases/blocks.json", BLOCKS_ATLAS),
+            (
+                "assets/minecraft/textures/block/x.png",
+                &png(16, 16, 0xFFFF_FFFF),
+            ),
+            (
+                "assets/minecraft/models/block/cube.json",
+                br##"{"textures": {"all": "block/x"}, "elements": [{"from": [0,0,0], "to": [16,16,16], "faces": {"up": {"texture": "#all"}}}]}"##,
+            ),
+            (
+                "assets/minecraft/blockstates/stone.json",
+                blockstate.as_bytes(),
+            ),
+            ("assets/minecraft/items/stone.json", item_def.as_bytes()),
+        ],
+        &limits,
+    );
+    let a = blocks(&res, 1024).unwrap();
+    let bm = BlockModels::bake(&res, &a);
+    assert!(
+        bm.warnings
+            .iter()
+            .any(|w| w.contains("multipart") || w.contains("parts"))
+    );
+    let im = ItemModels::bake(&res, &a, &a, None);
+    let held = ruthenium_assets::item::Held {
+        context: "gui",
+        left_handed: false,
+        using: false,
+        use_ticks: 0,
+        use_remaining: 0,
+        damage: None,
+        count: (1, 64),
+        charge: "none",
+        charge_ticks: 0.0,
+        trim_material: None,
+        block_state: &[],
+        has_component: &|_, _| false,
+    };
+    let mut out = Vec::new();
+    im.resolve("minecraft:stone", &held, &mut out);
+    assert!(out.len() <= 4, "resolved {} leaves", out.len());
 }

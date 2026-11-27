@@ -408,10 +408,23 @@ impl GlyphPages {
         }
         let (width, height, texels) = match ink {
             Ink::Bar => (5, 8, vec![255; 5 * 8 * 4]),
-            Ink::Char(c) => match font.texels(c) {
-                Some(i) => (i.width, i.height, i.to_rgba8()),
-                None => (0, 0, Vec::new()),
-            },
+            Ink::Char(c) => {
+                // Reject glyphs too large for a page before copying/converting their pixels.
+                let fits = font
+                    .glyph(c)
+                    .picture
+                    .is_some_and(|p| p.width < PAGE && p.height < PAGE);
+                if !fits {
+                    (0, 0, Vec::new())
+                } else {
+                    match font.texels(c) {
+                        Some(i) if i.width < PAGE && i.height < PAGE => {
+                            (i.width, i.height, i.to_rgba8())
+                        }
+                        _ => (0, 0, Vec::new()),
+                    }
+                }
+            }
         };
         let slot = (width > 0 && height > 0)
             .then(|| self.room(width, height))

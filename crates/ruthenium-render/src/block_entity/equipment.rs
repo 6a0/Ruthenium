@@ -65,6 +65,11 @@ fn own_path(id: &str) -> Option<&str> {
     }
 }
 
+/// Caps on untrusted equipment JSON definitions so one piece of armour cannot push
+/// hundreds of thousands of render instances per frame.
+const MAX_EQUIPMENT_LAYERS: usize = 16;
+const MAX_TRIM_OVERRIDES: usize = 256;
+
 impl Equipment {
     /// From an asset's file. Nothing for one without layers.
     pub fn parse(json: &Value) -> Option<Equipment> {
@@ -75,6 +80,7 @@ impl Equipment {
                 .and_then(Value::as_array)
                 .map_or(&[][..], Vec::as_slice)
                 .iter()
+                .take(MAX_EQUIPMENT_LAYERS)
                 .filter_map(|l| {
                     let texture = own_path(l.get("texture")?.as_str()?)?.to_owned();
                     let dyeable = l.get("dyeable").map(|d| {
@@ -91,6 +97,7 @@ impl Equipment {
             .and_then(Value::as_array)
             .map_or(&[][..], Vec::as_slice)
             .iter()
+            .take(MAX_TRIM_OVERRIDES)
             .filter_map(|o| {
                 let when = o.get("when")?;
                 let id = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(full);

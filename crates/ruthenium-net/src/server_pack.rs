@@ -28,6 +28,7 @@ mod java_url;
 mod tests;
 
 pub use address::AddressRange;
+pub use fetch::CancelToken;
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -152,10 +153,15 @@ pub trait Progress: Send {
     fn download_start(&mut self, size: Option<u64>);
     fn downloaded(&mut self, bytes: u64);
     fn request_finished(&mut self, ok: bool);
-    /// Whether to stop (the player left the server): checked before each pack and between
-    /// reads; the rest of the batch fails with [`DownloadError::Cancelled`].
+    /// Whether to stop (the player left the server): checked before each pack, between
+    /// redirects and between reads; the rest of the batch fails with
+    /// [`DownloadError::Cancelled`].
     fn cancelled(&mut self) -> bool {
         false
+    }
+    /// Optional cross-thread cancellation handle that also shuts down active sockets.
+    fn cancel_token(&self) -> Option<CancelToken> {
+        None
     }
 }
 
@@ -187,28 +193,53 @@ pub fn is_pack_url(url: &str) -> bool {
     java_url::parse(None, url).is_ok()
 }
 
-/// What a game run has done with each cache: opened (cleaned) it, and received how much.
-static RUNS: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+#[derive(Default, Clone, Copy)]
+struct RunStats {
+    received: u64,
+    requests: usize,
+}
+
+/// What a game run has done with each cache: opened (cleaned) it, received how much, and
+/// how many network attempts it made.
+static RUNS: Mutex<Vec<(PathBuf, RunStats)>> = Mutex::new(Vec::new());
 
 /// Opens the cache: refuses a symlink or a non-directory, makes it if missing, and the
 /// first time in a run cleans it as `DownloadQueue`'s constructor does. Returns the bytes
-/// this run has received into it.
-fn open_cache(dir: &Path) -> io::Result<u64> {
+/// and network attempts this run has spent on it.
+fn open_cache(dir: &Path) -> io::Result<RunStats> {
     cache::ensure_dir(dir, true)?;
     let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, received)) = runs.iter().find(|(d, _)| d == dir) {
-        return Ok(*received);
+    if let Some((_, stats)) = runs.iter().find(|(d, _)| d == dir) {
+        return Ok(*stats);
     }
     cache::vacuum(dir, MAX_KEPT_PACKS);
-    runs.push((dir.to_path_buf(), 0));
-    Ok(0)
+    runs.push((dir.to_path_buf(), RunStats::default()));
+    Ok(RunStats::default())
 }
 
-fn add_received(dir: &Path, bytes: u64) {
+/// Reserves one network download attempt if both byte and request budgets still have room.
+/// Returns the remaining byte budget at reservation time.
+fn try_begin_download(dir: &Path, limits: &fetch::Limits) -> Option<u64> {
     let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, received)) = runs.iter_mut().find(|(d, _)| d == dir) {
-        *received = received.saturating_add(bytes);
+    let (_, stats) = runs.iter_mut().find(|(d, _)| d == dir)?;
+    let remaining = limits.run_budget.saturating_sub(stats.received);
+    if remaining == 0 || stats.requests >= limits.run_requests {
+        return None;
     }
+    stats.requests += 1;
+    Some(remaining)
+}
+
+/// Atomically accounts for `bytes` received, returning false if the run budget would be
+/// exceeded (so concurrent batches cannot both spend the full budget).
+fn try_add_received(dir: &Path, bytes: u64, run_budget: u64) -> bool {
+    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((_, stats)) = runs.iter_mut().find(|(d, _)| d == dir) else {
+        return false;
+    };
+    let next = stats.received.saturating_add(bytes);
+    stats.received = next;
+    next <= run_budget
 }
 
 pub(crate) fn download_batch_with(
@@ -218,7 +249,7 @@ pub(crate) fn download_batch_with(
     limits: &fetch::Limits,
 ) -> Vec<(u128, Result<PathBuf, DownloadError>)> {
     let opened = open_cache(&config.cache_dir);
-    let client = fetch::Client::new(limits, &config.private_allowed);
+    let client = fetch::Client::new(limits, &config.private_allowed, progress.cancel_token());
     let mut results = Vec::with_capacity(requests.len());
     for (n, request) in requests.iter().enumerate() {
         progress.request_start();
@@ -249,6 +280,9 @@ fn download(
     progress: &mut dyn Progress,
 ) -> Result<PathBuf, DownloadError> {
     let url = java_url::parse(None, &request.url).map_err(|_| DownloadError::InvalidUrl)?;
+    // Validate the URL before checking the cache so unusable URLs always fail consistently
+    // and can't probe whether a pack is already cached.
+    let _ = fetch::Target::new(&url)?;
     let dir = config.cache_dir.join(cache::uuid_string(request.id));
     // A pack directory that is a symlink is refused before anything is read through it.
     if std::fs::symlink_metadata(&dir).is_ok() {
@@ -272,19 +306,20 @@ fn download(
         None => None,
     };
 
-    let received = open_cache(&config.cache_dir).map_err(cache_error)?;
-    let budget = limits.run_budget.saturating_sub(received);
-    if budget == 0 {
+    open_cache(&config.cache_dir).map_err(cache_error)?;
+    let Some(budget) = try_begin_download(&config.cache_dir, limits) else {
         return Err(DownloadError::BudgetExhausted);
-    }
+    };
+    client.reset_wire_limit(limits.max_size.min(budget));
     let deadline = Instant::now() + limits.whole;
-    let response = client.get(&url, &config.headers, deadline)?;
+    let response = client.get(&url, &config.headers, deadline, &mut || {
+        progress.cancelled()
+    })?;
     let size = response
         .headers()
         .get(ureq::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
-    cache::ensure_dir(&dir, false).map_err(cache_error)?;
     progress.download_start(size.filter(|&s| s > 0));
     if size.is_some_and(|s| s > limits.max_size) {
         return Err(DownloadError::TooLarge);
@@ -292,8 +327,30 @@ fn download(
     if size.is_some_and(|s| s > budget) {
         return Err(DownloadError::BudgetExhausted);
     }
+    cache::ensure_dir(&dir, false).map_err(cache_error)?;
+    let res = read_to_cache(
+        config, limits, client, request, &dir, target, response, deadline, progress,
+    );
+    if res.is_err() {
+        // Remove the UUID directory if it's empty so failed downloads don't leak inodes.
+        let _ = std::fs::remove_dir(&dir);
+    }
+    res
+}
 
-    let mut temp = cache::Temp::new(&dir).map_err(cache_error)?;
+#[allow(clippy::too_many_arguments)]
+fn read_to_cache(
+    config: &DownloadConfig,
+    limits: &fetch::Limits,
+    client: &fetch::Client,
+    request: &PackRequest,
+    dir: &Path,
+    target: Option<PathBuf>,
+    response: ureq::http::Response<ureq::Body>,
+    deadline: Instant,
+    progress: &mut dyn Progress,
+) -> Result<PathBuf, DownloadError> {
+    let mut temp = cache::Temp::new(dir).map_err(cache_error)?;
     let mut reader = response
         .into_body()
         .into_with_config()
@@ -302,26 +359,37 @@ fn download(
     let mut hasher = Sha1::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut so_far = 0u64;
+    // A cancelled token interrupts reads; checked too, so a progress that hands one out
+    // without answering `cancelled` from it can't spin on the interruptions.
+    let token = progress.cancel_token();
+    let cancelled = |p: &mut dyn Progress| {
+        p.cancelled() || token.as_ref().is_some_and(fetch::CancelToken::is_cancelled)
+    };
     loop {
         if Instant::now() >= deadline {
             return Err(DownloadError::TimedOut);
         }
-        if progress.cancelled() {
+        if cancelled(progress) {
             return Err(DownloadError::Cancelled);
         }
         let n = match io::Read::read(&mut reader, &mut buf) {
             Ok(0) => break,
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(fetch::read_error(&e)),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                if cancelled(progress) {
+                    return Err(DownloadError::Cancelled);
+                }
+                continue;
+            }
+            Err(e) => return Err(client.read_error(&e)),
         };
         so_far += n as u64;
-        add_received(&config.cache_dir, n as u64);
+        let within_run_budget = try_add_received(&config.cache_dir, n as u64, limits.run_budget);
         progress.downloaded(so_far);
         if so_far > limits.max_size {
             return Err(DownloadError::TooLarge);
         }
-        if so_far > budget {
+        if !within_run_budget {
             return Err(DownloadError::BudgetExhausted);
         }
         temp.write_all(&buf[..n]).map_err(cache_error)?;

@@ -268,3 +268,21 @@ fn batches_follow_javas_hash_map_order() {
         .collect();
     assert_eq!(order, [0x10, 1, (1 << 64) | 2]);
 }
+
+/// Pushing and immediately popping a pack while its download batch is still in flight
+/// keeps it counted in `tracked()` until the batch completes.
+#[test]
+fn push_and_pop_while_downloading_still_counts_toward_tracked() {
+    let mut p = allowed();
+    p.push(A, "http://h/a".into(), None);
+    p.run_tasks();
+    let b = batch(&p.take_effects());
+    assert_eq!(p.tracked(), 1);
+    p.pop(A);
+    p.run_tasks();
+    // Entry is removed from `packs`, but still pending in `out` while download `b` runs.
+    assert_eq!(p.tracked(), 1);
+    p.downloaded(b, vec![(A, Err(()))]);
+    p.run_tasks();
+    assert_eq!(p.tracked(), 0);
+}

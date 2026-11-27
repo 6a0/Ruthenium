@@ -123,6 +123,8 @@ impl Decoder {
 
     /// Appends the next packet's samples to `out`; false at the end of the stream.
     pub fn next_into(&mut self, out: &mut Vec<i16>) -> Result<bool, String> {
+        const MAX_SKIPPED_PACKETS: u32 = 64;
+        let mut skipped = 0u32;
         loop {
             let packet = match self.reader.next_packet() {
                 Ok(Some(p)) => p,
@@ -133,12 +135,22 @@ impl Decoder {
                 Err(e) => return Err(err(e)),
             };
             if packet.track_id != self.track {
+                skipped += 1;
+                if skipped > MAX_SKIPPED_PACKETS {
+                    return Err("too many skipped packets in Ogg stream".into());
+                }
                 continue;
             }
             let buf = match self.decoder.decode(&packet) {
                 Ok(b) => b,
                 // A damaged packet is skipped, as JOrbis skips one it can't synthesise.
-                Err(Error::DecodeError(_)) => continue,
+                Err(Error::DecodeError(_)) => {
+                    skipped += 1;
+                    if skipped > MAX_SKIPPED_PACKETS {
+                        return Err("too many corrupt packets in Ogg stream".into());
+                    }
+                    continue;
+                }
                 Err(e) => return Err(err(e)),
             };
             if usize::from(self.channels) != buf.spec().channels().count() {

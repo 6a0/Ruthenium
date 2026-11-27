@@ -99,11 +99,24 @@ impl SoundSwaps {
 }
 
 /// The server's prompt as plain text, cut to size: control characters (but line breaks)
-/// as spaces, at most [`MAX_PROMPT_CHARS`] characters and [`MAX_PROMPT_LINES`] lines.
+/// as spaces, format characters stripped, consecutive combining marks capped to prevent
+/// vertical Zalgo overflow, at most [`MAX_PROMPT_CHARS`] characters and
+/// [`MAX_PROMPT_LINES`] lines.
 pub fn prompt_lines(text: &str) -> Vec<String> {
+    let mut combining_run = 0usize;
     let cleaned: String = text
         .chars()
-        .filter(|&c| !is_format_char(c))
+        .filter(|&c| {
+            if is_format_char(c) {
+                return false;
+            }
+            if is_combining_mark(c) {
+                combining_run += 1;
+                return combining_run <= 2;
+            }
+            combining_run = 0;
+            true
+        })
         .take(MAX_PROMPT_CHARS)
         .map(|c| if c != '\n' && c.is_control() { ' ' } else { c })
         .collect();
@@ -112,6 +125,19 @@ pub fn prompt_lines(text: &str) -> Vec<String> {
         .map(|l| l.trim_end().to_owned())
         .take(MAX_PROMPT_LINES)
         .collect()
+}
+
+/// Non-spacing / enclosing combining marks (common Unicode blocks used in Zalgo text).
+fn is_combining_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{0483}'..='\u{0489}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
 }
 
 /// Unicode's format characters (general category Cf): bidirectional overrides and
@@ -229,10 +255,14 @@ impl Menu {
         } else {
             vec![button("Yes", Action::Confirm), button("No", Action::Cancel)]
         };
-        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-        self.session_form(FormKind::PackPrompt, title, &refs, buttons);
         if let Screen::Form(FormKind::PackPrompt, form, _) = &mut self.screen {
-            form.set_message_window(PROMPT_WINDOW, &self.fonts);
+            form.update_prompt(title.to_owned(), lines, buttons, PROMPT_WINDOW, &self.fonts);
+        } else {
+            let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+            self.session_form(FormKind::PackPrompt, title, &refs, buttons);
+            if let Screen::Form(FormKind::PackPrompt, form, _) = &mut self.screen {
+                form.set_message_window(PROMPT_WINDOW, &self.fonts);
+            }
         }
         self.packs.prompt = Some((in_world, p.required));
     }
@@ -249,13 +279,18 @@ impl Menu {
     /// `ConfirmScreen` has it.
     pub(super) fn answer_pack_prompt(&mut self, accept: bool) {
         let Some((in_world, _)) = self.packs.prompt.take() else {
+            self.screen = Screen::Servers;
             return;
         };
-        if let Some(s) = &self.session {
-            s.answer_pack_prompt(accept);
-        }
+        let Some(s) = &self.session else {
+            self.screen = Screen::Servers;
+            return;
+        };
+        s.answer_pack_prompt(accept);
         // (Declining a required pack: the session closes, with vanilla's reason.)
-        if in_world {
+        if self.death.is_some() {
+            self.death_form();
+        } else if in_world {
             self.enter_game();
         } else {
             self.connecting_form(ruthenium_net::connection::Stage::Joining);
@@ -352,7 +387,19 @@ impl Menu {
                 }
             }
         }
-        if !self.packs.given.is_empty() {
+        // Once only: leaving ends a session here and again when its Closed event comes,
+        // and a second request would overtake the first and build vanilla's again.
+        let vanilla_pending = self
+            .packs
+            .wanted
+            .iter()
+            .any(|r| r.session == 0 && r.packs.is_empty())
+            || self
+                .packs
+                .reloader
+                .as_ref()
+                .is_some_and(Reloader::vanilla_pending);
+        if (!self.packs.given.is_empty() || self.packs.stale) && !vanilla_pending {
             self.packs.stale = true;
             self.packs.wanted.push(Request {
                 packs: Vec::new(),
@@ -384,8 +431,14 @@ impl Menu {
         };
         for r in wanted {
             // The resources in use are already of these packs (vanilla makes them again;
-            // here they stay, and the world isn't meshed again for nothing).
-            if !reloader.busy() && renderer.has_world() && r.packs == self.packs.given {
+            // here they stay, and the world isn't meshed again for nothing). Never take
+            // this fast path while assets are stale or sounds differ.
+            if !self.packs.stale
+                && !reloader.busy()
+                && renderer.has_world()
+                && r.packs == self.packs.given
+                && self.packs.sounds_of == self.packs.given
+            {
                 eprintln!("[ruthenium] the resources in use are of these packs already");
                 if r.session == self.packs.session_number
                     && let Some(s) = &self.session
@@ -396,8 +449,12 @@ impl Menu {
             }
             reloader.request(r, max);
         }
-        // The first world's assets: vanilla's, unless a reload is building them.
-        if self.session.is_some() && !renderer.has_world() && !self.packs.world_requested {
+        // The first world's assets (or recovering from a failed vanilla cleanup reload):
+        // vanilla's, unless a reload is already building them.
+        if self.session.is_some()
+            && ((!renderer.has_world() && !self.packs.world_requested)
+                || (self.packs.stale && !reloader.busy()))
+        {
             self.packs.world_requested = true;
             if !reloader.busy() {
                 reloader.request(
@@ -409,30 +466,42 @@ impl Menu {
                 );
             }
         }
-        let Some((request, result)) = reloader.poll(max) else {
-            return;
-        };
-        let ok = match result {
-            Ok(r) => self.apply_reload(r, &request, renderer),
-            Err(e) => {
-                eprintln!("[ruthenium] the resource reload failed: {e}");
-                false
-            }
-        };
-        if !ok && request.session == 0 {
-            // The first world's assets didn't build: ask again with the next session.
-            self.packs.world_requested = false;
+        let mut completed = Vec::new();
+        while let Some(item) = reloader.poll(max) {
+            completed.push(item);
         }
-        if request.session == self.packs.session_number
-            && request.session != 0
-            && let Some(s) = &self.session
-        {
-            s.resources_reloaded(ok);
+        for (request, result) in completed {
+            let active = request.session == 0
+                || (self.session.is_some() && request.session == self.packs.session_number);
+            if !active {
+                eprintln!(
+                    "[ruthenium] dropping reload from ended session {}",
+                    request.session
+                );
+                continue;
+            }
+            let ok = match result {
+                Ok(r) => self.apply_reload(r, &request, renderer),
+                Err(e) => {
+                    eprintln!("[ruthenium] the resource reload failed: {e}");
+                    false
+                }
+            };
+            if !ok && request.session == 0 {
+                // The first world's assets didn't build: ask again with the next session.
+                self.packs.world_requested = false;
+            }
+            if request.session == self.packs.session_number
+                && request.session != 0
+                && let Some(s) = &self.session
+            {
+                s.resources_reloaded(ok);
+            }
         }
     }
 
     /// Puts a reload's resources in use: false if the renderer couldn't take them (then
-    /// nothing changed but what it took).
+    /// `stale` is set so a clean vanilla restoration reload is never skipped).
     fn apply_reload(&mut self, r: Reloaded, request: &Request, renderer: &mut Renderer) -> bool {
         if let Some(world) = r.world {
             let had = renderer.has_world();
@@ -443,6 +512,11 @@ impl Menu {
             };
             if let Err(e) = done {
                 eprintln!("[ruthenium] the world's new assets didn't load: {e}");
+                // `replace_world` may have replaced sky/HUD/block entities before failing,
+                // so mark stale to guarantee a clean vanilla reload runs on recovery/leave.
+                if had {
+                    self.packs.stale = true;
+                }
                 return false;
             }
         }
@@ -569,6 +643,8 @@ mod tests {
             packs: vec![(1, PathBuf::from("/p.zip"))],
             session: 4,
         });
+        m.packs_session_over();
+        // Leaving ends it here and again when its Closed event comes: one request.
         m.packs_session_over();
         let lang = m.joiner.as_mut().unwrap().server_lang();
         assert!(!lang.contains_key("death.attack.generic"));

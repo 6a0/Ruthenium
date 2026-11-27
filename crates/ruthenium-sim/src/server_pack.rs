@@ -679,9 +679,18 @@ impl<P: Clone> ServerPacks<P> {
         self.manager.prompt
     }
 
-    /// The packs the manager keeps (pushed, and not yet gone).
+    /// The packs the manager keeps (pushed and not yet gone), plus any already-removed
+    /// packs whose download batches are still queued/in-flight so push+pop floods cannot
+    /// bypass `MAX_TRACKED` and exhaust memory in `out` or the download channel.
     pub fn tracked(&self) -> usize {
-        self.manager.packs.len()
+        let in_flight_removed = self
+            .manager
+            .out
+            .iter()
+            .flat_map(|(_, serials)| serials.iter())
+            .filter(|&&s| !self.manager.packs.iter().any(|p| p.serial == s))
+            .count();
+        self.manager.packs.len().saturating_add(in_flight_removed)
     }
 
     /// A batch's result (on its way to the game thread: it runs with the tasks).

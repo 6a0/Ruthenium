@@ -88,9 +88,14 @@ fn darkened(c: [u32; 4]) -> u32 {
 pub fn solidify(img: &mut Image) {
     let (w, h) = (img.width as i64, img.height as i64);
     let n = (w * h) as usize;
+    if n == 0 {
+        return;
+    }
     let mut nearest = vec![0u32; n];
     let mut dist = vec![i32::MAX; n];
-    let mut queue = VecDeque::new();
+    // Use u32 indices (half the memory of usize on 64-bit) and only enqueue boundary
+    // opaque pixels that touch at least one transparent pixel (preserving exact BFS order).
+    let mut queue: VecDeque<u32> = VecDeque::new();
     // Seeded column by column, as vanilla does; ties resolve by this order.
     for x in 0..w {
         for y in 0..h {
@@ -99,11 +104,18 @@ pub fn solidify(img: &mut Image) {
             if alpha(c) != 0 {
                 dist[i] = 0;
                 nearest[i] = c;
-                queue.push_back(i);
+                let has_empty_neighbor = (x + 1 < w && alpha(img.pixels[i + 1]) == 0)
+                    || (x > 0 && alpha(img.pixels[i - 1]) == 0)
+                    || (y + 1 < h && alpha(img.pixels[i + w as usize]) == 0)
+                    || (y > 0 && alpha(img.pixels[i - w as usize]) == 0);
+                if has_empty_neighbor {
+                    queue.push_back(i as u32);
+                }
             }
         }
     }
     while let Some(i) = queue.pop_front() {
+        let i = i as usize;
         let (x, y) = (i as i64 % w, i as i64 / w);
         for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
             let (nx, ny) = (x + dx, y + dy);
@@ -112,7 +124,7 @@ pub fn solidify(img: &mut Image) {
                 if dist[j] > dist[i] + 1 {
                     dist[j] = dist[i] + 1;
                     nearest[j] = nearest[i];
-                    queue.push_back(j);
+                    queue.push_back(j as u32);
                 }
             }
         }

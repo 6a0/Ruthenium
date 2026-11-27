@@ -110,12 +110,22 @@ impl SoundHandle {
     /// does on a reload. Nothing changes without sound.
     pub fn replace_files(&self, files: SoundFiles) {
         let Some(engine) = &self.engine else { return };
-        load_sounds(Arc::new(files), &Arc::downgrade(engine), Instant::now());
+        load_sounds(
+            Arc::new(files),
+            &Arc::downgrade(engine),
+            Instant::now(),
+            false,
+        );
     }
 }
 
 /// Reads the events of `files` and hands them to the engine with a loader for them.
-fn load_sounds(files: Arc<SoundFiles>, engine: &std::sync::Weak<Mutex<Engine>>, started: Instant) {
+fn load_sounds(
+    files: Arc<SoundFiles>,
+    engine: &std::sync::Weak<Mutex<Engine>>,
+    started: Instant,
+    initial: bool,
+) {
     let (events, warnings) = files.events();
     for w in warnings.iter().take(20) {
         eprintln!("[sound] {w}");
@@ -129,16 +139,21 @@ fn load_sounds(files: Arc<SoundFiles>, engine: &std::sync::Weak<Mutex<Engine>>, 
         files.files(),
         started.elapsed().as_secs_f64() * 1e3
     );
-    let Ok(loader) = crate::loader::spawn(files, engine.clone()) else {
+    let Some(strong) = engine.upgrade() else {
+        return;
+    };
+    let mut guard = strong.lock().unwrap_or_else(PoisonError::into_inner);
+    if initial && guard.generation() > 0 {
+        // A session resource reload already installed newer sounds; don't overwrite them.
+        return;
+    }
+    let next_gen = guard.generation().wrapping_add(1);
+    let Ok(loader) = crate::loader::spawn(files, engine.clone(), next_gen) else {
         eprintln!("[sound] couldn't start the loader: no sounds");
         return;
     };
-    if let Some(engine) = engine.upgrade() {
-        engine
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .set_sounds(Arc::new(events), Box::new(loader));
-    }
+    let actual_gen = guard.set_sounds(Arc::new(events), Box::new(loader));
+    debug_assert_eq!(actual_gen, next_gen);
 }
 
 /// Sound for the client: see the module docs. Dropping it closes the output.
@@ -191,7 +206,7 @@ impl Audio {
                         return;
                     }
                 };
-                load_sounds(files, &weak, started);
+                load_sounds(files, &weak, started, true);
             });
         if let Err(e) = loading {
             eprintln!("[sound] couldn't start loading sounds: {e}");

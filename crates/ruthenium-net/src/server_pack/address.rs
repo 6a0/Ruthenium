@@ -17,13 +17,14 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use ureq::config::Config;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::NextTimeout;
+use ureq::unversioned::transport::time::Duration as UreqDuration;
 
 /// A range of addresses: `addr/prefix_len`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,14 +109,20 @@ impl Nat64Prefix {
         Some(Nat64Prefix { bytes, len })
     }
 
-    /// The IPv4 address `ip` reaches through this prefix, if it is in it.
-    fn embedded(&self, ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    /// Whether `ip` falls inside this prefix's leading `len` bits.
+    fn matches_prefix(&self, ip: Ipv6Addr) -> bool {
         let b = ip.octets();
         let n = usize::from(self.len / 8);
-        if b[..n] != self.bytes[..n] {
+        b[..n] == self.bytes[..n]
+    }
+
+    /// The IPv4 address `ip` reaches through this prefix, if it is in it and conforms to
+    /// RFC 6052 (`b[8] == 0` when `len != 96`).
+    fn embedded(&self, ip: Ipv6Addr) -> Option<Ipv4Addr> {
+        if !self.matches_prefix(ip) {
             return None;
         }
-        embedded_v4(b, self.len)
+        embedded_v4(ip.octets(), self.len)
     }
 }
 
@@ -144,8 +151,9 @@ pub(crate) fn nat64_prefixes(answers: impl IntoIterator<Item = IpAddr>) -> Vec<N
 }
 
 /// Asks the system resolver for `ipv4only.arpa` (RFC 7050), giving up after `timeout`:
-/// no answer means no NAT64 prefix of the network's own.
-pub(crate) fn discover_nat64(timeout: Duration) -> Vec<Nat64Prefix> {
+/// returns `Err(())` when the lookup timed out or couldn't run so callers can fail closed
+/// instead of caching an empty prefix list on transient timeouts.
+pub(crate) fn discover_nat64(timeout: Duration) -> Result<Vec<Nat64Prefix>, ()> {
     let (tx, rx) = mpsc::sync_channel(1);
     let spawned = std::thread::Builder::new()
         .name("nat64-discovery".into())
@@ -157,13 +165,14 @@ pub(crate) fn discover_nat64(timeout: Duration) -> Vec<Nat64Prefix> {
             let _ = tx.send(answers);
         });
     if spawned.is_err() {
-        return Vec::new();
+        return Err(());
     }
-    let prefixes = nat64_prefixes(rx.recv_timeout(timeout).unwrap_or_default());
+    let answers = rx.recv_timeout(timeout).map_err(|_| ())?;
+    let prefixes = nat64_prefixes(answers);
     if !prefixes.is_empty() {
         eprintln!("[packs] NAT64 prefixes of this network: {prefixes:?}");
     }
-    prefixes
+    Ok(prefixes)
 }
 
 /// What a download may connect to.
@@ -179,26 +188,47 @@ impl Policy {
     /// Whether a download may connect to `ip`: a public address, or one the caller
     /// allows; never an address no server can have.
     pub fn allowed(&self, ip: IpAddr) -> bool {
-        let reached = self.canonical(ip);
-        if never(reached) || never(ip) {
+        if never(ip) {
             return false;
         }
-        is_public(reached)
+        let base = canonical(ip);
+        if never(base) {
+            return false;
+        }
+        if let IpAddr::V6(v6) = base {
+            let mut matched_nat64 = false;
+            for prefix in &self.nat64 {
+                if !prefix.matches_prefix(v6) {
+                    continue;
+                }
+                matched_nat64 = true;
+                // A non-zero reserved `u` octet (byte 8) in a non-/96 NAT64 prefix is
+                // non-standard and may be ignored by permissive NAT64 translators; refuse it.
+                let Some(v4) = prefix.embedded(v6) else {
+                    return false;
+                };
+                let reached = IpAddr::V4(v4);
+                if never(reached) {
+                    return false;
+                }
+                let ok = is_public_v4(v4)
+                    || self
+                        .private_allowed
+                        .iter()
+                        .any(|r| r.contains(ip) || r.contains(reached));
+                if !ok {
+                    return false;
+                }
+            }
+            if matched_nat64 {
+                return true;
+            }
+        }
+        is_public(base)
             || self
                 .private_allowed
                 .iter()
-                .any(|r| r.contains(ip) || r.contains(reached))
-    }
-
-    /// IPv4 written as IPv6 (mapped, NAT64) as the IPv4 it reaches.
-    fn canonical(&self, ip: IpAddr) -> IpAddr {
-        let c = canonical(ip);
-        if let IpAddr::V6(v6) = c
-            && let Some(v4) = self.nat64.iter().find_map(|p| p.embedded(v6))
-        {
-            return v4.into();
-        }
-        c
+                .any(|r| r.contains(ip) || r.contains(base))
     }
 
     /// Whether the answer depends on the network's NAT64 prefixes: an IPv6 address that
@@ -316,7 +346,7 @@ pub(crate) struct CheckedResolver {
     inner: DefaultResolver,
     policy: Policy,
     /// The network's NAT64 prefixes: given (tests), or found on the first IPv6 answer.
-    nat64: OnceLock<Vec<Nat64Prefix>>,
+    nat64: Mutex<Option<Vec<Nat64Prefix>>>,
     discovery_timeout: Duration,
     /// Addresses tests treat as public (the test server is on loopback).
     pretend_public: Vec<IpAddr>,
@@ -331,36 +361,52 @@ impl CheckedResolver {
         discovery_timeout: Duration,
         pretend_public: Vec<IpAddr>,
     ) -> CheckedResolver {
-        let cell = OnceLock::new();
-        if let Some(n) = nat64 {
-            let _ = cell.set(n);
-        }
         CheckedResolver {
             inner: DefaultResolver::default(),
             policy: Policy {
                 private_allowed,
                 nat64: Vec::new(),
             },
-            nat64: cell,
+            nat64: Mutex::new(nat64),
             discovery_timeout,
             pretend_public,
             refused: Arc::default(),
         }
     }
 
-    fn allowed(&self, ip: IpAddr) -> bool {
+    fn allowed(&self, ip: IpAddr, timeout: NextTimeout) -> bool {
         if self.pretend_public.contains(&ip) {
             return true;
         }
         if !self.policy.needs_nat64(ip) {
             return self.policy.allowed(ip);
         }
-        let nat64 = self
-            .nat64
-            .get_or_init(|| discover_nat64(self.discovery_timeout));
+        let nat64 = {
+            let guard = self.nat64.lock().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
+        let nat64 = match nat64 {
+            Some(list) => list,
+            None => {
+                let budget = match timeout.after {
+                    UreqDuration::Exact(d) => self.discovery_timeout.min(d),
+                    _ => self.discovery_timeout,
+                };
+                if budget.is_zero() {
+                    return false;
+                }
+                let Ok(found) = discover_nat64(budget) else {
+                    // Fail closed if NAT64 discovery timed out, without permanently caching.
+                    return false;
+                };
+                let mut guard = self.nat64.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(found.clone());
+                found
+            }
+        };
         Policy {
             private_allowed: self.policy.private_allowed.clone(),
-            nat64: nat64.clone(),
+            nat64,
         }
         .allowed(ip)
     }
@@ -384,7 +430,7 @@ impl Resolver for CheckedResolver {
         let addrs = self.inner.resolve(uri, config, timeout)?;
         for addr in addrs.iter() {
             let ip = addr.ip();
-            if !self.allowed(ip) {
+            if !self.allowed(ip, timeout) {
                 if let Ok(mut r) = self.refused.lock() {
                     *r = Some(ip);
                 }
@@ -683,5 +729,34 @@ mod tests {
             assert!(!allowed(ip(s), true), "{s}");
             assert!(!allowed(ip(s), false), "{s}");
         }
+    }
+
+    #[test]
+    fn nat64_non_zero_u_octet_and_multi_prefix_are_refused() {
+        // Non-zero RFC 6052 reserved octet b[8] inside a discovered non-/96 prefix must
+        // fail closed rather than falling through as a plain public IPv6 address.
+        let p64 = Nat64Prefix::new("2a00:1234:5678:9abc::".parse().unwrap(), 64).unwrap();
+        let IpAddr::V6(v6) = synthesize("2a00:1234:5678:9abc::", 64, "127.0.0.1") else {
+            unreachable!()
+        };
+        let mut b = v6.octets();
+        b[8] = 0x01;
+        let policy = Policy {
+            private_allowed: Vec::new(),
+            nat64: vec![p64],
+        };
+        assert!(!policy.allowed(IpAddr::V6(Ipv6Addr::from(b))));
+
+        // Multiple overlapping NAT64 prefixes: even if the first extracts a public IPv4,
+        // a second matching prefix that extracts a private IPv4 must still refuse it.
+        let p32 = Nat64Prefix::new("2a00:1234::".parse().unwrap(), 32).unwrap();
+        let p64_priv = Nat64Prefix::new("2a00:1234:0808:0808::".parse().unwrap(), 64).unwrap();
+        // Bytes 4..8 = 8.8.8.8 (public under /32), bytes 9..13 = 127.0.0.1 (private under /64).
+        let addr = synthesize("2a00:1234:0808:0808::", 64, "127.0.0.1");
+        let multi = Policy {
+            private_allowed: Vec::new(),
+            nat64: vec![p32, p64_priv],
+        };
+        assert!(!multi.allowed(addr));
     }
 }

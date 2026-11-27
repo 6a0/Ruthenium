@@ -3,7 +3,9 @@
 //! `submitBlockDestroyAnimation`, `ShapeOutlineFeatureRenderer`,
 //! `SheetedDecalTextureGenerator`).
 
-use ruthenium_assets::model::{BakedQuad, Layer, ModelPart};
+#[cfg(test)]
+use ruthenium_assets::model::Layer;
+use ruthenium_assets::model::{BakedQuad, ModelPart};
 use ruthenium_gpu::{Arrival, FrameData, Pass, TextureDesc, TextureId, TextureTable, UploadRing};
 use ruthenium_prepare::exporters::ModelFace;
 use ruthenium_shaders::interface::{CRACK, LINE};
@@ -217,8 +219,10 @@ impl BlockMarks {
                 std::array::from_fn(|i| (((pos[i] >> 4) << 4) - view.block[i]) as f32);
             let into = &mut self.cracks[usize::from(is_translucent(&parts))];
             let before = into.len();
+            let mut visited = 0usize;
             for quad in parts.iter().flat_map(|p| p.all()) {
-                if into.len() >= MAX_CRACKS {
+                visited += 1;
+                if into.len() >= MAX_CRACKS || visited > MAX_CRACKS * 4 {
                     break;
                 }
                 if let Some(words) = crack_words(quad, base, origin) {
@@ -380,12 +384,9 @@ fn parts_of<'a>(table: &'a BlockTable, state: u32, pos: [i32; 3], out: &mut Vec<
 }
 
 /// Whether a model has anything that is seen through (`hasMaterialFlag` of the
-/// translucent flag).
+/// translucent flag), using each part's precomputed flag in O(parts).
 fn is_translucent(parts: &[&ModelPart]) -> bool {
-    parts
-        .iter()
-        .flat_map(|p| p.all())
-        .any(|q| q.layer == Layer::Translucent)
+    parts.iter().any(|p| p.translucent)
 }
 
 /// The record of a quad of cracks: its corners from the camera's block, each where the

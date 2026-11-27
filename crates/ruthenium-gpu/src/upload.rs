@@ -91,6 +91,14 @@ pub enum UploadError {
     Abandoned,
 }
 
+impl UploadError {
+    /// Whether retrying in a later frame may succeed (transient fullness or readiness),
+    /// as opposed to a permanent rejection (`TooLarge`, `Abandoned`).
+    pub fn try_again(self) -> bool {
+        matches!(self, UploadError::Full | UploadError::NotReady)
+    }
+}
+
 impl fmt::Display for UploadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

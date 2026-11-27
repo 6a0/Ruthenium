@@ -201,12 +201,13 @@ impl ServerList {
     }
 
     /// Adds a server from the Add Server screen: an address already hidden is shown again
-    /// with the new name (and icon, if it has one), as vanilla does.
+    /// with the new name, icon and pack status.
     pub fn add_shown(&mut self, server: ServerEntry) {
         match self.unhide(&server.ip) {
             Some(existing) => {
                 existing.name = server.name;
                 existing.icon = server.icon;
+                existing.pack_status = server.pack_status;
             }
             None => self.add(server, false),
         }
@@ -266,5 +267,19 @@ mod tests {
         std::fs::write(&path, b"junk").unwrap();
         assert_eq!(ServerList::load(&path), ServerList::default());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn add_shown_updates_pack_status_of_existing_entry() {
+        let mut list = ServerList::default();
+        let mut hidden = ServerEntry::new("Direct", "play.example.com");
+        hidden.pack_status = PackStatus::Enabled;
+        list.add(hidden, true);
+        let mut explicit = ServerEntry::new("My Server", "play.example.com");
+        explicit.pack_status = PackStatus::Disabled;
+        list.add_shown(explicit);
+        assert_eq!(list.servers.len(), 1);
+        assert_eq!(list.servers[0].pack_status, PackStatus::Disabled);
+        assert!(list.hidden.is_empty());
     }
 }

@@ -223,6 +223,8 @@ pub struct ModelPart {
     ends: [u32; 7],
     /// The model's `ambientocclusion` (the topmost model that says; else on).
     pub ambient_occlusion: bool,
+    /// Precomputed: whether any quad in this part is in `Layer::Translucent`.
+    pub translucent: bool,
 }
 
 /// The storage order of the culled groups, by direction ordinal: north, south, east,
@@ -257,10 +259,12 @@ impl ModelPart {
             quads.extend(g);
             ends[i] = quads.len() as u32;
         }
+        let translucent = quads.iter().any(|q| q.layer == Layer::Translucent);
         ModelPart {
             quads,
             ends,
             ambient_occlusion,
+            translucent,
         }
     }
 }
@@ -376,10 +380,10 @@ fn parse_face(v: &Value) -> Result<Face, String> {
                 return Err(format!("expected 4 uv values, found {}", a.len()));
             }
             Some([
-                number(&a[0], "uv")?,
-                number(&a[1], "uv")?,
-                number(&a[2], "uv")?,
-                number(&a[3], "uv")?,
+                number(&a[0], "uv")?.clamp(-1024.0, 1024.0),
+                number(&a[1], "uv")?.clamp(-1024.0, 1024.0),
+                number(&a[2], "uv")?.clamp(-1024.0, 1024.0),
+                number(&a[3], "uv")?.clamp(-1024.0, 1024.0),
             ])
         }
     };
@@ -402,7 +406,7 @@ fn parse_face(v: &Value) -> Result<Face, String> {
 fn parse_rotation(v: &Value) -> Result<ElementRotation, String> {
     let mut origin = vec3(v.get("origin"), "origin")?;
     for c in &mut origin {
-        *c *= 0.0625;
+        *c = c.clamp(-80.0, 80.0) * 0.0625;
     }
     let degrees = 0.017_453_292_f32;
     let float = |key: &str| match v.get(key) {
@@ -696,6 +700,224 @@ pub(crate) struct Material<'a> {
     pub(crate) force_translucent: bool,
 }
 
+/// Compact 2-level bitmask of a sprite's transparency across all of its animation frames,
+/// enabling sub-microsecond sub-rect transparency queries even on 4096 x 4096 sprites.
+struct SpriteTransparencyIndex {
+    width: u32,
+    height: u32,
+    /// Per-row words: `row_words = width.div_ceil(64)`.
+    row_words: usize,
+    transparent: Vec<u64>,
+    translucent: Vec<u64>,
+    /// Per 64x64 tile summary: bit 0 = any transparent, bit 1 = any translucent.
+    tile_cols: usize,
+    tiles: Vec<u8>,
+}
+
+impl SpriteTransparencyIndex {
+    fn build(atlas: &Atlas, sprite: &Sprite) -> SpriteTransparencyIndex {
+        let (w, h) = (sprite.width, sprite.height);
+        let row_words = (w as usize).div_ceil(64);
+        let mut transparent = vec![0u64; row_words * h as usize];
+        let mut translucent = vec![0u64; row_words * h as usize];
+        let tile_cols = (w as usize).div_ceil(64);
+        let tile_rows = (h as usize).div_ceil(64);
+        let mut tiles = vec![0u8; tile_cols * tile_rows];
+        let mut ingest = |image: &crate::Image, ox: u32, oy: u32| {
+            for y in 0..h {
+                let row_base = y as usize * row_words;
+                let tile_row = (y as usize / 64) * tile_cols;
+                for x in 0..w {
+                    let a = crate::image::alpha(image.get(ox + x, oy + y));
+                    if a == 255 {
+                        continue;
+                    }
+                    let word = x as usize / 64;
+                    let bit = 1u64 << (x & 63);
+                    if a == 0 {
+                        transparent[row_base + word] |= bit;
+                        tiles[tile_row + word] |= 1;
+                    } else {
+                        translucent[row_base + word] |= bit;
+                        tiles[tile_row + word] |= 2;
+                    }
+                }
+            }
+        };
+        match sprite.animated.and_then(|i| atlas.animated.get(i)) {
+            Some(animated) => {
+                let mut seen = std::collections::HashSet::new();
+                for &(frame, _) in &animated.animation.frames {
+                    if !seen.insert(frame) {
+                        continue;
+                    }
+                    let (fx, fy) = animated.animation.frame_pos(frame);
+                    ingest(&animated.levels[0], fx * w, fy * h);
+                }
+            }
+            None => ingest(
+                &atlas.levels[0],
+                sprite.x + sprite.padding,
+                sprite.y + sprite.padding,
+            ),
+        }
+        SpriteTransparencyIndex {
+            width: w,
+            height: h,
+            row_words,
+            transparent,
+            translucent,
+            tile_cols,
+            tiles,
+        }
+    }
+
+    fn query(&self, x0: u32, y0: u32, x1: u32, y1: u32) -> Transparency {
+        let mut t = Transparency::default();
+        if x0 >= x1 || y0 >= y1 || self.width == 0 || self.height == 0 {
+            return t;
+        }
+        let first_word = x0 as usize / 64;
+        let last_word = (x1 - 1) as usize / 64;
+        let first_mask = u64::MAX << (x0 & 63);
+        let rem = x1 & 63;
+        let last_mask = if rem == 0 {
+            u64::MAX
+        } else {
+            (1u64 << rem) - 1
+        };
+        let scan_rows = |ya: u32, yb: u32, t: &mut Transparency| {
+            for y in ya..yb {
+                let base = y as usize * self.row_words;
+                for word in first_word..=last_word {
+                    let mut mask = u64::MAX;
+                    if word == first_word {
+                        mask &= first_mask;
+                    }
+                    if word == last_word {
+                        mask &= last_mask;
+                    }
+                    if !t.transparent && (self.transparent[base + word] & mask) != 0 {
+                        t.transparent = true;
+                    }
+                    if !t.translucent && (self.translucent[base + word] & mask) != 0 {
+                        t.translucent = true;
+                    }
+                    if t.transparent && t.translucent {
+                        return;
+                    }
+                }
+            }
+        };
+        let full_w_start = if x0.is_multiple_of(64) {
+            first_word
+        } else {
+            first_word + 1
+        };
+        let full_w_end = if x1.is_multiple_of(64) {
+            last_word + 1
+        } else {
+            last_word
+        };
+        let full_y_start = y0.div_ceil(64) * 64;
+        let full_y_end = (y1 / 64) * 64;
+        if full_w_start < full_w_end && full_y_start < full_y_end {
+            // Check interior 64x64 tiles in O(1) per tile.
+            for ty in (full_y_start / 64)..(full_y_end / 64) {
+                let row = ty as usize * self.tile_cols;
+                for tx in full_w_start..full_w_end {
+                    let bits = self.tiles[row + tx];
+                    if bits & 1 != 0 {
+                        t.transparent = true;
+                    }
+                    if bits & 2 != 0 {
+                        t.translucent = true;
+                    }
+                    if t.transparent && t.translucent {
+                        return t;
+                    }
+                }
+            }
+            // Scan only the partial strips around the interior tiles.
+            scan_rows(y0, full_y_start, &mut t);
+            if t.transparent && t.translucent {
+                return t;
+            }
+            scan_rows(full_y_end, y1, &mut t);
+            if t.transparent && t.translucent {
+                return t;
+            }
+            // Left and right partial columns in the middle band.
+            if first_word < full_w_start {
+                for y in full_y_start..full_y_end {
+                    let base = y as usize * self.row_words;
+                    if !t.transparent && (self.transparent[base + first_word] & first_mask) != 0 {
+                        t.transparent = true;
+                    }
+                    if !t.translucent && (self.translucent[base + first_word] & first_mask) != 0 {
+                        t.translucent = true;
+                    }
+                    if t.transparent && t.translucent {
+                        return t;
+                    }
+                }
+            }
+            if full_w_end <= last_word {
+                for y in full_y_start..full_y_end {
+                    let base = y as usize * self.row_words;
+                    if !t.transparent && (self.transparent[base + last_word] & last_mask) != 0 {
+                        t.transparent = true;
+                    }
+                    if !t.translucent && (self.translucent[base + last_word] & last_mask) != 0 {
+                        t.translucent = true;
+                    }
+                    if t.transparent && t.translucent {
+                        return t;
+                    }
+                }
+            }
+        } else {
+            scan_rows(y0, y1, &mut t);
+        }
+        t
+    }
+}
+
+/// Per-bake cache of sprite transparency indices so `rect_transparency` runs in O(1)
+/// instead of O(quads * sprite_area * frames).
+#[derive(Default)]
+pub(crate) struct TransparencyCache {
+    sprites: HashMap<usize, SpriteTransparencyIndex>,
+    rects: HashMap<(usize, u32, u32, u32, u32), Transparency>,
+}
+
+impl TransparencyCache {
+    pub(crate) fn query(&mut self, atlas: &Atlas, sprite: &Sprite, rect: [f32; 4]) -> Transparency {
+        if sprite.transparency.is_opaque() || rect == [0.0, 0.0, 1.0, 1.0] {
+            return sprite.transparency;
+        }
+        let (w, h) = (sprite.width, sprite.height);
+        let clamp = |v: f32, max: u32| (v.max(0.0) as u32).min(max);
+        let x0 = clamp((rect[0] * w as f32).floor(), w);
+        let y0 = clamp((rect[1] * h as f32).floor(), h);
+        let x1 = clamp((rect[2] * w as f32).ceil(), w);
+        let y1 = clamp((rect[3] * h as f32).ceil(), h);
+        let ptr = std::ptr::from_ref(sprite) as usize;
+        if let Some(&t) = self.rects.get(&(ptr, x0, y0, x1, y1)) {
+            return t;
+        }
+        let idx = self
+            .sprites
+            .entry(ptr)
+            .or_insert_with(|| SpriteTransparencyIndex::build(atlas, sprite));
+        let t = idx.query(x0, y0, x1, y1);
+        if self.rects.len() < 65_536 {
+            self.rects.insert((ptr, x0, y0, x1, y1), t);
+        }
+        t
+    }
+}
+
 /// The transparency of the texels a face shows, over every frame of its sprite
 /// (`SpriteContents.computeTransparency`); `rect` is `[u0, v0, u1, v1]` as fractions of
 /// the sprite. Coordinates outside the sprite are clamped into it.
@@ -710,13 +932,16 @@ fn rect_transparency(atlas: &Atlas, sprite: &Sprite, rect: [f32; 4]) -> Transpar
     let x1 = clamp((rect[2] * w as f32).ceil(), w);
     let y1 = clamp((rect[3] * h as f32).ceil(), h);
     let mut t = Transparency::default();
-    let mut scan = |image: &crate::Image, ox: u32, oy: u32| {
+    let scan = |image: &crate::Image, ox: u32, oy: u32, t: &mut Transparency| {
         for y in y0..y1 {
             for x in x0..x1 {
                 match crate::image::alpha(image.get(ox + x, oy + y)) {
                     0 => t.transparent = true,
                     255 => {}
                     _ => t.translucent = true,
+                }
+                if t.transparent && t.translucent {
+                    return;
                 }
             }
         }
@@ -726,11 +951,14 @@ fn rect_transparency(atlas: &Atlas, sprite: &Sprite, rect: [f32; 4]) -> Transpar
         Some(animated) => {
             let mut seen = std::collections::HashSet::new();
             for &(frame, _) in &animated.animation.frames {
+                if t.transparent && t.translucent {
+                    break;
+                }
                 if !seen.insert(frame) {
                     continue;
                 }
                 let (fx, fy) = animated.animation.frame_pos(frame);
-                scan(&animated.levels[0], fx * w, fy * h);
+                scan(&animated.levels[0], fx * w, fy * h, &mut t);
             }
         }
         // Level 0 of the atlas holds the sprite's image (only the colour of fully
@@ -739,6 +967,7 @@ fn rect_transparency(atlas: &Atlas, sprite: &Sprite, rect: [f32; 4]) -> Transpar
             &atlas.levels[0],
             sprite.x + sprite.padding,
             sprite.y + sprite.padding,
+            &mut t,
         ),
     }
     t
@@ -811,33 +1040,37 @@ fn rewind(positions: &mut [Vec3; 4], uvs: &mut [[f32; 2]; 4], direction: u8) -> 
 
 /// Bakes one face of an element (`FaceBakery.bakeQuad`).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bake_quad(
+pub(crate) fn bake_quad_with(
     element: &Element,
     face: &Face,
     direction: u8,
     material: &Material<'_>,
     model: Option<&Mat3>,
     uv_lock: Option<&Mat3>,
+    fixed_transparency: Option<Transparency>,
+    cache: Option<&mut TransparencyCache>,
 ) -> BakedQuad {
     let uv = face
         .uvs
         .unwrap_or_else(|| default_uvs(element.from, element.to, direction));
-    let transparency = if material.force_translucent {
+    let transparency = if let Some(t) = fixed_transparency {
+        t
+    } else if material.force_translucent {
         Transparency {
             transparent: false,
             translucent: true,
         }
     } else {
-        rect_transparency(
-            material.atlas,
-            material.sprite,
-            [
-                uv[0].min(uv[2]) / 16.0,
-                uv[1].min(uv[3]) / 16.0,
-                uv[0].max(uv[2]) / 16.0,
-                uv[1].max(uv[3]) / 16.0,
-            ],
-        )
+        let rect = [
+            uv[0].min(uv[2]) / 16.0,
+            uv[1].min(uv[3]) / 16.0,
+            uv[0].max(uv[2]) / 16.0,
+            uv[1].max(uv[3]) / 16.0,
+        ];
+        match cache {
+            Some(c) => c.query(material.atlas, material.sprite, rect),
+            None => rect_transparency(material.atlas, material.sprite, rect),
+        }
     };
     let sprite = material.sprite;
     let origin = [
@@ -907,15 +1140,30 @@ pub(crate) fn bake_quad(
 
 /// Bakes a model's elements under a variant's rotation
 /// (`UnbakedCuboidGeometry.bake`). `material` resolves a face's texture slot.
+#[cfg(test)]
 pub(crate) fn bake_elements<'a>(
     elements: &[Element],
     rotation: ModelRotation,
     material: &dyn Fn(&str) -> Material<'a>,
 ) -> [Vec<BakedQuad>; 7] {
+    let mut cache = TransparencyCache::default();
+    bake_elements_with(elements, rotation, material, &mut cache, &|| false)
+}
+
+pub(crate) fn bake_elements_with<'a>(
+    elements: &[Element],
+    rotation: ModelRotation,
+    material: &dyn Fn(&str) -> Material<'a>,
+    cache: &mut TransparencyCache,
+    cancelled: &dyn Fn() -> bool,
+) -> [Vec<BakedQuad>; 7] {
     let matrix = rotation.matrix();
     let model = (!rotation.is_identity()).then_some(&matrix);
     let mut groups: [Vec<BakedQuad>; 7] = Default::default();
-    for e in elements {
+    for (step, e) in elements.iter().enumerate() {
+        if step & 63 == 0 && cancelled() {
+            return Default::default();
+        }
         // An element flat along an axis draws only the two faces across it.
         let flat: [bool; 3] = std::array::from_fn(|a| e.from[a] == e.to[a]);
         let draws = |axis: usize| (0..3).all(|other| other == axis || !flat[other]);
@@ -929,13 +1177,15 @@ pub(crate) fn bake_elements<'a>(
             let lock = (rotation.uv_lock && model.is_some())
                 .then(|| uv_lock_transform(&matrix, d as u8))
                 .filter(|t| *t != IDENTITY);
-            let quad = bake_quad(
+            let quad = bake_quad_with(
                 e,
                 face,
                 d as u8,
                 &material(&face.texture),
                 model,
                 lock.as_ref(),
+                None,
+                Some(cache),
             );
             match face.cull {
                 None => groups[0].push(quad),
@@ -1239,6 +1489,7 @@ struct Baker<'a> {
     variants: usize,
     /// The missing model's id, under which the missing model's parts are baked.
     missing_id: Id,
+    transparency: TransparencyCache,
 }
 
 impl Baker<'_> {
@@ -1357,7 +1608,13 @@ impl Baker<'_> {
                 }
             };
             match chain.iter().find_map(|m| m.elements.as_deref()) {
-                Some(elements) => bake_elements(elements, rotation, &material),
+                Some(elements) => bake_elements_with(
+                    elements,
+                    rotation,
+                    &material,
+                    &mut self.transparency,
+                    &|| self.files.cancelled(),
+                ),
                 None => Default::default(),
             }
         };
@@ -1433,6 +1690,7 @@ impl BlockModels {
             quads: 0,
             variants: 0,
             missing_id: Id::minecraft("builtin/missing").expect("a valid id"),
+            transparency: TransparencyCache::default(),
         };
         let missing_id = baker.missing_id.clone();
         baker.raw.insert(missing_id.clone(), missing);
@@ -1578,7 +1836,20 @@ fn define(
                 }
             };
             let choice = choices.len() as u32;
-            choices.push(baker.choice(&list, weighted)?);
+            let built = baker.choice(&list, weighted)?;
+            let max_q = built
+                .entries
+                .iter()
+                .map(|&(_, part)| baker.parts[part as usize].all().len())
+                .max()
+                .unwrap_or(0);
+            if max_q > baker.limits.state_quads {
+                return Err(format!(
+                    "variant '{key}': {max_q} quads is more than a block state may have ({})",
+                    baker.limits.state_quads
+                ));
+            }
+            choices.push(built);
             for state in block.states() {
                 if wanted
                     .iter()
@@ -1612,8 +1883,15 @@ fn define(
             let (variants, weighted) =
                 parse_variants(part.get("apply").ok_or("a part without 'apply'")?, max)?;
             let choice = choices.len() as u32;
-            choices.push(baker.choice(&variants, weighted)?);
-            selectors.push((condition, choice));
+            let built = baker.choice(&variants, weighted)?;
+            let max_q = built
+                .entries
+                .iter()
+                .map(|&(_, p)| baker.parts[p as usize].all().len())
+                .max()
+                .unwrap_or(0);
+            choices.push(built);
+            selectors.push((condition, choice, max_q));
         }
         for state in block.states() {
             if covered[(state - block.first_state) as usize] {
@@ -1625,13 +1903,31 @@ fn define(
                     baker.limits.multipart_parts
                 ));
             }
-            let start = multipart.len() as u32;
-            for (condition, choice) in &selectors {
+            let start = multipart.len();
+            let mut state_quads = 0usize;
+            for (condition, choice, max_q) in &selectors {
                 if condition.as_ref().is_none_or(|c| c.holds(block, state)) {
+                    let count = multipart.len() - start + 1;
+                    state_quads = state_quads.saturating_add(*max_q);
+                    if count > baker.limits.state_multipart_parts {
+                        multipart.truncate(start);
+                        return Err(format!(
+                            "more multipart parts on one block state than allowed ({})",
+                            baker.limits.state_multipart_parts
+                        ));
+                    }
+                    if state_quads > baker.limits.state_quads {
+                        multipart.truncate(start);
+                        return Err(format!(
+                            "more quads on one block state than allowed ({})",
+                            baker.limits.state_quads
+                        ));
+                    }
                     multipart.push(*choice);
                 }
             }
-            states[state as usize] = StateModel::Multipart(start, multipart.len() as u32 - start);
+            states[state as usize] =
+                StateModel::Multipart(start as u32, (multipart.len() - start) as u32);
         }
     }
     Ok(())
@@ -2083,6 +2379,7 @@ mod tests {
             quads: 0,
             variants: 0,
             missing_id: Id::minecraft("builtin/missing").unwrap(),
+            transparency: TransparencyCache::default(),
         };
         let id = |path: &str| Id::minecraft(path).unwrap();
         let child = baker.part(&id("block/child"), ModelRotation::default());

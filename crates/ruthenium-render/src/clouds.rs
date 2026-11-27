@@ -87,8 +87,16 @@ impl CloudCells {
     /// width (the same for its square picture); a neighbour that falls outside a picture
     /// wider than it is high counts as empty here, where the game's would fail to load.
     pub fn from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<CloudCells> {
+        // Vanilla's clouds.png is 256x256; cap so a 4096x4096 untrusted PNG cannot stall
+        // the render thread with tens of millions of cell iterations.
+        const MAX_CLOUD_SIDE: u32 = 1024;
         let (w, h) = (width as i64, height as i64);
-        if w == 0 || h == 0 || rgba.len() != (w * h * 4) as usize {
+        if w == 0
+            || h == 0
+            || width > MAX_CLOUD_SIDE
+            || height > MAX_CLOUD_SIDE
+            || rgba.len() != (w * h * 4) as usize
+        {
             return None;
         }
         let empty = |x: i64, y: i64| {

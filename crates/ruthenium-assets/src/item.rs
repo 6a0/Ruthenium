@@ -16,8 +16,8 @@ use crate::id::Id;
 use crate::image::{Image, alpha};
 use crate::limits::Limits;
 use crate::model::{
-    BakedQuad, Element, Face, Layer, Material, ModelFiles, ModelRotation, RawModel, Vec3,
-    bake_elements, bake_quad, parse_model_limited,
+    BakedQuad, Element, Face, Layer, Material, ModelFiles, ModelRotation, RawModel,
+    TransparencyCache, Vec3, bake_elements_with, bake_quad_with, parse_model_limited,
 };
 use crate::resources::Resources;
 
@@ -30,11 +30,16 @@ pub struct ItemTransform {
     pub scale: [f32; 3],
 }
 
+fn finite_f32(v: &Value, default: f32) -> f32 {
+    v.as_f64()
+        .map(|f| f as f32)
+        .filter(|f| f.is_finite())
+        .unwrap_or(default)
+}
+
 fn floats(v: Option<&Value>, default: [f32; 3]) -> [f32; 3] {
     match v.and_then(Value::as_array) {
-        Some(a) if a.len() == 3 => {
-            std::array::from_fn(|i| a[i].as_f64().map_or(default[i], |f| f as f32))
-        }
+        Some(a) if a.len() == 3 => std::array::from_fn(|i| finite_f32(&a[i], default[i])),
         _ => default,
     }
 }
@@ -52,7 +57,7 @@ pub(crate) fn parse_display(v: Option<&Value>) -> Vec<(String, ItemTransform)> {
             let translation = floats(t.get("translation"), [0.0; 3]);
             let scale = floats(t.get("scale"), [1.0; 3]);
             let transform = ItemTransform {
-                rotation: floats(t.get("rotation"), [0.0; 3]),
+                rotation: floats(t.get("rotation"), [0.0; 3]).map(|c| c.clamp(-3600.0, 3600.0)),
                 // Sixteenths, and never farther than five blocks or larger than four times.
                 translation: translation.map(|c| (c * 0.0625).clamp(-5.0, 5.0)),
                 scale: scale.map(|c| c.clamp(-4.0, 4.0)),
@@ -96,9 +101,9 @@ fn compose(a: &Transformation, b: &Transformation) -> Transformation {
 fn rotation(v: Option<&Value>) -> Transformation {
     let q = match v {
         Some(Value::Array(a)) if a.len() == 4 => {
-            let q: [f32; 4] = std::array::from_fn(|i| a[i].as_f64().unwrap_or(0.0) as f32);
+            let q: [f32; 4] = std::array::from_fn(|i| finite_f32(&a[i], 0.0));
             let n = q.iter().map(|c| c * c).sum::<f32>().sqrt();
-            if n > 0.0 {
+            if n > 0.0 && n.is_finite() {
                 q.map(|c| c / n)
             } else {
                 return NO_TRANSFORMATION;
@@ -106,9 +111,9 @@ fn rotation(v: Option<&Value>) -> Transformation {
         }
         Some(Value::Object(o)) => {
             let axis = floats(o.get("axis"), [0.0, 1.0, 0.0]);
-            let angle = o.get("angle").and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let angle = o.get("angle").map_or(0.0, |a| finite_f32(a, 0.0));
             let n = axis.iter().map(|c| c * c).sum::<f32>().sqrt();
-            if n == 0.0 {
+            if n == 0.0 || !n.is_finite() {
                 return NO_TRANSFORMATION;
             }
             let (s, c) = (angle / 2.0).sin_cos();
@@ -141,14 +146,25 @@ fn rotation(v: Option<&Value>) -> Transformation {
 
 /// A definition's `transformation`: sixteen numbers, a matrix by rows, or its parts (a
 /// translation, a rotation, a scale and another rotation, done from the last).
+/// Entries are kept finite and bounded so extreme scales cannot cause full-screen overdraw.
 fn parse_transformation(v: &Value) -> Option<Transformation> {
-    match v {
-        Value::Array(a) if a.len() == 16 => Some(std::array::from_fn(|r| {
-            std::array::from_fn(|c| a[r * 4 + c].as_f64().unwrap_or(0.0) as f32)
-        })),
+    let m = match v {
+        Value::Array(a) if a.len() == 16 => {
+            let mut m = [[0.0f32; 4]; 3];
+            for r in 0..3 {
+                for c in 0..4 {
+                    let val = a[r * 4 + c].as_f64()? as f32;
+                    if !val.is_finite() {
+                        return None;
+                    }
+                    m[r][c] = val.clamp(-1024.0, 1024.0);
+                }
+            }
+            m
+        }
         Value::Object(o) => {
-            let t = floats(o.get("translation"), [0.0; 3]);
-            let s = floats(o.get("scale"), [1.0; 3]);
+            let t = floats(o.get("translation"), [0.0; 3]).map(|c| c.clamp(-1024.0, 1024.0));
+            let s = floats(o.get("scale"), [1.0; 3]).map(|c| c.clamp(-16.0, 16.0));
             let moved = [
                 [1.0, 0.0, 0.0, t[0]],
                 [0.0, 1.0, 0.0, t[1]],
@@ -160,13 +176,11 @@ fn parse_transformation(v: &Value) -> Option<Transformation> {
                 [0.0, 0.0, s[2], 0.0],
             ];
             let left = compose(&moved, &rotation(o.get("left_rotation")));
-            Some(compose(
-                &compose(&left, &scaled),
-                &rotation(o.get("right_rotation")),
-            ))
+            compose(&compose(&left, &scaled), &rotation(o.get("right_rotation")))
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    m.iter().flatten().all(|x| x.is_finite()).then_some(m)
 }
 
 /// One quad of an item's model.
@@ -370,29 +384,46 @@ pub enum Drawn<'a> {
 }
 
 impl Node {
-    /// Gives each leaf that is drawn for `held` to `out`, in order.
-    fn resolve<'a>(&'a self, held: &Held<'_>, out: &mut dyn FnMut(Drawn<'a>)) {
+    /// Gives each leaf that is drawn for `held` to `out`, in order, stopping once `left`
+    /// resolved models have been emitted.
+    fn resolve<'a>(&'a self, held: &Held<'_>, left: &mut usize, out: &mut dyn FnMut(Drawn<'a>)) {
+        if *left == 0 {
+            return;
+        }
         match self {
             Node::Empty => {}
             Node::Model {
                 mesh,
                 tints,
                 transformation,
-            } => out(Drawn::Model {
-                mesh: *mesh,
-                tints,
-                transformation,
-            }),
+            } => {
+                *left -= 1;
+                out(Drawn::Model {
+                    mesh: *mesh,
+                    tints,
+                    transformation,
+                });
+            }
             Node::Special {
                 special,
                 base,
                 transformation,
-            } => out(Drawn::Special {
-                special: *special,
-                base: *base,
-                transformation,
-            }),
-            Node::Composite(nodes) => nodes.iter().for_each(|n| n.resolve(held, out)),
+            } => {
+                *left -= 1;
+                out(Drawn::Special {
+                    special: *special,
+                    base: *base,
+                    transformation,
+                });
+            }
+            Node::Composite(nodes) => {
+                for n in nodes {
+                    if *left == 0 {
+                        break;
+                    }
+                    n.resolve(held, left, out);
+                }
+            }
             Node::Condition {
                 property,
                 on_true,
@@ -408,7 +439,7 @@ impl Node {
                     } => (held.has_component)(component, *ignore_default),
                     Condition::Never => false,
                 };
-                if holds { on_true } else { on_false }.resolve(held, out);
+                if holds { on_true } else { on_false }.resolve(held, left, out);
             }
             Node::Select {
                 property,
@@ -433,7 +464,7 @@ impl Node {
                         .find(|(when, _)| when.iter().any(|w| w == v))
                         .map(|(_, node)| node)
                 });
-                chosen.unwrap_or(fallback).resolve(held, out);
+                chosen.unwrap_or(fallback).resolve(held, left, out);
             }
             Node::Range {
                 property,
@@ -477,7 +508,7 @@ impl Node {
                 chosen
                     .filter(|_| !value.is_nan())
                     .unwrap_or(fallback)
-                    .resolve(held, out);
+                    .resolve(held, left, out);
             }
         }
     }
@@ -491,6 +522,8 @@ pub struct ItemModels {
     /// (`swap_animation_scale`), for those that say.
     swap_scales: HashMap<String, f32>,
     meshes: Vec<ItemMesh>,
+    /// Maximum models resolved per item stack ([`Limits::item_resolved_models`]).
+    max_resolved: usize,
     /// What went wrong on the way, for the log.
     pub warnings: Vec<String>,
 }
@@ -523,6 +556,7 @@ struct Baker<'a> {
     /// A flat picture's quads, by its atlas, sprite and layer: each picture is looked
     /// through once, however many models show it. `None`: more quads than may be baked.
     flat: HashMap<(usize, usize, i32), FlatQuads>,
+    transparency: TransparencyCache,
 }
 
 fn colour(v: Option<&Value>, default: u32) -> u32 {
@@ -541,6 +575,56 @@ fn kind(v: &Value, key: &str) -> String {
 }
 
 impl<'a> Baker<'a> {
+    fn new(
+        files: &'a dyn ModelFiles,
+        blocks: &'a Atlas,
+        items: &'a Atlas,
+        grass: Option<&'a Image>,
+    ) -> Baker<'a> {
+        Baker {
+            files,
+            blocks,
+            items,
+            grass,
+            raw: HashMap::new(),
+            baked: HashMap::new(),
+            meshes: Vec::new(),
+            warnings: Vec::new(),
+            limits: files.limits(),
+            quads: 0,
+            nodes: 0,
+            depth: 0,
+            flat: HashMap::new(),
+            transparency: TransparencyCache::default(),
+        }
+    }
+
+    fn bake_definition(
+        &mut self,
+        id: &str,
+        text: &str,
+        out: &mut HashMap<String, Node>,
+        swap_scales: &mut HashMap<String, f32>,
+    ) {
+        let file = serde_json::from_str::<Value>(text).ok();
+        if let Some(scale) = file
+            .as_ref()
+            .and_then(|v| v.get("swap_animation_scale")?.as_f64())
+            .map(|s| s as f32)
+            .filter(|s| s.is_finite())
+        {
+            swap_scales.insert(id.to_owned(), scale.clamp(-16.0, 16.0));
+        }
+        let root = file.and_then(|v| v.get("model").cloned());
+        match root {
+            Some(model) => {
+                let node = self.node(&model, &NO_TRANSFORMATION);
+                out.insert(id.to_owned(), node);
+            }
+            None => self.warn(format!("item {id}: not a definition")),
+        }
+    }
+
     fn warn(&mut self, text: String) {
         if self.warnings.len() < 200 {
             self.warnings.push(text);
@@ -634,19 +718,31 @@ impl<'a> Baker<'a> {
                     std::ptr::from_ref(sprite) as usize,
                     layer as i32,
                 );
-                let left = self.limits.baked_quads.saturating_sub(self.quads);
+                let left = self
+                    .limits
+                    .baked_quads
+                    .saturating_sub(self.quads)
+                    .min(self.limits.item_mesh_quads.saturating_sub(quads.len()));
                 let flat = match self.flat.get(&key) {
-                    Some(f) => f.clone(),
+                    // (Baked for another mesh, which may have had more room left.)
+                    Some(Some(f)) if f.len() <= left => Some(f.clone()),
+                    Some(_) => None,
                     None => {
-                        let f = flat_layer(atlas, sprite, layer as i32, left).map(Rc::new);
-                        self.flat.insert(key, f.clone());
+                        let f = flat_layer(atlas, sprite, layer as i32, left, &|| {
+                            self.files.cancelled()
+                        })
+                        .map(Rc::new);
+                        // A failure with less room than a whole mesh's says nothing of
+                        // the next mesh, which may fit the layer.
+                        if f.is_some() || left >= self.limits.item_mesh_quads {
+                            self.flat.insert(key, f.clone());
+                        }
                         f
                     }
                 };
                 let Some(flat) = flat else {
                     self.warn(format!(
-                        "model {id}: {sprite_id} has more edges than may be baked ({})",
-                        self.limits.baked_quads
+                        "model {id}: {sprite_id} has more edges than may be baked ({left})"
                     ));
                     break;
                 };
@@ -663,13 +759,19 @@ impl<'a> Baker<'a> {
         } else if let Some(elements) = chain.iter().find_map(|m| m.elements.as_deref()) {
             // A model of elements takes all its pictures from one atlas (the game refuses
             // one that does not): the atlas of the first picture a face asks for.
+            let (items_atlas, blocks_atlas, files) = (self.items, self.blocks, self.files);
             let of: std::cell::Cell<Option<&Atlas>> = std::cell::Cell::new(None);
             let unknown = std::cell::RefCell::new(&mut missing);
             let material = |slot: &str| {
                 let slot = slot.strip_prefix('#').unwrap_or(slot);
-                let found = resolved
-                    .get(slot)
-                    .map(|&(id, force)| (id, force, self.sprite(id)));
+                let found = resolved.get(slot).map(|&(id, force)| {
+                    let s = match (items_atlas.sprite(id), blocks_atlas.sprite(id)) {
+                        (Some(s), _) => (items_atlas, s, true),
+                        (None, Some(s)) => (blocks_atlas, s, true),
+                        (None, None) => (items_atlas, items_atlas.missing(), false),
+                    };
+                    (id, force, s)
+                });
                 let (atlas, sprite, force_translucent) = match found {
                     Some((_, force, (atlas, sprite, true))) => (atlas, sprite, force),
                     other => {
@@ -677,7 +779,7 @@ impl<'a> Baker<'a> {
                             Some((id, ..)) => id.to_string(),
                             None => format!("#{slot}"),
                         });
-                        let atlas = of.get().unwrap_or(self.items);
+                        let atlas = of.get().unwrap_or(items_atlas);
                         (atlas, atlas.missing(), false)
                     }
                 };
@@ -690,12 +792,25 @@ impl<'a> Baker<'a> {
                     force_translucent,
                 }
             };
-            let groups = bake_elements(elements, ModelRotation::default(), &material);
-            let atlas = of.get().unwrap_or(self.items);
+            let groups = bake_elements_with(
+                elements,
+                ModelRotation::default(),
+                &material,
+                &mut self.transparency,
+                &|| files.cancelled(),
+            );
+            let atlas = of.get().unwrap_or(items_atlas);
             // As `QuadCollection.getAll` lists them.
             quads.extend(groups.into_iter().flatten().map(|q| (q, atlas)));
         }
-        let quads = if self.quads.saturating_add(quads.len()) > self.limits.baked_quads {
+        let quads = if quads.len() > self.limits.item_mesh_quads {
+            self.warn(format!(
+                "model {id}: {} quads is more than an item model may have ({})",
+                quads.len(),
+                self.limits.item_mesh_quads
+            ));
+            Vec::new()
+        } else if self.quads.saturating_add(quads.len()) > self.limits.baked_quads {
             self.warn(format!(
                 "model {id}: the models have more quads than may be baked ({})",
                 self.limits.baked_quads
@@ -857,6 +972,7 @@ impl<'a> Baker<'a> {
                     .and_then(Value::as_array)
                     .map_or(&[][..], Vec::as_slice)
                     .iter()
+                    .take(self.limits.item_resolved_models)
                     .map(|m| self.node(m, &transformation))
                     .collect(),
             ),
@@ -898,6 +1014,7 @@ impl<'a> Baker<'a> {
                             Value::String(s) => vec![s.clone()],
                             Value::Array(a) => a
                                 .iter()
+                                .take(256)
                                 .filter_map(|s| Some(s.as_str()?.to_owned()))
                                 .collect(),
                             _ => return None,
@@ -982,8 +1099,9 @@ fn flat_layer(
     sprite: &Sprite,
     layer: i32,
     max_quads: usize,
+    cancelled: &dyn Fn() -> bool,
 ) -> Option<Vec<BakedQuad>> {
-    if max_quads < 2 {
+    if max_quads < 2 || cancelled() {
         return None;
     }
     let material = Material {
@@ -1009,7 +1127,17 @@ fn flat_layer(
             shade_direction: None,
             light_emission: 0,
         };
-        bake_quad(&element, &face, direction, &material, None, None)
+        // Skip rect_transparency: the caller overwrites `q.layer` from `sprite.transparency`.
+        bake_quad_with(
+            &element,
+            &face,
+            direction,
+            &material,
+            None,
+            None,
+            Some(sprite.transparency),
+            None,
+        )
     };
     const SOUTH: u8 = 3;
     const NORTH: u8 = 2;
@@ -1057,6 +1185,9 @@ fn flat_layer(
     const SIDES: [(i32, i32, u8); 4] = [(0, -1, 1), (0, 1, 0), (-1, 0, 5), (1, 0, 4)];
     let mut sides = std::collections::BTreeSet::new();
     for (image, ox, oy) in frames {
+        if cancelled() {
+            return None;
+        }
         let clear = |x: i32, y: i32| {
             x < 0
                 || y < 0
@@ -1065,6 +1196,9 @@ fn flat_layer(
                 || alpha(image.get(ox + x as u32, oy + y as u32)) == 0
         };
         for y in 0..height {
+            if y & 15 == 0 && cancelled() {
+                return None;
+            }
             for x in 0..width {
                 if clear(x, y) {
                     continue;
@@ -1080,7 +1214,10 @@ fn flat_layer(
             }
         }
     }
-    for (side, x, y) in sides {
+    for (step, (side, x, y)) in sides.into_iter().enumerate() {
+        if step & 255 == 0 && cancelled() {
+            return None;
+        }
         let (x, y) = (x as f32, y as f32);
         let across = side < 2;
         let (u0, u1) = (x + 0.1, x + 1.0 - 0.1);
@@ -1121,22 +1258,42 @@ fn flat_layer(
 impl ItemModels {
     /// Bakes every item definition of `resources` and the models they name, with the
     /// sprites of the block and item atlases and the grass colour map.
+    /// Streams definitions one file at a time so huge packs don't buffer all JSON in RAM.
     pub fn bake(
         resources: &Resources,
         blocks: &Atlas,
         items: &Atlas,
         grass: Option<&Image>,
     ) -> ItemModels {
-        let definitions: Vec<(String, String)> = resources
-            .list("items", |p| p.ends_with(".json"))
-            .iter()
-            .filter_map(|(id, r)| {
-                let name = id.path().strip_prefix("items/")?.strip_suffix(".json")?;
-                let text = r.text().ok()?;
-                Some((format!("{}:{name}", id.namespace()), text))
-            })
-            .collect();
-        ItemModels::bake_from(resources, &definitions, blocks, items, grass)
+        let listed = resources.list("items", |p| p.ends_with(".json"));
+        let mut baker = Baker::new(resources, blocks, items, grass);
+        let mut out = HashMap::new();
+        let mut swap_scales = HashMap::new();
+        for (id, r) in &listed {
+            if resources.cancelled() {
+                baker.warn("the load was cancelled".into());
+                break;
+            }
+            let Some(name) = id
+                .path()
+                .strip_prefix("items/")
+                .and_then(|p| p.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let Ok(text) = r.text() else {
+                continue;
+            };
+            let item_id = format!("{}:{name}", id.namespace());
+            baker.bake_definition(&item_id, &text, &mut out, &mut swap_scales);
+        }
+        ItemModels {
+            definitions: out,
+            swap_scales,
+            meshes: baker.meshes,
+            max_resolved: baker.limits.item_resolved_models,
+            warnings: baker.warnings,
+        }
     }
 
     /// The same, from the definitions' ids (`minecraft:stick`) and texts.
@@ -1147,21 +1304,7 @@ impl ItemModels {
         items: &Atlas,
         grass: Option<&Image>,
     ) -> ItemModels {
-        let mut baker = Baker {
-            files,
-            blocks,
-            items,
-            grass,
-            raw: HashMap::new(),
-            baked: HashMap::new(),
-            meshes: Vec::new(),
-            warnings: Vec::new(),
-            limits: files.limits(),
-            quads: 0,
-            nodes: 0,
-            depth: 0,
-            flat: HashMap::new(),
-        };
+        let mut baker = Baker::new(files, blocks, items, grass);
         let mut out = HashMap::new();
         let mut swap_scales = HashMap::new();
         for (id, text) in definitions {
@@ -1169,26 +1312,13 @@ impl ItemModels {
                 baker.warn("the load was cancelled".into());
                 break;
             }
-            let file = serde_json::from_str::<Value>(text).ok();
-            if let Some(scale) = file
-                .as_ref()
-                .and_then(|v| v.get("swap_animation_scale")?.as_f64())
-            {
-                swap_scales.insert(id.clone(), scale as f32);
-            }
-            let root = file.and_then(|v| v.get("model").cloned());
-            match root {
-                Some(model) => {
-                    let node = baker.node(&model, &NO_TRANSFORMATION);
-                    out.insert(id.clone(), node);
-                }
-                None => baker.warn(format!("item {id}: not a definition")),
-            }
+            baker.bake_definition(id, text, &mut out, &mut swap_scales);
         }
         ItemModels {
             definitions: out,
             swap_scales,
             meshes: baker.meshes,
+            max_resolved: baker.limits.item_resolved_models,
             warnings: baker.warnings,
         }
     }
@@ -1201,7 +1331,12 @@ impl ItemModels {
     /// The same, each leaf given to `each` as it is found.
     pub fn resolve_each<'a>(&'a self, id: &str, held: &Held<'_>, each: &mut dyn FnMut(Drawn<'a>)) {
         if let Some(node) = self.definitions.get(id) {
-            node.resolve(held, each);
+            let mut left = if self.max_resolved == 0 {
+                usize::MAX
+            } else {
+                self.max_resolved
+            };
+            node.resolve(held, &mut left, each);
         }
     }
 

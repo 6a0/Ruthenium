@@ -1404,3 +1404,96 @@ fn pack_urls_are_what_vanilla_tries() {
     assert!(!is_pack_url("https://exa mple.com/"));
     assert!(!is_pack_url("https://[::1/"));
 }
+
+#[test]
+fn zero_output_gzip_flood_is_stopped_by_wire_limit() {
+    // A valid gzip stream with ~650 KiB of empty deflate blocks that decompresses to 1 byte
+    // ('x'): decoded size is 1 byte, so only the raw wire-byte guard can stop it.
+    let mut gz = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03];
+    for _ in 0..130_000 {
+        gz.extend_from_slice(&[0x00, 0x00, 0x00, 0xFF, 0xFF]);
+    }
+    gz.extend_from_slice(&[0x01, 0x01, 0x00, 0xFE, 0xFF, b'x']);
+    // CRC32 of b"x" = 0x8cdc1683, ISIZE = 1
+    gz.extend_from_slice(&0x8cdc_1683u32.to_le_bytes());
+    gz.extend_from_slice(&1u32.to_le_bytes());
+    // Send with Content-Encoding: gzip (chunked so there is no Content-Length header).
+    let mut raw = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+    raw.extend_from_slice(format!("{:x}\r\n", gz.len()).as_bytes());
+    raw.extend_from_slice(&gz);
+    raw.extend_from_slice(b"\r\n0\r\n\r\n");
+    let server = serve(move |_| Reply::Raw(raw.clone()));
+    let dir = TempDir::new();
+    let limits = fetch::Limits {
+        max_size: 16 * 1024,
+        ..limits()
+    };
+    let (result, _) = one(&config(&dir), &server.url("/gzip-bloat"), None, &limits);
+    assert_eq!(result, Err(DownloadError::TooLarge));
+}
+
+#[test]
+fn cancel_token_aborts_stalled_download_immediately() {
+    struct TokenProgress(CancelToken);
+    impl Progress for TokenProgress {
+        fn request_start(&mut self) {}
+        fn download_start(&mut self, _: Option<u64>) {}
+        fn downloaded(&mut self, _: u64) {}
+        fn request_finished(&mut self, _: bool) {}
+        fn cancel_token(&self) -> Option<CancelToken> {
+            Some(self.0.clone())
+        }
+    }
+
+    let server = serve(|_| Reply::Silent(Duration::from_secs(10)));
+    let dir = TempDir::new();
+    let token = CancelToken::new();
+    let trigger = token.clone();
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(60));
+        trigger.cancel();
+    });
+    let started = std::time::Instant::now();
+    let limits = fetch::Limits {
+        headers: Duration::from_secs(5),
+        per_read: Duration::from_secs(5),
+        whole: Duration::from_secs(10),
+        ..limits()
+    };
+    let mut progress = TokenProgress(token);
+    let results = download_batch_with(
+        &config(&dir),
+        &[PackRequest {
+            id: ID,
+            url: server.url("/stall"),
+            sha1: None,
+        }],
+        &mut progress,
+        &limits,
+    );
+    handle.join().unwrap();
+    assert_eq!(results[0].1, Err(DownloadError::Cancelled));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cancellation waited {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn failed_download_does_not_leave_empty_uuid_dir() {
+    // Chunked, so the size is only found too large while reading, after the directory
+    // was made.
+    let server = serve(|_| Reply::Chunked(vec![body(5000)]));
+    let dir = TempDir::new();
+    let limits = fetch::Limits {
+        max_size: 100,
+        ..limits()
+    };
+    let (result, _) = one(&config(&dir), &server.url("/big"), None, &limits);
+    assert_eq!(result, Err(DownloadError::TooLarge));
+    assert!(
+        !dir.cache().join(ID_DIR).exists(),
+        "empty UUID directory should not remain after failed download"
+    );
+}

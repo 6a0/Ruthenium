@@ -207,6 +207,9 @@ pub struct Engine {
     failed: HashSet<String>,
     /// The file each slot waiting for its stream asked for.
     streaming: Box<[Option<String>]>,
+    /// Incremented on every `set_sounds` so stale callbacks from an old loader thread
+    /// cannot poison the next session's cache, failed set, or voice slots.
+    generation: u64,
     /// Plays dropped because no output was open.
     pub dropped: u64,
 }
@@ -241,18 +244,29 @@ impl Engine {
             warned: HashSet::new(),
             failed: HashSet::new(),
             streaming: vec![None; VOICES].into_boxed_slice(),
+            generation: 0,
             dropped: 0,
         }
     }
 
-    /// The events of the packs, and what fetches their samples.
-    pub fn set_sounds(&mut self, events: Arc<SoundEvents>, fetch: Box<dyn Fetch>) {
+    /// Monotonic reload generation, incremented on each [`Self::set_sounds`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The events of the packs, and what fetches their samples. Returns the new
+    /// generation token for loader callbacks.
+    pub fn set_sounds(&mut self, events: Arc<SoundEvents>, fetch: Box<dyn Fetch>) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
         self.stop_all();
         self.cache.clear();
         self.decoding.clear();
         self.failed.clear();
+        self.warned.clear();
+        self.streaming.fill(None);
         self.events = events;
         self.fetch = Some(fetch);
+        self.generation
     }
 
     pub fn events(&self) -> &SoundEvents {
@@ -508,10 +522,28 @@ impl Engine {
         self.decoded_once(file, pcm, true);
     }
 
+    /// Like [`Self::decoded`], ignoring callbacks from a previous `set_sounds` generation.
+    pub(crate) fn decoded_gen(
+        &mut self,
+        generation: u64,
+        file: &Id,
+        pcm: Result<Arc<Pcm>, String>,
+    ) {
+        if generation == self.generation {
+            self.decoded_once(file, pcm, true);
+        }
+    }
+
     /// A file couldn't be decoded for now (too much sound is decoded at once): the next
     /// play tries again.
     pub fn decoded_for_now(&mut self, file: &Id, why: String) {
         self.decoded_once(file, Err(why), false);
+    }
+
+    pub(crate) fn decoded_for_now_gen(&mut self, generation: u64, file: &Id, why: String) {
+        if generation == self.generation {
+            self.decoded_once(file, Err(why), false);
+        }
     }
 
     fn decoded_once(&mut self, file: &Id, pcm: Result<Arc<Pcm>, String>, lasting: bool) {
@@ -543,6 +575,18 @@ impl Engine {
 
     /// A stream is ready to play in `slot` (or couldn't be opened).
     pub fn stream_opened(&mut self, slot: u16, feed: Result<StreamFeed, String>) {
+        self.stream_opened_gen(self.generation, slot, feed);
+    }
+
+    pub(crate) fn stream_opened_gen(
+        &mut self,
+        generation: u64,
+        slot: u16,
+        feed: Result<StreamFeed, String>,
+    ) {
+        if generation != self.generation {
+            return;
+        }
         self.pump();
         let file = self
             .streaming
@@ -1174,5 +1218,33 @@ mod tests {
         r.engine.detach();
         assert_eq!(r.engine.play(hit([0.0; 3])), PlayResult::NotStarted);
         drop(mixer);
+    }
+
+    #[test]
+    fn stale_generation_callbacks_are_ignored_after_set_sounds() {
+        let mut r = rig();
+        let old_gen = r.engine.generation();
+        let file = Id::minecraft("sounds/hit.ogg").unwrap();
+        // Trigger a reload that advances the engine's generation.
+        r.engine.set_sounds(
+            Arc::new(SoundEvents::default()),
+            Box::new(FakeFetch(Arc::default())),
+        );
+        assert!(r.engine.generation() > old_gen);
+        // Stale decoded PCM and stream-open callbacks from the old generation are ignored.
+        r.engine.decoded_gen(old_gen, &file, Ok(pcm(4800)));
+        assert!(r.engine.cache.get(&id_key(&file)).is_none());
+        let (_, rx) = rtrb::RingBuffer::new(64);
+        r.engine.stream_opened_gen(
+            old_gen,
+            STATIC_VOICES as u16,
+            Ok(StreamFeed {
+                channels: 1,
+                rate: 48_000,
+                samples: rx,
+                ended: Arc::default(),
+            }),
+        );
+        assert_eq!(r.engine.voices_in_use(), (0, 0));
     }
 }

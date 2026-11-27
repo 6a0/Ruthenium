@@ -104,6 +104,8 @@ impl Image {
         }
         let err = |e: png::DecodingError| ImageError(e.to_string());
         let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        decoder.set_ignore_text_chunk(true);
+        decoder.set_ignore_iccp_chunk(true);
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = decoder.read_info().map_err(err)?;
         let (w, h) = reader.info().size();

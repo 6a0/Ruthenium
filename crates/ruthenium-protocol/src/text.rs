@@ -189,8 +189,20 @@ impl Lang for std::collections::HashMap<String, String> {
     }
 }
 
+/// Maximum nesting depth when converting NBT to JSON via [`nbt_to_json`].
+const MAX_NBT_JSON_DEPTH: usize = 128;
+
 /// A tag as the JSON value with the same structure (numbers stay numbers).
+/// Nesting past 128 levels becomes `Value::Null` so deeply nested untrusted NBT cannot
+/// overflow the stack during conversion or drop.
 pub fn nbt_to_json(tag: &Tag) -> Value {
+    nbt_to_json_depth(tag, 0)
+}
+
+fn nbt_to_json_depth(tag: &Tag, depth: usize) -> Value {
+    if depth >= MAX_NBT_JSON_DEPTH {
+        return Value::Null;
+    }
     let num = |n: f64| serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number);
     match tag {
         Tag::Byte(v) => Value::from(*v),
@@ -201,10 +213,15 @@ pub fn nbt_to_json(tag: &Tag) -> Value {
         Tag::Double(v) => num(*v),
         Tag::ByteArray(v) => Value::Array(v.iter().map(|&b| Value::from(b)).collect()),
         Tag::String(s) => Value::String(s.clone()),
-        Tag::List(items) => Value::Array(items.iter().map(nbt_to_json).collect()),
+        Tag::List(items) => Value::Array(
+            items
+                .iter()
+                .map(|t| nbt_to_json_depth(t, depth + 1))
+                .collect(),
+        ),
         Tag::Compound(c) => Value::Object(
             c.iter()
-                .map(|(k, v)| (k.to_owned(), nbt_to_json(v)))
+                .map(|(k, v)| (k.to_owned(), nbt_to_json_depth(v, depth + 1)))
                 .collect(),
         ),
         Tag::IntArray(v) => Value::Array(v.iter().map(|&b| Value::from(b)).collect()),
@@ -277,6 +294,33 @@ impl Partial {
         }
     }
 
+    fn from_nbt(c: &crate::nbt::Compound) -> Partial {
+        let flag = |k: &str| {
+            c.get(k).and_then(|v| match v {
+                Tag::Byte(n) => Some(*n != 0),
+                Tag::Short(n) => Some(*n != 0),
+                Tag::Int(n) => Some(*n != 0),
+                Tag::Long(n) => Some(*n != 0),
+                Tag::Float(n) => Some(*n != 0.0),
+                Tag::Double(n) => Some(*n != 0.0),
+                _ => None,
+            })
+        };
+        let str_field = |k: &str| match c.get(k) {
+            Some(Tag::String(s)) => Some(s.as_str()),
+            _ => None,
+        };
+        Partial {
+            color: str_field("color").and_then(parse_color),
+            shadow: c.get("shadow_color").and_then(parse_argb_nbt),
+            bold: flag("bold"),
+            italic: flag("italic"),
+            underlined: flag("underlined"),
+            strikethrough: flag("strikethrough"),
+            obfuscated: flag("obfuscated"),
+        }
+    }
+
     fn over(self, parent: Style) -> Style {
         Style {
             color: self.color.or(parent.color),
@@ -306,13 +350,67 @@ fn parse_argb(v: &Value) -> Option<u32> {
     match v {
         Value::Number(n) => n.as_i64().map(|n| n as u32),
         Value::Array(parts) => {
-            let parts: [f64; 4] = parts
+            if parts.len() != 4 {
+                return None;
+            }
+            let parts = [
+                parts[0].as_f64()?,
+                parts[1].as_f64()?,
+                parts[2].as_f64()?,
+                parts[3].as_f64()?,
+            ];
+            let [r, g, b, a] = parts.map(|p| ((p as f32 * 255.0).floor() as i32 as u32) & 0xFF);
+            Some(a << 24 | r << 16 | g << 8 | b)
+        }
+        _ => None,
+    }
+}
+
+fn nbt_as_f64(v: &Tag) -> Option<f64> {
+    match v {
+        Tag::Byte(n) => Some(f64::from(*n)),
+        Tag::Short(n) => Some(f64::from(*n)),
+        Tag::Int(n) => Some(f64::from(*n)),
+        Tag::Long(n) => Some(*n as f64),
+        Tag::Float(n) => n.is_finite().then(|| f64::from(*n)),
+        Tag::Double(n) => n.is_finite().then_some(*n),
+        _ => None,
+    }
+}
+
+fn parse_argb_nbt(v: &Tag) -> Option<u32> {
+    match v {
+        Tag::Byte(n) => Some(*n as i64 as u32),
+        Tag::Short(n) => Some(*n as i64 as u32),
+        Tag::Int(n) => Some(*n as u32),
+        Tag::Long(n) => Some(*n as u32),
+        Tag::List(parts) if parts.len() == 4 => {
+            let parts = [
+                nbt_as_f64(&parts[0])?,
+                nbt_as_f64(&parts[1])?,
+                nbt_as_f64(&parts[2])?,
+                nbt_as_f64(&parts[3])?,
+            ];
+            let [r, g, b, a] = parts.map(|p| ((p as f32 * 255.0).floor() as i32 as u32) & 0xFF);
+            Some(a << 24 | r << 16 | g << 8 | b)
+        }
+        Tag::ByteArray(parts) if parts.len() == 4 => {
+            let [r, g, b, a] = parts
                 .iter()
-                .map(Value::as_f64)
-                .collect::<Option<Vec<_>>>()?
+                .map(|&p| ((f32::from(p) * 255.0).floor() as i32 as u32) & 0xFF)
+                .collect::<Vec<_>>()
                 .try_into()
                 .ok()?;
-            let [r, g, b, a] = parts.map(|p| ((p as f32 * 255.0).floor() as i32 as u32) & 0xFF);
+            Some(a << 24 | r << 16 | g << 8 | b)
+        }
+        Tag::IntArray(parts) if parts.len() == 4 => {
+            let [r, g, b, a] = [parts[0], parts[1], parts[2], parts[3]]
+                .map(|p| ((p as f32 * 255.0).floor() as i32 as u32) & 0xFF);
+            Some(a << 24 | r << 16 | g << 8 | b)
+        }
+        Tag::LongArray(parts) if parts.len() == 4 => {
+            let [r, g, b, a] = [parts[0], parts[1], parts[2], parts[3]]
+                .map(|p| ((p as f32 * 255.0).floor() as i32 as u32) & 0xFF);
             Some(a << 24 | r << 16 | g << 8 | b)
         }
         _ => None,
@@ -500,8 +598,12 @@ impl StyledText {
     }
 
     /// A component in its NBT form, translated with `lang`.
+    /// Walks `&Tag` directly under `MAX_DEPTH` and `Budget` without converting ignored
+    /// arrays or deep subtrees to JSON.
     pub fn from_nbt_in(tag: &Tag, lang: &dyn Lang) -> StyledText {
-        StyledText::from_json_in(&nbt_to_json(tag), lang)
+        let mut t = StyledText::default();
+        t.component_nbt(tag, Style::default(), 0, lang, &mut Budget::new());
+        t
     }
 
     /// The text without styles.
@@ -637,6 +739,9 @@ impl StyledText {
                 };
                 self.component(first, parent, depth + 1, lang, b);
                 for item in rest {
+                    if b.spent() {
+                        break;
+                    }
                     self.component(item, style, depth + 1, lang, b);
                 }
             }
@@ -658,12 +763,17 @@ impl StyledText {
                         .unwrap_or(key);
                     let args = o.get("with").and_then(Value::as_array);
                     let args = args.map_or(&[][..], Vec::as_slice);
-                    self.translate(format, args, style, depth, lang, b);
+                    self.translate_with(format, args.len(), style, b, |this, i, b| {
+                        this.component(&args[i], style, depth + 1, lang, b);
+                    });
                 } else if let Some(key) = o.get("keybind").and_then(Value::as_str) {
-                    self.push(&key_name(key, lang), style, b);
+                    self.push_key_name(key, style, depth, lang, b);
                 }
                 if let Some(Value::Array(extra)) = o.get("extra") {
                     for child in extra {
+                        if b.spent() {
+                            break;
+                        }
                         self.component(child, style, depth + 1, lang, b);
                     }
                 }
@@ -672,37 +782,251 @@ impl StyledText {
         }
     }
 
-    /// Fills `%s` / `%2$s` in `format` with `args`; `%%` is a percent sign. A format
-    /// with other specifiers, or an argument index past the end, shows the format as it
-    /// is (vanilla shows the key when formatting fails).
-    fn translate(
+    fn component_nbt(
         &mut self,
-        format: &str,
-        args: &[Value],
+        tag: &Tag,
+        parent: Style,
+        depth: usize,
+        lang: &dyn Lang,
+        b: &mut Budget,
+    ) {
+        if !b.step() || depth >= MAX_DEPTH {
+            return;
+        }
+        match tag {
+            Tag::String(s) => self.push_formatted(s, parent, b),
+            Tag::Byte(n) => self.push_formatted(&n.to_string(), parent, b),
+            Tag::Short(n) => self.push_formatted(&n.to_string(), parent, b),
+            Tag::Int(n) => self.push_formatted(&n.to_string(), parent, b),
+            Tag::Long(n) => self.push_formatted(&n.to_string(), parent, b),
+            Tag::Float(n) => {
+                if n.is_finite() {
+                    self.push_formatted(&f64::from(*n).to_string(), parent, b);
+                }
+            }
+            Tag::Double(n) => {
+                if n.is_finite() {
+                    self.push_formatted(&n.to_string(), parent, b);
+                }
+            }
+            Tag::List(items) => {
+                let Some((first, rest)) = items.split_first() else {
+                    return;
+                };
+                let style = match first {
+                    Tag::Compound(c) => Partial::from_nbt(c).over(parent),
+                    _ => parent,
+                };
+                self.component_nbt(first, parent, depth + 1, lang, b);
+                for item in rest {
+                    if b.spent() {
+                        break;
+                    }
+                    self.component_nbt(item, style, depth + 1, lang, b);
+                }
+            }
+            Tag::ByteArray(items) => {
+                for &n in items {
+                    if b.spent() || !b.step() || depth + 1 >= MAX_DEPTH {
+                        break;
+                    }
+                    self.push_formatted(&n.to_string(), parent, b);
+                }
+            }
+            Tag::IntArray(items) => {
+                for &n in items {
+                    if b.spent() || !b.step() || depth + 1 >= MAX_DEPTH {
+                        break;
+                    }
+                    self.push_formatted(&n.to_string(), parent, b);
+                }
+            }
+            Tag::LongArray(items) => {
+                for &n in items {
+                    if b.spent() || !b.step() || depth + 1 >= MAX_DEPTH {
+                        break;
+                    }
+                    self.push_formatted(&n.to_string(), parent, b);
+                }
+            }
+            Tag::Compound(c) => {
+                let style = Partial::from_nbt(c).over(parent);
+                if let Some(text) = c.get("text") {
+                    match text {
+                        Tag::String(s) => self.push_formatted(s, style, b),
+                        Tag::Byte(n) => self.push_formatted(&n.to_string(), style, b),
+                        Tag::Short(n) => self.push_formatted(&n.to_string(), style, b),
+                        Tag::Int(n) => self.push_formatted(&n.to_string(), style, b),
+                        Tag::Long(n) => self.push_formatted(&n.to_string(), style, b),
+                        Tag::Float(n) if n.is_finite() => {
+                            self.push_formatted(&f64::from(*n).to_string(), style, b);
+                        }
+                        Tag::Double(n) if n.is_finite() => {
+                            self.push_formatted(&n.to_string(), style, b);
+                        }
+                        _ => {}
+                    }
+                } else if let Some(Tag::String(key)) = c.get("translate") {
+                    let fallback = match c.get("fallback") {
+                        Some(Tag::String(s)) => Some(s.as_str()),
+                        _ => None,
+                    };
+                    let format = lang.get(key).or(fallback).unwrap_or(key);
+                    match c.get("with") {
+                        Some(Tag::List(args)) => {
+                            self.translate_with(format, args.len(), style, b, |this, i, b| {
+                                this.component_nbt(&args[i], style, depth + 1, lang, b);
+                            });
+                        }
+                        Some(Tag::ByteArray(args)) => {
+                            self.translate_with(format, args.len(), style, b, |this, i, b| {
+                                if this.step_for_arg(depth, b) {
+                                    this.push_formatted(&args[i].to_string(), style, b);
+                                }
+                            });
+                        }
+                        Some(Tag::IntArray(args)) => {
+                            self.translate_with(format, args.len(), style, b, |this, i, b| {
+                                if this.step_for_arg(depth, b) {
+                                    this.push_formatted(&args[i].to_string(), style, b);
+                                }
+                            });
+                        }
+                        Some(Tag::LongArray(args)) => {
+                            self.translate_with(format, args.len(), style, b, |this, i, b| {
+                                if this.step_for_arg(depth, b) {
+                                    this.push_formatted(&args[i].to_string(), style, b);
+                                }
+                            });
+                        }
+                        _ => {
+                            self.translate_with(format, 0, style, b, |_, _, _| {});
+                        }
+                    }
+                } else if let Some(Tag::String(key)) = c.get("keybind") {
+                    self.push_key_name(key, style, depth, lang, b);
+                }
+                if let Some(Tag::List(extra)) = c.get("extra") {
+                    for child in extra {
+                        if b.spent() {
+                            break;
+                        }
+                        self.component_nbt(child, style, depth + 1, lang, b);
+                    }
+                }
+            }
+        }
+    }
+
+    fn step_for_arg(&self, depth: usize, b: &mut Budget) -> bool {
+        b.step() && depth + 1 < MAX_DEPTH
+    }
+
+    /// Resolves a keybind into `self` under the caller's `Budget`, avoiding cloning
+    /// unbounded language strings or spawning a fresh scan budget.
+    fn push_key_name(
+        &mut self,
+        binding: &str,
         style: Style,
         depth: usize,
         lang: &dyn Lang,
         b: &mut Budget,
     ) {
+        if let Some(bound) = lang.bound_key(binding) {
+            match key_text(bound.name, bound.value, bound.mouse, bound.system, lang) {
+                KeyText::Literal(s) => {
+                    if b.scan(s.len()) {
+                        self.push(&s, style, b);
+                    }
+                }
+                KeyText::Translate(k) => {
+                    let s = lang.get(&k).unwrap_or(&k);
+                    if b.scan(s.len()) {
+                        self.push(s, style, b);
+                    }
+                }
+                KeyText::Button(n) => {
+                    let format = lang.get("key.mouse").unwrap_or("key.mouse");
+                    let num = n.to_string();
+                    self.translate_with(format, 1, style, b, |this, _, b| {
+                        if this.step_for_arg(depth, b) {
+                            this.push_formatted(&num, style, b);
+                        }
+                    });
+                }
+            }
+            return;
+        }
+        let Some((_, key)) = KEYS.iter().find(|(k, _)| *k == binding) else {
+            let s = lang.get(binding).unwrap_or(binding);
+            if b.scan(s.len()) {
+                self.push(s, style, b);
+            }
+            return;
+        };
+        match (lang.get(key), key.rsplit('.').next()) {
+            (Some(name), _) => {
+                if b.scan(name.len()) {
+                    self.push(name, style, b);
+                }
+            }
+            (None, Some(last)) if last.len() <= 3 => {
+                let up = last.to_uppercase();
+                if b.scan(up.len()) {
+                    self.push(&up, style, b);
+                }
+            }
+            _ => {
+                if b.scan(key.len()) {
+                    self.push(key, style, b);
+                }
+            }
+        }
+    }
+
+    /// Fills `%s` / `%2$s` in `format` with `arg_count` arguments; `%%` is a percent sign.
+    /// A format with other specifiers, or an argument index past the end, shows the format
+    /// as it is (vanilla shows the key when formatting fails).
+    fn translate_with(
+        &mut self,
+        format: &str,
+        arg_count: usize,
+        style: Style,
+        b: &mut Budget,
+        mut emit_arg: impl FnMut(&mut Self, usize, &mut Budget),
+    ) {
+        // Charge the format scan up front so huge formats with zero-padded specifiers
+        // (e.g., `%0000...1$s`) cannot be scanned repeatedly for free.
+        if !b.scan(format.len()) {
+            return;
+        }
+        let max_pieces = b.steps.saturating_mul(2).saturating_add(2);
         let mut pieces: Vec<Result<&str, usize>> = Vec::new();
         let mut next = 0;
         let mut rest = format;
         let ok = loop {
+            if pieces.len() >= max_pieces {
+                return;
+            }
             let Some(at) = rest.find('%') else {
                 pieces.push(Ok(rest));
                 break true;
             };
-            pieces.push(Ok(&rest[..at]));
+            if at > 0 {
+                pieces.push(Ok(&rest[..at]));
+            }
             let spec = &rest[at + 1..];
             let digits = spec.bytes().take_while(u8::is_ascii_digit).count();
             let (index, conv) = if digits > 0 && spec.as_bytes().get(digits) == Some(&b'$') {
-                (
-                    spec[..digits]
-                        .parse::<usize>()
-                        .ok()
-                        .map(|n| n.wrapping_sub(1)),
-                    &spec[digits + 1..],
-                )
+                // Reject oversized digit runs, overflowing indices, or `%0$s` rather than
+                // silently falling back to unindexed `%s`.
+                if digits > 10 {
+                    break false;
+                }
+                let Some(n) = spec[..digits].parse::<usize>().ok().filter(|&n| n > 0) else {
+                    break false;
+                };
+                (Some(n - 1), &spec[digits + 1..])
             } else {
                 (None, spec)
             };
@@ -716,7 +1040,7 @@ impl StyledText {
                         next += 1;
                         next - 1
                     });
-                    if i >= args.len() {
+                    if i >= arg_count {
                         break false;
                     }
                     pieces.push(Err(i));
@@ -732,9 +1056,12 @@ impl StyledText {
             return;
         }
         for p in pieces {
+            if b.spent() {
+                break;
+            }
             match p {
                 Ok(s) => self.push_formatted(s, style, b),
-                Err(i) => self.component(&args[i], style, depth + 1, lang, b),
+                Err(i) => emit_arg(self, i, b),
             }
         }
     }
@@ -980,5 +1307,66 @@ mod tests {
         assert_eq!(StyledText::from_json(&deep).plain(), "");
         assert_eq!(parse_color("#12345"), None);
         assert_eq!(parse_color("dark_aqua"), Some(0x00AAAA));
+    }
+
+    #[test]
+    fn hostile_formats_and_nbt_stay_within_budget() {
+        let started = std::time::Instant::now();
+        // Zero-padded specifier format: charged up front and rejected cleanly.
+        let zeros = format!("%{}1$s", "0".repeat(20_000));
+        let v = json!({"translate": "k", "fallback": zeros, "with": ["ok"]});
+        let t = StyledText::from_json(&v);
+        assert!(t.plain().chars().count() <= MAX_EXPANDED_CHARS);
+
+        // Overflowing index and %0$s must NOT silently fall back to unindexed %s.
+        let overflow = json!({
+            "translate": "k",
+            "fallback": "%999999999999999999999999$s",
+            "with": ["secret"]
+        });
+        assert_eq!(
+            StyledText::from_json(&overflow).plain(),
+            "%999999999999999999999999$s"
+        );
+        let zero_idx = json!({"translate": "k", "fallback": "%0$s", "with": ["secret"]});
+        assert_eq!(StyledText::from_json(&zero_idx).plain(), "%0$s");
+
+        // Huge shadow_color array is rejected immediately without allocation.
+        let big_shadow = json!({"text": "a", "shadow_color": vec![0.0; 4096]});
+        assert_eq!(
+            StyledText::from_json(&big_shadow).spans[0].style.shadow,
+            None
+        );
+
+        // Deeply nested NBT (512 deep) and huge ByteArray do not stack-overflow or amplify.
+        let mut deep = Tag::String("bottom".into());
+        for _ in 0..512 {
+            let mut c = crate::nbt::Compound::new();
+            c.put("text", Tag::String(String::new()));
+            c.put("extra", Tag::List(vec![deep]));
+            deep = Tag::Compound(c);
+        }
+        assert_eq!(StyledText::from_nbt_in(&deep, &()).plain(), "");
+
+        let mut big_bytes = crate::nbt::Compound::new();
+        big_bytes.put("text", Tag::String("hi".into()));
+        big_bytes.put("junk", Tag::ByteArray(vec![1; 100_000]));
+        assert_eq!(
+            StyledText::from_nbt_in(&Tag::Compound(big_bytes), &()).plain(),
+            "hi"
+        );
+
+        // Keybind lookup shares the caller's Budget so repeated keybinds cannot bypass it.
+        let mut lang = std::collections::HashMap::new();
+        lang.insert("key.keyboard.space".to_owned(), "X".repeat(2000));
+        let many_keys = Value::Array((0..200).map(|_| json!({"keybind": "key.jump"})).collect());
+        assert!(
+            StyledText::from_json_in(&many_keys, &lang)
+                .plain()
+                .chars()
+                .count()
+                <= MAX_EXPANDED_CHARS
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

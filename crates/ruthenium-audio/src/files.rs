@@ -60,6 +60,7 @@ impl SoundFiles {
     }
 
     /// The events of every pack's `sounds.json`, lowest pack first, with the warnings.
+    /// Streams one `sounds.json` at a time and respects cancellation.
     pub fn events(&self) -> (SoundEvents, Vec<String>) {
         let mut namespaces: Vec<&str> = self
             .resources
@@ -69,34 +70,38 @@ impl SoundFiles {
             .collect();
         namespaces.sort_unstable();
         namespaces.dedup();
-        let mut files: Vec<(String, String, Vec<u8>, Limits)> = Vec::new();
+        let max_total = self.resources.limits().sound_events;
+        let mut events = SoundEvents::default();
+        let mut warnings = Vec::new();
         for ns in namespaces {
+            if self.resources.cancelled() {
+                break;
+            }
             let Some(id) = Id::new(ns, "sounds.json") else {
                 continue;
             };
             for r in self.resources.stack(&id) {
+                if self.resources.cancelled() {
+                    break;
+                }
                 // `text` keeps a file over the JSON limit from being read at all.
                 match r.text() {
-                    Ok(b) => files.push((
-                        ns.to_owned(),
-                        r.pack().name().to_owned(),
-                        b.into_bytes(),
-                        *r.limits(),
-                    )),
+                    Ok(b) => {
+                        let f = SoundsJson {
+                            namespace: ns,
+                            pack: r.pack().name(),
+                            bytes: b.as_bytes(),
+                            limits: *r.limits(),
+                        };
+                        events.add_file(&f, max_total, &|file| self.has(file), &mut warnings);
+                    }
                     Err(e) => eprintln!("[sound] {}: {ns}:sounds.json: {e}", r.pack().name()),
                 }
             }
         }
-        SoundEvents::load(
-            files
-                .iter()
-                .map(|(namespace, pack, bytes, limits)| SoundsJson {
-                    namespace,
-                    pack,
-                    bytes,
-                    limits: *limits,
-                }),
-            |f| self.has(f),
-        )
+        if !self.resources.cancelled() {
+            events.finish_loading();
+        }
+        (events, warnings)
     }
 }

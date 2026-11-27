@@ -149,7 +149,9 @@ impl SoundEvents {
     ) -> (SoundEvents, Vec<String>) {
         let mut events = SoundEvents::default();
         let mut warnings = Vec::new();
+        let mut max_total_events = usize::MAX;
         for f in files {
+            max_total_events = max_total_events.min(f.limits.sound_events);
             let entries = match parse_file(f.bytes, &f.limits) {
                 Ok(e) => e,
                 Err(e) => {
@@ -165,11 +167,59 @@ impl SoundEvents {
                     ));
                     break;
                 };
+                if events.events.len() >= max_total_events
+                    && !events.events.contains_key(&id_key(&id))
+                {
+                    warnings.push(format!(
+                        "invalid sounds.json in {}: more than {max_total_events} sound events across packs",
+                        f.pack
+                    ));
+                    break;
+                }
                 events.register(id, reg, &has_file, &mut warnings);
             }
         }
         events.weigh();
         (events, warnings)
+    }
+
+    /// Streams files one at a time via a builder so callers don't need to hold every
+    /// namespace's `sounds.json` in memory simultaneously.
+    pub(crate) fn add_file(
+        &mut self,
+        f: &SoundsJson<'_>,
+        max_total_events: usize,
+        has_file: &impl Fn(&Id) -> bool,
+        warnings: &mut Vec<String>,
+    ) {
+        let entries = match parse_file(f.bytes, &f.limits) {
+            Ok(e) => e,
+            Err(e) => {
+                warnings.push(format!("invalid sounds.json in {}: {e}", f.pack));
+                return;
+            }
+        };
+        for (key, reg) in entries {
+            let Some(id) = Id::new(f.namespace, &key) else {
+                warnings.push(format!(
+                    "invalid sounds.json in {}: bad event name {key:?}",
+                    f.pack
+                ));
+                break;
+            };
+            if self.events.len() >= max_total_events && !self.events.contains_key(&id_key(&id)) {
+                warnings.push(format!(
+                    "invalid sounds.json in {}: more than {max_total_events} sound events across packs",
+                    f.pack
+                ));
+                break;
+            }
+            self.register(id, reg, has_file, warnings);
+        }
+    }
+
+    pub(crate) fn finish_loading(&mut self) {
+        self.weigh();
     }
 
     /// Works out every event's weight at every depth (`weights`), deepest first.
@@ -341,14 +391,15 @@ fn parse_file(bytes: &[u8], limits: &Limits) -> Result<Vec<(String, Registration
             limits.json_bytes
         ));
     }
-    let entries: Ordered = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if entries.0.len() > limits.sound_events {
-        return Err(format!(
-            "{} events is more than a sounds.json may have ({})",
-            entries.0.len(),
-            limits.sound_events
-        ));
-    }
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let entries = serde::de::DeserializeSeed::deserialize(
+        OrderedSeed {
+            max: limits.sound_events,
+        },
+        &mut de,
+    )
+    .map_err(|e| e.to_string())?;
+    de.end().map_err(|e| e.to_string())?;
     if let Some((k, _)) = entries.0.iter().find(|(_, v)| {
         v.get("sounds")
             .and_then(Value::as_array)
@@ -496,13 +547,21 @@ fn as_i32(v: &Value) -> Option<i32> {
     }
 }
 
-/// A JSON object's members in file order; a repeated key fails it, as Gson's map
-/// reader does.
+/// A JSON object's members in file order; a repeated key or more than `max` entries fails
+/// it immediately, in O(1) per key.
 struct Ordered(Vec<(String, Value)>);
 
-impl<'de> serde::Deserialize<'de> for Ordered {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Ordered, D::Error> {
-        struct Visit;
+struct OrderedSeed {
+    max: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for OrderedSeed {
+    type Value = Ordered;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Ordered, D::Error> {
+        struct Visit {
+            max: usize,
+        }
         impl<'de> serde::de::Visitor<'de> for Visit {
             type Value = Ordered;
 
@@ -515,16 +574,24 @@ impl<'de> serde::Deserialize<'de> for Ordered {
                 mut map: A,
             ) -> Result<Ordered, A::Error> {
                 let mut out: Vec<(String, Value)> = Vec::new();
-                while let Some((k, v)) = map.next_entry::<String, Value>()? {
-                    if out.iter().any(|(o, _)| *o == k) {
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                while let Some(k) = map.next_key::<String>()? {
+                    if !seen.insert(k.clone()) {
                         return Err(serde::de::Error::custom(format!("duplicate key: {k}")));
                     }
+                    if out.len() >= self.max {
+                        return Err(serde::de::Error::custom(format!(
+                            "more events than a sounds.json may have ({})",
+                            self.max
+                        )));
+                    }
+                    let v: Value = map.next_value()?;
                     out.push((k, v));
                 }
                 Ok(Ordered(out))
             }
         }
-        d.deserialize_map(Visit)
+        d.deserialize_map(Visit { max: self.max })
     }
 }
 
@@ -677,5 +744,25 @@ mod tests {
             e.choose("minecraft:loop", &mut JavaRandom::new(0)),
             Choice::Empty
         );
+    }
+
+    #[test]
+    fn oversized_sounds_json_fails_fast_without_quadratic_scan() {
+        let limits = Limits {
+            sound_events: 500,
+            ..Limits::untrusted()
+        };
+        let mut s = String::from("{");
+        for i in 0..800 {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("\"e{i}\":{{\"sounds\":[]}}"));
+        }
+        s.push('}');
+        let started = std::time::Instant::now();
+        let res = parse_file(s.as_bytes(), &limits);
+        assert!(res.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 }

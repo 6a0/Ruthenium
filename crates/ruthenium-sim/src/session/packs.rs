@@ -17,7 +17,8 @@ use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -124,12 +125,12 @@ type BatchResult = (u64, Vec<(u128, Result<PathBuf, ()>)>);
 
 /// The download thread, once there is one, and where its results come back.
 pub(super) struct Downloads {
-    jobs: Option<Sender<Batch>>,
+    jobs: Option<std::sync::mpsc::SyncSender<Batch>>,
     results_tx: Sender<BatchResult>,
     results: Receiver<BatchResult>,
-    /// Set when the session ends: a download under way stops between reads, and the
-    /// rest of its batch fails, instead of running on after the player has left.
-    cancel: Arc<AtomicBool>,
+    /// Cancelled when the session ends: stops downloads between reads/redirects and shuts
+    /// down active sockets via `ureq::Agent::shutdown` immediately.
+    cancel: download::CancelToken,
 }
 
 impl Default for Downloads {
@@ -139,14 +140,14 @@ impl Default for Downloads {
             jobs: None,
             results_tx,
             results,
-            cancel: Arc::default(),
+            cancel: download::CancelToken::new(),
         }
     }
 }
 
 impl Drop for Downloads {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel.cancel();
     }
 }
 
@@ -355,20 +356,25 @@ impl Game {
         } else {
             // `addOrUpdatePackPrompt`: the prompt showing takes one more pack, and the
             // last push's texts.
-            let mut requests = self
+            if self
                 .packs
                 .prompt
-                .take()
-                .map_or_else(Vec::new, |p| p.requests);
-            if requests.len() >= MAX_PROMPTED {
+                .as_ref()
+                .is_some_and(|p| p.requests.len() >= MAX_PROMPTED)
+            {
                 eprintln!(
                     "[server packs] {:032x}: the prompt already has {MAX_PROMPTED} packs; discarded",
                     push.id
                 );
                 self.send_pack_status(push.id, PackAction::Discarded);
-            } else {
-                requests.push((push.id, push.url, push.hash));
+                return;
             }
+            let mut requests = self
+                .packs
+                .prompt
+                .take()
+                .map_or_else(Vec::new, |p| p.requests);
+            requests.push((push.id, push.url, push.hash));
             let prompt = PackPrompt {
                 required: push.required,
                 prompt: push.prompt,
@@ -397,7 +403,7 @@ impl Game {
             self.send_pack_status(id, PackAction::Discarded);
             return;
         }
-        eprintln!("[server packs] {id:032x}: pushed ({url})");
+        eprintln!("[server packs] {id:032x}: pushed ({url:?})");
         self.packs.manager.push(id, url, download::parse_sha1(hash));
     }
 
@@ -493,9 +499,10 @@ impl Game {
         }
         self.packs.quiet = true;
         self.packs.prompt = None;
+        self.packs.downloads.cancel.cancel();
         self.packs.manager.cleanup_after_disconnect();
         self.apply_pack_effects();
-        // The download thread ends after the batch it is on.
+        // The download thread stops right away via `cancel.cancel()`.
         self.packs.downloads.jobs = None;
     }
 
@@ -545,9 +552,14 @@ impl Game {
             return;
         };
         if self.packs.downloads.jobs.is_none() {
+            let (hdr_name, hdr_uuid) = if self.local_name.is_empty() {
+                (self.name.as_str(), self.uuid)
+            } else {
+                (self.local_name.as_str(), self.local_uuid)
+            };
             let config = download::DownloadConfig {
                 cache_dir,
-                headers: download_headers(&self.name, self.uuid),
+                headers: download_headers(hdr_name, hdr_uuid),
                 // Only the server's own address (and, for a server on this machine, the
                 // loopback addresses) may serve its packs when it isn't public.
                 private_allowed: pack_hosts_allowed(self.packs.peer)
@@ -555,7 +567,7 @@ impl Game {
                     .map(download::AddressRange::host)
                     .collect(),
             };
-            let (jobs, rx) = channel::<Batch>();
+            let (jobs, rx) = std::sync::mpsc::sync_channel::<Batch>(MAX_TRACKED);
             let results = self.packs.downloads.results_tx.clone();
             let events = self.events.clone();
             let cancel = self.packs.downloads.cancel.clone();
@@ -584,7 +596,7 @@ impl Game {
             .downloads
             .jobs
             .as_ref()
-            .is_some_and(|j| j.send(batch.clone()).is_ok());
+            .is_some_and(|j| j.try_send(batch.clone()).is_ok());
         if !sent {
             let _ = self.packs.downloads.results_tx.send(failed(&batch));
         }
@@ -614,7 +626,7 @@ fn run_batch(
     config: &download::DownloadConfig,
     batch: &Batch,
     events: &Sender<SessionEvent>,
-    cancel: &Arc<AtomicBool>,
+    cancel: &download::CancelToken,
 ) -> BatchResult {
     let requests: Vec<download::PackRequest> = batch
         .requests
@@ -634,7 +646,7 @@ fn run_batch(
                 id,
                 r.map_err(|e| {
                     let url = requests.iter().find(|q| q.id == id).map_or("", |q| &q.url);
-                    eprintln!("[server packs] {id:032x}: failed to download {url}: {e}");
+                    eprintln!("[server packs] {id:032x}: failed to download {url:?}: {e}");
                 })
                 .inspect(|path| {
                     eprintln!("[server packs] {id:032x}: downloaded to {}", path.display());
@@ -653,11 +665,11 @@ struct Toast {
     size: Option<u64>,
     events: Sender<SessionEvent>,
     last: Option<Instant>,
-    cancel: Arc<AtomicBool>,
+    cancel: download::CancelToken,
 }
 
 impl Toast {
-    fn new(total: usize, events: Sender<SessionEvent>, cancel: Arc<AtomicBool>) -> Toast {
+    fn new(total: usize, events: Sender<SessionEvent>, cancel: download::CancelToken) -> Toast {
         Toast {
             total,
             count: 0,
@@ -715,7 +727,11 @@ impl download::Progress for Toast {
     }
 
     fn cancelled(&mut self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
+        self.cancel.is_cancelled()
+    }
+
+    fn cancel_token(&self) -> Option<download::CancelToken> {
+        Some(self.cancel.clone())
     }
 
     fn request_finished(&mut self, ok: bool) {
@@ -1070,5 +1086,32 @@ mod tests {
         r.game.answer_pack_prompt(Some(true));
         r.game.pack_tasks();
         assert!(r.sent().is_empty());
+    }
+
+    /// Pushing a non-required pack past [`MAX_PROMPTED`] discards it without altering
+    /// `required` or emitting another UI prompt event.
+    #[test]
+    fn prompt_at_cap_preserves_required_and_emits_no_extra_event() {
+        let mut r = rig(ServerPackSetup::default());
+        for i in 0..MAX_PROMPTED as u128 {
+            r.game.handle_pack_push(PackPush {
+                id: i,
+                ..push("http://127.0.0.1/p.zip", true)
+            });
+        }
+        let events_before = r.events().len();
+        assert_eq!(events_before, MAX_PROMPTED);
+        r.game.handle_pack_push(PackPush {
+            id: MAX_PROMPTED as u128,
+            ..push("http://127.0.0.1/extra.zip", false)
+        });
+        assert_eq!(
+            r.sent(),
+            [status(MAX_PROMPTED as u128, PackAction::Discarded)]
+        );
+        assert!(r.events().is_empty(), "no extra prompt event past cap");
+        // Declining must still disconnect because the original prompt was required.
+        r.game.answer_pack_prompt(Some(false));
+        assert!(r.game.close_reason.is_some());
     }
 }

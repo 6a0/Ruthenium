@@ -249,36 +249,36 @@ impl Hud {
     pub fn stage(&mut self, textures: &mut TextureTable, uploads: &mut UploadRing) {
         while let Some((name, image)) = self.containers_waiting.pop() {
             let whole = image.rgba.len() == image.width as usize * image.height as usize * 4;
+            if !whole {
+                continue;
+            }
             match textures.create_with(
                 uploads,
                 TextureDesc::rgba8(image.width, image.height),
                 &[&image.rgba],
-                Arrival::NextFrame,
+                Arrival::Background,
             ) {
-                Ok(id) if whole => self.containers.push((name, id)),
-                Ok(id) => textures.destroy(id),
-                // The ring is full for now.
-                Err(_) => {
-                    if whole {
-                        self.containers_waiting.push((name, image));
-                    }
+                Ok(id) => self.containers.push((name, id)),
+                Err(e) if e.try_again() => {
+                    self.containers_waiting.push((name, image));
                     break;
                 }
+                Err(_) => {}
             }
         }
         if let Some(image) = self.vignette_waiting.take() {
             let whole = image.rgba.len() == image.width as usize * image.height as usize * 4;
-            match textures.create_with(
-                uploads,
-                TextureDesc::rgba8(image.width, image.height),
-                &[&image.rgba],
-                Arrival::NextFrame,
-            ) {
-                Ok(id) if whole => self.vignette_picture = Some(id),
-                Ok(id) => textures.destroy(id),
-                // The ring is full for now.
-                Err(_) if whole => self.vignette_waiting = Some(image),
-                Err(_) => {}
+            if whole {
+                match textures.create_with(
+                    uploads,
+                    TextureDesc::rgba8(image.width, image.height),
+                    &[&image.rgba],
+                    Arrival::Background,
+                ) {
+                    Ok(id) => self.vignette_picture = Some(id),
+                    Err(e) if e.try_again() => self.vignette_waiting = Some(image),
+                    Err(_) => {}
+                }
             }
         }
         let Some(atlas) = self.waiting.take() else {
@@ -287,16 +287,20 @@ impl Hud {
         let Some(level) = atlas.levels.first() else {
             return;
         };
-        let Ok(id) = textures.create(TextureDesc::rgba8(atlas.width, atlas.height)) else {
-            self.waiting = Some(atlas);
-            return;
+        let id = match textures.create(TextureDesc::rgba8(atlas.width, atlas.height)) {
+            Ok(id) => id,
+            Err(e) => {
+                if e.try_again() {
+                    self.waiting = Some(atlas);
+                }
+                return;
+            }
         };
-        if textures
-            .stream(uploads, id, vec![level.to_rgba8()])
-            .is_err()
-        {
+        if let Err(e) = textures.stream(uploads, id, vec![level.to_rgba8()]) {
             textures.destroy(id);
-            self.waiting = Some(atlas);
+            if e.try_again() {
+                self.waiting = Some(atlas);
+            }
             return;
         }
         let sprites = HudSprites::new(&Sprites::from_atlas(&atlas, id.index()));

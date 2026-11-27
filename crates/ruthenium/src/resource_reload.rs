@@ -70,8 +70,10 @@ pub fn atlas_limit(max_texture: u32, server_packs: usize) -> u32 {
     }
 }
 
-/// Opens a server's downloaded pack as one whose every byte is hostile.
-pub fn open_server_pack(path: &Path) -> Result<Pack, String> {
+/// Opens a server's downloaded pack as one whose every byte is hostile (a reload opens
+/// its packs together, in `open_server_packs`, to share one budget).
+#[cfg(test)]
+fn open_server_pack(path: &Path) -> Result<Pack, String> {
     Pack::open_untrusted(path, &Limits::untrusted()).map_err(|e| e.to_string())
 }
 
@@ -89,20 +91,21 @@ pub fn is_loadable(path: &Path) -> bool {
     }
 }
 
-/// Opens a reload's server packs, each told of `cancel` (never vanilla's shared pack:
-/// a flag left on it would cancel every later reload; `with_server_packs` opens vanilla's
-/// anew beside them).
+/// Opens a reload's server packs, sharing one untrusted [`Budget`] (bytes, texels, and
+/// `cancel`) across all of them so 16 server packs cannot multiply the per-load budgets.
 fn open_server_packs(
     packs: &[(u128, PathBuf)],
     cancel: &Arc<AtomicBool>,
 ) -> Result<Vec<Pack>, String> {
+    let budget = Arc::new(ruthenium_assets::limits::Budget::default());
+    budget.cancel_with(cancel.clone());
     let mut opened = Vec::with_capacity(packs.len());
     for (id, path) in packs {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".to_owned());
         }
-        let pack = open_server_pack(path).map_err(|e| format!("pack {id:032x}: {e}"))?;
-        pack.cancel_with(cancel.clone());
+        let pack = Pack::open_untrusted_with(path, &Limits::untrusted(), budget.clone())
+            .map_err(|e| format!("pack {id:032x}: {e}"))?;
         opened.push(pack);
     }
     Ok(opened)
@@ -174,20 +177,30 @@ fn language(resources: &Resources, server: usize) -> HashMap<String, String> {
     let first_server = resources.packs().len().saturating_sub(server);
     let mut out = HashMap::new();
     let (mut bytes, mut added) = (0usize, 0usize);
+    let mut server_bytes_full = false;
     for ns in namespaces {
+        if resources.cancelled() {
+            break;
+        }
         let Some(id) = Id::new(ns, "lang/en_us.json") else {
             continue;
         };
         for r in resources.stack(&id) {
+            if resources.cancelled() {
+                break;
+            }
             let from_server = resources
                 .packs()
                 .iter()
                 .position(|p| std::ptr::eq(p, r.pack()))
                 .is_some_and(|i| i >= first_server);
-            let Ok(data) = r.read() else { continue };
             if from_server {
-                bytes += data.len();
-                if bytes > MAX_LANG_BYTES {
+                if server_bytes_full {
+                    continue;
+                }
+                if let Some(declared) = r.declared_size()
+                    && (bytes as u64).saturating_add(declared) > MAX_LANG_BYTES as u64
+                {
                     eprintln!(
                         "[server packs] {}: {ns}:lang/en_us.json is past {} MiB of language; left out",
                         r.pack().name(),
@@ -196,22 +209,39 @@ fn language(resources: &Resources, server: usize) -> HashMap<String, String> {
                     continue;
                 }
             }
-            let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&data) else {
-                eprintln!(
-                    "[ruthenium] {}: {ns}:lang/en_us.json isn't a JSON object",
-                    r.pack().name()
-                );
-                continue;
+            let max_bytes = from_server.then(|| MAX_LANG_BYTES.saturating_sub(bytes));
+            let (max_added, mut dummy_added) = if from_server {
+                (MAX_LANG_ENTRIES, 0)
+            } else {
+                (usize::MAX, 0)
             };
-            for (k, v) in map {
-                let Some(v) = v.as_str() else { continue };
-                if from_server && !out.contains_key(&k) {
-                    if added >= MAX_LANG_ENTRIES {
-                        continue;
+            let added_ref = if from_server {
+                &mut added
+            } else {
+                &mut dummy_added
+            };
+            match ruthenium_assets::lang::merge_strings(
+                &r, max_bytes, max_added, added_ref, &mut out,
+            ) {
+                Ok(file_bytes) => {
+                    if from_server {
+                        bytes = bytes.saturating_add(file_bytes);
+                        if bytes >= MAX_LANG_BYTES {
+                            server_bytes_full = true;
+                        }
                     }
-                    added += 1;
                 }
-                out.insert(k, v.to_owned());
+                Err(e) => {
+                    if from_server && max_bytes.is_some() && e.contains("past the language limit") {
+                        eprintln!(
+                            "[server packs] {}: {ns}:lang/en_us.json is past {} MiB of language; left out",
+                            r.pack().name(),
+                            MAX_LANG_BYTES >> 20
+                        );
+                    } else {
+                        eprintln!("[ruthenium] {}: {ns}:lang/en_us.json: {e}", r.pack().name());
+                    }
+                }
             }
         }
     }
@@ -364,14 +394,30 @@ impl Reloader {
         }
     }
 
+    /// Whether vanilla's own resources (the client's request, no server packs) are being
+    /// built or wait to be.
+    pub fn vanilla_pending(&self) -> bool {
+        let vanilla = |r: &Request| r.session == 0 && r.packs.is_empty();
+        self.running.as_ref().is_some_and(|r| vanilla(&r.request))
+            || self.next.as_ref().is_some_and(vanilla)
+    }
+
     /// Whether a reload is under way or waiting.
     pub fn busy(&self) -> bool {
         self.running.is_some() || self.next.is_some()
     }
 
     /// The session `session` is over: its reload under way stops at its next stage and
-    /// is not applied, and one of its waiting is dropped (both come back as failed).
+    /// is not applied, any already-finished answer from it is dropped so it can never be
+    /// applied to a later session, and one of its waiting is dropped (both come back as
+    /// failed).
     pub fn cancel_session(&mut self, session: u64, max_texture: u32) {
+        // Purge any completed results already queued for the ended session.
+        self.answers.retain(|(r, _)| r.session != session);
+        if session != 0 {
+            // Don't let the previous server's reload interval delay the next server.
+            self.last_server_start = None;
+        }
         if self.next.as_ref().is_some_and(|r| r.session == session)
             && let Some(r) = self.next.take()
         {
@@ -605,8 +651,11 @@ mod tests {
         let quick: Build = Arc::new(
             |_: &Path, _: &[(u128, PathBuf)], _, _, _: &Arc<AtomicBool>| Err("built".into()),
         );
-        let mut r =
-            Reloader::with_build(quick, Duration::from_millis(300), Duration::from_secs(60));
+        let mut r = Reloader::with_build(
+            quick.clone(),
+            Duration::from_millis(300),
+            Duration::from_secs(60),
+        );
         let started = Instant::now();
         r.request(request(1), 1024);
         assert_eq!(err(answer(&mut r)), (1, "built".into()));
@@ -619,11 +668,19 @@ mod tests {
         );
         assert_eq!(err(answer(&mut r)), (1, "built".into()));
         assert!(started.elapsed() >= Duration::from_millis(300));
-        // The client's own starts at once.
-        let at = Instant::now();
+        // Within the interval the client's own starts at once and a server's waits (judged
+        // by what is running, not by the clock, which a busy machine can't keep to).
+        let mut r = Reloader::with_build(quick, Duration::from_secs(60), Duration::from_secs(60));
+        r.request(request(1), 1024);
+        assert_eq!(err(answer(&mut r)), (1, "built".into()));
         r.request(request(0), 1024);
+        assert!(r.running.is_some(), "the client's own reload waited");
         assert_eq!(err(answer(&mut r)), (0, "built".into()));
-        assert!(at.elapsed() < Duration::from_millis(250));
+        r.request(request(1), 1024);
+        assert!(
+            r.running.is_none() && r.next.is_some(),
+            "a server's reload did not wait"
+        );
     }
 
     /// Cancelled between stages, a real build stops (here before opening the packs).
@@ -761,5 +818,22 @@ mod tests {
         .unwrap();
         let r = Resources::new(vec![open_server_pack(&p).unwrap()]);
         assert_eq!(language(&r, 1).len(), MAX_LANG_ENTRIES);
+    }
+
+    /// A finished reload's answer still queued when its session ends is dropped by
+    /// `cancel_session`, so it can never be applied afterwards; other sessions' stay.
+    #[test]
+    fn cancel_session_purges_queued_completed_answer() {
+        let build: Build =
+            Arc::new(|_: &Path, _: &[(u128, PathBuf)], _, _, _| Err("simulated result".into()));
+        let mut r = Reloader::with_build(build, Duration::ZERO, Duration::from_secs(60));
+        r.answers.push_back((request(9), Err("finished".into())));
+        r.answers.push_back((request(5), Err("other".into())));
+        r.cancel_session(9, 1024);
+        let mut left = Vec::new();
+        while let Some(a) = r.poll(1024) {
+            left.push(err(a));
+        }
+        assert_eq!(left, [(5, "other".to_owned())]);
     }
 }

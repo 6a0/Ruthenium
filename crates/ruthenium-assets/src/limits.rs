@@ -44,6 +44,10 @@ pub struct Limits {
     /// Overlay directories in `pack.mcmeta`. Every lookup asks each in turn; real packs
     /// have one per range of versions they support.
     pub pack_overlays: usize,
+    /// Distinct namespaces one pack may expose. Real packs have a handful.
+    pub pack_namespaces: usize,
+    /// Distinct namespaces a stack of packs may expose together.
+    pub stack_namespaces: usize,
     /// `filter.block` patterns in `pack.mcmeta`: regular expressions tried on every
     /// lookup below the pack. The game's packs have none, packs that use them one or two.
     pub pack_filters: usize,
@@ -110,11 +114,20 @@ pub struct Limits {
     /// Multipart parts over every state of every block, after the conditions: 16 MiB of
     /// indices.
     pub multipart_parts: usize,
+    /// Quads one block state may produce across its multipart/variant parts, bounding
+    /// chunk meshing work and vertex memory per block.
+    pub state_quads: usize,
+    /// Multipart parts one block state may collect.
+    pub state_multipart_parts: usize,
     /// How deep an item definition's nodes nest.
     pub item_model_depth: usize,
     /// Nodes of all item definitions together. Packs that key models on
     /// `custom_model_data` have thousands of cases in one definition.
     pub item_model_nodes: usize,
+    /// Quads one baked item mesh may have.
+    pub item_mesh_quads: usize,
+    /// Models one item stack may resolve to per frame (across `composite` trees).
+    pub item_resolved_models: usize,
     /// Providers of one font, references followed. Plugin-made packs put a bitmap provider
     /// per custom picture into `default.json`, some thousands of them.
     pub font_providers: usize,
@@ -123,6 +136,9 @@ pub struct Limits {
     /// Characters one font may give glyphs for, over all its providers. Unifont has some
     /// 57 000.
     pub font_glyphs: usize,
+    /// Total RGBA texels decoded for bitmap providers of one font (even when referencing
+    /// vanilla textures): 16M texels = 64 MiB.
+    pub font_bitmap_texels: u64,
     /// Entries of a language file; `en_us.json` has 8559.
     pub lang_entries: usize,
     /// Events in one `sounds.json`; the game's has 1991.
@@ -148,6 +164,8 @@ impl Limits {
             entry_bytes: u64::MAX,
             load_bytes: u64::MAX,
             pack_overlays: usize::MAX,
+            pack_namespaces: usize::MAX,
+            stack_namespaces: usize::MAX,
             pack_filters: usize::MAX,
             stack_filters: usize::MAX,
             json_bytes: u64::MAX,
@@ -169,11 +187,16 @@ impl Limits {
             blockstate_cases: usize::MAX,
             condition_terms: usize::MAX,
             multipart_parts: usize::MAX,
+            state_quads: usize::MAX,
+            state_multipart_parts: usize::MAX,
             item_model_depth: usize::MAX,
             item_model_nodes: usize::MAX,
+            item_mesh_quads: usize::MAX,
+            item_resolved_models: usize::MAX,
             font_providers: usize::MAX,
             font_references: usize::MAX,
             font_glyphs: usize::MAX,
+            font_bitmap_texels: u64::MAX,
             lang_entries: usize::MAX,
             sound_events: usize::MAX,
             sounds_per_event: usize::MAX,
@@ -191,6 +214,8 @@ impl Limits {
             entry_bytes: 64 << 20,
             load_bytes: 1 << 30,
             pack_overlays: 64,
+            pack_namespaces: 256,
+            stack_namespaces: 1024,
             pack_filters: 8,
             stack_filters: 16,
             json_bytes: 4 << 20,
@@ -211,11 +236,16 @@ impl Limits {
             blockstate_cases: 4096,
             condition_terms: 1 << 14,
             multipart_parts: 1 << 22,
+            state_quads: 1024,
+            state_multipart_parts: 64,
             item_model_depth: 64,
             item_model_nodes: 1 << 20,
+            item_mesh_quads: 4096,
+            item_resolved_models: 32,
             font_providers: 1 << 14,
             font_references: 16,
             font_glyphs: 1 << 18,
+            font_bitmap_texels: 1 << 24,
             lang_entries: 1 << 16,
             sound_events: 1 << 16,
             sounds_per_event: 4096,
@@ -233,6 +263,8 @@ impl Limits {
             entry_bytes: self.entry_bytes.min(o.entry_bytes),
             load_bytes: self.load_bytes.min(o.load_bytes),
             pack_overlays: self.pack_overlays.min(o.pack_overlays),
+            pack_namespaces: self.pack_namespaces.min(o.pack_namespaces),
+            stack_namespaces: self.stack_namespaces.min(o.stack_namespaces),
             pack_filters: self.pack_filters.min(o.pack_filters),
             stack_filters: self.stack_filters.min(o.stack_filters),
             json_bytes: self.json_bytes.min(o.json_bytes),
@@ -253,11 +285,16 @@ impl Limits {
             blockstate_cases: self.blockstate_cases.min(o.blockstate_cases),
             condition_terms: self.condition_terms.min(o.condition_terms),
             multipart_parts: self.multipart_parts.min(o.multipart_parts),
+            state_quads: self.state_quads.min(o.state_quads),
+            state_multipart_parts: self.state_multipart_parts.min(o.state_multipart_parts),
             item_model_depth: self.item_model_depth.min(o.item_model_depth),
             item_model_nodes: self.item_model_nodes.min(o.item_model_nodes),
+            item_mesh_quads: self.item_mesh_quads.min(o.item_mesh_quads),
+            item_resolved_models: self.item_resolved_models.min(o.item_resolved_models),
             font_providers: self.font_providers.min(o.font_providers),
             font_references: self.font_references.min(o.font_references),
             font_glyphs: self.font_glyphs.min(o.font_glyphs),
+            font_bitmap_texels: self.font_bitmap_texels.min(o.font_bitmap_texels),
             lang_entries: self.lang_entries.min(o.lang_entries),
             sound_events: self.sound_events.min(o.sound_events),
             sounds_per_event: self.sounds_per_event.min(o.sounds_per_event),

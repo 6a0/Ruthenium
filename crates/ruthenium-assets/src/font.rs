@@ -221,10 +221,11 @@ impl Provider {
 pub struct Font {
     /// Shared: a font referred to again gives the same providers, read once.
     providers: Vec<Arc<Provider>>,
-    /// What it is held to (the strictest of the packs'), and the glyphs its providers
-    /// have so far.
+    /// What it is held to (the strictest of the packs'), the glyphs its providers
+    /// have so far, and decoded bitmap texels charged across this font.
     limits: Limits,
     glyphs: usize,
+    bitmap_texels: u64,
     /// The characters by their advance rounded up, for obfuscated text.
     by_advance: HashMap<i32, Vec<u32>>,
     /// For a font of more than [`LINEAR_PROVIDERS`] providers, the provider of each
@@ -250,12 +251,20 @@ impl Font {
             providers: Vec::new(),
             limits: *res.limits(),
             glyphs: 0,
+            bitmap_texels: 0,
             by_advance: HashMap::new(),
             first: None,
             warnings: Vec::new(),
         };
         font.add(res, id, &mut Vec::new(), &mut HashMap::new());
-        font.index();
+        // Deduplicate shared provider Arcs (preserving first occurrence) so reference DAGs
+        // cannot multiply indexing or lookup work.
+        let mut seen_ptrs: std::collections::HashSet<*const Provider> =
+            std::collections::HashSet::with_capacity(font.providers.len());
+        font.providers.retain(|p| seen_ptrs.insert(Arc::as_ptr(p)));
+        if !res.cancelled() {
+            font.index_checked(&|| res.cancelled());
+        }
         font
     }
 
@@ -263,9 +272,19 @@ impl Font {
     /// With more than [`LINEAR_PROVIDERS`] providers, also which provider has each
     /// character.
     fn index(&mut self) {
+        self.index_checked(&|| false);
+    }
+
+    fn index_checked(&mut self, cancelled: &dyn Fn() -> bool) {
         let mut seen: HashMap<u32, u32> = HashMap::new();
         for (i, p) in self.providers.iter().enumerate() {
-            for c in p.characters() {
+            if cancelled() {
+                return;
+            }
+            for (step, c) in p.characters().enumerate() {
+                if step & 1023 == 0 && cancelled() {
+                    return;
+                }
                 if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(c)
                     && let Some(g) = p.glyph(c)
                 {
@@ -294,6 +313,7 @@ impl Font {
             ))],
             limits: Limits::trusted(),
             glyphs: 0,
+            bitmap_texels: 0,
             by_advance: HashMap::new(),
             first: None,
             warnings: Vec::new(),
@@ -311,12 +331,18 @@ impl Font {
         within: &mut Vec<Id>,
         read: &mut HashMap<Id, Vec<Arc<Provider>>>,
     ) {
+        if res.cancelled() {
+            return;
+        }
         if within.contains(id) {
             self.warnings.push(format!("font {id} refers to itself"));
             return;
         }
         if let Some(providers) = read.get(id) {
             for p in providers {
+                if res.cancelled() {
+                    return;
+                }
                 if self.providers.len() >= self.limits.font_providers {
                     self.warnings.push(format!(
                         "font {id}: more providers than a font may have ({})",
@@ -339,9 +365,15 @@ impl Font {
         within.push(id.clone());
         // Highest pack first.
         for file in res.stack(&id.wrap("font/", ".json")).iter().rev() {
+            if res.cancelled() {
+                break;
+            }
             match file.json() {
                 Ok(json) => {
                     for p in json["providers"].as_array().map_or(&[][..], Vec::as_slice) {
+                        if res.cancelled() {
+                            break;
+                        }
                         if self.providers.len() >= self.limits.font_providers {
                             self.warnings.push(format!(
                                 "font {id}: more providers than a font may have ({})",
@@ -409,7 +441,7 @@ impl Font {
                 let texture = file.wrap("textures/", "");
                 let picture = res.get(&texture).ok_or_else(|| format!("no {texture}"))?;
                 let bytes = picture.read().map_err(|e| format!("{texture}: {e}"))?;
-                let limits = *picture.limits();
+                let limits = picture.limits().min(&self.limits);
                 let budget = picture.pack().budget().clone();
                 let grid: Vec<Vec<u32>> = p["chars"]
                     .as_array()
@@ -420,14 +452,35 @@ impl Font {
                     .ok_or("chars that are not text")?;
                 let height = clamp_advance(p["height"].as_i64().unwrap_or(8) as f32);
                 let ascent = clamp_advance(p["ascent"].as_i64().ok_or("no ascent")? as f32);
+                if height <= 0.0 {
+                    return Err("height must be positive".into());
+                }
+                if ascent > height {
+                    return Err(format!("ascent {ascent} is greater than height {height}"));
+                }
                 self.take_glyphs(grid.iter().map(Vec::len).sum())?;
+                let max_font_texels = self.limits.font_bitmap_texels;
+                let mut font_texels = self.bitmap_texels;
                 let image = Image::decode_png_with(
                     &bytes,
                     limits.image_side,
                     limits.image_texels,
-                    &mut |n| budget.take_texels(n, &limits),
+                    &mut |n| {
+                        let Some(next) = font_texels.checked_add(n) else {
+                            return false;
+                        };
+                        if next > max_font_texels {
+                            return false;
+                        }
+                        if !budget.take_texels(n, &limits) {
+                            return false;
+                        }
+                        font_texels = next;
+                        true
+                    },
                 )
                 .map_err(|e| format!("{file}: {e}"))?;
+                self.bitmap_texels = font_texels;
                 self.providers.push(Arc::new(Provider::Bitmap(Box::new(
                     bitmap(image, &bytes, &grid, height, ascent)
                         .map_err(|e| format!("{file}: {e}"))?,
@@ -443,8 +496,9 @@ impl Font {
                     .is_untrusted()
                     .then(|| (*pack.limits(), pack.budget().clone()));
                 let max = self.limits.font_glyphs.saturating_sub(self.glyphs);
-                let unihex = shared_unihex(bytes, &p["size_overrides"], guard, max)
-                    .map_err(|e| format!("{file}: {e}"))?;
+                let unihex =
+                    shared_unihex(bytes, &p["size_overrides"], guard, max, &|| res.cancelled())
+                        .map_err(|e| format!("{file}: {e}"))?;
                 self.take_glyphs(unihex.narrow.len() + unihex.wide.len())?;
                 self.providers.push(Arc::new(Provider::Unihex(unihex)));
             }
@@ -510,11 +564,13 @@ impl Font {
             std::iter::once(Ok(std::borrow::Cow::Borrowed(hex.as_bytes()))),
             &Value::Null,
             usize::MAX,
+            &|| false,
         )?;
         let mut font = Font {
             providers: vec![Arc::new(Provider::Unihex(Arc::new(unihex)))],
             limits: Limits::trusted(),
             glyphs: 0,
+            bitmap_texels: 0,
             by_advance: HashMap::new(),
             first: None,
             warnings: Vec::new(),
@@ -568,6 +624,9 @@ fn bitmap(
     let columns = grid.first().map_or(0, Vec::len);
     if columns == 0 || grid.iter().any(|r| r.len() != columns) {
         return Err("chars are not a grid".into());
+    }
+    if !height.is_finite() || height <= 0.0 {
+        return Err("height must be positive".into());
     }
     if ascent > height {
         return Err("the ascent is above the height".into());
@@ -623,22 +682,25 @@ fn shared_unihex(
     overrides: &Value,
     guard: Option<(Limits, Arc<Budget>)>,
     max_glyphs: usize,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Arc<Unihex>, String> {
     let mut hasher = DefaultHasher::new();
     zip.hash(&mut hasher);
     overrides.to_string().hash(&mut hasher);
     let key = hasher.finish();
-    // Held while the file is read, so that a second reader waits for the first's.
-    let mut read = READ
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    read.retain(|(_, w)| w.strong_count() > 0);
-    if let Some(u) = read
-        .iter()
-        .find(|(k, _)| *k == key)
-        .and_then(|(_, w)| w.upgrade())
+    // Check cache briefly without holding READ across zip inflation and hex parsing.
     {
-        return Ok(u);
+        let mut read = READ
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        read.retain(|(_, w)| w.strong_count() > 0);
+        if let Some(u) = read
+            .iter()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, w)| w.upgrade())
+        {
+            return Ok(u);
+        }
     }
     let zip = match guard {
         Some((limits, budget)) => Zip::from_vec_untrusted(zip, &limits, budget),
@@ -648,7 +710,18 @@ fn shared_unihex(
     let files = (0..zip.len())
         .filter(|&i| zip.name(i).ends_with(".hex"))
         .map(|i| zip.read(i).map_err(|e| format!("{}: {e}", zip.name(i))));
-    let unihex = Arc::new(parse_unihex(files, overrides, max_glyphs)?);
+    let unihex = Arc::new(parse_unihex(files, overrides, max_glyphs, cancelled)?);
+    let mut read = READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    read.retain(|(_, w)| w.strong_count() > 0);
+    if let Some(existing) = read
+        .iter()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, w)| w.upgrade())
+    {
+        return Ok(existing);
+    }
     read.push((key, Arc::downgrade(&unihex)));
     Ok(unihex)
 }
@@ -657,6 +730,7 @@ fn parse_unihex<'a>(
     files: impl Iterator<Item = Result<std::borrow::Cow<'a, [u8]>, String>>,
     overrides: &Value,
     max_glyphs: usize,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Unihex, String> {
     // The character ranges whose sides are given: the first that has a character counts.
     let mut sized = Vec::new();
@@ -683,14 +757,28 @@ fn parse_unihex<'a>(
         narrow: HashMap::new(),
         wide: HashMap::new(),
     };
+    let max_lines = max_glyphs.saturating_mul(2).max(1024);
+    let mut seen_lines = 0usize;
     // Straight into the tables, sized beforehand: a table grown by doubling, or one read
     // first and copied, would leave a few MiB more of the heap taken for good (the
     // allocator keeps what a thread freed).
     for bytes in files {
+        if cancelled() {
+            return Err("the load was cancelled".into());
+        }
         let bytes = bytes?;
         let lines = bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty());
         unihex.narrow.reserve(lines.clone().count().min(max_glyphs));
         for line in lines {
+            seen_lines += 1;
+            if seen_lines > max_lines {
+                return Err(format!(
+                    "more unihex lines than a font may have ({max_lines})"
+                ));
+            }
+            if seen_lines & 1023 == 0 && cancelled() {
+                return Err("the load was cancelled".into());
+            }
             let (c, (rows, width)) = hex_line(line).ok_or("not a unihex line")?;
             let (left, right) = sized
                 .iter()

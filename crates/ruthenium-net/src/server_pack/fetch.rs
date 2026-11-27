@@ -10,7 +10,9 @@
 //! on the whole download, the address policy of [`super::address`], the player's name and
 //! UUID only for the host the server named, and error bodies never read.
 
+use std::io;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,7 +20,9 @@ use ureq::Agent;
 use ureq::config::AutoHeaderValue;
 use ureq::http::{Response, header};
 use ureq::tls::{RootCerts, TlsConfig};
-use ureq::unversioned::transport::DefaultConnector;
+use ureq::unversioned::transport::{
+    Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport,
+};
 
 use super::DownloadError;
 use super::address::{AddressRange, CheckedResolver, Nat64Prefix};
@@ -49,6 +53,9 @@ pub(crate) struct Limits {
     pub whole: Duration,
     /// Bytes this game run may receive into one cache, all downloads together.
     pub run_budget: u64,
+    /// Network download attempts this game run may make into one cache, so 0-byte or
+    /// oversized-header responses can't spin without end.
+    pub run_requests: usize,
     /// Downloads in one batch; the rest fail at once.
     pub max_requests: usize,
     /// Addresses treated as public (tests: the test server is on loopback).
@@ -73,11 +80,198 @@ impl Default for Limits {
             // Sixteen packs of the largest size: far beyond what any network sends a player
             // in one sitting, and a bound on what a hostile one can make us write.
             run_budget: 16 * super::MAX_PACK_SIZE,
+            run_requests: 256,
             // Servers send one pack, a few at most.
             max_requests: 32,
             pretend_public: Vec::new(),
             nat64: None,
         }
+    }
+}
+
+/// A cross-thread cancellation handle for pack downloads. Calling [`CancelToken::cancel`]
+/// both marks downloads cancelled and shuts down active sockets via `ureq::Agent::shutdown`,
+/// interrupting blocked header/body reads and TLS handshakes right away.
+#[derive(Clone, Default)]
+pub struct CancelToken {
+    state: Arc<CancelState>,
+}
+
+#[derive(Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    next_id: AtomicU64,
+    agents: Mutex<Vec<(u64, Agent)>>,
+}
+
+impl std::fmt::Debug for CancelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CancelToken")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
+impl CancelToken {
+    pub fn new() -> CancelToken {
+        CancelToken::default()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Cancels all downloads sharing this token and closes any active connections.
+    pub fn cancel(&self) {
+        self.state.cancelled.store(true, Ordering::Release);
+        let agents: Vec<Agent> = {
+            let mut guard = self.state.agents.lock().unwrap_or_else(|e| e.into_inner());
+            guard.drain(..).map(|(_, a)| a).collect()
+        };
+        for agent in agents {
+            agent.shutdown();
+        }
+    }
+
+    fn register(&self, agent: Agent) -> u64 {
+        let id = self.state.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut guard = self.state.agents.lock().unwrap_or_else(|e| e.into_inner());
+        if self.state.cancelled.load(Ordering::Acquire) {
+            drop(guard);
+            agent.shutdown();
+        } else {
+            guard.push((id, agent));
+        }
+        id
+    }
+
+    fn unregister(&self, id: u64) {
+        let mut guard = self.state.agents.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|(entry, _)| *entry != id);
+    }
+}
+
+/// Counts raw wire bytes read from the underlying socket (before dechunking or
+/// decompression) and checks cancellation on every transport operation.
+#[derive(Debug)]
+struct WireGuard {
+    read: AtomicU64,
+    cap: AtomicU64,
+    exceeded: AtomicBool,
+    cancel: Option<CancelToken>,
+}
+
+impl WireGuard {
+    fn new(cap: u64, cancel: Option<CancelToken>) -> WireGuard {
+        WireGuard {
+            read: AtomicU64::new(0),
+            cap: AtomicU64::new(cap),
+            exceeded: AtomicBool::new(false),
+            cancel,
+        }
+    }
+
+    fn reset(&self, cap: u64) {
+        self.read.store(0, Ordering::Relaxed);
+        self.cap.store(cap, Ordering::Relaxed);
+        self.exceeded.store(false, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(CancelToken::is_cancelled)
+    }
+
+    fn is_exceeded(&self) -> bool {
+        self.exceeded.load(Ordering::Acquire)
+    }
+
+    fn add(&self, n: u64) -> bool {
+        let total = self.read.fetch_add(n, Ordering::Relaxed).saturating_add(n);
+        if total > self.cap.load(Ordering::Relaxed) {
+            self.exceeded.store(true, Ordering::Release);
+            return false;
+        }
+        true
+    }
+}
+
+#[derive(Debug)]
+struct GuardedConnector {
+    inner: DefaultConnector,
+    guard: Arc<WireGuard>,
+}
+
+#[derive(Debug)]
+struct GuardedTransport {
+    inner: Box<dyn Transport>,
+    guard: Arc<WireGuard>,
+}
+
+impl Connector<()> for GuardedConnector {
+    type Out = GuardedTransport;
+
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<()>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        if self.guard.is_cancelled() {
+            return Err(ureq::Error::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cancelled",
+            )));
+        }
+        let Some(inner) = self.inner.connect(details, chained)? else {
+            return Ok(None);
+        };
+        Ok(Some(GuardedTransport {
+            inner,
+            guard: self.guard.clone(),
+        }))
+    }
+}
+
+impl Transport for GuardedTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        if self.guard.is_cancelled() {
+            return Err(ureq::Error::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cancelled",
+            )));
+        }
+        self.inner.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        if self.guard.is_cancelled() {
+            return Err(ureq::Error::Io(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "cancelled",
+            )));
+        }
+        if self.guard.is_exceeded() {
+            return Err(ureq::Error::Io(io::Error::other("wire limit exceeded")));
+        }
+        let before = self.inner.buffers().input().len();
+        let progress = self.inner.await_input(timeout)?;
+        let after = self.inner.buffers().input().len();
+        let added = after.saturating_sub(before) as u64;
+        if added > 0 && !self.guard.add(added) {
+            return Err(ureq::Error::Io(io::Error::other("wire limit exceeded")));
+        }
+        Ok(progress)
+    }
+
+    fn is_open(&mut self) -> bool {
+        !self.guard.is_cancelled() && !self.guard.is_exceeded() && self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
     }
 }
 
@@ -88,7 +282,17 @@ const IDENTITY_HEADERS: [&str; 2] = ["X-Minecraft-Username", "X-Minecraft-UUID"]
 pub(crate) struct Client {
     agent: Agent,
     refused: Arc<Mutex<Option<IpAddr>>>,
+    guard: Arc<WireGuard>,
+    cancel_registration: Option<(CancelToken, u64)>,
     max_redirects: u32,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some((token, id)) = self.cancel_registration.take() {
+            token.unregister(id);
+        }
+    }
 }
 
 impl std::fmt::Debug for Client {
@@ -98,7 +302,11 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    pub fn new(limits: &Limits, private_allowed: &[AddressRange]) -> Client {
+    pub fn new(
+        limits: &Limits,
+        private_allowed: &[AddressRange],
+        cancel: Option<CancelToken>,
+    ) -> Client {
         let tls = TlsConfig::builder()
             .root_certs(RootCerts::PlatformVerifier)
             .build();
@@ -125,11 +333,27 @@ impl Client {
             limits.pretend_public.clone(),
         );
         let refused = resolver.refused.clone();
+        let guard = Arc::new(WireGuard::new(wire_cap(limits.max_size), cancel.clone()));
+        let connector = GuardedConnector {
+            inner: DefaultConnector::default(),
+            guard: guard.clone(),
+        };
+        let agent = Agent::with_parts(config, connector, resolver);
+        let cancel_registration = cancel.map(|token| {
+            let id = token.register(agent.clone());
+            (token, id)
+        });
         Client {
-            agent: Agent::with_parts(config, DefaultConnector::default(), resolver),
+            agent,
             refused,
+            guard,
+            cancel_registration,
             max_redirects: limits.max_redirects,
         }
+    }
+
+    pub fn reset_wire_limit(&self, max_body_bytes: u64) {
+        self.guard.reset(wire_cap(max_body_bytes));
     }
 
     /// GETs the URL and follows its redirects, until a response with the file (2xx).
@@ -138,12 +362,16 @@ impl Client {
         url: &JavaUrl,
         headers: &[(String, String)],
         deadline: Instant,
+        cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Response<ureq::Body>, DownloadError> {
         let first = Target::new(url)?;
         let mut url = url.clone();
         let mut target = first.clone();
         let mut hops = 0;
         loop {
+            if self.guard.is_cancelled() || cancelled() {
+                return Err(DownloadError::Cancelled);
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(DownloadError::TimedOut);
@@ -172,8 +400,9 @@ impl Client {
             let status = response.status().as_u16();
             match status {
                 // A gzip body we didn't ask for comes decoded (ureq's doing; vanilla would
-                // keep the encoded bytes): the size limit counts the decoded bytes, so a
-                // small body inflating to gigabytes still stops at the limit.
+                // keep the encoded bytes): the size limit counts the decoded bytes, and
+                // WireGuard bounds raw wire bytes so empty gzip/chunk-trailer streams
+                // cannot stall or drain bandwidth indefinitely.
                 200..=299 => return Ok(response),
                 305 => return Err(DownloadError::BadRedirect("a proxy redirect (305)")),
                 300..=307 if status != 304 && status != 306 => {
@@ -198,11 +427,36 @@ impl Client {
     }
 
     fn error(&self, e: ureq::Error) -> DownloadError {
+        if self.guard.is_cancelled() {
+            return DownloadError::Cancelled;
+        }
+        if self.guard.is_exceeded() {
+            return DownloadError::TooLarge;
+        }
         if let Some(ip) = self.refused.lock().ok().and_then(|r| *r) {
             return DownloadError::RefusedAddress(ip);
         }
         network_error(e)
     }
+
+    /// What a body read failing means, accounting for cancellation and wire limits.
+    pub fn read_error(&self, e: &std::io::Error) -> DownloadError {
+        if self.guard.is_cancelled() {
+            return DownloadError::Cancelled;
+        }
+        if self.guard.is_exceeded() {
+            return DownloadError::TooLarge;
+        }
+        read_error(e)
+    }
+}
+
+/// Raw wire bytes allowed for one download: enough for headers across redirects, chunk
+/// framing and the body, while stopping zero-output trailer/empty-gzip floods quickly.
+fn wire_cap(max_body_bytes: u64) -> u64 {
+    max_body_bytes
+        .saturating_add(max_body_bytes / 16)
+        .saturating_add(512 * 1024)
 }
 
 pub(crate) fn network_error(e: ureq::Error) -> DownloadError {

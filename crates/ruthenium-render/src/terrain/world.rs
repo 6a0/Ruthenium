@@ -1830,6 +1830,9 @@ impl WorldRenderer {
             self.animated_rects.clear();
             self.animated_texels.clear();
             let mut next = Some(first);
+            // Keep each update batch comfortably below `MAX_IMAGE_COPIES` (1024) so many
+            // tiny animated sprites don't permanently fail with `UploadError::TooLarge`.
+            const MAX_BATCH_RECTS: usize = 512;
             while let Some(sprite) = next {
                 self.animated.push(sprite);
                 self.animations.compose(
@@ -1839,7 +1842,9 @@ impl WorldRenderer {
                 );
                 from = sprite + 1;
                 left -= 1;
-                next = (left > 0 && self.animated_texels.len() < ANIMATION_PIECE)
+                next = (left > 0
+                    && self.animated_texels.len() < ANIMATION_PIECE
+                    && self.animated_rects.len() < MAX_BATCH_RECTS)
                     .then(|| self.animations.next_stale(from))
                     .flatten();
             }
@@ -1860,7 +1865,15 @@ impl WorldRenderer {
                     (region, texels)
                 })
                 .collect();
-            if textures.update(uploads, self.atlas, &regions).is_err() {
+            if let Err(e) = textures.update(uploads, self.atlas, &regions) {
+                if !e.try_again() {
+                    // Permanent failure (e.g. sprite too large for the upload ring):
+                    // disable it so it doesn't stall every subsequent frame.
+                    for &sprite in &self.animated {
+                        self.animations.disable(sprite);
+                    }
+                    continue;
+                }
                 // No room: the next frame writes what they should show by then.
                 self.stats.animation_waits += 1;
                 break;

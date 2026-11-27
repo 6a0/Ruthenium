@@ -66,11 +66,12 @@ pub fn trace() -> bool {
 pub(crate) fn spawn(
     files: Arc<SoundFiles>,
     engine: Weak<Mutex<Engine>>,
+    generation: u64,
 ) -> std::io::Result<Loader> {
     let (jobs, rx) = channel();
     std::thread::Builder::new()
         .name("sound-loader".into())
-        .spawn(move || run(&files, &engine, &rx))?;
+        .spawn(move || run(&files, &engine, generation, &rx))?;
     Ok(Loader { jobs })
 }
 
@@ -112,7 +113,7 @@ fn lock(engine: &Weak<Mutex<Engine>>) -> Option<Arc<Mutex<Engine>>> {
     engine.upgrade()
 }
 
-fn run(files: &SoundFiles, engine: &Weak<Mutex<Engine>>, rx: &Receiver<Job>) {
+fn run(files: &SoundFiles, engine: &Weak<Mutex<Engine>>, generation: u64, rx: &Receiver<Job>) {
     let mut streams: Vec<OpenStream> = Vec::new();
     // The whole sounds decoded here, for as long as anything holds them.
     let mut live: Vec<Weak<Pcm>> = Vec::new();
@@ -158,8 +159,8 @@ fn run(files: &SoundFiles, engine: &Weak<Mutex<Engine>>, rx: &Receiver<Job>) {
                 let Some(engine) = lock(engine) else { return };
                 let mut engine = engine.lock().unwrap_or_else(PoisonError::into_inner);
                 match pcm {
-                    Err(e) if for_now => engine.decoded_for_now(&file, e),
-                    pcm => engine.decoded(&file, pcm),
+                    Err(e) if for_now => engine.decoded_for_now_gen(generation, &file, e),
+                    pcm => engine.decoded_gen(generation, &file, pcm),
                 }
             }
             Ok(Job::Stream {
@@ -176,7 +177,7 @@ fn run(files: &SoundFiles, engine: &Weak<Mutex<Engine>>, rx: &Receiver<Job>) {
                 engine
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .stream_opened(slot, feed);
+                    .stream_opened_gen(generation, slot, feed);
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
@@ -225,6 +226,7 @@ fn fill(s: &mut OpenStream) -> bool {
     if s.out.is_abandoned() {
         return false;
     }
+    let mut restarts = 0u32;
     loop {
         while s.at < s.pending.len() {
             if s.out.push(s.pending[s.at]).is_err() {
@@ -239,6 +241,12 @@ fn fill(s: &mut OpenStream) -> bool {
         match guarded(&s.file, || decoder.next_into(pending)) {
             Ok(true) => s.fresh &= s.pending.is_empty(),
             Ok(false) if s.looping && !s.fresh => {
+                // At most one decoder re-init per fill call so a 1-frame looping Ogg
+                // cannot spin Vorbis setup hundreds of thousands of times synchronously.
+                if restarts >= 1 {
+                    return true;
+                }
+                restarts += 1;
                 // `LoopingAudioStream`: from the start again.
                 let (bytes, limits) = (&s.bytes, &s.limits);
                 match guarded(&s.file, || Decoder::with_limits(bytes.clone(), limits)) {

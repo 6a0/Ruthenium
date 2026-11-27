@@ -117,6 +117,9 @@ impl<'a> Resource<'a> {
 
     /// The file's `.mcmeta`, or empty metadata if it has none.
     pub fn metadata(&self) -> Result<Metadata, String> {
+        if self.res.cancelled() {
+            return Err("the load was cancelled".into());
+        }
         match &self.meta {
             None => Ok(Metadata::default()),
             Some((pack, loc)) => {
@@ -134,6 +137,11 @@ impl<'a> Resource<'a> {
                 Metadata::parse(&bytes)
             }
         }
+    }
+
+    /// Declared uncompressed size of this resource, if known.
+    pub fn declared_size(&self) -> Option<u64> {
+        self.res.packs[self.pack].declared_size(&self.loc)
     }
 }
 
@@ -163,15 +171,40 @@ impl Resources {
                 patterns += n;
             }
         }
-        let mut all: Vec<&str> = packs
-            .iter()
-            .flat_map(|p| p.namespaces().iter().map(String::as_str))
-            .collect();
+        let mut all: Vec<&str> = Vec::new();
+        for pack in &packs {
+            for ns in pack.namespaces() {
+                if ns == "." || ns == ".." {
+                    continue;
+                }
+                all.push(ns.as_str());
+            }
+        }
         all.sort_unstable();
         all.dedup();
-        let mut namespaces: HashMap<String, Vec<Slot>> = HashMap::new();
-        for (i, pack) in packs.iter().enumerate() {
+        if all.len() > limits.stack_namespaces {
+            // Keep vanilla namespaces (minecraft/realms) plus the first namespaces up to the cap.
+            let mut kept: Vec<&str> = all
+                .iter()
+                .copied()
+                .filter(|&ns| ns == "minecraft" || ns == "realms")
+                .collect();
             for &ns in &all {
+                if kept.len() >= limits.stack_namespaces {
+                    break;
+                }
+                if ns != "minecraft" && ns != "realms" {
+                    kept.push(ns);
+                }
+            }
+            all = kept;
+        }
+        let mut namespaces: HashMap<String, Vec<Slot>> = HashMap::new();
+        'packs: for (i, pack) in packs.iter().enumerate() {
+            for (step, &ns) in all.iter().enumerate() {
+                if step & 63 == 0 && packs.iter().any(|p| p.budget().cancelled()) {
+                    break 'packs;
+                }
                 let content = pack.namespaces().contains(ns);
                 let filtered = pack.filter().is_some_and(|f| f.filters_namespace(ns));
                 if content || filtered {
@@ -312,6 +345,9 @@ impl Resources {
             let mut files: HashMap<String, (usize, usize, Loc)> = HashMap::new();
             let mut metas: HashMap<String, (usize, usize, Loc)> = HashMap::new();
             for (i, slot) in slots.iter().enumerate() {
+                if self.cancelled() {
+                    return BTreeMap::new();
+                }
                 if slot.filtered {
                     files.retain(|p, _| !self.filters(slot, p));
                     metas.retain(|p, _| !self.filters(slot, p));

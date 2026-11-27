@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use rayon::prelude::*;
-use regex::Regex;
+use regex::bytes::Regex;
 use serde_json::Value;
 
 use crate::id::Id;
@@ -237,6 +237,7 @@ fn parse_f64(v: Option<&Value>, what: &str, default: Option<f64>) -> Result<f64,
     }
 }
 
+#[cfg(test)]
 fn parse_sources(json: &Value) -> Result<Vec<Source>, String> {
     let list = json
         .get("sources")
@@ -271,7 +272,7 @@ fn parse_source(v: &Value) -> Result<Source, String> {
                 pattern
                     .get(k)
                     .map(|p| {
-                        crate::pack::pack_regex(
+                        crate::pack::filter_regex(
                             p.as_str().ok_or_else(|| format!("{k}: not a string"))?,
                         )
                     })
@@ -336,6 +337,30 @@ fn parse_source(v: &Value) -> Result<Source, String> {
     })
 }
 
+/// Largest palette PNG (in pixels) accepted by `paletted_permutations` so a pack cannot
+/// allocate multi-gigabyte palette HashMaps.
+const MAX_PALETTE_PIXELS: usize = 4096;
+
+/// Largest single frame (in texels) allowed for an animated sprite: 512 x 512 keeps a
+/// sprite's composed mip chain well below the GPU upload ring (`16 MiB`) and per-tick
+/// animation budget (`8 MiB`), preventing permanent per-frame upload failures.
+const MAX_ANIMATED_FRAME_TEXELS: u64 = 512 * 512;
+
+fn parse_sources_checked(v: &Value, cancelled: &dyn Fn() -> bool) -> Result<Vec<Source>, String> {
+    let list = v
+        .get("sources")
+        .and_then(Value::as_array)
+        .ok_or("missing sources")?;
+    let mut out = Vec::with_capacity(list.len());
+    for s in list {
+        if cancelled() {
+            return Err("the load was cancelled".into());
+        }
+        out.push(parse_source(s)?);
+    }
+    Ok(out)
+}
+
 /// Runs every source of the atlas's definition files (all packs, lowest
 /// first) into one id -> loader map. A definition file that fails to parse
 /// is skipped, as in vanilla.
@@ -350,6 +375,9 @@ fn collect<'a>(
     let limits = res.limits();
     let mut sprites: HashMap<Id, Loader<'a>> = HashMap::new();
     for r in res.stack(&file) {
+        if res.cancelled() {
+            return Err(AtlasError::Cancelled);
+        }
         let sources = r.json().and_then(|j| {
             let n = j
                 .get("sources")
@@ -361,8 +389,11 @@ fn collect<'a>(
                     r.limits().atlas_sources
                 ));
             }
-            parse_sources(&j)
+            parse_sources_checked(&j, &|| res.cancelled())
         });
+        if res.cancelled() {
+            return Err(AtlasError::Cancelled);
+        }
         let sources = match sources {
             Ok(s) => s,
             Err(e) => {
@@ -375,6 +406,9 @@ fn collect<'a>(
                 return Err(AtlasError::Cancelled);
             }
             run_source(res, source, &mut sprites, warnings);
+            if res.cancelled() {
+                return Err(AtlasError::Cancelled);
+            }
             if sprites.len() > limits.atlas_sprites {
                 return Err(AtlasError::TooManySprites {
                     atlas: def.name,
@@ -394,10 +428,14 @@ fn run_source<'a>(
     sprites: &mut HashMap<Id, Loader<'a>>,
     warnings: &mut Vec<String>,
 ) {
+    let max = res.limits().atlas_sprites;
     match source {
         Source::Directory { source, prefix } => {
             let dir = format!("textures/{source}");
             for (file, r) in res.list(&dir, |p| p.ends_with(".png")) {
+                if sprites.len() > max || res.cancelled() {
+                    return;
+                }
                 let path = &file.path()[dir.len() + 1..file.path().len() - 4];
                 sprites.insert(file.with_path(format!("{prefix}{path}")), Loader::File(r));
             }
@@ -409,8 +447,21 @@ fn run_source<'a>(
             None => warnings.push(format!("missing sprite: {}", texture_file(&resource))),
         },
         Source::Filter { namespace, path } => {
-            let hit = |re: &Option<Regex>, s: &str| re.as_ref().is_none_or(|r| r.is_match(s));
-            sprites.retain(|id, _| !(hit(&namespace, id.namespace()) && hit(&path, id.path())));
+            let hit =
+                |re: &Option<Regex>, s: &str| re.as_ref().is_none_or(|r| r.is_match(s.as_bytes()));
+            let mut step = 0usize;
+            let mut cancelled = false;
+            sprites.retain(|id, _| {
+                if cancelled {
+                    return true;
+                }
+                step += 1;
+                if step & 255 == 0 && res.cancelled() {
+                    cancelled = true;
+                    return true;
+                }
+                !(hit(&namespace, id.namespace()) && hit(&path, id.path()))
+            });
         }
         Source::Unstitch {
             resource,
@@ -423,6 +474,9 @@ fn run_source<'a>(
                     image: OnceLock::new(),
                 });
                 for (sprite, region) in regions {
+                    if sprites.len() > max || res.cancelled() {
+                        return;
+                    }
                     sprites.insert(
                         sprite,
                         Loader::Region {
@@ -454,9 +508,8 @@ fn run_source<'a>(
                         )
                     })
                     .collect();
-            let max = res.limits().atlas_sprites;
             for texture in textures {
-                if sprites.len() > max {
+                if sprites.len() > max || res.cancelled() {
                     // The atlas fails as soon as this source is done.
                     return;
                 }
@@ -469,6 +522,9 @@ fn run_source<'a>(
                     image: OnceLock::new(),
                 });
                 for (suffix, palette, target) in &palettes {
+                    if sprites.len() > max {
+                        return;
+                    }
                     sprites.insert(
                         texture.wrap("", &format!("{separator}{suffix}")),
                         Loader::Paletted {
@@ -486,7 +542,14 @@ fn run_source<'a>(
 
 fn load_palette(r: Option<&Resource<'_>>, max_side: u32) -> Result<Vec<u32>, String> {
     let r = r.ok_or("palette image not found")?;
-    Ok(r.image(max_side)?.pixels)
+    let pixels = r.image(max_side)?.pixels;
+    if pixels.len() > MAX_PALETTE_PIXELS {
+        return Err(format!(
+            "palette has {} pixels, more than {MAX_PALETTE_PIXELS}",
+            pixels.len()
+        ));
+    }
+    Ok(pixels)
 }
 
 fn build_palette(
@@ -620,6 +683,7 @@ fn load_file(id: Id, r: &Resource<'_>, gui: bool, load: &Load<'_>) -> Result<Con
             image.height / h
         ));
     }
+    let mut image = image;
     let animation = animation.and_then(|a| {
         let per_row = image.width / w;
         let total = per_row * (image.height / h);
@@ -631,11 +695,27 @@ fn load_file(id: Id, r: &Resource<'_>, gui: bool, load: &Load<'_>) -> Result<Con
                 .filter(|&(index, time)| time > 0 && index < total)
                 .collect(),
         };
-        (frames.len() > 1).then_some(Animation {
-            frames,
-            per_row,
-            interpolate: a.interpolate,
-        })
+        let changes = frames.len() > 1 && frames.iter().any(|&(idx, _)| idx != frames[0].0);
+        // An animated frame this large would exceed the upload ring or per-tick budget
+        // every frame.
+        let too_large =
+            r.pack().is_untrusted() && u64::from(w) * u64::from(h) > MAX_ANIMATED_FRAME_TEXELS;
+        if changes && !too_large {
+            return Some(Animation {
+                frames,
+                per_row,
+                interpolate: a.interpolate,
+            });
+        }
+        // Drawn still, as the frame the animation shows first (vanilla uploads
+        // `frames[0]`'s picture, which needn't be the image's top left one).
+        let first = frames.first().map_or(0, |f| f.0);
+        if first != 0
+            && let Some(still) = image.sub_image(first % per_row * w, first / per_row * h, w, h)
+        {
+            image = still;
+        }
+        None
     });
     Ok(Contents {
         id,
@@ -1058,5 +1138,26 @@ mod tests {
         ));
         let bad: Value = serde_json::from_str(r#"{"sources": [{"type": "nope"}]}"#).unwrap();
         assert!(parse_sources(&bad).is_err());
+    }
+
+    /// Filter patterns with `.` and negated classes compile (with ASCII classes) and match.
+    #[test]
+    fn filter_patterns_take_dots_and_negated_classes() {
+        let json: Value = serde_json::from_str(
+            r#"{"sources": [{"type": "filter", "pattern": {"namespace": "mine.raft", "path": "^block/.*_old$|^[^x]\\W\\S\\D$"}}]}"#,
+        )
+        .unwrap();
+        let s = parse_sources(&json).unwrap();
+        let Source::Filter {
+            namespace: Some(ns),
+            path: Some(path),
+        } = &s[0]
+        else {
+            panic!("not a filter: {s:?}");
+        };
+        assert!(ns.is_match(b"minecraft"));
+        assert!(path.is_match(b"block/stone_old"));
+        assert!(!path.is_match(b"block/stone_new"));
+        assert!(path.is_match(b"a/bc"));
     }
 }

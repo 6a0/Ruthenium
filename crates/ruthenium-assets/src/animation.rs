@@ -65,6 +65,8 @@ struct Sprite {
     stale: bool,
     /// It should be written, and waits for room in a tick's budget ([`MAX_STALE_TEXELS`]).
     owed: bool,
+    /// Disabled after a permanent GPU upload error (e.g., too large for the upload ring).
+    disabled: bool,
 }
 
 /// The most texels the sprites to be written may take at once: 8 MiB of RGBA. The game's
@@ -168,12 +170,12 @@ impl AtlasAnimations {
         }
         let sprites = atlas
             .animated
-            .iter()
+            .drain(..)
             .zip(places)
             .filter_map(|(a, place)| {
                 let (x, y, padding, width, height) = place?;
                 Some(Sprite {
-                    animation: a.animation.clone(),
+                    animation: a.animation,
                     levels: a.levels.iter().map(|i| (i.width, i.to_rgba8())).collect(),
                     at: (x, y),
                     padding,
@@ -181,6 +183,7 @@ impl AtlasAnimations {
                     head: Playhead::default(),
                     stale: false,
                     owed: false,
+                    disabled: false,
                 })
             })
             .collect();
@@ -203,7 +206,9 @@ impl AtlasAnimations {
     /// holds with those still waiting to be, from where the last tick stopped.
     pub fn tick(&mut self) {
         for s in &mut self.sprites {
-            s.tick();
+            if !s.disabled {
+                s.tick();
+            }
         }
         let mut taken: usize = self.stale_texels();
         let n = self.sprites.len();
@@ -249,7 +254,16 @@ impl AtlasAnimations {
 
     /// The first sprite from the `from`th on that the atlas does not show as it should.
     pub fn next_stale(&self, from: usize) -> Option<usize> {
-        (from..self.sprites.len()).find(|&i| self.sprites[i].stale)
+        (from..self.sprites.len()).find(|&i| self.sprites[i].stale && !self.sprites[i].disabled)
+    }
+
+    /// Permanently disables a sprite whose upload failed for a non-transient reason.
+    pub fn disable(&mut self, sprite: usize) {
+        if let Some(s) = self.sprites.get_mut(sprite) {
+            s.disabled = true;
+            s.stale = false;
+            s.owed = false;
+        }
     }
 
     /// Appends what the atlas should show of a sprite: the texels of its rectangles, one
@@ -291,6 +305,7 @@ mod tests {
             head: Playhead::default(),
             stale: false,
             owed: false,
+            disabled: false,
         }
     }
 

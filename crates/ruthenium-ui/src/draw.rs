@@ -98,7 +98,10 @@ impl Sprites {
 
 /// The most tiles one tiled blit draws. The game's smallest tiled part, the 2 x 2 centre
 /// of the bundle's bar, only ever fills a few dozen texels.
-const MAX_TILES: i64 = 16384;
+const MAX_TILES: i64 = 1024;
+/// Total quads a single GUI `DrawList` may expand tiled sprites into, keeping a frame's
+/// GUI quads well within `FRAME_DATA_BYTES` (4 MiB) so a pack cannot blank out the HUD.
+const MAX_TILED_DRAW_LIST_QUADS: usize = 16_384;
 
 /// Quads for one frame of GUI.
 #[derive(Debug, Default)]
@@ -259,17 +262,30 @@ impl DrawList {
             return;
         }
         let [u0, v0, u1, v1] = s.sub_uv(sw, sh, tx, ty, tw, th);
+        let remaining = MAX_TILED_DRAW_LIST_QUADS.saturating_sub(self.quads.len()) as i64;
+        if remaining <= 1 {
+            self.push(x, y, x + w, y + h, [u0, v0, u1, v1], color, t);
+            return;
+        }
+        let max_tiles = MAX_TILES.min(remaining);
         // A pack's sprite may tile by one texel: over a 4K screen that is millions of
-        // quads a frame. Past MAX_TILES the tiles are drawn larger, stretched.
+        // quads a frame. Past `max_tiles` the tiles are drawn larger, stretched.
         let (mut tw, mut th) = (tw, th);
         let tiles = |tw: i32, th: i32| {
             (i64::from(w) + i64::from(tw) - 1) / i64::from(tw)
                 * ((i64::from(h) + i64::from(th) - 1) / i64::from(th))
         };
-        if tiles(tw, th) > MAX_TILES {
-            let grow = (tiles(tw, th) as f64 / MAX_TILES as f64).sqrt().ceil() as i32 + 1;
-            tw = tw.saturating_mul(grow);
-            th = th.saturating_mul(grow);
+        if tiles(tw, th) > max_tiles {
+            let (tw0, th0) = (tw, th);
+            let mut grow = (tiles(tw, th) as f64 / max_tiles as f64).sqrt().ceil() as i32;
+            loop {
+                tw = tw0.saturating_mul(grow);
+                th = th0.saturating_mul(grow);
+                if tiles(tw, th) <= max_tiles || grow == i32::MAX {
+                    break;
+                }
+                grow += 1;
+            }
         }
         let lerp = |f: f32, a: f32, b: f32| a + f * (b - a);
         let mut ox = 0;

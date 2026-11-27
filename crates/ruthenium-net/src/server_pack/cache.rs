@@ -54,6 +54,20 @@ pub(crate) fn ensure_dir(dir: &Path, recursive: bool) -> io::Result<()> {
     }
 }
 
+fn open_no_follow(path: &Path, write: bool) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    if write {
+        o.write(true);
+    } else {
+        o.read(true);
+    }
+    // (libc's value: it differs between architectures, 0o400000 on x86-64 Linux and
+    // 0o100000 on aarch64 Linux, where 0o400000 is O_LARGEFILE.)
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut o, libc::O_NOFOLLOW);
+    o.open(path)
+}
+
 /// SHA-1 of a cached file, or None when it isn't a regular file or is larger than
 /// `max_size` (then it can't be a pack we'd have kept).
 pub(crate) fn hash_file(path: &Path, max_size: u64) -> io::Result<Option<[u8; 20]>> {
@@ -63,7 +77,21 @@ pub(crate) fn hash_file(path: &Path, max_size: u64) -> io::Result<Option<[u8; 20
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     }
-    let mut file = File::open(path)?.take(max_size + 1);
+    let file = match open_no_follow(path, false) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(40) || e.raw_os_error() == Some(62) => {
+            // ELOOP on Linux (40) or BSD/macOS (62): replaced with a symlink.
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > max_size {
+        return Ok(None);
+    }
+    let mut file = file.take(max_size + 1);
     let mut hasher = Sha1::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;
@@ -102,10 +130,12 @@ pub(crate) fn remove(path: &Path) -> io::Result<()> {
 
 /// `HttpUtil.updateModificationTime`: a reused pack counts as new for cleaning.
 pub(crate) fn touch(path: &Path) {
-    let r = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .and_then(|f| f.set_modified(SystemTime::now()));
+    let r = open_no_follow(path, true).and_then(|f| {
+        if !f.metadata()?.is_file() {
+            return Ok(());
+        }
+        f.set_modified(SystemTime::now())
+    });
     if let Err(e) = r {
         eprintln!(
             "[packs] couldn't update the time of {}: {e}",
@@ -180,9 +210,11 @@ const VACUUM_MAX_ENTRIES: usize = 100_000;
 /// oldest; then removes directories that emptied. Errors are logged, as vanilla does.
 pub(crate) fn vacuum(cache_dir: &Path, max_files: usize) {
     let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+    let mut orphan_temps: Vec<PathBuf> = Vec::new();
+    let mut already_empty_dirs: Vec<PathBuf> = Vec::new();
     let mut stack = vec![(cache_dir.to_path_buf(), 0usize)];
     let mut seen = 0usize;
-    while let Some((dir, depth)) = stack.pop() {
+    'walk: while let Some((dir, depth)) = stack.pop() {
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
@@ -193,10 +225,12 @@ pub(crate) fn vacuum(cache_dir: &Path, max_files: usize) {
                 continue;
             }
         };
+        let mut had_any = false;
         for entry in entries.flatten() {
+            had_any = true;
             seen += 1;
             if seen > VACUUM_MAX_ENTRIES {
-                break;
+                break 'walk;
             }
             // file_type() doesn't follow symlinks.
             let Ok(kind) = entry.file_type() else {
@@ -208,6 +242,14 @@ pub(crate) fn vacuum(cache_dir: &Path, max_files: usize) {
                     stack.push((path, depth + 1));
                 }
             } else if kind.is_file() && depth > 0 {
+                let is_temp = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("download-") && n.ends_with(".tmp"));
+                if is_temp {
+                    orphan_temps.push(path);
+                    continue;
+                }
                 let time = entry
                     .metadata()
                     .and_then(|m| m.modified())
@@ -215,6 +257,20 @@ pub(crate) fn vacuum(cache_dir: &Path, max_files: usize) {
                 files.push((path, time));
             }
         }
+        if depth > 0 && !had_any {
+            already_empty_dirs.push(dir);
+        }
+    }
+    for temp in orphan_temps {
+        if fs::remove_file(&temp).is_ok()
+            && let Some(parent) = temp.parent()
+            && parent != cache_dir
+        {
+            already_empty_dirs.push(parent.to_path_buf());
+        }
+    }
+    for dir in already_empty_dirs {
+        let _ = fs::remove_dir(&dir);
     }
     let Some(to_remove) = files.len().checked_sub(max_files).filter(|&n| n > 0) else {
         return;

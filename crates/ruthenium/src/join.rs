@@ -435,7 +435,7 @@ pub fn load_world_assets_from(
     })
     .map_err(|e| format!("{e}; run `ruthenium prepare`"))?;
     let animations = AtlasAnimations::take(&mut atlas);
-    let atlas_levels: Vec<Vec<u8>> = atlas.levels.iter().map(Image::to_rgba8).collect();
+    let atlas_levels: Vec<Vec<u8>> = atlas.levels.into_iter().map(|l| l.to_rgba8()).collect();
     eprintln!(
         "[ruthenium] world assets in {:.0?}: block atlas {}x{} with {} levels ({:.1} MiB, {:.0?}), {} of {} block states drawn from {} model parts",
         started.elapsed(),
@@ -501,8 +501,17 @@ fn block_entity_assets(
     let file = exports.join(ruthenium_prepare::exporters::MODEL_LAYERS);
     let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
     let models = ModelSet::new(&ruthenium_prepare::exporters::read_model_layers(&bytes)?)?;
+    // Cap extra entity/equipment/trim/palette texture counts so an untrusted pack cannot
+    // exhaust TextureTable slots or Vulkan allocations during reload.
+    const MAX_EXTRA_TEXTURES_PER_DIR: usize = 256;
+    const MAX_TRIM_TEXELS: u64 = 256 * 256;
+    const MAX_PALETTE_COLOURS: u64 = 256;
+
     let mut paths = block_entity::texture_paths();
     for folder in [block_entity::BANNER_DIR, block_entity::SHIELD_DIR] {
+        if resources.cancelled() {
+            return Err("the load was cancelled".into());
+        }
         let dir = format!("textures/entity/{folder}");
         paths.extend(
             resources
@@ -512,12 +521,16 @@ fn block_entity_assets(
                 .filter_map(|id| {
                     let path = id.path().strip_prefix("textures/entity/")?;
                     Some(path.strip_suffix(".png")?.to_owned())
-                }),
+                })
+                .take(MAX_EXTRA_TEXTURES_PER_DIR),
         );
     }
     let textures = paths
         .into_iter()
         .filter_map(|path| {
+            if resources.cancelled() {
+                return None;
+            }
             let picture = image(&format!("textures/entity/{path}.png"))?;
             Some((path, picture))
         })
@@ -533,6 +546,7 @@ fn block_entity_assets(
                 let below = id.path().strip_prefix(dir)?.strip_prefix('/')?;
                 Some((id.clone(), below.strip_suffix(suffix)?.to_owned()))
             })
+            .take(MAX_EXTRA_TEXTURES_PER_DIR)
             .collect()
     };
     let json = |id: &Id| -> Option<serde_json::Value> { resources.get(id)?.json().ok() };
@@ -548,6 +562,9 @@ fn block_entity_assets(
         equipment::WINGS_DIR,
     ] {
         for (_, name) in listed(&format!("textures/entity/{dir}"), ".png") {
+            if resources.cancelled() {
+                return Err("the load was cancelled".into());
+            }
             let path = format!("{dir}/{name}");
             if let Some(picture) = image(&format!("textures/entity/{path}.png")) {
                 textures.push((path, picture));
@@ -558,14 +575,25 @@ fn block_entity_assets(
     for kind in ["humanoid", "humanoid_leggings"] {
         let dir = format!("textures/trims/entity/{kind}");
         for (id, name) in listed(&dir, ".png") {
+            if resources.cancelled() {
+                return Err("the load was cancelled".into());
+            }
             let Some(picture) = image(id.path()) else {
                 continue;
             };
-            // The palette its colours are of, from its metadata.
-            let palette = Id::minecraft(&format!("{}.mcmeta", id.path()))
-                .and_then(|meta| json(&meta))
+            if u64::from(picture.width) * u64::from(picture.height) > MAX_TRIM_TEXELS {
+                continue;
+            }
+            // The palette its colours are of, from its metadata (bounded by mcmeta_bytes).
+            let palette = resources
+                .get(&id)
+                .and_then(|r| r.metadata().ok())
                 .and_then(|m| {
-                    let id = m.get("palette")?.get("base_palette")?.as_str()?.to_owned();
+                    let id = m
+                        .section("palette")?
+                        .get("base_palette")?
+                        .as_str()?
+                        .to_owned();
                     Some(id.strip_prefix("minecraft:").unwrap_or(&id).to_owned())
                 });
             trims.push((format!("trims/entity/{kind}/{name}"), picture, palette));
@@ -573,7 +601,16 @@ fn block_entity_assets(
     }
     let palettes = listed("textures/palettes", ".png")
         .into_iter()
-        .filter_map(|(id, name)| Some((name, image(id.path())?)))
+        .filter_map(|(id, name)| {
+            if resources.cancelled() {
+                return None;
+            }
+            let picture = image(id.path())?;
+            if u64::from(picture.width) * u64::from(picture.height) > MAX_PALETTE_COLOURS {
+                return None;
+            }
+            Some((name, picture))
+        })
         .collect();
     let font = Font::load(resources, &Id::minecraft("default").expect("a valid id"));
     for w in &font.warnings {

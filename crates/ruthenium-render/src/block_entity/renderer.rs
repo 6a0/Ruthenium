@@ -1195,26 +1195,20 @@ impl BlockEntityRenderer {
         // The items' atlas, once the ring has a stream to spare for it.
         if let Some(atlas) = self.item_atlas_waiting.take() {
             let whole = atlas.rgba.len() == atlas.width as usize * atlas.height as usize * 4;
-            let started = whole
-                .then(|| {
-                    textures
-                        .create(TextureDesc::rgba8(atlas.width, atlas.height))
-                        .ok()
-                })
-                .flatten()
-                .and_then(
-                    |id| match textures.stream(uploads, id, vec![atlas.rgba.clone()]) {
-                        Ok(()) => Some(id),
-                        Err(_) => {
+            if whole {
+                match textures.create(TextureDesc::rgba8(atlas.width, atlas.height)) {
+                    Ok(id) => match textures.stream(uploads, id, vec![atlas.rgba.clone()]) {
+                        Ok(()) => self.item_atlas = Some(id),
+                        Err(e) => {
                             textures.destroy(id);
-                            None
+                            if e.try_again() {
+                                self.item_atlas_waiting = Some(atlas);
+                            }
                         }
                     },
-                );
-            match started {
-                Some(id) => self.item_atlas = Some(id),
-                None if whole => self.item_atlas_waiting = Some(atlas),
-                None => {}
+                    Err(e) if e.try_again() => self.item_atlas_waiting = Some(atlas),
+                    Err(_) => {}
+                }
             }
         }
         // The models of what is newly held, as far as there is room and the ring takes
@@ -2968,17 +2962,25 @@ impl BlockEntityRenderer {
                     pass.bind_vertex_buffer(buffer, offset);
                     bound = source;
                 }
-                pass.draw_indexed_instances(
-                    LAYERS[usize::from(batch.0)].index(),
-                    if pushed { &[] } else { &push },
-                    quads * 6,
-                    0,
-                    (batch.2 * 4) as i32,
-                    at as u32,
-                    run as u32,
-                );
-                pushed = true;
-                self.stats.draws += 1;
+                // Chunk draws to the shared quad index buffer's capacity (16 384 quads)
+                // so a large model can never read out of bounds of the index buffer.
+                const QUADS_PER_DRAW: u32 = 1 << 14;
+                let mut done = 0u32;
+                while done < quads {
+                    let piece = (quads - done).min(QUADS_PER_DRAW);
+                    pass.draw_indexed_instances(
+                        LAYERS[usize::from(batch.0)].index(),
+                        if pushed { &[] } else { &push },
+                        piece * 6,
+                        0,
+                        ((batch.2 + done) * 4) as i32,
+                        at as u32,
+                        run as u32,
+                    );
+                    pushed = true;
+                    self.stats.draws += 1;
+                    done += piece;
+                }
                 at += run;
             }
             // (Nothing but what is solid was drawn.)

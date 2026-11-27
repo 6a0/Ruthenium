@@ -39,7 +39,25 @@ struct Region {
     w: u32,
     h: u32,
     item: Option<usize>,
+    /// True once this node or all of its children are completely filled, pruning O(N^2)
+    /// walks over full subtrees.
+    full: bool,
     children: Option<Vec<Region>>,
+}
+
+impl Drop for Region {
+    fn drop(&mut self) {
+        // Iterative drop so deep narrow chains cannot overflow the stack.
+        let mut stack = Vec::new();
+        if let Some(c) = self.children.take() {
+            stack.extend(c);
+        }
+        while let Some(mut node) = stack.pop() {
+            if let Some(c) = node.children.take() {
+                stack.extend(c);
+            }
+        }
+    }
 }
 
 impl Region {
@@ -50,16 +68,18 @@ impl Region {
             w,
             h,
             item: None,
+            full: false,
             children: None,
         }
     }
 
     fn add(&mut self, item: usize, iw: u32, ih: u32) -> bool {
-        if self.item.is_some() || iw > self.w || ih > self.h {
+        if self.full || self.item.is_some() || iw > self.w || ih > self.h {
             return false;
         }
         if iw == self.w && ih == self.h {
             self.item = Some(item);
+            self.full = true;
             return true;
         }
         let children = self.children.get_or_insert_with(|| {
@@ -80,18 +100,25 @@ impl Region {
             }
             c
         });
-        children.iter_mut().any(|c| c.add(item, iw, ih))
+        let added = children.iter_mut().any(|c| c.add(item, iw, ih));
+        if added && children.iter().all(|c| c.full) {
+            self.full = true;
+        }
+        added
     }
 
     fn walk(&self, out: &mut [Option<Placement>]) {
-        if let Some(i) = self.item {
-            out[i] = Some(Placement {
-                x: self.x,
-                y: self.y,
-            });
-        } else if let Some(c) = &self.children {
-            for r in c {
-                r.walk(out);
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            if let Some(i) = node.item {
+                out[i] = Some(Placement {
+                    x: node.x,
+                    y: node.y,
+                });
+            } else if let Some(c) = &node.children {
+                for r in c {
+                    stack.push(r);
+                }
             }
         }
     }

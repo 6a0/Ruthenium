@@ -343,12 +343,17 @@ impl std::fmt::Debug for Session {
 impl Session {
     pub fn start(options: SessionOptions) -> std::io::Result<Session> {
         let information = options.connect.information.clone();
+        let identity = (
+            options.connect.identity.name.clone(),
+            options.connect.identity.id,
+        );
         let connection = Connection::open(options.connect)?;
         Session::with_connection(
             connection,
             options.known_packs,
             options.physics,
             information,
+            identity,
             options.sound,
             options.profile_keys,
             options.server_packs,
@@ -356,11 +361,13 @@ impl Session {
     }
 
     /// A session on a connection that is already open.
+    #[allow(clippy::too_many_arguments)]
     fn with_connection(
         connection: Connection,
         known_packs: Vec<KnownPack>,
         physics: Option<Physics>,
         information: ClientInformation,
+        identity: (String, u128),
         sound: crate::sound::GameSounds,
         profile_keys: Option<Arc<dyn crate::chat::ProfileKeySource>>,
         server_packs: ServerPackSetup,
@@ -381,6 +388,8 @@ impl Session {
             .spawn(move || {
                 let mut game =
                     Game::new(connection, known_packs, physics, tx, publisher, information);
+                game.local_name = identity.0;
+                game.local_uuid = identity.1;
                 game.view = game_view;
                 game.container_view = game_container_view;
                 game.sounds = sound;
@@ -756,6 +765,10 @@ struct Game {
     /// UUID (its player list entry).
     name: String,
     uuid: u128,
+    /// The client's own authenticated identity (used for outbound resource-pack headers
+    /// so a malicious server cannot spoof X-Minecraft-Username/UUID via LoginFinished).
+    local_name: String,
+    local_uuid: u128,
     /// The player list and the scoreboard's teams (the play listener's, gone with it
     /// on a reconfiguration).
     players: PlayerInfos,
@@ -966,6 +979,8 @@ impl Game {
             online_mode: false,
             name: String::new(),
             uuid: 0,
+            local_name: String::new(),
+            local_uuid: 0,
             players: PlayerInfos::default(),
             teams: Teams::default(),
             scoreboard: Scoreboard::default(),
@@ -1579,7 +1594,7 @@ impl Game {
             Event::LoggedIn { profile, peer } => {
                 self.packs.peer = peer;
                 self.phase = Phase::Configuration;
-                eprintln!("[session] logged in as {}", profile.name);
+                eprintln!("[session] logged in as {:?}", profile.name);
                 self.name = profile.name.clone();
                 self.uuid = profile.id;
                 self.report(SessionEvent::LoggedIn { name: profile.name });
@@ -1587,12 +1602,14 @@ impl Game {
             Event::Configuration(p) => {
                 if let Err(e) = self.configuration(p) {
                     eprintln!("[session] {e}; disconnecting");
+                    self.close_reason = Some(Reason::Text(Tag::String(e)));
                     self.connection.close();
                 }
             }
             Event::Play(p) => {
                 if let Err(e) = self.play(p) {
                     eprintln!("[session] {e}; disconnecting");
+                    self.close_reason = Some(Reason::Text(Tag::String(e)));
                     self.connection.close();
                 }
             }
@@ -2159,7 +2176,10 @@ impl Game {
             Common::ResourcePackPush(push) => self.handle_pack_push(push),
             Common::ResourcePackPop { id } => self.handle_pack_pop(id),
             Common::Transfer { host, port } => {
-                eprintln!("[session] the server transfers to {host}:{port}: not supported yet");
+                eprintln!("[session] the server transfers to {host:?}:{port}: not supported yet");
+                self.close_reason = Some(Reason::Text(Tag::String(
+                    "Server transfers are not supported yet".into(),
+                )));
                 self.connection.close();
             }
             Common::CustomReportDetails { details } => self.report_details = details,
@@ -4332,6 +4352,7 @@ mod tests {
             Vec::new(),
             None,
             ClientInformation::default(),
+            (String::from("Player"), 0),
             crate::sound::GameSounds::default(),
             None,
             ServerPackSetup::default(),

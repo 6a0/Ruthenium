@@ -1202,6 +1202,9 @@ impl Menu {
         if let Some(s) = &self.session {
             s.disconnect();
         }
+        // Drop the server's language, sounds, toast, and reloads right away instead of
+        // waiting for the connection thread's Closed event.
+        self.packs_session_over();
         self.death = None;
         self.bed = false;
         self.leaving = true;
@@ -1216,6 +1219,11 @@ impl Menu {
             return;
         };
         let events: Vec<SessionEvent> = session.poll().collect();
+        // Coalesce PackPrompt bursts in a single frame so rapid pushes cannot freeze UI
+        // text shaping or repeatedly churn FormScreen layout.
+        let last_prompt = events
+            .iter()
+            .rposition(|e| matches!(e, SessionEvent::PackPrompt(_)));
         let ours = self.game_menu_open()
             || matches!(
                 self.screen,
@@ -1224,7 +1232,7 @@ impl Menu {
                     ..
                 )
             );
-        for e in events {
+        for (idx, e) in events.into_iter().enumerate() {
             match e {
                 SessionEvent::Stage(s) if ours && !self.leaving => self.connecting_form(s),
                 SessionEvent::CodeOfConduct(text) if !self.leaving => {
@@ -1260,7 +1268,11 @@ impl Menu {
                     });
                     self.death_form();
                 }
-                SessionEvent::PackPrompt(p) if !self.leaving => self.pack_prompt_arrived(p),
+                SessionEvent::PackPrompt(p) if !self.leaving => {
+                    if last_prompt == Some(idx) {
+                        self.pack_prompt_arrived(p);
+                    }
+                }
                 SessionEvent::PackStatus(s) => self.pack_status_changed(s),
                 SessionEvent::PackToast(t) => {
                     self.packs.toast = match t {
@@ -1289,12 +1301,32 @@ impl Menu {
                 SessionEvent::Closed(c) => {
                     self.session = None;
                     self.bed = false;
+                    self.death = None;
                     self.forget_world = true;
                     // (Before its reason is put in words: in vanilla's language.)
                     self.packs_session_over();
                     if self.leaving || crate::join::left_on_purpose(&c) {
                         self.leaving = false;
-                        if self.game_menu_open() {
+                        // Exit any session-bound screen (including PackPrompt) so closing
+                        // via Local::Closed can never strand the player on an orphaned form.
+                        let session_bound = self.game_menu_open()
+                            || matches!(
+                                self.screen,
+                                Screen::Game
+                                    | Screen::Chat(_)
+                                    | Screen::Container
+                                    | Screen::Paused
+                                    | Screen::Form(
+                                        FormKind::Connecting
+                                            | FormKind::Playing
+                                            | FormKind::CodeOfConduct
+                                            | FormKind::PackPrompt
+                                            | FormKind::Died
+                                            | FormKind::QuitConfirm,
+                                        ..
+                                    )
+                            );
+                        if session_bound {
                             self.settings_screen = None;
                             self.screen = Screen::Servers;
                         }
