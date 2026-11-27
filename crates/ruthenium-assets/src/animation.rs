@@ -73,8 +73,56 @@ struct Sprite {
 /// 56 animated sprites take 187 000 if all are written at once, padding and levels too; a pack's 65 536 interpolated sprites would
 /// be every texel of the atlas, every tick, composed on the frame's thread. Past it
 /// sprites wait their turn (round the list, so that each gets one): they move on less
-/// smoothly, and the work stays bounded.
+/// smoothly, and the work stays bounded. No sprite of a server's pack takes more than this
+/// in one write (one that would is drawn still: `atlas::build`), so a tick's writes from
+/// server packs never pass it; a larger one of the game's or the player's own packs is
+/// written whole, alone in its tick, as vanilla writes it.
 pub const MAX_STALE_TEXELS: usize = 1 << 21;
+
+/// Texels one write of an animated sprite takes: its slot at every one of `levels` mip
+/// levels, padding and all (what [`AtlasAnimations::compose`] makes of it).
+pub fn write_texels(width: u32, height: u32, padding: u32, levels: u32) -> u64 {
+    (0..levels.min(32))
+        .map(|l| {
+            let pad = 2 * u64::from(padding >> l);
+            (u64::from(width >> l) + pad) * (u64::from(height >> l) + pad)
+        })
+        .sum()
+}
+
+/// What staging a piece of sprites came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upload {
+    /// Staged: the atlas shows them from the next frame.
+    Done,
+    /// No room now: try again in a later frame.
+    NoRoom,
+    /// Never possible (larger than the upload ring, say): not to be tried again.
+    Never,
+}
+
+/// What [`AtlasAnimations::write_stale`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Writes {
+    /// Sprites written, and their bytes.
+    pub sprites: u64,
+    pub bytes: u64,
+    /// Times it stopped for lack of room.
+    pub waits: u64,
+    /// Sprites given up for good.
+    pub disabled: u64,
+    /// Whether there was anything to write.
+    pub worked: bool,
+}
+
+/// The scratch lists of [`AtlasAnimations::write_stale`]: a piece's sprites, their
+/// rectangles and their texels.
+#[derive(Debug, Default)]
+pub struct Piece {
+    pub sprites: Vec<usize>,
+    pub rects: Vec<Rect>,
+    pub texels: Vec<u8>,
+}
 
 impl Sprite {
     /// A tick goes by: the sprite is owed a write if it shows another frame, or blends.
@@ -279,6 +327,73 @@ impl AtlasAnimations {
     pub fn written(&mut self, sprite: usize) {
         self.sprites[sprite].stale = false;
     }
+
+    /// Writes up to `count` of the sprites the atlas doesn't show as it should, in pieces
+    /// of a few at a time: a piece takes sprites until it holds `piece_bytes` or
+    /// `piece_rects` rectangles, and is handed to `upload` (its rectangles, and their
+    /// texels one after another). A piece with no room waits for a later frame (and the
+    /// rest with it). A piece that can never be staged is tried again a sprite at a time,
+    /// so that only a sprite that can't go even alone is given up (disabled, drawn as it
+    /// last was), and the others in its piece play on.
+    pub fn write_stale(
+        &mut self,
+        count: usize,
+        piece_bytes: usize,
+        piece_rects: usize,
+        piece: &mut Piece,
+        mut upload: impl FnMut(&[Rect], &[u8]) -> Upload,
+    ) -> Writes {
+        let mut out = Writes::default();
+        let mut left = count;
+        let mut from = 0;
+        // After a piece that could never go: one sprite a piece, for the rest of the call.
+        let mut alone = false;
+        while left > 0
+            && let Some(first) = self.next_stale(from)
+        {
+            out.worked = true;
+            piece.sprites.clear();
+            piece.rects.clear();
+            piece.texels.clear();
+            let mut next = Some(first);
+            while let Some(sprite) = next {
+                piece.sprites.push(sprite);
+                self.compose(sprite, &mut piece.rects, &mut piece.texels);
+                from = sprite + 1;
+                left -= 1;
+                next = (!alone
+                    && left > 0
+                    && piece.texels.len() < piece_bytes
+                    && piece.rects.len() < piece_rects)
+                    .then(|| self.next_stale(from))
+                    .flatten();
+            }
+            match upload(&piece.rects, &piece.texels) {
+                Upload::Done => {
+                    for &sprite in &piece.sprites {
+                        self.written(sprite);
+                    }
+                    out.sprites += piece.sprites.len() as u64;
+                    out.bytes += piece.texels.len() as u64;
+                }
+                Upload::NoRoom => {
+                    out.waits += 1;
+                    break;
+                }
+                Upload::Never if piece.sprites.len() > 1 => {
+                    // One of them is too large for a piece: each goes alone.
+                    alone = true;
+                    from = first;
+                    left += piece.sprites.len();
+                }
+                Upload::Never => {
+                    self.disable(first);
+                    out.disabled += 1;
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +575,69 @@ mod tests {
         a.tick();
         assert_eq!(a.stale_count(), 1);
         assert_eq!(a.stale_texels(), one);
+    }
+
+    /// A piece that can never be staged (one sprite in it too large for the upload ring)
+    /// gives up only that sprite: the others in its piece are written, alone, and play on.
+    #[test]
+    fn a_sprite_that_can_never_be_written_gives_up_only_itself() {
+        let mut big = sprite(&[(0, 1), (1, 1)], false);
+        // Ten times the texels of the others.
+        big.levels = vec![(40, vec![0; 40 * 40 * 4])];
+        big.size = (20, 20);
+        big.padding = 0;
+        let mut a = AtlasAnimations {
+            sprites: vec![
+                sprite(&[(0, 1), (1, 1)], false),
+                big,
+                sprite(&[(0, 1), (1, 1)], false),
+            ],
+            cursor: 0,
+            budget: MAX_STALE_TEXELS,
+        };
+        let too_large = 400 * 4;
+        let mut piece = Piece::default();
+        let mut uploads = Vec::new();
+        let mut upload = |rects: &[Rect], texels: &[u8]| {
+            uploads.push(rects.len());
+            if texels.len() >= too_large {
+                Upload::Never
+            } else {
+                Upload::Done
+            }
+        };
+        for _ in 0..3 {
+            a.tick();
+            let w = a.write_stale(usize::MAX, 1 << 20, 512, &mut piece, &mut upload);
+            assert_eq!(a.stale_count(), 0);
+            assert!(w.sprites >= 2, "{w:?}");
+        }
+        assert!(a.sprites[1].disabled);
+        assert!(!a.sprites[0].disabled && !a.sprites[2].disabled);
+        // The first tick: the piece of all three, then each alone; later ticks, the two
+        // small ones together.
+        assert_eq!(uploads, [5, 2, 1, 2, 4, 4]);
+        // No room: it stops, and nothing is given up.
+        let mut a = AtlasAnimations {
+            sprites: vec![sprite(&[(0, 1), (1, 1)], false)],
+            cursor: 0,
+            budget: MAX_STALE_TEXELS,
+        };
+        a.tick();
+        let w = a.write_stale(1, 1 << 20, 512, &mut piece, |_, _| Upload::NoRoom);
+        assert_eq!((w.waits, w.disabled, a.stale_count()), (1, 0, 1));
+    }
+
+    /// A write's texels, as `Sprite::texels` counts them.
+    #[test]
+    fn a_writes_texels_are_its_slots_at_every_level() {
+        let s = sprite(&[(0, 1), (1, 1)], false);
+        assert_eq!(write_texels(2, 2, 2, 2) as usize, s.texels());
+        assert_eq!(write_texels(16, 16, 1, 1), 18 * 18);
+        assert_eq!(
+            write_texels(1 << 20, 1 << 20, 0, 40),
+            (0..32).map(|l| (1u64 << 20 >> l).pow(2)).sum::<u64>()
+        );
     }
 
     /// Where the game's own animation states stand after each of 64 ticks, as hashes of

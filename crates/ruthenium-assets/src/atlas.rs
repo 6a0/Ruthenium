@@ -341,11 +341,6 @@ fn parse_source(v: &Value) -> Result<Source, String> {
 /// allocate multi-gigabyte palette HashMaps.
 const MAX_PALETTE_PIXELS: usize = 4096;
 
-/// Largest single frame (in texels) allowed for an animated sprite: 512 x 512 keeps a
-/// sprite's composed mip chain well below the GPU upload ring (`16 MiB`) and per-tick
-/// animation budget (`8 MiB`), preventing permanent per-frame upload failures.
-const MAX_ANIMATED_FRAME_TEXELS: u64 = 512 * 512;
-
 fn parse_sources_checked(v: &Value, cancelled: &dyn Fn() -> bool) -> Result<Vec<Source>, String> {
     let list = v
         .get("sources")
@@ -618,6 +613,9 @@ struct Contents {
     gui: Option<GuiScaling>,
     blur: bool,
     clamp: bool,
+    /// Read from a server's pack: an animation it can't write within a tick's budget is
+    /// drawn still (see `build`).
+    untrusted: bool,
 }
 
 impl Contents {
@@ -634,6 +632,7 @@ impl Contents {
             gui: None,
             blur: false,
             clamp: false,
+            untrusted: false,
         }
     }
 }
@@ -696,11 +695,7 @@ fn load_file(id: Id, r: &Resource<'_>, gui: bool, load: &Load<'_>) -> Result<Con
                 .collect(),
         };
         let changes = frames.len() > 1 && frames.iter().any(|&(idx, _)| idx != frames[0].0);
-        // An animated frame this large would exceed the upload ring or per-tick budget
-        // every frame.
-        let too_large =
-            r.pack().is_untrusted() && u64::from(w) * u64::from(h) > MAX_ANIMATED_FRAME_TEXELS;
-        if changes && !too_large {
+        if changes {
             return Some(Animation {
                 frames,
                 per_row,
@@ -729,6 +724,7 @@ fn load_file(id: Id, r: &Resource<'_>, gui: bool, load: &Load<'_>) -> Result<Con
         gui,
         blur: texture.blur,
         clamp: texture.clamp,
+        untrusted: r.pack().is_untrusted(),
     })
 }
 
@@ -1032,6 +1028,26 @@ pub fn build(res: &Resources, def: &AtlasDef, opts: &AtlasOptions) -> Result<Atl
             .animation
             .as_ref()
             .map_or((0, 0), |a| a.frame_pos(a.frames[0].0));
+        // An animation of a server's pack whose one write (every level, padding and all)
+        // is more than a tick may write (`MAX_STALE_TEXELS`) is drawn still, as its first
+        // frame (which vanilla uploads first, and which is blitted above). Vanilla
+        // animates it; here it would either break the budget every time it changes
+        // frame, or, written over several ticks, show parts of two frames at once,
+        // which vanilla never does. Anything within the budget (up to about 1200 x 1200
+        // a frame) plays as vanilla's. The game's own and the player's packs keep
+        // vanilla's way: such a sprite is written whole, alone in its tick.
+        let animation = s.animation.filter(|_| {
+            let texels = crate::animation::write_texels(s.width, s.height, padding, levels + 1);
+            let fits = !s.untrusted || texels <= crate::animation::MAX_STALE_TEXELS as u64;
+            if !fits {
+                warnings.push(format!(
+                    "{}: its frames take {texels} texels a write, more than a tick's {}: drawn still",
+                    s.id,
+                    crate::animation::MAX_STALE_TEXELS
+                ));
+            }
+            fits
+        });
         for (l, dst) in out_levels.iter_mut().enumerate() {
             blit(
                 dst,
@@ -1042,7 +1058,7 @@ pub fn build(res: &Resources, def: &AtlasDef, opts: &AtlasOptions) -> Result<Atl
                 padding >> l,
             );
         }
-        let anim_index = s.animation.map(|animation| {
+        let anim_index = animation.map(|animation| {
             animated.push(Animated {
                 id: s.id.clone(),
                 animation,

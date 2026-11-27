@@ -31,7 +31,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ruthenium_assets::AtlasAnimations;
-use ruthenium_assets::animation::Rect;
+use ruthenium_assets::animation::{Piece, Upload};
 use ruthenium_gpu::{
     BufferPool, DRAW_COMMAND_BYTES, Error, FrameData, Gpu, ImageRegion, MAX_INDIRECT_DRAWS, Pass,
     PoolConfig, PoolError, PoolStats, RangeHandle, Reservation, ReservationState, StagingWriter,
@@ -756,9 +756,7 @@ pub(crate) struct WorldRenderer {
     animated_stale: usize,
     animated_frame: Option<Instant>,
     /// Scratch of [`Self::animate`]: a piece's sprites, rectangles and texels.
-    animated: Vec<usize>,
-    animated_rects: Vec<Rect>,
-    animated_texels: Vec<u8>,
+    animated: Piece,
     lightmap: Option<TextureId>,
     lightmap_inputs: LightmapInputs,
     pool: BufferPool,
@@ -1034,9 +1032,7 @@ impl WorldRenderer {
             animated_at: None,
             animated_stale: 0,
             animated_frame: None,
-            animated: Vec::new(),
-            animated_rects: Vec::new(),
-            animated_texels: Vec::new(),
+            animated: Piece::default(),
             lightmap: None,
             lightmap_inputs: LightmapInputs::default(),
             pool,
@@ -1818,41 +1814,20 @@ impl WorldRenderer {
             .map_or(ANIMATION_SPREAD, |last| {
                 started.saturating_duration_since(last)
             });
-        let mut left = animation_share(self.animated_stale, since);
-        let mut from = 0;
-        let mut worked = false;
-        while left > 0
-            && let Some(first) = self.animations.next_stale(from)
-        {
-            worked = true;
-            // A piece: some sprites, with all their levels.
-            self.animated.clear();
-            self.animated_rects.clear();
-            self.animated_texels.clear();
-            let mut next = Some(first);
-            // Keep each update batch comfortably below `MAX_IMAGE_COPIES` (1024) so many
-            // tiny animated sprites don't permanently fail with `UploadError::TooLarge`.
-            const MAX_BATCH_RECTS: usize = 512;
-            while let Some(sprite) = next {
-                self.animated.push(sprite);
-                self.animations.compose(
-                    sprite,
-                    &mut self.animated_rects,
-                    &mut self.animated_texels,
-                );
-                from = sprite + 1;
-                left -= 1;
-                next = (left > 0
-                    && self.animated_texels.len() < ANIMATION_PIECE
-                    && self.animated_rects.len() < MAX_BATCH_RECTS)
-                    .then(|| self.animations.next_stale(from))
-                    .flatten();
-            }
-            let mut rest = &self.animated_texels[..];
-            let regions: Vec<(ImageRegion, &[u8])> = self
-                .animated_rects
-                .iter()
-                .map(|r| {
+        let left = animation_share(self.animated_stale, since);
+        // Keep each piece comfortably below `MAX_IMAGE_COPIES` (1024) so many tiny
+        // animated sprites don't permanently fail with `UploadError::TooLarge`.
+        const MAX_BATCH_RECTS: usize = 512;
+        let atlas = self.atlas;
+        let writes = self.animations.write_stale(
+            left,
+            ANIMATION_PIECE,
+            MAX_BATCH_RECTS,
+            &mut self.animated,
+            |rects, texels| {
+                let mut regions: Vec<(ImageRegion, &[u8])> = Vec::with_capacity(rects.len());
+                let mut rest = texels;
+                for r in rects {
                     let (texels, after) = rest.split_at((r.width * r.height * 4) as usize);
                     rest = after;
                     let region = ImageRegion {
@@ -1862,28 +1837,23 @@ impl WorldRenderer {
                         width: r.width,
                         height: r.height,
                     };
-                    (region, texels)
-                })
-                .collect();
-            if let Err(e) = textures.update(uploads, self.atlas, &regions) {
-                if !e.try_again() {
-                    // Permanent failure (e.g. sprite too large for the upload ring):
-                    // disable it so it doesn't stall every subsequent frame.
-                    for &sprite in &self.animated {
-                        self.animations.disable(sprite);
-                    }
-                    continue;
+                    regions.push((region, texels));
                 }
-                // No room: the next frame writes what they should show by then.
-                self.stats.animation_waits += 1;
-                break;
-            }
-            for &sprite in &self.animated {
-                self.animations.written(sprite);
-            }
-            self.stats.animation_writes += self.animated.len() as u64;
-            self.stats.animation_bytes += self.animated_texels.len() as u64;
-        }
+                match textures.update(uploads, atlas, &regions) {
+                    Ok(()) => Upload::Done,
+                    // No room: the next frame writes what they should show by then.
+                    Err(e) if e.try_again() => Upload::NoRoom,
+                    // Never (e.g. a sprite too large for the upload ring): only the
+                    // sprite that can't go alone is given up, so it doesn't stall every
+                    // later frame.
+                    Err(_) => Upload::Never,
+                }
+            },
+        );
+        let worked = writes.worked;
+        self.stats.animation_waits += writes.waits;
+        self.stats.animation_writes += writes.sprites;
+        self.stats.animation_bytes += writes.bytes;
         if worked {
             let micros = started.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
             self.stats.slowest_animation_micros = self.stats.slowest_animation_micros.max(micros);

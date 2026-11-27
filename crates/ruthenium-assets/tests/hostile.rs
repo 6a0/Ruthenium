@@ -734,18 +734,23 @@ fn an_animation_of_a_million_frames_drops_its_sprite() {
 }
 
 /// An animation that never changes frame, and one too large to animate from a server's
-/// pack, are drawn still as the frame they show first, not the image's top one.
+/// pack (one write of it is more than a tick's budget), are drawn still as the frame
+/// they show first, not the image's top one. One within the budget plays, as vanilla's
+/// do, however large its frames: no write of a server's sprite is more than the budget.
 #[test]
 fn a_still_animation_shows_its_first_frame() {
     // Two frames of 16x16: red on top, blue below.
-    let mut two = Image::new(16, 32);
-    two.pixels[..256].fill(0xFFFF_0000);
-    two.pixels[256..].fill(0xFF00_00FF);
-    let two = two.encode_png();
-    let mut big = Image::new(1024, 2048);
-    big.pixels[..1024 * 1024].fill(0xFFFF_0000);
-    big.pixels[1024 * 1024..].fill(0xFF00_00FF);
-    let big = big.encode_png();
+    let two_frames = |side: usize| {
+        let mut two = Image::new(side as u32, 2 * side as u32);
+        two.pixels[..side * side].fill(0xFFFF_0000);
+        two.pixels[side * side..].fill(0xFF00_00FF);
+        two.encode_png()
+    };
+    let two = two_frames(16);
+    // 1536 x 1536 frames: with padding and mip levels, more than 2^21 texels a write.
+    let big = two_frames(1536);
+    // 1024 x 1024 ones are within it.
+    let mid = two_frames(1024);
     let (res, _t) = pack(
         &[
             ("assets/minecraft/atlases/blocks.json", BLOCKS_ATLAS),
@@ -759,10 +764,26 @@ fn a_still_animation_shows_its_first_frame() {
                 "assets/minecraft/textures/block/big.png.mcmeta",
                 br#"{"animation": {"frames": [1, 0]}}"#,
             ),
+            ("assets/minecraft/textures/block/mid.png", &mid),
+            (
+                "assets/minecraft/textures/block/mid.png.mcmeta",
+                br#"{"animation": {"frames": [1, 0]}}"#,
+            ),
         ],
         &Limits::untrusted(),
     );
-    let a = blocks(&res, 16384).unwrap();
+    let mut a = blocks(&res, 16384).unwrap();
+    assert!(a.sprite(&id("block/mid")).unwrap().animated.is_some());
+    assert!(
+        a.warnings
+            .iter()
+            .any(|w| w.contains("block/big") && w.contains("drawn still")),
+        "{:?}",
+        a.warnings
+    );
+    let animations = ruthenium_assets::AtlasAnimations::take(&mut a);
+    assert_eq!(animations.len(), 1);
+    assert!(animations.texels(0) <= ruthenium_assets::animation::MAX_STALE_TEXELS);
     for name in ["block/same", "block/big"] {
         let s = a.sprite(&id(name)).unwrap();
         assert!(s.animated.is_none(), "{name} is animated");
