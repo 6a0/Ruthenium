@@ -11,6 +11,12 @@
 //! handed on, in order, as an [`Event`] for the game thread, which answers through
 //! [`Connection::send`].
 //!
+//! Play packets between two bundle delimiters are held back and handed on together as one
+//! [`Event::Bundle`] once the closing delimiter has arrived (`PacketBundlePacker`), so
+//! the game thread handles a bundle in one go however its bytes were split. As vanilla
+//! runs a bundle's packets on its main thread (`handleBundlePacket`), the keep-alives,
+//! chunk batch packets and disconnects inside one are handled when it closes, in order.
+//!
 //! A terminal packet (`finish_configuration`, `start_configuration`) stops decoding,
 //! as vanilla's `ProtocolSwapHandler` does, until the game thread has handled it and
 //! called [`Connection::switch`] with its acknowledgement: that packet goes out in the
@@ -43,6 +49,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// The handshake's host field limit (`ClientIntentionPacket`).
 const MAX_HOST: usize = 255;
+/// The most packets a bundle may hold (`BundlerInfo.BUNDLE_SIZE_LIMIT`).
+const BUNDLE_SIZE_LIMIT: usize = 4096;
 
 /// The phases after the login, whose packets the game thread handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +191,9 @@ pub enum Event {
     },
     Configuration(configuration::Clientbound),
     Play(play::Clientbound),
+    /// The play packets of one bundle, in order (`ClientboundBundlePacket`): handled
+    /// together, as one task. Never empty.
+    Bundle(Vec<play::Clientbound>),
     /// The last event.
     Closed(Closed),
 }
@@ -351,6 +362,8 @@ struct Net<'a> {
     chunk_batches: ChunkBatchSize,
     /// The server's address.
     peer: Option<IpAddr>,
+    /// The packets of the bundle being read, once its opening delimiter has arrived.
+    bundle: Option<Vec<play::Clientbound>>,
 }
 
 /// How many chunks a tick the client asks for (`ChunkBatchSizeCalculator`): the time
@@ -445,31 +458,78 @@ impl Net<'_> {
             }
             State::After(Protocol::Play) => {
                 let p = play::Clientbound::decode(id, body).map_err(protocol)?;
-                match p {
-                    play::Clientbound::Common(Common::KeepAlive { id }) => {
-                        self.send(&play::keep_alive(id)).await
+                let bundle_error = |m: &str| Err(Reason::Local(Local::Protocol(m.into())));
+                if let Some(bundle) = &mut self.bundle {
+                    if p.is_terminal() {
+                        return bundle_error("Terminal message received in bundle");
                     }
-                    play::Clientbound::Common(Common::Disconnect { reason }) => {
-                        Err(Reason::Text(reason))
+                    if p != play::Clientbound::BundleDelimiter {
+                        if bundle.len() >= BUNDLE_SIZE_LIMIT {
+                            return bundle_error("Too many packets in a bundle");
+                        }
+                        bundle.push(p);
+                        return Ok(());
                     }
-                    play::Clientbound::ChunkBatchStart => {
-                        self.chunk_batches.start(std::time::Instant::now());
-                        Ok(())
-                    }
-                    play::Clientbound::ChunkBatchFinished { batch_size } => {
-                        self.chunk_batches
-                            .finish(batch_size, std::time::Instant::now());
-                        let desired = self.chunk_batches.desired_chunks_per_tick();
-                        self.send(&play::chunk_batch_received(desired)).await
-                    }
-                    p => {
-                        self.paused = p.is_terminal();
-                        self.event(Event::Play(p));
-                        Ok(())
-                    }
+                    let bundle = self.bundle.take().unwrap_or_default();
+                    return self.bundle_end(bundle).await;
                 }
+                if p == play::Clientbound::BundleDelimiter {
+                    self.bundle = Some(Vec::new());
+                    return Ok(());
+                }
+                self.play(p).await
             }
         }
+    }
+
+    /// A bundle's closing delimiter: what this thread handles itself is handled now, in
+    /// order, and the rest goes to the game thread as one event.
+    async fn bundle_end(&mut self, bundle: Vec<play::Clientbound>) -> Result<(), Reason> {
+        let mut rest = Vec::with_capacity(bundle.len());
+        for p in bundle {
+            if let Some(p) = self.net_play(p).await? {
+                rest.push(p);
+            }
+        }
+        if !rest.is_empty() {
+            self.event(Event::Bundle(rest));
+        }
+        Ok(())
+    }
+
+    /// A play packet outside a bundle.
+    async fn play(&mut self, p: play::Clientbound) -> Result<(), Reason> {
+        if let Some(p) = self.net_play(p).await? {
+            self.paused = p.is_terminal();
+            self.event(Event::Play(p));
+        }
+        Ok(())
+    }
+
+    /// Handles a play packet if it is one this thread handles; otherwise gives it back.
+    async fn net_play(
+        &mut self,
+        p: play::Clientbound,
+    ) -> Result<Option<play::Clientbound>, Reason> {
+        match p {
+            play::Clientbound::Common(Common::KeepAlive { id }) => {
+                self.send(&play::keep_alive(id)).await?;
+            }
+            play::Clientbound::Common(Common::Disconnect { reason }) => {
+                return Err(Reason::Text(reason));
+            }
+            play::Clientbound::ChunkBatchStart => {
+                self.chunk_batches.start(std::time::Instant::now());
+            }
+            play::Clientbound::ChunkBatchFinished { batch_size } => {
+                self.chunk_batches
+                    .finish(batch_size, std::time::Instant::now());
+                let desired = self.chunk_batches.desired_chunks_per_tick();
+                self.send(&play::chunk_batch_received(desired)).await?;
+            }
+            p => return Ok(Some(p)),
+        }
+        Ok(None)
     }
 
     async fn login(&mut self, o: &Opened, id: u32, body: &[u8]) -> Result<(), Reason> {
@@ -597,6 +657,7 @@ async fn run(
         hello_seen: false,
         chunk_batches: ChunkBatchSize::default(),
         peer: Some(socket.ip()),
+        bundle: None,
     };
     let mut host = host;
     if host.encode_utf16().count() > MAX_HOST {

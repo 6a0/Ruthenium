@@ -1839,6 +1839,10 @@ pub mod play {
         },
         /// `ClientboundCommandsPacket`: the commands the player may use.
         Commands(Box<crate::commands::CommandTree>),
+        /// `ClientboundBundleDelimiterPacket`: opens or closes a bundle. Never reaches the
+        /// game thread: the connection groups the packets between two into one event, as
+        /// vanilla's `PacketBundlePacker` makes a `ClientboundBundlePacket`.
+        BundleDelimiter,
         /// Any other packet, not read yet.
         Other(pl::Clientbound),
     }
@@ -1863,6 +1867,7 @@ pub mod play {
                 C::Transfer => Clientbound::Common(Common::read_transfer(&mut r)?),
                 C::CustomReportDetails => Clientbound::Common(Common::read_report_details(&mut r)?),
                 C::StartConfiguration => Clientbound::StartConfiguration,
+                C::BundleDelimiter => Clientbound::BundleDelimiter,
                 C::Login => {
                     let player_id = r.i32()?;
                     let hardcore = r.bool()?;

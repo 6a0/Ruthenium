@@ -263,6 +263,134 @@ fn offline_login_configuration_and_play() {
     assert!(matches!(&c.reason, Reason::Text(Tag::Compound(t)) if t.string("text") == Some("Bye")));
 }
 
+/// Logs in offline and goes straight through the configuration into play.
+async fn into_play(listener: &TcpListener, port: u16) -> Server {
+    let mut s = Server::accept(listener).await;
+    let name = s.opening(port).await;
+    s.finish_login(&name).await;
+    s.send(3, |_| {}).await;
+    assert_eq!(s.recv().await, (3, vec![]), "finish_configuration");
+    s
+}
+
+use ruthenium_data::v26_3::packets::play as pl;
+
+fn play_packet(s: &mut Server, id: pl::Clientbound, body: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    s.transport.encode(&wire::packet(id.id(), body)).unwrap()
+}
+
+#[test]
+fn bundles_reach_the_game_thread_whole() {
+    let events = session(Auth::Offline, |l, port| async move {
+        let mut s = into_play(&l, port).await;
+        // A ping before, then a bundle split across two writes with a pause between, a
+        // keep-alive inside it, then a ping after.
+        let mut first = play_packet(&mut s, pl::Clientbound::Ping, |o| wire::write_i32(o, 1));
+        first.extend(play_packet(
+            &mut s,
+            pl::Clientbound::BundleDelimiter,
+            |_| {},
+        ));
+        first.extend(play_packet(&mut s, pl::Clientbound::Ping, |o| {
+            wire::write_i32(o, 2)
+        }));
+        first.extend(play_packet(&mut s, pl::Clientbound::KeepAlive, |o| {
+            wire::write_i64(o, 9)
+        }));
+        s.stream.write_all(&first).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut second = play_packet(&mut s, pl::Clientbound::Ping, |o| wire::write_i32(o, 3));
+        second.extend(play_packet(
+            &mut s,
+            pl::Clientbound::BundleDelimiter,
+            |_| {},
+        ));
+        second.extend(play_packet(&mut s, pl::Clientbound::Ping, |o| {
+            wire::write_i32(o, 4)
+        }));
+        // An empty bundle hands nothing on.
+        second.extend(play_packet(
+            &mut s,
+            pl::Clientbound::BundleDelimiter,
+            |_| {},
+        ));
+        second.extend(play_packet(
+            &mut s,
+            pl::Clientbound::BundleDelimiter,
+            |_| {},
+        ));
+        s.stream.write_all(&second).await.unwrap();
+        // The keep-alive is answered when the bundle closes.
+        assert_eq!(s.recv().await, (28, 9i64.to_be_bytes().to_vec()));
+        s.send(32, |o| {
+            ruthenium_protocol::nbt::write_network(o, &Tag::String("Bye".into())).unwrap()
+        })
+        .await;
+    });
+    let ping = |id| play::Clientbound::Common(Common::Ping { id });
+    let play: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, Event::Play(_) | Event::Bundle(_)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        play,
+        [
+            Event::Play(ping(1)),
+            Event::Bundle(vec![ping(2), ping(3)]),
+            Event::Play(ping(4)),
+        ]
+    );
+}
+
+/// The events of a play session in which the server sends `packets`.
+fn bundle_ending(packets: Vec<(pl::Clientbound, Vec<u8>)>) -> Vec<Event> {
+    session(Auth::Offline, |l, port| async move {
+        let mut s = into_play(&l, port).await;
+        let mut all = Vec::new();
+        for (id, body) in packets {
+            all.extend(play_packet(&mut s, id, |o| o.extend(body)));
+        }
+        s.stream.write_all(&all).await.unwrap();
+        // Until the client gives up.
+        while s.try_recv().await.is_some() {}
+    })
+}
+
+#[test]
+fn bundles_refuse_terminal_packets_and_hold_at_most_4096() {
+    let delimiter = (pl::Clientbound::BundleDelimiter, vec![]);
+    let ping = (pl::Clientbound::Ping, 1i32.to_be_bytes().to_vec());
+    let protocol = |m: &str| Reason::Local(Local::Protocol(m.into()));
+    let terminal = vec![
+        delimiter.clone(),
+        (pl::Clientbound::StartConfiguration, vec![]),
+    ];
+    assert_eq!(
+        closed(&bundle_ending(terminal)).reason,
+        protocol("Terminal message received in bundle")
+    );
+    let mut full = vec![delimiter.clone()];
+    full.extend(std::iter::repeat_n(ping.clone(), 4096));
+    full.push(delimiter.clone());
+    full.push(ping.clone());
+    full.extend([delimiter.clone(), ping.clone()]);
+    full.extend(std::iter::repeat_n(ping.clone(), 4096));
+    let events = bundle_ending(full);
+    assert_eq!(
+        closed(&events).reason,
+        protocol("Too many packets in a bundle")
+    );
+    let bundles: Vec<usize> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Bundle(b) => Some(b.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bundles, [4096], "a full bundle is still one");
+}
+
 /// An encrypting server: hello, then the key packet, then everything encrypted.
 async fn encrypting_server(listener: TcpListener, port: u16, authenticate: bool) -> Option<String> {
     let key = private_key();

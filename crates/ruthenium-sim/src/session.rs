@@ -720,6 +720,14 @@ struct Game {
     started: Instant,
     /// Tests set the millisecond clock by hand.
     manual_ms: Option<i64>,
+    /// Until when (ms) the game thread stays busy with a login, handling nothing else.
+    busy_until: Option<i64>,
+    /// How long a login keeps it busy ([`LOGIN_BUSY_MS`]; tests driven by hand: 0).
+    login_busy_ms: i64,
+    /// The ticks counted by the frame a login held up, run when it goes on.
+    held_ticks: u32,
+    /// The rest of a bundle a login held up.
+    held_bundle: VecDeque<play::Clientbound>,
     view: Arc<Mutex<Option<PlayerView>>>,
     /// The container screen, its menus' packets, and what is drawn of it.
     containers: containers::Containers,
@@ -805,6 +813,9 @@ struct Game {
 /// The feature flag that switches minecarts to their new movement, which doesn't
 /// interpolate.
 const MINECART_IMPROVEMENTS: &str = "minecraft:minecart_improvements";
+/// How long the game thread stays busy with a login: one server tick at 20 TPS, so the
+/// join's teleport accept arrives after the server's first tick of the connection.
+const LOGIN_BUSY_MS: i64 = 50;
 
 /// `ClientboundGameEventPacket` events the session acts on.
 const GAME_EVENT_CHANGE_GAME_MODE: u8 = 3;
@@ -956,6 +967,10 @@ impl Game {
             ticks: 0,
             started: Instant::now(),
             manual_ms: None,
+            busy_until: None,
+            login_busy_ms: LOGIN_BUSY_MS,
+            held_ticks: 0,
+            held_bundle: VecDeque::new(),
             view: Arc::default(),
             containers: containers::Containers::default(),
             container_view: Arc::default(),
@@ -1161,13 +1176,39 @@ impl Game {
     /// that has arrived, the frame's input, the ticks, and the camera's turn. False once
     /// the session has ended.
     fn frame(&mut self, input: FrameInput) -> bool {
-        self.pack_frame_start();
-        let ticks = self.clock.advance(self.millis(), self.ms_per_tick());
+        let ticks = match self.busy_until {
+            // Still creating the level: nothing happens.
+            Some(until) if self.millis() < until => return true,
+            // Done: the rest of the frame the login held up, with the ticks it counted
+            // before it. The clock isn't read, so the next frame counts the ticks the
+            // wait took, as after vanilla's long frame.
+            Some(_) => {
+                self.busy_until = None;
+                self.held_ticks
+            }
+            None => {
+                self.pack_frame_start();
+                self.clock.advance(self.millis(), self.ms_per_tick())
+            }
+        };
+        // What was left of a bundle behind the login comes first.
+        if !self.held_bundle.is_empty() {
+            let rest = std::mem::take(&mut self.held_bundle);
+            self.bundle(rest);
+            if self.busy_until.is_some() {
+                self.held_ticks = ticks;
+                return true;
+            }
+        }
         loop {
             match self.connection.events().try_recv() {
                 Ok(e) => {
                     if !self.handle(e) {
                         return false;
+                    }
+                    if self.busy_until.is_some() {
+                        self.held_ticks = ticks;
+                        return true;
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1613,6 +1654,7 @@ impl Game {
                     self.connection.close();
                 }
             }
+            Event::Bundle(packets) => self.bundle(packets.into()),
             Event::Closed(mut c) => {
                 if c.reason == Reason::Local(Local::Closed)
                     && let Some(r) = self.close_reason.take()
@@ -1626,6 +1668,22 @@ impl Game {
             }
         }
         true
+    }
+
+    /// A bundle's packets one after the other, at once (`handleBundlePacket`); those
+    /// behind a login wait with it.
+    fn bundle(&mut self, mut packets: VecDeque<play::Clientbound>) {
+        while let Some(p) = packets.pop_front() {
+            if let Err(e) = self.play(p) {
+                eprintln!("[session] {e}; disconnecting");
+                self.connection.close();
+                return;
+            }
+            if self.busy_until.is_some() {
+                self.held_bundle = packets;
+                return;
+            }
+        }
     }
 
     /// A level for a dimension: its height from the dimension type the server named
@@ -2283,6 +2341,18 @@ impl Game {
                     login.spawn.game_type
                 );
                 self.drop_screen(false);
+                // Vanilla's `handleLogin` creates the level and holds its main thread
+                // for a while, so the packets behind it (the join's teleport first) are
+                // handled a frame later. Servers rely on that: vanilla's and Paper's
+                // `handleAcceptTeleportPacket` measure the accept from the connection's
+                // last good position, which is 0,0,0 until its first tick, and answer an
+                // accept that arrives sooner with "moved too quickly" and another
+                // teleport, again and again, as fast as frames go (29 setbacks on Paper
+                // at an uncapped frame rate). So the game thread waits one server tick
+                // here, packets and ticks alike.
+                if self.login_busy_ms > 0 {
+                    self.busy_until = Some(now + self.login_busy_ms);
+                }
                 let (level, biome_bits) = self.new_level(&login.spawn);
                 self.simulation_distance = login.simulation_distance;
                 let entities = self.new_entities(login.player_id);
@@ -3213,6 +3283,8 @@ impl Game {
                     self.sounds.pickup(at, orb);
                 }
             }
+            // The connection groups bundles; it never hands a delimiter on.
+            play::Clientbound::BundleDelimiter => {}
             play::Clientbound::Other(kind) => {
                 self.play_packets += 1;
                 if self.play_packets <= 3 {
@@ -3445,6 +3517,9 @@ mod tests {
             ClientInformation::default(),
         );
         game.manual_ms = Some(0);
+        // Packets right behind the login are handled with it (`login_keeps_the_game_busy_for_a_server_tick`
+        // tests the wait).
+        game.login_busy_ms = 0;
         game.configured.registries = vec![
             (
                 crate::environment::DIMENSION_TYPE.into(),
@@ -4345,6 +4420,83 @@ mod tests {
     }
 
     #[test]
+    fn login_keeps_the_game_busy_for_a_server_tick() {
+        use ruthenium_data::v26_3::packets::play as pl;
+        let accept = pl::Serverbound::AcceptTeleportation.id() as u8;
+        let tick_end = pl::Serverbound::ClientTickEnd.id() as u8;
+        let pong = pl::Serverbound::Pong.id() as u8;
+        let ids = |sent: &[Sent]| -> Vec<u8> {
+            sent.iter()
+                .filter_map(|s| match s {
+                    Sent::Packet(p) => Some(p[0]),
+                    _ => None,
+                })
+                .collect()
+        };
+        // The login and the join's teleport (and a ping) arrive together, one by one or
+        // in one bundle.
+        for bundled in [false, true] {
+            let mut r = rig(None);
+            r.game.login_busy_ms = LOGIN_BUSY_MS;
+            let frame_at = |r: &mut Rig, ms: i64| {
+                r.game.manual_ms = Some(ms);
+                assert!(r.game.frame(FrameInput::default()));
+                r.remote.sent()
+            };
+            frame_at(&mut r, 0);
+            let packets = vec![
+                login(),
+                play::Clientbound::PlayerPosition(play::PlayerPosition {
+                    id: 4,
+                    position: [300.5, -60.0, 300.5],
+                    delta: [0.0; 3],
+                    y_rot: 0.0,
+                    x_rot: 0.0,
+                    relatives: 0,
+                }),
+                play::Clientbound::Common(Common::Ping { id: 9 }),
+            ];
+            if bundled {
+                r.remote.event(Event::Bundle(packets));
+            } else {
+                for p in packets {
+                    r.packet(p);
+                }
+            }
+            // The frame counts a tick, then handles the login.
+            let sent = frame_at(&mut r, 60);
+            assert!(ids(&sent).is_empty(), "{bundled}: {sent:?}");
+            assert_eq!(r.game.ticks, 0);
+            // Busy for a server tick (50 ms): no packets handled, no ticks.
+            let sent = frame_at(&mut r, 109);
+            assert!(ids(&sent).is_empty(), "{bundled}: {sent:?}");
+            assert_eq!(r.game.ticks, 0);
+            // Then the held-up frame goes on: the teleport answered, the ping, then its
+            // one tick.
+            let sent = frame_at(&mut r, 110);
+            assert_eq!(
+                ids(&sent)[..3],
+                [accept, pong, tick_end],
+                "{bundled}: {sent:?}"
+            );
+            assert_eq!(
+                sent[0],
+                Sent::Packet(play::accept_teleportation(
+                    4,
+                    [300.5, -60.0, 300.5],
+                    0.0,
+                    0.0
+                ))
+            );
+            assert_eq!(r.game.ticks, 1);
+            // The next frame counts the ticks the wait took: 60 ms to 120 is one more,
+            // with the 10 ms left over from before.
+            frame_at(&mut r, 120);
+            assert_eq!(r.game.ticks, 2);
+        }
+    }
+
+    #[test]
     fn the_camera_runs_ahead_of_the_frames_by_the_turns_not_yet_taken() {
         let (connection, remote) = Connection::detached();
         let session = Session::with_connection(
@@ -4369,13 +4521,21 @@ mod tests {
             }
             panic!("the game thread did not get there");
         };
-        let first = session.frame();
-        wait(&|| {
-            session
+        // The login keeps the game thread busy for a while: frames until one is out.
+        let mut first = None;
+        for _ in 0..400 {
+            let sequence = session.frame();
+            std::thread::sleep(Duration::from_millis(5));
+            if session
                 .scene()
                 .frame()
-                .is_some_and(|f| f.input_sequence >= first)
-        });
+                .is_some_and(|f| f.input_sequence >= sequence)
+            {
+                first = Some(sequence);
+                break;
+            }
+        }
+        let first = first.expect("the game thread publishes a frame");
         let before = session.camera().unwrap();
         assert_eq!(before.turns_ahead, 0);
         let (y0, x0) = (before.frame.player.y_rot, before.frame.player.x_rot);
@@ -4431,7 +4591,8 @@ mod tests {
         session.disconnect();
         wait(&|| true);
         let stats = session.handoff_stats();
-        assert_eq!((stats.frames, stats.stalls), (3, 0));
+        // Every frame handed over, those that waited out the login included.
+        assert_eq!((stats.frames, stats.stalls), (third, 0));
         drop(session);
         let mut closed = false;
         for _ in 0..2000 {
