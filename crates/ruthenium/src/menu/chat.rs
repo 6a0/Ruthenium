@@ -858,8 +858,8 @@ mod tests {
 
     #[test]
     fn the_history_keeps_100_and_the_file_50_commands() {
-        let dir = std::env::temp_dir().join(format!("ruthenium-chat-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let path = dir.join("command_history.txt");
         let mut h = ChatHistory::load(Some(path.clone()));
         for i in 0..120 {
@@ -872,7 +872,6 @@ mod tests {
         let again = ChatHistory::load(Some(path.clone()));
         assert_eq!(again.len(), 50);
         assert_eq!((again.get(0), again.get(49)), (Some("/c70"), Some("/c119")));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -3081,8 +3081,12 @@ mod tests {
         }
     }
 
-    fn temp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ruthenium-menu-{name}-{}", std::process::id()))
+    /// `name` inside a fresh temporary folder, deleted with the guard even when the
+    /// test fails.
+    fn temp(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(name);
+        (tmp, dir)
     }
 
     fn names(m: &Menu) -> Vec<String> {
@@ -3464,7 +3468,7 @@ mod tests {
 
     #[test]
     fn privileges_can_turn_multiplayer_off() {
-        let dir = temp("privileges");
+        let (_tmp, dir) = temp("privileges");
         let (accounts, _) = accounts_in(&dir, &["Child", "Alex"], None);
         let mut m = Menu::new(None, accounts, SettingsFile::transient());
         m.layout((1600, 900));
@@ -3481,12 +3485,11 @@ mod tests {
             |m| matches!(m.accounts.status(), AccountStatus::SignedIn { name, .. } if name == "Alex"),
         );
         assert!(m.title_states.enabled(0));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn accounts_sign_in_switch_and_sign_out() {
-        let dir = temp("accounts");
+        let (_tmp, dir) = temp("accounts");
         let (accounts, pages, answer) = accounts_held_in(&dir, &["Alex"], Some(Ok("Notch")));
         let clip = FakeClipboard::default();
         let mut m = Menu::new(None, accounts, SettingsFile::transient());
@@ -3537,12 +3540,11 @@ mod tests {
         assert_eq!(names(&m), ["Notch"]);
         press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
         assert!(matches!(m.screen, Screen::Title));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn signing_in_with_a_code() {
-        let dir = temp("code");
+        let (_tmp, dir) = temp("code");
         let (accounts, _) = accounts_in(&dir, &[], None);
         let clip = FakeClipboard::default();
         let mut m = Menu::new(None, accounts, SettingsFile::transient());
@@ -3560,12 +3562,11 @@ mod tests {
         press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
         assert!(matches!(m.screen, Screen::Accounts));
         assert!(m.accounts.stage().is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_failed_sign_in_says_why_and_can_try_again() {
-        let dir = temp("failed");
+        let (_tmp, dir) = temp("failed");
         let (accounts, _) =
             accounts_in(&dir, &[], Some(Err(ruthenium_auth::AuthError::NotApproved)));
         let clip = FakeClipboard::default();
@@ -3588,12 +3589,11 @@ mod tests {
         });
         m.act(Action::Cancel, None, &clip);
         assert!(matches!(m.screen, Screen::Accounts));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn settings_from_the_keyboard_apply_and_save() {
-        let dir = temp("settings");
+        let (_tmp, dir) = temp("settings");
         let (accounts, _) = accounts_in(&dir, &[], None);
         let clip = FakeClipboard::default();
         let path = SettingsFile::path_in(&dir);
@@ -3631,12 +3631,11 @@ mod tests {
         let saved = SettingsFile::load(path).settings;
         assert_eq!(&saved, m.settings());
         assert!(saved.frame_stats && !saved.vsync);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_game_menu_opens_its_options_and_goes_as_it_came() {
-        let dir = temp("game-menu");
+        let (_tmp, dir) = temp("game-menu");
         let (accounts, _) = accounts_in(&dir, &["Alex"], None);
         let clip = FakeClipboard::default();
         let mut m = Menu::new(None, accounts, SettingsFile::transient());
@@ -3708,7 +3707,6 @@ mod tests {
         m.act(Action::Cancel, None, &clip);
         assert!(m.leaving && matches!(m.screen, Screen::Servers));
         assert!(m.pause.is_none() && !m.transition.shows());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3820,7 +3818,8 @@ mod tests {
     #[test]
     fn lan_games_join_under_their_message() {
         let clip = FakeClipboard::default();
-        let path = temp("lan").join("servers.dat");
+        let (_tmp, dir) = temp("lan");
+        let path = dir.join("servers.dat");
         let mut list = ServerList::default();
         list.add(ServerEntry::new("Saved", "127.0.0.1:1"), false);
         list.save(&path).unwrap();
@@ -3857,13 +3856,13 @@ mod tests {
             (m.server_name.as_str(), m.server_address.as_str()),
             ("§aA ᴡᴏʀʟᴅ", "192.168.1.5:25565")
         );
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn codes_of_conduct_accepted_for_good_are_not_asked_again() {
         let clip = FakeClipboard::default();
-        let path = temp("conduct").join("servers.dat");
+        let (_tmp, dir) = temp("conduct");
+        let path = dir.join("servers.dat");
         let mut list = ServerList::default();
         list.add(ServerEntry::new("Local", "127.0.0.1:25631"), false);
         list.add(ServerEntry::new("Other", "127.0.0.1:25631"), false);
@@ -3908,13 +3907,11 @@ mod tests {
             ServerList::load(&path).servers[0].accepted_code_of_conduct,
             0
         );
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn add_edit_and_delete_servers_from_the_keyboard() {
-        let dir = std::env::temp_dir().join(format!("ruthenium-menu-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let (_tmp, dir) = temp("servers");
         let path = dir.join("servers.dat");
         let mut list = ServerList::default();
         list.add(ServerEntry::new("One", "127.0.0.1:1"), false);
@@ -3988,6 +3985,5 @@ mod tests {
         assert!(matches!(m.screen, Screen::Servers));
         press(&mut m, SCANCODE_ESCAPE, false, false, &clip);
         assert!(matches!(m.screen, Screen::Title));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -505,8 +505,8 @@ mod tests {
                 })
             }
         }
-        let dir = std::env::temp_dir().join(format!("ruthenium-discovery-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("discovery");
         let cache = dir.join("discovery.json");
         let up = Doc(AtomicUsize::new(0), 200);
         assert_eq!(
@@ -540,7 +540,6 @@ mod tests {
             Endpoints::discover_cached(&down, &cache),
             Endpoints::default()
         );
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

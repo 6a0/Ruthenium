@@ -78,13 +78,14 @@ fn version() -> &'static GameVersion {
     }))
 }
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join("ruthenium-prepare-tests")
-        .join(format!("{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh folder, deleted with the guard even when the test fails.
+fn scratch(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::Builder::new()
+        .prefix(&format!("ruthenium-{name}-"))
+        .tempdir()
+        .unwrap();
+    let dir = tmp.path().to_path_buf();
+    (tmp, dir)
 }
 
 fn put(path: &Path, bytes: &[u8]) {
@@ -151,7 +152,7 @@ fn finds_each_launcher_layout() {
         ),
     ];
     for (launcher, jar, libs, assets) in cases {
-        let root = scratch(&format!("layout-{launcher:?}"));
+        let (_root, root) = scratch(&format!("layout-{launcher:?}"));
         fake_install(&root, jar, libs, assets);
         let install =
             discover::check(launcher, &root, v).unwrap_or_else(|e| panic!("{launcher}: {e}"));
@@ -161,7 +162,7 @@ fn finds_each_launcher_layout() {
 
 #[test]
 fn instance_folder_resolves_to_launcher_root() {
-    let root = scratch("instance");
+    let (_root, root) = scratch("instance");
     fake_prism(&root);
     let instance = root.join("instances/PvP/minecraft");
     std::fs::create_dir_all(&instance).unwrap();
@@ -175,7 +176,7 @@ fn instance_folder_resolves_to_launcher_root() {
 #[test]
 fn rejects_what_does_not_match_the_pins() {
     let v = version();
-    let root = scratch("reject");
+    let (_root, root) = scratch("reject");
     assert!(matches!(
         discover::check(Launcher::Prism, &root.join("nothing"), v),
         Err(Rejection::NotFound)
@@ -210,9 +211,9 @@ fn rejects_what_does_not_match_the_pins() {
 #[test]
 fn imports_once_and_verifies_objects() {
     let v = version();
-    let root = scratch("import-src");
+    let (_root, root) = scratch("import-src");
     fake_prism(&root);
-    let cache = scratch("import-cache");
+    let (_cache, cache) = scratch("import-cache");
     let install = discover::check(Launcher::Prism, &root, v).unwrap();
 
     assert!(import::open(v, &cache).is_none());
@@ -230,9 +231,9 @@ fn imports_once_and_verifies_objects() {
 #[test]
 fn accepts_an_index_with_republished_translations() {
     let v = version();
-    let root = scratch("lang-src");
+    let (_root, root) = scratch("lang-src");
     fake_prism(&root);
-    let cache = scratch("lang-cache");
+    let (_cache, cache) = scratch("lang-cache");
     let index = root.join("assets/indexes/99.json");
     let install = discover::check(Launcher::Prism, &root, v).unwrap();
     let (imported, _) = import::import(&install, v, &cache).unwrap();
@@ -274,7 +275,7 @@ fn accepts_an_index_with_republished_translations() {
     );
 
     // A republished translation that is damaged does not get in.
-    let cache = scratch("lang-damaged-cache");
+    let (_cache, cache) = scratch("lang-damaged-cache");
     std::fs::write(object(&root.join("assets"), NEW_LANG), b"tampered").unwrap();
     assert!(matches!(
         import::import(&install, v, &cache),
@@ -286,7 +287,7 @@ fn accepts_an_index_with_republished_translations() {
 #[test]
 fn rejects_an_index_whose_other_files_changed() {
     let v = version();
-    let root = scratch("index-src");
+    let (_root, root) = scratch("index-src");
     fake_prism(&root);
     let index = root.join("assets/indexes/99.json");
     let install = discover::check(Launcher::Prism, &root, v).unwrap();
@@ -308,7 +309,7 @@ fn rejects_an_index_whose_other_files_changed() {
             other => panic!("{bad}: {other:?}"),
         }
         // An install verified before its index changed is not imported either.
-        let cache = scratch("index-cache");
+        let (_cache, cache) = scratch("index-cache");
         match import::import(&install, v, &cache) {
             Err(ImportError::BadAssetIndex { .. }) => {}
             other => panic!("{bad}: {other:?}"),
@@ -330,13 +331,13 @@ fn rejects_an_index_whose_other_files_changed() {
 #[test]
 fn import_refuses_damaged_or_missing_objects() {
     let v = version();
-    let root = scratch("damaged-src");
+    let (_root, root) = scratch("damaged-src");
     fake_prism(&root);
     let install = discover::check(Launcher::Prism, &root, v).unwrap();
     let object = object(&root.join("assets"), OBJECTS[0]);
 
     std::fs::write(&object, b"tampered").unwrap();
-    let cache = scratch("damaged-cache");
+    let (_cache, cache) = scratch("damaged-cache");
     assert!(matches!(
         import::import(&install, v, &cache),
         Err(ImportError::Mismatch { .. })
@@ -354,7 +355,8 @@ fn import_refuses_damaged_or_missing_objects() {
 
 #[test]
 fn steps_run_once_per_key() {
-    let dir = scratch("step").join("out");
+    let (_dir, dir) = scratch("step");
+    let dir = dir.join("out");
     let mut runs = 0;
     for _ in 0..2 {
         ruthenium_prepare::step::run::<std::io::Error>(&dir, "key-a", |tmp| {

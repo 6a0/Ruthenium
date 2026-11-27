@@ -1589,8 +1589,8 @@ vsync = true
 
     #[test]
     fn key_bindings_are_imported_once_when_the_file_has_none() {
-        let dir = std::env::temp_dir().join(format!("ruthenium-keys-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("keys");
         let path = SettingsFile::path_in(&dir);
         let mut imported = KeyBinds::DEFAULT;
         imported.set(Action::Forward, Key::Keyboard(82));
@@ -1635,8 +1635,8 @@ vsync = true
                 .unwrap()
                 .save_chat_drafts
         );
-        let dir = std::env::temp_dir().join(format!("ruthenium-drafts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("drafts");
         let path = SettingsFile::path_in(&dir);
         // Vanilla's on: taken, and written at once.
         let mut f = SettingsFile::load(path.clone());
@@ -1664,7 +1664,6 @@ vsync = true
         assert!(Settings::has_chat_drafts(
             &std::fs::read_to_string(&path).unwrap()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1689,8 +1688,8 @@ vsync = true
 
     #[test]
     fn saves_only_changes_and_keeps_the_old_file() {
-        let dir = std::env::temp_dir().join(format!("ruthenium-settings-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("settings");
         let path = SettingsFile::path_in(&dir);
         let mut f = SettingsFile::load(path.clone());
         assert_eq!(f.settings, Settings::default());
@@ -1704,6 +1703,5 @@ vsync = true
         let old = std::fs::read_to_string(path.with_file_name("client.toml_old")).unwrap();
         assert!(old.contains("max_fps = \"unlimited\""));
         assert_eq!(SettingsFile::load(path).settings.max_fps, Some(60));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

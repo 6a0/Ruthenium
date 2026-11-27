@@ -2431,6 +2431,7 @@ dependencies = [
  "ruthenium-sim",
  "ruthenium-ui",
  "serde_json",
+ "tempfile",
  "toml",
 ]
 
@@ -2446,6 +2447,7 @@ dependencies = [
  "ruthenium-data",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -2460,6 +2462,7 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+ "tempfile",
 ]
 
 [[package]]
@@ -2473,6 +2476,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "tempfile",
  "ureq",
 ]
 
@@ -2514,6 +2518,7 @@ dependencies = [
  "ruthenium-protocol",
  "sha1",
  "socket2",
+ "tempfile",
  "tokio",
  "ureq",
 ]
@@ -2525,6 +2530,7 @@ dependencies = [
  "ash",
  "libc",
  "sdl3-sys",
+ "tempfile",
 ]
 
 [[package]]
@@ -2534,6 +2540,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -2581,6 +2588,7 @@ dependencies = [
  "ruthenium-protocol",
  "ruthenium-trace",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -3899,6 +3907,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "tempfile",
  "zip",
 ]
 

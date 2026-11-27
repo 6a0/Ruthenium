@@ -24,3 +24,4 @@ serde_json = "1.0.154"
 ruthenium-assets = { path = "../ruthenium-assets" }
 ruthenium-trace = { path = "../ruthenium-trace" }
 serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
+tempfile = "3.27.0"

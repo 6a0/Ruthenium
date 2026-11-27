@@ -462,7 +462,8 @@ mod tests {
             view_distance: 12,
             accept_eula: false,
         };
-        let dir = std::env::temp_dir().join("ruthenium-xtask-no-eula");
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("server");
         let e = Server::start(&dir, &settings).unwrap_err();
         assert!(e.contains("--accept-eula") && e.contains(EULA_URL));
         // Nothing was written, least of all an eula.txt.

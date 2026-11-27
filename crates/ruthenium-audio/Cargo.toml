@@ -27,3 +27,4 @@ symphonia = { version = "0.6.1", default-features = false, features = ["ogg", "v
 
 [dev-dependencies]
 rayon = "1.12.0"
+tempfile = "3.27.0"

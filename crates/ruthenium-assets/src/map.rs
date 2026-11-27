@@ -61,9 +61,8 @@ mod tests {
 
     #[test]
     fn a_mapped_file_reads_as_its_bytes() {
-        let path = |name: &str| {
-            std::env::temp_dir().join(format!("ruthenium-map-{}-{name}", std::process::id()))
-        };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = |name: &str| tmp.path().join(name);
         let (bytes, kept, empty) = (path("bytes"), path("kept"), path("empty"));
         std::fs::write(&bytes, b"mapped bytes").unwrap();
         let map = MappedFile::open(&bytes).unwrap();

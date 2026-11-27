@@ -64,13 +64,13 @@ mod tests {
 
     #[test]
     fn writes_a_readable_float_wav() {
-        let path = std::env::temp_dir().join(format!("ruthenium-wav-{}.wav", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out.wav");
         let mut w = WavWriter::create(&path, 48_000).unwrap();
         w.write(&[0.5, -0.25, 1.0, 0.0]).unwrap();
         w.flush(48_000).unwrap();
         drop(w);
         let b = std::fs::read(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
         assert_eq!(b.len(), 44 + 16);
         assert_eq!(&b[0..4], b"RIFF");
         assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 36 + 16);

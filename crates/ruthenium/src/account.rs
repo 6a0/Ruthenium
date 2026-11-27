@@ -904,13 +904,17 @@ pub(crate) mod tests {
         a.list().iter().map(|a| a.name.as_str()).collect()
     }
 
-    fn temp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ruthenium-{name}-{}", std::process::id()))
+    /// `name` inside a fresh temporary folder, deleted with the guard even when the
+    /// test fails.
+    fn temp(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(name);
+        (tmp, dir)
     }
 
     #[test]
     fn the_account_in_use_signs_in_again_and_switching_follows() {
-        let dir = temp("accounts-switch");
+        let (_tmp, dir) = temp("accounts-switch");
         let (mut a, _) = accounts_in(&dir, &["Alex", "Steve"], None);
         assert_eq!(a.status(), &AccountStatus::Checking("Alex".into()));
         wait(&mut a, |a| {
@@ -944,13 +948,19 @@ pub(crate) mod tests {
         );
         a.sign_out("id-Alex");
         assert_eq!(a.status(), &AccountStatus::None);
-        wait(&mut a, |a| a.list().is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(a.list().is_empty());
+        // Forgotten on disk too. The worker saves that after the list has changed: waited
+        // for here, or its save could land after the test, making the folder again.
+        wait(&mut a, |_| {
+            AccountStore::with_secrets(&dir, Box::new(MemorySecrets::default()))
+                .accounts()
+                .is_empty()
+        });
     }
 
     #[test]
     fn a_stale_report_does_not_win() {
-        let dir = temp("accounts-stale");
+        let (_tmp, dir) = temp("accounts-stale");
         let (mut a, _) = accounts_in(&dir, &["Alex", "Expired"], None);
         // Switch before Alex's launch check reports: only Expired's result counts.
         a.use_account("id-Expired");
@@ -964,12 +974,11 @@ pub(crate) mod tests {
                 reason: short_reason(&AuthError::SignInExpired)
             }
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn signing_in_in_the_browser_or_with_a_code() {
-        let dir = temp("accounts-sign-in");
+        let (_tmp, dir) = temp("accounts-sign-in");
         let (mut a, pages) = accounts_in(&dir, &[], None);
         assert_eq!(a.status(), &AccountStatus::None);
         a.sign_in(false);
@@ -1008,13 +1017,11 @@ pub(crate) mod tests {
             })
         );
         assert!(a.list().is_empty(), "no profile, no account");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn faces_come_from_the_skin_cache_or_not_at_all() {
-        let dir = temp("faces");
-        let _ = std::fs::remove_dir_all(&dir);
+        let (_tmp, dir) = temp("faces");
         let url = "http://textures.minecraft.net/texture/0123abcd";
         let mut skin = ruthenium_assets::Image::new(64, 64);
         for y in 8..16 {
@@ -1051,7 +1058,6 @@ pub(crate) mod tests {
         a.list.clear();
         a.poll();
         assert_eq!(a.face_wanted, [None]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

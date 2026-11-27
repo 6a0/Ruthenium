@@ -333,8 +333,8 @@ fn sounds_read_while_playing_are_not_counted_against_the_load() {
             br#"{"m": {"sounds": [{"name": "music", "stream": true}]}}"#,
         ),
     ]);
-    let path =
-        std::env::temp_dir().join(format!("ruthenium-sound-budget-{}.zip", std::process::id()));
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sound-budget.zip");
     std::fs::write(&path, z).unwrap();
     let limits = Limits {
         load_bytes: 1 << 20,

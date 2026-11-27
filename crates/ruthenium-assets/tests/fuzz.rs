@@ -322,9 +322,9 @@ fn mutate(bytes: &mut Vec<u8>, rng: &mut Lcg) {
 
 #[test]
 fn the_pack_itself_loads() {
-    let dir = std::env::temp_dir().join(format!("ruthenium-fuzz-{}-base", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let res = open(&zip(&files()), &dir, 0).expect("the pack opens");
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let res = open(&zip(&files()), dir, 0).expect("the pack opens");
     let opts = AtlasOptions::default();
     let blocks = atlas::build(&res, atlas::atlas_def("blocks").unwrap(), &opts).unwrap();
     assert!(blocks.warnings.is_empty(), "{:?}", blocks.warnings);
@@ -343,7 +343,6 @@ fn the_pack_itself_loads() {
     let models = BlockModels::bake(&res, &blocks);
     assert!(models.warnings.is_empty(), "{:?}", models.warnings);
     load_everything(&res);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Cases per test; each changes the pack's files or its zip. A case takes some 15 ms
@@ -352,8 +351,8 @@ const CASES: u64 = if cfg!(debug_assertions) { 1000 } else { 4000 };
 
 #[test]
 fn files_changed_at_random_load_without_a_panic() {
-    let dir = std::env::temp_dir().join(format!("ruthenium-fuzz-{}-files", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let base = files();
     let mut rng = Lcg(0x5EED_F11E);
     for case in 0..CASES {
@@ -362,17 +361,16 @@ fn files_changed_at_random_load_without_a_panic() {
             let i = rng.next(f.len() as u64) as usize;
             mutate(&mut f[i].1, &mut rng);
         }
-        if let Some(res) = open(&zip(&f), &dir, case) {
+        if let Some(res) = open(&zip(&f), dir, case) {
             load_everything(&res);
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn zips_changed_at_random_load_without_a_panic() {
-    let dir = std::env::temp_dir().join(format!("ruthenium-fuzz-{}-zips", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let base = zip(&files());
     let mut rng = Lcg(0x0123_4567_89AB);
     let mut opened = 0;
@@ -388,12 +386,11 @@ fn zips_changed_at_random_load_without_a_panic() {
         } else {
             mutate(&mut z, &mut rng);
         }
-        if let Some(res) = open(&z, &dir, case) {
+        if let Some(res) = open(&z, dir, case) {
             opened += 1;
             load_everything(&res);
         }
     }
     // Most changes leave a pack that opens, with some of its files broken.
     assert!(opened > CASES / 10, "{opened}");
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -201,32 +201,29 @@ fn is_own_prefix_dir(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn jar_with(names: &[&str]) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "ruthenium-bundle-{}-{}.jar",
-            std::process::id(),
-            names.len()
-        ));
+    fn jar_with(names: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bundle.jar");
         let mut zip = ZipWriter::new(std::fs::File::create(&path).unwrap());
         for name in names {
             zip.start_file(*name, SimpleFileOptions::default()).unwrap();
             zip.write_all(b"x").unwrap();
         }
         zip.finish().unwrap();
-        path
+        (tmp, path)
     }
 
     #[test]
     fn bundle_check_accepts_only_ruthenium_classes() {
-        let ok = jar_with(&[MANIFEST, "dev/ruthenium/exporters/Main.class"]);
+        let (_ok, ok) = jar_with(&[MANIFEST, "dev/ruthenium/exporters/Main.class"]);
         assert_eq!(check_bundle(&ok), Ok(1));
-        let bad = jar_with(&[
+        let (_bad, bad) = jar_with(&[
             MANIFEST,
             "dev/ruthenium/exporters/Main.class",
             "net/minecraft/world/entity/EntityType.class",
         ]);
         assert!(check_bundle(&bad).unwrap_err().contains("EntityType.class"));
-        let sneaky = jar_with(&["dev/ruthenium/../../net/minecraft/A.class", "x", "y"]);
+        let (_sneaky, sneaky) = jar_with(&["dev/ruthenium/../../net/minecraft/A.class", "x", "y"]);
         assert!(check_bundle(&sneaky).is_err());
     }
 }

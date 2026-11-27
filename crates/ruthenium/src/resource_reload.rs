@@ -489,12 +489,13 @@ mod tests {
     use super::*;
     use crate::test_zip::zip as zip_bytes;
 
-    fn temp(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("ruthenium-reload-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    /// `name` inside a fresh temporary folder, deleted with the guard even when the
+    /// test fails.
+    fn temp(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        (tmp, dir)
     }
 
     fn request(session: u64) -> Request {
@@ -698,7 +699,7 @@ mod tests {
     /// cancelled, and their builders stop inside their loops.
     #[test]
     fn server_packs_carry_the_reloads_flag() {
-        let dir = temp("flag");
+        let (_tmp, dir) = temp("flag");
         let p = dir.join("p.zip");
         std::fs::write(
             &p,
@@ -733,7 +734,7 @@ mod tests {
     /// loadable, one without it (or with a broken one) is not.
     #[test]
     fn the_check_reads_the_packs_metadata() {
-        let dir = temp("check");
+        let (_tmp, dir) = temp("check");
         let good = dir.join("good.zip");
         std::fs::write(&good, zip_bytes(&[("pack.mcmeta", MCMETA)])).unwrap();
         let none = dir.join("none.zip");
@@ -753,7 +754,7 @@ mod tests {
     /// A server pack's language goes over vanilla's, the newest pack over older ones.
     #[test]
     fn server_languages_stack_over_vanillas() {
-        let dir = temp("lang");
+        let (_tmp, dir) = temp("lang");
         let pack = |n: &str, lang: &str| {
             let p = dir.join(n);
             std::fs::write(
@@ -778,7 +779,7 @@ mod tests {
     /// Past the cap, a server pack's language is left out.
     #[test]
     fn a_huge_server_language_is_left_out() {
-        let dir = temp("huge");
+        let (_tmp, dir) = temp("huge");
         let mut big = String::from("{");
         let n = MAX_LANG_BYTES / 20 + 10;
         for i in 0..n {
@@ -801,7 +802,7 @@ mod tests {
     /// Entries a server's packs add stop at the cap; those they change don't count.
     #[test]
     fn server_language_entries_are_capped() {
-        let dir = temp("entries");
+        let (_tmp, dir) = temp("entries");
         let mut s = String::from("{");
         for i in 0..MAX_LANG_ENTRIES + 5 {
             s += &format!("\"{i}\":\"v\",");

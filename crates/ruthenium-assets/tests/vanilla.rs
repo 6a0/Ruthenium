@@ -139,10 +139,8 @@ fn the_games_assets_fit_a_server_packs_limits() {
     z.extend_from_slice(&cd_len.to_le_bytes());
     z.extend_from_slice(&cd.to_le_bytes());
     z.extend_from_slice(&[0; 2]);
-    let path = std::env::temp_dir().join(format!(
-        "ruthenium-empty-server-pack-{}.zip",
-        std::process::id()
-    ));
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("empty-server-pack.zip");
     std::fs::write(&path, z).unwrap();
     let server = Pack::open_untrusted(&path, &ruthenium_assets::Limits::untrusted()).unwrap();
     let _ = std::fs::remove_file(&path);

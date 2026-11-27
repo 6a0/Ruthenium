@@ -944,9 +944,8 @@ mod tests {
     #[test]
     fn pack_checks_are_kept_by_file() {
         use std::sync::atomic::AtomicUsize;
-        let dir = std::env::temp_dir().join(format!("ruthenium-checks-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let file = dir.join("p.zip");
         std::fs::write(&file, b"one").unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -970,7 +969,6 @@ mod tests {
             checks.check(&check, &f);
         }
         assert_eq!(checks.0.lock().unwrap().len(), CHECKS_KEPT);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Only the server's own address is allowed for pack hosts, and only when it is

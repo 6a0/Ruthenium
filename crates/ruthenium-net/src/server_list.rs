@@ -252,9 +252,9 @@ mod tests {
 
     #[test]
     fn saves_atomically() {
-        let dir = std::env::temp_dir().join(format!("ruthenium-servers-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("servers");
         let path = dir.join("servers.dat");
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(ServerList::load(&path), ServerList::default());
         let mut list = ServerList::default();
         list.add(ServerEntry::new("One", "one"), false);
@@ -266,7 +266,6 @@ mod tests {
         assert_eq!(old.servers.len(), 1);
         std::fs::write(&path, b"junk").unwrap();
         assert_eq!(ServerList::load(&path), ServerList::default());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

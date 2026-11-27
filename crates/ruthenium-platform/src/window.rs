@@ -373,7 +373,8 @@ mod tests {
 
     #[test]
     fn a_bundle_carries_its_vulkan_library_in_frameworks() {
-        let root = std::env::temp_dir().join(format!("ruthenium-bundle-{}", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let contents = root.join("Ruthenium.app/Contents");
         let exe = contents.join("MacOS/ruthenium");
         std::fs::create_dir_all(contents.join("MacOS")).unwrap();
@@ -389,6 +390,5 @@ mod tests {
             bundled_vulkan_library(std::path::Path::new("ruthenium")),
             None
         );
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

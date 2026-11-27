@@ -264,8 +264,8 @@ pub(crate) mod tests {
 
     #[test]
     fn remembers_accounts_without_their_secrets() {
-        let dir = std::env::temp_dir().join(format!("ruthenium-accounts-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("accounts");
         let mut s = AccountStore::with_secrets(&dir, Box::new(MemorySecrets::default()));
         s.signed_in(&profile("aaa", "Alex"), "r1").unwrap();
         // Within the same second: the order still holds, here and after a reload.
@@ -304,6 +304,5 @@ pub(crate) mod tests {
         // A refresh that lands after a sign-out doesn't bring the secret back.
         s.refreshed(&profile("bbb", "Steve"), "late").unwrap();
         assert_eq!(s.refresh_token("bbb").unwrap(), None);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

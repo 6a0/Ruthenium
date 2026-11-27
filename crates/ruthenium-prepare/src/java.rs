@@ -169,9 +169,8 @@ mod tests {
 
     #[test]
     fn finds_mojang_macos_runtime_layout() {
-        let root =
-            std::env::temp_dir().join(format!("ruthenium-java-layout-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         let home = root.join(
             "runtime/java-runtime-epsilon/mac-os-arm64/java-runtime-epsilon/jre.bundle/Contents/Home",
         );
@@ -180,7 +179,6 @@ mod tests {
         let mut found = Vec::new();
         find_java_exes(&root.join("runtime"), SEARCH_DEPTH, &mut found);
         assert_eq!(found, [home.join("bin").join(JAVA_EXE)]);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
