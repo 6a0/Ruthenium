@@ -263,6 +263,17 @@ pub const MIN_RELOAD_INTERVAL: Duration = Duration::from_secs(3);
 /// recovers from); its thread stops at its next stage.
 pub const RELOAD_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Why a reload that was overtaken by a newer one comes back.
+pub const OVERTAKEN: &str = "overtaken by a newer reload";
+/// Why a reload of a session that is over comes back.
+pub const SESSION_OVER: &str = "its session is over";
+
+/// Whether a reload's failure is only that it wasn't needed any more: overtaken by a
+/// newer reload, or of a session that is over (its build didn't fail).
+pub fn superseded(error: &str) -> bool {
+    error == OVERTAKEN || error == SESSION_OVER
+}
+
 /// What builds a reload ([`build`], or a stand-in in tests).
 type Build = Arc<
     dyn Fn(&Path, &[(u128, PathBuf)], u32, bool, &Arc<AtomicBool>) -> Result<Reloaded, String>
@@ -341,8 +352,7 @@ impl Reloader {
     /// Asks for the resources with `request`'s packs; `max_texture` as [`build`]'s.
     pub fn request(&mut self, request: Request, max_texture: u32) {
         if let Some(old) = self.next.replace(request) {
-            self.answers
-                .push_back((old, Err("overtaken by a newer reload".into())));
+            self.answers.push_back((old, Err(OVERTAKEN.into())));
         }
         self.pump(max_texture);
     }
@@ -421,8 +431,7 @@ impl Reloader {
         if self.next.as_ref().is_some_and(|r| r.session == session)
             && let Some(r) = self.next.take()
         {
-            self.answers
-                .push_back((r, Err("its session is over".into())));
+            self.answers.push_back((r, Err(SESSION_OVER.into())));
         }
         if self
             .running
@@ -433,7 +442,7 @@ impl Reloader {
             r.cancel.store(true, Ordering::Relaxed);
             self.abandoned = Some(r.handle);
             self.answers
-                .push_back((r.request, Err("its session is over".into())));
+                .push_back((r.request, Err(SESSION_OVER.into())));
         }
         self.pump(max_texture);
     }
@@ -473,7 +482,7 @@ impl Reloader {
                 .join()
                 .unwrap_or_else(|_| Err("the reload's thread panicked".into()));
             let result = if self.next.is_some() {
-                Err("overtaken by a newer reload".into())
+                Err(OVERTAKEN.into())
             } else {
                 result
             };

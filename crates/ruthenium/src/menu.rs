@@ -2927,7 +2927,7 @@ impl Menu {
             }
         }
         packs::draw_pack_toast(
-            self.packs.toast.as_ref().map(|(t, _)| t),
+            self.toast_text(),
             &scale,
             &self.fonts,
             atlas,

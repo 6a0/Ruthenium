@@ -58,6 +58,11 @@ pub(super) struct PackState {
     pub max_texture: Option<u32>,
     /// Orders the sound engine's file swaps, so a late one can't undo a newer one.
     pub sound_swaps: SoundSwaps,
+    /// The session (its number) in which a build of vanilla's own resources last
+    /// failed: not tried again until the next session starts (see `reload_failed`).
+    pub vanilla_failed: Option<u64>,
+    /// When a reload last failed for good: vanilla's `resourcePack.load_fail` toast.
+    pub load_failed: Option<Instant>,
 }
 
 /// Swaps of the sound engine's files, numbered: the swap back to vanilla's at a
@@ -450,11 +455,14 @@ impl Menu {
             reloader.request(r, max);
         }
         // The first world's assets (or recovering from a failed vanilla cleanup reload):
-        // vanilla's, unless a reload is already building them.
-        if self.session.is_some()
-            && ((!renderer.has_world() && !self.packs.world_requested)
-                || (self.packs.stale && !reloader.busy()))
-        {
+        // vanilla's, unless a reload is already building them, or one failed in this
+        // session (tried again only once the next session starts).
+        let busy = reloader.busy();
+        let want = self.vanilla_wanted(self.session.is_some(), renderer.has_world(), busy);
+        let Some(reloader) = &mut self.packs.reloader else {
+            return;
+        };
+        if want {
             self.packs.world_requested = true;
             if !reloader.busy() {
                 reloader.request(
@@ -480,16 +488,19 @@ impl Menu {
                 );
                 continue;
             }
-            let ok = match result {
-                Ok(r) => self.apply_reload(r, &request, renderer),
+            let (ok, superseded) = match result {
+                Ok(r) => (self.apply_reload(r, &request, renderer), false),
                 Err(e) => {
                     eprintln!("[ruthenium] the resource reload failed: {e}");
-                    false
+                    (false, crate::resource_reload::superseded(&e))
                 }
             };
             if !ok && request.session == 0 {
                 // The first world's assets didn't build: ask again with the next session.
                 self.packs.world_requested = false;
+                if !superseded {
+                    self.vanilla_reload_failed();
+                }
             }
             if request.session == self.packs.session_number
                 && request.session != 0
@@ -498,6 +509,15 @@ impl Menu {
                 s.resources_reloaded(ok);
             }
         }
+    }
+
+    /// Whether this frame asks for vanilla's own resources: in a session, the first
+    /// world's (none drawn yet, none asked for) or the way back from a session's packs
+    /// (`stale`, nothing building), unless they failed to build in this session.
+    fn vanilla_wanted(&self, in_session: bool, has_world: bool, busy: bool) -> bool {
+        in_session
+            && self.packs.vanilla_failed != Some(self.packs.session_number)
+            && ((!has_world && !self.packs.world_requested) || (self.packs.stale && !busy))
     }
 
     /// Puts a reload's resources in use: false if the renderer couldn't take them (then
@@ -541,6 +561,37 @@ impl Menu {
         true
     }
 
+    /// Vanilla's own resources didn't build (a cleanup after a session, or the first
+    /// world's). Vanilla retries nothing: a reload of the vanilla pack alone that fails
+    /// crashes the game (`rollbackResourcePacks` with one pack selected, Minecraft.java:834),
+    /// and a recovery reload that fails ends in `abortResourcePackRecovery`
+    /// (Minecraft.java:853): it leaves the world for the title screen with the
+    /// `resourcePack.load_fail` toast. Here that is what happens (without the crash): the
+    /// session, which has nothing to be drawn with, is left for the title screen, the
+    /// toast shows, and vanilla's resources are tried again only once another session
+    /// starts, at most once per session, instead of every frame while they are missing.
+    fn vanilla_reload_failed(&mut self) {
+        self.packs.vanilla_failed = Some(self.packs.session_number);
+        self.packs.load_failed = Some(Instant::now());
+        if self.session.is_some() {
+            eprintln!("[ruthenium] vanilla's resources didn't build: leaving the server");
+            self.leave();
+            self.screen = Screen::Title;
+        }
+        // (Leaving asks for vanilla's again: not until the next session.)
+        self.packs
+            .wanted
+            .retain(|r| !(r.session == 0 && r.packs.is_empty()));
+    }
+
+    /// What the toast says now: a failed reload's, else the download's.
+    pub(super) fn toast_text(&self) -> Option<(String, Option<String>)> {
+        if self.packs.load_failed.is_some() {
+            return Some(("Resource reload failed".into(), None));
+        }
+        self.packs.toast.as_ref().and_then(|(t, _)| toast_lines(t))
+    }
+
     /// Drops the toast once it has been up long enough.
     pub(super) fn expire_pack_toast(&mut self) {
         if self
@@ -551,22 +602,26 @@ impl Menu {
         {
             self.packs.toast = None;
         }
+        if self
+            .packs
+            .load_failed
+            .is_some_and(|at| at.elapsed().as_millis() > TOAST_MS)
+        {
+            self.packs.load_failed = None;
+        }
     }
 }
 
-/// The download toast, top right, while it is up.
+/// The packs' toast (its lines, from [`Menu::toast_text`]), top right, while it is up.
 pub(super) fn draw_pack_toast(
-    toast: Option<&PackToast>,
+    lines: Option<(String, Option<String>)>,
     scale: &ruthenium_ui::modern::UiScale,
     fonts: &ruthenium_ui::text::Fonts,
     atlas: Option<&ruthenium_ui::text::GlyphAtlas>,
     shapes: &mut ruthenium_ui::modern::ShapeList,
     text: &mut ruthenium_ui::text::TextList,
 ) {
-    let (Some(toast), Some(atlas)) = (toast, atlas) else {
-        return;
-    };
-    let Some((title, message)) = toast_lines(toast) else {
+    let (Some((title, message)), Some(atlas)) = (lines, atlas) else {
         return;
     };
     {
@@ -661,6 +716,56 @@ mod tests {
         let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
         m.packs_session_over();
         assert!(!m.packs.stale && m.packs.wanted.is_empty());
+    }
+
+    /// Vanilla's own resources that fail to build are not asked for again every frame
+    /// (they were, while the assets were stale): once a session, as vanilla retries
+    /// nothing; the failure toast shows for its five seconds. Being overtaken by a newer
+    /// reload is no failure.
+    #[test]
+    fn a_failed_vanilla_reload_is_tried_again_only_in_the_next_session() {
+        use crate::account::Accounts;
+        use crate::settings::SettingsFile;
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.packs.session_number = 3;
+        m.packs.stale = true;
+        m.packs.world_requested = true;
+        assert!(m.vanilla_wanted(true, true, false));
+        assert!(!m.vanilla_wanted(true, true, true), "not while one builds");
+        assert!(
+            !m.vanilla_wanted(false, true, false),
+            "not outside a session"
+        );
+        m.vanilla_reload_failed();
+        let asked = (0..1000)
+            .filter(|_| m.vanilla_wanted(true, true, false) || m.vanilla_wanted(true, false, false))
+            .count();
+        assert_eq!(asked, 0, "asked again in the session it failed in");
+        assert_eq!(
+            m.toast_text(),
+            Some(("Resource reload failed".to_owned(), None))
+        );
+        m.packs.load_failed = Some(Instant::now() - std::time::Duration::from_millis(6000));
+        m.expire_pack_toast();
+        assert_eq!(m.toast_text(), None);
+        // The next session tries once more.
+        m.packs.session_number = 4;
+        assert!(m.vanilla_wanted(true, true, false));
+        m.packs.world_requested = false;
+        m.packs.stale = false;
+        assert!(
+            m.vanilla_wanted(true, false, false),
+            "the first world's assets"
+        );
+        // Overtaken or of a session that is over: no failure.
+        assert!(crate::resource_reload::superseded(
+            crate::resource_reload::OVERTAKEN
+        ));
+        assert!(crate::resource_reload::superseded(
+            crate::resource_reload::SESSION_OVER
+        ));
+        assert!(!crate::resource_reload::superseded("it took too long"));
+        assert!(!crate::resource_reload::superseded("no game files"));
     }
 
     /// The swap back to vanilla's sounds, made late, doesn't undo the next server's.
