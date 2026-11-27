@@ -109,6 +109,28 @@ fn held_back(decoded: &Result<Pcm, DecodeError>) -> bool {
     matches!(decoded, Err(DecodeError::HeldBack))
 }
 
+/// The whole sounds held back for the room, and the samples each is known to have more
+/// than: one that doesn't say how long it is is found out only by decoding it up to the
+/// room it was given. Until there is more room than that it is held back again without
+/// being decoded, so a long sound played again and again while the room is short isn't
+/// decoded again on every play. (The decoder's own lengths are the file's word; a file
+/// that says it is longer than the room is held back before it is decoded anyway.)
+#[derive(Debug, Default)]
+struct HeldBack(std::collections::HashMap<String, usize>);
+
+impl HeldBack {
+    /// Whether `file` is known to need more than `room` samples.
+    fn known(&self, file: &str, room: usize) -> bool {
+        self.0.get(file).is_some_and(|&more_than| more_than >= room)
+    }
+
+    /// `file` was held back with `room`: it has more samples than that.
+    fn note(&mut self, file: &str, room: usize) {
+        let more_than = self.0.entry(file.to_owned()).or_default();
+        *more_than = (*more_than).max(room);
+    }
+}
+
 fn lock(engine: &Weak<Mutex<Engine>>) -> Option<Arc<Mutex<Engine>>> {
     engine.upgrade()
 }
@@ -117,6 +139,7 @@ fn run(files: &SoundFiles, engine: &Weak<Mutex<Engine>>, generation: u64, rx: &R
     let mut streams: Vec<OpenStream> = Vec::new();
     // The whole sounds decoded here, for as long as anything holds them.
     let mut live: Vec<Weak<Pcm>> = Vec::new();
+    let mut held = HeldBack::default();
     loop {
         let job = if streams.is_empty() {
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
@@ -127,18 +150,28 @@ fn run(files: &SoundFiles, engine: &Weak<Mutex<Engine>>, generation: u64, rx: &R
             Ok(Job::Decode(file)) => {
                 let started = Instant::now();
                 let room = room(&mut live);
+                let key = id_key(&file);
                 // Refused only for the room the sounds alive now leave: for now only. Any
                 // other failure is the file's own, and lasts.
                 let mut for_now = false;
-                let pcm = files
-                    .open(&file)
-                    .map_err(|e| e.to_string())
-                    .and_then(|(bytes, limits)| {
-                        let decoded = guarded(&file, || Ok(decode_limited(bytes, &limits, room)))?;
-                        for_now = held_back(&decoded);
-                        decoded.map_err(|e| e.to_string())
-                    })
-                    .map(Arc::new);
+                let pcm = if held.known(&key, room) {
+                    for_now = true;
+                    Err(DecodeError::HeldBack.to_string())
+                } else {
+                    files
+                        .open(&file)
+                        .map_err(|e| e.to_string())
+                        .and_then(|(bytes, limits)| {
+                            let decoded =
+                                guarded(&file, || Ok(decode_limited(bytes, &limits, room)))?;
+                            for_now = held_back(&decoded);
+                            decoded.map_err(|e| e.to_string())
+                        })
+                        .map(Arc::new)
+                };
+                if for_now {
+                    held.note(&key, room);
+                }
                 if let Ok(p) = &pcm {
                     live.push(Arc::downgrade(p));
                 }
@@ -286,6 +319,22 @@ mod tests {
         let broken = decode_limited(b"OggS broken".to_vec(), &Limits::untrusted(), 0);
         assert!(matches!(broken, Err(DecodeError::Broken(_))), "{broken:?}");
         assert!(!held_back(&broken));
+    }
+
+    /// A sound held back for the room isn't decoded again until there is more room than
+    /// it was refused with; then it is, and if it is longer still, it waits for more.
+    #[test]
+    fn a_held_back_sound_waits_for_more_room_before_it_is_decoded_again() {
+        let mut h = HeldBack::default();
+        let f = "minecraft:sounds/long.ogg";
+        assert!(!h.known(f, 1000));
+        h.note(f, 1000);
+        assert!(h.known(f, 1000) && h.known(f, 10));
+        assert!(!h.known(f, 1001), "more room: decoded again");
+        h.note(f, 5000);
+        h.note(f, 10);
+        assert!(h.known(f, 5000) && !h.known(f, 5001));
+        assert!(!h.known("minecraft:sounds/other.ogg", 0));
     }
 
     #[test]
