@@ -3612,6 +3612,17 @@ mod tests {
         }
     }
 
+    /// The session's packets go past the packet-order checker, which panics in tests: an
+    /// attack outside a tick is one vanilla never sends.
+    #[test]
+    #[should_panic(expected = "INV-T4")]
+    fn the_sessions_packets_go_past_the_packet_checker() {
+        let mut r = rig(None);
+        r.packet(login());
+        r.frame(10);
+        r.game.connection.send(play::attack(1));
+    }
+
     /// `handleRotatePlayer`: the server's rotation (`/rotate`), outright or relative,
     /// is taken without interpolation and answered at once with the player's rotation
     /// and no ground or collision flags.

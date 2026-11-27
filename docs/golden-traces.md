@@ -2,7 +2,7 @@
 
 Golden traces record what the vanilla 26.3 client does, tick by tick, in scripted scenarios: the inputs it reads, the packets it sends, the packets it processes and the player's state after every tick. Ruthenium's simulation will replay the inputs and inbound packets and must reproduce the positions, velocities and outbound packet bytes exactly.
 
-The committed traces are in `tests/golden/26.3/`. `crates/ruthenium-trace` reads them. Its tests check every trace against vanilla's per-tick packet rules and check every recorded packet id against the ids `cargo xtask codegen` generated.
+The committed traces are in `tests/golden/26.3/`. `crates/ruthenium-trace` reads them. Its tests check every trace against vanilla's per-tick packet rules and check every recorded packet id against the ids `cargo xtask codegen` generated. `crates/ruthenium-sim/tests/packet_check.rs` runs the packet-order checker (`ruthenium_sim::packet_check`) over every trace's outbound stream, with its frames, ticks and handled packets, and finds nothing: a rule vanilla breaks is a wrong rule. The replay below runs it over Ruthenium's own tick packets too.
 
 ## Recording
 
