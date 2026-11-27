@@ -13,7 +13,13 @@
 //! RFC 7050 finds by asking the system resolver for `ipv4only.arpa` (its DNS64 then
 //! answers with 192.0.0.170 and .171 inside the prefix). Without that, a name answering
 //! only `<operator prefix>::c0a8:101` (192.168.1.1 through the operator's NAT64) would pass
-//! as a public IPv6 address.
+//! as a public IPv6 address. A discovery that doesn't answer in time is, as RFC 7050
+//! section 3 has every unsuccessful case ("a DNS query timeout ... result[s] in a node
+//! being unable to perform local IPv6 address synthesis"), one that found no prefix: the
+//! address is judged without network prefixes, so public IPv6 stays reachable on networks
+//! without NAT64 whose resolver is slow to say so; the late answer, if it comes, is used
+//! from then on. What that leaves open: a NAT64 network whose DNS64 is too slow to answer
+//! `ipv4only.arpa` in time, for the downloads before its answer arrives.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
@@ -150,29 +156,41 @@ pub(crate) fn nat64_prefixes(answers: impl IntoIterator<Item = IpAddr>) -> Vec<N
     out
 }
 
-/// Asks the system resolver for `ipv4only.arpa` (RFC 7050), giving up after `timeout`:
-/// returns `Err(())` when the lookup timed out or couldn't run so callers can fail closed
-/// instead of caching an empty prefix list on transient timeouts.
-pub(crate) fn discover_nat64(timeout: Duration) -> Result<Vec<Nat64Prefix>, ()> {
+/// The system resolver's answers for `ipv4only.arpa` (RFC 7050's well-known name).
+fn lookup_ipv4only() -> Vec<IpAddr> {
+    ("ipv4only.arpa", 0)
+        .to_socket_addrs()
+        .map(|a| a.map(|s| s.ip()).collect())
+        .unwrap_or_default()
+}
+
+/// What looks `ipv4only.arpa` up (the system resolver, or a stand-in in tests).
+type Lookup = Arc<dyn Fn() -> Vec<IpAddr> + Send + Sync>;
+
+/// A discovery started on a thread of its own: its answers, once it has them.
+type Pending = mpsc::Receiver<Vec<IpAddr>>;
+
+/// Starts asking `lookup` for `ipv4only.arpa` (RFC 7050) on a thread; `None` when no
+/// thread could be started.
+fn start_discovery(lookup: &Lookup) -> Option<Pending> {
     let (tx, rx) = mpsc::sync_channel(1);
-    let spawned = std::thread::Builder::new()
+    let lookup = lookup.clone();
+    std::thread::Builder::new()
         .name("nat64-discovery".into())
         .spawn(move || {
-            let answers: Vec<IpAddr> = ("ipv4only.arpa", 0)
-                .to_socket_addrs()
-                .map(|a| a.map(|s| s.ip()).collect())
-                .unwrap_or_default();
-            let _ = tx.send(answers);
-        });
-    if spawned.is_err() {
-        return Err(());
-    }
-    let answers = rx.recv_timeout(timeout).map_err(|_| ())?;
+            let _ = tx.send(lookup());
+        })
+        .ok()?;
+    Some(rx)
+}
+
+/// The prefixes in a discovery's answers, logged when there are any.
+fn found_prefixes(answers: Vec<IpAddr>) -> Vec<Nat64Prefix> {
     let prefixes = nat64_prefixes(answers);
     if !prefixes.is_empty() {
         eprintln!("[packs] NAT64 prefixes of this network: {prefixes:?}");
     }
-    Ok(prefixes)
+    prefixes
 }
 
 /// What a download may connect to.
@@ -347,7 +365,11 @@ pub(crate) struct CheckedResolver {
     policy: Policy,
     /// The network's NAT64 prefixes: given (tests), or found on the first IPv6 answer.
     nat64: Mutex<Option<Vec<Nat64Prefix>>>,
+    /// A discovery that timed out and may still answer: its prefixes are taken for the
+    /// lookups after it arrives.
+    pending: Mutex<Option<Pending>>,
     discovery_timeout: Duration,
+    lookup: Lookup,
     /// Addresses tests treat as public (the test server is on loopback).
     pretend_public: Vec<IpAddr>,
     /// The last address refused, for the error.
@@ -368,10 +390,75 @@ impl CheckedResolver {
                 nat64: Vec::new(),
             },
             nat64: Mutex::new(nat64),
+            pending: Mutex::new(None),
             discovery_timeout,
+            lookup: Arc::new(lookup_ipv4only),
             pretend_public,
             refused: Arc::default(),
         }
+    }
+
+    /// Looks `ipv4only.arpa` up with `lookup` instead of the system resolver (tests).
+    #[cfg(test)]
+    fn with_lookup(mut self, lookup: impl Fn() -> Vec<IpAddr> + Send + Sync + 'static) -> Self {
+        self.lookup = Arc::new(lookup);
+        self
+    }
+
+    /// The network's NAT64 prefixes, as far as they are known: discovered once (RFC 7050
+    /// section 3), waiting at most `budget`. A discovery that times out is, as the RFC
+    /// has every unsuccessful case, one that found no prefix to synthesise with: the
+    /// lookup is judged without network-specific prefixes (the well-known 64:ff9b::/96
+    /// is always judged by the IPv4 it embeds), so a public IPv6 address stays allowed.
+    /// Nothing is cached for it: its answer, if it comes later, is taken by the lookups
+    /// after it (the RFC's retransmission), and none of them waits for it again.
+    fn known_prefixes(&self, budget: Duration) -> Vec<Nat64Prefix> {
+        let lock = |m: &Mutex<Option<Vec<Nat64Prefix>>>| {
+            m.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        };
+        if let Some(list) = lock(&self.nat64) {
+            return list;
+        }
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        // (Another lookup may have finished the discovery while this one waited.)
+        if let Some(list) = lock(&self.nat64) {
+            return list;
+        }
+        let answers = match pending.take() {
+            Some(rx) => match rx.try_recv() {
+                Ok(answers) => Some(answers),
+                Err(mpsc::TryRecvError::Empty) => {
+                    *pending = Some(rx);
+                    None
+                }
+                // Its thread ended without answering: ask again next time.
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            },
+            None => {
+                let Some(rx) = (!budget.is_zero())
+                    .then(|| start_discovery(&self.lookup))
+                    .flatten()
+                else {
+                    return Vec::new();
+                };
+                match rx.recv_timeout(budget) {
+                    Ok(answers) => Some(answers),
+                    Err(_) => {
+                        eprintln!(
+                            "[packs] NAT64 discovery (ipv4only.arpa) didn't answer in {budget:?}: judging without network prefixes"
+                        );
+                        *pending = Some(rx);
+                        None
+                    }
+                }
+            }
+        };
+        let Some(answers) = answers else {
+            return Vec::new();
+        };
+        let found = found_prefixes(answers);
+        *self.nat64.lock().unwrap_or_else(|e| e.into_inner()) = Some(found.clone());
+        found
     }
 
     fn allowed(&self, ip: IpAddr, timeout: NextTimeout) -> bool {
@@ -381,29 +468,17 @@ impl CheckedResolver {
         if !self.policy.needs_nat64(ip) {
             return self.policy.allowed(ip);
         }
-        let nat64 = {
-            let guard = self.nat64.lock().unwrap_or_else(|e| e.into_inner());
-            guard.clone()
+        let budget = match timeout.after {
+            UreqDuration::Exact(d) => self.discovery_timeout.min(d),
+            _ => self.discovery_timeout,
         };
-        let nat64 = match nat64 {
-            Some(list) => list,
-            None => {
-                let budget = match timeout.after {
-                    UreqDuration::Exact(d) => self.discovery_timeout.min(d),
-                    _ => self.discovery_timeout,
-                };
-                if budget.is_zero() {
-                    return false;
-                }
-                let Ok(found) = discover_nat64(budget) else {
-                    // Fail closed if NAT64 discovery timed out, without permanently caching.
-                    return false;
-                };
-                let mut guard = self.nat64.lock().unwrap_or_else(|e| e.into_inner());
-                *guard = Some(found.clone());
-                found
-            }
-        };
+        self.allowed_within(ip, budget)
+    }
+
+    /// Whether `ip` (an IPv6 answer that would pass without NAT64) is allowed, waiting
+    /// at most `budget` for the network's NAT64 prefixes.
+    fn allowed_within(&self, ip: IpAddr, budget: Duration) -> bool {
+        let nat64 = self.known_prefixes(budget);
         Policy {
             private_allowed: self.policy.private_allowed.clone(),
             nat64,
@@ -758,5 +833,66 @@ mod tests {
             nat64: vec![p32, p64_priv],
         };
         assert!(!multi.allowed(addr));
+    }
+
+    /// The resolver with this `ipv4only.arpa` lookup and nothing private allowed.
+    fn resolver(lookup: impl Fn() -> Vec<IpAddr> + Send + Sync + 'static) -> CheckedResolver {
+        CheckedResolver::new(Vec::new(), None, Duration::from_secs(5), Vec::new())
+            .with_lookup(lookup)
+    }
+
+    /// RFC 7050 section 3: a discovery that times out found no prefix, so public IPv6
+    /// stays allowed (not refused, as before); the well-known prefix is still judged by
+    /// the IPv4 it embeds; the late answer is taken by the lookups after it, and none of
+    /// them waits for it again.
+    #[test]
+    fn a_nat64_discovery_that_times_out_leaves_public_ipv6_allowed() {
+        let (go, wait) = mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        let r = resolver(move || {
+            let _ = wait.lock().unwrap().recv();
+            vec![synthesize("2a00:1234::", 96, "192.0.0.170")]
+        });
+        let budget = Duration::from_millis(20);
+        let public = ip("2606:4700:4700::1111");
+        let started = std::time::Instant::now();
+        assert!(r.allowed_within(public, budget));
+        assert!(!r.allowed_within(ip("64:ff9b::c0a8:101"), budget));
+        // Through the operator's prefix to 192.168.1.1: not known yet.
+        let operator_private = synthesize("2a00:1234::", 96, "192.168.1.1");
+        assert!(r.allowed_within(operator_private, budget));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "only the first lookup waited: {:?}",
+            started.elapsed()
+        );
+        // The answer arrives: from then on the operator's prefix is judged by its IPv4.
+        go.send(()).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while r.allowed_within(operator_private, budget) {
+            assert!(
+                std::time::Instant::now() < until,
+                "the late answer was never taken"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(r.allowed_within(public, budget));
+        assert!(r.allowed_within(synthesize("2a00:1234::", 96, "8.8.8.8"), budget));
+    }
+
+    /// A discovery that answers in time is cached: its prefixes judge every lookup, and
+    /// it is asked once.
+    #[test]
+    fn a_nat64_discovery_that_answers_is_asked_once() {
+        let asked = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count = asked.clone();
+        let r = resolver(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            vec![synthesize("2a00:1234::", 96, "192.0.0.171")]
+        });
+        let budget = Duration::from_secs(5);
+        assert!(!r.allowed_within(synthesize("2a00:1234::", 96, "10.0.0.1"), budget));
+        assert!(r.allowed_within(ip("2606:4700:4700::1111"), budget));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }
