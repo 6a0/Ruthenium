@@ -2754,6 +2754,28 @@ pub mod play {
         })
     }
 
+    /// `ServerboundContainerButtonClickPacket`: a menu's button (an enchanting table's
+    /// offer, a lectern's page buttons...), by the id the menu's `clickMenuButton` reads.
+    pub fn container_button_click(container_id: i32, button_id: i32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ContainerButtonClick.id(), |o| {
+            wire::write_varint(o, container_id);
+            wire::write_varint(o, button_id);
+        })
+    }
+
+    /// `ServerboundSetBeaconPacket`: the beacon's primary and secondary effects, each a
+    /// `minecraft:mob_effect` registry id if chosen (`MobEffect.STREAM_CODEC`, optional).
+    pub fn set_beacon(primary: Option<i32>, secondary: Option<i32>) -> Vec<u8> {
+        wire::packet(pl::Serverbound::SetBeacon.id(), |o| {
+            for effect in [primary, secondary] {
+                o.push(u8::from(effect.is_some()));
+                if let Some(id) = effect {
+                    wire::write_varint(o, id);
+                }
+            }
+        })
+    }
+
     /// The order fastutil's `Int2ObjectOpenHashMap` (default size 16, load factor 0.75)
     /// iterates distinct keys put into it in the given order: the key 0 first (kept
     /// apart), then the table from its last position down. A key's place is
@@ -4281,6 +4303,26 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "{keys:?}");
         }
+    }
+
+    #[test]
+    fn writes_the_menu_buttons_and_the_beacons_effects() {
+        // An enchanting table's third offer in menu 2; a lectern's page 7 (`100 + page`).
+        assert_eq!(
+            play::container_button_click(2, 2),
+            [pl::Serverbound::ContainerButtonClick.id() as u8, 2, 2]
+        );
+        assert_eq!(play::container_button_click(1, 107)[1..], [1, 107]);
+        // Haste (registry id 2) and no secondary; then both, the second id over a byte.
+        assert_eq!(
+            play::set_beacon(Some(2), None),
+            [pl::Serverbound::SetBeacon.id() as u8, 1, 2, 0]
+        );
+        assert_eq!(
+            play::set_beacon(Some(9), Some(200))[1..],
+            [1, 9, 1, 0xC8, 1]
+        );
+        assert_eq!(play::set_beacon(None, None)[1..], [0, 0]);
     }
 
     #[test]
