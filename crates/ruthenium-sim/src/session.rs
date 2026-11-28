@@ -2751,7 +2751,7 @@ impl Game {
             play::Clientbound::Explode {
                 player_knockback: None,
             } => {}
-            play::Clientbound::UpdateRecipes { item_sets } => {
+            play::Clientbound::UpdateRecipes { item_sets, .. } => {
                 self.recipe_sets = crate::item::RecipeSets::new();
                 for (key, items) in item_sets {
                     self.recipe_sets.set(&key, items);
@@ -3134,6 +3134,8 @@ impl Game {
                 inventory_columns,
                 entity_id,
             } => self.mount_screen_open(container_id, inventory_columns, entity_id),
+            // (Not run yet: no merchant screen.)
+            play::Clientbound::MerchantOffers { .. } => {}
             play::Clientbound::Cooldown { group, duration } => {
                 if let Some(w) = &mut self.world {
                     if duration == 0 {

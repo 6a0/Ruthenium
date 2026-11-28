@@ -1532,6 +1532,40 @@ fn resolvable_float(r: &mut Reader<'_>) -> Result<(), WireError> {
     Ok(())
 }
 
+impl HolderSet {
+    /// `ByteBufCodecs.holderSet`: 0 and a tag, or the count plus one and the ids.
+    pub fn read(r: &mut Reader<'_>) -> Result<HolderSet, WireError> {
+        read_holder_set(r)
+    }
+}
+
+/// A trim pattern's holder (`TrimPattern.STREAM_CODEC`), as a smithing display sends it.
+pub(crate) fn read_trim_pattern(r: &mut Reader<'_>) -> Result<TrimPart, WireError> {
+    trim_part(r, |r| {
+        let asset = r.identifier()?;
+        nbt(r)?;
+        Ok((asset, r.bool()?))
+    })
+}
+
+/// `DataComponentExactPredicate.STREAM_CODEC` (a list of `TypedDataComponent`s): the
+/// components a stack must have, each with exactly that value (type id, value).
+pub fn read_exact_components(r: &mut Reader<'_>) -> Result<Vec<(i32, Component)>, WireError> {
+    let n = r.count(usize::MAX)?;
+    let mut out = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        let kind = r.varint()?;
+        out.push((kind, read_component(r, kind, 0)?));
+    }
+    Ok(out)
+}
+
+/// A component's value as the network writes it, for a component built here (an
+/// anvil's or a loom's result).
+pub fn write_component(c: &Component) -> Result<Vec<u8>, &'static str> {
+    write_value(c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

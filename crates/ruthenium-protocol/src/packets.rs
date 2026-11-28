@@ -1476,9 +1476,20 @@ pub mod play {
             slot: i32,
         },
         /// The recipe property sets (`campfire_input`, `furnace_input`...): each set's
-        /// key and item ids. The stonecutter's recipes after them aren't read.
+        /// key and item ids; then the stonecutter's recipes.
         UpdateRecipes {
             item_sets: Vec<(String, Vec<i32>)>,
+            stonecutter: Vec<crate::recipe::StonecutterEntry>,
+        },
+        /// `ClientboundMerchantOffersPacket`: a merchant's offers for its open menu, its
+        /// level and experience, whether the screen shows the bar, and whether it restocks.
+        MerchantOffers {
+            container_id: i32,
+            offers: Vec<crate::trade::MerchantOffer>,
+            villager_level: i32,
+            villager_xp: i32,
+            show_progress: bool,
+            can_restock: bool,
         },
         TickingState {
             tick_rate: f32,
@@ -2054,9 +2065,20 @@ pub mod play {
                         }
                         item_sets.push((key, items));
                     }
-                    r.rest();
-                    Clientbound::UpdateRecipes { item_sets }
+                    let stonecutter = crate::recipe::read_stonecutter_recipes(&mut r)?;
+                    Clientbound::UpdateRecipes {
+                        item_sets,
+                        stonecutter,
+                    }
                 }
+                C::MerchantOffers => Clientbound::MerchantOffers {
+                    container_id: r.varint()?,
+                    offers: crate::trade::read_offers(&mut r)?,
+                    villager_level: r.varint()?,
+                    villager_xp: r.varint()?,
+                    show_progress: r.bool()?,
+                    can_restock: r.bool()?,
+                },
                 C::TickingState => Clientbound::TickingState {
                     tick_rate: r.f32()?,
                     frozen: r.bool()?,
@@ -4397,6 +4419,44 @@ mod tests {
                 entity_id: 256
             }
         );
+        // A merchant's offers, then its level, xp, the bar and restocking.
+        let mut b = vec![2, 1, 5, 12, 0, 3, 9, 0, 0, 0, 1];
+        for v in [12i32, 12, 2, 0] {
+            b.extend(v.to_be_bytes());
+        }
+        b.extend(0.2f32.to_be_bytes());
+        b.extend(0i32.to_be_bytes());
+        b.extend([3, 70, 1, 0]);
+        let play::Clientbound::MerchantOffers {
+            container_id,
+            offers,
+            villager_level,
+            villager_xp,
+            show_progress,
+            can_restock,
+        } = decode(pl::Clientbound::MerchantOffers, &b)
+        else {
+            panic!("not merchant offers");
+        };
+        assert_eq!((container_id, offers.len()), (2, 1));
+        assert!(offers[0].out_of_stock && offers[0].cost_b.is_none());
+        assert_eq!((villager_level, villager_xp), (3, 70));
+        assert!(show_progress && !can_restock);
+        // The recipe sets, then the stonecutter's recipes (one: items 1 and 2 to item 9).
+        let mut b = vec![1];
+        crate::wire::write_string(&mut b, "minecraft:furnace_input");
+        b.extend([1, 4]);
+        b.extend([1, 3, 1, 2, 4, 9]);
+        let play::Clientbound::UpdateRecipes {
+            item_sets,
+            stonecutter,
+        } = decode(pl::Clientbound::UpdateRecipes, &b)
+        else {
+            panic!("not update_recipes");
+        };
+        assert_eq!(item_sets, [("minecraft:furnace_input".to_owned(), vec![4])]);
+        assert_eq!(stonecutter.len(), 1);
+        assert_eq!(stonecutter[0].display, crate::recipe::SlotDisplay::Item(9));
         // container_close and container_click as vanilla writes them.
         assert_eq!(
             play::container_close(5),

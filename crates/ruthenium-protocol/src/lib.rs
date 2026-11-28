@@ -19,6 +19,8 @@ pub mod item;
 pub mod nbt;
 pub mod packets;
 pub mod profile;
+pub mod recipe;
 pub mod status;
 pub mod text;
+pub mod trade;
 pub mod wire;
