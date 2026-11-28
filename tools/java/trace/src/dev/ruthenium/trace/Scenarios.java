@@ -129,6 +129,12 @@ public final class Scenarios {
         server.runCommand("tp @p 0.5 -60 0.5 -90 30");
     }
 
+    /** The scaffolding_break scenario's column, built again from the floor up. */
+    private static void scaffoldingColumn(TestServerContext server) {
+        server.runCommand("fill 2 -60 3 2 -52 3 minecraft:air");
+        server.runCommand("fill 2 -60 3 2 -52 3 minecraft:scaffolding[distance=0,bottom=false]");
+    }
+
     /** Teleports the player and waits for the teleport to land. */
     private static void tp(ClientGameTestContext ctx, TestServerContext server, double x, double y, double z,
             double yaw, double pitch) {
@@ -525,6 +531,55 @@ public final class Scenarios {
                         hold(ctx, 15, SNEAK);
                         ctx.waitTicks(5);
                         hold(ctx, 12, W);
+                        ctx.waitTicks(20);
+                    }),
+            new Scenario("scaffolding_break",
+                    "Breaking the scaffolding the player is in: climbing a column from inside with jump held while breaking the piece at its feet (looking down), so the pieces above go too; standing inside and breaking its own piece; sneaking down while breaking; climbing while breaking the piece above; with scaffolding in hand (its outline a full block, so the piece at eye height is hit from inside) standing, climbing and sneaking while breaking.",
+                    List.of("gamerule block_drops false",
+                            "fill 2 -60 3 2 -52 3 minecraft:scaffolding[distance=0,bottom=false]"),
+                    start(2.5, -60, 0.5, 0, 0), (ctx, server) -> {
+                        ctx.waitTicks(10);
+                        // Climbing from the bottom, then breaking the piece at the feet as it goes.
+                        tp(ctx, server, 2.5, -60, 3.5, 0, 90);
+                        hold(ctx, 12, JUMP);
+                        hold(ctx, 20, JUMP, ATTACK);
+                        ctx.waitTicks(30);
+                        // Standing inside on the piece below, breaking its own piece.
+                        scaffoldingColumn(server);
+                        tp(ctx, server, 2.5, -56, 3.5, 0, 90);
+                        ctx.waitTicks(4);
+                        hold(ctx, 3, ATTACK);
+                        ctx.waitTicks(30);
+                        // Sneaking down through the column while breaking below.
+                        scaffoldingColumn(server);
+                        tp(ctx, server, 2.5, -56, 3.5, 0, 90);
+                        ctx.waitTicks(4);
+                        hold(ctx, 4, SNEAK);
+                        hold(ctx, 25, SNEAK, ATTACK);
+                        ctx.waitTicks(20);
+                        // Climbing while breaking the piece above.
+                        scaffoldingColumn(server);
+                        tp(ctx, server, 2.5, -58, 3.5, 0, -90);
+                        ctx.waitTicks(4);
+                        hold(ctx, 25, JUMP, ATTACK);
+                        ctx.waitTicks(30);
+                        // Scaffolding in hand: the piece at eye height, hit from inside.
+                        server.runCommand("item replace entity @a hotbar.0 with minecraft:scaffolding 16");
+                        scaffoldingColumn(server);
+                        tp(ctx, server, 2.5, -56, 3.5, 0, 0);
+                        ctx.waitTicks(4);
+                        hold(ctx, 3, ATTACK);
+                        ctx.waitTicks(20);
+                        scaffoldingColumn(server);
+                        tp(ctx, server, 2.5, -60, 3.5, 0, 0);
+                        ctx.waitTicks(4);
+                        hold(ctx, 8, JUMP);
+                        hold(ctx, 20, JUMP, ATTACK);
+                        ctx.waitTicks(30);
+                        scaffoldingColumn(server);
+                        tp(ctx, server, 2.5, -55, 3.5, 0, 0);
+                        ctx.waitTicks(4);
+                        hold(ctx, 25, SNEAK, ATTACK);
                         ctx.waitTicks(20);
                     }),
             new Scenario("using_blocks",

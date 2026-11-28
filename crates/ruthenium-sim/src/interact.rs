@@ -609,13 +609,13 @@ impl GameMode {
             return false;
         }
         // `playerWillDestroy` and `destroy` only make particles and sounds on the
-        // client (the rest is the server's). `removeBlock`: the fluid stays, and the
-        // neighbours hear of it.
+        // client (the rest is the server's). The fluid stays, and the neighbours hear of
+        // it (`UPDATE_ALL_IMMEDIATE`, `MultiPlayerGameMode.java:141`).
         w.sounds
             .push(crate::sound::BlockSound::Break { pos, state: old });
         let left = w.blocks.left_behind(old);
         w.track_player(p);
-        w.set_block(pos, left, crate::block::flags::ALL)
+        w.set_block(pos, left, crate::block::flags::ALL_IMMEDIATE)
     }
 
     /// `sameDestroyTarget`: the same block, with the same item in hand.

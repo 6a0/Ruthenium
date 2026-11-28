@@ -1627,7 +1627,7 @@ fn replay_from(name: &str, d: &Data, reminder: i32) -> Result<usize, (i64, Strin
 const LOOSE_CROSSHAIR: [&str; 2] = ["wind_charge", "shulker_box"];
 
 /// Scenarios the movement code must reproduce exactly (all of them now).
-const EXACT: [&str; 89] = [
+const EXACT: [&str; 90] = [
     "projectiles",
     "walk_directions",
     "mouse_turn",
@@ -1659,6 +1659,7 @@ const EXACT: [&str; 89] = [
     "using_blocks",
     "tools_on_blocks",
     "scaffolding",
+    "scaffolding_break",
     "shallow_water",
     "swim_under",
     "crawl",
@@ -1772,6 +1773,7 @@ fn golden_traces() {
         "using_blocks",
         "tools_on_blocks",
         "scaffolding",
+        "scaffolding_break",
         "shallow_water",
         "swim_under",
         "crawl",
