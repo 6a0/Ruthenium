@@ -443,7 +443,8 @@ mod tests {
         );
         // The wheel scrolls a row (16 recipes: one row off the screen).
         s.mouse_scrolled(&mut f, -1.0);
-        assert_eq!(super::stonecutter::cutter(&f.menu).unwrap().start_index, 4);
+        let cut = super::stonecutter::cutter(&f.menu).unwrap();
+        assert_eq!((cut.start_index, cut.scroll_offs), (4, 1.0));
         // A cell past the last recipe still counts as a press of its button.
         press(
             &mut s,
@@ -661,5 +662,123 @@ mod tests {
         );
         assert!(f.menu.own[2].is_empty());
         assert_eq!(f.menu.data[0], 0);
+    }
+
+    #[test]
+    fn the_anvil_asks_for_levels_and_turns_down_forty() {
+        let (_s, mut f) = Fake::new(Station::Anvil);
+        let mut inv = std::mem::take(&mut f.inv);
+        let mut sword = f.stack("minecraft:diamond_sword", 1);
+        sword = super::super::set_component(
+            &f.w.data.items,
+            &sword,
+            ruthenium_data::v26_3::registries::DataComponentType::Damage,
+            ruthenium_protocol::item::Component::Damage(900),
+            false,
+        );
+        let diamonds = f.stack("minecraft:diamond", 3);
+        f.menu.set_item(&mut inv, 0, 1, sword);
+        f.menu.set_item(&mut inv, 1, 2, diamonds);
+        // Three diamonds mend 900 damage in three goes: 3 levels.
+        assert_eq!(f.menu.data[0], 3);
+        assert!(!f.menu.own[2].is_empty());
+        let who = |creative| Who {
+            items: &f.w.data.items,
+            recipes: &f.w.recipes,
+            creative,
+        };
+        // Without the levels the result stays put.
+        f.menu.work_mut().unwrap().player.xp_level = 2;
+        f.menu.clicked(&mut inv, &who(false), 2, 0, Input::Pickup);
+        assert!(f.menu.carried.is_empty());
+        // With them it is taken, the levels go and the diamonds with it.
+        f.menu.work_mut().unwrap().player.xp_level = 5;
+        f.menu.clicked(&mut inv, &who(false), 2, 0, Input::Pickup);
+        assert_eq!(f.menu.carried.c.damage, Some(0));
+        assert_eq!(f.menu.work().unwrap().player.xp_level, 2);
+        assert!(f.menu.own[0].is_empty() && f.menu.own[1].is_empty());
+        // A sword worked on 39 levels' worth before, mended once more: forty levels, too
+        // expensive but in creative.
+        let worn = super::super::set_component(
+            &f.w.data.items,
+            &f.menu.carried,
+            ruthenium_data::v26_3::registries::DataComponentType::Damage,
+            ruthenium_protocol::item::Component::Damage(900),
+            false,
+        );
+        let worn = super::super::set_component(
+            &f.w.data.items,
+            &worn,
+            ruthenium_data::v26_3::registries::DataComponentType::RepairCost,
+            ruthenium_protocol::item::Component::Other {
+                kind: ruthenium_data::v26_3::registries::DataComponentType::RepairCost.id() as i32,
+                data: super::super::varint_bytes(39),
+            },
+            false,
+        );
+        let diamond = f.stack("minecraft:diamond", 1);
+        f.menu.carried = Stack::empty();
+        f.menu.set_item(&mut inv, 0, 3, worn);
+        f.menu.set_item(&mut inv, 1, 4, diamond);
+        assert_eq!(f.menu.data[0], 40);
+        assert!(f.menu.own[2].is_empty());
+        f.menu.work_mut().unwrap().player.creative = true;
+        super::super::anvil::create_result(&mut f.menu);
+        assert!(!f.menu.own[2].is_empty());
+    }
+
+    #[test]
+    fn a_full_banner_takes_no_pattern() {
+        let (_s, mut f) = Fake::new(Station::Loom);
+        let banner = |f: &Fake, layers: usize| {
+            let b = f.stack("minecraft:white_banner", 1);
+            super::super::set_component(
+                &f.w.data.items,
+                &b,
+                ruthenium_data::v26_3::registries::DataComponentType::BannerPatterns,
+                ruthenium_protocol::item::Component::BannerPatterns(
+                    (0..layers)
+                        .map(|_| (ruthenium_protocol::item::TrimPart::Id(1), 3))
+                        .collect(),
+                ),
+                false,
+            )
+        };
+        let mut inv = std::mem::take(&mut f.inv);
+        let dye = f.stack("minecraft:red_dye", 1);
+        f.menu.set_item(&mut inv, 1, 1, dye);
+        f.menu.set_item(&mut inv, 0, 2, banner(&f, 5));
+        assert!(super::loom::click_menu_button(&mut f.menu, 0));
+        assert!(!f.menu.own[3].is_empty());
+        let six = banner(&f, 6);
+        f.menu.set_item(&mut inv, 0, 3, six);
+        assert!(f.menu.own[3].is_empty());
+        assert_eq!(f.menu.data[0], -1);
+        assert!(super::loom::loom(&f.menu).unwrap().has_max_patterns);
+    }
+
+    #[test]
+    fn a_stonecutter_result_with_no_room_is_dropped() {
+        let (_s, mut f) = Fake::new(Station::Stonecutter);
+        let mut inv = std::mem::take(&mut f.inv);
+        for s in &mut inv.items[1..36] {
+            *s = f.stack("minecraft:stick", 64);
+        }
+        // Room for one of the two: the other is dropped.
+        inv.items[0] = f.stack("minecraft:cobblestone", 63);
+        let stone = f.stack("minecraft:stone", 2);
+        f.menu.set_item(&mut inv, 0, 1, stone);
+        super::stonecutter::click_menu_button(&mut f.menu, 0);
+        let result = f.stack("minecraft:cobblestone", 2);
+        f.menu.set_item(&mut inv, 1, 2, result);
+        let who = Who {
+            items: &f.w.data.items,
+            recipes: &f.w.recipes,
+            creative: false,
+        };
+        let out = f.menu.clicked(&mut inv, &who, 1, 0, Input::QuickMove);
+        assert_eq!(out.dropped.len(), 1);
+        assert_eq!(out.dropped[0].count, 1);
+        assert_eq!(f.menu.own[0].count, 1);
     }
 }
