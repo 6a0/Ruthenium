@@ -307,7 +307,7 @@ fn named(items: &Items, id: i32, name: &str) -> tabs::CreativeItem {
     }
 }
 
-//// A session's worth: a category tab of three items, the search tab over them, the
+/// A session's worth: a category tab of three items, the search tab over them, the
 /// saved hotbars' tab and the inventory tab.
 fn full_creative(items: &Items) -> Creative {
     let mut category = tab("minecraft:building_blocks", TabType::Category);
