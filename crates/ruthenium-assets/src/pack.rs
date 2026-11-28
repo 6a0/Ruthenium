@@ -549,11 +549,11 @@ impl Pack {
         let i = zip
             .find("pack.mcmeta")
             .ok_or_else(|| PackError::NoMetadata(path.to_owned()))?;
-        if zip.size(i) > limits.json_bytes {
-            let why = format!("{} bytes is too large", zip.size(i));
+        let meta_bytes = zip.read(i).map_err(io_err(path))?;
+        if meta_bytes.len() as u64 > limits.json_bytes {
+            let why = format!("{} bytes is too large", meta_bytes.len());
             return Err(PackError::BadMetadata(path.to_owned(), why));
         }
-        let meta_bytes = zip.read(i).map_err(io_err(path))?;
         let (metadata, overlays) = untrusted_metadata(path, &meta_bytes, limits)?;
         let filter = filter_or_none(path, &metadata, limits.pack_filters);
         let mut layers = Vec::new();
@@ -794,17 +794,6 @@ impl Pack {
                 _ => Err(io::Error::other("zip location in a non-zip layer")),
             },
             Loc::File(p) => std::fs::read(p).map(Cow::Owned),
-        }
-    }
-
-    /// The size a file says it has, if it says one (zip entries).
-    pub(crate) fn declared_size(&self, loc: &Loc) -> Option<u64> {
-        match loc {
-            Loc::Zip(layer, e) => match self.layers.get(*layer) {
-                Some(Layer::Zip { zip, .. }) => Some(zip.size(*e)),
-                _ => None,
-            },
-            Loc::File(p) => std::fs::metadata(p).ok().map(|m| m.len()),
         }
     }
 }

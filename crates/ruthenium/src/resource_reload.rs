@@ -198,16 +198,6 @@ fn language(resources: &Resources, server: usize) -> HashMap<String, String> {
                 if server_bytes_full {
                     continue;
                 }
-                if let Some(declared) = r.declared_size()
-                    && (bytes as u64).saturating_add(declared) > MAX_LANG_BYTES as u64
-                {
-                    eprintln!(
-                        "[server packs] {}: {ns}:lang/en_us.json is past {} MiB of language; left out",
-                        r.pack().name(),
-                        MAX_LANG_BYTES >> 20
-                    );
-                    continue;
-                }
             }
             let max_bytes = from_server.then(|| MAX_LANG_BYTES.saturating_sub(bytes));
             let (max_added, mut dummy_added) = if from_server {

@@ -83,9 +83,6 @@ impl<'a> Resource<'a> {
     fn json_bytes(&self) -> Result<Cow<'a, [u8]>, String> {
         let pack = &self.res.packs[self.pack];
         let max = pack.limits().json_bytes;
-        if pack.declared_size(&self.loc).is_some_and(|n| n > max) {
-            return Err(format!("larger than a JSON file may be ({max} bytes)"));
-        }
         let bytes = self.read().map_err(|e| e.to_string())?;
         if bytes.len() as u64 > max {
             return Err(format!("larger than a JSON file may be ({max} bytes)"));
@@ -127,9 +124,6 @@ impl<'a> Resource<'a> {
                 let max = pack.limits().mcmeta_bytes;
                 let too_large =
                     || format!("metadata larger than a .mcmeta file may be ({max} bytes)");
-                if pack.declared_size(loc).is_some_and(|n| n > max) {
-                    return Err(too_large());
-                }
                 let bytes = pack.read(loc).map_err(|e| e.to_string())?;
                 if bytes.len() as u64 > max {
                     return Err(too_large());
@@ -137,11 +131,6 @@ impl<'a> Resource<'a> {
                 Metadata::parse(&bytes)
             }
         }
-    }
-
-    /// Declared uncompressed size of this resource, if known.
-    pub fn declared_size(&self) -> Option<u64> {
-        self.res.packs[self.pack].declared_size(&self.loc)
     }
 }
 

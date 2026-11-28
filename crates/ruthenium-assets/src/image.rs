@@ -104,6 +104,9 @@ impl Image {
         }
         let err = |e: png::DecodingError| ImageError(e.to_string());
         let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        // Vanilla reads pictures with STB, which checks neither a chunk's CRC nor the
+        // image data's Adler-32: packs "protected" by item plugins break every CRC.
+        decoder.ignore_checksums(true);
         decoder.set_ignore_text_chunk(true);
         decoder.set_ignore_iccp_chunk(true);
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);

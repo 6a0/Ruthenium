@@ -456,11 +456,8 @@ impl Font {
                     .ok_or("chars that are not text")?;
                 let height = clamp_advance(p["height"].as_i64().unwrap_or(8) as f32);
                 let ascent = clamp_advance(p["ascent"].as_i64().ok_or("no ascent")? as f32);
-                // Vanilla takes a height of 0 (BitmapProvider.java's `Definition` checks
-                // only the ascent): see `bitmap`.
-                if height < 0.0 {
-                    return Err("height must not be negative".into());
-                }
+                // Vanilla takes any height (BitmapProvider.java's `Definition` checks only
+                // the ascent): see `bitmap`.
                 if ascent > height {
                     return Err(format!("ascent {ascent} is greater than height {height}"));
                 }
@@ -634,10 +631,11 @@ fn bitmap(
     // A height of 0 is vanilla's too: its glyphs' scale is 0 (BitmapProvider.java:150),
     // so each advances 1 (`(int)(0.5 + width * 0) + 1`) and is drawn 0 wide and 0 high
     // (oversample 1 / 0): nothing shows. Here such a glyph has no picture, and no
-    // division by its height is made. A negative height (vanilla draws its glyphs
-    // mirrored, with negative advances) is still refused.
-    if !height.is_finite() || height < 0.0 {
-        return Err("height must not be negative".into());
+    // division by its height is made. A negative height gives a negative scale, as in
+    // vanilla: glyphs drawn mirrored, advancing backwards by their ink. Item plugins
+    // (ItemsAdder) make their "negative space" characters so, far above the line.
+    if !height.is_finite() {
+        return Err("the height is not a number".into());
     }
     if ascent > height {
         return Err("the ascent is above the height".into());
@@ -989,9 +987,10 @@ mod tests {
     }
 
     /// Vanilla takes a height of 0: each glyph advances 1 and shows nothing
-    /// (BitmapProvider.java's scale of 0). A negative height is refused.
+    /// (BitmapProvider.java's scale of 0). A negative one is a negative scale: the advance
+    /// is `(int)(0.5 + ink * scale) + 1` and the picture is mirrored.
     #[test]
-    fn a_height_of_0_advances_one_and_draws_nothing() {
+    fn heights_of_0_and_below_are_vanillas() {
         let png = sheet();
         let (res, _dir) = pack(
             "height0",
@@ -999,7 +998,7 @@ mod tests {
                 (
                     "assets/minecraft/font/default.json",
                     br#"{"providers":[{"type":"bitmap","file":"minecraft:font/x.png","height":0,"ascent":-3,"chars":["AB"]},
-                        {"type":"bitmap","file":"minecraft:font/x.png","height":-1,"ascent":-2,"chars":["CD"]}]}"#,
+                        {"type":"bitmap","file":"minecraft:font/x.png","height":-16,"ascent":-20,"chars":["CD"]}]}"#,
                 ),
                 ("assets/minecraft/textures/font/x.png", &png),
             ],
@@ -1009,12 +1008,13 @@ mod tests {
             let g = font.glyph(c);
             assert_eq!((g.advance, g.picture), (1.0, None), "{c}");
         }
-        assert_eq!(font.glyph('C'), Glyph::MISSING);
-        assert!(
-            font.warnings.iter().any(|w| w.contains("negative")),
-            "{:?}",
-            font.warnings
-        );
+        assert!(font.warnings.is_empty(), "{:?}", font.warnings);
+        // A scale of -2: C's ink is 3 wide, (int)(0.5 - 6) + 1 = -4; D has none.
+        let c = font.glyph('C');
+        assert_eq!(c.advance, -4.0);
+        let p = c.picture.unwrap();
+        assert_eq!((p.right, p.top, p.bottom), (-16.0, 27.0, 11.0));
+        assert_eq!(font.glyph('D').advance, 1.0);
     }
 
     #[test]

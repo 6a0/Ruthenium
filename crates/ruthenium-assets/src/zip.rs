@@ -2,7 +2,8 @@
 //!
 //! The client jar and zipped resource packs are read in place: the central
 //! directory is parsed once, stored entries are borrowed straight from the map
-//! and deflated ones are inflated into an exactly sized buffer. Zip64 archives
+//! and deflated ones are inflated to the end of their stream, as Java's `ZipFile`
+//! does (the sizes the directory gives are a guess). Zip64 archives
 //! are supported; encrypted entries and methods other than stored and deflate
 //! are reported as unreadable.
 
@@ -96,8 +97,8 @@ struct Guard {
     budget: Arc<Budget>,
 }
 
-/// Deflate's highest ratio, 1032 to 1 (a 258-byte match costs at least two bits). An entry
-/// that says it inflates to more than this lies.
+/// Deflate's highest ratio, 1032 to 1 (a 258-byte match costs at least two bits): no
+/// entry inflates to more, whatever it says.
 const DEFLATE_RATIO: u64 = 1032;
 
 impl Zip {
@@ -194,8 +195,10 @@ impl Zip {
             return Err(bad(format!("{name} is encrypted")));
         }
         e.data = Some(span(b, &e, start, name)?);
-        check_size(&e, name, limits)?;
-        contents(b, &e, name).map(|c| Some(c.into_owned()))
+        check_compressed(&e, name, limits)?;
+        let c = contents(b, &e, name, limits.entry_bytes)?;
+        check_bloat(&e, c.len(), name)?;
+        Ok(Some(c.into_owned()))
     }
 
     /// [`Self::open_untrusted`] for an archive held in memory (a zip inside a pack).
@@ -313,11 +316,6 @@ impl Zip {
         &self.names[index]
     }
 
-    /// The size entry `index` says it inflates to.
-    pub fn size(&self, index: usize) -> u64 {
-        self.entries[index].size
-    }
-
     /// Indices of the file entries whose names start with `prefix`, in name order.
     pub fn with_prefix(&self, prefix: &str) -> std::ops::Range<usize> {
         let start = self.names.partition_point(|n| **n < *prefix);
@@ -351,72 +349,97 @@ impl Zip {
         if e.encrypted {
             return Err(bad(format!("{name} is encrypted")));
         }
-        if let Some(g) = &self.guard {
-            if budgeted && g.budget.cancelled() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "the load was cancelled",
-                ));
-            }
-            check_size(&e, name, &g.limits)?;
-            let cost = e.size.max(e.compressed);
-            if budgeted && !g.budget.take_bytes(cost, &g.limits) {
-                return Err(bad(format!(
-                    "{name}: the pack has inflated more than a load may ({} bytes)",
-                    g.limits.load_bytes
-                )));
-            }
+        let Some(g) = &self.guard else {
+            return contents(&self.bytes, &e, name, u64::MAX);
+        };
+        if budgeted && g.budget.cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "the load was cancelled",
+            ));
         }
-        contents(&self.bytes, &e, name)
+        check_compressed(&e, name, &g.limits)?;
+        // The size the entry gives is only a guess (see `contents`): what it could be is
+        // taken before the read, and set right after it.
+        let over = || {
+            bad(format!(
+                "{name}: the pack has inflated more than a load may ({} bytes)",
+                g.limits.load_bytes
+            ))
+        };
+        let guess = e
+            .size
+            .min(most_inflated(&e))
+            .min(g.limits.entry_bytes)
+            .max(e.compressed);
+        if !budgeted {
+            return contents(&self.bytes, &e, name, g.limits.entry_bytes);
+        }
+        if !g.budget.take_bytes(guess, &g.limits) {
+            return Err(over());
+        }
+        let read = contents(&self.bytes, &e, name, g.limits.entry_bytes)
+            .and_then(|c| check_bloat(&e, c.len(), name).map(|()| c));
+        let used = read.as_ref().map_or(0, |c| c.len() as u64);
+        if used < guess {
+            g.budget.give_bytes(guess - used);
+        } else if used > guess && !g.budget.take_bytes(used - guess, &g.limits) {
+            g.budget.give_bytes(guess);
+            return Err(over());
+        }
+        read
     }
 }
 
-/// An untrusted entry's sizes: no larger than a file may be (compressed or inflated),
-/// no more than deflate can give of its compressed bytes, and no absurd deflate bloat
-/// (e.g., megabytes of empty deflate blocks inflating to a few bytes).
-fn check_size(e: &Entry, name: &str, limits: &Limits) -> io::Result<()> {
-    if e.size > limits.entry_bytes {
-        return Err(bad(format!(
-            "{name}: {} bytes is larger than a file may be ({})",
-            e.size, limits.entry_bytes
-        )));
+/// The most an entry can hold, whatever its directory entry says: its stored bytes, or
+/// what deflate's highest ratio makes of its compressed ones.
+fn most_inflated(e: &Entry) -> u64 {
+    if e.method == 8 {
+        e.compressed
+            .saturating_mul(DEFLATE_RATIO)
+            .saturating_add(1024)
+    } else {
+        e.compressed
     }
+}
+
+/// An untrusted entry's compressed size: no larger than a file may be.
+fn check_compressed(e: &Entry, name: &str, limits: &Limits) -> io::Result<()> {
     if e.compressed > limits.entry_bytes {
         return Err(bad(format!(
             "{name}: {} compressed bytes is larger than a file may be ({})",
             e.compressed, limits.entry_bytes
         )));
     }
-    if e.method == 8 {
-        if e.size
-            > e.compressed
-                .saturating_mul(DEFLATE_RATIO)
-                .saturating_add(1024)
-        {
-            return Err(bad(format!(
-                "{name}: {} bytes cannot inflate to {}",
-                e.compressed, e.size
-            )));
-        }
-        // Raw DEFLATE worst-case expansion is ~0.03% (5 bytes per 64 KiB block) plus header
-        // overhead. Allowing size + size/1000 + 64 KiB permits all real deflate streams
-        // while rejecting empty-block decompression bombs.
-        let max_compressed = e
-            .size
-            .saturating_add(e.size / 1000)
-            .saturating_add(64 * 1024);
-        if e.compressed > max_compressed {
-            return Err(bad(format!(
-                "{name}: {} compressed bytes is bloated for a {}-byte entry",
-                e.compressed, e.size
-            )));
-        }
+    Ok(())
+}
+
+/// No absurd deflate bloat in an untrusted entry, now that what it inflates to is known
+/// (megabytes of empty deflate blocks inflating to a few bytes are no real file). Raw
+/// DEFLATE's worst-case expansion is ~0.03% (5 bytes per 64 KiB block) plus header
+/// overhead, so size + size/1000 + 64 KiB passes every real stream.
+fn check_bloat(e: &Entry, inflated: usize, name: &str) -> io::Result<()> {
+    let inflated = inflated as u64;
+    let most = inflated
+        .saturating_add(inflated / 1000)
+        .saturating_add(64 * 1024);
+    if e.method == 8 && e.compressed > most {
+        return Err(bad(format!(
+            "{name}: {} compressed bytes is bloated for a {inflated}-byte entry",
+            e.compressed
+        )));
     }
     Ok(())
 }
 
-/// An entry's contents: borrowed if stored, inflated otherwise.
-fn contents<'a>(b: &'a [u8], e: &Entry, name: &str) -> io::Result<Cow<'a, [u8]>> {
+/// An entry's contents, no more than `max` bytes: borrowed if stored, inflated otherwise.
+///
+/// As Java's `ZipFile` (vanilla's reader) does, the size the directory gives is never
+/// believed: a stored entry is its compressed bytes and a deflated one is inflated until
+/// its stream ends. Packs "protected" by item plugins give every entry a made-up size
+/// (ItemsAdder's say 1337 bytes), and a local header with another name and no checksum,
+/// which Java does not look at either. The size only says where the buffer starts.
+fn contents<'a>(b: &'a [u8], e: &Entry, name: &str, max: u64) -> io::Result<Cow<'a, [u8]>> {
     let data = match e.data {
         Some((from, to)) => b.get(from as usize..to as usize),
         None => {
@@ -432,13 +455,24 @@ fn contents<'a>(b: &'a [u8], e: &Entry, name: &str) -> io::Result<Cow<'a, [u8]>>
         }
     }
     .ok_or_else(|| bad(format!("{name}: data out of range")))?;
-    let size = usize::try_from(e.size).map_err(|_| bad("entry too large"))?;
+    let max = usize::try_from(max).unwrap_or(usize::MAX);
+    let too_large = || bad(format!("{name}: larger than a file may be ({max} bytes)"));
     match e.method {
-        0 if data.len() == size => Ok(Cow::Borrowed(data)),
-        0 => Err(bad(format!("{name}: stored size mismatch"))),
-        8 => inflate(data, size)
-            .map(Cow::Owned)
-            .ok_or_else(|| bad(format!("{name}: corrupt deflate data"))),
+        0 if data.len() <= max => Ok(Cow::Borrowed(data)),
+        0 => Err(too_large()),
+        8 => {
+            let most = usize::try_from(most_inflated(e)).unwrap_or(usize::MAX);
+            let guess = usize::try_from(e.size)
+                .unwrap_or(usize::MAX)
+                .min(most)
+                .min(max)
+                .min(16 << 20);
+            match inflate(data, guess, max.min(most)) {
+                Ok(out) => Ok(Cow::Owned(out)),
+                Err(Inflate::TooLarge) => Err(too_large()),
+                Err(Inflate::Corrupt) => Err(bad(format!("{name}: corrupt deflate data"))),
+            }
+        }
         m => Err(bad(format!("{name}: unsupported compression method {m}"))),
     }
 }
@@ -569,13 +603,38 @@ fn plain_name(name: &str) -> bool {
             .all(|s| !s.is_empty() && s != "." && s != "..")
 }
 
-/// Inflates raw deflate `data` that must produce exactly `size` bytes.
-fn inflate(data: &[u8], size: usize) -> Option<Vec<u8>> {
-    let mut out = vec![0u8; size];
+enum Inflate {
+    Corrupt,
+    TooLarge,
+}
+
+/// Raw DEFLATE `data` inflated to its end, in a buffer that starts at `guess` bytes (one
+/// pass when the size given was true) and grows to at most `max`.
+fn inflate(data: &[u8], guess: usize, max: usize) -> Result<Vec<u8>, Inflate> {
+    let mut out = vec![0u8; guess];
     let mut state = Box::<DecompressorOxide>::default();
     let flags = inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-    let (status, read, written) = decompress(&mut state, data, &mut out, 0, flags);
-    (status == TINFLStatus::Done && written == size && read <= data.len()).then_some(out)
+    let (mut read, mut written) = (0, 0);
+    loop {
+        let (status, r, w) = decompress(&mut state, &data[read..], &mut out, written, flags);
+        read += r;
+        written += w;
+        match status {
+            TINFLStatus::Done => {
+                out.truncate(written);
+                if out.capacity() > written.saturating_mul(2) {
+                    out.shrink_to_fit();
+                }
+                return Ok(out);
+            }
+            TINFLStatus::HasMoreOutput if out.len() < max => {
+                let grown = out.len().saturating_mul(2).max(4096).min(max);
+                out.resize(grown, 0);
+            }
+            TINFLStatus::HasMoreOutput => return Err(Inflate::TooLarge),
+            _ => return Err(Inflate::Corrupt),
+        }
+    }
 }
 
 #[cfg(test)]

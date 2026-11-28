@@ -193,7 +193,7 @@ fn quick(started: Instant) {
 // The zip file.
 
 #[test]
-fn a_header_that_claims_4_gib_allocates_nothing() {
+fn a_header_that_claims_4_gib_allocates_nothing_and_is_not_believed() {
     let started = Instant::now();
     let mut e = entry("assets/minecraft/a.txt", b"small");
     e.size = Some(0xFFFF_FFF0);
@@ -204,8 +204,9 @@ fn a_header_that_claims_4_gib_allocates_nothing() {
     .unwrap();
     let res = Resources::new(vec![p]);
     let r = res.get(&id("a.txt")).unwrap();
-    let e = r.read().unwrap_err().to_string();
-    assert!(e.contains("larger than a file may be"), "{e}");
+    assert_eq!(&*r.read().unwrap(), b"small");
+    // What it might have been is given back.
+    assert!(res.packs()[0].budget().used().0 < 4096);
     quick(started);
 }
 
@@ -257,7 +258,7 @@ fn a_load_inflates_no_more_than_its_budget_until_reset() {
 }
 
 #[test]
-fn an_impossible_ratio_is_a_lie() {
+fn an_impossible_ratio_is_not_believed() {
     let mut e = entry("assets/minecraft/a.txt", &[0; 100]);
     e.size = Some(50 << 20);
     let (p, _t) = open(
@@ -266,32 +267,38 @@ fn an_impossible_ratio_is_a_lie() {
     )
     .unwrap();
     let res = Resources::new(vec![p]);
-    let err = res
-        .get(&id("a.txt"))
-        .unwrap()
-        .read()
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("cannot inflate"), "{err}");
+    assert_eq!(
+        &*res.get(&id("a.txt")).unwrap().read().unwrap(),
+        &[0u8; 100]
+    );
 }
 
+/// Java's `ZipFile` reads a stored entry by its compressed size and inflates a deflated one
+/// to the end of its stream, whatever size the directory gives: packs "protected" by item
+/// plugins (ItemsAdder's give every entry 1337 bytes) load in vanilla.
 #[test]
-fn declared_and_actual_sizes_must_agree() {
-    // Deflated to more than it says: the exact buffer is full before the stream ends.
+fn declared_sizes_are_not_believed_as_in_javas_zip_file() {
     let mut more = entry("assets/minecraft/more.txt", &[1; 5000]);
-    more.size = Some(10);
-    // Stored with another size than its data.
+    more.size = Some(1337);
+    let mut less = entry("assets/minecraft/less.txt", &[2; 500]);
+    less.size = Some(1337);
     let mut stored = entry("assets/minecraft/stored.txt", b"0123456789");
     stored.deflate = false;
     stored.size = Some(5);
-    let (p, _t) = open(
-        &zip_with(&[entry("pack.mcmeta", META), more, stored], None),
-        &Limits::untrusted(),
-    )
-    .unwrap();
+    let mut meta = entry("pack.mcmeta", META);
+    meta.size = Some(1337);
+    let bytes = zip_with(&[meta, more, less, stored], None);
+    let (p, _t) = open(&bytes, &Limits::untrusted()).unwrap();
     let res = Resources::new(vec![p]);
-    assert!(res.get(&id("more.txt")).unwrap().read().is_err());
-    assert!(res.get(&id("stored.txt")).unwrap().read().is_err());
+    let read = |n: &str| res.get(&id(n)).unwrap().read().unwrap().into_owned();
+    assert_eq!(read("more.txt"), [1; 5000]);
+    assert_eq!(read("less.txt"), [2; 500]);
+    assert_eq!(read("stored.txt"), b"0123456789");
+    // The load costs what was inflated, not what was said.
+    let inflated = (META.len() + 5000 + 500 + 10) as u64;
+    assert_eq!(res.packs()[0].budget().used().0, inflated);
+    let t = Temp::new("check.zip", &bytes);
+    assert!(Pack::check_untrusted(&t.0, &Limits::untrusted()).is_ok());
 }
 
 #[test]
@@ -1551,9 +1558,9 @@ fn unihex_size_overrides_are_bounded() {
 #[test]
 fn a_unihex_zip_inside_the_zip_is_read_under_the_same_limits() {
     let started = Instant::now();
-    // The inner zip says its .hex file inflates to 3 GiB.
-    let mut bomb = entry("u.hex", b"0041:00000000000000000000000000000000\n");
-    bomb.size = Some(3 << 30);
+    // The inner zip's .hex file inflates to more than a file may be (and says it is small).
+    let mut bomb = entry("u.hex", &vec![b'0'; (64 << 20) + 1]);
+    bomb.size = Some(38);
     let bomb = zip_with(&[bomb], None);
     let lines: String = (0..2000)
         .map(|c| format!("{:04X}:{}\n", 0x4E00 + c, "18".repeat(16)))
@@ -1876,11 +1883,15 @@ fn the_metadata_check_reads_pack_mcmeta_alone() {
     // The last of two copies, as the archive's lookup gives.
     let two = zip(&[("pack.mcmeta", b"{"), ("pack.mcmeta", META)]);
     assert!(check(&two).is_ok());
-    // A pack.mcmeta that claims to inflate to more than a JSON file may be.
-    let mut big = entry("pack.mcmeta", META);
-    big.size = Some(5 << 20);
+    // A pack.mcmeta that inflates to more than a JSON file may be, whatever it says; one
+    // that only claims to is read.
+    let mut big = entry("pack.mcmeta", &[META, &vec![b' '; 5 << 20]].concat());
+    big.size = Some(100);
     let e = check(&zip_with(&[big], None)).unwrap_err().to_string();
     assert!(e.contains("larger than a file may be"), "{e}");
+    let mut claims = entry("pack.mcmeta", META);
+    claims.size = Some(5 << 20);
+    assert!(check(&zip_with(&[claims], None)).is_ok());
     // Entries that overlap, or a broken filter, are not looked at: the full opening
     // refuses the first (the reload then fails) and ignores the second.
     let mut entries = vec![
@@ -2148,7 +2159,7 @@ fn namespaces_and_dot_overlays_and_hidden_dot_paths_are_rejected() {
 }
 
 /// A bitmap font of height 0 loads as vanilla's (advance 1, nothing drawn) and its
-/// picture counts like any other; a negative height is rejected; total bitmap texels
+/// picture counts like any other; so does a negative height's; total bitmap texels
 /// across providers are capped.
 #[test]
 fn font_bitmap_height_and_texel_budget_are_bounded() {
@@ -2157,11 +2168,12 @@ fn font_bitmap_height_and_texel_budget_are_bounded() {
         &[
             ("assets/minecraft/textures/font/a.png", &big),
             ("assets/minecraft/textures/font/b.png", &big),
+            ("assets/minecraft/textures/font/c.png", &png(8, 8, 0xFFFF_FFFF)),
             (
                 "assets/minecraft/font/default.json",
                 br#"{"providers": [
                     {"type": "bitmap", "file": "minecraft:font/a.png", "height": 0, "ascent": 0, "chars": ["X"]},
-                    {"type": "bitmap", "file": "minecraft:font/a.png", "height": -1, "ascent": -1, "chars": ["N"]},
+                    {"type": "bitmap", "file": "minecraft:font/c.png", "height": -1, "ascent": -1, "chars": ["N"]},
                     {"type": "bitmap", "file": "minecraft:font/a.png", "ascent": 7, "chars": ["A"]},
                     {"type": "bitmap", "file": "minecraft:font/b.png", "ascent": 7, "chars": ["B"]}
                 ]}"#,
@@ -2175,7 +2187,8 @@ fn font_bitmap_height_and_texel_budget_are_bounded() {
     let f = font(&res);
     assert!(f.has('X'), "a height of 0 is vanilla's");
     assert_eq!((f.glyph('X').advance, f.glyph('X').picture), (1.0, None));
-    assert!(!f.has('N'), "a negative height is rejected");
+    // Vanilla's scale of -1/8: (int)(0.5 - 1) + 1.
+    assert_eq!(f.glyph('N').advance, 1.0, "a negative height is vanilla's");
     assert!(f.has('A'));
     assert!(!f.has('B'), "the third picture exceeds font_bitmap_texels");
 }

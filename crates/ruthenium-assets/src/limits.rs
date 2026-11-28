@@ -363,6 +363,15 @@ impl Budget {
         Budget::take(&self.bytes, n, limits.load_bytes)
     }
 
+    /// Gives back `n` inflated bytes taken for a read that turned out to need fewer.
+    pub fn give_bytes(&self, n: u64) {
+        let _ = self
+            .bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(n))
+            });
+    }
+
     /// Takes `n` decoded texels, or fails.
     pub fn take_texels(&self, n: u64, limits: &Limits) -> bool {
         Budget::take(&self.texels, n, limits.load_texels)
