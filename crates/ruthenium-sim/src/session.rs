@@ -516,12 +516,14 @@ impl Session {
             input.screen_open,
             input.player_list,
         );
+        let held = (input.creative.save_down, input.creative.load_down);
         let frame = std::mem::take(&mut *input);
         input.keys = keys;
         input.use_down = use_down;
         input.attack_down = attack_down;
         input.screen_open = screen_open;
         input.player_list = player_list;
+        (input.creative.save_down, input.creative.load_down) = held;
         drop(input);
         let events = frame.scrolls.len() + frame.turns.len();
         let turns = frame.turns.clone();
