@@ -427,6 +427,8 @@ pub struct Menu {
     /// The server the session is with, as the list names it, and its address.
     server_name: String,
     server_address: String,
+    /// The address the session is with: the entry's, or where the last transfer went.
+    connected_to: String,
     /// The code of conduct showing: its hash, and whether to stop asking about it.
     conduct: Option<(i32, bool)>,
     /// The player left the session (Cancel, Disconnect): its end needs no screen.
@@ -641,6 +643,7 @@ impl Menu {
             joiner: None,
             session: None,
             server_name: String::new(),
+            connected_to: String::new(),
             server_address: String::new(),
             conduct: None,
             leaving: false,
@@ -1008,7 +1011,7 @@ impl Menu {
     /// `ServerData` goes on, so its name, Server Resource Packs setting and accepted code
     /// of conduct stay the entry's), under "Transferring to new server...".
     fn start_transfer(&mut self, t: Transfer) {
-        eprintln!("[ruthenium] {} transfers to {}", self.server_name, t.to);
+        eprintln!("[ruthenium] {}", self.transfer_line(&t));
         // As the end of a session (`Minecraft.disconnect`).
         self.bed = false;
         self.death = None;
@@ -1017,11 +1020,21 @@ impl Menu {
         self.begin_session(&name, &address, Some(t));
     }
 
+    /// The log's line for a transfer: the server left (the address the session was
+    /// with, not the entry's once a transfer has been followed) and where to.
+    fn transfer_line(&self, t: &Transfer) -> String {
+        format!("{} transfers to {}", self.connected_to, t.to)
+    }
+
     /// Starts a session for the server list entry `name` at `address`: a join, or a
     /// transfer's.
     fn begin_session(&mut self, name: &str, address: &str, transfer: Option<Transfer>) {
         self.server_name = name.to_owned();
         self.server_address = address.to_owned();
+        self.connected_to = match &transfer {
+            Some(t) => t.to.to_string(),
+            None => ruthenium_net::ServerAddress::parse(address).to_string(),
+        };
         self.leaving = false;
         self.transferred = transfer.is_some();
         // A transfer in play keeps the server's packs (`Minecraft.disconnect(screen,
@@ -3652,6 +3665,37 @@ mod tests {
         m.start_join("Nowhere", "127.0.0.1:1");
         assert!(!m.transferred);
         assert_eq!(form_kind(&m).unwrap().1, ["Connecting to the server..."]);
+    }
+
+    /// The log names the server actually left: after A, B and C, the second transfer is
+    /// B's, while the entry joined stays A's.
+    #[test]
+    fn a_transfer_is_logged_from_the_server_left() {
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        let to = |port| Transfer {
+            to: ruthenium_net::ServerAddress::new("127.0.0.1", port),
+            state: Default::default(),
+            packs: Default::default(),
+        };
+        m.start_join("Lobby", "a.example:25600");
+        assert_eq!(
+            m.transfer_line(&to(2)),
+            "a.example:25600 transfers to 127.0.0.1:2"
+        );
+        m.start_transfer(to(2));
+        assert_eq!(
+            m.transfer_line(&to(3)),
+            "127.0.0.1:2 transfers to 127.0.0.1:3"
+        );
+        m.start_transfer(to(3));
+        assert_eq!(
+            m.transfer_line(&to(4)),
+            "127.0.0.1:3 transfers to 127.0.0.1:4"
+        );
+        assert_eq!(
+            (m.server_name.as_str(), m.server_address.as_str()),
+            ("Lobby", "a.example:25600")
+        );
     }
 
     #[test]
