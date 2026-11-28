@@ -2722,6 +2722,14 @@ pub mod play {
         })
     }
 
+    /// `ServerboundSelectTradePacket`: the merchant's offer chosen, by its place in the
+    /// list.
+    pub fn select_trade(offer: i32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::SelectTrade.id(), |o| {
+            wire::write_varint(o, offer)
+        })
+    }
+
     /// `ServerboundRenameItemPacket`: the name typed into an anvil's box.
     pub fn rename_item(name: &str) -> Vec<u8> {
         wire::packet(pl::Serverbound::RenameItem.id(), |o| {
@@ -4383,6 +4391,10 @@ mod tests {
         assert_eq!(
             play::container_close(5),
             [pl::Serverbound::ContainerClose.id() as u8, 5]
+        );
+        assert_eq!(
+            play::select_trade(300),
+            [pl::Serverbound::SelectTrade.id() as u8, 0xAC, 2]
         );
         assert_eq!(
             play::rename_item("Az"),
