@@ -2722,6 +2722,13 @@ pub mod play {
         })
     }
 
+    /// `ServerboundRenameItemPacket`: the name typed into an anvil's box.
+    pub fn rename_item(name: &str) -> Vec<u8> {
+        wire::packet(pl::Serverbound::RenameItem.id(), |o| {
+            wire::write_string(o, name)
+        })
+    }
+
     /// `ServerboundContainerButtonClickPacket`: a menu's button (a stonecutter's recipe,
     /// a loom's pattern, an enchanting table's offer...), by the menu's own numbering.
     pub fn container_button_click(container_id: i32, button_id: i32) -> Vec<u8> {
@@ -4376,6 +4383,10 @@ mod tests {
         assert_eq!(
             play::container_close(5),
             [pl::Serverbound::ContainerClose.id() as u8, 5]
+        );
+        assert_eq!(
+            play::rename_item("Az"),
+            [pl::Serverbound::RenameItem.id() as u8, 2, b'A', b'z']
         );
         assert_eq!(
             play::container_button_click(3, 17),
