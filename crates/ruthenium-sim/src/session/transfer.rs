@@ -334,6 +334,27 @@ mod tests {
         assert_eq!(remote.sent(), vec![Sent::Close]);
     }
 
+    /// The log says why a session ended in words, not as the compound it came as.
+    #[test]
+    fn the_log_gives_reasons_as_text() {
+        use super::super::reason_text;
+        assert_eq!(reason_text(&transferred()), "disconnect.transfer");
+        let mut kick = Compound::new();
+        kick.put("text", Tag::String("Kicked by ".into()));
+        let mut who = Compound::new();
+        who.put("text", Tag::String("an operator".into()));
+        kick.put("extra", Tag::List(vec![Tag::Compound(who)]));
+        assert_eq!(
+            reason_text(&Reason::Text(Tag::Compound(kick))),
+            "Kicked by an operator"
+        );
+        assert_eq!(
+            reason_text(&Reason::Json(r#"{"text":"Server closed"}"#.into())),
+            "Server closed"
+        );
+        assert_eq!(reason_text(&Reason::Json("not json".into())), "not json");
+    }
+
     #[test]
     fn a_transfer_vanilla_cant_address_only_ends_the_session() {
         for (host, port) in [("example.com:25", 25565), ("example.com", 65536), ("a", -1)] {

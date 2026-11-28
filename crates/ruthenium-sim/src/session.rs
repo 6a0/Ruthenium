@@ -3485,12 +3485,22 @@ fn log_configured(c: &Configured, brand: Option<&str>) {
 }
 
 fn log_closed(c: &Closed) {
-    let why = match &c.reason {
-        Reason::Json(j) => j.clone(),
-        Reason::Text(t) => format!("{t:?}"),
+    eprintln!("[session] closed: {}", reason_text(&c.reason));
+}
+
+/// A reason as plain text for the log. Without a language here, a translated reason
+/// shows its fallback or key (`disconnect.transfer`); JSON that doesn't parse shows as
+/// it is, as the disconnected screen shows it.
+fn reason_text(r: &Reason) -> String {
+    use ruthenium_protocol::text::StyledText;
+    match r {
+        Reason::Json(j) => match serde_json::from_str::<serde_json::Value>(j) {
+            Ok(v) => StyledText::from_json_in(&v, &()).plain(),
+            Err(_) => j.clone(),
+        },
+        Reason::Text(t) => StyledText::from_nbt_in(t, &()).plain(),
         Reason::Local(l) => l.to_string(),
-    };
-    eprintln!("[session] closed: {why}");
+    }
 }
 
 #[cfg(test)]
