@@ -254,6 +254,31 @@ impl Menu {
     }
 }
 
+/// For the live checks (`RUTHENIUM_MENU_LOG`): the slots a server's `set_content` or
+/// `set_slot` would change, by the stacks' hashes as the server compares them
+/// (`HashedStack.matches`), so a resend of what the client predicted reads as none.
+pub fn log_resent(
+    menu: &Menu,
+    inv: &Inventory,
+    from: usize,
+    stacks: &[Stack],
+    registries: &dyn ruthenium_protocol::hashed::SyncedRegistries,
+) {
+    let changed: Vec<String> = (stacks.iter().enumerate())
+        .filter(|(k, s)| {
+            let i = from + k;
+            i < menu.slots.len()
+                && super::hash(menu.item(inv, i), registries) != super::hash(s, registries)
+        })
+        .map(|(k, s)| format!("{}={}", from + k, super::describe(s)))
+        .collect();
+    if changed.is_empty() {
+        eprintln!("[menu]   (no slot changes)");
+    } else {
+        eprintln!("[menu]   CHANGES slots [{}]", changed.join(" "));
+    }
+}
+
 /// `EnchantmentHelper.getComponentType`: an enchanted book's are stored.
 fn enchantment_kind(stack: &Stack) -> K {
     if stack.item() == Item::EnchantedBook.id() as i32 {

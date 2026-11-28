@@ -2997,7 +2997,8 @@ impl Game {
                     && let Some(physics) = &self.physics
                 {
                     let it = &physics.items;
-                    let stacks = items.iter().map(|s| it.stack(s)).collect();
+                    let stacks: Vec<crate::item::Stack> =
+                        items.iter().map(|s| it.stack(s)).collect();
                     let p = &mut w.player;
                     let menu = if container_id == 0 {
                         Some(&mut p.menus.inventory)
@@ -3005,6 +3006,10 @@ impl Game {
                         p.menus.open.as_mut().filter(|m| m.id == container_id)
                     };
                     if let Some(menu) = menu {
+                        if crate::menu::log_enabled() {
+                            let r = &self.containers.registries;
+                            crate::menu::stations::log_resent(menu, &p.inventory, 0, &stacks, r);
+                        }
                         menu.initialize(&mut p.inventory, state_id, stacks, it.stack(&carried));
                         self.hud.slots_replaced();
                     }
@@ -3049,6 +3054,13 @@ impl Game {
                     } else if let Some(menu) =
                         p.menus.open.as_mut().filter(|m| m.id == container_id)
                     {
+                        if crate::menu::log_enabled()
+                            && let Ok(at) = usize::try_from(slot)
+                        {
+                            let r = &self.containers.registries;
+                            let one = std::slice::from_ref(&s);
+                            crate::menu::stations::log_resent(menu, &p.inventory, at, one, r);
+                        }
                         menu.set_item(&mut p.inventory, i32::from(slot), state_id, s);
                         self.hud.slots_replaced();
                     }
