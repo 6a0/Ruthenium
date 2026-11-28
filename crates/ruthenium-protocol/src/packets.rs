@@ -2722,6 +2722,15 @@ pub mod play {
         })
     }
 
+    /// `ServerboundContainerButtonClickPacket`: a menu's button (a stonecutter's recipe,
+    /// a loom's pattern, an enchanting table's offer...), by the menu's own numbering.
+    pub fn container_button_click(container_id: i32, button_id: i32) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ContainerButtonClick.id(), |o| {
+            wire::write_varint(o, container_id);
+            wire::write_varint(o, button_id);
+        })
+    }
+
     /// `ServerboundContainerClickPacket`: the menu, its state id, the slot (a short),
     /// the button (a byte), the `ContainerInput` id, the slots the click changed with
     /// their new stacks hashed, and the stack on the cursor hashed. `changed` is in slot
@@ -4367,6 +4376,10 @@ mod tests {
         assert_eq!(
             play::container_close(5),
             [pl::Serverbound::ContainerClose.id() as u8, 5]
+        );
+        assert_eq!(
+            play::container_button_click(3, 17),
+            [pl::Serverbound::ContainerButtonClick.id() as u8, 3, 17]
         );
         let stone = crate::hashed::HashedStack {
             item: 1,
