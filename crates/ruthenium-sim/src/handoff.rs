@@ -205,6 +205,16 @@ impl<F, C> Handoff<F, C> {
         self.push(s, 0, Item::Control(control))
     }
 
+    /// As [`Handoff::push_control`], but gives the control back once the game thread
+    /// takes no more ([`Handoff::end`]), for whoever else can take it.
+    pub fn try_push_control(&self, control: C) -> Result<u64, C> {
+        let s = self.lock();
+        if s.ended {
+            return Err(control);
+        }
+        Ok(self.push(s, 0, Item::Control(control)))
+    }
+
     /// Asks the game thread to close, whatever is queued.
     pub fn close(&self) {
         let mut s = self.lock();
@@ -219,14 +229,22 @@ impl<F, C> Handoff<F, C> {
         self.wake.notify_one();
     }
 
-    /// The game thread takes no more: a main thread waiting for room goes on.
-    pub fn end(&self) {
+    /// The game thread takes no more: a main thread waiting for room goes on. Returns
+    /// the controls that were still queued, oldest first (the frames are dropped).
+    pub fn end(&self) -> Vec<C> {
         let mut s = self.lock();
         s.ended = true;
-        s.queue.clear();
+        let controls = std::mem::take(&mut s.queue)
+            .into_iter()
+            .filter_map(|q| match q.item {
+                Item::Control(c) => Some(c),
+                Item::Frame(_) => None,
+            })
+            .collect();
         s.frames = 0;
         s.events = 0;
         self.room.notify_all();
+        controls
     }
 
     /// The next item in order, waiting for one. Closing and dropping come first.
@@ -394,5 +412,19 @@ mod tests {
         assert_eq!(blocked.join().unwrap(), 2);
         assert_eq!(h.push_frame((2, vec![]), 0), 3);
         assert_eq!(h.waiting(), 0);
+    }
+
+    /// The controls the game thread never took come back from its end, and later ones
+    /// are given back to the caller: none is lost without anybody knowing.
+    #[test]
+    fn controls_left_at_the_end_are_handed_back() {
+        let h = H::new(Limits::default());
+        h.push_frame((0, vec![]), 0);
+        assert_eq!(h.try_push_control("reloaded"), Ok(2));
+        h.push_frame((1, vec![]), 0);
+        h.push_control("chat");
+        assert_eq!(h.end(), ["reloaded", "chat"]);
+        assert_eq!(h.try_push_control("late"), Err("late"));
+        assert!(h.end().is_empty());
     }
 }

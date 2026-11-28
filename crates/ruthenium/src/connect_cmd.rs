@@ -746,6 +746,11 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
         if closed.is_some()
             && let Some(to) = transfer.take()
         {
+            // A transfer in play keeps the server's packs: the reloads they asked for
+            // answer the next session.
+            if to.packs.kept() {
+                reloader.move_session(session_number, session_number + 1);
+            }
             session = match joiner.join_transfer(to, &accounts, server_packs) {
                 Ok(s) => s,
                 Err(e) => {

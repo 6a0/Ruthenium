@@ -88,8 +88,8 @@ mod packs;
 mod transfer;
 pub use containers::{At, ContainerView, Pointer, ScreenInput};
 pub use packs::{
-    DownloadProgress, MAX_ACTIVE, MAX_PROMPTED, MAX_TRACKED, PackPrompt, PackToast, ResourceReload,
-    ServerPackSetup, download_headers,
+    DownloadProgress, KeptPacks, MAX_ACTIVE, MAX_PROMPTED, MAX_TRACKED, PackPrompt, PackToast,
+    ResourceReload, ServerPackSetup, download_headers,
 };
 use ruthenium_audio::SoundSource;
 use ruthenium_protocol::profile::ResolvableProfile;
@@ -332,6 +332,8 @@ pub struct Session {
     /// has them in its rotation.
     turns: Mutex<VecDeque<(u64, f64, f64)>>,
     thread: Option<JoinHandle<()>>,
+    /// The server packs the game thread hands on with a transfer in play.
+    kept: packs::KeptPacks,
 }
 
 /// Turns kept for [`Session::camera`] at most (the oldest go first).
@@ -399,6 +401,8 @@ impl Session {
         let container_view = Arc::new(Mutex::new(None));
         let game_container_view = container_view.clone();
         let game_handoff = handoff.clone();
+        let kept = packs::KeptPacks::default();
+        let handover = kept.clone();
         let thread = std::thread::Builder::new()
             .name("game".into())
             .spawn(move || {
@@ -410,7 +414,8 @@ impl Session {
                 game.container_view = game_container_view;
                 game.sounds = sound;
                 game.profile_keys = profile_keys;
-                game.packs = packs::Packs::new(server_packs);
+                game.packs = packs::Packs::for_session(server_packs);
+                game.handover = handover;
                 game.cookies = cookies;
                 game.run(&game_handoff);
             })?;
@@ -423,6 +428,7 @@ impl Session {
             scene,
             turns: Mutex::default(),
             thread: Some(thread),
+            kept,
         })
     }
 
@@ -446,9 +452,17 @@ impl Session {
         self.handoff.push_control(Command::PackPrompt(None));
     }
 
-    /// The reload [`SessionEvent::ReloadResources`] asked for ended.
+    /// The reload [`SessionEvent::ReloadResources`] asked for ended. Once the game thread
+    /// takes no more, the answer goes to the packs it handed on, if it did (a transfer in
+    /// play): they wait for it in the next session.
     pub fn resources_reloaded(&self, ok: bool) {
-        self.handoff.push_control(Command::ResourcesReloaded(ok));
+        if self
+            .handoff
+            .try_push_control(Command::ResourcesReloaded(ok))
+            .is_err()
+        {
+            self.kept.late_answer(ok);
+        }
     }
 
     /// Disconnects; a [`SessionEvent::Closed`] follows. It doesn't wait its turn behind
@@ -832,6 +846,9 @@ struct Game {
     close_reason: Option<Reason>,
     /// The session is leaving for a transfer.
     transfer: Option<transfer::Leaving>,
+    /// Where the server packs go if a transfer in play hands them on (shared with the
+    /// [`Session`]).
+    handover: packs::KeptPacks,
 }
 
 /// The feature flag that switches minecarts to their new movement, which doesn't
@@ -1037,6 +1054,7 @@ impl Game {
             packs: packs::Packs::default(),
             close_reason: None,
             transfer: None,
+            handover: packs::KeptPacks::default(),
         }
     }
 
@@ -1051,8 +1069,13 @@ impl Game {
         self.pack_cleanup();
         // Leaving stops every sound (`Minecraft.disconnect`).
         self.sounds.stop_all();
-        // A main thread waiting for room in the queue goes on.
-        handoff.end();
+        // A main thread waiting for room in the queue goes on. A reload's answer it
+        // handed over that wasn't taken goes to the packs handed on, if they were.
+        for c in handoff.end() {
+            if let Command::ResourcesReloaded(ok) = c {
+                self.handover.late_answer(ok);
+            }
+        }
         self.publisher.end_level();
     }
 

@@ -447,6 +447,26 @@ impl Reloader {
         self.pump(max_texture);
     }
 
+    /// The packs of session `from` went on into session `to` (a transfer in play keeps
+    /// them): its reloads, under way, waiting or ended and not yet taken, are `to`'s now,
+    /// for `to` to hear how they went.
+    pub fn move_session(&mut self, from: u64, to: u64) {
+        let moved = |r: &mut Request| {
+            if r.session == from {
+                r.session = to;
+            }
+        };
+        if let Some(r) = &mut self.running {
+            moved(&mut r.request);
+        }
+        if let Some(r) = &mut self.next {
+            moved(r);
+        }
+        for (r, _) in &mut self.answers {
+            moved(r);
+        }
+    }
+
     /// A reload that has ended: its request and what it built (`Err`: it failed, and
     /// nothing changes).
     pub fn poll(&mut self, max_texture: u32) -> Option<(Request, Result<Reloaded, String>)> {
@@ -540,6 +560,23 @@ mod tests {
                 Err("cancelled".into())
             },
         )
+    }
+
+    /// A transfer in play keeps the packs: the reloads of the session left, under way and
+    /// waiting, are the next session's (the end of the one left gives up none of them),
+    /// and come back to it.
+    #[test]
+    fn reloads_go_on_with_the_packs_a_transfer_keeps() {
+        let mut r = Reloader::with_build(endless(), Duration::ZERO, Duration::from_secs(60));
+        r.request(request(4), 1024);
+        r.request(request(4), 1024);
+        assert!(r.running.is_some() && r.next.is_some());
+        r.move_session(4, 5);
+        r.cancel_session(4, 1024);
+        assert!(r.running.is_some() && r.next.is_some());
+        r.cancel_session(5, 1024);
+        assert_eq!(err(answer(&mut r)), (5, SESSION_OVER.into()));
+        assert_eq!(err(answer(&mut r)), (5, SESSION_OVER.into()));
     }
 
     /// A session's reload under way is given up when the session is over: it comes back

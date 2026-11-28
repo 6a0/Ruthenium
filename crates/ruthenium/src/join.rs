@@ -24,7 +24,7 @@ use ruthenium_sim::enchantment::Enchantments;
 use ruthenium_sim::entity::EntityTypes;
 use ruthenium_sim::item::Items;
 use ruthenium_sim::session::{
-    DimensionType, Physics, ServerPackSetup, Session, SessionOptions, Transfer,
+    DimensionType, KeptPacks, Physics, ServerPackSetup, Session, SessionOptions, Transfer,
 };
 use ruthenium_sim::use_on::Transformers;
 
@@ -786,20 +786,27 @@ impl Joiner {
         packs: ruthenium_net::server_list::PackStatus,
     ) -> Result<Session, String> {
         let address = ruthenium_net::ServerAddress::parse(address);
-        self.start(address, None, accounts, packs)
+        self.start(address, None, accounts, packs, KeptPacks::default())
     }
 
     /// Follows a transfer: a session with the server it names, carrying its state, as
     /// the same player; `packs` is still the setting of the server list entry joined
     /// first (vanilla hands the same `ServerData` on,
-    /// `ClientCommonPacketListenerImpl.java:326`).
+    /// `ClientCommonPacketListenerImpl.java:326`). The server packs a transfer in play
+    /// kept go on into the new session.
     pub fn join_transfer(
         &mut self,
         transfer: Transfer,
         accounts: &Accounts,
         packs: ruthenium_net::server_list::PackStatus,
     ) -> Result<Session, String> {
-        self.start(transfer.to, Some(transfer.state), accounts, packs)
+        self.start(
+            transfer.to,
+            Some(transfer.state),
+            accounts,
+            packs,
+            transfer.packs,
+        )
     }
 
     fn start(
@@ -808,6 +815,7 @@ impl Joiner {
         transfer: Option<ruthenium_net::connection::TransferState>,
         accounts: &Accounts,
         packs: ruthenium_net::server_list::PackStatus,
+        kept: KeptPacks,
     ) -> Result<Session, String> {
         let (identity, auth, local_only) = self.who(accounts)?;
         let profile_keys = self.profile_keys(accounts);
@@ -833,6 +841,7 @@ impl Joiner {
                 status: packs,
                 cache_dir: self.cache_dir.as_deref().map(|d| d.join(SERVER_PACKS_DIR)),
                 check: Arc::new(crate::resource_reload::is_loadable),
+                kept,
             },
         })
         .map_err(|e| format!("couldn't start the connection: {e}"))

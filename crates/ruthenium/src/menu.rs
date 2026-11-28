@@ -1024,13 +1024,20 @@ impl Menu {
         self.server_address = address.to_owned();
         self.leaving = false;
         self.transferred = transfer.is_some();
+        // A transfer in play keeps the server's packs (`Minecraft.disconnect(screen,
+        // true)`, Minecraft.java:2116), and they go on into the next session.
+        let keep_packs = transfer.as_ref().is_some_and(|t| t.packs.kept());
         // A session still closing is dropped (and so disconnected) here; the resources
-        // go back to vanilla's (its own request for that goes with it).
-        if self.session.take().is_some() {
+        // go back to vanilla's (its own request for that goes with it), unless they are
+        // kept.
+        if self.session.take().is_some() && !keep_packs {
             self.packs_session_over();
         }
         self.forget_world = true;
         self.packs.session_number += 1;
+        if keep_packs {
+            self.packs_carried_over(self.packs.session_number - 1);
+        }
         self.packs.prompt = None;
         let pack_status = self.entry_pack_status(name, address);
         let transferred = self.transferred;
@@ -1053,6 +1060,10 @@ impl Menu {
             }
             Err(e) => {
                 eprintln!("[ruthenium] can't join {name}: {e}");
+                // (The packs kept went with the session that couldn't start.)
+                if keep_packs {
+                    self.packs_session_over();
+                }
                 self.session_form(
                     FormKind::Disconnected,
                     if transferred {
@@ -3632,6 +3643,7 @@ mod tests {
         m.start_transfer(Transfer {
             to: ruthenium_net::ServerAddress::new("127.0.0.1", 1),
             state: Default::default(),
+            packs: Default::default(),
         });
         let (kind, message) = form_kind(&m).unwrap();
         assert_eq!(kind, FormKind::Connecting);

@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ruthenium_data::v26_3::packets::{
@@ -154,6 +156,29 @@ impl Peer {
         });
     }
 
+    /// Offers a resource pack (no prompt text, not required).
+    fn push_pack(&mut self, id: u128, url: &str, hash: &str) {
+        self.send(cfg_ids::Clientbound::ResourcePackPush.id(), |o| {
+            wire::write_uuid(o, id);
+            wire::write_string(o, url);
+            wire::write_string(o, hash);
+            wire::write_bool(o, false);
+            wire::write_bool(o, false);
+        });
+    }
+
+    /// The pack statuses the client sends next, `n` of them, as (pack, action).
+    fn pack_statuses(&mut self, n: usize) -> Vec<(u128, i32)> {
+        (0..n)
+            .map(|_| {
+                let (id, body) = self.recv();
+                assert_eq!(id, cfg_ids::Serverbound::ResourcePack.id(), "resource_pack");
+                let mut r = Reader::new(&body);
+                (r.uuid().unwrap(), r.varint().unwrap())
+            })
+            .collect()
+    }
+
     /// What the client sends until it closes the connection.
     fn rest(&mut self) -> Vec<u32> {
         std::iter::from_fn(|| self.try_recv().map(|(id, _)| id)).collect()
@@ -186,6 +211,138 @@ fn cookies(list: &[(&str, &[u8])]) -> HashMap<String, Vec<u8>> {
     list.iter()
         .map(|(k, v)| ((*k).to_owned(), v.to_vec()))
         .collect()
+}
+
+/// A pack host on a local port: every request gets `body`; counts the requests.
+fn pack_host(body: &'static [u8]) -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let gets = Arc::new(AtomicUsize::new(0));
+    let counted = gets.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(body);
+        }
+    });
+    (port, gets)
+}
+
+/// A server pack goes on through a transfer in play (vanilla's `disconnect(screen,
+/// true)`): A pushes it, B pushes it again and gets it from the cache, not the host, as
+/// the same pack; it is dropped only when the chain ends.
+#[test]
+fn server_packs_go_on_through_a_transfer_in_play() {
+    const PACK: u128 = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef;
+    // sha1("a pack for the transfer test")
+    const HASH: &str = "72f14704cb2ab76aa8ff80fd4cfb9e7ac61d0d1f";
+    let (http, gets) = pack_host(b"a pack for the transfer test");
+    let url = format!("http://127.0.0.1:{http}/p.zip");
+    let a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let (port_a, port_b) = (
+        a.local_addr().unwrap().port(),
+        b.local_addr().unwrap().port(),
+    );
+    let served = url.clone();
+    let servers = std::thread::spawn(move || {
+        // (ACCEPTED, DOWNLOADED, SUCCESSFULLY_LOADED.)
+        let applied = vec![(PACK, 3), (PACK, 4), (PACK, 0)];
+        let mut s = Peer::accept(&a);
+        let (_, name) = s.opening(port_a);
+        s.finish_login(&name);
+        s.push_pack(PACK, &served, HASH);
+        assert_eq!(s.pack_statuses(3), applied, "A");
+        s.send(cfg_ids::Clientbound::FinishConfiguration.id(), |_| {});
+        assert_eq!(s.recv().0, cfg_ids::Serverbound::FinishConfiguration.id());
+        s.transfer(play_ids::Clientbound::Transfer.id(), port_b);
+        s.rest();
+
+        let mut s = Peer::accept(&b);
+        let (intent, name) = s.opening(port_b);
+        assert_eq!(intent, 3, "TRANSFER");
+        s.finish_login(&name);
+        s.push_pack(PACK, &served, HASH);
+        assert_eq!(s.pack_statuses(3), applied, "B");
+        s.send(cfg_ids::Clientbound::Disconnect.id(), |o| {
+            ruthenium_protocol::nbt::write_network(o, &Tag::String("Bye".into())).unwrap()
+        });
+        s.rest();
+    });
+
+    let cache = tempfile::tempdir().unwrap();
+    let packs = ServerPackSetup {
+        status: ruthenium_net::server_list::PackStatus::Enabled,
+        cache_dir: Some(cache.path().to_owned()),
+        check: Arc::new(|_| true),
+        ..ServerPackSetup::default()
+    };
+    let start = |to, transfer: Option<Transfer>| {
+        let mut o = options(to, transfer.as_ref().map(|t| t.state.clone()));
+        o.server_packs = ServerPackSetup {
+            kept: transfer.map(|t| t.packs).unwrap_or_default(),
+            ..packs.clone()
+        };
+        Session::start(o).unwrap()
+    };
+    let mut session = start(ServerAddress::new("127.0.0.1", port_a), None);
+    // The reloads asked for, by session.
+    let mut reloads: Vec<(usize, Vec<(u128, PathBuf)>)> = Vec::new();
+    let (mut sessions, mut next, mut kept) = (0, None, Vec::new());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    'run: loop {
+        assert!(Instant::now() < deadline, "the run didn't end: {reloads:?}");
+        session.frame();
+        let events: Vec<SessionEvent> = session.poll().collect();
+        for e in events {
+            match e {
+                SessionEvent::ReloadResources(r) => {
+                    reloads.push((sessions, r.packs));
+                    session.resources_reloaded(true);
+                }
+                SessionEvent::Transfer(t) => {
+                    kept.push(t.packs.kept());
+                    next = Some(t);
+                }
+                SessionEvent::Closed(_) => match next.take() {
+                    Some(t) => {
+                        sessions += 1;
+                        session = start(t.to.clone(), Some(t));
+                    }
+                    None => break 'run,
+                },
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(session);
+    servers.join().expect("the servers saw what they expected");
+    assert_eq!(kept, [true]);
+    assert_eq!(reloads.len(), 3, "{reloads:?}");
+    let pack = reloads[0].1.clone();
+    assert_eq!(pack.len(), 1);
+    assert!(pack[0].1.starts_with(cache.path()), "{pack:?}");
+    assert_eq!(
+        reloads,
+        [(0, pack.clone()), (1, pack), (1, Vec::new())],
+        "A's pack, the same again from B, and none once the chain ends"
+    );
+    assert_eq!(gets.load(Ordering::SeqCst), 1, "B's came from the cache");
 }
 
 #[test]
@@ -276,7 +433,9 @@ fn transfers_carry_the_cookies_from_server_to_server() {
                     ends.push(c);
                     match next.take() {
                         Some(t) => {
-                            session = Session::start(options(t.to, Some(t.state))).unwrap();
+                            let mut o = options(t.to, Some(t.state));
+                            o.server_packs.kept = t.packs;
+                            session = Session::start(o).unwrap();
                         }
                         None => break 'run,
                     }
@@ -290,22 +449,29 @@ fn transfers_carry_the_cookies_from_server_to_server() {
     servers.join().expect("the servers saw what they expected");
 
     assert_eq!(
-        transfers,
+        transfers
+            .iter()
+            .map(|t| (t.to.clone(), t.state.clone(), t.packs.kept()))
+            .collect::<Vec<_>>(),
         [
-            Transfer {
-                to: ServerAddress::new("127.0.0.1", port_b),
-                state: TransferState {
+            (
+                ServerAddress::new("127.0.0.1", port_b),
+                TransferState {
                     cookies: cookies(&[("test:a", &[1])]),
                     from: Some(Ipv4Addr::LOCALHOST.into()),
                 },
-            },
-            Transfer {
-                to: ServerAddress::new("127.0.0.1", port_a),
-                state: TransferState {
+                // In configuration: the server packs are dropped.
+                false,
+            ),
+            (
+                ServerAddress::new("127.0.0.1", port_a),
+                TransferState {
                     cookies: cookies(&[("test:a", &[1]), ("test:b", &[2, 2]), ("test:c", &[3])]),
                     from: Some(Ipv4Addr::LOCALHOST.into()),
                 },
-            },
+                // In play: kept.
+                true,
+            ),
         ]
     );
     let reasons: Vec<String> = ends

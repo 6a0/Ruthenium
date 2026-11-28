@@ -413,6 +413,23 @@ impl Menu {
         }
     }
 
+    /// A transfer in play kept the server's packs (`Minecraft.disconnect(screen, true)`):
+    /// they go on into the session that now has the number `session_number`, which was
+    /// `from`'s. Its reloads, asked for, under way or ended and not yet answered, are the
+    /// next session's to hear of; the resources, the language and the sounds in use
+    /// stay.
+    pub(super) fn packs_carried_over(&mut self, from: u64) {
+        let to = self.packs.session_number;
+        for r in &mut self.packs.wanted {
+            if r.session == from {
+                r.session = to;
+            }
+        }
+        if let Some(reloader) = &mut self.packs.reloader {
+            reloader.move_session(from, to);
+        }
+    }
+
     /// The session asks for its resources again.
     pub(super) fn reload_asked(&mut self, r: ResourceReload) {
         self.packs.wanted.push(Request {
@@ -716,6 +733,75 @@ mod tests {
         let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
         m.packs_session_over();
         assert!(!m.packs.stale && m.packs.wanted.is_empty());
+    }
+
+    /// A transfer in play keeps the packs in use: the language stays the packs', no
+    /// vanilla reload is asked for, and what the session left asked for is the next
+    /// one's. One in configuration goes back to vanilla's as any session's end does; so
+    /// does a kept transfer whose session can't start.
+    #[cfg(feature = "dev-offline")]
+    #[test]
+    fn a_transfer_in_play_keeps_the_packs_in_use() {
+        use crate::account::Accounts;
+        use crate::settings::SettingsFile;
+        use ruthenium_sim::session::{KeptPacks, Transfer};
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.set_joiner(crate::join::Joiner::new(None, None));
+        let pack_lang = |m: &mut Menu| {
+            let mut lang = std::collections::HashMap::new();
+            lang.insert("death.attack.generic".to_owned(), "PACK %s".to_owned());
+            if let Some(j) = &mut m.joiner {
+                j.set_server_lang(Some(std::sync::Arc::new(lang)));
+            }
+        };
+        let has_pack_lang = |m: &mut Menu| {
+            let lang = m.joiner.as_mut().unwrap().server_lang();
+            lang.contains_key("death.attack.generic")
+        };
+        let to = |packs| Transfer {
+            to: ruthenium_net::ServerAddress::new("127.0.0.1", 1),
+            state: Default::default(),
+            packs,
+        };
+        m.start_join("Lobby", "127.0.0.1:1");
+        assert!(m.session.is_some());
+        pack_lang(&mut m);
+        let given = vec![(1, PathBuf::from("/p.zip"))];
+        let number = m.packs.session_number;
+        m.packs.given = given.clone();
+        m.packs.wanted.push(Request {
+            packs: given.clone(),
+            session: number,
+        });
+        m.start_transfer(to(KeptPacks::handed_for_tests()));
+        assert!(m.session.is_some());
+        assert_eq!(
+            m.packs.wanted,
+            [Request {
+                packs: given.clone(),
+                session: number + 1,
+            }]
+        );
+        assert!(!m.packs.stale);
+        assert!(has_pack_lang(&mut m));
+        // In configuration: dropped.
+        m.start_transfer(to(KeptPacks::default()));
+        assert!(m.packs.stale);
+        assert!(!has_pack_lang(&mut m));
+        assert_eq!(
+            m.packs.wanted,
+            [Request {
+                packs: Vec::new(),
+                session: 0,
+            }]
+        );
+        // Kept, but the next session can't start: dropped too.
+        let mut m = Menu::new(None, Accounts::disabled(), SettingsFile::transient());
+        m.start_join("Lobby", "127.0.0.1:1");
+        m.packs.given = given;
+        m.start_transfer(to(KeptPacks::handed_for_tests()));
+        assert!(m.session.is_none());
+        assert!(m.packs.stale);
     }
 
     /// Vanilla's own resources that fail to build are not asked for again every frame

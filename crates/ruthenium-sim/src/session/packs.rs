@@ -57,6 +57,9 @@ pub struct ServerPackSetup {
     /// Whether a downloaded file is a pack that can be loaded (`Pack.readPackMetadata`);
     /// called on the game thread when a reload starts, as vanilla's `loadRequestedPacks`.
     pub check: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
+    /// The packs the session before handed on (a transfer in play: [`super::Transfer`]'s
+    /// `packs`); none: the session starts with none.
+    pub kept: KeptPacks,
 }
 
 impl Default for ServerPackSetup {
@@ -65,6 +68,7 @@ impl Default for ServerPackSetup {
             status: PackStatus::Prompt,
             cache_dir: None,
             check: Arc::new(|_| false),
+            kept: KeptPacks::default(),
         }
     }
 }
@@ -74,7 +78,94 @@ impl std::fmt::Debug for ServerPackSetup {
         f.debug_struct("ServerPackSetup")
             .field("status", &self.status)
             .field("cache_dir", &self.cache_dir)
+            .field("kept", &self.kept)
             .finish_non_exhaustive()
+    }
+}
+
+/// A session's server packs, handed on to the next session by a transfer in play, as
+/// vanilla keeps them (`ClientCommonPacketListenerImpl.onDisconnect` calls
+/// `Minecraft.disconnect(screen, isTransferring)`, whose `keepResourcePacks` skips
+/// `clearDownloadedResourcePacks`, Minecraft.java:2116; a transfer in configuration drops
+/// them, `ClientConfigurationPacketListenerImpl.java:210`). Vanilla's `ServerPackManager`
+/// simply lives on; here the session's pack state (the manager, the downloads under way,
+/// the checks) moves from the game thread of the session left to the next one's.
+///
+/// Shared by the session that hands them on (its game thread puts them in, its
+/// [`super::Session`] stays), the [`super::Transfer`] that names them and the next
+/// session, which takes them ([`ServerPackSetup::kept`]). A reload's answer that reaches
+/// the session left after it stopped taking them waits here for the next session, whose
+/// packs are waiting for it.
+#[derive(Clone, Default)]
+pub struct KeptPacks(Arc<std::sync::Mutex<Kept>>);
+
+#[derive(Default)]
+struct Kept {
+    packs: Option<Box<Packs>>,
+    /// Packs were handed on (they may have been taken since).
+    handed: bool,
+    /// Answers to the reload under way that came too late for the session left.
+    answers: Vec<bool>,
+}
+
+impl KeptPacks {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Kept> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the session handed its packs on.
+    pub fn kept(&self) -> bool {
+        self.lock().handed
+    }
+
+    /// Packs handed on (none in fact), for tests of what follows such a transfer.
+    #[doc(hidden)]
+    pub fn handed_for_tests() -> KeptPacks {
+        let k = KeptPacks::default();
+        k.lock().handed = true;
+        k
+    }
+
+    pub(super) fn put(&self, packs: Packs) {
+        let mut k = self.lock();
+        k.packs = Some(Box::new(packs));
+        k.handed = true;
+    }
+
+    fn take(&self) -> Option<Box<Packs>> {
+        self.lock().packs.take()
+    }
+
+    /// The reload under way ended, and the session it was for takes no more: if that
+    /// session handed its packs on, they take the answer (else it is of no use).
+    pub(super) fn late_answer(&self, ok: bool) {
+        let mut k = self.lock();
+        if k.handed {
+            k.answers.push(ok);
+        }
+    }
+
+    fn take_answers(&self) -> Vec<bool> {
+        std::mem::take(&mut self.lock().answers)
+    }
+}
+
+impl std::fmt::Debug for KeptPacks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let k = self.lock();
+        f.debug_struct("KeptPacks")
+            .field("handed", &k.handed)
+            .field("waiting", &k.packs.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Two are the same if both handed packs on or neither did.
+impl PartialEq for KeptPacks {
+    fn eq(&self, other: &KeptPacks) -> bool {
+        self.kept() == other.kept()
     }
 }
 
@@ -208,6 +299,9 @@ pub(super) struct Packs {
     pub(super) peer: Option<IpAddr>,
     /// The checks of the packs downloaded.
     checks: Checks,
+    /// Where these packs came from, if the session before handed them on: a reload's
+    /// answer that came too late for it is taken from there.
+    from: Option<KeptPacks>,
 }
 
 impl Default for Packs {
@@ -278,6 +372,46 @@ impl Packs {
             cleaned: false,
             peer: None,
             checks,
+            from: None,
+        }
+    }
+
+    /// A session's packs: those the session before handed on (`setup.kept`), or none.
+    /// Kept packs stay loaded, and the new server is told of them from now on
+    /// (`ConnectScreen.java:138`: `configureForServerControl` with the server list
+    /// entry's setting, which the transfer keeps). The prompt that was showing is gone
+    /// (vanilla's screen made way for the `ConnectScreen`), and downloads from now on go
+    /// as this server's (its address decides which hosts may serve them); a download
+    /// under way finishes as the last server's.
+    pub(super) fn for_session(mut setup: ServerPackSetup) -> Packs {
+        let kept = std::mem::take(&mut setup.kept);
+        let Some(mut p) = kept.take() else {
+            return Packs::new(setup);
+        };
+        eprintln!(
+            "[server packs] {} pack(s) kept from the server left",
+            p.manager.tracked()
+        );
+        p.manager
+            .configure_for_server_control(prompt_status(setup.status));
+        p.setup = setup;
+        p.prompt = None;
+        p.quiet = false;
+        p.cleaned = false;
+        p.peer = None;
+        p.downloads.jobs = None;
+        // (An answer still on its way to the packs' last home follows them.)
+        let late = p.from.replace(kept.clone()).map(|k| k.take_answers());
+        kept.lock().answers.extend(late.into_iter().flatten());
+        *p
+    }
+
+    /// What stays of a session's packs once it handed them on: nothing to clean up.
+    pub(super) fn handed_on() -> Packs {
+        Packs {
+            quiet: true,
+            cleaned: true,
+            ..Packs::default()
         }
     }
 }
@@ -463,6 +597,11 @@ impl Game {
     /// The frame's start: download results that came meanwhile, and a reload that
     /// waited for another.
     pub(super) fn pack_frame_start(&mut self) {
+        let late = self.packs.from.as_ref().map(KeptPacks::take_answers);
+        for ok in late.into_iter().flatten() {
+            eprintln!("[server packs] the reload's answer came after the transfer");
+            self.resources_reloaded(ok);
+        }
         self.take_download_results();
         self.packs.manager.frame_start();
         self.apply_pack_effects();
@@ -794,7 +933,7 @@ mod tests {
         );
         game.manual_ms = Some(0);
         game.phase = Phase::Configuration;
-        game.packs = Packs::new(setup);
+        game.packs = Packs::for_session(setup);
         Rig {
             game,
             remote,
@@ -825,6 +964,320 @@ mod tests {
 
     fn status(id: u128, a: PackAction) -> Sent {
         Sent::Packet(cfg::resource_pack(id, a))
+    }
+
+    /// Downloads go to the test, which hands back their results ([`deliver`]).
+    fn fake_downloads(r: &mut Rig) -> Receiver<Batch> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(MAX_TRACKED);
+        r.game.packs.downloads.jobs = Some(tx);
+        rx
+    }
+
+    /// The batch asked for, downloaded: each pack to its file in `files` (else failed).
+    fn deliver(r: &mut Rig, jobs: &Receiver<Batch>, files: &[(u128, &Path)]) {
+        let batch = jobs.try_recv().expect("a download");
+        let result = batch
+            .requests
+            .iter()
+            .map(|q| {
+                let file = files.iter().find(|(id, _)| *id == q.id);
+                (q.id, file.map(|(_, p)| p.to_path_buf()).ok_or(()))
+            })
+            .collect();
+        r.game
+            .packs
+            .downloads
+            .results_tx
+            .send((batch.batch, result))
+            .unwrap();
+        r.game.pack_tasks();
+    }
+
+    /// The reloads the session asked for since the last call.
+    fn reloads(r: &Rig) -> Vec<Vec<(u128, PathBuf)>> {
+        r.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::ReloadResources(r) => Some(r.packs),
+                _ => None,
+            })
+            .collect()
+    }
+
+    const OTHER: u128 = 0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0000;
+
+    /// Two packs on disk, and a server list setting that takes packs.
+    fn two_packs() -> (tempfile::TempDir, PathBuf, PathBuf, ServerPackSetup) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a.zip"), tmp.path().join("b.zip"));
+        std::fs::write(&a, b"one").unwrap();
+        std::fs::write(&b, b"two").unwrap();
+        let setup = ServerPackSetup {
+            status: PackStatus::Enabled,
+            cache_dir: Some(tmp.path().to_owned()),
+            check: Arc::new(|_| true),
+            kept: KeptPacks::default(),
+        };
+        (tmp, a, b, setup)
+    }
+
+    fn transfer_packet(phase: Phase) -> Event {
+        let t = ruthenium_protocol::packets::Common::Transfer {
+            host: "127.0.0.1".into(),
+            port: 25612,
+        };
+        match phase {
+            Phase::Play => Event::Play(play::Clientbound::Common(t)),
+            _ => Event::Configuration(cfg::Clientbound::Common(t)),
+        }
+    }
+
+    /// The first server, in `phase`, has the pack `ID` (`a`) applied and transfers
+    /// the player: what its session reported at its end, and the transfer.
+    fn applied_then_transferred(
+        phase: Phase,
+        a: &Path,
+        setup: &ServerPackSetup,
+    ) -> (Vec<SessionEvent>, super::super::Transfer) {
+        let mut r = rig(setup.clone());
+        r.game.phase = phase;
+        let jobs = fake_downloads(&mut r);
+        r.game
+            .handle_pack_push(push("http://127.0.0.1/a.zip", false));
+        r.game.pack_tasks();
+        deliver(&mut r, &jobs, &[(ID, a)]);
+        assert_eq!(reloads(&r), [vec![(ID, a.to_owned())]]);
+        r.game.resources_reloaded(true);
+        let s = |a| match phase {
+            Phase::Play => Sent::Packet(play::resource_pack(ID, a)),
+            _ => status(ID, a),
+        };
+        assert_eq!(
+            r.sent(),
+            [
+                s(PackAction::Accepted),
+                s(PackAction::Downloaded),
+                s(PackAction::SuccessfullyLoaded)
+            ]
+        );
+        r.remote.event(transfer_packet(phase));
+        assert!(r.game.frame(super::super::FrameInput::default()));
+        r.remote
+            .event(Event::Closed(ruthenium_net::connection::Closed {
+                during_login: false,
+                reason: Reason::Local(Local::Closed),
+            }));
+        assert!(!r.game.frame(super::super::FrameInput::default()));
+        let events = r.events();
+        let t = events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Transfer(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("a transfer");
+        (events, t)
+    }
+
+    /// The next server's session, with what the transfer handed on.
+    fn next_session(setup: &ServerPackSetup, t: &super::super::Transfer) -> (Rig, Receiver<Batch>) {
+        let mut r = rig(ServerPackSetup {
+            kept: t.packs.clone(),
+            ..setup.clone()
+        });
+        let jobs = fake_downloads(&mut r);
+        (r, jobs)
+    }
+
+    /// Ends a session the way a server's disconnect does.
+    fn end_session(r: &mut Rig) {
+        r.remote
+            .event(Event::Closed(ruthenium_net::connection::Closed {
+                during_login: false,
+                reason: Reason::Text(Tag::String("Bye".into())),
+            }));
+        assert!(!r.game.frame(super::super::FrameInput::default()));
+    }
+
+    /// A transfer in play keeps the packs, as vanilla's `disconnect(screen, true)`: the
+    /// session left asks for no reload, and the next one starts with them active and
+    /// still says nothing of them. Its push of the same pack is that pack again:
+    /// accepted, its file downloaded (vanilla's cache has it), and the same packs
+    /// reloaded (the client already has them in use); the chain's end drops them.
+    #[test]
+    fn a_transfer_in_play_keeps_the_packs_until_the_chain_ends() {
+        let (_tmp, a, _, setup) = two_packs();
+        let (events, t) = applied_then_transferred(Phase::Play, &a, &setup);
+        assert!(t.packs.kept());
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ReloadResources(_))),
+            "{events:?}"
+        );
+        let (mut b, jobs) = next_session(&setup, &t);
+        assert_eq!(b.game.packs.manager.tracked(), 1);
+        b.game.pack_frame_start();
+        b.game.pack_tasks();
+        assert!(b.sent().is_empty() && b.events().is_empty());
+        assert!(jobs.try_recv().is_err());
+        b.game
+            .handle_pack_push(push("http://127.0.0.1/a.zip", false));
+        b.game.pack_tasks();
+        deliver(&mut b, &jobs, &[(ID, &a)]);
+        assert_eq!(reloads(&b), [vec![(ID, a.clone())]]);
+        b.game.resources_reloaded(true);
+        assert_eq!(
+            b.sent(),
+            [
+                status(ID, PackAction::Accepted),
+                status(ID, PackAction::Downloaded),
+                status(ID, PackAction::SuccessfullyLoaded)
+            ]
+        );
+        end_session(&mut b);
+        assert_eq!(reloads(&b), [Vec::new()]);
+    }
+
+    /// The next server leaves the kept packs alone, pops one, pops all, or pushes
+    /// another: as vanilla's manager, which lives on, does with them.
+    #[test]
+    fn the_next_server_has_the_kept_packs_as_its_own() {
+        let (_tmp, a, b_file, setup) = two_packs();
+        // Nothing pushed: they stay for as long as the session does.
+        let (_, t) = applied_then_transferred(Phase::Play, &a, &setup);
+        let (mut b, _jobs) = next_session(&setup, &t);
+        for _ in 0..3 {
+            b.game.pack_frame_start();
+            b.game.pack_tasks();
+        }
+        assert!(reloads(&b).is_empty());
+        end_session(&mut b);
+        assert_eq!(reloads(&b), [Vec::new()]);
+        // A pop of the kept pack, or of all: gone at once.
+        for id in [Some(ID), None] {
+            let (_, t) = applied_then_transferred(Phase::Play, &a, &setup);
+            let (mut b, _jobs) = next_session(&setup, &t);
+            b.game.handle_pack_pop(id);
+            b.game.pack_tasks();
+            assert_eq!(reloads(&b), [Vec::new()], "{id:?}");
+            // (Vanilla says nothing of a pack the server took away.)
+            assert!(b.sent().is_empty());
+            b.game.resources_reloaded(true);
+            end_session(&mut b);
+            assert!(reloads(&b).is_empty(), "nothing left to drop");
+        }
+        // Another pack: on top of the kept one.
+        let (_, t) = applied_then_transferred(Phase::Play, &a, &setup);
+        let (mut b, jobs) = next_session(&setup, &t);
+        b.game.handle_pack_push(PackPush {
+            id: OTHER,
+            ..push("http://127.0.0.1/b.zip", false)
+        });
+        b.game.pack_tasks();
+        deliver(&mut b, &jobs, &[(OTHER, &b_file)]);
+        let got = reloads(&b);
+        assert_eq!(got.len(), 1);
+        let mut ids: Vec<u128> = got[0].iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [ID, OTHER]);
+        b.game.resources_reloaded(true);
+        end_session(&mut b);
+        assert_eq!(reloads(&b), [Vec::new()]);
+    }
+
+    /// A server list entry set to Disabled (the transfer keeps the entry) declines what
+    /// the next server offers, and the kept pack, accepted before, stays
+    /// (`rejectServerPacks` removes only packs not accepted).
+    #[test]
+    fn a_declining_entry_keeps_what_was_accepted() {
+        let (_tmp, a, _, setup) = two_packs();
+        let (_, t) = applied_then_transferred(Phase::Play, &a, &setup);
+        let declined = ServerPackSetup {
+            status: PackStatus::Disabled,
+            ..setup.clone()
+        };
+        let (mut b, _jobs) = next_session(&declined, &t);
+        b.game.handle_pack_push(PackPush {
+            id: OTHER,
+            ..push("http://127.0.0.1/b.zip", false)
+        });
+        b.game.pack_tasks();
+        assert_eq!(b.sent(), [status(OTHER, PackAction::Declined)]);
+        assert!(reloads(&b).is_empty());
+        end_session(&mut b);
+        assert_eq!(reloads(&b), [Vec::new()]);
+    }
+
+    /// A transfer in configuration drops the packs
+    /// (`ClientConfigurationPacketListenerImpl.onDisconnect`): the session left goes
+    /// back to vanilla's, and the next one starts with none.
+    #[test]
+    fn a_transfer_in_configuration_drops_the_packs() {
+        let (_tmp, a, _, setup) = two_packs();
+        let (events, t) = applied_then_transferred(Phase::Configuration, &a, &setup);
+        assert!(!t.packs.kept());
+        let at = |f: fn(&SessionEvent) -> bool| events.iter().position(f).unwrap();
+        assert!(
+            at(|e| matches!(e, SessionEvent::ReloadResources(r) if r.packs.is_empty()))
+                < at(|e| matches!(e, SessionEvent::Transfer(_)))
+        );
+        let (mut b, _jobs) = next_session(&setup, &t);
+        assert_eq!(b.game.packs.manager.tracked(), 0);
+        end_session(&mut b);
+        assert!(reloads(&b).is_empty());
+    }
+
+    /// A reload under way at a transfer in play goes on: its answer, whether it comes to
+    /// the next session or too late to the one left ([`KeptPacks::late_answer`]), is
+    /// the kept packs'.
+    #[test]
+    fn a_reload_under_way_at_a_transfer_is_answered_to_the_next_session() {
+        let (_tmp, a, _, setup) = two_packs();
+        for late in [false, true] {
+            let mut r = rig(ServerPackSetup {
+                status: PackStatus::Enabled,
+                ..setup.clone()
+            });
+            r.game.phase = Phase::Play;
+            let jobs = fake_downloads(&mut r);
+            r.game
+                .handle_pack_push(push("http://127.0.0.1/a.zip", false));
+            r.game.pack_tasks();
+            deliver(&mut r, &jobs, &[(ID, &a)]);
+            assert_eq!(reloads(&r).len(), 1);
+            r.remote.event(transfer_packet(Phase::Play));
+            assert!(r.game.frame(super::super::FrameInput::default()));
+            r.remote
+                .event(Event::Closed(ruthenium_net::connection::Closed {
+                    during_login: false,
+                    reason: Reason::Local(Local::Closed),
+                }));
+            assert!(!r.game.frame(super::super::FrameInput::default()));
+            let t = r
+                .events()
+                .into_iter()
+                .find_map(|e| match e {
+                    SessionEvent::Transfer(t) => Some(t),
+                    _ => None,
+                })
+                .unwrap();
+            let (mut b, _jobs) = next_session(&setup, &t);
+            if late {
+                t.packs.late_answer(true);
+                b.game.pack_frame_start();
+            } else {
+                b.game.resources_reloaded(true);
+            }
+            assert_eq!(
+                b.sent(),
+                [status(ID, PackAction::SuccessfullyLoaded)],
+                "late: {late}"
+            );
+            // Not twice.
+            b.game.pack_frame_start();
+            assert!(b.sent().is_empty());
+        }
     }
 
     /// Vanilla's answer to a URL it can't use, at once.

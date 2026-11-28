@@ -18,6 +18,12 @@
 //! already disconnected (`ClientCommonPacketListenerImpl.java:322`): its screen says
 //! "Transferred to another server" and nothing follows; so here.
 //!
+//! Server packs: a transfer in play keeps them (`Minecraft.disconnect(screen, true)`):
+//! the session hands its pack state on with the [`Transfer`] ([`super::KeptPacks`]),
+//! and the next session takes it. One in configuration drops them, as any session's end
+//! does (`ClientConfigurationPacketListenerImpl.onDisconnect`,
+//! `ClientConfigurationPacketListenerImpl.java:208`).
+//!
 //! The address is the server's to choose: like a join, it goes through the resolver
 //! (SRV and Mojang's list of blocked servers, `ServerNameResolver.resolveAddress`), and
 //! vanilla checks nothing else, so a transfer may name this machine or the local network.
@@ -27,7 +33,8 @@ use ruthenium_net::connection::{Closed, Reason, TransferState};
 use ruthenium_protocol::nbt::{Compound, Tag};
 use ruthenium_protocol::packets::Common;
 
-use super::Game;
+use super::packs::{KeptPacks, Packs};
+use super::{Game, Phase};
 
 /// Where a server sent the client, and what goes with it: the next session connects to
 /// `to` with `state` in its [`ruthenium_net::connection::ConnectOptions::transfer`].
@@ -35,12 +42,17 @@ use super::Game;
 pub struct Transfer {
     pub to: ServerAddress,
     pub state: TransferState,
+    /// The server packs, handed on when the transfer came in play: the next session's
+    /// [`super::ServerPackSetup::kept`].
+    pub packs: KeptPacks,
 }
 
 /// A session leaving for a transfer: where to (`None`: an address vanilla can't make).
 #[derive(Debug)]
 pub(super) struct Leaving {
     to: Option<ServerAddress>,
+    /// It came in play: the server packs go on with the player.
+    keep_packs: bool,
 }
 
 /// `disconnect.transfer`: why the session ended.
@@ -74,23 +86,36 @@ impl Game {
                 "[session] the server transfers to {host:?}:{port}, which isn't an address: leaving"
             ),
         }
-        self.transfer = Some(Leaving { to });
+        self.transfer = Some(Leaving {
+            to,
+            keep_packs: self.phase == Phase::Play,
+        });
         self.close_reason = Some(transferred());
         self.connection.close();
     }
 
     /// The connection closed: if for a transfer, its reason is the transfer's (whatever
-    /// else ended it meanwhile), and the transfer to report before the session's end.
+    /// else ended it meanwhile), and the transfer to report before the session's end,
+    /// with the server packs if it came in play. (Where vanilla can't make the address,
+    /// it keeps the packs on the screen it is left on, until another session ends; here
+    /// the session's end drops them.)
     pub(super) fn transfer_closed(&mut self, c: &mut Closed) -> Option<Transfer> {
         let leaving = self.transfer.take()?;
         c.during_login = false;
         c.reason = transferred();
+        let to = leaving.to?;
+        let state = TransferState {
+            cookies: std::mem::take(&mut self.cookies),
+            from: self.packs.peer,
+        };
+        if leaving.keep_packs {
+            self.handover
+                .put(std::mem::replace(&mut self.packs, Packs::handed_on()));
+        }
         Some(Transfer {
-            to: leaving.to?,
-            state: TransferState {
-                cookies: std::mem::take(&mut self.cookies),
-                from: self.packs.peer,
-            },
+            to,
+            state,
+            packs: self.handover.clone(),
         })
     }
 }
@@ -190,6 +215,8 @@ mod tests {
                 ]),
                 from: None,
             },
+            // In configuration: the packs are dropped.
+            packs: KeptPacks::default(),
         };
         assert_eq!(
             got[got.len() - 2..],
@@ -222,21 +249,27 @@ mod tests {
         // The ping behind the transfer isn't answered.
         assert_eq!(remote.sent(), vec![Sent::Close]);
         let got = end(&mut game, &remote, &events, Local::EndOfStream);
+        let [SessionEvent::Transfer(t), closed] = &got[..] else {
+            panic!("{got:?}");
+        };
         assert_eq!(
-            got,
-            [
-                SessionEvent::Transfer(Transfer {
-                    to: ServerAddress::new("::1", 25565),
-                    state: TransferState {
-                        cookies: cookies(&[("test:a", b"one"), ("test:b", b"two")]),
-                        from: Some(peer),
-                    },
-                }),
-                SessionEvent::Closed(Closed {
-                    during_login: false,
-                    reason: transferred(),
-                }),
-            ]
+            (&t.to, &t.state),
+            (
+                &ServerAddress::new("::1", 25565),
+                &TransferState {
+                    cookies: cookies(&[("test:a", b"one"), ("test:b", b"two")]),
+                    from: Some(peer),
+                }
+            )
+        );
+        // In play: the packs go on with the player.
+        assert!(t.packs.kept());
+        assert_eq!(
+            *closed,
+            SessionEvent::Closed(Closed {
+                during_login: false,
+                reason: transferred(),
+            })
         );
     }
 
