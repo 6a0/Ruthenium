@@ -1497,6 +1497,40 @@ mod tests {
         c.violations().iter().map(|v| v.invariant).collect()
     }
 
+    /// The creative inventory's sends (`set_creative_mode_slot`): its clicks at frame
+    /// time with the screen up, the listener's echo of a set_slot while packets are
+    /// handled, a saved hotbar loaded among a tick's keys, and its close.
+    #[test]
+    fn the_creative_inventorys_sends_pass() {
+        use ruthenium_protocol::item::ItemStack;
+        let mut c = joined();
+        let stone = ItemStack {
+            item: 1,
+            count: 64,
+            patch: Default::default(),
+        };
+        c.frame();
+        c.set_screen(true);
+        for slot in [36, 37, -1, 20, 0, 45] {
+            c.sent(&play::set_creative_mode_slot(slot, &stone));
+        }
+        c.handled(&play::Clientbound::ContainerSetSlot {
+            container_id: 0,
+            state_id: 3,
+            slot: 36,
+            item: stone.clone(),
+        });
+        c.sent(&play::set_creative_mode_slot(36, &stone));
+        c.sent(&play::container_close(0));
+        c.set_screen(false);
+        c.frame();
+        let hotbar: Vec<Vec<u8>> = (36..45)
+            .map(|slot| play::set_creative_mode_slot(slot, &ItemStack::EMPTY))
+            .collect();
+        tick(&mut c, 1, &[hotbar, vec![input(1)]].concat());
+        assert_eq!(broken(&c), Vec::<&str>::new());
+    }
+
     #[test]
     fn a_tick_in_vanilla_order_passes() {
         let mut c = joined();
