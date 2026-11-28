@@ -2704,7 +2704,11 @@ impl Game {
                     );
                 }
             }
-            play::Clientbound::UpdateTags(tags) => self.apply_tags(&tags),
+            play::Clientbound::UpdateTags(tags) => {
+                self.apply_tags(&tags);
+                // `handleUpdateTags`: the creative tag search is made again.
+                self.creative.state.forget_trees();
+            }
             play::Clientbound::UpdateAttributes {
                 entity_id,
                 attributes,
