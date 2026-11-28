@@ -653,4 +653,48 @@ mod golden_tests {
         }
         assert_eq!(bad, 0, "{bad} of {} queries differ", golden::QUERIES.len());
     }
+
+    /// 2000 queries over lines sharing long prefixes, many alike (SearchGolden): where
+    /// vanilla's array is sorted only as deep as its doubling went and its partition's
+    /// pivot moves, the same elements found.
+    #[test]
+    fn searches_over_long_prefixes_find_what_vanillas_find() {
+        let mut r = Lcg(0x5EA4_C401);
+        let lines: Vec<Vec<String>> = (0..400)
+            .map(|_| {
+                // (SearchGolden draws the count again at every turn of its loop.)
+                let mut l = Vec::new();
+                while l.len() < 1 + r.next(2) {
+                    let mut s = "q".repeat(12 + r.next(6));
+                    for _ in 0..r.next(6) {
+                        s.push(if r.next(2) == 0 { 'a' } else { 'b' });
+                    }
+                    l.push(s);
+                }
+                l
+            })
+            .collect();
+        let names: Vec<Vec<Vec<u16>>> = lines
+            .iter()
+            .map(|l| l.iter().map(|s| lower(s)).collect())
+            .collect();
+        let keys: Vec<String> = (0..400).map(|i| format!("minecraft:e{i}")).collect();
+        let tree = FullTextTree::new(&names, keys.iter().map(|k| vec![k.as_str()]));
+        let mut bad = 0;
+        for &want in golden::PREFIXED {
+            let mut q = "q".repeat(r.next(20));
+            for _ in 0..r.next(5) {
+                q.push(if r.next(2) == 0 { 'a' } else { 'b' });
+            }
+            let found: String = tree
+                .search(&lower(&q))
+                .iter()
+                .map(|i| format!("{i},"))
+                .collect();
+            if fnv(&format!("{q}|{found}")) != want {
+                bad += 1;
+            }
+        }
+        assert_eq!(bad, 0, "{bad} of {} queries differ", golden::PREFIXED.len());
+    }
 }
