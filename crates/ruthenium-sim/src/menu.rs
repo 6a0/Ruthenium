@@ -22,7 +22,9 @@ use crate::inventory::Inventory;
 use crate::item::{EquipmentSlot, Items, RecipeSets, Stack};
 
 pub mod creative;
+pub mod mount;
 pub mod screen;
+pub mod stations;
 
 /// `AbstractContainerMenu.SLOT_CLICKED_OUTSIDE`.
 pub const SLOT_OUTSIDE: i32 = -999;
@@ -89,6 +91,15 @@ pub enum Kind {
     BlastFurnace,
     Smoker,
     Hopper,
+    /// `BeaconMenu`, `BrewingStandMenu`, `EnchantmentMenu`, `GrindstoneMenu`,
+    /// `LecternMenu` ([`stations`]).
+    Beacon,
+    BrewingStand,
+    Enchantment,
+    Grindstone,
+    Lectern,
+    /// `HorseInventoryMenu` or `NautilusInventoryMenu` ([`mount`]).
+    Mount(mount::Mount),
     /// A menu the client doesn't run (an anvil, an enchanting table, a horse's
     /// inventory...): it stays open with its container id, so the server's packets for
     /// it land, and its screen is a placeholder that clicks nothing.
@@ -167,6 +178,11 @@ impl Kind {
             "blast_furnace" => Kind::BlastFurnace,
             "smoker" => Kind::Smoker,
             "hopper" => Kind::Hopper,
+            "beacon" => Kind::Beacon,
+            "brewing_stand" => Kind::BrewingStand,
+            "enchantment" => Kind::Enchantment,
+            "grindstone" => Kind::Grindstone,
+            "lectern" => Kind::Lectern,
             _ => return None,
         })
     }
@@ -214,6 +230,19 @@ pub enum Rule {
     /// `mayPlace` for it) or gathered from it (`canTakeItemForPickAll`), and a locked
     /// stack can't be picked up (`CustomCreativeSlot.mayPickup`).
     Creative,
+    /// A mount's saddle or body armour (`ArmorSlot` on the mount).
+    MountEquipment(EquipmentSlot),
+    /// `BeaconMenu.PaymentSlot`; `BrewingStandMenu`'s `PotionSlot`, `IngredientsSlot`
+    /// and `FuelSlot`; `EnchantmentMenu`'s item and lapis slots; `GrindstoneMenu`'s
+    /// inputs and result ([`stations`]).
+    BeaconPayment,
+    Potion,
+    BrewingIngredient,
+    BrewingFuel,
+    EnchantItem,
+    Lapis,
+    GrindstoneInput,
+    GrindstoneResult,
 }
 
 /// `Slot`: its container and place there, where it is drawn, and its rule.
@@ -299,6 +328,8 @@ pub struct Menu {
     /// The slots' identity hash codes (`System.identityHashCode`, random per object),
     /// which order the sets of them a screen keeps.
     pub slot_hashes: Vec<u32>,
+    /// The items a grindstone makes its result with (the session's).
+    pub items: stations::MenuItems,
 }
 
 /// Identity hash codes as HotSpot's thread-local xor-shift hands them out: 31 bits,
@@ -472,6 +503,15 @@ impl Menu {
                 standard_inventory(&mut slots, 8, 84);
                 (3, 0, 4)
             }
+            Kind::Beacon
+            | Kind::BrewingStand
+            | Kind::Enchantment
+            | Kind::Grindstone
+            | Kind::Lectern
+            | Kind::Mount(_) => {
+                let (own, data) = stations::layout(kind, &mut slots);
+                (own, 0, data)
+            }
             Kind::Placeholder(p) => {
                 let hidden = |slots: &mut Vec<Slot>, from: u8, n: u8| {
                     for i in from..from + n {
@@ -514,13 +554,14 @@ impl Menu {
             own: vec![Stack::empty(); own],
             grid: vec![Stack::empty(); grid_width * grid_width],
             grid_width,
-            data: vec![0; data],
+            data: stations::data(kind, data),
             carried: Stack::empty(),
             state_id: 0,
             quickcraft_type: -1,
             quickcraft_status: 0,
             quickcraft_slots: Vec::new(),
             slot_hashes: Vec::new(),
+            items: stations::MenuItems::default(),
         }
         .with_hashes()
     }
@@ -553,13 +594,49 @@ impl Menu {
         !self.item(inv, i).is_empty()
     }
 
-    /// `Slot.set` (and `setByPlayer`): the container's `setItem`.
+    /// `Slot.set` (and `setByPlayer`): the container's `setItem`, and its
+    /// `setChanged`.
     fn set(&mut self, inv: &mut Inventory, i: usize, stack: Stack) {
+        self.set_quiet(inv, i, stack);
+        self.touched(i);
+    }
+
+    /// The container's `setItem` alone (a stack changed in place).
+    fn set_quiet(&mut self, inv: &mut Inventory, i: usize, stack: Stack) {
         let s = self.slots[i];
         match s.container {
             Container::Inventory => inv.set(s.index, stack),
-            Container::Own => self.own[s.index] = stack,
+            Container::Own => {
+                self.own[s.index] = stack;
+                // `SimpleContainer.setItem`'s `limitSize`: a menu's own container holds
+                // no more than its most (99, a beacon's 1) and the stack's; a result's
+                // and a mount's equipment aren't such containers.
+                if !matches!(
+                    s.rule,
+                    Rule::CraftResult | Rule::GrindstoneResult | Rule::MountEquipment(_)
+                ) {
+                    let most = if self.kind == Kind::Beacon {
+                        1
+                    } else {
+                        CONTAINER_MAX
+                    };
+                    let here = &mut self.own[s.index];
+                    let max = most.min(here.max_stack_size());
+                    if !here.is_empty() && here.count > max {
+                        here.count = max;
+                    }
+                }
+            }
             Container::Grid => self.grid[s.index] = stack,
+        }
+    }
+
+    /// `Slot.setChanged`: a menu's own container may make something of it
+    /// (`slotsChanged`: a grindstone's result).
+    fn touched(&mut self, i: usize) {
+        let s = self.slots[i];
+        if s.container == Container::Own {
+            self.station_slot_changed(s.index);
         }
     }
 
@@ -626,13 +703,14 @@ impl Menu {
             // `canFitInsideContainerItems`: not a shulker box.
             Rule::ShulkerBox => !is_shulker_box(stack),
             Rule::Creative => false,
+            r => stations::may_place(self, r, stack, _who),
         }
     }
 
     /// `Slot.mayPickup`: armour cursed with binding stays on a player not in creative.
     pub fn may_pickup(&self, inv: &Inventory, i: usize, who: &Who) -> bool {
         match self.slots[i].rule {
-            Rule::Armor(_) => {
+            Rule::Armor(_) | Rule::MountEquipment(_) => {
                 let s = self.item(inv, i);
                 s.is_empty() || who.creative || !s.c.prevent_armor_change
             }
@@ -653,7 +731,10 @@ impl Menu {
 
     /// `Slot.remove`: the container's `removeItem` (a crafting result is taken whole).
     fn remove(&mut self, inv: &mut Inventory, i: usize, amount: i32) -> Stack {
-        if self.slots[i].rule == Rule::CraftResult {
+        if matches!(
+            self.slots[i].rule,
+            Rule::CraftResult | Rule::GrindstoneResult
+        ) {
             let taken = self.get(inv, i);
             self.set(inv, i, Stack::empty());
             return taken;
@@ -744,8 +825,14 @@ impl Menu {
 
     /// `Slot.onTake`: taking a crafting result uses one of each ingredient.
     fn on_take(&mut self, inv: &mut Inventory, i: usize, who: &Who, out: &mut Outcome) {
-        if self.slots[i].rule == Rule::CraftResult {
-            self.take_craft(inv, who, out);
+        match self.slots[i].rule {
+            Rule::CraftResult => self.take_craft(inv, who, out),
+            // `GrindstoneMenu`'s result slot: the inputs go.
+            Rule::GrindstoneResult => {
+                self.set(inv, 0, Stack::empty());
+                self.set(inv, 1, Stack::empty());
+            }
+            _ => {}
         }
     }
 
@@ -989,6 +1076,8 @@ impl Menu {
                         }
                     }
                 }
+                // `slot.setChanged()`, whatever happened.
+                self.touched(i);
             }
         } else if input == Input::Swap && ((0..9).contains(&button) || button == 40) {
             let Some(i) = self.index(slot) else {
@@ -1175,6 +1264,13 @@ impl Menu {
         let moved = match self.kind {
             // Its screen clicks nothing; the creative picker's is above.
             Kind::Placeholder(_) | Kind::Creative => false,
+
+            Kind::Beacon
+            | Kind::BrewingStand
+            | Kind::Enchantment
+            | Kind::Grindstone
+            | Kind::Lectern
+            | Kind::Mount(_) => self.station_quick_move(inv, &mut stack, i, who),
             Kind::Inventory => {
                 let eq = equipment_slot_for_item(&clicked);
                 if i == 0 {
@@ -1240,16 +1336,23 @@ impl Menu {
                 }
             }
         };
-        // The source slot holds the stack as moving left it.
-        self.set(inv, i, stack.clone());
+        // The source slot holds the stack as moving left it (changed in place: its
+        // container hears of it only below).
+        self.set_quiet(inv, i, stack.clone());
         if !moved {
             return Stack::empty();
         }
+        // `setByPlayer(EMPTY)`, or `setChanged`.
         if stack.is_empty() {
             self.set(inv, i, Stack::empty());
+        } else {
+            self.touched(i);
         }
-        // Chests, shulker boxes and hoppers stop here.
-        if matches!(self.kind, Kind::Chest(_) | Kind::ShulkerBox | Kind::Hopper) {
+        // Chests, shulker boxes, hoppers and mounts stop here.
+        if matches!(
+            self.kind,
+            Kind::Chest(_) | Kind::ShulkerBox | Kind::Hopper | Kind::Mount(_)
+        ) {
             return clicked;
         }
         if stack.count == clicked.count {
@@ -1432,7 +1535,11 @@ fn humanoid_armor_slot(eq: EquipmentSlot) -> Option<usize> {
 /// fuel slot one bucket, any other as many as the stack allows up to 99.
 pub fn rule_max_stack_size(rule: Rule, stack: &Stack) -> i32 {
     let slot = match rule {
-        Rule::Armor(_) => 1,
+        Rule::Armor(_)
+        | Rule::MountEquipment(_)
+        | Rule::BeaconPayment
+        | Rule::Potion
+        | Rule::EnchantItem => 1,
         Rule::FurnaceFuel if is_bucket(stack) => return 1,
         _ => CONTAINER_MAX,
     };

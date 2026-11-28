@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ruthenium_protocol::nbt::Tag;
 use ruthenium_protocol::packets::configuration::RegistryEntry;
 use serde_json::Value;
 
@@ -190,6 +191,10 @@ pub struct Enchantment {
     pub crossbow_charge_time: Option<ValueEffect>,
     /// `minecraft:prevent_armor_change` (curse of binding).
     pub prevent_armor_change: bool,
+    /// Its name (`description`, a text component) and `max_level`, for an enchanting
+    /// table's offers (`Enchantment.getFullname`).
+    pub description: Option<Arc<Tag>>,
+    pub max_level: i32,
 }
 
 impl Enchantment {
@@ -203,7 +208,31 @@ impl Enchantment {
             prevent_armor_change: effects
                 .and_then(|e| e.get("minecraft:prevent_armor_change"))
                 .is_some(),
+            description: v.get("description").map(|d| Arc::new(json_text(d))),
+            max_level: v.get("max_level").and_then(Value::as_i64).unwrap_or(1) as i32,
         }
+    }
+}
+
+/// A text component's JSON as the NBT form the HUD draws (strings, numbers, lists and
+/// objects as they are).
+fn json_text(v: &Value) -> Tag {
+    match v {
+        Value::String(s) => Tag::String(s.clone()),
+        Value::Bool(b) => Tag::Byte(i8::from(*b)),
+        Value::Number(n) => n
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .map_or_else(|| Tag::Double(n.as_f64().unwrap_or(0.0)), Tag::Int),
+        Value::Array(a) => Tag::List(a.iter().map(json_text).collect()),
+        Value::Object(o) => {
+            let mut c = ruthenium_protocol::nbt::Compound::new();
+            for (k, v) in o {
+                c.put(k, json_text(v));
+            }
+            Tag::Compound(c)
+        }
+        Value::Null => Tag::String(String::new()),
     }
 }
 
@@ -246,7 +275,14 @@ impl Enchantments {
         let mut by_name = HashMap::new();
         for e in entries {
             let ench = match &e.data {
-                Some(data) => Some(Arc::new(Enchantment::from_json(&nbt_to_json(data)))),
+                Some(data) => {
+                    let mut ench = Enchantment::from_json(&nbt_to_json(data));
+                    // (Its name as sent, not as it went through JSON.)
+                    if let Some(d) = data.as_compound().and_then(|c| c.get("description")) {
+                        ench.description = Some(Arc::new(d.clone()));
+                    }
+                    Some(Arc::new(ench))
+                }
                 None => vanilla.by_name.get(&e.id).cloned(),
             };
             if let Some(ench) = &ench {

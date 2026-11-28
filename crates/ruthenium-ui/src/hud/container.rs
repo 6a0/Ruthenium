@@ -95,6 +95,22 @@ pub fn background_name(kind: Kind) -> &'static str {
         // Pieces of the chest's window.
         Kind::Placeholder(_) => "generic_54",
         Kind::Creative => "creative_inventory/tab_items",
+        Kind::Beacon => "beacon",
+        Kind::BrewingStand => "brewing_stand",
+        Kind::Enchantment => "enchanting_table",
+        Kind::Grindstone => "grindstone",
+        Kind::Lectern => "book",
+        Kind::Mount(m) if m.nautilus => "nautilus",
+        Kind::Mount(_) => "horse",
+    }
+}
+
+/// Where a window's picture is in the packs: `textures/gui/container/<name>.png`, but
+/// a book's is `textures/gui/book.png`.
+pub fn background_path(name: &str) -> String {
+    match name {
+        "book" => "textures/gui/book.png".into(),
+        n => format!("textures/gui/container/{n}.png"),
     }
 }
 
@@ -118,7 +134,7 @@ fn placeholder_body_end(inventory: bool, image_height: i32) -> i32 {
 }
 
 /// Every picture a container screen may need.
-pub const BACKGROUNDS: [&str; 12] = [
+pub const BACKGROUNDS: &[&str] = &[
     "inventory",
     "generic_54",
     "dispenser",
@@ -131,6 +147,13 @@ pub const BACKGROUNDS: [&str; 12] = [
     "creative_inventory/tab_items",
     "creative_inventory/tab_item_search",
     "creative_inventory/tab_inventory",
+    "beacon",
+    "brewing_stand",
+    "enchanting_table",
+    "grindstone",
+    "book",
+    "horse",
+    "nautilus",
 ];
 
 fn translated(key: &str) -> Arc<Tag> {

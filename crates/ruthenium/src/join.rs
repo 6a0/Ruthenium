@@ -489,7 +489,7 @@ pub fn load_world_assets_from(
         containers: ruthenium_ui::hud::BACKGROUNDS
             .iter()
             .filter_map(|n| {
-                let image = sky_image(&format!("textures/gui/container/{n}.png"))?;
+                let image = sky_image(&ruthenium_ui::hud::background_path(n))?;
                 Some(((*n).to_owned(), image))
             })
             .collect(),

@@ -18,6 +18,9 @@ pub fn image_size(kind: Kind) -> (i32, i32) {
         Kind::Hopper => (176, 133),
         Kind::Placeholder(p) if !p.inventory => (176, 80),
         Kind::Creative => (super::creative::IMAGE_WIDTH, super::creative::IMAGE_HEIGHT),
+        Kind::Beacon => (230, 219),
+        // `BookViewScreen`'s book.
+        Kind::Lectern => (192, 192),
         _ => (176, 166),
     }
 }
@@ -32,6 +35,9 @@ pub struct Binds {
     pub hotbar: [bool; 9],
     pub pick: bool,
     pub drop: bool,
+    /// Page Up and Page Down (a book's screen reads the keys themselves).
+    pub page_up: bool,
+    pub page_down: bool,
 }
 
 /// A mouse button's event: SDL's numbering (1 left, 2 middle, 3 right), where the
@@ -206,9 +212,8 @@ impl Screen {
 
     /// `getHoveredSlot`: the first slot under the pointer.
     pub fn slot_at(&self, menu: &Menu, mx: f64, my: f64) -> Option<usize> {
-        menu.slots
-            .iter()
-            .position(|s| self.is_hovering(s.x, s.y, mx, my))
+        (menu.slots.iter().enumerate())
+            .position(|(i, s)| menu.slot_active(i) && self.is_hovering(s.x, s.y, mx, my))
     }
 
     /// `hasClickedOutside`.

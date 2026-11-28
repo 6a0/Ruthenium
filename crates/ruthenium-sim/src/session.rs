@@ -86,6 +86,7 @@ use crate::world::{BiomeInfo, ChunkPacket, Level, global_bits};
 mod containers;
 mod creative;
 mod packs;
+mod stations;
 mod transfer;
 pub use containers::{At, ContainerView, Pointer, ScreenInput};
 pub use packs::{
@@ -94,6 +95,7 @@ pub use packs::{
 };
 use ruthenium_audio::SoundSource;
 use ruthenium_protocol::profile::ResolvableProfile;
+pub use stations::{BEACON_EFFECTS, Button, ButtonKind, EnchantClue, StationView, book_pages};
 pub use transfer::Transfer;
 
 #[derive(Debug)]
@@ -3563,6 +3565,8 @@ fn reason_text(r: &Reason) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod stations;
+
     use super::*;
     use crate::scene::{SectionKey, WHOLE_COLUMN, dirty};
     use crate::world::testing::{chunk_data, light};

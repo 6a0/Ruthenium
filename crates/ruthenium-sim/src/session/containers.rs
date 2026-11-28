@@ -126,6 +126,8 @@ pub struct ContainerView {
     pub cooldowns: Vec<crate::hud::Cooldown>,
     /// The creative inventory's tabs, scroller and search box.
     pub creative: Option<Arc<crate::menu::creative::CreativeView>>,
+    /// A beacon's, an enchanting table's or a lectern's buttons and state.
+    pub station: Option<super::StationView>,
 }
 
 /// The session's container screen state.
@@ -134,12 +136,13 @@ pub(super) struct Containers {
     pub(super) screen: Option<Screen>,
     title: Option<Arc<Tag>>,
     serial: u64,
-    pointer: Pointer,
+    pub(super) pointer: Pointer,
     last_click: Option<(Instant, u64, u8)>,
     /// Inventory key presses not yet read (`keyInventory.clickCount`).
     pub(super) inventory_clicks: u32,
     /// The synced registries' keys, for hashing stacks (set as play begins).
     pub(super) registries: HashMap<String, Vec<String>>,
+    pub(super) station: super::stations::StationState,
 }
 
 static NO_ITEMS: LazyLock<Items> = LazyLock::new(Items::default);
@@ -294,6 +297,20 @@ impl Game {
         let Some(s) = &self.containers.screen else {
             return;
         };
+        // A lectern's book screen has buttons and keys of its own, no slots.
+        if s.kind == Kind::Lectern {
+            match *e {
+                ScreenInput::Press { button, at, .. } => {
+                    let (x, y) = self.place(at);
+                    self.station_press(button, x, y);
+                }
+                ScreenInput::Key { binds, .. } => {
+                    self.lectern_key(binds.escape, binds.page_up, binds.page_down);
+                }
+                _ => {}
+            }
+            return;
+        }
         // A placeholder clicks nothing; Escape and the inventory key close it.
         if matches!(s.kind, Kind::Placeholder(_)) {
             if let ScreenInput::Key { binds, .. } = e
@@ -346,7 +363,10 @@ impl Game {
                     shift,
                     binds,
                 };
-                self.with_screen(|s, c| s.mouse_clicked(c, m, double));
+                // A button of the screen takes the press first.
+                if !self.station_press(button, x, y) {
+                    self.with_screen(|s, c| s.mouse_clicked(c, m, double));
+                }
                 self.containers.last_click = Some((when, serial, button));
             }
             ScreenInput::Release {
@@ -405,6 +425,11 @@ impl Game {
         self.containers.pointer = p;
         if resized && let Some(s) = &mut self.containers.screen {
             s.resize(p.width, p.height);
+            let kind = s.kind;
+            self.station_layout(kind);
+            let Some(s) = &self.containers.screen else {
+                return;
+            };
             if crate::menu::log_enabled() {
                 eprintln!(
                     "[menu] screen at {}, {} on a GUI of {} by {}",
@@ -451,6 +476,7 @@ impl Game {
                     data: Vec::new(),
                     cooldowns,
                     creative: self.creative_view(),
+                    station: None,
                 })
             });
             *lock(&self.container_view) = view.map(Arc::new);
@@ -463,6 +489,8 @@ impl Game {
             self.with_screen(|s, c| s.mouse_dragged(c, x, y));
         }
         self.with_screen(|s, c| s.frame(c, x, y));
+        self.station_sync();
+        let station = self.station_view();
         let view = self.containers.screen.as_ref().and_then(|s| {
             let w = self.world.as_ref()?;
             let p = &w.player;
@@ -486,13 +514,20 @@ impl Game {
                 title: self.containers.title.clone(),
                 image_width: s.image_width,
                 image_height: s.image_height,
-                slots: m.slots.iter().map(|sl| (sl.x, sl.y, sl.rule)).collect(),
+                // (A slot that isn't active is neither drawn nor pointed at.)
+                slots: (m.slots.iter().enumerate())
+                    .map(|(i, sl)| match m.slot_active(i) {
+                        true => (sl.x, sl.y, sl.rule),
+                        false => (crate::menu::HIDDEN, crate::menu::HIDDEN, sl.rule),
+                    })
+                    .collect(),
                 stacks,
                 carried: m.carried.clone(),
                 screen: s.view(m),
                 data: m.data.clone(),
                 cooldowns,
                 creative: None,
+                station,
             })
         });
         *lock(&self.container_view) = view.map(Arc::new);
@@ -515,6 +550,7 @@ impl Game {
         self.containers.screen = Some(Screen::new(kind, width, height));
         self.containers.title = title.map(Arc::new);
         self.containers.serial += 1;
+        self.station_opened(kind);
         // It takes the place of the death screen or the bed screen.
         self.death_screen = None;
         self.bed_screen = false;
@@ -547,8 +583,9 @@ impl Game {
         eprintln!("[menu] open_screen container {container_id} type {menu_type}");
         match Kind::from_menu_type(menu_type) {
             Some(kind) => {
+                let menu = self.new_menu(kind, container_id);
                 if let Some(w) = &mut self.world {
-                    w.player.menus.open = Some(Menu::new(kind, container_id));
+                    w.player.menus.open = Some(menu);
                 }
                 self.show_screen(kind, Some(title));
             }
@@ -587,10 +624,41 @@ impl Game {
             eprintln!("[menu] mount screen for entity {entity_id}, not a mount: nothing opens");
             return;
         };
+        let name = u32::try_from(e.entity_type)
+            .ok()
+            .and_then(ruthenium_data::v26_3::registries::EntityType::from_id)
+            .map_or("", |t| t.name());
+        let state = crate::menu::mount::MountState {
+            alive: !e.removed && e.health > 0.0,
+            baby: e.baby,
+            // `AbstractHorse.isTamed` is its flags' bit 2; a nautilus is a
+            // `TamableAnimal`.
+            tamed: if name.ends_with("nautilus") {
+                e.tame
+            } else {
+                e.horse_flags & 2 != 0
+            },
+        };
+        let tags = self
+            .physics
+            .as_ref()
+            .map(|p| p.items.tags.clone())
+            .unwrap_or_default();
+        let entity_type = e.entity_type;
+        let Some(mount) = crate::menu::mount::Mount::new(name, entity_type, columns, state, &tags)
+        else {
+            self.open_placeholder(container_id, Placeholder::mount(columns), title);
+            return;
+        };
         eprintln!(
-            "[menu] entity {entity_id}'s inventory ({columns} columns, container {container_id}): a placeholder"
+            "[menu] entity {entity_id}'s inventory ({columns} columns, container {container_id}): {mount:?}"
         );
-        self.open_placeholder(container_id, Placeholder::mount(columns), title);
+        let kind = Kind::Mount(mount);
+        let menu = self.new_menu(kind, container_id);
+        if let Some(w) = &mut self.world {
+            w.player.menus.open = Some(menu);
+        }
+        self.show_screen(kind, Some(title));
     }
 
     /// `LocalPlayer.closeContainer`: the server is told, then the client closes it.
@@ -694,13 +762,18 @@ impl Game {
             return;
         };
         let p = &w.player;
-        if !p.is_alive() || p.health <= 0.0 {
+        // (A lectern's book screen isn't a container screen: it has no such tick.)
+        if s.kind == Kind::Lectern {
+            self.station_tick();
+        } else if !p.is_alive() || p.health <= 0.0 {
             self.close_container();
         } else if s.kind == Kind::Inventory && p.abilities.instabuild {
             // `InventoryScreen.containerTick`: the creative screen takes its place.
             self.open_creative();
         } else if s.kind == Kind::Creative {
             self.creative_tick();
+        } else {
+            self.station_tick();
         }
     }
 
@@ -710,6 +783,14 @@ impl Game {
 }
 
 impl Game {
+    /// A menu of `kind` opening with container id `id`, with the session's items (a
+    /// grindstone makes its result with them).
+    fn new_menu(&self, kind: Kind, id: i32) -> Menu {
+        let mut m = Menu::new(kind, id);
+        m.items = crate::menu::stations::MenuItems(self.physics.as_ref().map(|p| p.items.clone()));
+        m
+    }
+
     /// The tags the menus read (a beacon's payment, a brewing stand's potions, who may
     /// wear a mount's armour, curses), from the server's tags: into the items, where the
     /// menus' rules find them.

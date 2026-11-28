@@ -20,6 +20,9 @@ use super::{Menu, SCANCODE_ESCAPE, Screen};
 /// SDL's scancodes of the shift and control keys, left and right.
 const SHIFT: [u32; 2] = [225, 229];
 const CTRL: [u32; 2] = [224, 228];
+/// SDL's scancodes of Page Up and Page Down (`SDLK_PAGEUP`, `SDLK_PAGEDOWN`).
+const PAGE_UP: u32 = 75;
+const PAGE_DOWN: u32 = 78;
 
 /// The container screen's input between frames.
 #[derive(Debug, Default)]
@@ -205,11 +208,19 @@ impl Menu {
         }
         let mut binds = self.screen_binds(Key::scancode(scancode));
         binds.escape = scancode == SCANCODE_ESCAPE;
+        (binds.page_up, binds.page_down) = (scancode == PAGE_UP, scancode == PAGE_DOWN);
         let (ctrl, at) = (self.ctrl_held(), self.pointer_at());
+        // A lectern's book screen isn't a container screen: the inventory key does
+        // nothing there.
+        let book = self
+            .session
+            .as_ref()
+            .and_then(|s| s.container_view())
+            .is_some_and(|v| v.kind == ruthenium_sim::menu::Kind::Lectern);
         if let Some(s) = &self.session {
             s.screen_input(ScreenInput::Key { binds, ctrl, at });
         }
-        if binds.escape || binds.inventory {
+        if binds.escape || binds.inventory && !book {
             self.container_closed();
         }
     }

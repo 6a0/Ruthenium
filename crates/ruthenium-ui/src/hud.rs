@@ -20,7 +20,9 @@ use ruthenium_javamath::random::JavaRandom;
 use ruthenium_protocol::text::Lang;
 use ruthenium_sim::hud::{HudEffect, HudRecord, OFF_HAND};
 
-pub use self::container::{BACKGROUNDS, ContainerDraw, background_name, view_background};
+pub use self::container::{
+    BACKGROUNDS, ContainerDraw, background_name, background_path, view_background,
+};
 use self::text::Words;
 pub use self::text::{HudFace, HudMemory, HudText, TextLine};
 use crate::draw::{DrawList, SpriteInfo, Sprites};
