@@ -2031,6 +2031,16 @@ impl LocalPlayer {
         self.health = health;
     }
 
+    /// `LivingEntity.handleDamageEvent` (LivingEntity.java:2049) for the local player: a
+    /// flinch, and the next hurt held off for 20 ticks. The cooldown is what makes the
+    /// hearts blink (Hud.java:771): a server sends the lower health in the player's
+    /// entity data as well, and when that comes before `set_health` (`/damage`, a
+    /// player's hit), `hurtTo` sees no loss and leaves the cooldown alone.
+    pub fn handle_damage_event(&mut self) {
+        self.damage_cooldown = 20;
+        self.first_person.hurt(None);
+    }
+
     /// `isScoping`: looking through a spyglass.
     pub fn is_scoping(&self) -> bool {
         self.is_using_item() && self.use_item.c.class == crate::item::Class::Spyglass
@@ -4642,6 +4652,24 @@ mod tests {
             vehicle_points: vec![[0.0, 0.6, 0.0]],
             attributes: Vec::new(),
         }])
+    }
+
+    #[test]
+    fn a_damage_event_holds_off_the_next_hurt_when_the_health_came_before() {
+        // Live on vanilla and Paper (2026-11-28): after `/damage` the lower health
+        // came first in the player's entity data, then the damage event, then
+        // `set_health` with the health the player already had.
+        let types = player_types();
+        let mut p = LocalPlayer::new();
+        p.hurt_to(20.0);
+        p.set_data(&[(9, DataValue::Float(17.0))], &types);
+        assert_eq!((p.health, p.damage_cooldown), (17.0, 0));
+        p.handle_damage_event();
+        p.hurt_to(17.0);
+        assert_eq!((p.health, p.damage_cooldown), (17.0, 20));
+        let mut r = crate::first_person::FirstPersonRecord::default();
+        p.first_person.record(&mut r);
+        assert_eq!(r.hurt_time, 10);
     }
 
     #[test]

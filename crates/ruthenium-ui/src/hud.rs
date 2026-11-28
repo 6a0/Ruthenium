@@ -1220,6 +1220,38 @@ mod tests {
     }
 
     #[test]
+    fn hearts_blink_at_a_hurt_whose_health_came_before_set_health() {
+        // Live on vanilla and Paper (2026-11-28): after `/damage` (and a player's hit)
+        // the lower health comes first in the player's entity data, then the damage
+        // event, then a `set_health` that changes nothing; only the damage event's
+        // cooldown lets the hearts see the loss (Hud.java:771).
+        use ruthenium_sim::hud::HudState;
+        use ruthenium_sim::player::LocalPlayer;
+        let mut p = LocalPlayer::new();
+        p.hurt_to(20.0);
+        let mut state = HudState::default();
+        let mut health = HudHealth::default();
+        let mut record = HudRecord::default();
+        let mut show = |p: &LocalPlayer, state: &mut HudState, millis: i64| {
+            state.tick(p);
+            record.fill(state, p, false, false, false);
+            record.survival = true;
+            lay_with(&record, &mut health, millis, HudOptions::default())
+                .of("hud/heart/container")
+                .iter()
+                .any(|(n, _)| n.ends_with("_blinking"))
+        };
+        assert!(!show(&p, &mut state, 10_000));
+        p.health = 17.0;
+        p.handle_damage_event();
+        p.hurt_to(17.0);
+        let blinks: Vec<bool> = (0..20)
+            .map(|i| show(&p, &mut state, 10_050 + i * 50))
+            .collect();
+        assert!(blinks.iter().any(|b| *b), "{blinks:?}");
+    }
+
+    #[test]
     fn hearts_blink_when_health_changes_and_show_what_was_lost() {
         let mut health = HudHealth::default();
         let options = HudOptions::default();

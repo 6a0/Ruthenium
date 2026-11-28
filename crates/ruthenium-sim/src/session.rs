@@ -3206,7 +3206,7 @@ impl Game {
                 let effects = self.damage_effects(source_type);
                 if let Some(w) = &mut self.world {
                     if entity_id == w.player.entity_id {
-                        w.player.first_person.hurt(None);
+                        w.player.handle_damage_event();
                         self.sounds.hurt(&w.player, &effects);
                     } else {
                         w.entities.damaged(entity_id);
@@ -4220,6 +4220,15 @@ mod tests {
         let f = r.frame(100);
         assert_eq!(f.hud.ticks, ticks + i32::try_from(f.ticks).unwrap());
         assert!(f.hud.ticks > ticks);
+
+        // The player's own damage event holds off the next hurt too: with the health
+        // already lowered by the entity data, `set_health` alone would not.
+        assert_eq!(f.hud.damage_cooldown, 10);
+        r.packet(play::Clientbound::DamageEvent {
+            entity_id: f.player.entity_id,
+            source_type: 0,
+        });
+        assert_eq!(r.frame(1).hud.damage_cooldown, 20);
     }
 
     #[test]
