@@ -95,6 +95,8 @@ impl SignText {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Ink {
     Char(char),
+    /// A character of the `minecraft:alt` font (an enchanting table's words).
+    Alt(char),
     /// Filled: underlines and strikes.
     Bar,
 }
@@ -408,7 +410,8 @@ impl GlyphPages {
         }
         let (width, height, texels) = match ink {
             Ink::Bar => (5, 8, vec![255; 5 * 8 * 4]),
-            Ink::Char(c) => {
+            // (`font` is the one the ink is of.)
+            Ink::Char(c) | Ink::Alt(c) => {
                 // Reject glyphs too large for a page before copying/converting their pixels.
                 let fits = font
                     .glyph(c)

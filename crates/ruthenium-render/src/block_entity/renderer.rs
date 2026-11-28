@@ -218,6 +218,8 @@ pub struct BlockEntityAssets {
     pub textures: Vec<(String, SkyImage)>,
     /// What signs and names are written in.
     pub font: Font,
+    /// The `minecraft:alt` font (Standard Galactic: an enchanting table's words).
+    pub alt_font: Font,
     pub lang: HashMap<String, String>,
     /// The picture of an entity's shadow (`textures/misc/shadow.png`).
     pub shadow: Option<SkyImage>,
@@ -780,6 +782,7 @@ pub(crate) struct BlockEntityRenderer {
     resting: HashMap<u32, Vec<PartDraw>>,
     patterns: HashMap<[i32; 3], Patterns>,
     font: Font,
+    alt_font: Font,
     lang: HashMap<String, String>,
     pages: GlyphPages,
     signs: HashMap<[i32; 3], Sign>,
@@ -1021,6 +1024,7 @@ impl BlockEntityRenderer {
             resting: HashMap::new(),
             patterns: HashMap::new(),
             font: assets.font,
+            alt_font: assets.alt_font,
             lang: assets.lang,
             pages: GlyphPages::default(),
             signs: HashMap::new(),
@@ -1145,6 +1149,7 @@ impl BlockEntityRenderer {
             self.item_pool.grow_now()?;
         }
         self.font = assets.font;
+        self.alt_font = assets.alt_font;
         self.lang = assets.lang;
         self.equipment = assets.equipment;
         self.trim_bases = assets
@@ -2738,6 +2743,11 @@ impl BlockEntityRenderer {
         &self.font
     }
 
+    /// The `minecraft:alt` font.
+    pub fn alt_font(&self) -> &Font {
+        &self.alt_font
+    }
+
     /// The language texts are translated with.
     pub fn lang(&self) -> &HashMap<String, String> {
         &self.lang
@@ -2899,7 +2909,13 @@ impl BlockEntityRenderer {
     fn gui_text(&mut self, text: &HudText, out: &mut Vec<Quad>) {
         let random = &mut self.random;
         let mut pick = |below: usize| next_random(random, below);
-        let (font, pages) = (&self.font, &mut self.pages);
+        let font = if text.alt { &self.alt_font } else { &self.font };
+        let pages = &mut self.pages;
+        let ink = if text.alt {
+            sign::Ink::Alt
+        } else {
+            sign::Ink::Char
+        };
         let mut pen = Pen {
             at: [text.x, text.y],
             scale: text.scale,
@@ -2912,9 +2928,7 @@ impl BlockEntityRenderer {
         let mut put = |c: char, style: Style| {
             let c = sign::drawn(c, style, font, &mut pick);
             let glyph = font.glyph(c);
-            let picture = glyph
-                .picture
-                .and_then(|_| pages.picture(sign::Ink::Char(c), font));
+            let picture = glyph.picture.and_then(|_| pages.picture(ink(c), font));
             pen.put(&glyph, style, picture, out);
         };
         match &text.line {

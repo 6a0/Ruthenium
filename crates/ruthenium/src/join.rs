@@ -629,6 +629,7 @@ fn block_entity_assets(
     for w in &font.warnings {
         eprintln!("[ruthenium] {w}");
     }
+    let alt_font = Font::load(resources, &Id::minecraft("alt").expect("a valid id"));
     let lang = resources
         .get(&Id::minecraft(LANG_PATH).expect("a valid id"))
         .and_then(|r| ruthenium_assets::lang::read(&r).ok())
@@ -637,6 +638,7 @@ fn block_entity_assets(
         models,
         textures,
         font,
+        alt_font,
         lang,
         shadow: image("textures/misc/shadow.png"),
         equipment,
