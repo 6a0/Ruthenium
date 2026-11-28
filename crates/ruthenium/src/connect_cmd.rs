@@ -36,6 +36,12 @@
 //! `eff2.ID` (a beacon's primary or secondary effect by its registry id), `offer.I`
 //! and `roffer.I` (an enchanting table's offer 0 to 2, left or right), and `pgup` and
 //! `pgdn` (a book's Page Up and Page Down).
+//! For the workstations: `at.X.Y` and `rat.X.Y` (a left or right click at X, Y in the
+//! window, from its corner: a stonecutter's recipe, a trade's button), `wheel.N` (the
+//! wheel, positive up), `type.TEXT` (typed into an edit box, as `chat=` writes text),
+//! `ekey.K` (a key an edit box reads, then the same key's bindings: `backspace`,
+//! `delete`, `home`, `end`, `left`, `right`, `all`, `cut`) and `ikey` (the inventory
+//! key over the screen, which closes it unless an edit box takes it).
 //!
 //! What the chat shows is printed as it comes. A death is printed, and Respawn pressed as soon as the death screen's buttons work;
 //! the script goes on (it doesn't start over) once the player is back.
@@ -188,6 +194,8 @@ enum ScreenEvent {
     Text(String),
     Tab(usize),
     Scroll(f64),
+    Wheel(f64),
+    EditKey(ruthenium_sim::menu::work::edit_box::EditKey),
 }
 
 /// The screen events of a script token (see the module docs), if it is one.
@@ -309,6 +317,38 @@ fn screen_events(k: &str) -> Option<Vec<ScreenEvent>> {
             false,
             At::Outside,
         )],
+        ["at", x, y] => click(1, At::Window(x.parse().ok()?, y.parse().ok()?), false),
+        ["rat", x, y] => click(3, At::Window(x.parse().ok()?, y.parse().ok()?), false),
+        ["wheel", n] => vec![ScreenEvent::Wheel(n.parse().ok()?)],
+        ["ekey", k] => {
+            use ruthenium_sim::menu::work::edit_box::EditKey as E;
+            let key = match *k {
+                "backspace" => E::Backspace,
+                "delete" => E::Delete,
+                "home" => E::Home,
+                "end" => E::End,
+                "left" => E::Left,
+                "right" => E::Right,
+                "all" => E::SelectAll,
+                "cut" => E::Cut,
+                _ => return None,
+            };
+            vec![
+                ScreenEvent::EditKey(key),
+                Key(Binds::default(), false, At::Outside),
+            ]
+        }
+        ["ikey"] => vec![
+            ScreenEvent::EditKey(ruthenium_sim::menu::work::edit_box::EditKey::Other),
+            Key(
+                Binds {
+                    inventory: true,
+                    ..Binds::default()
+                },
+                false,
+                At::Outside,
+            ),
+        ],
         ["raw", slot, button, input] => {
             // (A negative slot reads as "raw.-999...": its minus was kept.)
             let input = Input::from_name(input).or_else(|| Input::from_id(input.parse().ok()?))?;
@@ -386,7 +426,7 @@ impl Player {
         };
         for e in &st.screen {
             println!("          screen: {e:?}");
-            session.screen_input(match *e {
+            session.screen_input(match e.clone() {
                 ScreenEvent::Press(button, at, shift) => ScreenInput::Press {
                     button,
                     at,
@@ -414,6 +454,16 @@ impl Player {
                 ScreenEvent::Text(ref t) => ScreenInput::Text(t.clone()),
                 ScreenEvent::Tab(i) => ScreenInput::Tab(i),
                 ScreenEvent::Scroll(y) => ScreenInput::Scroll { y, at: At::Outside },
+                ScreenEvent::Wheel(amount) => ScreenInput::Scroll {
+                    y: amount,
+                    at: At::Outside,
+                },
+                ScreenEvent::EditKey(key) => ScreenInput::EditKey {
+                    key,
+                    shift: false,
+                    ctrl: false,
+                    paste: String::new(),
+                },
             });
         }
         for _ in 0..st.swaps {
@@ -739,6 +789,8 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     let mut transferred = false;
     let mut session_number = 1;
     loop {
+        // The language stacks' names are read in (an anvil's name box), as the window's.
+        session.set_language(joiner.server_lang());
         let mut closed = None;
         for e in session.poll() {
             let t = started.elapsed().as_secs_f64();

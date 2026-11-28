@@ -57,6 +57,8 @@ pub enum At {
         primary: bool,
     },
     Offer(usize),
+    /// In GUI units from the window's corner (a workstation's button, for scripts).
+    Window(f64, f64),
 }
 
 /// A container screen's event, from the window or a script.
@@ -291,6 +293,7 @@ impl Game {
         ctx.sent.extend(ctx.menus.container_mut().take_outbox());
         let (sent, dropped) = (std::mem::take(&mut ctx.sent), ctx.dropped);
         for packet in sent {
+            super::work::log_sent(&packet);
             self.connection.send(packet);
         }
         for _ in 0..dropped {
@@ -322,6 +325,7 @@ impl Game {
                 f64::from(s.top + 14 + 19 * i as i32 + 9),
             ),
             (At::Button(_) | At::Effect { .. }, ..) => self.station_place(at),
+            (At::Window(x, y), Some(s), _) => (f64::from(s.left) + x, f64::from(s.top) + y),
             _ => (-1.0, -1.0),
         }
     }

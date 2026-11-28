@@ -85,6 +85,7 @@ impl Game {
         };
         let packets = w.player.menus.container_mut().take_outbox();
         for p in packets {
+            log_sent(&p);
             self.connection.send(p);
         }
     }
@@ -123,4 +124,33 @@ impl Game {
             can_restock,
         );
     }
+}
+
+/// `RUTHENIUM_MENU_LOG`: a workstation's own packets as they go.
+pub(super) fn log_sent(p: &[u8]) {
+    use ruthenium_data::v26_3::packets::play::Serverbound as S;
+    if !crate::menu::log_enabled() {
+        return;
+    }
+    let Some(&id) = p.first() else {
+        return;
+    };
+    let mut r = ruthenium_protocol::wire::Reader::new(&p[1..]);
+    let what = match S::from_id(u32::from(id)) {
+        Some(S::RenameItem) => format!("rename_item {:?}", r.string(32767).unwrap_or("?")),
+        Some(S::ContainerButtonClick) => format!(
+            "container_button_click container {} button {}",
+            r.varint().unwrap_or(-1),
+            r.varint().unwrap_or(-1)
+        ),
+        Some(S::SelectTrade) => format!("select_trade {}", r.varint().unwrap_or(-1)),
+        Some(S::ContainerSlotStateChanged) => format!(
+            "container_slot_state_changed slot {} container {} {}",
+            r.varint().unwrap_or(-1),
+            r.varint().unwrap_or(-1),
+            r.bool().unwrap_or(false)
+        ),
+        _ => return,
+    };
+    eprintln!("[menu] sent {what}");
 }
