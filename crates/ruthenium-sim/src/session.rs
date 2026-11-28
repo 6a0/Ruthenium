@@ -84,6 +84,7 @@ use crate::weather::Weather;
 use crate::world::{BiomeInfo, ChunkPacket, Level, global_bits};
 
 mod containers;
+mod creative;
 mod packs;
 mod transfer;
 pub use containers::{At, ContainerView, Pointer, ScreenInput};
@@ -195,6 +196,8 @@ pub enum SessionEvent {
     ContainerOpened,
     /// The container screen closed.
     ContainerClosed,
+    /// The creative inventory's search box copied or cut this to the clipboard.
+    Clipboard(String),
     /// The server offered resource packs and the player is asked
     /// (`addOrUpdatePackPrompt`): show the prompt, or update the one showing. Answer with
     /// [`Session::answer_pack_prompt`].
@@ -276,6 +279,8 @@ struct FrameInput {
     /// held (a drag).
     pointer: Option<Pointer>,
     drag: bool,
+    /// What the creative inventory reads of the window.
+    creative: creative::CreativeInput,
 }
 
 /// The local player as of the last tick, for the screen.
@@ -631,6 +636,23 @@ impl Session {
         lock(&self.input).screen_open = open;
     }
 
+    /// Whether the Save Hotbar and Load Hotbar activators are held (`isDown`).
+    pub fn set_hotbar_activators(&self, save: bool, load: bool) {
+        let mut input = lock(&self.input);
+        input.creative.save_down = save;
+        input.creative.load_down = load;
+    }
+
+    /// The language the creative inventory's search reads tooltips in.
+    pub fn set_language(&self, lang: Arc<HashMap<String, String>>) {
+        lock(&self.input).creative.language = Some(lang);
+    }
+
+    /// The Operator Items Tab option (`operatorItemsTab`).
+    pub fn set_operator_items_tab(&self, on: bool) {
+        lock(&self.input).creative.operator_tab = Some(on);
+    }
+
     /// Whether the player list's key is held: the frames then carry the list.
     pub fn set_player_list(&self, shown: bool) {
         lock(&self.input).player_list = shown;
@@ -747,6 +769,8 @@ struct Game {
     item_tags: crate::item::ItemTags,
     /// The recipe property sets the server sent.
     recipe_sets: crate::item::RecipeSets,
+    /// The creative inventory.
+    creative: creative::CreativeSession,
     /// The block transformers of the configuration's registry.
     transformers: crate::use_on::Transformers,
     clock: TickClock,
@@ -1010,6 +1034,7 @@ impl Game {
             tags: BlockTags::new(),
             item_tags: crate::item::ItemTags::new(),
             recipe_sets: crate::item::RecipeSets::new(),
+            creative: creative::CreativeSession::default(),
             transformers: crate::use_on::Transformers::default(),
             clock: TickClock::new(0),
             frames: 0,
@@ -1564,6 +1589,7 @@ impl Game {
         if let Some(p) = input.pointer {
             self.set_pointer(p);
         }
+        self.take_creative_input(&input.creative);
         for e in &input.screen_inputs {
             self.screen_input(e);
         }
@@ -2052,6 +2078,10 @@ impl Game {
         for p in out.drain(..) {
             self.connection.send(p);
         }
+        // `LocalPlayer.tick` once loaded: the drop throttle.
+        if w.loaded {
+            self.creative.state.tick();
+        }
         if let Some(load) = &mut w.load {
             let (cx, cz) = w.player.chunk();
             let chunk = w.level.has_chunk(cx, cz);
@@ -2137,13 +2167,21 @@ impl Game {
                 others: None,
             };
             hit = Some(pick_target(&env, &w.entities, &self.players, &w.player));
+            let mut saved_hotbars = Vec::new();
             for (slot, pending) in self.hotbar_clicks.iter_mut().enumerate() {
                 if *pending > 0 {
                     *pending -= 1;
-                    if !w.player.spectator {
+                    // Save or Load Hotbar held in creative: `handleHotbarLoadOrSave`.
+                    let activators = self.creative.save_down || self.creative.load_down;
+                    if !w.player.spectator && w.player.abilities.instabuild && activators {
+                        saved_hotbars.push(slot);
+                    } else if !w.player.spectator {
                         w.player.inventory.selected = slot as i32;
                     }
                 }
+            }
+            for slot in saved_hotbars {
+                self.creative_hotbar_key(slot);
             }
             self.inventory_key();
         }
@@ -2354,6 +2392,7 @@ impl Game {
                     c.tags = std::mem::take(&mut self.configured.tags);
                 }
                 self.configured = c;
+                self.creative.configuration += 1;
                 self.containers.registries = self.configured.keys();
                 self.transformers = self.configured_transformers();
                 self.chat_types = self.configured_chat_types();
@@ -2976,6 +3015,7 @@ impl Game {
                         if item.patch.is_empty() { "" } else { "+patch" }
                     );
                 }
+                let mut creative_heard = false;
                 if let Some(w) = &mut self.world
                     && let Some(physics) = &self.physics
                 {
@@ -2996,12 +3036,17 @@ impl Game {
                         p.menus
                             .inventory
                             .set_item(&mut p.inventory, i32::from(slot), state_id, s);
+                        creative_heard = true;
                     } else if let Some(menu) =
                         p.menus.open.as_mut().filter(|m| m.id == container_id)
                     {
                         menu.set_item(&mut p.inventory, i32::from(slot), state_id, s);
                         self.hud.slots_replaced();
                     }
+                }
+                // The creative screen's listener hears it (and sends it back).
+                if creative_heard {
+                    self.creative_set_slot();
                 }
             }
             play::Clientbound::SetPlayerInventory { slot, item } => {
@@ -3029,8 +3074,10 @@ impl Game {
                 if crate::menu::log_enabled() {
                     eprintln!("[menu] got set_cursor_item {}*{}", item.item, item.count);
                 }
+                // (Not while the creative screen is up.)
                 if let Some(w) = &mut self.world
                     && let Some(physics) = &self.physics
+                    && !self.creative.state.screen.is_some()
                 {
                     w.player.menus.container_mut().carried = physics.items.stack(&item);
                 }

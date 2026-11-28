@@ -80,6 +80,19 @@ pub enum ScreenInput {
         button: i32,
         input: Input,
     },
+    /// A key over the creative screen, with what its search box reads of it.
+    CreativeKey {
+        key: crate::menu::creative::CreativeKey,
+        at: At,
+    },
+    /// A key went up (the creative screen's `keyReleased`).
+    KeyReleased,
+    /// Typed text (the creative screen's `charTyped`).
+    Text(String),
+    /// The wheel over the screen: SDL's vertical amount (`mouseScrolled`).
+    Scroll { y: f64, at: At },
+    /// The creative screen's tab of this place among those shown is selected (scripts).
+    Tab(usize),
 }
 
 /// The frame's pointer over a screen: where (GUI units), the GUI's size.
@@ -111,6 +124,8 @@ pub struct ContainerView {
     pub data: Vec<i32>,
     /// Each slot's cooldown as of this tick: ticks left and of how many.
     pub cooldowns: Vec<crate::hud::Cooldown>,
+    /// The creative inventory's tabs, scroller and search box.
+    pub creative: Option<Arc<crate::menu::creative::CreativeView>>,
 }
 
 /// The session's container screen state.
@@ -258,6 +273,11 @@ impl Game {
         let menu = self.world.as_ref().map(|w| w.player.menus.container());
         match (at, s, menu) {
             (At::Gui(x, y), ..) => (x, y),
+            (At::Slot(i), Some(s), _) if s.kind == Kind::Creative => {
+                self.creative_slot_place(i).map_or((-1.0, -1.0), |(x, y)| {
+                    (f64::from(s.left + x + 8), f64::from(s.top + y + 8))
+                })
+            }
             (At::Slot(i), Some(s), Some(m)) => m.slots.get(i).map_or((-1.0, -1.0), |slot| {
                 (
                     f64::from(s.left + slot.x + 8),
@@ -284,6 +304,29 @@ impl Game {
             return;
         }
         let serial = self.containers.serial;
+        if s.kind == Kind::Creative {
+            let at = match e {
+                ScreenInput::Press { at, .. }
+                | ScreenInput::Release { at, .. }
+                | ScreenInput::Drag { at }
+                | ScreenInput::Key { at, .. }
+                | ScreenInput::CreativeKey { at, .. }
+                | ScreenInput::Scroll { at, .. } => *at,
+                _ => At::Gui(self.containers.pointer.x, self.containers.pointer.y),
+            };
+            let place = self.place(at);
+            let mut double = false;
+            if let ScreenInput::Press { button, when, .. } = *e {
+                double = self.containers.last_click.is_some_and(|(t, s, b)| {
+                    s == serial && b == button && when.saturating_duration_since(t) < DOUBLE_CLICK
+                });
+                self.containers.last_click = Some((when, serial, button));
+            }
+            if self.creative_input(e, place, double) {
+                self.close_container();
+            }
+            return;
+        }
         match *e {
             ScreenInput::Press {
                 button,
@@ -343,6 +386,12 @@ impl Game {
             } => {
                 self.with_screen(|_, c| c.click(slot, button, input));
             }
+            // The creative screen's alone.
+            ScreenInput::CreativeKey { .. }
+            | ScreenInput::KeyReleased
+            | ScreenInput::Text(_)
+            | ScreenInput::Scroll { .. }
+            | ScreenInput::Tab(_) => {}
         }
     }
 
@@ -369,6 +418,44 @@ impl Game {
     /// with the pointer that moved, the slot under it, and what is drawn.
     pub(super) fn container_frame(&mut self, drag: bool) {
         let Pointer { x, y, .. } = self.containers.pointer;
+        if self.creative_open() {
+            self.creative_frame(x, y, drag);
+            let view = self.containers.screen.as_ref().and_then(|s| {
+                let w = self.world.as_ref()?;
+                let cs = self.creative.state.screen.as_ref()?;
+                let p = &w.player;
+                let m = cs.menu();
+                let stacks: Vec<Stack> = (0..m.slots.len())
+                    .map(|i| m.item(&p.inventory, i).clone())
+                    .collect();
+                let cooldowns = stacks
+                    .iter()
+                    .map(|st| {
+                        if st.is_empty() {
+                            crate::hud::Cooldown::default()
+                        } else {
+                            p.cooldowns.of(&st.cooldown_group())
+                        }
+                    })
+                    .collect();
+                Some(ContainerView {
+                    serial: self.containers.serial,
+                    kind: s.kind,
+                    title: None,
+                    image_width: s.image_width,
+                    image_height: s.image_height,
+                    slots: m.slots.iter().map(|sl| (sl.x, sl.y, sl.rule)).collect(),
+                    stacks,
+                    carried: p.menus.inventory.carried.clone(),
+                    screen: s.view(m),
+                    data: Vec::new(),
+                    cooldowns,
+                    creative: self.creative_view(),
+                })
+            });
+            *lock(&self.container_view) = view.map(Arc::new);
+            return;
+        }
         if drag {
             if crate::menu::log_enabled() {
                 eprintln!("[menu] drag at {x}, {y}");
@@ -405,6 +492,7 @@ impl Game {
                 screen: s.view(m),
                 data: m.data.clone(),
                 cooldowns,
+                creative: None,
             })
         });
         *lock(&self.container_view) = view.map(Arc::new);
@@ -421,7 +509,7 @@ impl Game {
     }
 
     /// `gui.setScreen` of a container screen for the menu now open (`kind`'s).
-    fn show_screen(&mut self, kind: Kind, title: Option<Tag>) {
+    pub(super) fn show_screen(&mut self, kind: Kind, title: Option<Tag>) {
         self.replace_screen();
         let Pointer { width, height, .. } = self.containers.pointer;
         self.containers.screen = Some(Screen::new(kind, width, height));
@@ -440,6 +528,9 @@ impl Game {
         let Some(s) = self.containers.screen.take() else {
             return false;
         };
+        if s.kind == Kind::Creative {
+            self.creative_removed();
+        }
         if s.kind == Kind::Inventory
             && let Some(w) = &mut self.world
         {
@@ -509,6 +600,7 @@ impl Game {
         };
         let id = w.player.menus.container().id;
         eprintln!("[menu] sent close container {id}");
+        self.creative_closed();
         self.connection.send(play::container_close(id));
         self.client_side_close_container();
     }
@@ -541,14 +633,17 @@ impl Game {
     /// reconfiguration): another menu open is closed first if `tell` (`handleRespawn`),
     /// and any screen goes without a word.
     pub(super) fn drop_screen(&mut self, tell: bool) {
+        // (The creative picker open counts: `containerMenu` isn't the inventory's.)
         if tell
-            && self
-                .world
-                .as_ref()
-                .is_some_and(|w| w.player.menus.has_container_open())
+            && (self.creative.picker_open
+                || self
+                    .world
+                    .as_ref()
+                    .is_some_and(|w| w.player.menus.has_container_open()))
         {
             self.close_container();
         }
+        self.creative_new_player();
         if self.containers.screen.take().is_some() {
             self.report(SessionEvent::ContainerClosed);
         }
@@ -576,8 +671,10 @@ impl Game {
                     play::PLAYER_COMMAND_OPEN_INVENTORY,
                     0,
                 ));
-            } else if p.creative {
-                eprintln!("[menu] the creative inventory isn't run: nothing opens");
+            } else if p.abilities.instabuild {
+                // `InventoryScreen.init` gives way to the creative screen at once.
+                self.open_creative();
+                return true;
             } else {
                 self.show_screen(Kind::Inventory, None);
                 return true;
@@ -599,8 +696,11 @@ impl Game {
         let p = &w.player;
         if !p.is_alive() || p.health <= 0.0 {
             self.close_container();
-        } else if s.kind == Kind::Inventory && p.creative {
-            self.client_side_close_container();
+        } else if s.kind == Kind::Inventory && p.abilities.instabuild {
+            // `InventoryScreen.containerTick`: the creative screen takes its place.
+            self.open_creative();
+        } else if s.kind == Kind::Creative {
+            self.creative_tick();
         }
     }
 

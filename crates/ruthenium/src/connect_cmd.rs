@@ -730,6 +730,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                     );
                 }
                 SessionEvent::ContainerOpened => println!("{t:7.3}s  container screen open"),
+                SessionEvent::Clipboard(text) => println!("{t:7.3}s  copied {text:?}"),
                 SessionEvent::ContainerClosed => println!("{t:7.3}s  container screen closed"),
                 SessionEvent::Transfer(to) => {
                     println!("{t:7.3}s  transferred to {}", to.to);
