@@ -2722,6 +2722,16 @@ pub mod play {
         })
     }
 
+    /// `ServerboundContainerSlotStateChangedPacket`: a crafter's slot switched on or off
+    /// (the slot first, then the container).
+    pub fn container_slot_state_changed(slot: i32, container_id: i32, enabled: bool) -> Vec<u8> {
+        wire::packet(pl::Serverbound::ContainerSlotStateChanged.id(), |o| {
+            wire::write_varint(o, slot);
+            wire::write_varint(o, container_id);
+            wire::write_bool(o, enabled);
+        })
+    }
+
     /// `ServerboundSelectTradePacket`: the merchant's offer chosen, by its place in the
     /// list.
     pub fn select_trade(offer: i32) -> Vec<u8> {
@@ -4391,6 +4401,15 @@ mod tests {
         assert_eq!(
             play::container_close(5),
             [pl::Serverbound::ContainerClose.id() as u8, 5]
+        );
+        assert_eq!(
+            play::container_slot_state_changed(4, 2, false),
+            [
+                pl::Serverbound::ContainerSlotStateChanged.id() as u8,
+                4,
+                2,
+                0
+            ]
         );
         assert_eq!(
             play::select_trade(300),
