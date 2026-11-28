@@ -28,6 +28,7 @@ mod java_url;
 mod tests;
 
 pub use address::AddressRange;
+pub(crate) use address::is_public;
 pub use fetch::CancelToken;
 
 use std::net::IpAddr;

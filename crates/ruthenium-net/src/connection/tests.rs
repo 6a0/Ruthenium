@@ -577,7 +577,10 @@ fn a_transfer_says_so_and_answers_the_login_from_its_cookies() {
     cookies.insert("test:empty".to_owned(), Vec::new());
     let events = session_with(
         |port| ConnectOptions {
-            transfer: Some(TransferState { cookies }),
+            transfer: Some(TransferState {
+                cookies,
+                from: Some(IpAddr::from([127, 0, 0, 1])),
+            }),
             ..options(port, Auth::Offline)
         },
         |listener, port| async move {
@@ -623,4 +626,76 @@ fn a_join_answers_the_logins_cookie_requests_empty() {
         s.finish_login(&name).await;
     });
     assert_eq!(events[0], Event::Stage(Stage::Connecting));
+}
+
+#[test]
+fn a_public_servers_transfer_cant_reach_this_computer_or_its_network() {
+    // A transfer from a public server to this computer is refused before connecting:
+    // nothing listens on the port, and the reason isn't a refused connection.
+    let mut o = options(1, Auth::Offline);
+    o.local_only = false;
+    o.transfer = Some(TransferState {
+        cookies: HashMap::new(),
+        from: Some(IpAddr::from([1, 1, 1, 1])),
+    });
+    let c = Connection::open(o).unwrap();
+    let last = c
+        .events()
+        .iter()
+        .find(|e| matches!(e, Event::Closed(_)))
+        .unwrap();
+    assert_eq!(
+        last,
+        Event::Closed(Closed {
+            during_login: true,
+            reason: Reason::Local(Local::TransferNotPublic)
+        })
+    );
+}
+
+#[test]
+fn transfers_reach_this_network_only_from_a_server_on_it() {
+    let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+    let public = Some(ip("1.1.1.1"));
+    for to in [
+        "127.0.0.1",
+        "192.168.1.1",
+        "10.0.0.2",
+        "172.16.5.4",
+        "100.64.0.1",
+        "169.254.1.1",
+        "0.0.0.0",
+        "::1",
+        "fd00::1",
+        "fe80::1",
+        "::ffff:192.168.1.1",
+        "64:ff9b::c0a8:101",
+    ] {
+        assert!(
+            !transfer_allowed(public, ip(to)),
+            "{to} from a public server"
+        );
+        assert!(
+            !transfer_allowed(None, ip(to)),
+            "{to} from an unknown server"
+        );
+    }
+    for to in ["1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
+        assert!(transfer_allowed(public, ip(to)), "{to}");
+        assert!(transfer_allowed(None, ip(to)), "{to}");
+    }
+    for from in ["127.0.0.1", "192.168.1.20", "fd12::1"] {
+        assert!(
+            transfer_allowed(Some(ip(from)), ip("192.168.1.1")),
+            "from {from}"
+        );
+        assert!(
+            transfer_allowed(Some(ip(from)), ip("127.0.0.1")),
+            "from {from}"
+        );
+        assert!(
+            transfer_allowed(Some(ip(from)), ip("1.1.1.1")),
+            "from {from}"
+        );
+    }
 }

@@ -132,6 +132,22 @@ pub struct ConnectOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransferState {
     pub cookies: HashMap<String, Vec<u8>>,
+    /// The address of the server that sent the transfer, if known: whether it was itself
+    /// off the public internet decides where it may send the client
+    /// ([`transfer_allowed`]).
+    pub from: Option<IpAddr>,
+}
+
+/// Whether a transfer from the server at `from` may connect to `to`. Vanilla goes
+/// wherever a transfer says, checking only Mojang's blocked servers. Here a server can't
+/// send the client to this computer or its network (loopback, private, link-local,
+/// CGNAT, unique-local...: whatever a pack download may not reach either), so it can't
+/// point the player's client at their router or a service listening on their machine. A
+/// server that is itself off the public internet may: transfers between servers on one
+/// network keep working. An unknown sender counts as public.
+pub fn transfer_allowed(from: Option<IpAddr>, to: IpAddr) -> bool {
+    use crate::server_pack::is_public;
+    is_public(to) || from.is_some_and(|f| !is_public(f))
 }
 
 /// Where the login is, for the connecting screen (vanilla's `connect.*` messages).
@@ -163,6 +179,9 @@ pub enum Local {
     UnknownHost,
     /// `local_only`, and the server is elsewhere.
     NotLocal,
+    /// A transfer from a public server to an address on this computer or its network
+    /// ([`transfer_allowed`]).
+    TransferNotPublic,
     /// Connecting failed (refused, unreachable...).
     Connect(String),
     TimedOut,
@@ -186,6 +205,9 @@ impl std::fmt::Display for Local {
             Local::UnknownHost => f.write_str("Unknown host"),
             Local::NotLocal => f.write_str(
                 "Development builds only join servers on this computer or the local network",
+            ),
+            Local::TransferNotPublic => f.write_str(
+                "The server tried to send you to an address on your computer or local network",
             ),
             Local::Connect(e) | Local::Io(e) => f.write_str(e),
             Local::TimedOut => f.write_str("Timed out"),
@@ -645,6 +667,7 @@ async fn run(
         transfer,
     } = options;
     let transferring = transfer.is_some();
+    let transfer_from = transfer.as_ref().map(|t| t.from);
     let opened = Opened {
         brand,
         information,
@@ -667,6 +690,12 @@ async fn run(
         };
         if local_only && !is_local(socket.ip()) {
             return Err(Reason::Local(Local::NotLocal));
+        }
+        // Judged on the address connected to, after SRV and DNS.
+        if let Some(from) = transfer_from
+            && !transfer_allowed(from, socket.ip())
+        {
+            return Err(Reason::Local(Local::TransferNotPublic));
         }
         let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(socket))
             .await

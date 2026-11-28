@@ -89,6 +89,7 @@ impl Game {
             to: leaving.to?,
             state: TransferState {
                 cookies: std::mem::take(&mut self.cookies),
+                from: self.packs.peer,
             },
         })
     }
@@ -187,6 +188,7 @@ mod tests {
                     ("test:a", b"one"),
                     ("test:b", b"two"),
                 ]),
+                from: None,
             },
         };
         assert_eq!(
@@ -205,6 +207,10 @@ mod tests {
     fn a_transfer_in_play_goes_even_if_the_server_hangs_up_first() {
         let (mut game, mut remote, events, _scene) = game();
         game.phase = super::super::Phase::Play;
+        // The server left, as the login found it: where it may send the client
+        // depends on it (`transfer_allowed`).
+        let peer: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        game.packs.peer = Some(peer);
         let p = |p: Common| Event::Play(play::Clientbound::Common(p));
         remote.event(p(store("test:a", b"one")));
         remote.event(Event::Bundle(vec![
@@ -223,6 +229,7 @@ mod tests {
                     to: ServerAddress::new("::1", 25565),
                     state: TransferState {
                         cookies: cookies(&[("test:a", b"one"), ("test:b", b"two")]),
+                        from: Some(peer),
                     },
                 }),
                 SessionEvent::Closed(Closed {

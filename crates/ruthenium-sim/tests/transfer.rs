@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -296,12 +296,14 @@ fn transfers_carry_the_cookies_from_server_to_server() {
                 to: ServerAddress::new("127.0.0.1", port_b),
                 state: TransferState {
                     cookies: cookies(&[("test:a", &[1])]),
+                    from: Some(Ipv4Addr::LOCALHOST.into()),
                 },
             },
             Transfer {
                 to: ServerAddress::new("127.0.0.1", port_a),
                 state: TransferState {
                     cookies: cookies(&[("test:a", &[1]), ("test:b", &[2, 2]), ("test:c", &[3])]),
+                    from: Some(Ipv4Addr::LOCALHOST.into()),
                 },
             },
         ]
