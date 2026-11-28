@@ -154,6 +154,7 @@ impl InGame {
             s.set_player_list(false);
             s.set_use(false);
             s.set_attack(false);
+            s.set_hotbar_activators(false, false);
         }
     }
 
@@ -239,6 +240,10 @@ impl InGame {
         s.set_attack(held.action_down(binds, Action::Attack));
         s.set_use(held.action_down(binds, Action::Use));
         s.set_player_list(held.action_down(binds, Action::PlayerList));
+        s.set_hotbar_activators(
+            held.action_down(binds, Action::SaveToolbarActivator),
+            held.action_down(binds, Action::LoadToolbarActivator),
+        );
     }
 
     /// The movement keys as the game reads them: sneak and sprint as toggled or held.

@@ -25,6 +25,12 @@
 //! `esc` (Escape), and `raw.SLOT.BUTTON.INPUT` (a click as the screen's
 //! `slotClicked` makes it: INPUT is `pickup`, `quick_move`, `swap`, `clone`,
 //! `throw`, `quick_craft` or `pickup_all`; `raw.-999.0.pickup` outside).
+//! The creative screen takes these too, and `tab.I` (the I-th tab shown, from 0),
+//! `type.TEXT` (typed into the search box, `_` a space, `%XX` a byte), `key.CODE`
+//! (the key of that SDL scancode, with `skey`/`ckey` for shift/ctrl), `chatkey` (the
+//! chat key), `ekey` (the inventory key) and `scroll.Y` (the wheel). `csave` and
+//! `cload` hold Save Hotbar and Load Hotbar through the step (with a digit: C or X
+//! and that number in the world).
 //!
 //! What the chat shows is printed as it comes. A death is printed, and Respawn pressed as soon as the death screen's buttons work;
 //! the script goes on (it doesn't start over) once the player is back.
@@ -87,6 +93,8 @@ struct Step {
     /// Inventory key presses, and container screen events, at the step's start.
     inventory: u32,
     screen: Vec<ScreenEvent>,
+    /// Save Hotbar and Load Hotbar held through the step.
+    activators: (bool, bool),
     ms: u64,
     turn: (f32, f32),
 }
@@ -121,6 +129,7 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                 chat: None,
                 inventory: 0,
                 screen: Vec::new(),
+                activators: (false, false),
                 ms: ms.parse().map_err(|_| bad())?,
                 turn,
             };
@@ -144,6 +153,8 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
                     "swap" => st.swaps += 1,
                     "wake" => st.wake = true,
                     "inv" => st.inventory += 1,
+                    "csave" => st.activators.0 = true,
+                    "cload" => st.activators.1 = true,
                     k if screen_events(k).is_some() => {
                         st.screen.extend(screen_events(k).unwrap_or_default());
                     }
@@ -166,6 +177,12 @@ enum ScreenEvent {
     Drag(At),
     Key(Binds, bool, At),
     Click(i32, i32, Input),
+    /// The creative screen's: a key with its scancode (shift, ctrl), typed text, a tab,
+    /// the wheel.
+    CreativeKey(ruthenium_sim::menu::creative::CreativeKey),
+    Text(String),
+    Tab(usize),
+    Scroll(f64),
 }
 
 /// The screen events of a script token (see the module docs), if it is one.
@@ -228,6 +245,31 @@ fn screen_events(k: &str) -> Option<Vec<ScreenEvent>> {
             false,
             At::Outside,
         )],
+        ["tab", i] => vec![ScreenEvent::Tab(i.parse().ok()?)],
+        ["type", text] => vec![ScreenEvent::Text(script_text(text)?)],
+        ["scroll", y] => vec![ScreenEvent::Scroll(y.parse().ok()?)],
+        ["key" | "skey" | "ckey", code] => {
+            let mut k = ruthenium_sim::menu::creative::CreativeKey::default();
+            k.key.scancode = code.parse().ok()?;
+            k.key.shift = parts[0] == "skey";
+            k.key.shortcut = parts[0] == "ckey";
+            k.ctrl = k.key.shortcut;
+            vec![ScreenEvent::CreativeKey(k)]
+        }
+        ["chatkey"] => vec![ScreenEvent::CreativeKey(
+            ruthenium_sim::menu::creative::CreativeKey {
+                chat: true,
+                ..Default::default()
+            },
+        )],
+        ["ekey"] => vec![Key(
+            Binds {
+                inventory: true,
+                ..Binds::default()
+            },
+            false,
+            At::Outside,
+        )],
         ["raw", slot, button, input] => {
             // (A negative slot reads as "raw.-999...": its minus was kept.)
             let input = Input::from_name(input).or_else(|| Input::from_id(input.parse().ok()?))?;
@@ -283,6 +325,7 @@ impl Player {
             st.keys, st.ms, st.turn
         );
         session.set_keys(st.keys);
+        session.set_hotbar_activators(st.activators.0, st.activators.1);
         for &slot in &st.hotbar {
             session.hotbar_key(slot);
         }
@@ -325,6 +368,13 @@ impl Player {
                     button,
                     input,
                 },
+                ScreenEvent::CreativeKey(ref key) => ScreenInput::CreativeKey {
+                    key: key.clone(),
+                    at: At::Outside,
+                },
+                ScreenEvent::Text(ref t) => ScreenInput::Text(t.clone()),
+                ScreenEvent::Tab(i) => ScreenInput::Tab(i),
+                ScreenEvent::Scroll(y) => ScreenInput::Scroll { y, at: At::Outside },
             });
         }
         for _ in 0..st.swaps {
@@ -626,6 +676,12 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
     joiner.set_sound(audio.handle());
     let data = joiner.data();
     let mut session = joiner.join(&address, &accounts, server_packs)?;
+    ruthenium_sim::menu::creative::hotbars::set_path(Some(data_dir.join("hotbar.nbt")));
+    let creative_options = |s: &Session, j: &mut Joiner| {
+        s.set_language(j.server_lang());
+        s.set_operator_items_tab(settings.settings.operator_items_tab);
+    };
+    creative_options(&session, &mut joiner);
     let mut reloader = crate::resource_reload::Reloader::new(Some(data_dir.join("game")), true);
     if let Some(route) = route {
         return run_route(&session, route, expected, route_out.as_deref(), &data.lang);
@@ -759,6 +815,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                     return Ok(ExitCode::FAILURE);
                 }
             };
+            creative_options(&session, &mut joiner);
             session_number += 1;
             transferred = true;
             playing = false;
@@ -785,6 +842,7 @@ fn run_inner(args: &[String]) -> Result<ExitCode, String> {
                         request.packs.len()
                     );
                     joiner.set_server_lang((r.packs > 0).then(|| r.lang.clone()));
+                    creative_options(&session, &mut joiner);
                     joiner.sound().replace_files(r.sounds);
                     if let Some(world) = &r.world {
                         println!(

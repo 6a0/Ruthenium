@@ -1238,6 +1238,10 @@ impl Menu {
             }
             s.set_screen_open(!in_world);
             s.set_fov_effects(self.settings.settings.game.fov_effects as f32 / 100.0);
+            s.set_operator_items_tab(self.settings.settings.operator_items_tab);
+            if let Some(lang) = self.joiner.as_mut().map(|j| j.server_lang()) {
+                s.set_language(lang);
+            }
             s.frame();
         }
     }
@@ -1344,6 +1348,7 @@ impl Menu {
                 SessionEvent::ReloadResources(r) => self.reload_asked(r),
                 SessionEvent::ContainerOpened if !self.leaving => self.container_opened(),
                 SessionEvent::ContainerClosed => self.container_closed(),
+                SessionEvent::Clipboard(text) => self.container.clipboard = Some(text),
                 SessionEvent::InBed if !self.leaving => self.in_bed(),
                 SessionEvent::WokeUp => self.woke_up(),
                 SessionEvent::RespawnReady => {
@@ -1588,6 +1593,7 @@ impl Menu {
     pub fn wants_text_input(&self) -> bool {
         matches!(&self.screen, Screen::Form(_, form, _) if form.focused_field().is_some())
             || matches!(self.screen, Screen::Chat(_))
+            || self.container_wants_text()
     }
 
     /// Lays every live screen out for the window, if its size changed.
@@ -2189,7 +2195,7 @@ impl Menu {
                 return None;
             }
             Screen::Container => {
-                self.container_key(scancode, down);
+                self.container_key(scancode, down, shift, shortcut, clipboard);
                 return None;
             }
             Screen::Paused if escape => return self.act(Action::Back, None, clipboard),
@@ -2382,6 +2388,9 @@ impl Menu {
         if let Screen::Chat(chat) = &mut self.screen {
             chat.type_text(text);
         }
+        if matches!(self.screen, Screen::Container) {
+            self.container_text(text);
+        }
         self.validate_form();
     }
 
@@ -2401,6 +2410,7 @@ impl Menu {
         }
         match (&self.screen, &mut self.servers, &mut self.accounts_screen) {
             (Screen::Game, ..) => self.game.wheel(raw.0, raw.1, self.session.as_ref()),
+            (Screen::Container, ..) => self.container_wheel(raw.1),
             (Screen::Servers, Some(s), _) => s.screen.wheel(notches),
             (Screen::Accounts, _, Some(a)) => a.list.wheel(notches),
             (Screen::Settings, ..) => {

@@ -30,6 +30,8 @@ pub(super) struct ContainerInput {
     /// this frame.
     held: Option<u8>,
     moved: bool,
+    /// What the creative search box copied, for the clipboard at the next key.
+    pub(super) clipboard: Option<String>,
 }
 
 impl Menu {
@@ -103,9 +105,101 @@ impl Menu {
             .map_or(At::Outside, |p| At::Gui(p.x, p.y))
     }
 
+    /// Whether the creative screen is up (as the last view has it), and its search tab.
+    fn creative_shown(&self) -> Option<bool> {
+        let v = self.session.as_ref()?.container_view()?;
+        let c = v.creative.as_ref()?;
+        Some(c.search.is_some())
+    }
+
+    /// A key over the creative screen (down, a repeat or up): with its bindings and what
+    /// its search box reads; Escape closes it, and the inventory key outside the search
+    /// tab (whose box takes every other key).
+    fn creative_key(
+        &mut self,
+        scancode: u32,
+        down: bool,
+        shift: bool,
+        shortcut: bool,
+        clipboard: &dyn super::Clipboard,
+        search: bool,
+    ) {
+        let Some(s) = &self.session else {
+            return;
+        };
+        if !down {
+            s.screen_input(ScreenInput::KeyReleased);
+            return;
+        }
+        let key = Key::scancode(scancode);
+        let mut binds = self.screen_binds(key);
+        binds.escape = scancode == SCANCODE_ESCAPE;
+        let chat = self.binds().on(key).any(|a| a == Action::Chat);
+        let paste = shortcut && scancode == ruthenium_sim::menu::creative::edit_box::SCANCODE_V;
+        let k = ruthenium_sim::menu::creative::CreativeKey {
+            binds,
+            chat,
+            key: ruthenium_sim::menu::creative::edit_box::KeyPress {
+                scancode,
+                shift,
+                shortcut,
+                clipboard: paste.then(|| clipboard.get()).flatten(),
+            },
+            ctrl: self.ctrl_held(),
+        };
+        let at = self.pointer_at();
+        s.screen_input(ScreenInput::CreativeKey { key: k, at });
+        if binds.escape || (binds.inventory && !search) {
+            self.container_closed();
+        }
+    }
+
+    /// The wheel over the screen (the creative one scrolls).
+    pub(super) fn container_wheel(&mut self, y: f32) {
+        if self.creative_shown().is_none() {
+            return;
+        }
+        let at = self.pointer_at();
+        if let Some(s) = &self.session {
+            s.screen_input(ScreenInput::Scroll {
+                y: f64::from(y),
+                at,
+            });
+        }
+    }
+
+    /// Typed text (the creative screen's search box).
+    pub(super) fn container_text(&mut self, text: &str) {
+        if self.creative_shown().is_none() {
+            return;
+        }
+        if let Some(s) = &self.session {
+            s.screen_input(ScreenInput::Text(text.to_owned()));
+        }
+    }
+
+    /// Whether the screen takes typed text (the creative one).
+    pub(super) fn container_wants_text(&self) -> bool {
+        matches!(self.screen, Screen::Container) && self.creative_shown().is_some()
+    }
+
     /// A key went down or repeated over the screen (`keyPressed`); Escape and the
     /// inventory key close it.
-    pub(super) fn container_key(&mut self, scancode: u32, down: bool) {
+    pub(super) fn container_key(
+        &mut self,
+        scancode: u32,
+        down: bool,
+        shift: bool,
+        shortcut: bool,
+        clipboard: &dyn super::Clipboard,
+    ) {
+        if let Some(text) = self.container.clipboard.take() {
+            clipboard.set(&text);
+        }
+        if let Some(search) = self.creative_shown() {
+            self.creative_key(scancode, down, shift, shortcut, clipboard, search);
+            return;
+        }
         if !down {
             return;
         }

@@ -804,6 +804,9 @@ fn run_inner(opts: &Options, started: Instant) -> Result<ExitCode, Box<dyn std::
     let mut menu = Menu::new(servers_file, accounts, settings);
     crate::menu::load_unifont(data_dir.as_ref().map(|d| d.join("game")));
     menu.set_command_history(data_dir.as_ref().map(|d| d.join("command_history.txt")));
+    ruthenium_sim::menu::creative::hotbars::set_path(
+        data_dir.as_ref().map(|d| d.join("hotbar.nbt")),
+    );
     if let Some(n) = opts.mesh_workers {
         menu.set_mesh_workers(n);
     }

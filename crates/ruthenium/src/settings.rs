@@ -169,6 +169,9 @@ pub struct Settings {
     /// `saveChatDrafts`). Imported from vanilla's `options.txt` when the file doesn't set
     /// it.
     pub save_chat_drafts: bool,
+    /// The creative inventory shows the operator's tab to an operator (vanilla's
+    /// Operator Items Tab, `operatorItemsTab`, off by default).
+    pub operator_items_tab: bool,
 }
 
 /// Vanilla's volume sliders (`soundCategory_*`): any value from 0 to 1, kept exactly.
@@ -255,6 +258,7 @@ impl Default for Settings {
             toggle_sprint: false,
             sound: SoundSettings::default(),
             save_chat_drafts: false,
+            operator_items_tab: false,
         }
     }
 }
@@ -551,6 +555,7 @@ impl Settings {
             mouse,
             sound,
             save_chat_drafts: flag(chat, "save_drafts", d.save_chat_drafts),
+            operator_items_tab: flag(controls, "operator_items_tab", d.operator_items_tab),
         })
     }
 
@@ -933,6 +938,8 @@ impl Settings {
              # Whether Sneak and Sprint toggle instead of being held.\n\
              toggle_sneak = {}\n\
              toggle_sprint = {}\n\
+             # The creative inventory's operator tab, for operators (Operator Items Tab).\n\
+             operator_items_tab = {}\n\
              \n\
              [game]\n\
              # {FOV_MIN} to {FOV_MAX} degrees.\n\
@@ -974,6 +981,7 @@ impl Settings {
             self.mouse.invert_y,
             self.toggle_sneak,
             self.toggle_sprint,
+            self.operator_items_tab,
             self.game.fov,
             self.game.gui_scale,
             self.game.view_bobbing,
@@ -1293,6 +1301,7 @@ mod tests {
                 ],
             },
             save_chat_drafts: true,
+            operator_items_tab: true,
         };
         assert_eq!(Settings::parse(&s.to_toml()), Ok(s.clone()));
         assert!(Settings::has_chat_drafts(&s.to_toml()));
