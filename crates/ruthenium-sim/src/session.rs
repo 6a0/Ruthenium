@@ -4912,6 +4912,201 @@ mod tests {
         }
         assert!(closed);
     }
+    /// A workstation's own packets go out as vanilla's: an anvil's rename ahead of the
+    /// click whose slot change made it, typing renames, a key the name box takes doesn't
+    /// close the screen, and a merchant's offers and trade choice.
+    #[test]
+    fn workstations_send_their_packets_in_vanillas_order() {
+        use crate::menu::screen::Binds;
+        use ruthenium_data::v26_3::packets::play as pl;
+        use ruthenium_protocol::item::ItemStack;
+        let Some(physics) = physics() else {
+            return;
+        };
+        let mut r = start(Some(physics));
+        let sent = |r: &mut Rig| -> Vec<Vec<u8>> {
+            r.remote
+                .sent()
+                .into_iter()
+                .filter_map(|s| match s {
+                    Sent::Packet(p) if p[0] != pl::Serverbound::ClientTickEnd.id() as u8 => Some(p),
+                    _ => None,
+                })
+                .filter(|p| {
+                    // (Movement goes on meanwhile.)
+                    ![
+                        pl::Serverbound::MovePlayerPos,
+                        pl::Serverbound::MovePlayerPosRot,
+                        pl::Serverbound::MovePlayerRot,
+                        pl::Serverbound::MovePlayerStatusOnly,
+                    ]
+                    .iter()
+                    .any(|k| p[0] == k.id() as u8)
+                })
+                .collect()
+        };
+        let item = |name: &str| {
+            ruthenium_data::v26_3::registries::Item::from_name(name)
+                .unwrap()
+                .id() as i32
+        };
+        r.packet(play::Clientbound::OpenScreen {
+            container_id: 2,
+            menu_type: 8,
+            title: Tag::String("Repair & Name".into()),
+        });
+        r.frame(1);
+        let mut items = vec![ItemStack::EMPTY; 39];
+        items[30] = ItemStack {
+            item: item("minecraft:diamond_sword"),
+            count: 1,
+            patch: Default::default(),
+        };
+        r.packet(play::Clientbound::ContainerSetContent {
+            container_id: 2,
+            state_id: 1,
+            items,
+            carried: ItemStack::EMPTY,
+        });
+        r.frame(1);
+        sent(&mut r);
+        let click = |slot| ScreenInput::Click {
+            slot,
+            button: 0,
+            input: crate::menu::Input::Pickup,
+        };
+        r.frame_with(
+            1,
+            FrameInput {
+                screen_inputs: vec![click(30), click(0)],
+                ..FrameInput::default()
+            },
+        );
+        let s = sent(&mut r);
+        assert_eq!(s.len(), 3, "{s:?}");
+        assert_eq!(s[0][0], pl::Serverbound::ContainerClick.id() as u8);
+        assert_eq!(s[1], play::rename_item(""));
+        assert_eq!(s[2][0], pl::Serverbound::ContainerClick.id() as u8);
+        // Typing renames it (the language here has no names: its key is its name).
+        r.frame_with(
+            1,
+            FrameInput {
+                screen_inputs: vec![ScreenInput::Text("!".into())],
+                ..FrameInput::default()
+            },
+        );
+        assert_eq!(
+            sent(&mut r),
+            [play::rename_item("item.minecraft.diamond_sword!")]
+        );
+        // The inventory key types into the box; Escape closes the screen.
+        let key = |binds: Binds| {
+            vec![
+                ScreenInput::EditKey {
+                    key: crate::menu::work::edit_box::EditKey::Other,
+                    shift: false,
+                    ctrl: false,
+                    paste: String::new(),
+                },
+                ScreenInput::Key {
+                    binds,
+                    ctrl: false,
+                    at: At::Outside,
+                },
+            ]
+        };
+        r.frame_with(
+            1,
+            FrameInput {
+                screen_inputs: key(Binds {
+                    inventory: true,
+                    ..Binds::default()
+                }),
+                ..FrameInput::default()
+            },
+        );
+        assert!(r.game.container_screen_open());
+        r.frame_with(
+            1,
+            FrameInput {
+                screen_inputs: key(Binds {
+                    escape: true,
+                    ..Binds::default()
+                }),
+                ..FrameInput::default()
+            },
+        );
+        assert!(!r.game.container_screen_open());
+        assert_eq!(sent(&mut r), [play::container_close(2)]);
+        // A merchant: its offers land, and choosing one sends it.
+        r.packet(play::Clientbound::OpenScreen {
+            container_id: 3,
+            menu_type: 19,
+            title: Tag::String("Librarian".into()),
+        });
+        r.packet(play::Clientbound::MerchantOffers {
+            container_id: 3,
+            offers: vec![ruthenium_protocol::trade::MerchantOffer {
+                cost_a: ruthenium_protocol::trade::ItemCost {
+                    item: item("minecraft:emerald"),
+                    count: 5,
+                    components: Vec::new(),
+                },
+                result: ItemStack {
+                    item: item("minecraft:book"),
+                    count: 1,
+                    patch: Default::default(),
+                },
+                cost_b: None,
+                out_of_stock: false,
+                uses: 0,
+                max_uses: 12,
+                xp: 1,
+                special_price_diff: 0,
+                price_multiplier: 0.05,
+                demand: 0,
+            }],
+            villager_level: 1,
+            villager_xp: 0,
+            show_progress: true,
+            can_restock: true,
+        });
+        r.frame(1);
+        let menu = r.game.world.as_ref().unwrap().player.menus.container();
+        let Some(crate::menu::work::KindState::Merchant(t)) = menu.work().map(|w| &w.kind) else {
+            panic!("no merchant");
+        };
+        assert_eq!(t.offers.len(), 1);
+        let (left, top) = {
+            let s = r.game.containers.screen.as_ref().unwrap();
+            (f64::from(s.left), f64::from(s.top))
+        };
+        sent(&mut r);
+        let at = At::Gui(left + 45.0, top + 28.0);
+        r.frame_with(
+            1,
+            FrameInput {
+                screen_inputs: vec![
+                    ScreenInput::Press {
+                        button: 1,
+                        at,
+                        shift: false,
+                        binds: Binds::default(),
+                        when: std::time::Instant::now(),
+                    },
+                    ScreenInput::Release {
+                        button: 1,
+                        at,
+                        shift: false,
+                        binds: Binds::default(),
+                    },
+                ],
+                ..FrameInput::default()
+            },
+        );
+        assert_eq!(sent(&mut r), [play::select_trade(0)]);
+    }
+
     /// Container screens: a menu the server opens takes the frame's events (and its
     /// clicks go out), the wheel and the keys' presses reach nothing under it, Escape
     /// closes it with the menu's id, the server may close it, and a menu the client
