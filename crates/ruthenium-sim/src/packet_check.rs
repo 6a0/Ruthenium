@@ -793,6 +793,7 @@ impl PacketChecker {
             }
             S::ContainerClick => self.container_click(r)?,
             S::ContainerClose => self.container_close(r)?,
+            S::ContainerButtonClick | S::SetBeacon => self.menu_button(id, r)?,
             _ => {}
         }
         Ok(())
@@ -916,6 +917,7 @@ impl PacketChecker {
             }
             S::ContainerClick => self.container_click(r)?,
             S::ContainerClose => self.container_close(r)?,
+            S::ContainerButtonClick | S::SetBeacon => self.menu_button(id, r)?,
             _ => {}
         }
         Ok(())
@@ -1261,6 +1263,27 @@ impl PacketChecker {
                 name,
                 format!("button {button} with click kind {input}"),
             );
+        }
+        Ok(())
+    }
+
+    /// INV-C10: a menu's button (`handleInventoryButtonClick`) in the menu that is open,
+    /// and a beacon's effects (`ServerboundSetBeaconPacket`) only from a menu.
+    fn menu_button(&mut self, id: S, r: &mut Reader<'_>) -> Result<(), WireError> {
+        let name = id.name();
+        if id == S::SetBeacon {
+            if self.container == Some(0) {
+                self.flag("INV-C10", name, "with no menu open".into());
+            }
+            return Ok(());
+        }
+        let container = r.varint()?;
+        let _button = r.varint()?;
+        if let Some(open) = self.container
+            && container != open
+        {
+            let detail = format!("a button in menu {container}, menu {open} is open");
+            self.flag("INV-C10", name, detail);
         }
         Ok(())
     }
@@ -2007,6 +2030,25 @@ mod tests {
         // Closed: the inventory's.
         c.sent(&click(0, 0, 1, 0));
         assert_eq!(broken(&c).len(), 5);
+    }
+
+    #[test]
+    fn a_menus_buttons_in_the_open_menu() {
+        let mut c = joined();
+        // No menu but the inventory's: a beacon's effects come from nowhere.
+        c.sent(&play::set_beacon(Some(0), None));
+        assert_eq!(broken(&c), ["INV-C10"]);
+        let mut c = joined();
+        c.handled(&play::Clientbound::OpenScreen {
+            container_id: 4,
+            menu_type: 13,
+            title: ruthenium_protocol::nbt::Tag::String(String::new()),
+        });
+        c.sent(&play::container_button_click(4, 2));
+        c.sent(&play::set_beacon(Some(0), Some(9)));
+        assert_eq!(broken(&c), Vec::<&str>::new());
+        c.sent(&play::container_button_click(3, 0));
+        assert_eq!(broken(&c), ["INV-C10"]);
     }
 
     #[test]
