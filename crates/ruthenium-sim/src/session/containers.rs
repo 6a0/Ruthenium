@@ -101,6 +101,14 @@ pub enum ScreenInput {
     Scroll { y: f64, at: At },
     /// The creative screen's tab of this place among those shown is selected (scripts).
     Tab(usize),
+    /// A key an edit box reads, sent ahead of the same key's `Key` (with the clipboard's
+    /// text, for a paste).
+    EditKey {
+        key: crate::menu::work::edit_box::EditKey,
+        shift: bool,
+        ctrl: bool,
+        paste: String,
+    },
 }
 
 /// The frame's pointer over a screen: where (GUI units), the GUI's size.
@@ -130,6 +138,8 @@ pub struct ContainerView {
     pub screen: screen::View,
     /// The menu's data slots (a furnace's progress).
     pub data: Vec<i32>,
+    /// A workstation's own state and its screen's.
+    pub work: Option<Arc<crate::menu::work::State>>,
     /// Each slot's cooldown as of this tick: ticks left and of how many.
     pub cooldowns: Vec<crate::hud::Cooldown>,
     /// The creative inventory's tabs, scroller and search box.
@@ -151,6 +161,10 @@ pub(super) struct Containers {
     /// The synced registries' keys, for hashing stacks (set as play begins).
     pub(super) registries: HashMap<String, Vec<String>>,
     pub(super) station: super::stations::StationState,
+    /// What the workstations read of the session.
+    pub(super) work: super::work::WorkSession,
+    /// An anvil's name box took the key whose bindings come next.
+    swallow_key: bool,
 }
 
 static NO_ITEMS: LazyLock<Items> = LazyLock::new(Items::default);
@@ -189,9 +203,15 @@ impl Clicker for Ctx<'_> {
             input,
             self.registries,
         ) {
+            // What the click had a workstation send went first (an anvil's rename).
+            self.sent.extend(self.menus.container_mut().take_outbox());
             self.sent.push(packet);
             self.dropped += outcome.dropped.len();
         }
+    }
+
+    fn work(&mut self, f: &mut dyn FnMut(&mut Menu, &mut Inventory, &Who)) {
+        f(self.menus.container_mut(), self.inv, &self.who);
     }
 }
 
@@ -268,6 +288,7 @@ impl Game {
             dropped: 0,
         };
         let r = f(screen, &mut ctx);
+        ctx.sent.extend(ctx.menus.container_mut().take_outbox());
         let (sent, dropped) = (std::mem::take(&mut ctx.sent), ctx.dropped);
         for packet in sent {
             self.connection.send(packet);
@@ -357,6 +378,8 @@ impl Game {
             }
             return;
         }
+        self.work_sync();
+        let swallow = std::mem::take(&mut self.containers.swallow_key);
         match *e {
             ScreenInput::Press {
                 button,
@@ -406,6 +429,11 @@ impl Game {
                 self.with_screen(|s, c| s.mouse_dragged(c, x, y));
             }
             ScreenInput::Key { binds, ctrl, at } => {
+                // `AnvilScreen.keyPressed`: Escape closes; a key its box took or could
+                // take goes no further.
+                if swallow && !binds.escape {
+                    return;
+                }
                 let (x, y) = self.place(at);
                 if self.with_screen(|s, c| s.key_pressed(c, binds, ctrl, x, y)) == Some(true) {
                     // `onClose`.
@@ -420,11 +448,24 @@ impl Game {
                 self.with_screen(|_, c| c.click(slot, button, input));
             }
             // The creative screen's alone.
-            ScreenInput::CreativeKey { .. }
-            | ScreenInput::KeyReleased
-            | ScreenInput::Text(_)
-            | ScreenInput::Scroll { .. }
-            | ScreenInput::Tab(_) => {}
+            ScreenInput::CreativeKey { .. } | ScreenInput::KeyReleased | ScreenInput::Tab(_) => {}
+            ScreenInput::Scroll { y, .. } => {
+                self.with_screen(|s, c| s.mouse_scrolled(c, y));
+            }
+            ScreenInput::Text(ref text) => {
+                self.with_screen(|_, c| crate::menu::work::screen::text(c, text));
+            }
+            ScreenInput::EditKey {
+                key,
+                shift,
+                ctrl,
+                ref paste,
+            } => {
+                let swallow = self.with_screen(|_, c| {
+                    crate::menu::work::screen::edit_key(c, key, shift, ctrl, paste)
+                });
+                self.containers.swallow_key = swallow == Some(true);
+            }
         }
     }
 
@@ -490,6 +531,7 @@ impl Game {
                     cooldowns,
                     creative: self.creative_view(),
                     station: None,
+                    work: None,
                 })
             });
             *lock(&self.container_view) = view.map(Arc::new);
@@ -538,6 +580,7 @@ impl Game {
                 carried: m.carried.clone(),
                 screen: s.view(m),
                 data: m.data.clone(),
+                work: m.work().cloned().map(Arc::new),
                 cooldowns,
                 creative: None,
                 station,
@@ -599,6 +642,9 @@ impl Game {
                 let menu = self.new_menu(kind, container_id);
                 if let Some(w) = &mut self.world {
                     w.player.menus.open = Some(menu);
+                }
+                if matches!(kind, Kind::Station(_)) {
+                    self.work_opened();
                 }
                 self.show_screen(kind, Some(title));
             }
@@ -787,6 +833,9 @@ impl Game {
             self.creative_tick();
         } else {
             self.station_tick();
+            if let Some(w) = &mut self.world {
+                crate::menu::work::screen::tick(w.player.menus.container_mut());
+            }
         }
     }
 

@@ -568,6 +568,8 @@ pub struct Components {
     pub stored_enchantments: Vec<(i32, i32)>,
     /// `equippable`'s `allowed_entities` (`canBeEquippedBy`): any, without it.
     pub equip_allowed: Option<Arc<HolderSet>>,
+    /// What the workstations read ([`crate::menu::work::ItemFacts`]).
+    pub work: Arc<crate::menu::work::ItemFacts>,
 }
 
 /// What the registered potion `id` is called in names (`Potion.name`): longer and
@@ -756,6 +758,9 @@ impl Components {
                 Some(Kind::CookingFuel) => self.cooking_fuel = false,
                 _ => {}
             }
+        }
+        if crate::menu::work::ItemFacts::touched_by(patch) {
+            Arc::make_mut(&mut self.work).apply(patch);
         }
         // (A removed equippable takes its asset along.)
         if self.equippable.is_none() {
@@ -1741,6 +1746,7 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
         .and_then(|d| d.as_str())
         .and_then(|name| DYE_NAMES.iter().position(|n| *n == name))
         .map(|i| i as u8);
+    c.work = Arc::new(crate::menu::work::ItemFacts::from_defaults(v));
     c.blocks_attacks = has("minecraft:blocks_attacks");
     c.spear = v.get("minecraft:kinetic_weapon").map(|w| {
         let ticks = |field: &str| w.pointer(field).and_then(|v| v.as_i64()).unwrap_or(0) as i32;

@@ -2770,7 +2770,8 @@ pub mod play {
     }
 
     /// `ServerboundContainerButtonClickPacket`: a menu's button (a stonecutter's recipe,
-    /// a loom's pattern, an enchanting table's offer...), by the menu's own numbering.
+    /// a loom's pattern, an enchanting table's offer, a lectern's page buttons...), by the
+    /// id the menu's `clickMenuButton` reads.
     pub fn container_button_click(container_id: i32, button_id: i32) -> Vec<u8> {
         wire::packet(pl::Serverbound::ContainerButtonClick.id(), |o| {
             wire::write_varint(o, container_id);
@@ -2807,15 +2808,6 @@ pub mod play {
                 HashedStack::write(stack.as_ref(), o);
             }
             HashedStack::write(carried, o);
-        })
-    }
-
-    /// `ServerboundContainerButtonClickPacket`: a menu's button (an enchanting table's
-    /// offer, a lectern's page buttons...), by the id the menu's `clickMenuButton` reads.
-    pub fn container_button_click(container_id: i32, button_id: i32) -> Vec<u8> {
-        wire::packet(pl::Serverbound::ContainerButtonClick.id(), |o| {
-            wire::write_varint(o, container_id);
-            wire::write_varint(o, button_id);
         })
     }
 

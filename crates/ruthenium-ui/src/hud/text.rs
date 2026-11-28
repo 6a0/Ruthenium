@@ -88,7 +88,7 @@ pub(super) fn head_by_width<'a>(s: &'a str, width: i32, font: &Font) -> &'a str 
 }
 
 /// The same from the end: the longest end of `s` no wider than `width`.
-fn tail_by_width<'a>(s: &'a str, width: i32, font: &Font) -> &'a str {
+pub(super) fn tail_by_width<'a>(s: &'a str, width: i32, font: &Font) -> &'a str {
     let mut used = 0.0f32;
     for (i, c) in s.char_indices().rev() {
         used += font.glyph(c).advance(false);

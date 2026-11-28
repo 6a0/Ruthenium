@@ -16,6 +16,7 @@ pub fn image_size(kind: Kind) -> (i32, i32) {
         Kind::Chest(rows) => (176, 114 + i32::from(rows) * 18),
         Kind::ShulkerBox => (176, 167),
         Kind::Hopper => (176, 133),
+        Kind::Station(s) => s.image_size(),
         Kind::Placeholder(p) if !p.inventory => (176, 80),
         Kind::Creative => (super::creative::IMAGE_WIDTH, super::creative::IMAGE_HEIGHT),
         Kind::Beacon => (230, 219),
@@ -70,6 +71,10 @@ pub trait Clicker {
     }
     /// What `hasClickedOutside` found (the creative inventory keeps it).
     fn clicked_outside(&mut self, _outside: bool) {}
+    /// Runs `f` on the screen's menu, the inventory and who clicks (a workstation
+    /// screen's own changes: a button, a scroll bar, a name); a clicker that can't
+    /// change the menu does nothing.
+    fn work(&mut self, _f: &mut dyn FnMut(&mut Menu, &mut Inventory, &Who)) {}
 }
 
 /// `java.util.HashSet` of slots by their identity hash codes: the order a quick-craft
@@ -244,6 +249,9 @@ impl Screen {
         input: Input,
     ) {
         let id = slot.map_or(slot_id, |s| s as i32);
+        if slot.is_some() {
+            super::work::screen::slot_clicked(c, id, button, input);
+        }
         c.click(id, button, input);
     }
 
@@ -314,6 +322,10 @@ impl Screen {
     /// `mouseClicked`. `double_click`: the mouse handler's (the same button again on
     /// this screen within 250 ms).
     pub fn mouse_clicked(&mut self, c: &mut dyn Clicker, m: Mouse, double_click: bool) {
+        // A workstation's own widgets first.
+        if super::work::screen::mouse_clicked(self, c, m) {
+            return;
+        }
         let cloning = m.binds.pick && c.who().creative;
         let slot = self.slot_at(c.menu(), m.x, m.y);
         self.doubleclick = self.last_click_slot == slot && double_click;
@@ -373,6 +385,9 @@ impl Screen {
 
     /// `mouseDragged` (once a frame while a button is held and the pointer moved).
     pub fn mouse_dragged(&mut self, c: &mut dyn Clicker, mx: f64, my: f64) {
+        if super::work::screen::mouse_dragged(self, c, my) {
+            return;
+        }
         let Some(slot) = self.slot_at(c.menu(), mx, my) else {
             return;
         };
@@ -391,6 +406,7 @@ impl Screen {
 
     /// `mouseReleased`.
     pub fn mouse_released(&mut self, c: &mut dyn Clicker, m: Mouse) {
+        super::work::screen::mouse_released(c);
         let slot = self.slot_at(c.menu(), m.x, m.y);
         let outside = self.clicked_outside(c, m.x, m.y);
         let mut slot_id = slot.map_or(-1, |s| s as i32);
@@ -486,6 +502,11 @@ impl Screen {
             }
         }
         self.is_quick_crafting = false;
+    }
+
+    /// `mouseScrolled` (`scroll`: positive is up): a workstation's list scrolls.
+    pub fn mouse_scrolled(&mut self, c: &mut dyn Clicker, scroll: f64) {
+        super::work::screen::mouse_scrolled(c, scroll);
     }
 
     /// `keyPressed` (a press or a held key's repeat), with the pointer at `(mx, my)`.

@@ -242,6 +242,8 @@ impl Game {
                     creative::slot_clicked(s, c, at, *slot, *button, *input);
                     false
                 }
+                // A workstation's edit box's.
+                ScreenInput::EditKey { .. } => false,
                 ScreenInput::Tab(i) => {
                     let tabs = c.creative.tabs.clone();
                     if let Some((t, _)) = tabs.shown().nth(*i) {

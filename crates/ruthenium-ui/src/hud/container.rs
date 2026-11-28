@@ -24,6 +24,7 @@ use ruthenium_javamath::mth;
 
 mod creative;
 mod stations;
+mod work;
 
 /// The titles' colour (`-12566464`).
 const LABEL: u32 = 0xFF40_4040;
@@ -48,6 +49,7 @@ pub(super) struct ContainerSprites {
     tooltip_frame: SpriteInfo,
     creative: creative::CreativeSprites,
     station: stations::StationSprites,
+    work: work::WorkSprites,
 }
 
 impl ContainerSprites {
@@ -64,6 +66,7 @@ impl ContainerSprites {
             tooltip_frame: s("tooltip/frame"),
             creative: creative::CreativeSprites::with(s),
             station: stations::StationSprites::with(s),
+            work: work::WorkSprites::with(s),
         }
     }
 }
@@ -97,6 +100,7 @@ pub fn background_name(kind: Kind) -> &'static str {
         Kind::BlastFurnace => "blast_furnace",
         Kind::Smoker => "smoker",
         Kind::Hopper => "hopper",
+        Kind::Station(s) => work::background_name(s),
         // Pieces of the chest's window.
         Kind::Placeholder(_) => "generic_54",
         Kind::Creative => "creative_inventory/tab_items",
@@ -159,6 +163,13 @@ pub const BACKGROUNDS: &[&str] = &[
     "book",
     "horse",
     "nautilus",
+    work::BACKGROUNDS[0],
+    work::BACKGROUNDS[1],
+    work::BACKGROUNDS[2],
+    work::BACKGROUNDS[3],
+    work::BACKGROUNDS[4],
+    work::BACKGROUNDS[5],
+    work::BACKGROUNDS[6],
 ];
 
 fn translated(key: &str) -> Arc<Tag> {
@@ -352,8 +363,12 @@ impl HudLayout {
                     }
                 }
                 _ => {
+                    let size = match v.kind {
+                        Kind::Station(s) => work::background_size(s),
+                        _ => [256, 256],
+                    };
                     self.under
-                        .blit_part(&PICTURE, t, [256, 256], [0, 0], left, top, iw, ih, WHITE)
+                        .blit_part(&PICTURE, t, size, [0, 0], left, top, iw, ih, WHITE)
                 }
             }
         }
@@ -416,41 +431,53 @@ impl HudLayout {
             self.creative_front(sprites, font, lang, memory, cv, stacks, left, top);
         }
         self.station_background(sprites, font, memory, lang, d, stacks, (left, top));
+        self.work_background(sprites, font, lang, memory, d, stacks, left, top);
         // `extractLabels`: the title, and the inventory's name over its rows (not in
         // the inventory screen itself; the creative screen's are above).
         let own_labels = self.station_labels(font, memory, lang, v.kind, (left, top));
         let title = v.title.clone().unwrap_or_else(|| CRAFTING.clone());
         let title = memory.lines(&title, Wrap::Single, font, lang)[0].clone();
-        let title_x = match v.kind {
-            Kind::Inventory => 97,
-            Kind::Crafting => 29,
+        let title_at = match v.kind {
+            Kind::Inventory => Some((97, 6)),
+            Kind::Crafting => Some((29, 6)),
             Kind::Dispenser
             | Kind::Furnace
             | Kind::BlastFurnace
             | Kind::Smoker
-            | Kind::BrewingStand => (iw - title.width) / 2,
-            _ => 8,
+            | Kind::BrewingStand => Some(((iw - title.width) / 2, 6)),
+            Kind::Station(s) => work::title_pos(s, iw, title.width),
+            _ => Some((8, 6)),
         };
-        if v.creative.is_none() && !own_labels {
-            self.styled(&title, [0, 0], 1, left + title_x, top + 6, LABEL, false);
+        if v.creative.is_none()
+            && !own_labels
+            && let Some((x, y)) = title_at
+        {
+            self.styled(&title, [0, 0], 1, left + x, top + y, LABEL, false);
         }
         let shows_inventory = match v.kind {
             Kind::Inventory | Kind::Creative => false,
             _ if own_labels => false,
             Kind::Placeholder(p) => p.inventory,
+            // (The merchant writes its own, further right.)
+            Kind::Station(s) => s != ruthenium_sim::menu::work::Station::Merchant,
             _ => true,
         };
         if shows_inventory {
             let inventory = memory.lines(&INVENTORY, Wrap::Single, font, lang)[0].clone();
             self.styled(&inventory, [0, 0], 1, left + 8, top + ih - 94, LABEL, false);
         }
+        self.work_labels(font, lang, memory, d, left, top);
         // `getHoveredSlot`: the first slot within a unit of the pointer.
         let (mx, my) = (d.mouse.0 - left, d.mouse.1 - top);
         let hovered = v
             .slots
             .iter()
             .position(|&(x, y, _)| mx >= x - 1 && mx < x + 17 && my >= y - 1 && my < y + 17);
-        if let Some(h) = hovered {
+        // (`isHighlightable`: not a crafter's result.)
+        let highlight = hovered.filter(|&h| {
+            v.slots[h].2 != Rule::Station(ruthenium_sim::menu::work::SlotRule::CrafterResult)
+        });
+        if let Some(h) = highlight {
             let (x, y, _) = v.slots[h];
             self.under.blit(
                 &s.highlight_back,
@@ -475,6 +502,9 @@ impl HudLayout {
                 continue;
             }
             let (x, y) = (left + x, top + y);
+            if self.work_slot(sprites, v, i, x, y) {
+                continue;
+            }
             let mut stack = v.stacks[i].clone();
             let mut count = None;
             let mut dragged = false;
@@ -518,7 +548,7 @@ impl HudLayout {
             self.decorations(font, &stack, x, y, count, cooldown);
             self.item(stacks, stack, x, y, 0.0);
         }
-        if let Some(h) = hovered {
+        if let Some(h) = highlight {
             let (x, y, _) = v.slots[h];
             self.over.blit(
                 &s.highlight_front,
@@ -542,12 +572,17 @@ impl HudLayout {
                 self.item(stacks, shown, x, y, CARRIED_Z);
             }
         }
+        self.work_front(sprites, d);
         // A button's tooltip comes first (`extractTooltip`'s is set if none is), an
         // offer's after.
         if self.station_tooltip(sprites, font, memory, lang, d, (left, top)) {
             return;
         }
-        // `extractTooltip`: the hovered stack's name, when nothing is carried.
+        // `extractTooltip`: the hovered stack's name, when nothing is carried (or a
+        // workstation's own tooltip over it).
+        if self.work_tooltip(sprites, font, lang, memory, d, left, top, hovered) {
+            return;
+        }
         if let Some(h) = hovered
             && carried.is_empty()
             && !v.stacks[h].is_empty()

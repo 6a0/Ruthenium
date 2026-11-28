@@ -88,6 +88,7 @@ mod creative;
 mod packs;
 mod stations;
 mod transfer;
+mod work;
 pub use containers::{At, ContainerView, Pointer, ScreenInput};
 pub use packs::{
     DownloadProgress, KeptPacks, MAX_ACTIVE, MAX_PROMPTED, MAX_TRACKED, PackPrompt, PackToast,
@@ -275,6 +276,8 @@ struct FrameInput {
     fov_effects: Option<f32>,
     /// Presses of the inventory key in the world.
     inventory_clicks: u32,
+    /// The language stacks' names are read in, when it was set this frame.
+    language: Option<Arc<HashMap<String, String>>>,
     /// A container screen's events, in order.
     screen_inputs: Vec<ScreenInput>,
     /// The pointer over a screen as the frame ends, and whether it moved with a button
@@ -647,11 +650,6 @@ impl Session {
         input.creative.load_down = load;
     }
 
-    /// The language the creative inventory's search reads tooltips in.
-    pub fn set_language(&self, lang: Arc<HashMap<String, String>>) {
-        lock(&self.input).creative.language = Some(lang);
-    }
-
     /// The Operator Items Tab option (`operatorItemsTab`).
     pub fn set_operator_items_tab(&self, on: bool) {
         lock(&self.input).creative.operator_tab = Some(on);
@@ -687,6 +685,14 @@ impl Session {
     /// A press of the inventory key in the world, read by the next tick.
     pub fn inventory_key(&self) {
         lock(&self.input).inventory_clicks += 1;
+    }
+
+    /// The language the game reads stacks' names in (an anvil's name box) and the
+    /// creative inventory's search reads tooltips in, as the resource packs make it.
+    pub fn set_language(&self, language: Arc<HashMap<String, String>>) {
+        let mut input = lock(&self.input);
+        input.creative.language = Some(language.clone());
+        input.language = Some(language);
     }
 
     /// An event of the open container screen (a mouse button, a key, a drag, or a
@@ -1615,6 +1621,9 @@ impl Game {
         if let Some(scale) = input.fov_effects {
             self.fov_effects = scale;
         }
+        if let Some(language) = &input.language {
+            self.containers.work.language = language.clone();
+        }
         // The death screen or the bed screen took the keys (`KeyMapping.releaseAll`)
         // and keeps them.
         if self.death_screen.is_some() || self.bed_screen || self.container_screen_open() {
@@ -2034,6 +2043,7 @@ impl Game {
     /// The block tags movement reads, from the server's tags (block registry ids).
     fn apply_tags(&mut self, tags: &[RegistryTags]) {
         self.apply_menu_tags(tags);
+        self.containers.work.set_tags(tags);
         if let Some(items) = tags.iter().find(|t| t.registry == "minecraft:item") {
             for (tag, ids) in &items.tags {
                 let names = ids.iter().filter_map(|&id| {
@@ -2751,7 +2761,11 @@ impl Game {
             play::Clientbound::Explode {
                 player_knockback: None,
             } => {}
-            play::Clientbound::UpdateRecipes { item_sets, .. } => {
+            play::Clientbound::UpdateRecipes {
+                item_sets,
+                stonecutter,
+            } => {
+                self.containers.work.stonecutter = stonecutter;
                 self.recipe_sets = crate::item::RecipeSets::new();
                 for (key, items) in item_sets {
                     self.recipe_sets.set(&key, items);
@@ -3014,6 +3028,7 @@ impl Game {
                         self.hud.slots_replaced();
                     }
                 }
+                self.work_outbox();
             }
             play::Clientbound::ContainerSetSlot {
                 container_id,
@@ -3069,6 +3084,7 @@ impl Game {
                 if creative_heard {
                     self.creative_set_slot();
                 }
+                self.work_outbox();
             }
             play::Clientbound::SetPlayerInventory { slot, item } => {
                 if crate::menu::log_enabled() {
@@ -3134,8 +3150,21 @@ impl Game {
                 inventory_columns,
                 entity_id,
             } => self.mount_screen_open(container_id, inventory_columns, entity_id),
-            // (Not run yet: no merchant screen.)
-            play::Clientbound::MerchantOffers { .. } => {}
+            play::Clientbound::MerchantOffers {
+                container_id,
+                offers,
+                villager_level,
+                villager_xp,
+                show_progress,
+                can_restock,
+            } => self.merchant_offers(
+                container_id,
+                &offers,
+                villager_level,
+                villager_xp,
+                show_progress,
+                can_restock,
+            ),
             play::Clientbound::Cooldown { group, duration } => {
                 if let Some(w) = &mut self.world {
                     if duration == 0 {
@@ -4983,13 +5012,13 @@ mod tests {
         r.frame(1);
         assert!(!r.game.container_screen_open());
         assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
-        // An anvil (8) isn't run: it opens a placeholder as a chest opens its screen:
+        // A grindstone (15) isn't run: it opens a placeholder as a chest opens its screen:
         // the keys let go, the menu's id and slots kept, nothing sent.
         r.game.use_keys.use_clicks = 2;
         r.packet(play::Clientbound::OpenScreen {
             container_id: 5,
-            menu_type: 8,
-            title: Tag::String("Repair".into()),
+            menu_type: 15,
+            title: Tag::String("Repair & Disenchant".into()),
         });
         r.frame(1);
         assert!(r.game.container_screen_open());

@@ -905,6 +905,7 @@ mod tests {
             cooldowns: vec![Default::default(); menu.slots.len()],
             creative: None,
             station,
+            work: None,
         }
     }
 

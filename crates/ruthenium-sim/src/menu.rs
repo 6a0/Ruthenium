@@ -25,6 +25,7 @@ pub mod creative;
 pub mod mount;
 pub mod screen;
 pub mod stations;
+pub mod work;
 
 /// `AbstractContainerMenu.SLOT_CLICKED_OUTSIDE`.
 pub const SLOT_OUTSIDE: i32 = -999;
@@ -100,6 +101,9 @@ pub enum Kind {
     Lectern,
     /// `HorseInventoryMenu` or `NautilusInventoryMenu` ([`mount`]).
     Mount(mount::Mount),
+    /// A workstation: an anvil, a smithing table, a stonecutter, a loom, a cartography
+    /// table, a crafter or a merchant ([`work`]).
+    Station(work::Station),
     /// A menu the client doesn't run (an anvil, an enchanting table, a horse's
     /// inventory...): it stays open with its container id, so the server's packets for
     /// it land, and its screen is a placeholder that clicks nothing.
@@ -183,7 +187,7 @@ impl Kind {
             "enchantment" => Kind::Enchantment,
             "grindstone" => Kind::Grindstone,
             "lectern" => Kind::Lectern,
-            _ => return None,
+            name => return work::Station::from_menu_name(name).map(Kind::Station),
         })
     }
 
@@ -243,6 +247,8 @@ pub enum Rule {
     Lapis,
     GrindstoneInput,
     GrindstoneResult,
+    /// A workstation's own slots ([`work::SlotRule`]).
+    Station(work::SlotRule),
 }
 
 /// `Slot`: its container and place there, where it is drawn, and its rule.
@@ -330,6 +336,8 @@ pub struct Menu {
     pub slot_hashes: Vec<u32>,
     /// The items a grindstone makes its result with (the session's).
     pub items: stations::MenuItems,
+    /// A workstation's own state and its screen's ([`work::State`]).
+    work: Option<Box<work::State>>,
 }
 
 /// Identity hash codes as HotSpot's thread-local xor-shift hands them out: 31 bits,
@@ -367,7 +375,7 @@ fn slot(container: Container, index: usize, x: i32, y: i32, rule: Rule) -> Slot 
 }
 
 /// `addStandardInventorySlots`: the three rows, then the hotbar 58 lower.
-fn standard_inventory(slots: &mut Vec<Slot>, left: i32, top: i32) {
+pub(crate) fn standard_inventory(slots: &mut Vec<Slot>, left: i32, top: i32) {
     for y in 0..3 {
         for x in 0..9 {
             slots.push(slot(
@@ -533,6 +541,10 @@ impl Menu {
             }
             // Its slots are `creative`'s to lay out.
             Kind::Creative => (0, 0, 0),
+            Kind::Station(st) => {
+                let (own, data) = work::layout(st, &mut slots);
+                (own, 0, data)
+            }
             Kind::Hopper => {
                 for x in 0..5 {
                     slots.push(slot(
@@ -562,6 +574,10 @@ impl Menu {
             quickcraft_slots: Vec::new(),
             slot_hashes: Vec::new(),
             items: stations::MenuItems::default(),
+            work: match kind {
+                Kind::Station(st) => Some(Box::new(work::State::new(st, id))),
+                _ => None,
+            },
         }
         .with_hashes()
     }
@@ -603,6 +619,17 @@ impl Menu {
 
     /// The container's `setItem` alone (a stack changed in place).
     fn set_quiet(&mut self, inv: &mut Inventory, i: usize, stack: Stack) {
+        let s = self.slots[i];
+        self.own_or_inv_put(inv, i, stack);
+        // A workstation's container hears of it.
+        if self.work.is_some() && s.container == Container::Own {
+            work::container_set(self, inv, s.index);
+        }
+    }
+
+    /// The slot's container holds `stack` now, as a stack changed in place does: no
+    /// container hears of it.
+    fn own_or_inv_put(&mut self, inv: &mut Inventory, i: usize, stack: Stack) {
         let s = self.slots[i];
         match s.container {
             Container::Inventory => inv.set(s.index, stack),
@@ -692,7 +719,7 @@ impl Menu {
     // --- Slot rules ---------------------------------------------------------------
 
     /// `Slot.mayPlace`.
-    pub fn may_place(&self, i: usize, stack: &Stack, _who: &Who) -> bool {
+    pub fn may_place(&self, i: usize, stack: &Stack, who: &Who) -> bool {
         match self.slots[i].rule {
             Rule::Plain | Rule::Offhand => true,
             // `isEquippableInSlot`: an item without `equippable` goes only in the main
@@ -703,7 +730,8 @@ impl Menu {
             // `canFitInsideContainerItems`: not a shulker box.
             Rule::ShulkerBox => !is_shulker_box(stack),
             Rule::Creative => false,
-            r => stations::may_place(self, r, stack, _who),
+            Rule::Station(r) => work::may_place(self, i, r, stack, who),
+            r => stations::may_place(self, r, stack, who),
         }
     }
 
@@ -715,6 +743,7 @@ impl Menu {
                 s.is_empty() || who.creative || !s.c.prevent_armor_change
             }
             Rule::Creative => !creative::locked(self.item(inv, i)),
+            Rule::Station(r) => work::may_pickup(self, inv, r, who),
             _ => true,
         }
     }
@@ -731,10 +760,18 @@ impl Menu {
 
     /// `Slot.remove`: the container's `removeItem` (a crafting result is taken whole).
     fn remove(&mut self, inv: &mut Inventory, i: usize, amount: i32) -> Stack {
+        let whole = match self.slots[i].rule {
+            Rule::Station(r) => work::remove_whole(r),
+            _ => None,
+        };
+        if whole == Some(false) {
+            return Stack::empty();
+        }
         if matches!(
             self.slots[i].rule,
             Rule::CraftResult | Rule::GrindstoneResult
-        ) {
+        ) || whole == Some(true)
+        {
             let taken = self.get(inv, i);
             self.set(inv, i, Stack::empty());
             return taken;
@@ -784,8 +821,8 @@ impl Menu {
         out: &mut Outcome,
     ) -> Stack {
         match self.try_remove(inv, i, amount, max, who) {
-            Some(taken) => {
-                self.on_take(inv, i, who, out);
+            Some(mut taken) => {
+                self.on_take_stack(inv, i, &mut taken, who, out);
                 taken
             }
             None => Stack::empty(),
@@ -825,13 +862,28 @@ impl Menu {
 
     /// `Slot.onTake`: taking a crafting result uses one of each ingredient.
     fn on_take(&mut self, inv: &mut Inventory, i: usize, who: &Who, out: &mut Outcome) {
+        self.on_take_stack(inv, i, &mut Stack::empty(), who, out);
+    }
+
+    /// `Slot.onTake` with the stack taken, which a workstation's slot may change (a map
+    /// loses its post-processing).
+    fn on_take_stack(
+        &mut self,
+        inv: &mut Inventory,
+        i: usize,
+        taken: &mut Stack,
+        who: &Who,
+        out: &mut Outcome,
+    ) {
         match self.slots[i].rule {
             Rule::CraftResult => self.take_craft(inv, who, out),
+            Rule::Station(r) => work::on_take(self, inv, i, r, taken, who, out),
             // `GrindstoneMenu`'s result slot: the inputs go.
             Rule::GrindstoneResult => {
                 self.set(inv, 0, Stack::empty());
                 self.set(inv, 1, Stack::empty());
             }
+            _ if self.work.is_some() => work::set_changed(self, inv, i),
             _ => {}
         }
     }
@@ -897,6 +949,9 @@ impl Menu {
 
     /// `canTakeItemForPickAll`: not from a crafting result.
     fn can_take_for_pick_all(&self, i: usize) -> bool {
+        if self.work.is_some() {
+            return work::can_take_for_pick_all(self, i);
+        }
         !(matches!(self.kind, Kind::Inventory | Kind::Crafting)
             && self.slots[i].rule == Rule::CraftResult)
             && self.slots[i].rule != Rule::Creative
@@ -1056,9 +1111,9 @@ impl Menu {
                         } else {
                             (clicked.count + 1) / 2
                         };
-                        if let Some(taken) = self.try_remove(inv, i, amount, i32::MAX, who) {
+                        if let Some(mut taken) = self.try_remove(inv, i, amount, i32::MAX, who) {
+                            self.on_take_stack(inv, i, &mut taken, who, out);
                             self.carried = taken;
-                            self.on_take(inv, i, who, out);
                         }
                     } else if self.may_place(i, &carried, who) {
                         if clicked.same_item_same_components(&carried) {
@@ -1070,14 +1125,15 @@ impl Menu {
                         }
                     } else if clicked.same_item_same_components(&carried) {
                         let max = carried.max_stack_size() - carried.count;
-                        if let Some(taken) = self.try_remove(inv, i, clicked.count, max, who) {
+                        if let Some(mut taken) = self.try_remove(inv, i, clicked.count, max, who) {
                             self.carried.grow(taken.count);
-                            self.on_take(inv, i, who, out);
+                            self.on_take_stack(inv, i, &mut taken, who, out);
                         }
                     }
                 }
                 // `slot.setChanged()`, whatever happened.
                 self.touched(i);
+                work::set_changed(self, inv, i);
             }
         } else if input == Input::Swap && ((0..9).contains(&button) || button == 40) {
             let Some(i) = self.index(slot) else {
@@ -1093,7 +1149,9 @@ impl Menu {
                 if self.may_pickup(inv, i, who) {
                     inv.set(b, target);
                     self.set(inv, i, Stack::empty());
-                    self.on_take(inv, i, who, out);
+                    let mut t = inv.get(b).clone();
+                    self.on_take_stack(inv, i, &mut t, who, out);
+                    inv.set(b, t);
                 }
             } else if target.is_empty() {
                 if self.may_place(i, &source, who) {
@@ -1113,15 +1171,17 @@ impl Menu {
                     let part = source.split(max);
                     inv.set(b, source);
                     self.set(inv, i, part);
-                    self.on_take(inv, i, who, out);
                     let mut back = target;
+                    self.on_take_stack(inv, i, &mut back, who, out);
                     if !inv.add_stack(&mut back, who.creative) {
                         drop_stack(out, back);
                     }
                 } else {
                     inv.set(b, target);
                     self.set(inv, i, source);
-                    self.on_take(inv, i, who, out);
+                    let mut t = inv.get(b).clone();
+                    self.on_take_stack(inv, i, &mut t, who, out);
+                    inv.set(b, t);
                 }
             }
         } else if input == Input::Clone && who.creative && self.carried.is_empty() && slot >= 0 {
@@ -1130,8 +1190,11 @@ impl Menu {
             };
             let here = self.item(inv, i);
             if !here.is_empty() {
-                // `safeClone`.
+                // `safeClone` (a cartography table's map loses its post-processing).
                 self.carried = here.copy_with_count(here.max_stack_size());
+                if self.slots[i].rule == Rule::Station(work::SlotRule::MapResult) {
+                    work::crafted_by(who.items, &mut self.carried);
+                }
             }
         } else if input == Input::Throw && self.carried.is_empty() && slot >= 0 {
             let Some(i) = self.index(slot) else {
@@ -1250,6 +1313,9 @@ impl Menu {
         if !self.has_item(inv, i) {
             return Stack::empty();
         }
+        if self.work.is_some() {
+            return work::quick_move_stack(self, inv, i, who, out);
+        }
         let mut stack = self.get(inv, i);
         let clicked = stack.copy();
         let n = self.slots.len();
@@ -1262,8 +1328,9 @@ impl Menu {
         }
         // (Each branch: where to, and whether failing to move ends it.)
         let moved = match self.kind {
-            // Its screen clicks nothing; the creative picker's is above.
-            Kind::Placeholder(_) | Kind::Creative => false,
+            // Its screen clicks nothing; the creative picker's and a workstation's moves are
+            // their own (above).
+            Kind::Placeholder(_) | Kind::Creative | Kind::Station(_) => false,
 
             Kind::Beacon
             | Kind::BrewingStand

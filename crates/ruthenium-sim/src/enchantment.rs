@@ -178,6 +178,20 @@ impl ValueEffect {
 }
 
 /// A `type` field without its `minecraft:` namespace.
+/// Item names as item ids (the item registry is built in).
+fn item_holders(h: crate::menu::work::Holders) -> crate::menu::work::Holders {
+    use crate::menu::work::Holders;
+    match h {
+        Holders::Names(n) => Holders::Ids(
+            n.iter()
+                .filter_map(|n| ruthenium_data::v26_3::registries::Item::from_name(n))
+                .map(|i| i.id() as i32)
+                .collect(),
+        ),
+        h => h,
+    }
+}
+
 fn type_name(v: &Value) -> Option<&str> {
     let t = v.get("type")?.as_str()?;
     Some(t.strip_prefix("minecraft:").unwrap_or(t))
@@ -195,6 +209,11 @@ pub struct Enchantment {
     /// table's offers (`Enchantment.getFullname`).
     pub description: Option<Arc<Tag>>,
     pub max_level: i32,
+    /// What an anvil reads: `anvil_cost`, `max_level`, `supported_items` and
+    /// `exclusive_set`.
+    pub anvil_cost: i32,
+    pub supported_items: Option<crate::menu::work::Holders>,
+    pub exclusive_set: Option<crate::menu::work::Holders>,
 }
 
 impl Enchantment {
@@ -210,6 +229,14 @@ impl Enchantment {
                 .is_some(),
             description: v.get("description").map(|d| Arc::new(json_text(d))),
             max_level: v.get("max_level").and_then(Value::as_i64).unwrap_or(1) as i32,
+            anvil_cost: v.get("anvil_cost").and_then(Value::as_i64).unwrap_or(0) as i32,
+            supported_items: v
+                .get("supported_items")
+                .and_then(crate::menu::work::Holders::from_json)
+                .map(item_holders),
+            exclusive_set: v
+                .get("exclusive_set")
+                .and_then(crate::menu::work::Holders::from_json),
         }
     }
 }
@@ -242,6 +269,8 @@ fn json_text(v: &Value) -> Tag {
 pub struct Enchantments {
     by_id: Vec<Option<Arc<Enchantment>>>,
     by_name: HashMap<String, Arc<Enchantment>>,
+    /// The entries' names by network id.
+    names: Vec<String>,
 }
 
 impl Enchantments {
@@ -265,6 +294,7 @@ impl Enchantments {
         Enchantments {
             by_id: Vec::new(),
             by_name,
+            names: Vec::new(),
         }
     }
 
@@ -290,7 +320,12 @@ impl Enchantments {
             }
             by_id.push(ench);
         }
-        Enchantments { by_id, by_name }
+        let names = entries.iter().map(|e| e.id.clone()).collect();
+        Enchantments {
+            by_id,
+            by_name,
+            names,
+        }
     }
 
     /// Vanilla's registry order (the data pack's files sorted by name), as a server
@@ -312,6 +347,14 @@ impl Enchantments {
         usize::try_from(id)
             .ok()
             .and_then(|i| self.by_id.get(i)?.as_deref())
+    }
+
+    /// An enchantment's name, by network id.
+    pub fn name(&self, id: i32) -> Option<&str> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|i| self.names.get(i))
+            .map(String::as_str)
     }
 
     /// The network id of an enchantment, by name.
