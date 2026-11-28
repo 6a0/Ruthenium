@@ -742,6 +742,45 @@ fn write_patch(o: &mut Vec<u8>, p: &ComponentPatch) -> Result<(), &'static str> 
     Ok(())
 }
 
+impl ComponentPatch {
+    /// `DataComponentPatch.DELIMITED_STREAM_CODEC` (what the client sends): as the server
+    /// sends a patch, but each added value goes with its length in bytes before it
+    /// (`registryFriendlyLengthPrefixed`).
+    pub fn write_delimited(&self, o: &mut Vec<u8>) -> Result<(), &'static str> {
+        wire::write_varint(o, self.added.len() as i32);
+        wire::write_varint(o, self.removed.len() as i32);
+        for (kind, c) in &self.added {
+            wire::write_varint(o, *kind);
+            let k = component_kind(*kind).map_err(|_| "a component type")?;
+            let mut value = Vec::new();
+            match self.raw.get(*kind).filter(|r| reads_as(k, r, c)) {
+                Some(r) => value.extend_from_slice(r),
+                None => write_into(c, &mut value)?,
+            }
+            wire::write_varint(o, value.len() as i32);
+            o.extend_from_slice(&value);
+        }
+        for kind in &self.removed {
+            wire::write_varint(o, *kind);
+        }
+        Ok(())
+    }
+}
+
+impl ItemStack {
+    /// `ItemStack.OPTIONAL_UNTRUSTED_STREAM_CODEC`: the count (0 for the empty stack),
+    /// the item and the delimited patch.
+    pub fn write_untrusted(&self, o: &mut Vec<u8>) -> Result<(), &'static str> {
+        if self.is_empty() {
+            wire::write_varint(o, 0);
+            return Ok(());
+        }
+        wire::write_varint(o, self.count);
+        wire::write_varint(o, self.item);
+        self.patch.write_delimited(o)
+    }
+}
+
 fn write_into(c: &Component, o: &mut Vec<u8>) -> Result<(), &'static str> {
     use crate::wire::{write_bool, write_f32, write_i32, write_string, write_varint};
     match c {

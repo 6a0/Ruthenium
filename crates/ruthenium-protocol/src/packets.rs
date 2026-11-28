@@ -2694,6 +2694,27 @@ pub mod play {
         wire::packet(pl::Serverbound::ConfigurationAcknowledged.id(), |_| {})
     }
 
+    /// `ServerboundSetCreativeModeSlotPacket`: the inventory menu's slot as a short (-1:
+    /// dropped), then the stack (`ItemStack.OPTIONAL_UNTRUSTED_STREAM_CODEC`). A stack the
+    /// patch can't be written for goes out without its patch's values (none of the
+    /// client's own).
+    pub fn set_creative_mode_slot(slot: i16, stack: &crate::item::ItemStack) -> Vec<u8> {
+        wire::packet(pl::Serverbound::SetCreativeModeSlot.id(), |o| {
+            o.extend_from_slice(&slot.to_be_bytes());
+            let mut body = Vec::new();
+            if stack.write_untrusted(&mut body).is_err() {
+                body.clear();
+                crate::item::ItemStack {
+                    patch: crate::item::ComponentPatch::default(),
+                    ..stack.clone()
+                }
+                .write_untrusted(&mut body)
+                .ok();
+            }
+            o.extend_from_slice(&body);
+        })
+    }
+
     /// `ServerboundContainerClosePacket`.
     pub fn container_close(container_id: i32) -> Vec<u8> {
         wire::packet(pl::Serverbound::ContainerClose.id(), |o| {
@@ -4348,5 +4369,29 @@ mod tests {
         want.extend((-10.0f32).to_be_bytes());
         want.push(0b10);
         assert_eq!(play::move_player_rot(45.0, -10.0, false, true), want);
+    }
+}
+
+#[cfg(test)]
+mod creative_slot_tests {
+    use super::play::set_creative_mode_slot;
+    use crate::item::ItemStack;
+    use crate::wire::Reader;
+
+    #[test]
+    fn a_creative_slot_carries_a_delimited_patch() {
+        // A stack of 5 with one component (max_stack_size 3: type 1, value 3).
+        let bytes = [1u8, 0, 1, 3];
+        let mut body = vec![5, 7];
+        body.extend_from_slice(&bytes);
+        let stack = ItemStack::read_optional(&mut Reader::new(&body)).expect("reads");
+        let p = set_creative_mode_slot(36, &stack);
+        // Packet id, the slot, count 5, item 7, one added and none removed, type 1 with
+        // one byte.
+        assert_eq!(&p[1..], &[0, 36, 5, 7, 1, 0, 1, 1, 3]);
+        assert_eq!(
+            &set_creative_mode_slot(-1, &ItemStack::EMPTY)[1..],
+            &[0xFF, 0xFF, 0]
+        );
     }
 }
