@@ -35,5 +35,6 @@ public final class Main {
         BlockRenderExporter.export(out.resolve(BlockRenderExporter.FILE));
         ModelLayersExporter.export(out.resolve(ModelLayersExporter.FILE));
         BlockSoundExporter.export(out.resolve(BlockSoundExporter.FILE));
+        CreativeTabsExporter.export(out.resolve(CreativeTabsExporter.FILE));
     }
 }

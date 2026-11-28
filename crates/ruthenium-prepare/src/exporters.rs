@@ -14,6 +14,11 @@ use crate::import::Imported;
 use crate::java::Java;
 use crate::step;
 
+mod creative;
+pub use creative::{
+    CreativeEntryData, CreativeTabData, CreativeTabsData, PaintingData, read_creative_tabs,
+};
+
 pub const BUNDLE_NAME: &str = "ruthenium-exporters.jar";
 const MAIN_CLASS: &str = "dev.ruthenium.exporters.Main";
 pub const ENTITY_DIMENSIONS: &str = "entity_dimensions.bin";
@@ -23,6 +28,7 @@ pub const BLOCK_BEHAVIOUR: &str = "block_behaviour.bin";
 pub const BLOCK_RENDER: &str = "block_render.bin";
 pub const MODEL_LAYERS: &str = "model_layers.bin";
 pub const BLOCK_SOUNDS: &str = "block_sounds.bin";
+pub const CREATIVE_TABS: &str = "creative_tabs.bin";
 
 /// The exporter bundle: `explicit`, then `RUTHENIUM_EXPORTERS`, then next to
 /// the executable, then `../java/` from it (`target/java/` in a dev build).
@@ -84,6 +90,7 @@ pub fn run(java: &Java, imported: &Imported, bundle: &Path) -> Result<(PathBuf, 
             BLOCK_RENDER,
             MODEL_LAYERS,
             BLOCK_SOUNDS,
+            CREATIVE_TABS,
         ] {
             let expected = tmp.join(file);
             if !expected.is_file() {
