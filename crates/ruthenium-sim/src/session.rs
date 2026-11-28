@@ -4570,6 +4570,48 @@ mod tests {
         assert_eq!(sit(901, &[own]).unwrap().0, "mount.sit");
     }
 
+    /// The cracks of the block the player breaks reach the frame as the breaking tells
+    /// them, and a teleport, which stops the breaking, takes them away in its frame.
+    #[test]
+    fn the_players_cracks_reach_the_frame() {
+        let Some(physics) = physics() else {
+            return;
+        };
+        let mut r = start(Some(physics));
+        // In survival, looking down at the stone under its feet.
+        r.packet(play::Clientbound::GameEvent {
+            event: GAME_EVENT_CHANGE_GAME_MODE,
+            param: 0.0,
+        });
+        let at = |id| {
+            play::Clientbound::PlayerPosition(play::PlayerPosition {
+                id,
+                position: [8.5, 0.0, 8.5],
+                delta: [0.0; 3],
+                y_rot: 0.0,
+                x_rot: 90.0,
+                relatives: 0,
+            })
+        };
+        r.packet(at(2));
+        for _ in 0..5 {
+            r.frame(50);
+        }
+        let held = |clicks| FrameInput {
+            attack_down: true,
+            attack_clicks: clicks,
+            ..FrameInput::default()
+        };
+        let f = r.frame_with(50, held(1));
+        assert_eq!(f.breaking, [([8, -1, 8], 0)]);
+        let f = r.frame_with(50, held(0));
+        assert_eq!(f.breaking, [([8, -1, 8], 0)]);
+        // The teleport, handled in a frame without a tick.
+        r.packet(at(3));
+        let f = r.frame_with(0, FrameInput::default());
+        assert!(f.breaking.is_empty(), "{:?}", f.breaking);
+    }
+
     #[test]
     fn login_keeps_the_game_busy_for_a_server_tick() {
         use ruthenium_data::v26_3::packets::play as pl;

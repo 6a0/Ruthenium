@@ -1230,6 +1230,27 @@ mod tests {
         assert!(out.is_empty() && f.game_mode.cracks.is_none());
     }
 
+    /// Turning to another block while breaking takes the cracks off the first: breaking
+    /// starts on the new one at no progress (stage -1, `MultiPlayerGameMode.java:204`).
+    #[test]
+    fn another_block_takes_the_cracks_off_the_first() {
+        let Some(mut f) = Fixture::new() else {
+            return;
+        };
+        f.floor();
+        f.player.on_ground = true;
+        let (first, second) = ([0, -60, 2], [1, -60, 2]);
+        f.set(first, "minecraft:dirt");
+        f.set(second, "minecraft:dirt");
+        f.attack_face(first, Direction::North, 1);
+        f.attack_face(first, Direction::North, 0);
+        assert_eq!(f.game_mode.cracks, Some((first, 1)));
+        f.attack_face(second, Direction::North, 0);
+        assert_eq!(f.game_mode.cracks, Some((second, -1)));
+        f.attack_face(second, Direction::North, 0);
+        assert_eq!(f.game_mode.cracks, Some((second, 0)));
+    }
+
     /// Letting go of a block being broken takes its cracks away.
     #[test]
     fn letting_go_takes_the_cracks_away() {
