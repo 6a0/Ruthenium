@@ -21,6 +21,7 @@
 use crate::inventory::Inventory;
 use crate::item::{EquipmentSlot, Items, RecipeSets, Stack};
 
+pub mod creative;
 pub mod screen;
 
 /// `AbstractContainerMenu.SLOT_CLICKED_OUTSIDE`.
@@ -92,6 +93,8 @@ pub enum Kind {
     /// inventory...): it stays open with its container id, so the server's packets for
     /// it land, and its screen is a placeholder that clicks nothing.
     Placeholder(Placeholder),
+    /// The creative inventory's `ItemPickerMenu` (see [`creative`]).
+    Creative,
 }
 
 /// The layout of a menu the client doesn't run, as far as the slots' numbering goes:
@@ -206,6 +209,11 @@ pub enum Rule {
     FurnaceResult,
     /// `ShulkerBoxSlot`.
     ShulkerBox,
+    /// The creative inventory's `CONTAINER` (its rows and the destroy slot): nothing is
+    /// dragged onto it (`canDragTo`, which the client reads wherever it reads
+    /// `mayPlace` for it) or gathered from it (`canTakeItemForPickAll`), and a locked
+    /// stack can't be picked up (`CustomCreativeSlot.mayPickup`).
+    Creative,
 }
 
 /// `Slot`: its container and place there, where it is drawn, and its rule.
@@ -483,6 +491,8 @@ impl Menu {
                 hidden(&mut slots, p.before, p.after);
                 (usize::from(p.before + p.after), 0, 0)
             }
+            // Its slots are `creative`'s to lay out.
+            Kind::Creative => (0, 0, 0),
             Kind::Hopper => {
                 for x in 0..5 {
                     slots.push(slot(
@@ -615,6 +625,7 @@ impl Menu {
             Rule::FurnaceFuel => stack.c.cooking_fuel || is_bucket(stack),
             // `canFitInsideContainerItems`: not a shulker box.
             Rule::ShulkerBox => !is_shulker_box(stack),
+            Rule::Creative => false,
         }
     }
 
@@ -625,6 +636,7 @@ impl Menu {
                 let s = self.item(inv, i);
                 s.is_empty() || who.creative || !s.c.prevent_armor_change
             }
+            Rule::Creative => !creative::locked(self.item(inv, i)),
             _ => true,
         }
     }
@@ -800,6 +812,7 @@ impl Menu {
     fn can_take_for_pick_all(&self, i: usize) -> bool {
         !(matches!(self.kind, Kind::Inventory | Kind::Crafting)
             && self.slots[i].rule == Rule::CraftResult)
+            && self.slots[i].rule != Rule::Creative
     }
 
     /// Public for the screen.
@@ -1151,10 +1164,17 @@ impl Menu {
         let mut stack = self.get(inv, i);
         let clicked = stack.copy();
         let n = self.slots.len();
+        // `ItemPickerMenu.quickMoveStack`: a hotbar slot is emptied, nothing moves.
+        if self.kind == Kind::Creative {
+            if i + 9 >= n {
+                self.set(inv, i, Stack::empty());
+            }
+            return Stack::empty();
+        }
         // (Each branch: where to, and whether failing to move ends it.)
         let moved = match self.kind {
-            // Its screen clicks nothing.
-            Kind::Placeholder(_) => false,
+            // Its screen clicks nothing; the creative picker's is above.
+            Kind::Placeholder(_) | Kind::Creative => false,
             Kind::Inventory => {
                 let eq = equipment_slot_for_item(&clicked);
                 if i == 0 {

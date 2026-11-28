@@ -90,6 +90,7 @@ pub fn background_name(kind: Kind) -> &'static str {
         Kind::Hopper => "hopper",
         // Pieces of the chest's window.
         Kind::Placeholder(_) => "generic_54",
+        Kind::Creative => "creative_inventory/tab_items",
     }
 }
 

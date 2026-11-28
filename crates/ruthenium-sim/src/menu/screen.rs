@@ -17,6 +17,7 @@ pub fn image_size(kind: Kind) -> (i32, i32) {
         Kind::ShulkerBox => (176, 167),
         Kind::Hopper => (176, 133),
         Kind::Placeholder(p) if !p.inventory => (176, 80),
+        Kind::Creative => (super::creative::IMAGE_WIDTH, super::creative::IMAGE_HEIGHT),
         _ => (176, 166),
     }
 }
@@ -54,6 +55,15 @@ pub trait Clicker {
     fn who(&self) -> Who<'_>;
     /// `MultiPlayerGameMode.handleContainerInput` for the screen's menu.
     fn click(&mut self, slot: i32, button: i32, input: Input);
+    /// A tab of the window's whose rectangle (from the window's corner, 26 by 32) a
+    /// click outside doesn't count as outside in: the creative inventory's selected
+    /// tab, which `hasClickedOutside` tests against the pointer's place in the GUI, not
+    /// in the window, as vanilla does.
+    fn outside_except(&self) -> Option<(i32, i32)> {
+        None
+    }
+    /// What `hasClickedOutside` found (the creative inventory keeps it).
+    fn clicked_outside(&mut self, _outside: bool) {}
 }
 
 /// `java.util.HashSet` of slots by their identity hash codes: the order a quick-craft
@@ -202,11 +212,22 @@ impl Screen {
     }
 
     /// `hasClickedOutside`.
-    fn clicked_outside(&self, mx: f64, my: f64) -> bool {
-        mx < f64::from(self.left)
+    fn clicked_outside(&self, c: &mut dyn Clicker, mx: f64, my: f64) -> bool {
+        let mut outside = mx < f64::from(self.left)
             || my < f64::from(self.top)
             || mx >= f64::from(self.left + self.image_width)
-            || my >= f64::from(self.top + self.image_height)
+            || my >= f64::from(self.top + self.image_height);
+        if let Some((x, y)) = c.outside_except() {
+            let (x, y) = (f64::from(x), f64::from(y));
+            outside &= !(mx >= x && mx <= x + 26.0 && my >= y && my <= y + 32.0);
+        }
+        c.clicked_outside(outside);
+        outside
+    }
+
+    /// `quickCraftSlots.clear` (the creative inventory's `selectTab`).
+    pub fn clear_quick_craft(&mut self) {
+        self.quick_craft_slots.clear();
     }
 
     /// `slotClicked`: a slot's own number wins over the one given.
@@ -305,7 +326,7 @@ impl Screen {
                 }
             }
         } else {
-            let outside = self.clicked_outside(m.x, m.y);
+            let outside = self.clicked_outside(c, m.x, m.y);
             let mut slot_id = slot.map_or(-1, |s| s as i32);
             if outside {
                 slot_id = super::SLOT_OUTSIDE;
@@ -366,7 +387,7 @@ impl Screen {
     /// `mouseReleased`.
     pub fn mouse_released(&mut self, c: &mut dyn Clicker, m: Mouse) {
         let slot = self.slot_at(c.menu(), m.x, m.y);
-        let outside = self.clicked_outside(m.x, m.y);
+        let outside = self.clicked_outside(c, m.x, m.y);
         let mut slot_id = slot.map_or(-1, |s| s as i32);
         if outside {
             slot_id = super::SLOT_OUTSIDE;
