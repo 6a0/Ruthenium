@@ -231,6 +231,44 @@ impl Fixture {
         out
     }
 
+    /// One tick of the attack key held on `face` of the block at `pos` (its middle),
+    /// with `clicks` presses of it this tick. Returns the packets it sent.
+    pub fn attack_face(&mut self, pos: Pos, face: Direction, clicks: u32) -> Vec<Vec<u8>> {
+        let n = face.normal();
+        let hit = HitResult::Block(BlockHit {
+            location: [
+                f64::from(pos[0]) + 0.5 + f64::from(n[0]) * 0.5,
+                f64::from(pos[1]) + 0.5 + f64::from(n[1]) * 0.5,
+                f64::from(pos[2]) + 0.5 + f64::from(n[2]) * 0.5,
+            ],
+            direction: face,
+            pos,
+            inside: false,
+            miss: false,
+            world_border: false,
+        });
+        let mut out = Vec::new();
+        let game = self.game;
+        let mut w = World::new(
+            &mut self.level,
+            &mut self.predictions,
+            &game.blocks,
+            &game.tags,
+            &self.entities,
+            &self.fluid_shapes,
+        )
+        .with_items(&game.items)
+        .with_item_tags(&game.item_tags);
+        let mut keys = UseKeys {
+            attack_down: true,
+            attack_clicks: clicks,
+            ..UseKeys::default()
+        };
+        self.game_mode
+            .handle_keybinds(&mut self.player, &mut w, &hit, &mut keys, &mut out);
+        out
+    }
+
     /// Clicks the middle of a face.
     pub fn click_face(&mut self, pos: Pos, face: Direction) -> Vec<Vec<u8>> {
         let n = face.normal();

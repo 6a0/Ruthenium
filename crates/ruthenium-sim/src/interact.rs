@@ -88,6 +88,13 @@ pub struct GameMode {
     destroy_direction: Option<Direction>,
     /// `isDestroying`: a block is being broken (and the use key waits).
     pub is_destroying: bool,
+    /// The last `destroyBlockProgress` the breaking made, not yet handed to the
+    /// level's cracks (`ClientLevel.destroyingBlocks`): the block and its stage, none
+    /// (-1) once breaking is given up or the block is broken. The cracks follow these
+    /// calls, not `isDestroying`: a block that came back (the server refused to break
+    /// it) is broken again with `isDestroying` false, and cracks
+    /// (`MultiPlayerGameMode.java:281`).
+    pub cracks: Option<([i32; 3], i32)>,
 }
 
 impl Default for GameMode {
@@ -103,6 +110,7 @@ impl Default for GameMode {
             destroy_delay: 0,
             destroy_direction: None,
             is_destroying: false,
+            cracks: None,
         }
     }
 }
@@ -485,6 +493,8 @@ impl GameMode {
                 self.destroying_item = p.hand(Hand::Main).clone();
                 self.destroy_progress = 0.0;
                 self.destroy_ticks = 0.0;
+                // No cracks yet (stage -1 at no progress, `MultiPlayerGameMode.java:204`).
+                self.cracks = Some((pos, self.destroy_stage()));
                 // `addBreakingBlockEffects` with its sound.
                 w.sounds.push(crate::sound::BlockSound::Hit { pos, state });
             }
@@ -564,6 +574,9 @@ impl GameMode {
                 0,
             ));
         }
+        // Each tick on the same block, broken or not, and whether or not
+        // `isDestroying` (`MultiPlayerGameMode.java:281`).
+        self.cracks = Some((self.destroy_pos, self.destroy_stage()));
         true
     }
 
@@ -579,6 +592,7 @@ impl GameMode {
             ));
             self.is_destroying = false;
             self.destroy_progress = 0.0;
+            self.cracks = Some((self.destroy_pos, -1));
             p.reset_attack_strength_ticker();
         }
     }
@@ -1142,4 +1156,96 @@ fn pov_hit(p: &LocalPlayer, w: &World<'_>, fluid: FluidMode) -> BlockHit {
     let to = [from[0] + v[0] * r, from[1] + v[1] * r, from[2] + v[2] * r];
     let held = p.hand(Hand::Main).c.name;
     pick::clip(&w.env(), from, to, fluid, held, w.fluid_shapes)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::block::testing::Fixture;
+    use crate::direction::Direction;
+    use crate::first_person::Destruction;
+
+    /// A block the server puts back cracks again while the player keeps breaking it,
+    /// as vanilla's does: the cracks follow `destroyBlockProgress`, which
+    /// `continueDestroyBlock` calls on the same block whether or not `isDestroying`
+    /// (false once the client broke the block).
+    #[test]
+    fn a_block_put_back_cracks_again() {
+        let Some(mut f) = Fixture::new() else {
+            return;
+        };
+        f.floor();
+        f.player.on_ground = true;
+        let pos = [0, -60, 2];
+        f.set(pos, "minecraft:dirt");
+        let blocks = f.blocks();
+        let mut cracks = Destruction::default();
+        let mut stages = Vec::new();
+        let mut tick = |f: &mut Fixture, clicks: u32, game_time: i64| {
+            f.attack_face(pos, Direction::North, clicks);
+            if let Some((at, stage)) = f.game_mode.cracks.take() {
+                cracks.set(f.player.entity_id, at, stage, game_time);
+            }
+            let mut out = Vec::new();
+            cracks.stages(&mut out);
+            out.first().map(|&(_, s)| s)
+        };
+        // The click starts breaking; the server refuses (spawn protection: only the
+        // acknowledgement; a protection plugin also sends the block, unchanged).
+        stages.push(tick(&mut f, 1, 0));
+        f.predictions
+            .server_block(&mut f.level, pos, Fixture::state("minecraft:dirt"));
+        f.predictions
+            .acknowledge(1, &mut f.level, blocks, &mut f.player);
+        // Dirt by hand: a fifteenth a tick, broken (predicted) on the fifteenth.
+        for t in 1..15 {
+            stages.push(tick(&mut f, 0, t));
+        }
+        assert_eq!(f.get(pos), "minecraft:air");
+        assert!(!f.game_mode.is_destroying);
+        let first: Vec<_> = (0..10).map(|s| Some(s as u8)).collect();
+        // Stages 0 to 9 over the fifteen ticks, then none once broken.
+        assert_eq!(stages.iter().filter(|s| s.is_some()).count(), 14);
+        assert!(first.iter().all(|s| stages.contains(s)));
+        assert_eq!(stages.last(), Some(&None));
+        // The server refuses the break: its acknowledgement puts the block back.
+        f.predictions
+            .acknowledge(2, &mut f.level, blocks, &mut f.player);
+        assert_eq!(f.get(pos), "minecraft:dirt");
+        // Five ticks' delay, then breaking goes on from nothing, with cracks though
+        // `isDestroying` is false.
+        stages.clear();
+        for t in 15..30 {
+            stages.push(tick(&mut f, 0, t));
+        }
+        assert!(!f.game_mode.is_destroying);
+        assert_eq!(&stages[..5], &[None; 5]);
+        assert_eq!(
+            &stages[5..10],
+            &[Some(0), Some(1), Some(2), Some(2), Some(3)]
+        );
+        // Letting go while not `isDestroying` sends nothing and leaves the cracks, as
+        // vanilla's `stopDestroyBlock` does (they go after 400 ticks without news).
+        let mut out = Vec::new();
+        f.game_mode.stop_destroy_block(&mut f.player, &mut out);
+        assert!(out.is_empty() && f.game_mode.cracks.is_none());
+    }
+
+    /// Letting go of a block being broken takes its cracks away.
+    #[test]
+    fn letting_go_takes_the_cracks_away() {
+        let Some(mut f) = Fixture::new() else {
+            return;
+        };
+        f.floor();
+        f.player.on_ground = true;
+        let pos = [0, -60, 2];
+        f.set(pos, "minecraft:dirt");
+        f.attack_face(pos, Direction::North, 1);
+        f.attack_face(pos, Direction::North, 0);
+        assert_eq!(f.game_mode.cracks, Some((pos, 1)));
+        let mut out = Vec::new();
+        f.game_mode.stop_destroy_block(&mut f.player, &mut out);
+        assert_eq!(out.len(), 1, "abort_destroy_block");
+        assert_eq!(f.game_mode.cracks, Some((pos, -1)));
+    }
 }

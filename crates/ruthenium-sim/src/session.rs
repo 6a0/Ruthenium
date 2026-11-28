@@ -915,6 +915,14 @@ struct World {
 }
 
 impl World {
+    /// The player's breaking hands its last `destroyBlockProgress` to the cracks.
+    fn hand_on_cracks(&mut self) {
+        if let Some((pos, stage)) = self.game_mode.cracks.take() {
+            self.destruction
+                .set(self.player.entity_id, pos, stage, self.game_time);
+        }
+    }
+
     /// The chunks kept for drawing while the player was dead go (it lives again).
     fn forget_kept_chunks(&mut self) {
         for (x, z) in std::mem::take(&mut self.forgotten_while_dead) {
@@ -1589,6 +1597,7 @@ impl Game {
         if input.paused {
             let mut out = Vec::new();
             w.game_mode.stop_destroy_block(&mut w.player, &mut out);
+            w.hand_on_cracks();
             for p in out {
                 self.connection.send(p);
             }
@@ -2181,19 +2190,9 @@ impl Game {
                 self.connection.send(p);
             }
         }
-        // The cracks of the block the player is breaking (`destroyBlockProgress` with
-        // `getDestroyStage`: none once it is given up or broken).
-        let stage = if w.game_mode.is_destroying {
-            w.game_mode.destroy_stage()
-        } else {
-            -1
-        };
-        w.destruction.set(
-            w.player.entity_id,
-            w.game_mode.destroy_pos,
-            stage,
-            w.game_time,
-        );
+        // The cracks of the block the player is breaking, as the breaking last told
+        // them (`destroyBlockProgress` with `getDestroyStage`).
+        w.hand_on_cracks();
         let env = Env {
             level: &w.level,
             blocks: &physics.blocks,
@@ -2515,6 +2514,7 @@ impl Game {
                 w.predictions.on_teleport();
                 let mut out = Vec::new();
                 w.game_mode.stop_destroy_block(&mut w.player, &mut out);
+                w.hand_on_cracks();
                 for p in out {
                     self.connection.send(p);
                 }
