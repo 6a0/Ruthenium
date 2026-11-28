@@ -1079,12 +1079,15 @@ mod tests {
         (events, t)
     }
 
-    /// The next server's session, with what the transfer handed on.
+    /// The next server's session, with what the transfer handed on; its downloads are
+    /// its own (none under way as the last server's: the next goes as this server's,
+    /// whose address decides which hosts may serve it).
     fn next_session(setup: &ServerPackSetup, t: &super::super::Transfer) -> (Rig, Receiver<Batch>) {
         let mut r = rig(ServerPackSetup {
             kept: t.packs.clone(),
             ..setup.clone()
         });
+        assert!(r.game.packs.downloads.jobs.is_none());
         let jobs = fake_downloads(&mut r);
         (r, jobs)
     }
