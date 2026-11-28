@@ -76,7 +76,7 @@ impl TextLine {
 }
 
 /// `Font.plainSubstrByWidth`: the longest start of `s` no wider than `width`.
-fn head_by_width<'a>(s: &'a str, width: i32, font: &Font) -> &'a str {
+pub(super) fn head_by_width<'a>(s: &'a str, width: i32, font: &Font) -> &'a str {
     let mut used = 0.0f32;
     for (i, c) in s.char_indices() {
         used += font.glyph(c).advance(false);
@@ -237,7 +237,13 @@ impl HudMemory {
 
     /// Where the edit box shows `value` from with the caret at `caret`
     /// (`EditBox.scrollTo`, each time the text or the caret has moved).
-    fn edit_display(&mut self, value: &str, caret: usize, font: &Font, width: i32) -> usize {
+    pub(super) fn edit_display(
+        &mut self,
+        value: &str,
+        caret: usize,
+        font: &Font,
+        width: i32,
+    ) -> usize {
         let (display, text, at) = &mut self.edit;
         if text != value || *at != caret {
             text.clear();

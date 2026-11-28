@@ -22,6 +22,8 @@ use crate::draw::SpriteInfo;
 use ruthenium_assets::meta::GuiScaling;
 use ruthenium_javamath::mth;
 
+mod creative;
+
 /// The titles' colour (`-12566464`).
 const LABEL: u32 = 0xFF40_4040;
 /// `ChatFormatting.YELLOW`.
@@ -43,6 +45,7 @@ pub(super) struct ContainerSprites {
     burn: [SpriteInfo; 3],
     tooltip_background: SpriteInfo,
     tooltip_frame: SpriteInfo,
+    creative: creative::CreativeSprites,
 }
 
 impl ContainerSprites {
@@ -57,6 +60,7 @@ impl ContainerSprites {
             burn: kinds.map(|k| s(&format!("container/{k}/burn_progress"))),
             tooltip_background: s("tooltip/background"),
             tooltip_frame: s("tooltip/frame"),
+            creative: creative::CreativeSprites::with(s),
         }
     }
 }
@@ -94,6 +98,19 @@ pub fn background_name(kind: Kind) -> &'static str {
     }
 }
 
+/// The picture a view's window is drawn from: the creative inventory's selected tab's,
+/// else its kind's.
+pub fn view_background(view: &ContainerView) -> &str {
+    view.creative
+        .as_ref()
+        .and_then(|c| {
+            c.background
+                .strip_prefix("textures/gui/container/")?
+                .strip_suffix(".png")
+        })
+        .unwrap_or_else(|| background_name(view.kind))
+}
+
 /// Where a placeholder window's plain band ends: at its inventory part (96 units
 /// tall), or at its bottom edge (7).
 fn placeholder_body_end(inventory: bool, image_height: i32) -> i32 {
@@ -101,7 +118,7 @@ fn placeholder_body_end(inventory: bool, image_height: i32) -> i32 {
 }
 
 /// Every picture a container screen may need.
-pub const BACKGROUNDS: [&str; 9] = [
+pub const BACKGROUNDS: [&str; 12] = [
     "inventory",
     "generic_54",
     "dispenser",
@@ -111,6 +128,9 @@ pub const BACKGROUNDS: [&str; 9] = [
     "blast_furnace",
     "smoker",
     "hopper",
+    "creative_inventory/tab_items",
+    "creative_inventory/tab_item_search",
+    "creative_inventory/tab_inventory",
 ];
 
 fn translated(key: &str) -> Arc<Tag> {
@@ -237,6 +257,9 @@ impl HudLayout {
         let (left, top) = ((d.width - iw) / 2, (d.height - ih) / 2);
         // `extractTransparentBackground`.
         self.gradient(0, 0, d.width, d.height, 0xC010_1010, 0xD010_1010);
+        if let Some(cv) = &v.creative {
+            self.creative_behind(sprites, cv, stacks, left, top);
+        }
         if let Some(t) = d.background {
             match v.kind {
                 Kind::Chest(rows) => {
@@ -356,8 +379,11 @@ impl HudLayout {
                 WHITE,
             );
         }
+        if let Some(cv) = &v.creative {
+            self.creative_front(sprites, font, lang, memory, cv, stacks, left, top);
+        }
         // `extractLabels`: the title, and the inventory's name over its rows (not in
-        // the inventory screen itself).
+        // the inventory screen itself; the creative screen's are above).
         let title = v.title.clone().unwrap_or_else(|| CRAFTING.clone());
         let title = memory.lines(&title, Wrap::Single, font, lang)[0].clone();
         let title_x = match v.kind {
@@ -368,9 +394,11 @@ impl HudLayout {
             }
             _ => 8,
         };
-        self.styled(&title, [0, 0], 1, left + title_x, top + 6, LABEL, false);
+        if v.creative.is_none() {
+            self.styled(&title, [0, 0], 1, left + title_x, top + 6, LABEL, false);
+        }
         let shows_inventory = match v.kind {
-            Kind::Inventory => false,
+            Kind::Inventory | Kind::Creative => false,
             Kind::Placeholder(p) => p.inventory,
             _ => true,
         };
@@ -403,8 +431,9 @@ impl HudLayout {
             .as_ref()
             .filter(|_| !carried.is_empty());
         for (i, &(x, y, rule)) in v.slots.iter().enumerate() {
-            // A placeholder's own slots aren't drawn.
-            if x == menu::HIDDEN {
+            // A placeholder's own slots aren't drawn, nor the creative inventory tab's
+            // crafting slots (at -2000).
+            if x == menu::HIDDEN || x <= -2000 {
                 continue;
             }
             let (x, y) = (left + x, top + y);
@@ -484,6 +513,9 @@ impl HudLayout {
             let name = Arc::new(ruthenium_sim::item_name::styled_name(&v.stacks[h]));
             let line = memory.lines(&name, Wrap::Single, font, lang)[0].clone();
             self.tooltip(sprites, d, &line);
+        }
+        if let Some(cv) = &v.creative {
+            self.creative_tooltips(sprites, font, lang, memory, d, cv, left, top);
         }
     }
 

@@ -426,7 +426,7 @@ impl Hud {
             let background = self
                 .containers
                 .iter()
-                .find(|(n, _)| n == ruthenium_ui::hud::background_name(view.kind))
+                .find(|(n, _)| n == ruthenium_ui::hud::view_background(view))
                 .map(|(_, t)| *t)
                 .filter(|t| textures.is_ready(*t))
                 .map(TextureId::index);
