@@ -15,7 +15,12 @@ use ruthenium_sim::session::{At, Pointer, ScreenInput};
 use ruthenium_ui::GuiScale;
 
 use super::chat::ExitReason;
-use super::{Menu, SCANCODE_ESCAPE, Screen};
+use super::{
+    Menu, SCANCODE_A, SCANCODE_BACKSPACE, SCANCODE_C, SCANCODE_DELETE, SCANCODE_END,
+    SCANCODE_ESCAPE, SCANCODE_HOME, SCANCODE_LEFT, SCANCODE_RIGHT, SCANCODE_V, SCANCODE_X, Screen,
+};
+use ruthenium_sim::menu::work::edit_box::EditKey;
+use ruthenium_sim::menu::work::{KindState, State};
 
 /// SDL's scancodes of the shift and control keys, left and right.
 const SHIFT: [u32; 2] = [225, 229];
@@ -157,11 +162,9 @@ impl Menu {
         }
     }
 
-    /// The wheel over the screen (the creative one scrolls).
+    /// The wheel turned over the screen (`mouseScrolled`; SDL's vertical amount): the
+    /// creative screen and the workstations' lists scroll.
     pub(super) fn container_wheel(&mut self, y: f32) {
-        if self.creative_shown().is_none() {
-            return;
-        }
         let at = self.pointer_at();
         if let Some(s) = &self.session {
             s.screen_input(ScreenInput::Scroll {
@@ -171,23 +174,23 @@ impl Menu {
         }
     }
 
-    /// Typed text (the creative screen's search box).
+    /// Typed text over the screen (`charTyped`): the creative screen's search box, an
+    /// anvil's name box.
     pub(super) fn container_text(&mut self, text: &str) {
-        if self.creative_shown().is_none() {
-            return;
-        }
         if let Some(s) = &self.session {
             s.screen_input(ScreenInput::Text(text.to_owned()));
         }
     }
 
-    /// Whether the screen takes typed text (the creative one).
+    /// Whether the screen takes typed text (the creative one, an anvil).
     pub(super) fn container_wants_text(&self) -> bool {
-        matches!(self.screen, Screen::Container) && self.creative_shown().is_some()
+        matches!(self.screen, Screen::Container)
+            && (self.creative_shown().is_some() || self.anvil_box().is_some())
     }
 
     /// A key went down or repeated over the screen (`keyPressed`); Escape and the
-    /// inventory key close it.
+    /// inventory key close it. An anvil's name box reads the key first: what it takes, or
+    /// any key while it takes input, goes no further (`AnvilScreen.keyPressed`).
     pub(super) fn container_key(
         &mut self,
         scancode: u32,
@@ -217,11 +220,43 @@ impl Menu {
             .as_ref()
             .and_then(|s| s.container_view())
             .is_some_and(|v| v.kind == ruthenium_sim::menu::Kind::Lectern);
+        let mut swallowed = false;
+        if let Some(name) = self.anvil_box() {
+            let key = edit_key(scancode, shortcut);
+            // (Copying and cutting take the selection the screen shows.)
+            if matches!(key, EditKey::Copy | EditKey::Cut) {
+                clipboard.set(&name.highlighted());
+            }
+            let paste = if key == EditKey::Paste {
+                clipboard.get().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            swallowed = key != EditKey::Other || name.editable;
+            if let Some(s) = &self.session {
+                s.screen_input(ScreenInput::EditKey {
+                    key,
+                    shift,
+                    ctrl: shortcut,
+                    paste,
+                });
+            }
+        }
         if let Some(s) = &self.session {
             s.screen_input(ScreenInput::Key { binds, ctrl, at });
         }
-        if binds.escape || binds.inventory && !book {
+        if binds.escape || (binds.inventory && !swallowed && !book) {
             self.container_closed();
+        }
+    }
+
+    /// The open anvil's name box, as last drawn.
+    fn anvil_box(&self) -> Option<ruthenium_sim::menu::work::edit_box::EditBox> {
+        let view = self.session.as_ref()?.container_view()?;
+        let w: &State = view.work.as_deref()?;
+        match &w.kind {
+            KindState::Anvil(a) => Some(a.name.clone()),
+            _ => None,
         }
     }
 
@@ -271,8 +306,12 @@ impl Menu {
         renderer.set_container_screen(view.zip(pointer).map(|(v, p)| (v, (p.x, p.y))));
     }
 
-    /// Before the session's frame: where the pointer is, and whether it dragged.
+    /// Before the session's frame: where the pointer is, and whether it dragged. (And
+    /// the language stacks' names are read in, for an anvil's name box.)
     pub(super) fn container_game_frame(&mut self) {
+        if let (Some(s), Some(j)) = (&self.session, &mut self.joiner) {
+            s.set_language(j.server_lang());
+        }
         if !matches!(self.screen, Screen::Container) {
             return;
         }
@@ -280,5 +319,23 @@ impl Menu {
         if let (Some(s), Some(p)) = (&self.session, self.gui_pointer()) {
             s.set_pointer(p, drag);
         }
+    }
+}
+
+/// The edit box's key for a scancode (\`EditBox.keyPressed\`'s keys; \`shortcut\` is the
+/// platform's control or command).
+fn edit_key(scancode: u32, shortcut: bool) -> EditKey {
+    match scancode {
+        SCANCODE_BACKSPACE => EditKey::Backspace,
+        SCANCODE_DELETE => EditKey::Delete,
+        SCANCODE_HOME => EditKey::Home,
+        SCANCODE_END => EditKey::End,
+        SCANCODE_RIGHT => EditKey::Right,
+        SCANCODE_LEFT => EditKey::Left,
+        SCANCODE_A if shortcut => EditKey::SelectAll,
+        SCANCODE_C if shortcut => EditKey::Copy,
+        SCANCODE_X if shortcut => EditKey::Cut,
+        SCANCODE_V if shortcut => EditKey::Paste,
+        _ => EditKey::Other,
     }
 }
