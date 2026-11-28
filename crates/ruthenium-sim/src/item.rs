@@ -1175,6 +1175,23 @@ impl ItemTags {
         self.all.insert(tag.to_owned(), by_item);
     }
 
+    /// The tags an item is in (`Holder.tags`, in no particular order).
+    pub fn tags_of(&self, item: i32) -> Vec<&str> {
+        let Ok(i) = usize::try_from(item) else {
+            return Vec::new();
+        };
+        self.all
+            .iter()
+            .filter(|(_, by)| by.get(i).copied().unwrap_or(false))
+            .map(|(t, _)| t.as_str())
+            .collect()
+    }
+
+    /// Every tag's name.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.all.keys().map(String::as_str)
+    }
+
     /// `ItemStack.is(tag)`: an empty stack, or an unknown tag, holds nothing.
     pub fn is(&self, stack: &Stack, tag: &str) -> bool {
         !stack.is_empty()
@@ -1233,6 +1250,9 @@ pub struct Items {
     pub trims: Trims,
     /// The `minecraft:banner_pattern` registry: each entry's asset, by id.
     pub banner_patterns: Vec<Arc<str>>,
+    /// What the creative inventory's tabs hold (the `creative_tabs` export; empty
+    /// without it).
+    pub creative: Arc<ruthenium_prepare::exporters::CreativeTabsData>,
 }
 
 impl Items {
@@ -1253,7 +1273,19 @@ impl Items {
                 defaults.insert(c.key.clone(), v);
             }
         }
-        Ok(Items::new(&classes, &defaults))
+        let mut items = Items::new(&classes, &defaults);
+        let path = exports.join(ruthenium_prepare::exporters::CREATIVE_TABS);
+        match std::fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| ruthenium_prepare::exporters::read_creative_tabs(&b))
+        {
+            Ok(c) => items.creative = Arc::new(c),
+            Err(e) => eprintln!(
+                "[ruthenium] no creative tabs ({}: {e}); run `ruthenium prepare`. The creative inventory is empty",
+                path.display()
+            ),
+        }
+        Ok(items)
     }
 
     /// From the exported classes and each item's report (`{"components": {...}}`).
@@ -1287,6 +1319,7 @@ impl Items {
             enchantments: crate::enchantment::Enchantments::default(),
             trims: Trims::default(),
             banner_patterns: Vec::new(),
+            creative: Arc::default(),
         }
     }
 
