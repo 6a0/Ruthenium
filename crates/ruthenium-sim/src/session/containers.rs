@@ -49,6 +49,14 @@ pub enum At {
     Gui(f64, f64),
     Slot(usize),
     Outside,
+    /// The middle of a screen's button ([`super::stations`]), of a beacon's effect
+    /// (primary or secondary), or of an enchanting table's offer (0 to 2).
+    Button(super::ButtonKind),
+    Effect {
+        effect: i32,
+        primary: bool,
+    },
+    Offer(usize),
 }
 
 /// A container screen's event, from the window or a script.
@@ -288,6 +296,11 @@ impl Game {
                 )
             }),
             (At::Outside, Some(s), _) => (f64::from(s.left - 20), f64::from(s.top - 20)),
+            (At::Offer(i), Some(s), _) => (
+                f64::from(s.left + 60 + 54),
+                f64::from(s.top + 14 + 19 * i as i32 + 9),
+            ),
+            (At::Button(_) | At::Effect { .. }, ..) => self.station_place(at),
             _ => (-1.0, -1.0),
         }
     }

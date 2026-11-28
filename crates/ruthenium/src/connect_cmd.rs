@@ -31,6 +31,11 @@
 //! chat key), `ekey` (the inventory key) and `scroll.Y` (the wheel). `csave` and
 //! `cload` hold Save Hotbar and Load Hotbar through the step (with a digit: C or X
 //! and that number in the world).
+//! The buttons of the beacon, the enchanting table and the lectern: `btn.NAME` (a left
+//! click on `done`, `take`, `next`, `prev`, `confirm` or `cancel`), `eff.ID` and
+//! `eff2.ID` (a beacon's primary or secondary effect by its registry id), `offer.I`
+//! and `roffer.I` (an enchanting table's offer 0 to 2, left or right), and `pgup` and
+//! `pgdn` (a book's Page Up and Page Down).
 //!
 //! What the chat shows is printed as it comes. A death is printed, and Respawn pressed as soon as the death screen's buttons work;
 //! the script goes on (it doesn't start over) once the player is back.
@@ -265,6 +270,40 @@ fn screen_events(k: &str) -> Option<Vec<ScreenEvent>> {
         ["ekey"] => vec![Key(
             Binds {
                 inventory: true,
+                ..Binds::default()
+            },
+            false,
+            At::Outside,
+        )],
+        ["btn", name] => {
+            use ruthenium_sim::session::ButtonKind as B;
+            let kind = match *name {
+                "done" => B::Done,
+                "take" => B::TakeBook,
+                "next" => B::PageForward,
+                "prev" => B::PageBack,
+                "confirm" => B::BeaconConfirm,
+                "cancel" => B::BeaconCancel,
+                _ => return None,
+            };
+            click(1, At::Button(kind), false)
+        }
+        ["eff" | "eff2", id] => click(
+            1,
+            At::Effect {
+                effect: id.parse().ok()?,
+                primary: parts[0] == "eff",
+            },
+            false,
+        ),
+        ["offer" | "roffer", i] => {
+            let i: usize = i.parse().ok().filter(|i| *i < 3)?;
+            click(if parts[0] == "offer" { 1 } else { 3 }, At::Offer(i), false)
+        }
+        ["pgup"] | ["pgdn"] => vec![Key(
+            Binds {
+                page_up: parts[0] == "pgup",
+                page_down: parts[0] == "pgdn",
                 ..Binds::default()
             },
             false,
@@ -1074,5 +1113,33 @@ mod tests {
         assert!(parse_script("chat=%G1@5").is_err());
         assert!(parse_script("w@").is_err());
         assert!(parse_script("fly@100").is_err());
+    }
+
+    #[test]
+    fn reads_the_station_screens_buttons() {
+        use ruthenium_sim::session::ButtonKind;
+        let s = parse_script("btn.take+eff.3+eff2.9@100 roffer.2+pgdn@0").unwrap();
+        assert_eq!(
+            s[0].screen[..2],
+            [
+                ScreenEvent::Press(1, At::Button(ButtonKind::TakeBook), false),
+                ScreenEvent::Release(1, At::Button(ButtonKind::TakeBook), false),
+            ]
+        );
+        assert_eq!(
+            s[0].screen[4],
+            ScreenEvent::Press(
+                1,
+                At::Effect {
+                    effect: 9,
+                    primary: false
+                },
+                false
+            )
+        );
+        assert_eq!(s[1].screen[0], ScreenEvent::Press(3, At::Offer(2), false));
+        assert!(matches!(s[1].screen[2], ScreenEvent::Key(b, false, At::Outside) if b.page_down));
+        assert!(parse_script("offer.3@0").is_err());
+        assert!(parse_script("btn.jump@0").is_err());
     }
 }

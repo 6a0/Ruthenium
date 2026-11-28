@@ -512,6 +512,31 @@ impl Game {
         true
     }
 
+    /// The middle of the button a script names (`At::Button`, `At::Effect`).
+    pub(super) fn station_place(&self, at: super::At) -> (f64, f64) {
+        let found = self
+            .containers
+            .station
+            .buttons
+            .iter()
+            .find(|b| match (at, b.kind) {
+                (super::At::Button(k), kind) => k == kind,
+                (
+                    super::At::Effect { effect, primary },
+                    ButtonKind::BeaconEffect {
+                        effect: e,
+                        primary: p,
+                        upgrade,
+                        ..
+                    },
+                ) => effect == e && primary == p && !upgrade || !primary && upgrade && effect == e,
+                _ => false,
+            });
+        found.map_or((-1.0, -1.0), |b| {
+            (f64::from(b.x + b.width / 2), f64::from(b.y + b.height / 2))
+        })
+    }
+
     /// What the drawing needs (with the frame's view).
     pub(super) fn station_view(&self) -> Option<StationView> {
         let kind = self.station_kind()?;
