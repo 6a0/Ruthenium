@@ -5207,60 +5207,9 @@ mod tests {
         r.frame(1);
         assert!(!r.game.container_screen_open());
         assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
-        // A grindstone (15) isn't run: it opens a placeholder as a chest opens its screen:
-        // the keys let go, the menu's id and slots kept, nothing sent.
-        r.game.use_keys.use_clicks = 2;
-        r.packet(play::Clientbound::OpenScreen {
-            container_id: 5,
-            menu_type: 15,
-            title: Tag::String("Repair & Disenchant".into()),
-        });
-        r.frame(1);
-        assert!(r.game.container_screen_open());
-        assert_eq!(r.game.use_keys.use_clicks, 0);
-        let menu = r.game.world.as_ref().unwrap().player.menus.container();
-        assert_eq!((menu.id, menu.slots.len()), (5, 3 + 36));
-        assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
-        // It clicks nothing, the number keys swap nothing, and E closes it.
-        r.frame_with(
-            1,
-            FrameInput {
-                screen_inputs: vec![
-                    ScreenInput::Click {
-                        slot: 3,
-                        button: 0,
-                        input: crate::menu::Input::Pickup,
-                    },
-                    ScreenInput::Key {
-                        binds: Binds {
-                            hotbar: [true, false, false, false, false, false, false, false, false],
-                            ..Binds::default()
-                        },
-                        ctrl: false,
-                        at: At::Slot(3),
-                    },
-                ],
-                ..FrameInput::default()
-            },
-        );
-        assert!(r.game.container_screen_open());
-        assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
-        r.frame_with(
-            1,
-            FrameInput {
-                screen_inputs: vec![ScreenInput::Key {
-                    binds: Binds {
-                        inventory: true,
-                        ..Binds::default()
-                    },
-                    ctrl: false,
-                    at: At::Outside,
-                }],
-                ..FrameInput::default()
-            },
-        );
-        assert!(!r.game.container_screen_open());
-        assert_eq!(sent(&mut r), [play::container_close(5)]);
+        // Every menu type is run now (the creative inventory, the mounts, the stations
+        // and the workstations): no server's screen opens a placeholder any more, but
+        // its layouts stay right.
         // A lectern (17) has one slot and no inventory; a crafter (7) its result last.
         let layout = |name| crate::menu::Placeholder::for_menu(name);
         assert!(!layout("minecraft:lectern").inventory);
