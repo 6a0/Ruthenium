@@ -4432,6 +4432,7 @@ mod tests {
                         Component::Equippable {
                             slot: 3,
                             asset: None,
+                            allowed_entities: None,
                             swappable: true,
                             damage_on_hurt: true,
                             equip_on_interact: false,

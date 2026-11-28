@@ -2031,6 +2031,7 @@ impl Game {
 
     /// The block tags movement reads, from the server's tags (block registry ids).
     fn apply_tags(&mut self, tags: &[RegistryTags]) {
+        self.apply_menu_tags(tags);
         if let Some(items) = tags.iter().find(|t| t.registry == "minecraft:item") {
             for (tag, ids) in &items.tags {
                 let names = ids.iter().filter_map(|&id| {

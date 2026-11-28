@@ -360,6 +360,8 @@ pub enum Component {
     Equippable {
         slot: i32,
         asset: Option<String>,
+        /// The entities that may wear it (`allowedEntities`): any, without it.
+        allowed_entities: Option<HolderSet>,
         swappable: bool,
         damage_on_hurt: bool,
         equip_on_interact: bool,
@@ -495,11 +497,12 @@ fn read_component(r: &mut Reader<'_>, kind: i32, depth: u32) -> Result<Component
             // The asset id, the camera overlay, the entities that may wear it.
             let asset = opt(r, |r| r.identifier())?;
             opt(r, |r| r.identifier())?;
-            opt(r, holder_set)?;
+            let allowed_entities = opt(r, read_holder_set)?;
             let _dispensable = r.bool()?;
             let c = Component::Equippable {
                 slot,
                 asset,
+                allowed_entities,
                 swappable: r.bool()?,
                 damage_on_hurt: r.bool()?,
                 equip_on_interact: r.bool()?,
@@ -862,6 +865,7 @@ fn write_into(c: &Component, o: &mut Vec<u8>) -> Result<(), &'static str> {
         Component::Equippable {
             slot,
             asset,
+            allowed_entities,
             swappable,
             damage_on_hurt,
             equip_on_interact,
@@ -871,7 +875,7 @@ fn write_into(c: &Component, o: &mut Vec<u8>) -> Result<(), &'static str> {
             write_varint(o, sound_id("minecraft:item.armor.equip_generic") + 1);
             write_opt(o, asset, |o, a| write_string(o, a));
             write_bool(o, false);
-            write_bool(o, false);
+            write_opt(o, allowed_entities, write_holder_set);
             write_bool(o, true);
             for b in [swappable, damage_on_hurt, equip_on_interact, can_be_sheared] {
                 write_bool(o, *b);
@@ -1677,6 +1681,7 @@ mod tests {
             Some(Component::Equippable {
                 slot: 4,
                 asset: Some("minecraft:iron".into()),
+                allowed_entities: Some(HolderSet::Tag("minecraft:skeletons".into())),
                 swappable: true,
                 damage_on_hurt: false,
                 equip_on_interact: true,

@@ -559,6 +559,15 @@ pub struct Components {
     pub cooking_fuel: bool,
     /// One of its enchantments has `prevent_armor_change` (curse of binding).
     pub prevent_armor_change: bool,
+    /// `brewing_fuel`: a brewing stand burns it.
+    pub brewing_fuel: bool,
+    /// `enchantable`, and `enchantments` removed by the patch (`isEnchantable`).
+    pub enchantable: bool,
+    pub enchantments_removed: bool,
+    /// `stored_enchantments` (an enchanted book's): (`minecraft:enchantment` id, level).
+    pub stored_enchantments: Vec<(i32, i32)>,
+    /// `equippable`'s `allowed_entities` (`canBeEquippedBy`): any, without it.
+    pub equip_allowed: Option<Arc<HolderSet>>,
 }
 
 /// What the registered potion `id` is called in names (`Potion.name`): longer and
@@ -714,7 +723,13 @@ impl Components {
                     self.charged = false;
                     self.charged_rocket = false;
                 }
-                Some(Kind::Enchantments) => self.enchantments.clear(),
+                Some(Kind::Enchantments) => {
+                    self.enchantments.clear();
+                    self.enchantments_removed = true;
+                }
+                Some(Kind::StoredEnchantments) => self.stored_enchantments.clear(),
+                Some(Kind::Enchantable) => self.enchantable = false,
+                Some(Kind::BrewingFuel) => self.brewing_fuel = false,
                 Some(Kind::Tool) => self.tool = None,
                 Some(Kind::CanBreak) => self.can_break = None,
                 Some(Kind::CanPlaceOn) => self.can_place_on = None,
@@ -745,6 +760,7 @@ impl Components {
         // (A removed equippable takes its asset along.)
         if self.equippable.is_none() {
             self.equipment_asset = None;
+            self.equip_allowed = None;
         }
         for (_, c) in &patch.added {
             match c {
@@ -797,6 +813,7 @@ impl Components {
                     slot,
                     swappable,
                     asset,
+                    allowed_entities,
                     ..
                 } => {
                     self.equippable = Some(Equippable {
@@ -804,6 +821,7 @@ impl Components {
                         swappable: *swappable,
                     });
                     self.equipment_asset = asset.as_deref().map(Arc::from);
+                    self.equip_allowed = allowed_entities.clone().map(Arc::new);
                 }
                 Component::ItemModel(id) => self.item_model = Some(id.as_str().into()),
                 Component::DyedColor(rgb) => self.dyed_color = Some(*rgb as u32 & 0xFF_FFFF),
@@ -894,7 +912,11 @@ impl Components {
                         Item::from_name("minecraft:firework_rocket").map(|i| i.id() as i32);
                     self.charged_rocket = p.iter().any(|s| Some(s.item) == rocket);
                 }
-                Component::Enchantments(e) => self.enchantments = e.clone(),
+                Component::Enchantments(e) => {
+                    self.enchantments = e.clone();
+                    self.enchantments_removed = false;
+                }
+                Component::StoredEnchantments(e) => self.stored_enchantments = e.clone(),
                 Component::Glider => self.glider = true,
                 Component::Tool {
                     rules,
@@ -935,6 +957,8 @@ impl Components {
             match kind {
                 Some(Kind::Compostable) => self.compostable = true,
                 Some(Kind::CookingFuel) => self.cooking_fuel = true,
+                Some(Kind::BrewingFuel) => self.brewing_fuel = true,
+                Some(Kind::Enchantable) => self.enchantable = true,
                 Some(Kind::JukeboxPlayable) => self.jukebox_playable = true,
                 Some(Kind::LodestoneTracker) => self.lodestone = true,
                 Some(Kind::CustomName) => self.custom_name = text(c),
@@ -1253,6 +1277,197 @@ pub struct Items {
     /// What the creative inventory's tabs hold (the `creative_tabs` export; empty
     /// without it).
     pub creative: Arc<ruthenium_prepare::exporters::CreativeTabsData>,
+    /// The server's tags that menus read: items', entity types' and enchantments'.
+    pub tags: Arc<MenuTags>,
+}
+
+/// The server's tags the menus read (`ItemStack.is`, `Entity.is`, `Holder.is`): a
+/// beacon's payment, a brewing stand's potions, who wears a mount's armour, curses.
+#[derive(Debug, Clone, Default)]
+pub struct MenuTags {
+    pub items: ItemTags,
+    pub entity_types: IdTags,
+    pub enchantments: IdTags,
+}
+
+/// A registry's tags by entry id (`HolderSet.Named` as the client has them).
+#[derive(Debug, Clone, Default)]
+pub struct IdTags {
+    all: HashMap<String, Vec<bool>>,
+}
+
+impl IdTags {
+    /// Sets a tag's entries, by registry id.
+    pub fn set(&mut self, tag: &str, ids: impl IntoIterator<Item = i32>) {
+        let mut by_id = Vec::new();
+        for i in ids.into_iter().filter_map(|i| usize::try_from(i).ok()) {
+            if by_id.len() <= i {
+                by_id.resize(i + 1, false);
+            }
+            by_id[i] = true;
+        }
+        self.all.insert(tag.to_owned(), by_id);
+    }
+
+    /// Whether entry `id` is in `tag` (an unknown tag holds nothing).
+    pub fn contains(&self, tag: &str, id: i32) -> bool {
+        usize::try_from(id)
+            .ok()
+            .and_then(|i| self.all.get(tag)?.get(i).copied())
+            .unwrap_or(false)
+    }
+
+    /// `HolderSet.contains`: a tag's entries, or those listed.
+    pub fn holds(&self, set: &HolderSet, id: i32) -> bool {
+        match set {
+            HolderSet::Tag(t) => self.contains(t, id),
+            HolderSet::Ids(ids) => ids.contains(&id),
+        }
+    }
+}
+
+impl Items {
+    /// `Equippable.canBeEquippedBy`: an entity of type `entity_type` may wear `stack`.
+    pub fn can_be_equipped_by(&self, stack: &Stack, entity_type: i32) -> bool {
+        stack
+            .c
+            .equip_allowed
+            .as_deref()
+            .is_none_or(|set| self.tags.entity_types.holds(set, entity_type))
+    }
+}
+
+/// An `allowed_entities` of an item's report: a `#` tag, one type or a list of them.
+fn entity_set(v: &serde_json::Value) -> HolderSet {
+    use ruthenium_data::v26_3::registries::EntityType;
+    let id = |s: &str| EntityType::from_name(&full_identifier(s)).map(|t| t.id() as i32);
+    match v {
+        serde_json::Value::String(s) => match s.strip_prefix('#') {
+            Some(tag) => HolderSet::Tag(full_identifier(tag)),
+            None => HolderSet::Ids(id(s).into_iter().collect()),
+        },
+        serde_json::Value::Array(a) => {
+            HolderSet::Ids(a.iter().filter_map(|e| id(e.as_str()?)).collect())
+        }
+        _ => HolderSet::Ids(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod menu_tag_tests {
+    use super::*;
+    use ruthenium_data::v26_3::registries::EntityType;
+
+    fn horse_items() -> Items {
+        let mut classes = Vec::new();
+        let mut reports = HashMap::new();
+        let equip = |slot: &str, allowed: serde_json::Value| {
+            serde_json::json!({"components": {
+                "minecraft:max_stack_size": 1,
+                "minecraft:enchantments": {},
+                "minecraft:equippable": {"slot": slot, "allowed_entities": allowed},
+            }})
+        };
+        for (name, report) in [
+            (
+                "minecraft:iron_horse_armor",
+                equip("body", "#minecraft:can_wear_horse_armor".into()),
+            ),
+            (
+                "minecraft:white_carpet",
+                equip(
+                    "body",
+                    serde_json::json!(["minecraft:llama", "trader_llama"]),
+                ),
+            ),
+            (
+                "minecraft:wolf_armor",
+                equip("body", "minecraft:wolf".into()),
+            ),
+            (
+                "minecraft:diamond_helmet",
+                serde_json::json!({"components": {"minecraft:equippable": {"slot": "head"}}}),
+            ),
+            (
+                "minecraft:blaze_powder",
+                serde_json::json!({"components": {"minecraft:brewing_fuel": {}, "minecraft:enchantments": {}}}),
+            ),
+            (
+                "minecraft:book",
+                serde_json::json!({"components": {"minecraft:enchantable": {"value": 1}, "minecraft:enchantments": {}}}),
+            ),
+        ] {
+            classes.push(ItemClassData {
+                id: Item::from_name(name).unwrap().id(),
+                key: name.to_owned(),
+                classes: vec!["Item".to_owned()],
+                flags: 0,
+                block: None,
+                fields: Vec::new(),
+            });
+            reports.insert(name.to_owned(), report);
+        }
+        let mut items = Items::new(&classes, &reports);
+        let mut tags = MenuTags::default();
+        tags.entity_types.set(
+            "minecraft:can_wear_horse_armor",
+            [EntityType::Horse.id() as i32],
+        );
+        items.tags = Arc::new(tags);
+        items
+    }
+
+    #[test]
+    fn who_may_wear_it_and_what_brews_and_enchants() {
+        let items = horse_items();
+        let stack = |name: &str| items.new_stack(Item::from_name(name).unwrap().id() as i32, 1);
+        let (horse, llama, trader, wolf) = (
+            EntityType::Horse.id() as i32,
+            EntityType::Llama.id() as i32,
+            EntityType::TraderLlama.id() as i32,
+            EntityType::Wolf.id() as i32,
+        );
+        let armour = stack("minecraft:iron_horse_armor");
+        assert!(items.can_be_equipped_by(&armour, horse));
+        assert!(!items.can_be_equipped_by(&armour, llama));
+        let carpet = stack("minecraft:white_carpet");
+        assert!(
+            items.can_be_equipped_by(&carpet, llama) && items.can_be_equipped_by(&carpet, trader)
+        );
+        assert!(!items.can_be_equipped_by(&carpet, horse));
+        assert!(items.can_be_equipped_by(&stack("minecraft:wolf_armor"), wolf));
+        assert!(!items.can_be_equipped_by(&stack("minecraft:wolf_armor"), horse));
+        // No list: anyone.
+        assert!(items.can_be_equipped_by(&stack("minecraft:diamond_helmet"), horse));
+        assert!(stack("minecraft:blaze_powder").c.brewing_fuel);
+        let book = stack("minecraft:book");
+        assert!(book.c.enchantable && !book.c.enchantments_removed);
+        assert!(!stack("minecraft:wolf_armor").c.enchantable);
+        // A patch can name others, or take the component away.
+        let patched = items.stack(&ItemStack {
+            item: armour.item,
+            count: 1,
+            patch: ComponentPatch {
+                added: vec![(
+                    Kind::Equippable.id() as i32,
+                    Component::Equippable {
+                        slot: 6,
+                        asset: None,
+                        allowed_entities: Some(HolderSet::Ids(vec![wolf])),
+                        swappable: true,
+                        damage_on_hurt: true,
+                        equip_on_interact: false,
+                        can_be_sheared: false,
+                    },
+                )],
+                removed: vec![Kind::Enchantments.id() as i32],
+                ..Default::default()
+            },
+        });
+        assert!(items.can_be_equipped_by(&patched, wolf));
+        assert!(!items.can_be_equipped_by(&patched, horse));
+        assert!(patched.c.enchantments_removed);
+    }
 }
 
 impl Items {
@@ -1320,6 +1535,7 @@ impl Items {
             trims: Trims::default(),
             banner_patterns: Vec::new(),
             creative: Arc::default(),
+            tags: Arc::default(),
         }
     }
 
@@ -1412,6 +1628,9 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
     c.jukebox_playable = has("minecraft:jukebox_playable");
     c.glider = has("minecraft:glider");
     c.cooking_fuel = has("minecraft:cooking_fuel");
+    c.brewing_fuel = has("minecraft:brewing_fuel");
+    c.enchantable = has("minecraft:enchantable");
+    c.enchantments_removed = !has("minecraft:enchantments");
     if let Some(o) = v.get("minecraft:block_state").and_then(|o| o.as_object()) {
         let props = o
             .iter()
@@ -1471,6 +1690,7 @@ fn read_defaults(c: &mut Components, v: &serde_json::Value) {
             .get("asset_id")
             .and_then(|a| a.as_str())
             .map(|a| full_identifier(a).into());
+        c.equip_allowed = o.get("allowed_entities").map(|a| Arc::new(entity_set(a)));
     }
     c.item_model = v
         .get("minecraft:item_model")

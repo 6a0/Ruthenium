@@ -708,3 +708,45 @@ impl Game {
         self.containers.screen.is_some()
     }
 }
+
+impl Game {
+    /// The tags the menus read (a beacon's payment, a brewing stand's potions, who may
+    /// wear a mount's armour, curses), from the server's tags: into the items, where the
+    /// menus' rules find them.
+    pub(super) fn apply_menu_tags(
+        &mut self,
+        tags: &[ruthenium_protocol::packets::configuration::RegistryTags],
+    ) {
+        let Some(physics) = &mut self.physics else {
+            return;
+        };
+        let items = Arc::make_mut(&mut physics.items);
+        let mine = Arc::make_mut(&mut items.tags);
+        for t in tags {
+            match t.registry.as_str() {
+                "minecraft:item" => {
+                    for (tag, ids) in &t.tags {
+                        let names = ids.iter().filter_map(|&id| {
+                            ruthenium_data::v26_3::registries::Item::from_id(
+                                u32::try_from(id).ok()?,
+                            )
+                            .map(|i| i.name())
+                        });
+                        mine.items.set(tag, names);
+                    }
+                }
+                "minecraft:entity_type" => {
+                    for (tag, ids) in &t.tags {
+                        mine.entity_types.set(tag, ids.iter().copied());
+                    }
+                }
+                "minecraft:enchantment" => {
+                    for (tag, ids) in &t.tags {
+                        mine.enchantments.set(tag, ids.iter().copied());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
