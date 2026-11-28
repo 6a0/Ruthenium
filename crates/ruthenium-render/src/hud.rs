@@ -438,6 +438,7 @@ impl Hud {
                 mouse: (mx.floor() as i32, my.floor() as i32),
                 background,
                 partial,
+                alt_font: None,
             };
             let lang = WithKeys {
                 lang: models.lang(),

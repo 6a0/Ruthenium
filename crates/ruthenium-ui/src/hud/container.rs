@@ -23,6 +23,7 @@ use ruthenium_assets::meta::GuiScaling;
 use ruthenium_javamath::mth;
 
 mod creative;
+mod stations;
 
 /// The titles' colour (`-12566464`).
 const LABEL: u32 = 0xFF40_4040;
@@ -46,6 +47,7 @@ pub(super) struct ContainerSprites {
     tooltip_background: SpriteInfo,
     tooltip_frame: SpriteInfo,
     creative: creative::CreativeSprites,
+    station: stations::StationSprites,
 }
 
 impl ContainerSprites {
@@ -61,6 +63,7 @@ impl ContainerSprites {
             tooltip_background: s("tooltip/background"),
             tooltip_frame: s("tooltip/frame"),
             creative: creative::CreativeSprites::with(s),
+            station: stations::StationSprites::with(s),
         }
     }
 }
@@ -78,6 +81,8 @@ pub struct ContainerDraw<'a> {
     pub background: Option<u32>,
     /// How far the view's tick has come (the cooldowns).
     pub partial: f32,
+    /// The `minecraft:alt` font (an enchanting table's words), if there is one.
+    pub alt_font: Option<&'a Font>,
 }
 
 /// The picture a kind's window is drawn from (`textures/gui/container/<name>.png`).
@@ -280,6 +285,11 @@ impl HudLayout {
         let (left, top) = ((d.width - iw) / 2, (d.height - ih) / 2);
         // `extractTransparentBackground`.
         self.gradient(0, 0, d.width, d.height, 0xC010_1010, 0xD010_1010);
+        // A lectern's book isn't a container window.
+        if v.kind == Kind::Lectern {
+            self.lectern(sprites, font, lang, memory, d);
+            return;
+        }
         if let Some(cv) = &v.creative {
             self.creative_behind(sprites, cv, stacks, left, top);
         }
@@ -405,23 +415,28 @@ impl HudLayout {
         if let Some(cv) = &v.creative {
             self.creative_front(sprites, font, lang, memory, cv, stacks, left, top);
         }
+        self.station_background(sprites, font, memory, lang, d, stacks, (left, top));
         // `extractLabels`: the title, and the inventory's name over its rows (not in
         // the inventory screen itself; the creative screen's are above).
+        let own_labels = self.station_labels(font, memory, lang, v.kind, (left, top));
         let title = v.title.clone().unwrap_or_else(|| CRAFTING.clone());
         let title = memory.lines(&title, Wrap::Single, font, lang)[0].clone();
         let title_x = match v.kind {
             Kind::Inventory => 97,
             Kind::Crafting => 29,
-            Kind::Dispenser | Kind::Furnace | Kind::BlastFurnace | Kind::Smoker => {
-                (iw - title.width) / 2
-            }
+            Kind::Dispenser
+            | Kind::Furnace
+            | Kind::BlastFurnace
+            | Kind::Smoker
+            | Kind::BrewingStand => (iw - title.width) / 2,
             _ => 8,
         };
-        if v.creative.is_none() {
+        if v.creative.is_none() && !own_labels {
             self.styled(&title, [0, 0], 1, left + title_x, top + 6, LABEL, false);
         }
         let shows_inventory = match v.kind {
             Kind::Inventory | Kind::Creative => false,
+            _ if own_labels => false,
             Kind::Placeholder(p) => p.inventory,
             _ => true,
         };
@@ -481,16 +496,15 @@ impl HudLayout {
             }
             if stack.is_empty() {
                 let icon = match rule {
-                    Rule::Armor(EquipmentSlot::Head) => Some(0),
-                    Rule::Armor(EquipmentSlot::Chest) => Some(1),
-                    Rule::Armor(EquipmentSlot::Legs) => Some(2),
-                    Rule::Armor(EquipmentSlot::Feet) => Some(3),
-                    Rule::Offhand => Some(4),
-                    _ => None,
+                    Rule::Armor(EquipmentSlot::Head) => Some(&s.icons[0]),
+                    Rule::Armor(EquipmentSlot::Chest) => Some(&s.icons[1]),
+                    Rule::Armor(EquipmentSlot::Legs) => Some(&s.icons[2]),
+                    Rule::Armor(EquipmentSlot::Feet) => Some(&s.icons[3]),
+                    Rule::Offhand => Some(&s.icons[4]),
+                    r => s.station.icon(r, v.kind),
                 };
                 if let Some(icon) = icon {
-                    self.under
-                        .blit(&s.icons[icon], sprites.texture, x, y, 16, 16, WHITE);
+                    self.under.blit(icon, sprites.texture, x, y, 16, 16, WHITE);
                     continue;
                 }
             }
@@ -527,6 +541,11 @@ impl HudLayout {
                 self.decorations(font, &shown, x, y, None, 0.0);
                 self.item(stacks, shown, x, y, CARRIED_Z);
             }
+        }
+        // A button's tooltip comes first (`extractTooltip`'s is set if none is), an
+        // offer's after.
+        if self.station_tooltip(sprites, font, memory, lang, d, (left, top)) {
+            return;
         }
         // `extractTooltip`: the hovered stack's name, when nothing is carried.
         if let Some(h) = hovered

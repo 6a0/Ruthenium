@@ -336,6 +336,8 @@ pub struct HudText {
     pub shadow: bool,
     /// How many of the layout's `over` are under it.
     pub at: usize,
+    /// It is in the `minecraft:alt` font (an enchanting table's words).
+    pub alt: bool,
 }
 
 /// A player's face (`PlayerFaceExtractor`), eight by eight units.
@@ -405,7 +407,19 @@ impl HudLayout {
         t.line = None;
         t.scale = 1.0;
         t.at = at;
+        t.alt = false;
         t
+    }
+
+    /// The text laid out last is in the `minecraft:alt` font.
+    pub(super) fn mark_alt(&mut self) {
+        if let Some(t) = self
+            .texts_used
+            .checked_sub(1)
+            .and_then(|i| self.texts.get_mut(i))
+        {
+            t.alt = true;
+        }
     }
 
     pub(super) fn text(

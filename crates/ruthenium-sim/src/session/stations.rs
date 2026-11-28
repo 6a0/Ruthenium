@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use ruthenium_data::v26_3::registries::{DataComponentType as K, MobEffect};
+use ruthenium_data::v26_3::registries::{DataComponentType as K, Item, MobEffect};
 use ruthenium_protocol::nbt::Tag;
 use ruthenium_protocol::packets::play;
 
@@ -117,6 +117,9 @@ pub struct StationView {
     pub infinite_materials: bool,
     /// Each offer's enchantment, if the registry has it.
     pub clues: [Option<EnchantClue>; 3],
+    /// The pictures a beacon's window shows of what it may be paid with (netherite,
+    /// emerald, diamond, gold, iron).
+    pub items: Vec<Stack>,
 }
 
 /// The screens' state between events.
@@ -536,7 +539,20 @@ impl Game {
                 });
             }
         }
+        let items = match (kind, &self.physics) {
+            (Kind::Beacon, Some(ph)) => [
+                Item::NetheriteIngot,
+                Item::Emerald,
+                Item::Diamond,
+                Item::GoldIngot,
+                Item::IronIngot,
+            ]
+            .map(|i| ph.items.new_stack(i.id() as i32, 1))
+            .to_vec(),
+            _ => Vec::new(),
+        };
         Some(StationView {
+            items,
             buttons: st.buttons.clone(),
             pages: st.pages.clone(),
             page: st.page,
