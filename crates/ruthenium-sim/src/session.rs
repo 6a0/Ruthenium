@@ -2730,6 +2730,10 @@ impl Game {
                     w.entities.add(&add, &physics.entity_types, &self.players);
                 }
             }
+            // `handleRemoveEntities` (ClientPacketListener.java:770): gone at once. Twenty
+            // ticks after the player dies the server takes it out of the level and stops
+            // tracking every entity for it (ChunkMap.java:1168), so the other players
+            // leave the picture behind the death screen, in vanilla's client too.
             play::Clientbound::RemoveEntities { ids } => {
                 if let Some(w) = &mut self.world {
                     for id in ids {
