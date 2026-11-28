@@ -2018,6 +2018,34 @@ mod tests {
     }
 
     #[test]
+    fn an_equippables_wearers_are_written_as_read() {
+        // The typed value writes what it was read from (hashing falls back to it).
+        let c = Component::Equippable {
+            slot: 6,
+            asset: Some("minecraft:iron".into()),
+            allowed_entities: Some(HolderSet::Tag("minecraft:can_wear_horse_armor".into())),
+            swappable: true,
+            damage_on_hurt: false,
+            equip_on_interact: true,
+            can_be_sheared: true,
+        };
+        let bytes = write_value(&c).unwrap();
+        assert!(reads_as(Kind::Equippable, &bytes, &c));
+        let other = Component::Equippable {
+            slot: 6,
+            asset: Some("minecraft:iron".into()),
+            allowed_entities: Some(HolderSet::Ids(vec![79, 138])),
+            swappable: true,
+            damage_on_hurt: false,
+            equip_on_interact: true,
+            can_be_sheared: true,
+        };
+        let bytes = write_value(&other).unwrap();
+        assert!(reads_as(Kind::Equippable, &bytes, &other));
+        assert!(!reads_as(Kind::Equippable, &bytes, &c));
+    }
+
+    #[test]
     fn holder_sets_tag_and_list() {
         let s = stack(with(
             3,

@@ -579,3 +579,82 @@ fn a_grindstone_makes_what_vanillas_makes() {
         &wrong[..wrong.len().min(20)]
     );
 }
+
+/// What vanilla's menus do but the random cases seldom reach.
+mod rules {
+    use super::*;
+    use crate::menu::screen::Screen;
+
+    fn who<'a>(items: &'a Items, recipes: &'a RecipeSets) -> Who<'a> {
+        Who {
+            items,
+            recipes,
+            creative: false,
+        }
+    }
+
+    /// A shift-click that moves nothing leaves the source slot's container unaware
+    /// (`quickMoveStack` returns before `setChanged`): a grindstone keeps the result the
+    /// server last sent, as vanilla's does.
+    #[test]
+    fn a_grindstone_keeps_the_servers_result_when_nothing_moves() {
+        let items = Arc::new(items());
+        let recipes = recipes();
+        let who = who(&items, &recipes);
+        let mut m = Menu::new(Kind::Grindstone, 1);
+        m.items = super::super::MenuItems(Some(items.clone()));
+        let mut inv = Inventory::default();
+        for i in 3..39 {
+            m.set(&mut inv, i, items.new_stack(id("minecraft:stone"), 64));
+        }
+        let sword = items.stack(&ItemStack {
+            item: id("minecraft:diamond_sword"),
+            count: 1,
+            patch: ComponentPatch {
+                added: vec![(
+                    K::Enchantments.id() as i32,
+                    Component::Enchantments(vec![(0, 2)]),
+                )],
+                ..ComponentPatch::default()
+            },
+        });
+        m.set(&mut inv, 0, sword);
+        assert_eq!(m.own[2].item(), id("minecraft:diamond_sword"));
+        // The server's result, whatever it is: a bow.
+        m.set_item(&mut inv, 2, 5, items.new_stack(id("minecraft:bow"), 1));
+        m.clicked(&mut inv, &who, 0, 0, Input::QuickMove);
+        assert_eq!(m.own[0].item(), id("minecraft:diamond_sword"));
+        assert_eq!(m.own[2].item(), id("minecraft:bow"));
+        // A pickup tells the container whatever happens: the result is made again.
+        m.clicked(&mut inv, &who, 1, 0, Input::Pickup);
+        assert_eq!(m.own[2].item(), id("minecraft:diamond_sword"));
+    }
+
+    /// A slot the mount can't use isn't there to point at (`Slot.isActive`).
+    #[test]
+    fn a_mounts_hidden_slots_are_not_pointed_at() {
+        let state = MountState {
+            alive: true,
+            baby: false,
+            tamed: false,
+        };
+        let donkey = EntityType::Donkey.id() as i32;
+        let m = Mount::new("minecraft:donkey", donkey, 5, state, &MenuTags::default()).unwrap();
+        assert!(!m.saddle_shown && !m.body_shown);
+        let kind = Kind::Mount(m);
+        let menu = Menu::new(kind, 1);
+        let s = Screen::new(kind, 400, 300);
+        let at = |i: usize| {
+            let slot = menu.slots[i];
+            (
+                f64::from(s.left + slot.x + 8),
+                f64::from(s.top + slot.y + 8),
+            )
+        };
+        let (x, y) = at(0);
+        assert_eq!(s.slot_at(&menu, x, y), None);
+        let (x, y) = at(2);
+        assert_eq!(s.slot_at(&menu, x, y), Some(2));
+        assert!(!menu.slot_active(1) && menu.slot_active(2));
+    }
+}

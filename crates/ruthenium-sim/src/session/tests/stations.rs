@@ -204,6 +204,28 @@ fn a_beacons_buttons_choose_and_send_its_effects() {
         )
     });
     assert!(regen.selected && regen.active);
+    // Another primary takes the secondary away, unless it is that one.
+    let speed_button = button(&r, speed);
+    let (x, y) = middle(&speed_button);
+    press(&mut r, x, y, 1);
+    assert!(
+        !button(&r, |k| matches!(
+            k,
+            ButtonKind::BeaconEffect {
+                effect: 9,
+                upgrade: false,
+                ..
+            }
+        ))
+        .selected
+    );
+    let upgrade_button = button(&r, upgrade);
+    let (x, y) = middle(&upgrade_button);
+    press(&mut r, x, y, 1);
+    assert!(button(&r, upgrade).selected);
+    let (x, y) = middle(&speed_button);
+    press(&mut r, x, y, 1);
+    assert!(button(&r, upgrade).selected);
     let cancel = button(&r, |k| *k == ButtonKind::BeaconCancel);
     let (x, y) = middle(&cancel);
     press(&mut r, x, y, 1);
@@ -242,6 +264,11 @@ fn an_enchanting_tables_offers_are_sent_when_they_may_be_taken() {
     let (x, y) = offer(2);
     press(&mut r, x, y, 1);
     assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
+    // Levels enough, lapis not.
+    r.game.world.as_mut().unwrap().player.experience_level = 30;
+    press(&mut r, x, y, 1);
+    assert_eq!(sent(&mut r), Vec::<Vec<u8>>::new());
+    r.game.world.as_mut().unwrap().player.experience_level = 10;
     // An item taken away takes the offers along (`slotsChanged`).
     own(&mut r)[1] = stack("minecraft:lapis_lazuli", 3);
     r.game.world.as_mut().unwrap().player.experience_level = 30;
@@ -314,6 +341,14 @@ fn a_lecterns_book_turns_its_pages_on_the_server() {
     r.frame(1);
     assert_eq!(r.game.station_view().unwrap().page, 2);
     assert!(!button(&r, |k| *k == ButtonKind::PageForward).visible);
+    key(
+        &mut r,
+        Binds {
+            page_up: true,
+            ..Binds::default()
+        },
+    );
+    assert_eq!(sent(&mut r), [play::container_button_click(6, 1)]);
     // Page Down presses it all the same; the inventory key does nothing here.
     key(
         &mut r,
@@ -406,6 +441,40 @@ fn a_mounts_inventory_opens_with_its_slots() {
     };
     assert_eq!(menu.slots.len(), 2 + 36);
     assert!(!m.saddle && !m.saddle_shown && !m.body_shown);
+    // A horse wears a saddle and armour by the server's entity type tags.
+    let horse = EntityType::from_name("minecraft:horse").unwrap().id() as i32;
+    r.packet(play::Clientbound::UpdateTags(vec![
+        ruthenium_protocol::packets::configuration::RegistryTags {
+            registry: "minecraft:entity_type".into(),
+            tags: vec![
+                ("minecraft:can_equip_saddle".into(), vec![horse]),
+                ("minecraft:can_wear_horse_armor".into(), vec![horse]),
+            ],
+        },
+    ]));
+    r.packet(play::Clientbound::AddEntity(Box::new(play::AddEntity {
+        entity_id: 903,
+        uuid: 903,
+        entity_type: horse,
+        position: [0.0, 10.0, 0.0],
+        movement: [0.0; 3],
+        x_rot: 0,
+        y_rot: 0,
+        y_head_rot: 0,
+        data: 0,
+    })));
+    r.frame(1);
+    r.packet(play::Clientbound::MountScreenOpen {
+        container_id: 11,
+        inventory_columns: 0,
+        entity_id: 903,
+    });
+    r.frame(1);
+    let menu = r.game.world.as_ref().unwrap().player.menus.container();
+    let crate::menu::Kind::Mount(m) = menu.kind else {
+        panic!();
+    };
+    assert!(m.saddle_shown && m.body_shown, "{m:?}");
     // A pig has no inventory screen: nothing opens.
     r.packet(play::Clientbound::MountScreenOpen {
         container_id: 10,
@@ -415,6 +484,6 @@ fn a_mounts_inventory_opens_with_its_slots() {
     r.frame(1);
     assert_eq!(
         r.game.world.as_ref().unwrap().player.menus.container().id,
-        9
+        11
     );
 }

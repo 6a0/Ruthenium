@@ -954,13 +954,13 @@ mod tests {
     #[test]
     fn a_brewing_stand_shows_its_fuel_and_its_progress() {
         let names = Names(RefCell::new(Vec::new()));
-        // 100 of 400 ticks left, 10 of 20 fuel.
-        let v = view(Kind::BrewingStand, vec![100, 10, 400, 20], None);
+        // 100 of 400 ticks left, 7 of 20 fuel: 6.3 of 18, drawn as 7.
+        let v = view(Kind::BrewingStand, vec![100, 7, 400, 20], None);
         let (l, (x, y)) = draw(&names, &v, (0, 0));
         let under = &l.under;
         assert_eq!(
             names.of(under, "container/brewing_stand/fuel_length"),
-            [[x + 60, y + 44, 9, 4]]
+            [[x + 60, y + 44, 7, 4]]
         );
         assert_eq!(
             names.of(under, "container/brewing_stand/brew_progress"),
@@ -1143,7 +1143,13 @@ mod tests {
             (x + 62 - primary.0.len() as i32 * 3, y + 10, 0xFFE0_E0E0)
         );
         assert_eq!(t.last().unwrap().0, "effect.minecraft.haste");
-        assert_eq!(names.of(&l.over, "tooltip/background").len(), 1);
+        // One line: eight high, and twelve more all round.
+        let w = "effect.minecraft.haste".len() as i32 * 6;
+        let ground = names.of(&l.over, "tooltip/background");
+        assert_eq!(
+            (ground.len(), ground[0][2], ground[0][3]),
+            (1, w + 24, 8 + 24)
+        );
     }
 
     #[test]
@@ -1154,6 +1160,7 @@ mod tests {
             Arc::new(Tag::String(
                 "a second page that is longer than one line of it".into(),
             )),
+            Arc::new(Tag::String("line\n".repeat(20))),
         ]
         .into();
         let (bl, bt) = ((400 - 192) / 2, 2);
@@ -1217,5 +1224,27 @@ mod tests {
                 .of(&l.under, "container/slot_highlight_back")
                 .is_empty()
         );
+        // A page of twenty lines shows fourteen.
+        let mut v = v;
+        if let Some(st) = &mut v.station {
+            st.page = 2;
+        }
+        let (l, _) = draw(&names, &v, (0, 0));
+        assert_eq!(texts(&l).iter().filter(|t| t.1 == bl + 36).count(), 14);
+    }
+
+    #[test]
+    fn a_nautilus_has_no_chest() {
+        let names = Names(RefCell::new(Vec::new()));
+        let state = MountState {
+            alive: true,
+            baby: false,
+            tamed: true,
+        };
+        // (Even should the server say it has columns.)
+        let nautilus = Mount::new("minecraft:nautilus", 89, 3, state, &Default::default()).unwrap();
+        let v = view(Kind::Mount(nautilus), Vec::new(), None);
+        let (l, _) = draw(&names, &v, (0, 0));
+        assert!(names.of(&l.under, "container/horse/chest_slots").is_empty());
     }
 }
